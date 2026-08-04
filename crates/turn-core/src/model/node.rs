@@ -268,6 +268,7 @@ impl SessionTree {
             if node.parent.as_ref() == Some(id) {
                 node.parent = None;
                 node.relation = Relation::Unknown;
+                node.relationship = Relationship::default();
             }
         }
         self.nodes.remove(id)
@@ -390,8 +391,7 @@ impl SessionTree {
         let Some(node) = self.nodes.get_mut(child) else {
             return false;
         };
-        node.parent = Some(parent);
-        node.relation = relation;
+        node.link_to(parent, relation);
         true
     }
 
