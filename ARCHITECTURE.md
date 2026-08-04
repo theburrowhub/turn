@@ -18,13 +18,13 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 
 | Crate | Status | Tests | Notes |
 | --- | --- | --- | --- |
-| `turn-core` | Built | 120 | Domain, two-axis state, attention. |
-| `turn-proto` | Built | 172 | Envelope, framing, requests, responses, pushes, bytes, cells, view models. |
-| `turn-store` | Built | 140 | SQLite, migrations, redaction, seven repositories. |
+| `turn-core` | In progress | 120+ | Built baseline plus ADR-040 hierarchy/checkout values under integration. |
+| `turn-proto` | In progress | 172+ | Built v2 transport/cells; v3 hierarchy/errors/catalogue under integration. |
+| `turn-store` | In progress | 140+ | Built baseline; migration 003, global fences and hierarchy repository under hardening. |
 | `turn-pty` | Built | 47 | Ptys, buffers, supervision. |
 | `turn-hook` | Built | 21 | The `turn-hook` helper binary and its library. |
 | `turn-agents` | Built | 169 | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
-| `turnd` | Built | 88 | `config`, `paths`, `instance`, `server`, `core/*`; `main.rs` is a real entry point. |
+| `turnd` | In progress | 88+ | Real entry point/baseline; atomic Session/lease/projection lifecycle not yet accepted. |
 | `turn-gui` | In progress | 80 | The native window: cells, theme, view, keymap, panes, transport, plus `wgpu` snapshots. |
 
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
@@ -68,26 +68,27 @@ because the whole point of the daemon is that the UI can go away.
                      ┌──────────────────────────────────────────────────┐
                      │  turn-gui  (eframe/egui on wgpu — native, no     │
                      │  webview)                      IN PROGRESS       │
-                     │  sidebar · panes painted cell by cell ·          │
-                     │  attention queue · permission banner             │
+                     │  unified hierarchy · user-chosen panes ·         │
+                     │  contextual inspector · permission banner        │
                      └───────────────────┬──────────────────────────────┘
-                                         │ turn-proto  BUILT
+                                         │ turn-proto  v2 BUILT / v3 IN PROGRESS
                                          │ newline-delimited JSON over a unix socket
                                          │ ── Request  → Response
                                          │ ── ServerMessage pushes (state, cells/output, effects)
                      ┌───────────────────┴──────────────────────────────┐
                      │  turnd — the daemon           IN PROGRESS        │
                      │                                                  │
-                     │  owns: pty handles · session registry ·          │
+                     │  owns: pty handles · session/checkout registry · │
                      │  one AttentionManager · the hook server ·        │
-                     │  supervisor scan timing · all store writes ·     │
+                     │  write leases · hierarchy projection ·           │
+                     │  supervisor timing · all store writes ·          │
                      │  the ONLY place a pty fact and an agent fact     │
                      │  are joined                                      │
                      └──┬───────────┬──────────────┬──────────────┬─────┘
                         │           │              │              │
         ┌───────────────▼──┐ ┌──────▼───────────┐ ┌▼───────────┐ ┌▼──────────────────┐
         │ turn-pty  BUILT  │ │ turn-agents      │ │ turn-core  │ │ turn-store        │
-        │                  │ │ BUILT            │ │ BUILT      │ │ BUILT             │
+        │                  │ │ BUILT            │ │ IN PROGRESS│ │ IN PROGRESS       │
         │ PtyProcess       │ │                  │ │            │ │                   │
         │ TerminalBuffer   │ │ AgentAdapter     │ │ ids        │ │ Store facade      │
         │ ProcessSupervisor│ │ claude · codex   │ │ event      │ │ migrations        │
@@ -96,7 +97,8 @@ because the whole point of the daemon is that the UI can go away.
         │                  │ │ server (127.0.0.1)│ │ attention  │ │  session, node,   │
         │                  │ │ risk             │ │            │ │  event, attention,│
         └────────┬─────────┘ └────┬─────────────┘ └─────▲──────┘ │  template,        │
-                 │                │                     │        │  settings}        │
+                 │                │                     │        │  settings,        │
+                 │                │                     │        │  hierarchy}       │
       ┌──────────▼───────────┐    │                     │        └───────────────────┘
       │ real ptys            │    │                     │
       │ agent CLIs · shells  │    │                     │
@@ -148,7 +150,8 @@ TLS stack to POST a few hundred bytes to loopback. Its HTTP client is hand-writt
 
 ## 2. turn-core — domain, state, attention
 
-**Status: Built. 116 tests.** No I/O, no pty, no database, no UI. This is why the rules that matter can
+**Status: built baseline, ADR-040 model integration in progress.** No I/O, no pty, no database, no UI. This
+is why the rules that matter can
 be tested exhaustively without spawning a process, and why every function that needs the time takes
 `now_ms: i64` as a parameter instead of reading the clock.
 
@@ -162,10 +165,10 @@ user's screen.
 
 | Module | Types | Purpose |
 | --- | --- | --- |
-| `ids` | `WorkspaceId` `SessionId` `NodeId` `PaneId` `TemplateId` `EventId` `AttentionId` | Prefixed newtype strings (`sess_ab12cd34ef56`). A `PaneId` cannot be passed where a `SessionId` is expected, and the prefix keeps them readable in logs and SQLite. |
+| `ids` | `WorkspaceId` `SessionId` `NodeId` `PaneId` `TemplateId` `EventId` `AttentionId` `CheckoutId` `LeaseId` | Prefixed newtype strings (`sess_ab12cd34ef56`). A `PaneId` cannot be passed where a `SessionId` is expected, and the prefix keeps them readable in logs and SQLite. |
 | `state` | `Lifecycle` `Turn` `AwaitingReason` `DisplayState` | The two-axis model. §2.3. |
 | `event` | `TurnEvent` `EventKind` `Confidence` `EventSource` `Severity` `Risk` `AgentRef` | The single event vocabulary. §2.4. |
-| `model` | `Workspace` `Session` `SessionStatus` `RestoreState` `ProcessNode` `NodeKind` `AgentInfo` `PendingPermission` `Relation` `SessionTree` `Layout` `LayoutNode` `Split` `Child` `Pane` `PaneKind` `RestoreBehaviour` `Direction` `Template` | Entities. §2.5. |
+| `model` | Existing Workspace/Session/process/Layout/Template types plus `SessionMode`, `WorkspaceCheckout`, `WorkspaceWriteLease`, `Relationship`, `AgentName`, `ActivityPreview`, `PaneNodeBinding`, `TreeUiState` | Normalised entities and ADR-040 hierarchy support values. §2.5. |
 | `attention` | `AttentionPolicy` `Trigger` `Action` `Sound` `AttentionQueue` `AttentionEntry` `EntryState` `FocusGovernor` `UserContext` `FocusDecision` `FocusDenial` `DeferReason` `AttentionManager` `Effect` | Attention coordination. §2.6. |
 | crate root | `now_ms()` | The one clock read, for the edges. |
 
@@ -202,9 +205,14 @@ failure, because failing to re-attach is not the same as the work having gone wr
 
 ### 2.4 The event vocabulary
 
-Every signal — a Claude Code hook, a Codex `notify` callback, a pty heuristic, the process supervisor,
-a user correction — is normalised into a `TurnEvent` before anything downstream sees it. Consumers
-never learn which tool produced an event, only how much to trust it.
+Every **session-scoped runtime fact** — a Claude Code hook, a Codex `notify` callback, a pty heuristic,
+the process supervisor, a user correction — is normalised into a `TurnEvent` before downstream state and
+attention consume it. Consumers retain its source and confidence without depending on a vendor payload.
+
+ADR-040 makes the boundary explicit: not every wire push or persisted record is a `TurnEvent`. A lease
+denial may happen before a Session exists; tree selection belongs to one UI surface; preview updates are
+high-frequency current state. Those use typed lease/audit records, per-surface UI state and coalesced
+snapshot pushes respectively. They are not forged into the session event log.
 
 **Produces:** nothing; this is a data module.
 **Consumed by:** `AttentionManager::ingest`, the daemon's state reducer, `turn-store`'s `EventRepo`,
@@ -217,7 +225,7 @@ never learn which tool produced an event, only how much to trust it.
 | `process.started` | `pid`, `command` | |
 | `process.exited` | `code` | Resolves attention for the node. |
 | `process.failed` | `code?`, `signal?` | `Severity::Error`. |
-| `process.spawned_child` | `child`, `pid`, `command`, `confirmed_parent` | The boolean is the whole point: false when the link came from the process table. |
+| `process.spawned_child` | `child`, `pid`, `command`, relationship evidence | Runtime observation. The edge stores relationship kind and confidence separately from event confidence. |
 | `agent.started` | `tool`, `model?`, `external_id?` | `external_id` is the tool's own session/thread id, needed to resume it. |
 | `agent.turn_started` | `prompt_excerpt?` | Also the signal that clears a pending demand — the user answered. |
 | `agent.turn_completed` | `last_message?`, `background_tasks: usize` | `background_tasks` is reported by Claude Code, not inferred. |
@@ -228,7 +236,7 @@ never learn which tool produced an event, only how much to trust it.
 | `agent.task_completed` | `summary?` | |
 | `agent.failed` | `reason` | |
 | `agent.idle` | — | `Severity::Debug`. Explicitly *not* an attention moment. |
-| `agent.subagent_started` | `agent_type?`, `agent_id?` | Confirmed hierarchy. |
+| `agent.subagent_started` | `agent_type?`, `agent_id?`, declared name when actually supplied | Confirmed discovery; a role/type is not silently promoted to a name and no Pane is opened. |
 | `agent.subagent_stopped` | `agent_id?` | |
 | `session.needs_attention` | `reason` | For adapters with a coarser signal. |
 | `session.attention_resolved` | — | |
@@ -243,26 +251,42 @@ Three properties of `TurnEvent` do real work:
   The attention manager never pattern-matches event kinds itself. `agent.turn_completed` deliberately
   returns `None`: finishing a turn is not, by itself, a demand.
 
-`raw: Option<String>` keeps the untouched payload for debugging bad adapters. It is never rendered
-as-is, and `turn-store`'s `redact` module is what stands between it and the database file (§7.5).
+`raw: Option<String>` may keep an untouched payload in memory for debugging bad adapters. It is never
+rendered as-is and is not persisted by default; key-based environment redaction is insufficient for free
+text such as prompts and transcript paths (§7.5 and `docs/SECURITY.md`).
 
 ### 2.5 Entities
 
-**`Workspace`** — the persistent project. Root path, git remote, environment applied to every process
-started here, default shell and Agent, init commands, default Template, a baseline `AttentionPolicy`
-Sessions may override, and a `tmux_enabled` flag that nothing reads yet.
+**`Workspace` / `WorkspaceCheckout`** — the persistent project and the filesystem roots known beneath it.
+The Workspace owns root path, git remote, launch environment, defaults and baseline policy. A checkout owns
+canonical path identity, branch, whether it is primary, and an explicit list of ports, containers, databases,
+caches or other resources a worktree does not isolate. Path spelling is never the exclusivity key.
 
 **`Session`** — the unit of work. Name in the user's words, cwd, env, `Layout`, `SessionTree`,
 `AttentionPolicy`, `SessionStatus` (`Active`/`Paused`/`Archived`), `RestoreState`, tags, git branch,
-linked PR reference, pin/favourite, `parent_session` for duplicates. `display_state()` returns `Idle`
+linked PR reference, pin/favourite, `parent_session` for duplicates, checkout assignment and the closed
+`SessionMode` (`main_checkout`, `read_only`, `isolated_worktree`). `display_state()` returns `Idle`
 for an empty tree — a Session whose processes have not started is not a mystery — and otherwise the
 tree's aggregate. `sidebar_rank()` returns `(pinned, demands_user, severity, last_activity_ms)` as a
 tuple rather than an `Ord` impl, because ordering is a presentation concern that may differ per view.
+
+**`WorkspaceWriteLease`** — daemon-owned exclusivity for the primary checkout, not for a window or focus.
+The semantic record carries Workspace, Session and checkout identity, `ExclusiveWrite`, state, acquisition
+time and heartbeat. At most one non-released lease exists for a canonical primary checkout. Acquisition is
+atomic and precedes Session insertion, init commands and process/Pane materialisation. Heartbeat expiry is
+evidence for reconciliation, never authority to steal. Closing a UI, archiving while processes live or
+`KeepProcesses` does not release it.
 
 **`ProcessNode` / `SessionTree`** — the process hierarchy. Stored **flat with parent pointers**, not as
 nested structs: processes arrive out of order (a child's hook can land before the parent's spawn
 notification), and re-parenting a flat map is trivial where re-parenting a tree is not.
 `order: Vec<NodeId>` preserves insertion order so the tree renders stably instead of in hash order.
+
+Normalised ownership remains `Session.workspace_id`, `ProcessNode.session_id` and `ProcessNode.parent`.
+ADR-040 does not introduce polymorphic Workspace/Session/Node parent foreign keys. A relationship edge
+stores meaning (`spawned_by`, `owns_process`, related or unknown) and confidence independently. An agentic
+node also carries lossless naming: declared name when the source supplied one, user-facing display name,
+source, confidence and whether the user renamed it.
 
 `SessionTree::relink` enforces the `Relation` ladder — a `Confirmed` link is never downgraded by an
 `Inferred` one — and refuses to create a cycle, with a 1,000-hop defensive bound in case the store ever
@@ -270,7 +294,8 @@ hands it a corrupt tree. `remove` promotes children to roots with `Relation::Unk
 deleting them or silently re-attaching them elsewhere. `aggregate_state()` is the **most severe**
 state, not the most recent.
 
-**`Layout` / `Pane`** — the pane arrangement, a tree of `Split`s whose `children: Vec<Child>` hold a
+**`Layout` / `Pane` / `PaneNodeBinding`** — the pane arrangement and its views onto runtime nodes. Layout is
+a tree of `Split`s whose `children: Vec<Child>` hold a
 fractional `size`. Splits hold a list rather than exactly two children so three side-by-side Panes are
 one split with three children instead of a lopsided nest; that is what makes resize behave the way a
 user expects. `split` joins an existing same-direction split as a sibling and shrinks everyone
@@ -278,6 +303,16 @@ proportionally. `resize` borrows from the next sibling with a 5% floor so a Pane
 of existence. `close` refuses on the last Pane and collapses a split left with one child. `zoomed`
 never mutates the tree, so un-zooming restores exact previous geometry. `sizes_are_normalised()` is
 the structural invariant; `normalise()` repairs a hand-edited Layout on load.
+
+A binding belongs to a Session and connects one Pane to one node; a node may have zero, one or many
+bindings. The binding table is authoritative after migration. Process identity never points back to one
+privileged Pane, and closing a binding never stops the node. A node with semantic events but no independent
+PTY can be shown as Preview or Process Details, not as a fabricated terminal.
+
+**`ActivityPreview` / `TreeUiState`** — bounded navigation state. Preview is sanitised, redacted,
+provenance-labelled text derived from semantic status or one stable screen line; it is not terminal history.
+Tree expansion and selection are stored per stable `surface_id`. Neither the preview projection nor UI state
+changes process ownership, Layout, focus or Attention.
 
 **`Template`** — a reusable Session shape. `from_layout` strips `node_id` bindings (a Template must not
 remember which process it was cloned from); `instantiate` reassigns every `PaneId` so two Sessions from
@@ -773,7 +808,10 @@ of it.
 The daemon is the only process that holds a pty handle. It owns:
 
 - the Session registry and the authoritative `SessionTree` per Session;
+- checkout identity and the write-lease arbiter for every Workspace;
+- the revisioned `HierarchySnapshot` projection and reconciliation of legacy checkout ownership;
 - one `PtyProcess` per terminal Pane;
+- zero-to-many Pane bindings per runtime node and bounded/coalesced Activity Preview state;
 - one `AttentionManager` for the whole application — the queue is global by design, being the ordered
   list of everything wanting the user across every Workspace;
 - the `HookServer` and its token table;
@@ -785,6 +823,14 @@ It is also the **only** place where a pty fact and an Agent fact are joined: map
 `session_id` to a `NodeId` via `SessionTree::find_by_external_id`, or a supervisor `ObservedProcess` to
 an existing node via `find_by_pid`. Concentrating that join is deliberate; it is where a wrong
 correlation would silently corrupt state.
+
+Creating a `main_checkout` Session is one daemon transaction boundary: canonicalise and validate the
+checkout, persist the Session/assignment and acquire its exclusive lease atomically, then run init commands
+and materialise processes/Panes. A conflict rolls the store transaction back and returns the current owner
+and allowed alternatives before any external side effect. Duplicating a Session never copies an active
+lease. Release is fenced and occurs only after
+the writer has really stopped or explicitly changed mode; UI close, archive and `KeepProcesses` are not
+release signals.
 
 #### Why the daemon exists from day one, and exactly what it buys
 
@@ -853,14 +899,16 @@ guard degrades to nothing.
 
 ## 6. turn-proto and turn-store
 
-Both are **built**.
+Both v2/base layers are built. Their ADR-040 protocol-v3 and migration-003 extensions are **in progress**
+and are not counted complete merely because domain/schema types exist.
 
 ### 6.1 turn-proto — the daemon↔UI protocol
 
-**Status: Built.** Modules: `envelope`, `framing`, `request`, `response`, `events`, `cells`, `screen`,
-`bytes`, `error`, `geometry`, `view/{session,tree,attention,workspace}`. It is types, framing and the one
-reading of a parsed screen as cells — no I/O, no tokio, no socket, so the contract can be tested without
-either process existing.
+**Status: protocol v2 built; protocol v3 hierarchy contract in progress.** Framing, terminal cell transport,
+request correlation and the safety omissions remain unchanged. Version 3 replaces independent navigation
+bootstrap with one revisioned hierarchy projection and adds structured checkout conflict, Preview, binding
+and per-surface tree-state operations. It is still types only — no I/O, tokio or socket — so the contract can
+be tested without either process existing.
 
 **The connection.** A versioned envelope (`ClientFrame` / `ServerFrame`) carries four things: a
 `hello`/`welcome` handshake resolved by `negotiate()`, id-correlated `request`/`response` pairs, and
@@ -868,15 +916,15 @@ unsolicited `event` pushes at any time.
 
 ```text
 UI                                             turnd
- │  {"v":2,"type":"hello",…}                      │
+ │  {"v":3,"type":"hello",…}                      │
  │ ─────────────────────────────────────────────► │
- │                    {"v":2,"type":"welcome",…}  │   negotiate()
+ │                    {"v":3,"type":"welcome",…}  │   negotiate()
  │ ◄───────────────────────────────────────────── │
- │  {"v":2,"type":"request","id":"r-1",…}         │
+ │  {"v":3,"type":"request","id":"r-1",…}         │
  │ ─────────────────────────────────────────────► │
- │                   {"v":2,"type":"response",…}  │   correlated by id
+ │                   {"v":3,"type":"response",…}  │   correlated by id
  │ ◄───────────────────────────────────────────── │
- │                      {"v":2,"type":"event",…}  │   unsolicited, any time
+ │                      {"v":3,"type":"event",…}  │   unsolicited, any time
  │ ◄───────────────────────────────────────────── │
 ```
 
@@ -944,25 +992,36 @@ than by the daemon remembering to check them:
 
 **Responses and errors.** Every success is a `Response` variant tagged with `result`. Failures never
 arrive as a `Response` — they arrive as `ServerMessage::Error` carrying a `ProtoError` with a
-machine-readable `ErrorCode` and a `message` that is for humans and never parsed. One error shape rather
-than a per-request enum, because the UI's error handling is generic and a client in another language
-should not have to model forty failure types to be correct.
+machine-readable `ErrorCode`, a human-only `message` and optional typed `context`. Generic failures need no
+payload. A `conflict` may carry `context.kind = workspace_write_lease_conflict` with owner
+Workspace/Session/checkout, lease identity/generation and the closed alternatives `focus_owner`,
+`create_read_only`, `create_isolated_worktree`, `cancel`. `stale_lease_generation` identifies a fenced
+heartbeat/release attempt. No client parses `message` or `detail` to decide recovery.
 
 **Pushes (`events`).** Everything the daemon says without being asked, which is the interesting half:
 the whole point of the product is that thirty processes are getting on with things while the user looks
-at one. Pushes are addressed but **not correlated** — no request id, because no request caused them. A
-client processes them in arrival order and treats each as the current truth about what it names.
+at one. Pushes are addressed but **not correlated** — no request id, because no request caused them.
+Terminal attachments keep their per-attachment sequence. Hierarchy pushes carry a monotonic projection
+revision; a client that observes a gap discards the stale hierarchy and requests a full replacement.
+`PreviewChanged`, `PaneBindingChanged` and `LeaseChanged` carry current bounded state and do not enter the
+append-only `TurnEvent` log.
 
-**View models (`view/*`): derive, never duplicate.** `SessionSummary`, `SessionDetails`,
-`AgentSummary`, `TreeNodeView`, `AttentionView`, `WorkspaceSummary`, `TemplateSummary`. The daemon owns
-every product rule. If the UI had to call `DisplayState::derive` itself, or decide whether a parent link
-is a guess, or work out which of thirty Sessions is shouting loudest, those rules would exist twice —
-and the second copy would be written by someone reading a screenshot. Now that the client is also Rust the
-temptation is *larger*, not smaller: `turn-core` is importable, so a client could call `derive` itself.
-It must not. A client that computes is a client that can disagree with the daemon. Anything already
-modelled in `turn-core` is embedded as that type; the extra fields are strictly derived values.
-**Provisional stays visible:** a guessed parent link and an inferred state both carry their uncertainty
-into the view model, so the UI can render a guess as a guess.
+**View models (`view/*`): derive, never duplicate.** `HierarchySnapshot` is the navigation model:
+`revision`, stable `surface_id`, `TreeSurfaceState` and ordered `WorkspaceTreeView` roots containing
+checkout/lease state and `SessionTreeView` children. Runtime node rows retain parent/depth and draw order,
+derived state/badges, relationship meaning/confidence, zero-to-many `pane_bindings` and safe Activity
+Preview.
+`SessionSummary`, `SessionDetails`, `AttentionView` and administrative Workspace/Template projections remain
+useful, but the client does not join them to invent a second tree. The daemon owns every product rule. A
+client never calls `DisplayState::derive`, guesses an edge, computes urgency or synthesises a declared name.
+Provisional state remains explicit on the wire.
+
+**Protocol v3 navigation operations.** Bootstrap is `GetHierarchy`; `ListWorkspaces`, `ListSessions` and
+`GetSession` remain administrative/detail endpoints, not a navigation recipe. `SetTreeExpanded` and
+`SelectTreeNode` are scoped by stable `surface_id` and acknowledged without broadcasting another surface's
+selection. Node actions include rename, relationship correction with old/new parent audit,
+`GetPreviewHistory`, `OpenNodeAsTemporaryPane` and `FocusPaneForNode`. Lease acquire/release carry expected
+fencing generation; Session creation includes `SessionMode` and returns no partial Session on conflict.
 
 **Two catalogue-level tests hold the contract together**, and they are the reason
 `Request::expected_result` exists at all: `contract::every_request_names_a_response_variant_that_exists`
@@ -972,9 +1031,9 @@ treat the request→response pairing as load-bearing rather than as documentatio
 
 ### 6.2 turn-store — SQLite persistence
 
-**Status: Built. 119 tests** (106 unit, 9 in `tests/restart_restores_the_desk.rs`, 3 in
-`tests/secrets_never_reach_the_disk.rs`, 1 doctest). Modules: `migrations`, `codec`, `redact`, `location`,
-`error`, `repo/{workspace, session, node, event, attention, template, settings}`, behind a `Store` facade
+**Status: Built baseline; migration 003 and hierarchy repository in progress.** Modules: `migrations`,
+`codec`, `redact`, `location`, `error`,
+`repo/{workspace, session, node, event, attention, template, settings, hierarchy}`, behind a `Store` facade
 (`open_default`, `open_in`, `open_at`, `open_in_memory`, plus `schema_version`, `journal_mode`,
 `foreign_keys_enforced` and `compact`). WAL and enforced foreign keys are set at open.
 
@@ -982,9 +1041,10 @@ Everything is synchronous: the daemon calls it from a blocking context and owns 
 runtime, no background thread and no lock in the crate.
 
 **The persistence boundary is the most important thing about it**, because getting it wrong produces a
-convincing lie. Persisted: Workspaces, Sessions, the layout tree, Templates, attention policies, the
-Attention Queue, the event log, and process *metadata*. Never persisted: the pty master, the terminal grid
-and its scrollback, the output broadcast channel, the vt100 parser state, live subscriptions.
+convincing lie. Persisted: Workspaces/checkouts, Session assignment and mode, Layouts, Templates, attention
+policies/queue, event log, process metadata/relationships/names, Pane bindings, bounded redacted previews,
+leases and per-surface tree state. Never persisted: the pty master, raw terminal bytes, grid or scrollback,
+the output broadcast channel, parser state, live subscriptions or unredacted preview source.
 
 And the line that makes restore honest: **`SessionRepo::load_for_restore` downgrades anything stored as
 running to `Lifecycle::Orphaned`**, because a stored `Alive` only ever meant "alive when we last wrote".
@@ -997,6 +1057,19 @@ Migrations are **append-only**; once a version has shipped its statements are fr
 them would leave every machine that already ran it with a schema no later migration accounts for.
 **Downgrades are refused, loudly:** opening a newer database and writing to it would either fail on
 unknown columns or, worse, succeed and drop the fields the newer build depends on.
+
+Migration 003 is conservative and side-effect free. It creates one deterministic primary-checkout record
+per Workspace, assigns legacy Sessions as `read_only` with enforcement false, imports non-conflicting legacy
+Pane bindings and marks the Workspace for lease reconciliation. It creates **no active write lease** and
+does not launch, kill, move, chmod or relaunch a process. DDL cannot prove that a recent Session is the sole
+writer; daemon reconciliation or an explicit user decision must do that later. Conflicting legacy binding
+sources are surfaced for reconciliation rather than silently choosing two authorities.
+
+The schema additions are Session mode/checkout/enforcement fields and
+`workspace_checkouts`, `checkout_write_fences`, `workspace_write_leases`, `activity_previews`,
+`pane_node_bindings` and `tree_ui_state`. `checkout_write_fences` is keyed by canonical path and survives
+Workspace/lease recreation, so generation is globally monotonic for the protected filesystem identity.
+Partial uniqueness treats every non-released lease state — including stale/recovery-required — as blocking.
 
 **Codec.** Two column shapes, chosen per column. `tag` for payload-free enums, which land as a bare
 `awaiting_user` rather than a quoted JSON scalar — those columns are filtered and grouped in SQL, and a
@@ -1016,11 +1089,16 @@ Per-repository notes worth knowing:
 
 - **`session`** — a save is one transaction over three tables (session row, layout document, nodes),
   because a Session whose layout survived but whose nodes did not is not a Session anybody can restore.
-- **`node`** — stores *only* metadata: pid, command, cwd, lifecycle, relation, exit code, external id.
+- **`node`** — stores runtime metadata: pid, command, cwd, lifecycle, relationship, naming, exit code and
+  external id.
   Enough to look a process up in the process table and try to re-attach, and enough to say "this was
   running and we can no longer find it" when that fails. **Not** stored: the pty, the scrollback, the
   terminal grid, the output channel — a pty master cannot outlive the process, and a restored scrollback
   would be a screenshot of a conversation the Agent no longer remembers.
+- **`hierarchy`** — checkout assignments; acquire/heartbeat/fenced release for main-checkout leases;
+  zero-to-many Pane bindings; bounded, sanitised Activity Preview; and selection/expansion scoped by stable
+  `surface_id`. Lease ownership is validated across Workspace, Session and checkout, and canonical checkout
+  identity is protected by a unique active-owner constraint.
 - **`event`** — append-only. Nothing rewrites an event; a wrong state is corrected by a *new* event with
   `EventSource::UserCorrection`, which is what makes the log a usable account of what Turn believed and
   when. Every row keeps its `Confidence` and source, so weeks later Turn can still say "this read as
@@ -1042,19 +1120,25 @@ testable without a test mutating process-global state every other test in the bi
 
 ### 6.3 The UI
 
-> **Normative correction (ADR-040).** The current paragraph-level inventory predates the unified hierarchy
-> upgrade. The target client has one persistent left tree containing Workspaces, Sessions, Agents, tools
-> and relevant child processes. It has no second Agent tree, permanent Session overview or permanent queue
-> navigator. The right side is a contextual inspector; AgentNodes and Pane bindings have independent
-> lifetimes. Domain, event, SQLite and protocol changes are specified in
-> `docs/UNIFIED_HIERARCHY_UPGRADE.md` and take precedence over conflicting text below.
+**Status: In progress.** `crates/turn-gui` is a native window drawn on the GPU — `eframe`/`egui` over
+`wgpu`, one binary named `turn`, no webview, HTML or TypeScript. ADR-039 records the stack decision;
+ADR-040 defines the accepted information architecture.
 
-**Status: In progress.** `crates/turn-gui` is a **native window drawn on the GPU** — `eframe`/`egui` over
-`wgpu`, one binary named `turn`, no webview, no HTML and no TypeScript anywhere in the repository. The
-previous Tauri shell and TypeScript frontend were built, rejected by the product owner, and deleted; ADR-039
-records why, what it cost and what it costs from here.
+The persistent left surface is one Workspace hierarchy: Workspace → Session → Agent/Tool → child. It is
+the only navigation home for those identities. There is no parallel Session tab strip, permanent overview,
+permanent Attention Queue navigator or optional second Agent tree. Collapse, search, state filters and
+virtualised rows make the same projection work at 3, 10 and 30 Sessions. The centre contains only the
+user/template-selected Layout. The right side is an optional contextual inspector, and Quick Preview is a
+non-layout overlay.
 
-What exists today is the spike that settles the stack, not a finished window:
+The client holds four independent references: selected `HierarchyKey`, active Session, focused Pane and
+pending Attention. `Enter` activates or focuses an existing Pane, `Space` opens Quick Preview and
+`Cmd+Enter` explicitly opens a temporary Pane; merely moving tree selection performs none of those actions.
+Expansion and selection persist through daemon-owned `TreeSurfaceState` keyed by stable `surface_id`, but
+one surface's selection is never broadcast to another. Rows expose native accessibility Tree/TreeItem roles,
+names that include state/confidence in words, and complete keyboard equivalents.
+
+What exists today is a transitional stack spike:
 
 - **`src/cells.rs`** — a pane's screen as `Grid`/`Cell`/`CellAttrs`/`Rgb`, and the conversion from the
   daemon's `vt100`-parsed screen. The client paints cells; it does not parse an escape stream, so there is
@@ -1063,24 +1147,25 @@ What exists today is the spike that settles the stack, not a finished window:
   that no caller can signal a state by colour alone. `every_state_has_a_glyph_as_well_as_a_colour` and
   `the_attention_colour_is_reserved_for_states_that_block_the_user` make that structural rather than a
   convention.
-- **`src/view.rs`** — the status bar, the non-modal permission banner, the session sidebar with its indented
-  hierarchy, a terminal pane painted cell by cell, and the attention queue.
+- **`src/view.rs`** — a flat Session sidebar, terminal painter, permission banner and permanent queue. The
+  painter/banner survive; the two navigation surfaces are replaced by the unified hierarchy and contextual
+  Attention actions rather than preserved as product structure.
 - **`tests/snapshots.rs`** — `egui_kittest` renders the real widget tree through `wgpu` **with no display
   attached** and diffs against committed PNGs; `UPDATE_SNAPSHOTS=1 cargo test -p turn-gui` re-records. This
   is what makes a GPU-drawn frontend reviewable at all, and it has already earned itself: the first snapshot
   caught two labels drawn on top of each other, which the logic tests could not see.
 
-The window is a **performer of effects and a reporter of context**, unchanged by the stack swap. It does not
+The window is a **performer of effects and a reporter of context**. It does not
 decide when to interrupt — that is `AttentionManager`'s job, in the daemon, tested without a window — and it
-never derives a state, a rank or a score; `state_label`, `severity`, `score`, `provisional` and
-`relation_is_provisional` arrive computed (ADR-032). Only `Effect::focus` may move the user;
+never derives a state, hierarchy edge, rank, score or preview confidence; those arrive in protocol view
+models (ADR-032). Only `Effect::focus` may move the user;
 `focus_deferred` and `focus_denied` are verdicts to report.
 
-Not built yet, stated plainly rather than implied by the section above: the live daemon connection, the
-keymap, the command palette, the agent tree panel, the event log, the session overview, pane splitting and
-dividers, the four perceptible effect channels, and the restore offers. The equivalents of all of these
-existed in the deleted frontend and their designs are recorded — ADR-039 §"What was carried over" — but none
-of that is code in this repository today. There is also no accessibility coverage yet
+Not built yet, stated plainly rather than implied by the target above: protocol-v3 hierarchy bootstrap and
+revision resync, checkout-conflict chooser, contextual inspector/Quick Preview, zero-to-many Pane actions,
+the complete keymap/command palette, perceptible effect channels and hierarchy restoration. The current
+flat sidebar/queue must be removed as navigation, not wired up and renamed. There is also no complete
+accessibility coverage yet
 (`every_session_row_is_reachable_by_its_accessible_name` is committed failing and `#[ignore]`d) and no IME
 work at all, which are the two things the webview used to provide for free.
 
@@ -1169,9 +1254,10 @@ searching them: `secrets_never_reach_the_disk::no_secret_value_is_present_anywhe
 `a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes`, and
 `a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent`.
 
-**Still open:** `TurnEvent::raw` holds the untouched hook payload, which can carry a `transcript_path`, a
-`cwd` and a prompt excerpt, and key-based redaction does not touch free text. Whether `raw` is persisted at
-all, or kept only in memory for debugging, is an open decision (`ROADMAP.md` §Open decisions).
+ADR-040 closes the persistence side of the former `TurnEvent::raw` question: an untouched hook payload may
+exist transiently in memory for adapter diagnostics, but it is not written to SQLite by default and it is
+never a preview source without normalisation/redaction. Free text cannot be made safe by environment-key
+matching alone.
 
 ### 7.6 No auto-approval, no auto-relaunch, no inferred execution — **implemented at every layer**
 
@@ -1226,6 +1312,23 @@ What still holds, and is what the security model actually rests on:
 So the net position is: one injection vector removed, one containment layer removed. The first is worth more
 than the second in this specific product, because the containment only ever mattered if the injection
 succeeded — but it is a trade, not a free win.
+
+### 7.10 Checkouts, leases and previews — **accepted, implementation in progress**
+
+Write exclusivity is enforced on canonical checkout identity, not a user-supplied path string. Session,
+Workspace and checkout ownership must agree before acquisition. Symlink/path aliases cannot create a second
+lease, and worktree creation must stay below an approved parent and report shared resources it does not
+isolate. Read-only mode exposes whether the guard is enforced; an agent prompt saying “do not write” is not
+a security boundary.
+
+Lease acquisition happens before any init command or process spawn. Heartbeats and fencing generations
+prevent a stale daemon/client from releasing a newer owner's lease, but time alone never proves the old
+writer is dead. Migration 003 grants no lease and changes no filesystem permissions.
+
+Activity Preview and agent names cross an untrusted-text boundary before entering navigation chrome. They
+use the same control/bidi sanitisation as titles, known-secret redaction, strict character/history limits
+and provenance. Raw PTY bytes, prompts, spinners and raw hook bodies are not stored as previews. Restored
+preview text is marked stale so it cannot impersonate current activity.
 
 ---
 

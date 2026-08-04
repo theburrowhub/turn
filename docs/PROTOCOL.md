@@ -1,15 +1,15 @@
 # The Turn daemon protocol
 
-`turn-proto` version **2**.
+Normative contract for `turn-proto` version **3**. Implementation is in progress; version 2 is historical
+context for the retained terminal-cell transport, not a supported navigation mode.
 
 This is the contract between `turnd` — which owns every pty, all state and the
 attention manager — and a UI client, which renders and forwards keystrokes.
 
-Every message shown below was produced by serialising the real types; the field
-sets are exact, not illustrative. The source of truth is
-`crates/turn-proto/src/`, and tests in that crate assert that the operation names,
-the request-to-response pairing and the catalogue sizes documented here match the
-code.
+Fields shown without an ellipsis are normative. Examples containing `…` deliberately omit unrelated view
+fields. The implementation source of truth is `crates/turn-proto/src/`; catalogue and conversation tests
+must fail if operation names, request-to-response pairing, protocol version or revision semantics drift from
+this contract.
 
 ---
 
@@ -189,7 +189,7 @@ Every frame, in both directions, carries `v` — the protocol version it is writ
 against — alongside a `type` discriminator.
 
 ```jsonc
-{"v": 2, "type": "request", "id": "r-1", "request": {"op": "..."}}
+{"v": 3, "type": "request", "id": "r-1", "request": {"op": "..."}}
 ```
 
 Negotiating once and trusting the connection afterwards would be enough. The
@@ -220,6 +220,27 @@ attachment without guessing what a silent client meant.
 Also new, and additive: `resync_pane`, the `screen` result, the `pane_screen` push, the
 `screen` field on `attached`, and `max_screen_cells` in `limits`.
 
+### What changed in version 3
+
+Version 3 is the ADR-040 hierarchy and checkout-safety boundary. It is incompatible because an older client
+would bootstrap independent Workspace, Session and per-Session process lists, silently omit Session mode and
+lease conflict choices, assume one Pane per node, and never resynchronise the unified navigation projection.
+
+Version 3 adds:
+
+- `get_hierarchy` and `HierarchySnapshot { revision, surface_id, tree_state, workspaces }` as the only
+  navigation bootstrap;
+- per-surface `set_tree_expanded` and `select_tree_node`, which are acknowledged but not broadcast;
+- closed `SessionMode` values `main_checkout`, `read_only`, `isolated_worktree` and checkout/lease operations;
+- typed `workspace_write_lease_conflict` and `stale_lease_generation` error context;
+- relationship kind plus confidence, lossless Agent naming, safe Activity Preview and zero-to-many Pane
+  bindings;
+- revisioned `hierarchy_changed` full replacements and bounded preview/binding/lease pushes.
+
+The cell protocol introduced in v2 is retained unchanged. This pre-release codebase serves v3 only:
+`MIN_PROTOCOL_VERSION == PROTOCOL_VERSION == 3`. Legacy list/detail operations may remain as administrative
+endpoints, not as a dual-v2 compatibility mode.
+
 ### Compatibility rules
 
 - No type uses `deny_unknown_fields`. An older client **must** ignore fields it
@@ -239,7 +260,7 @@ The client sends `hello`. The daemon calls `negotiate(v)` and replies `welcome` 
 
 ```jsonc
 // UI → daemon
-{"v":2,"type":"hello","client":"turn-gui","client_version":"0.1.0"}
+{"v":3,"type":"hello","client":"turn-gui","client_version":"0.1.0"}
 ```
 
 `accepts_encoding` may be included (`["base64"]`); an empty or absent list means
@@ -247,8 +268,8 @@ base64.
 
 ```jsonc
 // daemon → UI
-{"v":2,"type":"welcome","protocol_version":2,"min_protocol_version":2,
- "agreed_version":2,"daemon_version":"0.1.0","daemon_pid":51234,
+{"v":3,"type":"welcome","protocol_version":3,"min_protocol_version":3,
+ "agreed_version":3,"daemon_version":"0.1.0","daemon_pid":51234,
  "daemon_started_ms":1700000000000,
  "limits":{"max_line_bytes":8388608,"max_output_chunk_bytes":262144,
            "max_screen_cells":65536},
@@ -299,10 +320,10 @@ One shape for every failure. Code is what software branches on; `message` is
 shown to the user verbatim and is never parsed. `detail` is for logs.
 
 ```jsonc
-{"v":2,"type":"error","id":"r-9","error":{
+{"v":3,"type":"error","id":"r-9","error":{
   "code":"not_found","message":"No such session","detail":"sess_gone"}}
 
-{"v":2,"type":"error","error":{
+{"v":3,"type":"error","error":{
   "code":"malformed_message","message":"A message could not be understood"}}
 ```
 
@@ -322,21 +343,56 @@ shown to the user verbatim and is never parsed. `detail` is for logs.
 | `unavailable` | The store, the pty layer or an agent binary is not there | **yes** | no |
 | `internal` | A daemon bug | **yes** | no |
 
+`message` and legacy `detail` are for people/logs. A client branches only on `code` and optional tagged
+`context`. Checkout conflicts are therefore self-contained:
+
+```jsonc
+{"v":3,"type":"error","id":"r-lease","error":{
+  "code":"conflict","message":"The primary checkout already has a writer",
+  "context":{"kind":"workspace_write_lease_conflict",
+    "workspace_id":"ws_9f2a1c","checkout_id":"checkout_a4c9",
+    "owner_session_id":"sess_owner","lease_id":"lease_72ce","generation":4,
+    "alternatives":["focus_owner","create_read_only","create_isolated_worktree","cancel"]}}}
+```
+
+`stale_lease_generation` carries `lease_id`, `expected_generation` and `actual_generation`; it means a stale
+actor attempted a heartbeat or release and must resynchronise. Neither context authorises stealing a lease.
+
 ---
 
 ## 6. Requests — UI → daemon
 
-> **Protocol v3 upgrade in progress (ADR-040).** The canonical navigation surface is a unified Workspace
-> hierarchy, not independently rendered Workspace, Session and process lists. New Tree, Preview, Pane
-> binding and Lease operations are specified in `UNIFIED_HIERARCHY_UPGRADE.md`. Until the v3 types land,
-> the v2 endpoints below describe the legacy wire contract, not the accepted product navigation model.
-
-41 operations, tagged `op`. Every request carries a client-supplied `id`; the
+Operations are tagged `op`. Every request carries a client-supplied `id`; the
 daemon echoes it untouched. Ids are client-supplied so the UI can key its pending
 map on something it already has, without a round trip to learn the key.
 
 `session_id`, `workspace_id`, `pane_id`, `node_id`, `template_id` and
-`attention_id` are the prefixed string ids from `turn_core::ids`.
+`attention_id`, `checkout_id` and `lease_id` are the prefixed string ids from `turn_core::ids`.
+`HierarchyKey` is tagged `workspace`, `session` or `process`; a raw string is never accepted where the
+kind matters.
+
+### Unified hierarchy
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `get_hierarchy` | `surface_id`, `include_archived?` | `hierarchy` |
+| `set_tree_expanded` | `surface_id`, `key: HierarchyKey`, `expanded` | `ack` |
+| `select_tree_node` | `surface_id`, `key: HierarchyKey?` | `ack` |
+| `rename_node` | `session_id`, `node_id`, `display_name` | `node` |
+| `correct_relationship` | `session_id`, `node_id`, `old_parent?`, `new_parent?`, `kind`, `note?` | `node` |
+| `get_preview_history` | `session_id`, `node_id`, `limit?` (clamped to 20) | `preview_history` |
+| `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `pane_binding` |
+| `focus_pane_for_node` | `surface_id`, `session_id`, `node_id`, `pane_id?` | `pane_binding` |
+
+`get_hierarchy` is navigation bootstrap. `list_workspaces`, `list_sessions`, `get_session` and
+`get_process_tree` remain useful to administration, search and details, but composing them into a second
+navigation tree is a client bug. `HierarchySnapshot.revision` is monotonic for the daemon lifetime; after a
+revision gap or daemon identity change, request a full snapshot.
+
+Expansion/selection writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active
+Session or Pane focus, and do not produce a broadcast. `correct_relationship` is an audited user correction:
+the daemon verifies the old edge, refuses cycles/cross-Session moves and records explicit confidence. There
+is deliberately no unconstrained `move_node`.
 
 ### Workspaces
 
@@ -348,6 +404,9 @@ map on something it already has, without a round trip to learn the key.
 | `archive_workspace` | `workspace_id`, `archived` | `workspace` |
 | `duplicate_workspace` | `workspace_id`, `name?` — settings only, no sessions | `workspace` |
 | `close_workspace` | `workspace_id`, `disposition` | `ack` |
+| `get_workspace_write_lease` | `workspace_id` | `workspace_write_lease` |
+| `acquire_workspace_write_lease` | `workspace_id`, `session_id`, `checkout_id` | `workspace_write_lease` |
+| `release_workspace_write_lease` | `lease_id`, `expected_generation` | `workspace_write_lease` |
 
 `archive_*` takes a flag rather than existing as two operations, so undo is the
 same code path as do.
@@ -357,8 +416,10 @@ same code path as do.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `list_sessions` | `workspace_id?` (absent = all), `include_archived?` | `sessions` |
-| `create_session` | `workspace_id`, `name`, `cwd?`, `panes?`, `note?`, `tags?` | `session` |
-| `create_session_from_template` | `workspace_id`, `template_id`, `name?`, `cwd?`, `branch?`, `task?` | `session` |
+| `create_session` | `workspace_id`, `name`, `mode`, `checkout_id?`, `cwd?`, `panes?`, `note?`, `tags?` | `session` |
+| `create_session_from_template` | `workspace_id`, `template_id`, `mode`, `checkout_id?`, `name?`, `cwd?`, `branch?`, `task?` | `session` |
+| `create_read_only_session` | `workspace_id`, `name`, `checkout_id?`, `template_id?` | `session` |
+| `create_worktree_session` | `workspace_id`, `name`, `branch`, `template_id?` | `session` |
 | `rename_session` | `session_id`, `name` | `session` |
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
@@ -368,6 +429,12 @@ same code path as do.
 
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
+
+Creating `main_checkout` persists the Session assignment and acquires the lease in one atomic store
+transaction, before init commands, processes or Panes exist. A conflict rolls the transaction back, returns
+the typed context in §5 and leaves no partial Session. Duplicate never inherits an active lease; it must
+choose/reconcile a mode. Read-only replies include `read_only_enforced`, because metadata and agent guidance
+are not enforcement. Worktree replies include the new checkout and declared shared resources.
 
 ### Templates
 
@@ -396,6 +463,11 @@ instance it was captured from.
 Every pane operation answers with the resulting `layout` rather than an ack, so
 the UI renders the daemon's arrangement instead of its own optimistic guess at what
 a split, a collapse or a clamped resize did.
+
+Pane identity and runtime identity are many-to-one through `PaneNodeBinding`: one Pane binds at most one
+node, one node may have zero or many Panes. `ProcessNode.pane_id` is not a v3 authority. Opening a semantic
+subagent with no independent PTY yields a Preview/Process Details pane capability, not a terminal that
+cannot work. Closing/detaching a binding never implies terminating the node.
 
 - `direction`: `"horizontal"` \| `"vertical"`
 - `target`: `{"kind":"pane","pane_id":…}` \| `{"kind":"next"}` \| `{"kind":"previous"}`
@@ -463,7 +535,7 @@ A muted session still badges. Muting silences the interruption, not the evidence
 // The user fixing a state Turn got wrong. Recorded with
 // EventSource::UserCorrection at explicit confidence: on the question of what is
 // actually happening in their terminal, the human outranks every heuristic.
-{"v":2,"type":"request","id":"r-6","request":{
+{"v":3,"type":"request","id":"r-6","request":{
   "op":"correct_state","session_id":"sess_4b71e0","node_id":"proc_7a12ff",
   "turn":{"kind":"active"},"note":"still working"}}
 ```
@@ -475,7 +547,7 @@ A muted session still badges. Muting silences the interruption, not the evidence
 | `update_user_activity` | `context` | `effects` |
 
 ```jsonc
-{"v":2,"type":"request","id":"r-4","request":{
+{"v":3,"type":"request","id":"r-4","request":{
   "op":"update_user_activity","context":{
     "last_keystroke_ms":1700000000000,"app_foreground":true,
     "active_session":"sess_4b71e0","sensitive_operation":false}}}
@@ -505,27 +577,31 @@ user wanted kept or leak processes they thought were gone.
 | `terminate` | Ask them to stop, the way closing a terminal would. |
 | `kill` | Stop them without asking. |
 
+`keep_processes`, closing the UI and archiving a Session with a live writer do not release its checkout
+lease. A fenced explicit release is valid only after write-capable processes stopped or the Session changed
+mode; daemon restart reconciliation never treats a silent heartbeat alone as proof.
+
 ### Examples
 
 ```jsonc
-{"v":2,"type":"request","id":"r-1","request":{
-  "op":"list_sessions","workspace_id":"ws_9f2a1c","include_archived":false}}
+{"v":3,"type":"request","id":"r-1","request":{
+  "op":"get_hierarchy","surface_id":"main-window","include_archived":false}}
 
 // Cells, because the field is absent. What a renderer wants.
-{"v":2,"type":"request","id":"r-2","request":{
+{"v":3,"type":"request","id":"r-2","request":{
   "op":"attach_pane","session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
   "size":{"rows":40,"cols":120}}}
 
 // The escape stream instead, for something that needs the bytes themselves.
-{"v":2,"type":"request","id":"r-2b","request":{
+{"v":3,"type":"request","id":"r-2b","request":{
   "op":"attach_pane","session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
   "size":{"rows":40,"cols":120},"stream":"bytes"}}
 
 // Answering an agent's y/n prompt. There is no "approve" request; this is it.
-{"v":2,"type":"request","id":"r-3","request":{
+{"v":3,"type":"request","id":"r-3","request":{
   "op":"write_pty","session_id":"sess_4b71e0","node_id":"proc_7a12ff","data":"eQ0="}}
 
-{"v":2,"type":"request","id":"r-5","request":{
+{"v":3,"type":"request","id":"r-5","request":{
   "op":"close_session","session_id":"sess_4b71e0","disposition":"keep_processes"}}
 ```
 
@@ -533,7 +609,7 @@ user wanted kept or leak processes they thought were gone.
 
 ## 7. Responses — daemon → UI
 
-16 result shapes, tagged `result`. Each request names exactly one
+Result shapes are tagged `result`. Each request names exactly one
 (`Request::expected_result`), and a test asserts that every name it produces exists
 in this catalogue, so the pairing above is load-bearing rather than documentation
 that might be stale. Failures never arrive as a response; they arrive as an
@@ -557,15 +633,19 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `attention` | `entry?: AttentionView` — absent when the queue is empty |
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
+| `hierarchy` | `snapshot: HierarchySnapshot` |
+| `preview_history` | `session_id`, `node_id`, `previews: [ActivityPreview]` |
+| `pane_binding` | `binding: PaneBindingView`, `capability` |
+| `workspace_write_lease` | `workspace_id`, `lease?: WorkspaceWriteLeaseView` |
 
 ```jsonc
-{"v":2,"type":"response","id":"r-3","response":{"result":"ack"}}
+{"v":3,"type":"response","id":"r-3","response":{"result":"ack"}}
 ```
 
 ### `attached` — the feature made visible
 
 ```jsonc
-{"v":2,"type":"response","id":"r-2","response":{"result":"attached","attachment":{
+{"v":3,"type":"response","id":"r-2","response":{"result":"attached","attachment":{
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "stream":"cells",
   "screen":{"rows":40,"cols":120,"cursor":[1,0],
@@ -604,7 +684,7 @@ Sending both would double the cost of every attach to serve a client that asked 
 ### `screen` — the answer to `resync_pane`
 
 ```jsonc
-{"v":2,"type":"response","id":"r-7","response":{"result":"screen",
+{"v":3,"type":"response","id":"r-7","response":{"result":"screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "next_seq":312,"grid":{"rows":40,"cols":120,"…":"…"}}}
 ```
@@ -638,7 +718,7 @@ A client **must not** treat `focus_deferred` or `focus_denied` as a jump. Only
 
 ## 8. Server pushes — daemon → UI
 
-13 pushes, tagged `event`, wrapped in `{"type":"event","event":{…}}`. They carry no
+Pushes are tagged `event`, wrapped in `{"type":"event","event":{…}}`. They carry no
 request id because no request caused them.
 
 | `event` | Payload |
@@ -652,15 +732,19 @@ request id because no request caused them.
 | `turn_event_emitted` | `turn_event: TurnEvent` |
 | `attention_effect` | `effect: Effect` |
 | `attention_queue_changed` | `entries: [AttentionView]` |
-| `tree_changed` | `session_id`, `nodes: [TreeNodeView]` |
+| `hierarchy_changed` | `snapshot: HierarchySnapshot` — full replacement with monotonic revision |
+| `activity_preview_changed` | `session_id`, `node_id`, `preview?: ActivityPreview` |
+| `pane_bindings_changed` | `session_id`, `node_id`, `bindings: [PaneBindingView]` |
+| `workspace_write_lease_changed` | `workspace_id`, `lease?: WorkspaceWriteLeaseView` |
 | `layout_changed` | `session_id`, `layout` |
 | `pty_resized` | `session_id`, `node_id`, `size` |
 | `restore_result` | `session_id`, `state`, `needs_explanation`, `panes` |
 
-`session_state_changed`, `tree_changed` and `layout_changed` send the whole thing
-rather than a diff. Each is small, and a client applying diffs to a stale copy is a
-class of bug that shows up as a sidebar disagreeing with the terminal — or, for the
-tree, as an invented parent link.
+`hierarchy_changed` sends the whole projection, not a structural diff. A client accepts only a strictly
+newer revision from the same daemon; a gap, reversal or daemon identity change requires `get_hierarchy`.
+Applying a diff to stale ownership is how a sidebar invents an edge. Preview/binding pushes are bounded
+replacements for one node and may be coalesced; they are not `TurnEvent`s. Selection/expansion produces no
+broadcast.
 
 ### 8.1 The screen: `pane_screen`
 
@@ -669,7 +753,7 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 
 ```jsonc
 // The rows that differ. The everyday case.
-{"v":2,"type":"event","event":{"event":"pane_screen",
+{"v":3,"type":"event","event":{"event":"pane_screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":312,"update":{
     "mode":"rows","size":{"rows":40,"cols":120},"cursor":[7,18],
@@ -678,7 +762,7 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 
 // The whole screen. Sent on resync, after a resize, and when a diff would not be
 // smaller.
-{"v":2,"type":"event","event":{"event":"pane_screen",
+{"v":3,"type":"event","event":{"event":"pane_screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":313,"update":{"mode":"full","grid":{"rows":40,"cols":120,"…":"…"}}}}
 ```
@@ -731,11 +815,11 @@ already accounted for in the next screen it takes. That is why there is no
 ### 8.3 Bytes: `pane_output`
 
 ```jsonc
-{"v":2,"type":"event","event":{"event":"pane_output",
+{"v":3,"type":"event","event":{"event":"pane_output",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":41,"data":"b2sNCg=="}}
 
-{"v":2,"type":"event","event":{"event":"pane_output_gap",
+{"v":3,"type":"event","event":{"event":"pane_output_gap",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","dropped":12,"resume_seq":53}}
 ```
 
@@ -764,7 +848,7 @@ the difference between a daemon that idles and one that does not.
 ### State changes
 
 ```jsonc
-{"v":2,"type":"event","event":{"event":"node_state_changed",
+{"v":3,"type":"event","event":{"event":"node_state_changed",
   "session_id":"sess_4b71e0","node_id":"proc_7a12ff",
   "lifecycle":{"kind":"alive"},"turn":{"kind":"done"},
   "display_state":"completed_turn"}}
@@ -783,7 +867,7 @@ supervisor sweep) rather than being filled in with a fabricated cause.
 ### The event stream
 
 ```jsonc
-{"v":2,"type":"event","event":{"event":"turn_event_emitted","turn_event":{
+{"v":3,"type":"event","event":{"event":"turn_event_emitted","turn_event":{
   "id":"evt_c41b90","timestamp_ms":1700000000000,"workspace_id":null,
   "session_id":"sess_4b71e0","node_id":"proc_7a12ff","parent_node_id":null,
   "agent":{"provider":null,"tool":null,"model":null},
@@ -800,34 +884,44 @@ supervisor sweep) rather than being filled in with a fabricated cause.
 `explicit` as facts. `background_tasks` is why the notification for this event says
 *"Turn complete · 2 still running"* rather than "done".
 
-### The tree
+### The unified hierarchy
 
 ```jsonc
-{"v":2,"type":"event","event":{"event":"tree_changed",
-  "session_id":"sess_4b71e0","nodes":[
-  {"node_id":"proc_7a12ff","parent":null,"relation":"unknown",
-   "relation_is_provisional":true,"depth":0,"child_count":1,
+{"v":3,"type":"event","event":{"event":"hierarchy_changed","snapshot":{
+  "revision":18,"surface_id":"main-window","tree_state":{"selected":null,"expanded":[]},
+  "workspaces":[{"workspace":{"id":"ws_9f2a1c","name":"turn",
+      "lease_reconciliation_required":false},"sessions":[{"session":{
+      "id":"sess_4b71e0","name":"Fix restore","mode":"main_checkout"},"nodes":[
+  {"node_id":"proc_7a12ff","parent":null,"depth":0,"child_count":1,
    "kind":"agent","is_agentic":true,"title":"claude","command":"claude",
    "lifecycle":{"kind":"alive"},"turn":{"kind":"active"},
    "display_state":"running","state_label":"running","severity":20,
    "needs_user":false,"runtime_ms":3000, "…":"…"},
-  {"node_id":"proc_e5c308","parent":"proc_7a12ff","relation":"confirmed",
-   "relation_is_provisional":false,"depth":1,"child_count":0,
-   "kind":"subagent","is_agentic":true,"title":"explore", "…":"…"}]}}
+  {"node_id":"proc_e5c308","parent":"proc_7a12ff",
+   "relationship":{"kind":"spawned_by","confidence":"explicit"},
+   "depth":1,"child_count":0,
+   "kind":"subagent","is_agentic":true,
+   "agent":{"name":{"declared_name":"Reviewer","display_name":"Reviewer",
+                      "source":"explicit_parent_event","confidence":"explicit"}},
+   "activity_preview":{"normalized_text":"Reviewing restore path",
+                       "source":"semantic_event","confidence":"explicit",
+                       "stable":true,"redacted":true},
+   "pane_bindings":[],"pane_capability":"preview_details"}]}]}]}}}
 ```
 
-(Elided fields are listed in §9; the wire form carries all of them.)
+Elided fields are listed in §9. This is what a reported background subagent changes: one revisioned
+projection, a declared name only when the integration supplied it, an explicit `spawned_by` edge, safe
+preview and no Pane binding. It does not mutate Layout, selection, focus or Attention.
 
-This is the push a subagent appearing produces. `relation` and
-`relation_is_provisional` are the point: Claude Code's `SubagentStart` hook gives a
-**confirmed** edge, a pid whose ppid happens to match gives an **inferred** one, and
-the UI must draw the second differently. Anything Turn cannot place stays
-`unknown`, renders at `depth: 0`, and is never hidden.
+An OS parent observation could carry the same relationship kind with `inferred_high`; event confidence that
+the scan occurred remains a separate field. An unknown runtime parent leaves the node directly contained by
+its Session rather than inventing a process edge. A client renders uncertainty supplied by the daemon and
+never recomputes it.
 
 ### Restore
 
 ```jsonc
-{"v":2,"type":"event","event":{"event":"restore_result",
+{"v":3,"type":"event","event":{"event":"restore_result",
   "session_id":"sess_4b71e0","state":"partially_restored","needs_explanation":true,
   "panes":[
     {"pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
@@ -856,17 +950,34 @@ anything yet.
 
 The daemon owns every product rule. If the client derived `display_state` itself,
 or decided whether a parent link is a guess, or worked out which of thirty sessions
-is shouting loudest, those rules would exist twice — and the second copy would be
-written in TypeScript by someone reading a screenshot.
+is shouting loudest, those rules would exist twice. Sharing Rust types does not make two derivations agree;
+the GUI renders daemon projections.
 
 Two rules the projections keep: turn-core types are **embedded** rather than
 re-described, and extra fields are strictly *derived* values a client would
 otherwise need a copy of the rules to compute.
 
-### `SessionSummary` — one sidebar row
+### `HierarchySnapshot` — the one navigation projection
+
+`revision`, `surface_id`, `tree_state`, `workspaces`.
+
+`tree_state` is `TreeSurfaceState { surface_id, selected?, expanded }`. Keys are tagged
+`workspace`/`session`/`process`; expansion and selection from another surface are never merged into it.
+
+Each `WorkspaceTreeView` contains `workspace`, `checkouts`, `write_lease?` and ordered `sessions`. Each
+`SessionTreeView` contains `session` and ordered node rows. The daemon supplies parent/depth/order, derived
+state and badges, relationship confidence, preview, bindings and capability; the GUI does not join separate
+lists or infer missing values. A snapshot is a full replacement. `revision` rejects stale/out-of-order
+delivery and tells a client when to resynchronise.
+
+### `SessionSummary` — one Session projection
 
 Identity: `id`, `workspace_id`, `name`, `note`, `cwd`, `status`
 (`active`\|`paused`\|`archived`).
+
+Checkout safety: `mode` (`main_checkout`\|`read_only`\|`isolated_worktree`), `checkout_id?`,
+`worktree_path?`, `read_only_enforced`. A read-only badge must not imply technical enforcement when the last
+field is false.
 
 Derived state — **the client renders these, it never computes them**:
 
@@ -906,7 +1017,7 @@ prevent.
 can re-sort a list it already holds after a push, without a round trip and without
 inventing its own ordering.
 
-### `TreeNodeView` — one row of the process tree
+### `TreeNodeView` — one runtime node projection
 
 Flat with a `depth` rather than nested, for the same reason `SessionTree` stores
 parent pointers: the shape changes as subagents come and go, and re-rendering a
@@ -914,19 +1025,20 @@ list is cheaper and less error-prone than diffing a recursive structure. Rows
 arrive in draw order — each root followed by its subtree, depth-first, siblings in
 insertion order.
 
-Placement: `node_id`, `session_id`, `parent`, `relation`
-(`confirmed`\|`inferred`\|`unknown`), **`relation_is_provisional`**, `depth`,
-`child_count`.
+Placement: `node_id`, `session_id`, `parent`, `relationship { kind, confidence }`, `depth`, `child_count`.
+Event confidence does not substitute for `relationship.confidence`.
 
 Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`.
 
 State: `lifecycle`, `turn` (absent for a non-agent), `display_state`,
 `state_label`, `severity`, `needs_user`, `interaction_pending`.
 
-Placement and timing: `pane_id`, `started_ms`, `ended_ms`, `runtime_ms`
-(freezes at the exit), `exit_code`.
+Views and timing: `pane_bindings: [PaneBindingView]`, `pane_capability`, `started_ms`, `ended_ms`,
+`runtime_ms` (freezes at exit), `exit_code`. There is no privileged single `pane_id`.
 
-`agent`: an `AgentSummary`, for agentic nodes.
+`agent`: an `AgentSummary`, for agentic nodes, including lossless `name` (`declared_name?`, `display_name`,
+source/confidence, `user_renamed`). `activity_preview?` and `preview_visibility` are bounded/redacted current
+state, never raw output.
 
 A node whose parent is not in the tree is reported at `depth: 0` with its `parent`
 still set — orphaned, not hidden, and not silently re-attached elsewhere.
@@ -973,10 +1085,26 @@ them as "no history offered" rather than as "no history exists".
 
 `id`, `name`, `root`, `git_remote`, `colour`, `icon`, `archived`,
 `session_count`, `sessions_needing_user`, `badge_count`, `default_agent`,
-`default_shell`, `default_template`, `tmux_enabled`, `created_ms`, `last_used_ms`.
+`default_shell`, `default_template`, `tmux_enabled`, `lease_reconciliation_required`, `created_ms`,
+`last_used_ms`.
 
 The counts are the sum of the workspace's `SessionSummary` values, so a workspace
 badge and its session badges can never disagree.
+
+### Lease, binding and preview views
+
+`WorkspaceWriteLeaseView` carries Workspace/Session/checkout identity, `exclusive_write`, state,
+acquisition/heartbeat timestamps and fencing generation. `recovery_required` and `stale` still block a new
+owner; only fenced release/reconciliation makes the claim non-blocking. A `canonical_path` may be included
+for diagnosis but clients never use it to perform filesystem work.
+
+`PaneBindingView` carries Pane, Session and node identity, temporary/durable ownership, optional
+`surface_id` and open time. `pane_capability` is the closed
+`NodePaneCapability::{Terminal, PreviewDetails}`, so a semantic-only subagent cannot be opened as a fake
+terminal.
+
+`ActivityPreview` carries normalised text, source, confidence, stability/redaction flags, update time and
+optional source sequence for replacement ordering. It never carries raw bytes or an unredacted source.
 
 ### `TemplateSummary`
 
@@ -989,7 +1117,7 @@ and choosing one should be an informed decision.
 
 ## 10. What the protocol refuses to express
 
-Four product guarantees appear here as **absences**, which is the strongest
+Product guarantees appear here as **absences**, which is the strongest
 enforcement a type definition can offer. A future request matching these
 descriptions has to argue with a test first.
 
@@ -1006,6 +1134,12 @@ descriptions has to argue with a test first.
    `relaunch_node`, all of which the user chose.
 4. **Turn never relaunches on its own.** `relaunch_node` is the only path back, and
    it always originates with a human. `restore_result` reports and offers.
+5. **A client cannot request an unarbitrated primary-checkout writer.** Session mode is closed, creation
+   goes through daemon lease arbitration, and conflict recovery is one of the typed alternatives. There is
+   no force/steal flag; generation mismatch is a conflict, not a retry loop.
+6. **Navigation cannot fabricate ownership.** There is no unconstrained `move_node`, no client-supplied
+   confidence promotion and no `tree.node_selected` domain event. Relationship correction is scoped,
+   audited and cycle-checked.
 
 One more, on the transport, which this crate does not implement but assumes:
 `$SOCKET` is owner-only, and the hook server binds `127.0.0.1` with a per-node
@@ -1020,8 +1154,8 @@ token. Never `0.0.0.0`.
    `error.message` and stop — do not retry.
 3. Store `agreed_version`, `daemon_pid` and `limits` from `welcome`. Stamp `v` on
    every frame you send.
-4. `list_workspaces`, `list_sessions`, `get_session`. Render from the view models;
-   compute nothing the daemon already computed.
+4. Mint or restore a stable `surface_id`, then call `get_hierarchy`. Render that snapshot as the one
+   navigation projection; use list/detail operations only for their named administrative purpose.
 5. `attach_pane` for each visible pane. Draw `screen`, then apply each `pane_screen`
    in `seq` order (§8.1). On a `seq` jump, `resync_pane`. A `rows` update whose `size`
    is not what you are rendering means you missed a resize: resync.
@@ -1031,13 +1165,15 @@ token. Never `0.0.0.0`.
 6. Forward keystrokes as `write_pty` and window resizes as `resize_pty`. Pipeline
    freely.
 7. Send `update_user_activity` on activity transitions, not on a timer.
-8. Handle every push in §8. Treat each as the current truth about what it names.
+8. Handle every push in §8. Apply terminal sequence rules independently from hierarchy revision rules.
+   On an invalid hierarchy revision, request `get_hierarchy`; do not patch stale ownership.
 9. On a decode error, reply with an `error` frame built from
    `FrameError::to_proto_error()` and **keep the connection**.
-10. On reconnect, re-handshake and compare `daemon_pid`: unchanged means your
-    processes are still there and re-attaching restores them.
+10. On reconnect, re-handshake and compare `daemon_pid`: unchanged means the runtime may still be there,
+    but hierarchy/lease state is still resynchronised before enabling write actions. A different daemon
+    identity triggers restore/reconciliation and never automatic lease takeover.
 
 ---
 
-*Protocol version 2. Catalogue: 41 requests, 16 response shapes, 13 pushes, 13
-error codes.*
+*Protocol version 3. The Rust request/response catalogue is authoritative for the exact variant count;
+this document is authoritative for hierarchy, checkout-safety, revision and recovery semantics.*

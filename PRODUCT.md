@@ -32,8 +32,9 @@ thrown away. Meanwhile the same agent finishes a hundred things that need no hum
 of those is a chance to interrupt someone who did not need interrupting.
 
 Turn's job is to be correct about that distinction. It runs each agent in a real pty inside a
-persistent Workspace, organises work into Sessions, tracks the agent hierarchy, and maintains one
-ordered Attention Queue whose top item is the thing the user should look at next. It tells the user
+persistent Workspace, organises work into Sessions, projects Workspace, Session, Agent and tool identity
+through one persistent hierarchy, and maintains one ordered Attention Queue whose top item is the thing
+the user should look at next. It tells the user
 when it is their turn, and otherwise stays out of the way.
 
 Turn is not an agent, not a model client, and not a chat interface. It supervises the agent CLIs the
@@ -93,10 +94,11 @@ deliberately copies none of the live processes (`model::session::tests::duplicat
 the_shape_and_drops_the_processes`).
 
 Navigation begins one level above it. The accepted hierarchy is Workspace → Session → Agent/Tool →
-Child, shown once in the left tree. A Workspace's primary checkout has one writing Session; concurrent
-work is read-only or isolated in a worktree. AgentNodes live independently from Panes, so a subagent can
+Child, shown once in the left tree. A Workspace's primary checkout has at most one active exclusive writer;
+concurrent work is technically read-only where viable or isolated in a worktree. AgentNodes live
+independently from Panes, so a subagent can
 run, preview, ask for attention and finish without changing the centre Layout. ADR-040 and
-`docs/UNIFIED_HIERARCHY_UPGRADE.md` are normative where older UI wording conflicts.
+`docs/UNIFIED_HIERARCHY_UPGRADE.md` define the detailed domain, migration and interaction contract.
 
 ### 3.2 Agents form a hierarchy, and Turn never invents one
 
@@ -104,12 +106,12 @@ A main Agent spawns subagents. Agents spawn processes: test runners, dev servers
 sometimes a GUI application. Turn shows that tree, because "which of the eleven things under this
 Session is the one that failed" is a question users actually have.
 
-The hard rule is that the tree is only as confident as its evidence. A parent link reported by the
-tool itself is `Relation::Confirmed`. A link derived from the OS process table is
-`Relation::Inferred` and is labelled as a guess in the UI. Anything else is `Relation::Unknown` and
-renders at the Session root rather than under a plausible-looking parent. Confirmed links are never
-overwritten by inferred ones — once the tool has told the truth, a coincidence in the process table
-must not undo it (`model::node::tests::a_confirmed_link_is_not_overwritten_by_an_inferred_one`).
+The hard rule is that the tree is only as confident as its evidence. Each parent edge records both what
+the relationship means and how confidently Turn knows it. A link declared by the tool can be
+`spawned_by/explicit`; a link derived from the OS process table is provisional. Anything else stays
+unknown and renders under the Session rather than under a plausible-looking process parent. Relationship
+confidence is not event confidence: Turn may know explicitly that a process-table scan happened while the
+edge inferred from that scan remains provisional. A stronger edge is never overwritten by a weaker one.
 
 ### 3.3 The user's attention is a scarce resource, and Turn spends it deliberately
 
@@ -161,6 +163,17 @@ a pending permission are a display and ordering aid, explicitly not an authorisa
 process cannot be recovered after a restart, Turn reports `Lifecycle::Lost` — an honest "we don't
 know" — rather than a silent respawn.
 
+### 3.7 Views do not own work
+
+An AgentNode is runtime identity; a Pane is one view of it. An Agent may have zero, one or several panes,
+and closing a pane never implies stopping the Agent. Discovery of a subagent updates the hierarchy in the
+background and does not mutate Layout, selection, focus or Attention.
+
+The tree may show a compact Activity Preview so background work is legible without rendering every
+terminal. A preview is normalised, provenance-labelled, redacted and bounded status — never transcript,
+scrollback or restored conversational memory. A recovered preview is visibly stale until fresh activity
+arrives. Opening Quick Preview changes no Layout or process state.
+
 ---
 
 ## 4. Personas and use cases
@@ -197,8 +210,9 @@ fill in the branch, and Session duplication that copies the shape without the pr
 
 ### Use cases the design is aimed at
 
-1. **Fan out one task across agents.** Two Panes, two different agents, same repository, same prompt;
-   compare. The `Pair of Agents` Template exists for this.
+1. **Fan out one task across agents.** Two agents receive the same prompt in isolated worktrees, or one
+   works while the other reviews read-only; compare the results. The product never starts two unarbitrated
+   writers against the same primary checkout.
 2. **Watch a long run without babysitting it.** Start an agent on a large refactor, keep working, get
    pulled in only when it is blocked — and not when it merely finished a turn.
 3. **Handle a burst of simultaneous blockers.** Three agents block within a second of each other.
@@ -228,6 +242,8 @@ requirement rather than an aspiration.
 
 **Domain and attention**
 - Workspaces, Sessions, Panes, Layouts, Templates.
+- Closed Session modes: `main_checkout`, `read_only`, `isolated_worktree`; daemon-owned arbitration that
+  allows at most one writer on the primary checkout and returns structured alternatives on conflict.
 - The two-axis state model (`Lifecycle` × `Turn`) with a derived `DisplayState` for the UI.
 - The Attention Queue: deduplication, priority, ageing without starvation, snooze, acknowledge,
   dismiss, and a `next-attention` command that is deterministic rather than a lottery.
@@ -250,7 +266,10 @@ requirement rather than an aspiration.
   containing Sessions, Agents, tools and relevant processes; user-chosen Panes showing real terminals; a
   logical Attention Queue reached through the tree/commands; an optional contextual inspector; and a
   permission banner that the user answers (ADR-040).
-- SQLite persistence of Workspaces, Sessions, Layouts, Templates and event history.
+- Background AgentNodes with zero-to-many Pane bindings, bounded Activity Preview and explicit Quick
+  Preview/temporary-pane actions.
+- SQLite persistence of Workspaces, checkout assignments, Sessions, Layouts, Templates, leases, bindings,
+  safe previews, per-surface tree state and event history.
 
 **Explicit non-goals inside the MVP**
 - Turn does not write a terminal emulator. The daemon embeds `vt100` and the window paints the cells that
@@ -515,6 +534,29 @@ Unchecked items say what is missing, not when it will arrive.
 - [x] **A Session's aggregate state is the most severe, not the most recent.** One failure among nine
   healthy processes reads as failed: `node::tests::the_aggregate_state_is_the_most_severe_not_the_
   most_recent`.
+- [ ] **One revisioned hierarchy snapshot contains Workspace → Session → Agent/Tool → Child in draw
+  order.** The GUI bootstraps from it rather than joining independent Workspace, Session and process lists.
+- [ ] **A reported subagent appears with its true declared name and no Pane binding.** Discovery does not
+  change Layout, selection, pane focus, OS focus or the Attention Queue.
+- [ ] **Relationship kind and relationship confidence survive persistence and protocol separately from
+  event confidence.** A process-table edge remains visibly provisional even when the observation event is
+  explicit.
+- [ ] **Tree selection, active Session, focused Pane and pending Attention are independent.** Expansion and
+  selection restore per stable UI surface and one window never adopts another window's selection.
+- [ ] **Quick Preview and a temporary Pane are explicit view actions.** Closing either leaves the Agent
+  alive; a node without a PTY opens Preview/Process Details rather than a fake terminal.
+
+### Checkout safety
+
+- [ ] **Creating a `main_checkout` Session stores its assignment and acquires the exclusive lease in one
+  atomic transaction before any init command, process or Pane is materialised.** Failure rolls back the
+  Session and performs no external side effect.
+- [ ] **A conflicting writer returns structured data naming the owner and the allowed alternatives:** focus
+  owner, read-only, isolated worktree or cancel. No client parses a human error string to construct them.
+- [ ] **A heartbeat timeout never steals a lease.** Restart reconciliation verifies the owner/processes or
+  asks the user; closing the UI, archiving a live Session or `keep_processes` does not release ownership.
+- [ ] **Read-only truth is visible.** Turn distinguishes enforced read-only from unenforced legacy metadata;
+  agent instructions alone never count as enforcement.
 
 ### Layouts and Templates
 
@@ -555,6 +597,12 @@ Unchecked items say what is missing, not when it will arrive.
   the UI renders: `screen_rows_never_carry_invisible_or_direction_changing_characters`.
 - [x] **One enormous line cannot grow the screen model without bound.** It is bounded by the terminal
   geometry: `buffer::tests::one_enormous_line_is_bounded_by_the_terminal_geometry`.
+- [ ] **Activity Preview cannot become a transcript or secret side channel.** ANSI, control sequences,
+  bidi controls and unstable prompt/spinner text are removed; known secrets are redacted before SQLite;
+  raw PTY bytes and raw hook payloads never enter preview storage; retention is capped at 20 per node and
+  2,000 globally.
+- [ ] **Checkout identity resists path aliases.** Lease arbitration uses canonical filesystem identity,
+  rejects cross-Workspace/checkpoint mismatches, and reports worktree resources that remain shared.
 
 ### Persistence
 
@@ -588,6 +636,11 @@ Unchecked items say what is missing, not when it will arrive.
 - [x] **A restored Pane is never given a scrollback the Agent no longer remembers.** Only process metadata
   is persisted — pid, command, cwd, lifecycle, relation, exit code, external id — never the pty, the
   terminal grid or the parser state. `repo::node::tests` (12 tests).
+- [ ] **Migration 003 grants no write lease.** It creates primary checkout assignments, imports compatible
+  legacy pane bindings and marks ambiguous Workspaces for reconciliation. It launches, kills and moves no
+  process and never claims a legacy Session is technically read-only merely by changing metadata.
+- [ ] **Restoration preserves hierarchy edges, names, previews, bindings and per-surface expansion without
+  opening a new Pane.** A persisted preview is labelled stale until replaced.
 
 ### The daemon↔UI boundary
 
@@ -619,6 +672,12 @@ Unchecked items say what is missing, not when it will arrive.
   type definition. `request::tests`.
 - [x] **A subagent appearing pushes a tree the client can draw without guessing.**
   `conversation::a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing`.
+- [ ] **Protocol v3 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
+  revision triggers full resync; the client never applies a hierarchy diff to stale state.
+- [ ] **Lease conflicts are typed.** The wire payload carries owner Workspace/Session/checkout and recovery
+  choices independently from the human-readable message.
+- [ ] **Preview and pane-binding pushes are coalesced current state, not append-only `TurnEvent`s.** Tree
+  expansion and selection are scoped requests/acks, not broadcast domain events.
 
 ### Not demonstrated
 
@@ -667,7 +726,8 @@ section may be checked off. Each item says which case it is.
   on sight and deleted** (ADR-039). What exists now is `crates/turn-gui`: a native `eframe`/`egui` window on
   `wgpu` that paints the status bar, the permission banner, the session sidebar, a terminal pane cell by cell
   and the attention queue, verified by 11 unit tests and 2 snapshot tests rendered through `wgpu` with no
-  display. It has no daemon connection, so it has never shown any agent, real or otherwise.
+  display. That flat sidebar/permanent queue is an incompatible spike, not the accepted ADR-040 navigation
+  model. It has no daemon connection, so it has never shown any agent, real or otherwise.
 - [ ] **tmux-backed Sessions.** *No code.* Flags and node kinds exist; nothing reads them. Deliberate
   (see §6).
 - [x] **Clean `cargo fmt --check` and clippy.** Both pass across the workspace as of 2026-08-04:

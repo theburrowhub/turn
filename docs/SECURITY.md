@@ -8,6 +8,8 @@ security surfaces, and they point in opposite directions:
   is untrusted input**;
 - a user looks at Turn's sidebar to decide what to attend to, so **anything Turn
   displays is load-bearing**.
+- Turn arbitrates which Session may write a checkout, so **a false ownership claim
+  can corrupt work even when every terminal behaves correctly**.
 
 This document says what Turn trusts, what it does not, what is mitigated and how,
 and what is knowingly accepted for the MVP with the reasoning. It is written to be
@@ -25,6 +27,8 @@ defence fails a test that says what was lost.
 | An approval | The one moment a user grants an agent something dangerous. Misrepresenting *what* is being approved is the highest-value attack in the product. |
 | A pty | Anything that can write to a pty can type into the user's shell and into a running agent's prompt. |
 | Credentials | A developer machine has `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, cloud credentials and session cookies in its environment, and agents read files. |
+| Checkout integrity | Two writers against one canonical checkout can race on files, branch and Git index while each believes it is alone. |
+| Hierarchy truth | Names, parent edges and previews tell the user which background Agent they are inspecting; spoofing them can redirect a high-risk action. |
 | The daemon's liveness | The daemon holds every live session. A crash is data loss; a hang is worse, because the sessions are still running and nothing is being reported. |
 
 ## 2. Trust boundaries
@@ -45,6 +49,10 @@ is Turn's own file, written by Turn). Anything the user typed into Turn's UI.
    agent can run `curl`, read `/proc`, and open loopback ports.
 4. **The environment `turn-hook` inherits.** It runs inside the agent's process
    tree, so a repository's `direnv` or task runner has a say in it.
+5. **Checkout paths, worktree branches and shared-resource declarations.** They can
+   contain symlink aliases, misleading text and collisions the filesystem layout does not isolate.
+6. **Agent names, relationship labels and Activity Preview source text.** They enter
+   native navigation chrome even when they came from a hook or terminal line.
 
 **The boundary Turn does not defend, and cannot.** Anything running as the same
 user. The daemon's control socket is `0600`, which stops other accounts, but any
@@ -161,25 +169,16 @@ Two rules, because either alone leaks:
    UUIDs and make the log useless. It will miss a credential with no distinctive
    shape, so it is a net under rule 1, not a replacement.
 
-Both rules run on the raw payload **and** on the serialised event kind, which is
-where a permission request keeps its command and a turn start keeps a prompt
-excerpt.
+Both rules run on the structured event kind before persistence. The untouched hook payload may be retained
+transiently in memory for adapter diagnosis, but ADR-040 closes the former open question: it is not persisted
+by default. Key/shape redaction cannot prove arbitrary free text safe, and a `Write` payload can contain an
+entire source file. Diagnostic persistence would require an explicit opt-in, a separate short-lived store and
+its own threat review; it is not part of the event log.
 
-The retained payload keeps its control characters on purpose. Serialising it as
-JSON turns `ESC` into the six readable characters `` rather than a live
-escape sequence, so fidelity for "a stray escape byte was sent" costs nothing —
-that is what the field is for. Bidirectional and invisible formatting is the
-exception, because JSON does *not* escape it and it would stay live in any event
-inspector: `strip_misleading` removes exactly that class and nothing else, which is
-why a stored event is entirely `is_display_safe` end to end.
-
-Adapters also minimise before storing (`text::raw_for_storage`): members that
-carry bulk content rather than state — `content`, `old_string`, `new_string`,
-`patch`, `diff`, `stdout`, … — are dropped, and the whole payload is capped at
-8 KiB. A `Write` permission request contains the entire file the agent is about to
-write; copying that into the event log would duplicate the user's source, and any
-credential in it, into a second file with a different lifetime, in exchange for
-nothing Turn renders.
+Adapters still minimise before any diagnostic rendering: members that carry bulk content rather than state
+— `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`, … — are dropped, the remainder is capped,
+and misleading Unicode/control content is stripped. That transform does not turn the result into durable
+product state.
 
 ### 3.6 `turn-hook`
 
@@ -194,6 +193,60 @@ nothing Turn renders.
 - Debug output masks the token: a debug line lands in the user's terminal and in
   the agent's own transcript.
 - Reads are capped at 256 KiB from stdin and 64 bytes from the response.
+
+### 3.7 Checkouts and write leases
+
+The protected resource is a **canonical checkout path**, not a Workspace name, UI window or the spelling of
+`cwd`. The store maintains a global monotonic fence per canonical path, so deleting/recreating a Workspace
+or using a symlink alias cannot reset generation and resurrect a stale owner. Active, stale and
+`recovery_required` claims all block a new writer until explicit fenced reconciliation; only `released` is
+non-blocking.
+
+Acquisition validates that Workspace, Session and checkout agree and that the checkout is the Workspace's
+primary one. Session assignment and acquisition commit atomically; init commands, process spawn and Pane
+materialisation occur only afterwards. A conflict rolls back all Session records and returns typed owner and
+alternative data. Release/heartbeat name `lease_id` and `expected_generation`; a stale actor cannot release a
+newer's claim by knowing the Session id.
+
+A heartbeat timeout is evidence, never proof that the writer died. Daemon restart enters reconciliation,
+checks process ownership and otherwise asks the user. Closing the UI, archiving a live Session and
+`keep_processes` are not release events. Migration 003 creates no lease, changes no permissions and performs
+no filesystem/process action.
+
+`read_only` always exposes `read_only_enforced`. A false value is a warning, not a security guarantee; agent
+instructions do not enforce it. `isolated_worktree` isolates files/Git index, not necessarily ports,
+containers, databases, credential helpers, caches or services, so those shared resources are declared and
+shown before launch. Worktree paths must be canonicalised, constrained to an approved parent and checked for
+alias/collision immediately before use.
+
+### 3.8 Hierarchy identity and Activity Preview
+
+An Agent may declare ids, roles, labels and task strings, but only an explicit parent/integration name enters
+`declared_name`; values such as `Explore` and `default` remain roles unless the source actually named the
+child. Every display name goes through the native-label sanitiser and length bound. A user rename changes
+only display state and never destroys provenance.
+
+Relationship meaning and relationship confidence are stored separately from event confidence. An explicit
+process-table observation can still produce only an inferred edge. The GUI never promotes confidence or
+accepts an unconstrained move; user correction is same-Session, cycle-checked and audited with old/new edge.
+
+Activity Preview is an especially tempting exfiltration channel because it persists in navigation chrome.
+The pipeline accepts semantic status first and at most one stable rendered line as fallback; strips ANSI,
+control/bidi/invisible characters and carriage-return rewrites; rejects prompts, spinners and repeated noise;
+redacts known secrets; caps text; and records provenance. Raw PTY bytes, terminal grid, prompt bodies and raw
+hook payloads never enter the preview table. Retention is 20 snapshots per node and 2,000 globally, and a
+restored preview is marked stale until fresh activity arrives.
+
+### 3.9 Per-surface state and Pane bindings
+
+Tree selection/expansion is scoped by stable `surface_id`, acknowledged to the originating client and never
+broadcast as another window's state. It is not a `TurnEvent`, does not change active Session/Pane focus and
+cannot resolve Attention.
+
+A `PaneNodeBinding` must name a Pane and node in the same Session. One Pane binds at most one node; a node may
+have many views. Opening a Pane is an explicit UI action. A semantic-only subagent with no independent PTY
+can expose Preview/Process Details but never a terminal/write capability. Closing a binding is not process
+termination, and no binding operation changes checkout ownership.
 
 ## 4. Product invariants, defended as security properties
 
@@ -210,6 +263,20 @@ if a later change is careless.
 | Parent/child links are Confirmed only from a tool report | `subagent_hierarchy_only_ever_comes_from_an_explicit_report` |
 | An agent cannot choose a command-line flag | `an_agent_cannot_choose_a_command_line_flag_by_naming_its_own_session` |
 | No shell in the launch path | `no_adapter_wraps_the_users_command_in_a_shell` |
+
+ADR-040 adds security properties that are **accepted but not yet demonstrated**. They stay unverified until
+the named adversarial behaviour has an automated test:
+
+| Required invariant | Required proof |
+| --- | --- |
+| One canonical checkout has one blocking write claim globally | concurrent acquisition through path aliases and recreated Workspaces yields exactly one owner |
+| Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
+| Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
+| Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
+| Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
+| Preview stores no source/secret | real SQLite bytes contain neither raw PTY/hook content nor seeded credentials after pruning/restart |
+| UI state is surface-isolated | selection from surface A is neither returned nor pushed as selection for surface B |
+| A Pane cannot acquire runtime authority | closing/duplicating a binding neither stops the node nor changes its lease |
 
 Turn never relaunches anything: `SessionRepo::load_for_restore` downgrades every
 stored `Alive` to `Orphaned`, and the UI offers rather than acts.
@@ -237,12 +304,13 @@ Ranked by severity, worst first.
 4. **Credentials reached the database under innocent keys.** The serialised event
    kind was stored unredacted, so `AgentPermissionRequired.command` and
    `AgentTurnStarted.prompt_excerpt` — a command with a bearer token in it, a
-   prompt with a pasted key — were written verbatim. Redaction now covers the kind
-   as well as the raw payload, and matches credential shapes as well as key names.
+   prompt with a pasted key — were written verbatim. Redaction now covers the structured kind and matches
+   credential shapes as well as key names; ADR-040 additionally requires untouched raw payload to stay out
+   of durable product storage, with the M6 integration proof still pending.
 5. **File contents reached the database.** A `Write` permission request carries
    the whole file in `tool_input.content` (confirmed in the captured fixture), and
-   the whole payload was stored. Bulk members are now dropped and the payload is
-   capped.
+   the whole payload was stored. Bulk members are dropped for transient diagnostics; M6 must prove the
+   untouched payload is no longer a persisted event field.
 6. **Escape sequences and bidi overrides reached UI text.** `excerpt` collapsed
    whitespace but passed `ESC`, `BEL` and U+202E through, so an agent-authored
    command, message or model name could carry an OSC 52 clipboard write or reverse
@@ -290,13 +358,10 @@ Stated so the next audit does not re-litigate them.
 - **DNS rebinding against the hook port.** A browser can send a cross-origin
   `POST` to a loopback port, but there is no route that does anything without the
   token, and the token is not obtainable from a web page.
-- **`transcript_path` and `cwd` in stored payloads.** Accepted deliberately, and
-  it is not a leak Turn introduces: the store already keeps every session's `cwd`
-  and command line because restoring the desk is the product. `transcript_path`
-  reveals the user's home directory and project name to a file that lives in the
-  user's own data directory. What makes it acceptable is that the DB is not more
-  exposed than the paths it describes — which is exactly what §8's first item is
-  about.
+- **Session `cwd` as explicit metadata.** It is required for honest restore and permission context, is
+  normalised as metadata and is not evidence that raw hook payloads are safe to keep. ADR-040 no longer
+  accepts `transcript_path` merely because it also contains a path; untouched hook payload persistence is
+  outside the product store.
 
 ## 7. Knowingly accepted for the MVP
 
@@ -340,6 +405,15 @@ decides whether to *ask*, this reasoning stops holding.
 that steers an agent. Turn's contribution is to refuse to be the mechanism: it
 never executes what an agent said, never approves on the user's behalf, and never
 lets agent-authored text misrepresent itself in the UI.
+
+**A worktree is not a sandbox.** It isolates a Git worktree and index, not credential helpers, ports,
+containers, databases, caches or external services. Turn accepts those collisions for the MVP only when the
+Workspace declares them and the conflict choice shows them. Calling the mode “isolated” must never imply
+process or credential isolation.
+
+**Read-only enforcement varies by platform/tool.** When Turn cannot install a technical guard, the Session
+may still be useful for review, but it is explicitly `read_only_enforced=false`, cannot acquire the primary
+write lease and must ask before any write-capable relaunch. Hiding that limitation is not accepted.
 
 ## 8. Reported, not fixed
 
@@ -395,3 +469,11 @@ Outside the files this audit was scoped to change. Each has a specific fix.
 - Never add a response body to the hook endpoint.
 - Bounds are not optional: a new buffer that a process can grow needs a cap and a
   counter for what it dropped.
+- Never arbitrate a checkout by raw path spelling. Canonical identity and the global generation fence are
+  required, including after Workspace deletion/recreation.
+- Never release a write claim by Session id or timeout alone. Require lease identity plus expected generation
+  and verify the owning writer stopped or was explicitly reconciled.
+- Never turn a terminal line into Activity Preview without sanitisation, secret redaction, stability/noise
+  filtering and retention bounds; raw source is not a debug convenience inside SQLite.
+- Never make tree selection, Pane focus, active Session or Attention aliases of one variable. A UI action on
+  one must not grant process/write authority through another.

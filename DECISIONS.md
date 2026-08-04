@@ -30,10 +30,10 @@ Status values:
 | [014](#adr-014) | `background_tasks` makes "turn done, work continuing" a reported fact | Accepted, implemented |
 | [015](#adr-015) | Time is always a parameter, never read inside logic | Accepted, implemented |
 | [016](#adr-016) | The attention manager emits `Effect`s; it never performs them | Accepted, implemented |
-| [017](#adr-017) | Flat process tree with parent pointers and a `Relation` ladder | Accepted, implemented |
+| [017](#adr-017) | Flat process tree with parent pointers and an evidence ladder | Flat ownership implemented; relationship extension in progress |
 | [018](#adr-018) | Focus guards live in the governor, not in the policy | Accepted, implemented |
 | [019](#adr-019) | Scan the process table on demand, never on a timer | Accepted, implemented |
-| [020](#adr-020) | Prefixed typed-id newtypes | Accepted, implemented |
+| [020](#adr-020) | Prefixed typed-id newtypes | Accepted, implemented and extended by ADR-040 |
 | [021](#adr-021) | Inject agent configuration into a Turn-owned scratch directory | Accepted, implemented |
 | [022](#adr-022) | A deferred focus request carries its originating policy | Accepted, implemented |
 | [023](#adr-023) | Replay from the parser's formatted contents, not the raw ring | Accepted, implemented |
@@ -49,10 +49,11 @@ Status values:
 | [033](#adr-033) | Schema version in SQLite's `user_version`, append-only migrations, no downgrades | Accepted, implemented |
 | [034](#adr-034) | `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE` | Accepted, implemented |
 | [035](#adr-035) | Redact the value, keep the key | Accepted, implemented |
-| [036](#adr-036) | Persist node metadata only; never the scrollback | Accepted, implemented |
+| [036](#adr-036) | Persist node metadata, never terminal history | Implemented; narrowly amended by ADR-040 |
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implementation in progress; supersedes the UI half of ADR-001 |
+| [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implementation in progress; narrowly amends ADR-036 |
 
 ---
 
@@ -871,9 +872,10 @@ the I/O boundary and makes the decision logic untestable without a window.
 ---
 
 <a id="adr-017"></a>
-## ADR-017 — Flat process tree with parent pointers and a `Relation` ladder
+## ADR-017 — Flat process tree with parent pointers and an evidence ladder
 
-**Status:** Accepted, implemented.
+**Status:** Accepted; flat ownership implemented, relationship representation extended by ADR-040 and in
+progress.
 
 ### Context
 
@@ -894,15 +896,21 @@ directly violates the product rule against inventing relationships.
 ### Decision
 
 `SessionTree` is `HashMap<NodeId, ProcessNode>` plus `order: Vec<NodeId>` for stable rendering. Every
-node carries `parent: Option<NodeId>` and a `Relation`:
+node carries `parent: Option<NodeId>`. The legacy v2 representation stored a `Relation`:
 
 - `Confirmed` — the tool reported it.
 - `Inferred` — derived from the process table or the pty hierarchy. Rendered as a guess.
 - `Unknown` — no parent established. Renders at the Session root.
 
-`relink` enforces the ladder: `Confirmed` is never downgraded by `Inferred`. It also refuses cycles,
+ADR-040 retains the parent pointer and generalises edge evidence to `Relationship { kind, confidence }`.
+Meaning (`spawned_by`, `owns_process`, related, unknown) is no longer conflated with certainty. Legacy
+`Confirmed` tool edges migrate to `spawned_by/explicit`, `Inferred` to
+`spawned_by/inferred_high`, and `Unknown` remains unknown. Event confidence that an observation occurred is
+a separate axis.
+
+`relink` enforces the evidence ladder: an explicit edge is never downgraded by an inferred one. It refuses cycles,
 with a 1,000-hop bound in case the store hands it a corrupt tree. `remove` promotes children to roots
-with `Relation::Unknown` rather than deleting them or re-attaching them elsewhere.
+with an unknown runtime edge rather than deleting them or re-attaching them elsewhere.
 
 ### Consequences
 
@@ -913,7 +921,9 @@ with `Relation::Unknown` rather than deleting them or re-attaching them elsewher
 - **Downside:** rendering requires walking the map to find children (`children()`, `descendants()`),
   which is O(n) per level. Fine for tens of nodes; it would need an index at thousands.
 - **Downside:** the tree can be a forest, and every consumer must handle multiple roots.
-- **Downside:** three relation states are three things the UI must express without being noisy about it.
+- **Downside:** relationship kind plus five confidence levels are more expressive and more work to render
+  accessibly; the daemon-derived view supplies the spoken/provisional labels so the client does not invent
+  them.
 
 ---
 
@@ -1007,12 +1017,12 @@ memory, disk and CPU statistics, which is a great deal of work to throw away.
 <a id="adr-020"></a>
 ## ADR-020 — Prefixed typed-id newtypes
 
-**Status:** Accepted, implemented. `ids.rs`, one macro, seven types.
+**Status:** Accepted, implemented and extended by ADR-040. `ids.rs`, one macro, nine types.
 
 ### Context
 
-Seven entity kinds all identified by opaque strings, flowing through events, a protocol, SQLite and a
-web UI. Passing a `PaneId` where a `SessionId` is expected is a class of bug that compiles fine and
+Entity kinds are identified by opaque strings flowing through events, a protocol, SQLite and the native
+UI. Passing a `PaneId` where a `SessionId` is expected is a class of bug that compiles fine and
 fails at runtime, possibly much later.
 
 ### Alternatives considered
@@ -1026,7 +1036,8 @@ Pane exists the moment it is split), and integers are unreadable in logs and eve
 ### Decision
 
 One `typed_id!` macro generating a `#[serde(transparent)]` newtype over `String`, with a 12-hex-character
-UUID suffix and a per-type prefix: `ws_`, `sess_`, `proc_`, `pane_`, `tpl_`, `evt_`, `attn_`.
+UUID suffix and a per-type prefix: `ws_`, `sess_`, `proc_`, `pane_`, `tpl_`, `evt_`, `attn_`,
+`checkout_`, `lease_`.
 `from_stored` rebuilds from persistence without validation, because the store is trusted.
 
 ### Consequences
@@ -1767,9 +1778,10 @@ them a repository.
 ---
 
 <a id="adr-036"></a>
-## ADR-036 — Persist node metadata only; never the scrollback
+## ADR-036 — Persist node metadata, never terminal history
 
-**Status:** Accepted, implemented. `turn-store::repo::node`, 12 tests.
+**Status:** Accepted, implemented for terminal persistence; narrowly amended by ADR-040 for bounded
+Activity Preview. `turn-store::repo::node`, 12 tests.
 
 ### Context
 
@@ -1784,7 +1796,10 @@ per Pane of write traffic for state that changes constantly. Conceptually — an
 their previous exchange, type a follow-up, and get a reply from an Agent with no memory of any of it. That is
 worse than an empty Pane, because it looks like it works.
 
-**Persist a summary or the last N lines.** Rejected: the same confusion in a smaller box.
+**Persist a conversation summary or the last N terminal lines as restored history.** Rejected: the same
+confusion in a smaller box. ADR-040 permits a different artefact — one short, provenance-labelled Activity
+Preview for navigation — precisely because it is never presented as scrollback, transcript or conversational
+memory.
 
 ### Decision
 
@@ -1794,6 +1809,11 @@ to re-attach, and enough to say "this was running and we can no longer find it" 
 
 Not stored: the pty, the scrollback, the terminal grid, the output channel. A pty master cannot outlive the
 process that holds it, and the rest is ephemeral by nature.
+
+ADR-040's exception is deliberately narrow. A preview contains normalised semantic status or one stable,
+sanitised line; it is redacted before persistence, bounded to 20 snapshots per node and 2,000 globally,
+and marked stale after restore until fresh activity arrives. Raw PTY bytes, the grid, prompts, spinners and
+unredacted hook payloads remain outside this exception.
 
 ### Consequences
 
@@ -2185,9 +2205,9 @@ is in the retirement report; the load-bearing items are:
 <a id="adr-040"></a>
 ## ADR-040 — One unified hierarchy, one main-checkout writer, background subagents
 
-**Status:** Accepted. Normative product correction. Amends only conflicting UI inventories and projections
-in ADR-017, ADR-032, ADR-033 and ADR-039. Their architectural decisions—daemon ownership, derived view
-models, append-only migrations and native egui/wgpu—remain in force.
+**Status:** Accepted, implementation in progress. Extends ADR-017's flat parent-pointer model, ADR-032's
+daemon-derived views, ADR-033's append-only migration discipline and ADR-039's native egui/wgpu client.
+It does not supersede any of them. It narrowly amends ADR-036 as described there.
 
 ### Context
 
@@ -2202,29 +2222,43 @@ an event the parent produced, violating Turn's rule that the user decides what t
 
 ### Decision
 
-The left sidebar is the single persistent navigation tree: Workspace → Session → Agent/Tool → child.
+The left sidebar is the single persistent **navigation projection**: Workspace → Session → Agent/Tool →
+child. It is derived from normalised ownership — `Session.workspace_id`, `ProcessNode.session_id` and
+`ProcessNode.parent` — rather than stored as polymorphic tree foreign keys. Workspace containment and a
+runtime parent relationship are different facts and remain different fields.
+
 Sessions are not duplicated in top tabs, bottom strips or a permanent overview, and Agents are not
 duplicated in a second persistent tree. The right side is an optional contextual inspector. The centre is
-only the user/template-chosen Layout.
+only the user/template-chosen Layout. Tree selection, active Session, focused Pane and pending Attention are
+independent. Tree expansion and selection persist per stable UI `surface_id`; they are not `TurnEvent`s and
+are never broadcast as another window's selection.
 
-Every primary checkout has at most one active `exclusive_write` lease. A second Session must focus the
-owner, be technically read-only, or use an isolated worktree. Worktrees declare the shared resources they
-do not isolate.
+`SessionMode` is a closed enum with wire values `main_checkout`, `read_only` and `isolated_worktree`.
+Every primary checkout has at most one active `exclusive_write` lease, owned and arbitrated by the daemon.
+Its semantic record is `workspace_id`, `session_id`, `checkout_id`, `mode`, `state`, `acquired_at` and
+`heartbeat_at`; implementation identifiers, fencing generations and release timestamps may support that
+contract but do not change it. The fencing generation is monotonic per canonical checkout path even if a
+Workspace or lease row is deleted and recreated; every non-released state remains blocking. A heartbeat
+timeout alone never transfers ownership. A second Session must
+focus the owner, use technically enforced read-only mode where available, create an isolated worktree, or
+cancel. Worktrees declare the shared resources they do not isolate.
 
 An AgentNode exists independently of any Pane and may have zero or many pane bindings. A subagent reported
-by its parent is inserted under that parent, preserving its declared name and relation confidence. It
+by its parent is inserted under that parent, preserving a declared name only when the source actually
+declared one. Tool roles such as `Explore` or `default` are not silently promoted to names. Parent edges
+carry relationship kind and confidence separately from the confidence that an event occurred. The subagent
 starts in the background, never opens a Pane, changes Layout, steals focus or resolves attention. `Space`
 opens a cheap Quick Preview; `Cmd+Enter` explicitly creates a temporary pane. Closing a pane never stops
-the agent.
+the agent. A node without its own PTY opens Preview or Process Details, never a fabricated terminal.
 
 The full normative model, migration, events, API and wireframe are in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`.
 
-This ADR also amends ADR-036 narrowly. Activity Preview is not restored scrollback or a conversation
-summary: it is one short, provenance-labelled navigation status. Turn persists no raw PTY bytes or grid,
-redacts before write, keeps at most 20 preview snapshots per node and 2,000 globally, and may display a
-recovered preview only as stale until fresh activity arrives. ADR-036's rejection of terminal/scrollback
-persistence otherwise remains in force.
+Activity Preview is not restored scrollback or a conversation summary: it is short, provenance-labelled
+navigation status. Turn persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
+most 20 snapshots per node and 2,000 globally, and displays a recovered preview only as stale until fresh
+activity arrives. High-frequency preview updates are snapshot state and coalesced pushes, not append-only
+domain events. ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
 
 ### Alternatives considered
 
@@ -2250,5 +2284,10 @@ attention all need an identity that survives with no view.
 - UI selection, pane focus and attention are separate persisted concepts and require explicit tests.
 - A read-only Session needs OS/process enforcement where viable; model instructions alone are not a
   security boundary.
-- Existing databases migrate conservatively: one recent active Session receives the main lease, other
-  same-checkout Sessions become read-only, and no process is relaunched or moved.
+- Protocol v3 exposes one revisioned `HierarchySnapshot`; a client that misses a revision requests a full
+  replacement rather than applying a guessed diff. Lease conflicts carry structured owner and recovery
+  choices; clients never parse a human message to decide what to offer.
+- Migration 003 creates checkout assignments, bindings, preview storage and reconciliation state but
+  **grants no lease automatically**. Legacy Sessions start conservatively as unenforced read-only metadata
+  until the daemon proves a sole viable writer or the user reconciles them. No process is launched, killed,
+  moved or retroactively made safe by DDL.

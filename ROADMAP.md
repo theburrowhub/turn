@@ -13,13 +13,13 @@ this document says what happens next and how we will know it worked.
 **The frontend was replaced.** The Tauri shell and the TypeScript/`xterm.js` window were built, rejected by
 the product owner on sight, and deleted: `ui/` and `crates/turn-ui` no longer exist and `turn-ui` is out of
 the workspace. The window is now native Rust drawn on the GPU (`crates/turn-gui`, `eframe`/`egui` over
-`wgpu`). ADR-039 records the decision, its cost and its downsides. M6 is therefore **reopened** below, and
-the tests it used to count are gone rather than renamed.
+`wgpu`). ADR-039 records the decision, its cost and its downsides. The window milestone is therefore
+**reopened** as M7 below, and the tests it used to count are gone rather than renamed.
 
 Every remaining crate was built and green **together in one run** the moment the old frontend came out:
 **730 tests pass** — `turn-agents` 169, `turn-store` 140, `turn-proto` 133, `turn-core` 120, `turnd` 88,
 `turn-pty` 46, `turn-hook` 21, `turn-gui` 13 (measured 2026-08-04,
-`cargo test --workspace -- --test-threads=4`, 0 failed, 1 ignored — the accessibility snapshot named in M6).
+`cargo test --workspace -- --test-threads=4`, 0 failed, 1 ignored — the accessibility snapshot named in M7).
 There is now one test runner and one command: no `pnpm`, no `vitest`, no second lockfile.
 
 That total has already moved. `turn-proto` and `turn-gui` are being extended right now — a cell
@@ -32,7 +32,7 @@ ptys and want `--test-threads=4` on a busy machine.
 **Nothing has yet been shown to run end to end.** Every piece is tested against its own contract and against
 a fake counterpart — the adapters against payloads recorded from a live Claude Code run, the window against
 committed snapshot images — and no one has yet started `turnd`, opened the window, and watched a real
-`claude` session answer a real permission. That is M7, and until it closes "Built" means "compiles and keeps
+`claude` session answer a real permission. That is M8, and until it closes "Built" means "compiles and keeps
 its own promises", not "works".
 
 | Milestone | Delivers | Status |
@@ -43,12 +43,12 @@ its own promises", not "works".
 | M3 — Persistence | `turn-store`: SQLite, migrations, redaction, seven repositories | **Done** |
 | M4 — Protocol | `turn-proto`: framing, requests, responses, pushes, view models | **Done** |
 | M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Code complete**, exit criterion unverified |
-| M6 — The window | ~~Tauri shell, `xterm.js`~~ → native Rust on the GPU: sidebar, panes, queue, tree | **Reopened.** First version deleted (ADR-039); `turn-gui` is a spike, not a window |
-| M7 — First vertical | One real Session, one real Agent, end to end | **Not started.** Now blocked on M6: there is no client that can connect |
-| M8 — Hardening | Measurement, restore semantics, Linux parity, packaging | **Not started**; two CI boxes already green |
-| M9 — Unified hierarchy correction | ADR-040: write lease, AgentNode/View split, previews, one tree, restored Reviewer vertical | **In progress**; normative model and migration plan landed first |
+| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **In progress**; domain/schema checkpoint landed, runtime/protocol proof pending |
+| M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Reopened.** First version deleted; current flat-sidebar/queue spike is transitional |
+| M8 — First vertical | One real Session and background Reviewer, end to end | **Not started.** Blocked on M6 contract and M7 client |
+| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **Not started**; two CI boxes already green |
 
-The M9 correction has priority over incompatible M6/M7 UI work. Its exit proof is the reproducible
+M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
 Preview → temporary Pane → close without stop → restart and reattach` sequence in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`.
@@ -241,20 +241,55 @@ and a hook POST from that Agent changes what the client is told.
 
 ---
 
-## M6 — The window · **Reopened: the first version was built and deleted**
+## M6 — Unified hierarchy foundation · **In progress**
 
-The first M6 shipped as a Tauri shell plus a TypeScript/`xterm.js` frontend, reached code-complete with its
+This milestone makes ADR-040 true below the UI before M7 builds on it.
+
+**Delivers.** Normalised Workspace/Session/Process ownership plus one revisioned `HierarchySnapshot`;
+closed Session modes; canonical checkout identity with one global fenced primary-writer claim; lossless
+Agent naming and relationship confidence; background nodes independent of Pane bindings; bounded/redacted
+Activity Preview; per-surface tree state; and protocol v3 with structured lease conflict/recovery.
+
+Migration 003 is append-only and conservative: one primary checkout record per Workspace, legacy Session
+assignments marked `read_only_enforced=false`, compatible legacy binding import and reconciliation flags.
+It creates no lease, starts/kills/moves no process, changes no filesystem permission and never chooses the
+“most recent” Session as writer. Daemon reconciliation or explicit user action is the first place authority
+can be granted.
+
+**Verified by.** All of these must be automated before the milestone closes:
+
+1. Two concurrent acquisitions, symlink/path aliases and Workspace delete/recreate yield one canonical
+   owner and a monotonically fenced generation.
+2. A stale heartbeat/release cannot mutate a newer lease; `recovery_required` remains blocking.
+3. Conflicting Session creation rolls back its rows and runs no init command/process/Pane side effect.
+4. v2→v3 migration over multiple possibly-live Sessions creates zero leases and asks for reconciliation.
+5. `HierarchySnapshot` restores Workspace → Session → Agent/Tool → Child, rejects stale revisions and keeps
+   selection scoped to one stable `surface_id`.
+6. A fixture-declared `Reviewer` appears under its parent with no Pane; a role such as `Explore` is not
+   fabricated as its declared name.
+7. ANSI/carriage-return/noisy output produces one bounded redacted preview, stores no raw source/secret and
+   is stale after restart until fresh activity.
+8. Quick Preview/temporary Pane close removes only a binding; the Agent and lease remain.
+
+**Status detail.** Domain/schema groundwork exists at the checkpoint. Lease lifecycle hardening, daemon
+transaction boundaries, complete protocol-v3 catalogue/conversations and the reproducible vertical are not
+yet accepted. “Types exist” is not the exit criterion.
+
+---
+
+## M7 — The window · **Reopened: the first version was built and deleted**
+
+The first window implementation shipped as a Tauri shell plus a TypeScript/`xterm.js` frontend, reached code-complete with its
 own suites green, and was **rejected by the product owner on sight**. It has been deleted — `ui/`, 51
 TypeScript files and 13,317 lines, and `crates/turn-ui`, 2,230 lines — and with it the tests that used to be
 counted here. ADR-039 records why, what it cost and what it costs from here. The milestone is reopened rather
 than marked done with an asterisk, because a deleted window is not a delivered one.
 
-**Delivers (unchanged as a specification).** The `turn-proto` client (framing, handshake, request
-correlation, push handling, lag recovery); a terminal per Pane wired to output pushes and keystrokes; the
-Session sidebar ordered by the daemon's `SessionSummary`; the Layout renderer with split, close, resize, zoom
-and focus; the Attention Queue panel with the `goto_next` shortcut; the agent tree from `TreeNodeView` with
-guessed edges visibly marked; the event log; and the permission banner showing the command, the `cwd`
-**verbatim** and the risk explanation.
+**Delivers.** The `turn-proto` v3 client (framing, handshake, request correlation, hierarchy revision/resync,
+push handling and terminal lag recovery); one accessible Workspace → Session → Agent/Tool → Child tree; the
+Layout renderer with split, close, resize, zoom and focus; contextual inspector and Quick Preview; logical
+Attention Queue through badges/commands and `goto_next`, not a second permanent navigator; and the
+permission banner showing command, `cwd` **verbatim** and risk explanation.
 
 Also the other half of attention: performing `Effect`s (badge, highlight, sound, OS notification, focus) and
 **reporting `UserContext` back** — last keystroke, foreground state, active Session, sensitive operation.
@@ -263,12 +298,14 @@ Without that report the typing guard is inert, so it is not optional polish.
 **What exists now.** `crates/turn-gui`: an `eframe`/`egui` window over `wgpu`, 1440×900, with `cells.rs` (a
 pane's screen as cells, converted from the daemon's parsed screen — so there is no second VT emulator),
 `theme.rs` (whose `state_marker` returns a colour **and** a glyph together, making "never colour alone"
-structural) and `view.rs` (status bar, non-modal permission banner, indented session sidebar, a terminal pane
-painted cell by cell, attention queue). 13 tests: 11 unit plus 2 snapshot tests that render the real widget
+structural) and `view.rs` (status bar, non-modal permission banner, flat Session sidebar, terminal painter
+and permanent queue). The painter/banner survive; the two navigation surfaces are explicitly transitional.
+13 tests: 11 unit plus 2 snapshot tests that render the real widget
 tree through `wgpu` **with no display attached** and diff against committed PNGs.
 
-That is a spike that settles the stack. It is not a window: there is no daemon connection, no keymap, no
-palette, no tree panel, no event log, no overview, no splitting, no effect channels and no restore offers.
+That is a spike that settles the stack. It is not the accepted window: there is no complete v3 hierarchy,
+checkout-conflict chooser, contextual inspector/Quick Preview, accessible Tree/TreeItem navigation,
+splitting, effect channels or restore flow. The flat sidebar/permanent queue are removed, not promoted.
 
 **What is verified.** The cell model against a real `vt100` stream, including the cases that are easy to get
 silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
@@ -296,14 +333,15 @@ further from met than it was a week ago — that is the honest accounting of a f
 
 ---
 
-## M7 — First vertical · **Not started, and blocked again**
+## M8 — First vertical · **Not started, and blocked**
 
 The point of this milestone is that nothing counts until a person can do it.
 
-**What has changed, and it is a step backwards.** M7 was unblocked: both halves existed as code. Deleting the
+**What has changed, and it is a step backwards.** The vertical was once unblocked: both halves existed as
+code. Deleting the
 frontend (ADR-039) re-blocks it, because there is no longer a client that can open a socket. The daemon (M5)
-still assembles everything and owns the ptys; the window (M6) is now a paint-layer spike with no daemon
-connection. M7 waits on M6 again, and pretending otherwise would be the kind of accounting this document
+still assembles everything and owns the ptys; the window (M7) is now a paint-layer spike. M8 waits on both
+the M6 hierarchy contract and M7 client, and pretending otherwise would be the kind of accounting this document
 exists to avoid.
 
 **What the true remaining gap is.** Every suite in the workspace tests a piece against a *stand-in*: the
@@ -316,11 +354,11 @@ diverging but one GPU stack behaving differently on Metal and Vulkan, which is a
 made to see (§Risks 2a).
 
 To be clear about the other direction too: this is not the *only* thing between the code and a working
-product. M8 holds the unmeasured performance budget, the unfinished restore semantics, Linux sign-off and
-packaging, and none of that is optional for something a person installs. M7 is the milestone that turns
+product. M9 holds the unmeasured performance budget, the unfinished restore semantics, Linux sign-off and
+packaging, and none of that is optional for something a person installs. M8 is the milestone that turns
 "built" into "seen to work once".
 
-**Delivers.** Six scenarios, working, on both platforms:
+**Delivers.** Seven scenarios, working, on both platforms:
 
 1. **One Agent.** New Workspace, new Session from the `Coding` Template, `claude` runs, output renders,
    input works, state is correct throughout — `Running` → `NeedsPermission` → `Running` → `CompletedTurn`.
@@ -328,20 +366,23 @@ packaging, and none of that is optional for something a person installs. M7 is t
    shortcut walks all three in priority order, and the queue drains.
 3. **Turn done, work continuing.** An Agent finishes a turn with `background_tasks > 0`. The notification
    says "N still running". The Session does not read as finished.
-4. **The tree.** An Agent spawns a subagent (confirmed) and a dev server (inferred). Both appear, the
-   inferred edge is marked as a guess, and a failure in the server makes the Session read as failed.
+4. **The hierarchy.** One Workspace snapshot contains the main Session, Agent, declared background Reviewer
+   and inferred dev server. Neither child opens a Pane. Relationship uncertainty is visible and a failure
+   still makes the Session read as failed.
 5. **A UI restart.** Close the window with three Agents mid-task. Reopen. All three re-attach, screens are
    rebuilt from replay, and no process was touched.
 6. **A tool with no integration.** Run `gemini` (heuristic) and `make` (generic terminal) in Panes.
    `gemini` badges on a guessed state and **never** moves focus; `make` makes no claims. The Session details
    panel explains both.
+7. **Checkout conflict.** A second main writer is refused before external side effects; the chooser focuses
+   the owner or creates read-only/worktree. Restart and a stale heartbeat do not steal the first lease.
 
 **Verified by.** A scripted end-to-end harness where possible, and a written manual checklist for the rest,
 run on macOS and Linux before the milestone closes.
 
 ---
 
-## M8 — Hardening · **Not started, and partly overtaken**
+## M9 — Hardening · **Not started, and partly overtaken**
 
 Nothing in this milestone has been done as a milestone, but two of its boxes have been ticked in passing:
 `cargo clippy --workspace --all-targets` and `cargo fmt --all -- --check` are both clean as of 2026-08-04
@@ -361,7 +402,7 @@ Nothing in this milestone has been done as a milestone, but two of its boxes hav
 - **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the full
   test suite and the `ui` job, all green on both runners. See §Technical debt: `fmt`, clippy and both test
   suites now pass locally on macOS; what is left is the `ui` job's Node version, which needs raising to 22,
-  and the fact that no runner has yet reported any of it. It should all be fixed long before M8 rather than
+  and the fact that no runner has yet reported any of it. It should all be fixed long before M9 rather than
   saved up for it.
 - **Packaging**: a signed macOS bundle, a Linux artefact, `turn-hook` installed and locatable, and a
   first-run experience that works with no configuration.
@@ -404,18 +445,20 @@ and what must not be foreclosed.
 
 Live questions. Each names what would settle it.
 
+ADR-040 closed two former questions: untouched `TurnEvent::raw` is memory-only by default, and Attention is
+one global logical queue reached through hierarchy badges/commands rather than a permanent global or
+per-Workspace navigator.
+
 | # | Question | Settled by |
 | --- | --- | --- |
-| 1 | **Is `TurnEvent::raw` persisted at all?** It holds the untouched hook payload, which can carry a `transcript_path`, a `cwd` and a prompt excerpt. Key-based redaction (ADR-035) does not touch free text. Options: drop it before writing; keep it in memory only; keep a hash; keep it behind a debug setting. | A decision, recorded as an ADR, before the daemon writes its first event. |
 | 2 | ~~Does a Codex hook *handler* entry accept an `args` array?~~ **Settled live (0.146.0): it parses and is silently ignored — argv reaches the handler empty.** Payloads arrive on stdin. Routing the URL through `TURN_HOOK_URL` was the right call for a second reason: argv is world-readable. | Done. |
 | 3 | ~~Does installing hooks into Codex require interactive trust on first launch?~~ **Settled live: yes.** See Risk 5 — `codex exec` silently runs nothing, the TUI blocks on a review dialog, `notify` is ungated. `HooksAndNotify` therefore cannot claim `Structured` by default; what remains is a product decision, not a question about Codex. | Done; the two product decisions moved to Risk 5. |
 | 4 | **What are the `execution_mode` semantics** (`blocking` / `await`)? Left unset deliberately, because guessing risks configuring Codex to wait on Turn. | Reading Codex's source or a controlled experiment. |
-| 5 | **How does the daemon defend against pid reuse when re-attaching?** The stored command line is the only corroboration and it is weak. | A design decision in M5, tested adversarially. |
-| 6 | **Where does the daemon's socket live, and what is the single-instance rule?** `turnd` now answers both in code, unverified here: `paths::resolve_socket_path` takes flag, then `TURN_SOCKET`, then `<runtime-or-data-dir>/turnd.sock`, refusing a path over 100 bytes because `sun_path` is 104 on macOS; `instance` probes for an answering daemon via the real handshake rather than trusting the socket file's existence. The window's side was settled and then deleted with it (ADR-039): the retired shell never started `turnd` — the daemon's lifetime is deliberately longer than the window's — and showed `reconnecting` with the socket path while it retried, with a backoff a connection had to survive ten seconds to spend. Those two rules are the ones to reproduce in `turn-gui`, and until they are, nothing on this side is settled. Whether *something else* should start the daemon on first run is still open. | M8 packaging for the remaining half. |
-| 7 | **Is the Attention Queue global or per Workspace in the UI?** It is global in the model, deliberately, and the window's queue panel now renders it global while the sidebar groups Sessions by Workspace. Whether the queue should also scope is still a product question, and still unanswered by use. | M7, with a real multi-Workspace setup. |
-| 8 | **Per-`PaneKind` buffer bounds.** `with_capacity` takes both bounds; nothing uses them non-default yet. | M8 measurement. |
-| 9 | **Does `TerminalBuffer::replay()` need scrollback, or is the visible screen enough?** Today a re-attached Pane starts with no history above the fold (ADR-023). | M7 scenario 5, with real users. |
-| 10 | **How is `turn-hook` located at runtime,** and what happens on version skew with the daemon? | M8 packaging. |
+| 5 | **How does the daemon defend against pid reuse when re-attaching?** The stored command line is the only corroboration and it is weak. | M9 restore hardening, tested adversarially. |
+| 6 | **Where does the daemon's socket live, and what is the single-instance rule?** `turnd` now answers both in code, unverified here: `paths::resolve_socket_path` takes flag, then `TURN_SOCKET`, then `<runtime-or-data-dir>/turnd.sock`, refusing a path over 100 bytes because `sun_path` is 104 on macOS; `instance` probes for an answering daemon via the real handshake rather than trusting the socket file's existence. The window's side was settled and then deleted with it (ADR-039): the retired shell never started `turnd` — the daemon's lifetime is deliberately longer than the window's — and showed `reconnecting` with the socket path while it retried, with a backoff a connection had to survive ten seconds to spend. Those two rules are the ones to reproduce in `turn-gui`, and until they are, nothing on this side is settled. Whether *something else* should start the daemon on first run is still open. | M9 packaging for the remaining half. |
+| 8 | **Per-`PaneKind` buffer bounds.** `with_capacity` takes both bounds; nothing uses them non-default yet. | M9 measurement. |
+| 9 | **Does `TerminalBuffer::replay()` need scrollback, or is the visible screen enough?** Today a re-attached Pane starts with no history above the fold (ADR-023). | M8 scenario 5, with real users. |
+| 10 | **How is `turn-hook` located at runtime,** and what happens on version skew with the daemon? | M9 packaging. |
 
 ---
 
@@ -451,6 +494,41 @@ spellings, which protects against our typos and not against upstream drift. Also
 on upgrade, and any coverage beyond one version on one machine. A contract test only fires when someone runs
 it, so a release between CI runs still reaches users first.
 
+### 1a. Checkout aliasing and stale lease authority — **M6 blocker**
+
+The catastrophic failure is two Sessions believing they exclusively own the same Git index/files. Raw path
+strings alias through symlinks and spelling; a daemon can crash between side effect and commit; a stale
+client can release a newer claim; deleting/recreating a Workspace can reset locally scoped generation.
+
+*Mitigated by:* canonical-path uniqueness across Workspaces, one global monotonic fence per canonical path,
+`BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release
+and blocking `recovery_required` state. Migration 003 grants no lease.
+*Still missing:* the concurrent/path-alias/recreate tests, daemon transaction proof before init/spawn, and a
+manual recovery flow that never interprets timeout as death. M6 cannot close on schema types alone.
+
+### 1b. Activity Preview can become a durable exfiltration/lying channel — **M6 blocker**
+
+A terminal line may contain secrets, prompt injection, bidi/invisible text or a transient spinner that looks
+like stable progress. Persisting “last lines” also recreates the misleading restored-conversation problem
+ADR-036 rejected.
+
+*Mitigated by:* semantic-source priority, control/bidi/ANSI and carriage-return normalisation, stability/noise
+filtering, known-secret redaction, 20-per-node/2,000-global retention, no raw PTY/hook source and a stale-on-
+restore label. High-frequency changes are snapshot state, not append-only events.
+*Still missing:* adversarial SQLite/restart tests seeded with secrets and noisy TUI output, plus UI proof that
+stale/provisional provenance is spoken as well as coloured.
+
+### 1c. Protocol v3 projection drift — **M6/M7 blocker**
+
+If hierarchy bootstrap, bounded pushes and per-surface state use different ownership/order rules, the GUI can
+show the right terminal under the wrong Agent or apply one window's selection to another. Shared Rust types
+do not prevent two derivations.
+
+*Mitigated by:* one daemon-derived `HierarchySnapshot`, monotonic revision and full replacement, typed
+`HierarchyKey`, structured lease conflict and server-provided relationship/preview confidence.
+*Still missing:* catalogue/conversation tests for revision gaps, daemon restart, surface isolation and every
+request→response/push variant; `docs/PROTOCOL.md` still has no mechanical prose-to-code check.
+
 ### 2. ~~Webview divergence between macOS and Linux~~ — **struck: the webview is gone**
 
 This was the risk ADR-001 named as the single biggest in the stack: WKWebView on macOS against WebKitGTK on
@@ -478,7 +556,7 @@ happening on the CPU, so glyph shaping is identical and only the composite diffe
 *Still missing:* the snapshot baselines exist only for macOS/Metal, so the comparison runs on macOS only and
 the workflow says so in place of skipping quietly. Nobody has opened the window on Linux. Recording a Linux
 baseline under lavapipe, and measuring how far it sits from the Metal one, is the first real evidence this
-risk will have — and it needs a Linux machine, which is also what M8's Linux sign-off needs.
+risk will have — and it needs a Linux machine, which is also what M9's Linux sign-off needs.
 
 ### 2b. Accessibility and IME are now Turn's problem, and are unbuilt
 
@@ -507,8 +585,8 @@ keystrokes and not irrelevant for a `cargo build` firehose.
 bounds so they can be tuned per `PaneKind`; `MAX_OUTPUT_CHUNK_BYTES` capping a frame; backpressure that
 degrades to "you lagged, here is a replay" rather than to stutter; and `OutputEncoding` already negotiated in
 the handshake so a binary channel is additive.
-*Still missing:* an actual measurement. It is an M8 deliverable and the numbers could force a redesign of the
-output path, which is why it should not wait until M8 if a cheap benchmark can be built earlier.
+*Still missing:* an actual measurement. It is an M9 deliverable and the numbers could force a redesign of the
+output path, which is why it should not wait until M9 if a cheap benchmark can be built earlier.
 
 ADR-039 changed the shape of this risk without shrinking it. Sending cells rather than bytes to the client
 removes the base64 inflation from the pane path and removes the second parse entirely, which should help. It
@@ -621,8 +699,8 @@ been decided on.
   make this class of drift impossible; there is none.
 - **`turn-store`'s database file is `0644` in a `0755` directory.** `location.rs:57` calls `create_dir_all`
   and nothing calls `set_permissions` anywhere in the crate. The store keeps every command line, cwd and
-  redacted payload by design, so this is the one place where Open decision 1 (persisting `TurnEvent::raw`)
-  stops being a preference and becomes an exposure.
+  structured event excerpt, lease and Activity Preview by design. ADR-040 removes untouched hook payloads,
+  but the remaining metadata is still private and file mode remains an exposure.
 - **The pty tests are load-sensitive, and more of them than was thought.**
   `turn_pty::process::a_process_sees_the_size_we_gave_it` failed once with `OpenPty(Os { code: -6 })` while
   other cargo builds saturated the machine, then passed on rerun — a third test beyond the two already known
@@ -655,7 +733,7 @@ Concrete, verified items. Each is real today.
    baseline. The Linux job still compiles the snapshot target every push, so it cannot rot, and it runs
    `turn-gui`'s logic tests. Lifting it: `sudo apt-get install -y mesa-vulkan-drivers libvulkan1` on the
    runner, `UPDATE_SNAPSHOTS=1 cargo test -p turn-gui` on a Linux machine, review the images, commit them,
-   then drop the two `if:` guards. Needs a Linux machine, like §Risks 2a and M8's Linux sign-off.
+   then drop the two `if:` guards. Needs a Linux machine, like §Risks 2a and M9's Linux sign-off.
 
 ### Missing artefacts
 
@@ -694,7 +772,8 @@ Concrete, verified items. Each is real today.
 13. **Typed ids are 12 hex characters — 48 bits, not a UUID.** Fine at this scale; they should not be
     treated as globally unique. Relatedly, `Default` on an id **mints a fresh identity**, so a stray
     `..Default::default()` silently creates a new one.
-14. **`TurnEvent::raw` is unredacted** and currently in-memory only. Open decision 1.
+14. **`TurnEvent::raw` is unredacted and memory-only by ADR-040.** The decision is closed; the missing work
+    is an integration test proving EventRepo/PreviewRepo never serialise it, including after restart/prune.
 15. **The heuristic marker lists are English** and taken from the shapes today's CLIs render. A localised or
     restyled CLI stops being detected with nothing failing — the Session just goes quiet.
 16. **`Session::duplicate` names the copy `"{name} (copy)"`** in English, in the domain layer, and the UI
