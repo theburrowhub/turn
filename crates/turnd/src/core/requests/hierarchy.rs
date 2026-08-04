@@ -412,10 +412,8 @@ impl Core {
             let checkouts = self
                 .store
                 .hierarchy()
-                .primary_checkout(&workspace.id)
-                .map_err(store)?
-                .into_iter()
-                .collect();
+                .checkouts_for_workspace(&workspace.id)
+                .map_err(store)?;
             let write_lease = self
                 .store
                 .hierarchy()

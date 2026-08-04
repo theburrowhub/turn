@@ -166,7 +166,14 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
     );
     assert!(relaunched.lifecycle.is_running());
     assert!(pid_is_alive(relaunched.pid.expect("a fresh pid")));
-    assert_eq!(relaunched.pane_ids.as_slice(), &[shell_pane.id]);
+    assert_eq!(
+        relaunched
+            .pane_bindings
+            .iter()
+            .map(|binding| &binding.pane_id)
+            .collect::<Vec<_>>(),
+        vec![&shell_pane.id]
+    );
 
     daemon.shutdown().await;
 }

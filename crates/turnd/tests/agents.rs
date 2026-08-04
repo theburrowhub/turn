@@ -9,7 +9,8 @@ mod common;
 use common::agent::*;
 use common::*;
 use turn_core::attention::Effect;
-use turn_core::model::{PaneKind, Relation};
+use turn_core::event::Confidence;
+use turn_core::model::PaneKind;
 use turn_core::state::{AwaitingReason, DisplayState, Turn};
 use turn_proto::{NewPane, Request, ServerEvent};
 
@@ -187,11 +188,12 @@ async fn a_subagent_joins_the_tree_with_a_confirmed_link_and_does_not_move_the_u
         .expect("the subagent");
     assert_eq!(subagent.parent.as_ref(), Some(&agent.node));
     assert_eq!(
-        subagent.relation,
-        Relation::Confirmed,
+        subagent.relationship.kind,
+        turn_core::model::RelationshipKind::SpawnedBy,
         "the tool reported this itself; it is not a guess"
     );
-    assert!(!subagent.relation_is_provisional);
+    assert_eq!(subagent.relationship.confidence, Confidence::Explicit);
+    assert!(!subagent.relationship_is_provisional);
     assert_eq!(subagent.depth, 1);
     assert_eq!(subagent.title, "Explore");
     assert_eq!(

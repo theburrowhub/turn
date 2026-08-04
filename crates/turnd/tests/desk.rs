@@ -655,12 +655,16 @@ async fn a_child_process_nothing_announced_is_adopted_as_an_inferred_link() {
         .find(|node| node.depth == 1)
         .expect("the adopted child");
     assert_eq!(
-        child.relation,
-        turn_core::model::Relation::Inferred,
+        child.relationship.kind,
+        turn_core::model::RelationshipKind::SpawnedBy,
         "a pid whose parent happens to match is not the same claim as a tool reporting it"
     );
+    assert_eq!(
+        child.relationship.confidence,
+        turn_core::event::Confidence::InferredHigh
+    );
     assert!(
-        child.relation_is_provisional,
+        child.relationship_is_provisional,
         "the UI must be able to draw this edge differently"
     );
     assert_eq!(child.parent.as_ref(), Some(&nodes[0].node_id));

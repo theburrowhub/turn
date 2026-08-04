@@ -4,9 +4,12 @@ use super::workspaces::store;
 use super::{check_name, Answer};
 use crate::core::Core;
 use crate::paths;
-use turn_core::ids::{SessionId, TemplateId, WorkspaceId};
+use std::path::{Path, PathBuf};
+use std::process::Command as SystemCommand;
+use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
     Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template,
+    WorkspaceCheckout,
 };
 use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
 
@@ -98,7 +101,7 @@ impl Core {
         let id = session.id.clone();
         self.store
             .hierarchy()
-            .create_session(&session, now_ms)
+            .create_read_only_session(&session, false)
             .map_err(store)?;
         self.sessions.insert(id.clone(), session);
         self.touch_workspace(workspace_id, now_ms);
@@ -110,19 +113,104 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_worktree_session(
         &mut self,
-        _workspace_id: &WorkspaceId,
-        _name: String,
-        _branch: String,
-        _worktree_path: Option<String>,
-        _panes: Option<Vec<NewPane>>,
-        _note: Option<String>,
-        _tags: Vec<String>,
-        _now_ms: i64,
+        workspace_id: &WorkspaceId,
+        name: String,
+        branch: String,
+        worktree_path: Option<String>,
+        panes: Option<Vec<NewPane>>,
+        note: Option<String>,
+        tags: Vec<String>,
+        now_ms: i64,
     ) -> Answer {
-        Err(turn_proto::ProtoError::new(
-            turn_proto::ErrorCode::Unavailable,
-            "Isolated worktree creation is not available in this build",
-        ))
+        let name = check_name(&name)?;
+        let branch = validate_git_branch(&branch)?;
+        let workspace = self.workspace(workspace_id)?.clone();
+        let path = resolve_worktree_path(
+            &self.data_dir,
+            workspace_id,
+            &branch,
+            worktree_path.as_deref(),
+        )?;
+        if path.exists() {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "The isolated worktree path already exists",
+            )
+            .with_detail(path.display().to_string()));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| ProtoError::invalid("The worktree path needs a parent directory"))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "The worktree parent directory could not be created",
+            )
+            .with_detail(error.to_string())
+        })?;
+        create_git_worktree(Path::new(&workspace.root), &path, &branch)?;
+
+        let canonical = std::fs::canonicalize(&path).map_err(|error| {
+            rollback_git_worktree(Path::new(&workspace.root), &path);
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "The new worktree could not be resolved",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let layout = match panes {
+            Some(panes) if !panes.is_empty() => layout_from_panes(&panes),
+            _ => Layout::single(default_shell_pane()),
+        };
+        let mut session = Session::new(
+            workspace_id.clone(),
+            name,
+            canonical.to_string_lossy(),
+            layout,
+            now_ms,
+        );
+        session.note = note;
+        session.tags = tags;
+        session.attention = workspace.attention.clone();
+        session.env = workspace.env.clone();
+        session.mode = SessionMode::IsolatedWorktree;
+        session.checkout_id = CheckoutId::new();
+        session.worktree_path = Some(canonical.to_string_lossy().to_string());
+        session.git_branch = Some(branch.clone());
+        let id = session.id.clone();
+        let inherited_resources = self
+            .store
+            .hierarchy()
+            .primary_checkout(workspace_id)
+            .map_err(store)?
+            .map(|checkout| checkout.shared_resources)
+            .unwrap_or_default();
+        let checkout = WorkspaceCheckout {
+            id: session.checkout_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: canonical.to_string_lossy().to_string(),
+            canonical_path: canonical.to_string_lossy().to_string(),
+            branch: Some(branch),
+            primary: false,
+            shared_resources: inherited_resources,
+            created_ms: now_ms,
+        };
+        if let Err(error) = self
+            .store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+        {
+            rollback_git_worktree(Path::new(&workspace.root), &path);
+            return Err(store(error));
+        }
+        self.sessions.insert(id.clone(), session);
+        self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
+        self.materialise_session(&id, now_ms);
+        self.touch_workspace(workspace_id, now_ms);
+        self.persist_session(&id)?;
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        self.answer_session(&id, now_ms)
     }
 
     /// Creates a session from a template.
@@ -430,6 +518,142 @@ pub(super) fn pane_from_spec(spec: &NewPane) -> Pane {
     pane
 }
 
+fn validate_git_branch(raw: &str) -> Result<String, ProtoError> {
+    let branch = raw.trim();
+    if branch.is_empty() || branch.chars().count() > 200 {
+        return Err(ProtoError::invalid(
+            "A worktree branch must contain between 1 and 200 characters",
+        ));
+    }
+    let output = SystemCommand::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .map_err(|error| {
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "Git is required to validate an isolated worktree branch",
+            )
+            .with_detail(error.to_string())
+        })?;
+    if !output.status.success() {
+        return Err(ProtoError::invalid("That is not a valid Git branch name"));
+    }
+    Ok(branch.to_string())
+}
+
+fn resolve_worktree_path(
+    data_dir: &Path,
+    workspace_id: &WorkspaceId,
+    branch: &str,
+    requested: Option<&str>,
+) -> Result<PathBuf, ProtoError> {
+    let path = match requested.map(str::trim).filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let slug: String = branch
+                .chars()
+                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                .collect();
+            paths::worktree_root(data_dir, workspace_id).join(slug)
+        }
+    };
+    if !path.is_absolute() {
+        return Err(ProtoError::invalid(
+            "An explicit worktree path must be absolute",
+        ));
+    }
+    if path.parent().is_none() || path.file_name().is_none() {
+        return Err(ProtoError::invalid(
+            "The filesystem root cannot be used as a worktree",
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(ProtoError::invalid(
+            "A worktree path cannot contain parent-directory components",
+        ));
+    }
+    Ok(path)
+}
+
+fn create_git_worktree(root: &Path, target: &Path, branch: &str) -> Result<(), ProtoError> {
+    let repository = SystemCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|error| {
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "Git could not inspect the Workspace repository",
+            )
+            .with_detail(error.to_string())
+        })?;
+    if !repository.status.success() {
+        return Err(ProtoError::new(
+            turn_proto::ErrorCode::Conflict,
+            "The Workspace root is not inside a Git repository",
+        ));
+    }
+    let branch_exists = SystemCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .status()
+        .map_err(|error| {
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "Git could not inspect the requested branch",
+            )
+            .with_detail(error.to_string())
+        })?
+        .success();
+    let mut command = SystemCommand::new("git");
+    command.arg("-C").arg(root).args(["worktree", "add"]);
+    if !branch_exists {
+        command.arg("-b").arg(branch);
+    }
+    command.arg(target);
+    if branch_exists {
+        command.arg(branch);
+    }
+    let output = command.output().map_err(|error| {
+        ProtoError::new(
+            turn_proto::ErrorCode::Unavailable,
+            "Git could not create the isolated worktree",
+        )
+        .with_detail(error.to_string())
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(1_000)
+            .collect::<String>();
+        return Err(ProtoError::new(
+            turn_proto::ErrorCode::Conflict,
+            "Git refused to create the isolated worktree",
+        )
+        .with_detail(detail));
+    }
+    Ok(())
+}
+
+fn rollback_git_worktree(root: &Path, target: &Path) {
+    let result = SystemCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "remove", "--force"])
+        .arg(target)
+        .status();
+    if result.as_ref().is_err() || result.is_ok_and(|status| !status.success()) {
+        tracing::warn!(path = %target.display(), "could not roll back the new Git worktree");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +759,133 @@ mod tests {
         assert_eq!(harness.core.sessions.len(), sessions_before);
         assert_eq!(harness.core.processes.len(), processes_before);
         assert_eq!(harness.core.store.sessions().count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_read_only_alternative_never_launches_without_a_technical_guard() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace = match harness
+            .core
+            .create_workspace("space-troopers".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness
+            .core
+            .create_session(
+                &workspace,
+                "Writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap();
+        let response = harness
+            .core
+            .create_read_only_session(
+                &workspace,
+                "Review current changes".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::Agent).with_command("claude")]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .unwrap();
+        let id = match response {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session = &harness.core.sessions[&id];
+        assert_eq!(session.mode, SessionMode::ReadOnly);
+        assert!(!session.read_only_enforced);
+        assert!(
+            session.tree.is_empty(),
+            "an unguarded command must not start"
+        );
+        assert!(harness
+            .core
+            .processes
+            .values()
+            .all(|process| process.session_id != id));
+    }
+
+    #[tokio::test]
+    async fn an_isolated_session_uses_a_real_independent_git_worktree() {
+        let mut harness = Harness::new().await;
+        let repository = harness._dir.path().join("repository");
+        std::fs::create_dir_all(&repository).unwrap();
+        let run_git = |args: &[&str]| {
+            let status = SystemCommand::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "turn@example.invalid"]);
+        run_git(&["config", "user.name", "Turn Test"]);
+        std::fs::write(repository.join("README.md"), "turn\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        let workspace = match harness
+            .core
+            .create_workspace(
+                "space-troopers".into(),
+                repository.to_string_lossy().to_string(),
+                10,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let target = harness._dir.path().join("review-worktree");
+        let response = harness
+            .core
+            .create_worktree_session(
+                &workspace,
+                "Alternative movement".into(),
+                "turn/alternative-movement".into(),
+                Some(target.to_string_lossy().to_string()),
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .unwrap();
+        let id = match response {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session = &harness.core.sessions[&id];
+        assert_eq!(session.mode, SessionMode::IsolatedWorktree);
+        assert_ne!(Path::new(&session.cwd), repository.as_path());
+        assert!(Path::new(&session.cwd).join("README.md").exists());
+        assert_eq!(
+            harness
+                .core
+                .store
+                .hierarchy()
+                .checkouts_for_workspace(&workspace)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .is_none());
     }
 }

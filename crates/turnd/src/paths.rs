@@ -20,6 +20,9 @@ pub const SOCKET_FILE: &str = "turnd.sock";
 /// Directory under the data dir that holds per-session scratch configuration.
 pub const SCRATCH_DIR: &str = "scratch";
 
+/// Daemon-owned default root for isolated Git worktrees.
+pub const WORKTREES_DIR: &str = "worktrees";
+
 /// Longest socket path we will attempt.
 ///
 /// `sun_path` is 104 bytes on macOS and 108 on Linux, and the byte after the path
@@ -82,6 +85,10 @@ pub fn check_socket_path(socket: &Path) -> Result<()> {
 /// The root of Turn's own scratch space.
 pub fn scratch_root(data_dir: &Path) -> PathBuf {
     data_dir.join(SCRATCH_DIR)
+}
+
+pub fn worktree_root(data_dir: &Path, workspace: &turn_core::ids::WorkspaceId) -> PathBuf {
+    data_dir.join(WORKTREES_DIR).join(workspace.as_str())
 }
 
 /// Where a session's injected agent configuration lives.
