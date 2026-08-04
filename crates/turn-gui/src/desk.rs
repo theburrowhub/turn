@@ -25,11 +25,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turn_core::attention::AttentionPolicy;
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{Direction, Layout, PaneKind};
+use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind};
 use turn_proto::cells::Grid;
 use turn_proto::{
-    AttentionView, CloseDisposition, FocusTarget, NewPane, PtySize, Request, Response,
-    SessionSummary, TemplateSummary, TerminalBytes, TreeNodeView, WorkspaceSummary,
+    AttentionView, CloseDisposition, FocusTarget, HierarchyKey, HierarchySnapshot, NewPane,
+    NodePaneCapability, NodePaneView, PtySize, Request, Response, SessionSummary, TemplateSummary,
+    TerminalBytes, TreeNodeView, WorkspaceSummary,
 };
 
 use crate::announce::Announcement;
@@ -69,6 +70,13 @@ const INITIAL_SIZE: PtySize = PtySize { rows: 24, cols: 80 };
 pub struct Desk {
     connection: ConnectionState,
     notice: Option<String>,
+    /// The sole persistent navigation projection. Flat collections below are
+    /// compatibility indexes for commands and pane ownership, never a second
+    /// navigation model.
+    hierarchy: Option<HierarchySnapshot>,
+    surface_id: String,
+    preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
+    temporary_pane: Option<NodePaneView>,
     workspaces: Vec<WorkspaceSummary>,
     templates: Vec<TemplateSummary>,
     /// In the daemon's own order, re-sorted locally with the daemon's own ranking after
@@ -109,6 +117,10 @@ impl Desk {
         Desk {
             connection: ConnectionState::Starting,
             notice: None,
+            hierarchy: None,
+            surface_id: "main-window".to_string(),
+            preview_history: HashMap::new(),
+            temporary_pane: None,
             workspaces: Vec::new(),
             templates: Vec::new(),
             sessions: Vec::new(),
@@ -132,6 +144,21 @@ impl Desk {
 
     pub fn selected(&self) -> Option<&SessionId> {
         self.selected.as_ref()
+    }
+
+    pub fn hierarchy(&self) -> Option<&HierarchySnapshot> {
+        self.hierarchy.as_ref()
+    }
+
+    pub fn preview_history(&self, node: &NodeId) -> &[ActivityPreview] {
+        self.preview_history
+            .get(node)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn temporary_pane(&self) -> Option<&NodePaneView> {
+        self.temporary_pane.as_ref()
     }
 
     pub fn sessions(&self) -> &[SessionSummary] {
@@ -173,6 +200,11 @@ impl Desk {
 
     /// The node behind a pane, for a request addressed to the process.
     fn node_of(&self, pane: &PaneId) -> Option<NodeId> {
+        if let Some(temporary) = &self.temporary_pane {
+            if &temporary.binding.pane_id == pane {
+                return Some(temporary.binding.node_id.clone());
+            }
+        }
         let session = self.pane_owner.get(pane)?;
         self.layouts
             .get(session)?
@@ -221,17 +253,17 @@ impl Desk {
         self.trees.clear();
         self.policies.clear();
         self.pane_owner.clear();
+        self.hierarchy = None;
+        self.preview_history.clear();
+        self.temporary_pane = None;
+        self.workspaces.clear();
+        self.sessions.clear();
+        self.selected = None;
         vec![
             Reaction::Send {
-                ask: Ask::Workspaces,
-                request: Request::ListWorkspaces {
-                    include_archived: false,
-                },
-            },
-            Reaction::Send {
-                ask: Ask::Sessions,
-                request: Request::ListSessions {
-                    workspace_id: None,
+                ask: Ask::Hierarchy,
+                request: Request::GetHierarchy {
+                    surface_id: self.surface_id.clone(),
                     include_archived: false,
                 },
             },
@@ -248,6 +280,30 @@ impl Desk {
 
     fn apply_answer(&mut self, ask: Ask, response: Response) -> Vec<Reaction> {
         match (ask, response) {
+            (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot),
+            (_, Response::TreeState { state }) => {
+                if let Some(hierarchy) = self.hierarchy.as_mut() {
+                    hierarchy.tree_state = state;
+                }
+                Vec::new()
+            }
+            (
+                _,
+                Response::WorkspaceWriteLease {
+                    workspace_id,
+                    lease,
+                },
+            ) => {
+                if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter_mut()
+                        .find(|branch| branch.workspace.id == workspace_id)
+                }) {
+                    branch.write_lease = lease;
+                }
+                Vec::new()
+            }
             (_, Response::Workspaces { workspaces }) => {
                 self.workspaces = workspaces;
                 Vec::new()
@@ -270,7 +326,7 @@ impl Desk {
             }
             (_, Response::Session { session }) => {
                 self.upsert_session(*session);
-                Vec::new()
+                vec![self.hierarchy_request()]
             }
             (_, Response::SessionDetails { details }) => {
                 let details = *details;
@@ -302,6 +358,61 @@ impl Desk {
                 }
                 Vec::new()
             }
+            (
+                _,
+                Response::PreviewHistory {
+                    node_id, entries, ..
+                },
+            ) => {
+                self.preview_history.insert(node_id, entries);
+                Vec::new()
+            }
+            (_, Response::NodePane { pane }) => {
+                let session_id = pane.binding.session_id.clone();
+                let pane_id = pane.binding.pane_id.clone();
+                self.pane_owner.insert(pane_id.clone(), session_id.clone());
+                let terminal = matches!(pane.capability, NodePaneCapability::Terminal { .. });
+                self.temporary_pane = Some(pane);
+                if terminal {
+                    self.attaching.insert(pane_id.clone());
+                    vec![Reaction::Send {
+                        ask: Ask::Attach {
+                            session_id: session_id.clone(),
+                            pane_id: pane_id.clone(),
+                        },
+                        request: Request::AttachPane {
+                            session_id,
+                            pane_id,
+                            size: INITIAL_SIZE,
+                            stream: turn_proto::PaneStream::Cells,
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            (_, Response::PaneFocus { focus }) => {
+                let Some(focus) = focus else {
+                    return Vec::new();
+                };
+                let mut reactions = self.select(focus.session_id.clone());
+                let is_temporary = self.temporary_pane.as_ref().is_some_and(|pane| {
+                    pane.binding.pane_id == focus.pane_id
+                        && pane.binding.session_id == focus.session_id
+                });
+                if !is_temporary {
+                    reactions.push(Reaction::Send {
+                        ask: Ask::Action("focusing the Agent pane"),
+                        request: Request::FocusPane {
+                            session_id: focus.session_id,
+                            target: FocusTarget::Pane {
+                                pane_id: focus.pane_id,
+                            },
+                        },
+                    });
+                }
+                reactions
+            }
             (_, Response::AttentionList { entries }) => {
                 self.queue = entries;
                 Vec::new()
@@ -324,6 +435,70 @@ impl Desk {
                 Vec::new()
             }
             _ => Vec::new(),
+        }
+    }
+
+    fn hierarchy_request(&self) -> Reaction {
+        Reaction::Send {
+            ask: Ask::Hierarchy,
+            request: Request::GetHierarchy {
+                surface_id: self.surface_id.clone(),
+                include_archived: false,
+            },
+        }
+    }
+
+    fn replace_hierarchy(&mut self, snapshot: HierarchySnapshot) -> Vec<Reaction> {
+        let previous_active = self.selected.clone();
+        self.workspaces = snapshot
+            .workspaces
+            .iter()
+            .map(|branch| branch.workspace.clone())
+            .collect();
+        self.sessions = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|branch| {
+                branch
+                    .sessions
+                    .iter()
+                    .map(|session| session.session.clone())
+            })
+            .collect();
+        self.trees = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|branch| {
+                branch
+                    .sessions
+                    .iter()
+                    .map(|session| (session.session.id.clone(), session.nodes.clone()))
+            })
+            .collect();
+        let selected_from_tree = snapshot
+            .tree_state
+            .selected
+            .as_ref()
+            .and_then(|key| session_for_key(&snapshot, key));
+        let active = previous_active
+            .filter(|id| self.sessions.iter().any(|session| &session.id == id))
+            .or(selected_from_tree)
+            .or_else(|| self.sessions.first().map(|session| session.id.clone()));
+        self.hierarchy = Some(snapshot);
+
+        let Some(active) = active else {
+            self.selected = None;
+            return Vec::new();
+        };
+        let needs_details = self.layouts.get(&active).is_none();
+        self.selected = Some(active.clone());
+        if needs_details {
+            vec![Reaction::Send {
+                ask: Ask::Details(active.clone()),
+                request: Request::GetSession { session_id: active },
+            }]
+        } else {
+            self.attach_wanted()
         }
     }
 
@@ -370,11 +545,28 @@ impl Desk {
                 Vec::new()
             }
             E::SessionStateChanged { session } => {
-                self.upsert_session(*session);
+                let session = *session;
+                self.upsert_session(session.clone());
+                if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter_mut()
+                        .flat_map(|workspace| workspace.sessions.iter_mut())
+                        .find(|branch| branch.session.id == session.id)
+                }) {
+                    branch.session = session;
+                }
                 Vec::new()
             }
             E::SessionRemoved { session_id, .. } => {
                 self.sessions.retain(|summary| summary.id != session_id);
+                if let Some(hierarchy) = self.hierarchy.as_mut() {
+                    for workspace in &mut hierarchy.workspaces {
+                        workspace
+                            .sessions
+                            .retain(|session| session.session.id != session_id);
+                    }
+                }
                 self.layouts.remove(&session_id);
                 self.trees.remove(&session_id);
                 self.policies.remove(&session_id);
@@ -400,7 +592,76 @@ impl Desk {
             }
             E::LayoutChanged { session_id, layout } => self.apply_layout(&session_id, layout),
             E::TreeChanged { session_id, nodes } => {
-                self.trees.insert(session_id, nodes);
+                self.trees.insert(session_id.clone(), nodes.clone());
+                if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter_mut()
+                        .flat_map(|workspace| workspace.sessions.iter_mut())
+                        .find(|branch| branch.session.id == session_id)
+                }) {
+                    branch.nodes = nodes;
+                }
+                Vec::new()
+            }
+            E::HierarchyChanged { snapshot } => self.replace_hierarchy(*snapshot),
+            E::ActivityPreviewChanged {
+                hierarchy_revision,
+                session_id,
+                node_id,
+                preview,
+            } => {
+                if !self.accept_partial_revision(hierarchy_revision) {
+                    return vec![self.hierarchy_request()];
+                }
+                self.update_hierarchy_node(&session_id, &node_id, |node| {
+                    node.activity_preview = preview;
+                });
+                Vec::new()
+            }
+            E::PaneBindingsChanged {
+                hierarchy_revision,
+                session_id,
+                node_id,
+                bindings,
+            } => {
+                if !self.accept_partial_revision(hierarchy_revision) {
+                    return vec![self.hierarchy_request()];
+                }
+                self.update_hierarchy_node(&session_id, &node_id, |node| {
+                    node.pane_bindings = bindings.clone();
+                });
+                if let Some(temporary) = &self.temporary_pane {
+                    let still_open = bindings.iter().any(|binding| {
+                        binding.pane_id == temporary.binding.pane_id
+                            && binding.session_id == temporary.binding.session_id
+                    });
+                    if temporary.binding.node_id == node_id && !still_open {
+                        let pane_id = temporary.binding.pane_id.clone();
+                        self.temporary_pane = None;
+                        self.pane_owner.remove(&pane_id);
+                        self.feeds.remove(&pane_id);
+                        self.attaching.remove(&pane_id);
+                    }
+                }
+                Vec::new()
+            }
+            E::WorkspaceWriteLeaseChanged {
+                hierarchy_revision,
+                workspace_id,
+                lease,
+            } => {
+                if !self.accept_partial_revision(hierarchy_revision) {
+                    return vec![self.hierarchy_request()];
+                }
+                if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter_mut()
+                        .find(|branch| branch.workspace.id == workspace_id)
+                }) {
+                    branch.write_lease = lease;
+                }
                 Vec::new()
             }
             E::AttentionQueueChanged { entries } => {
@@ -454,11 +715,65 @@ impl Desk {
                 self.notice = Some(message.clone());
                 vec![Reaction::Notice(message)]
             }
-            E::NodeStateChanged { .. } | E::TurnEventEmitted { .. } => {
+            E::NodeStateChanged {
+                session_id,
+                node_id,
+                lifecycle,
+                turn,
+                display_state,
+                ..
+            } => {
+                self.update_hierarchy_node(&session_id, &node_id, |node| {
+                    node.lifecycle = lifecycle.clone();
+                    node.turn = turn.clone();
+                    node.display_state = display_state;
+                    node.state_label = display_state.label().to_string();
+                    node.severity = display_state.severity();
+                    node.needs_user = display_state.demands_user();
+                });
                 let _ = now_ms;
                 Vec::new()
             }
+            E::TurnEventEmitted { .. } => Vec::new(),
         }
+    }
+
+    fn accept_partial_revision(&mut self, revision: u64) -> bool {
+        let Some(hierarchy) = self.hierarchy.as_mut() else {
+            return false;
+        };
+        if revision < hierarchy.revision {
+            return true;
+        }
+        if revision > hierarchy.revision.saturating_add(1) {
+            return false;
+        }
+        hierarchy.revision = revision;
+        true
+    }
+
+    fn update_hierarchy_node(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        update: impl FnOnce(&mut TreeNodeView),
+    ) {
+        let Some(node) = self.hierarchy.as_mut().and_then(|hierarchy| {
+            hierarchy
+                .workspaces
+                .iter_mut()
+                .flat_map(|workspace| workspace.sessions.iter_mut())
+                .find(|branch| &branch.session.id == session_id)
+                .and_then(|branch| {
+                    branch
+                        .nodes
+                        .iter_mut()
+                        .find(|node| &node.node_id == node_id)
+                })
+        }) else {
+            return;
+        };
+        update(node);
     }
 
     /// Which session a pane belongs to.
@@ -481,7 +796,12 @@ impl Desk {
     /// grid is the largest thing the client keeps, and thirty sessions of dead panes
     /// would be a leak that looks like ordinary memory use.
     fn remember_layout(&mut self, session_id: SessionId, layout: Layout) {
-        self.pane_owner.retain(|_, owner| owner != &session_id);
+        let temporary = self
+            .temporary_pane
+            .as_ref()
+            .map(|pane| pane.binding.pane_id.clone());
+        self.pane_owner
+            .retain(|pane, owner| owner != &session_id || Some(pane) == temporary.as_ref());
         for pane in layout.panes() {
             self.pane_owner.insert(pane.id.clone(), session_id.clone());
         }
@@ -526,6 +846,14 @@ impl Desk {
                 }
             }
         }
+        if let Some(temporary) = &self.temporary_pane {
+            if matches!(temporary.capability, NodePaneCapability::Terminal { .. }) {
+                wanted.push((
+                    temporary.binding.session_id.clone(),
+                    temporary.binding.pane_id.clone(),
+                ));
+            }
+        }
         wanted
     }
 
@@ -568,7 +896,9 @@ impl Desk {
             Some(existing) => *existing = summary,
             None => self.sessions.push(summary),
         }
-        self.sort_sessions();
+        if self.hierarchy.is_none() {
+            self.sort_sessions();
+        }
     }
 
     /// Re-sorts with the daemon's own ranking.
@@ -584,8 +914,15 @@ impl Desk {
 
     /// Selects a session and fetches its detail.
     pub fn select(&mut self, session_id: SessionId) -> Vec<Reaction> {
+        let select_tree = Reaction::Send {
+            ask: Ask::Action("selecting a Session in the workspace tree"),
+            request: Request::SelectTreeNode {
+                surface_id: self.surface_id.clone(),
+                selected: Some(HierarchyKey::session(session_id.clone())),
+            },
+        };
         if self.selected.as_ref() == Some(&session_id) {
-            return Vec::new();
+            return vec![select_tree];
         }
         self.selected = Some(session_id.clone());
         // Screens for panes nothing wants any more are dropped, which for a window not
@@ -598,10 +935,13 @@ impl Desk {
         self.feeds.retain(|pane, _| wanted.contains(pane));
         self.attaching.retain(|pane| wanted.contains(pane));
 
-        let mut reactions = vec![Reaction::Send {
-            ask: Ask::Details(session_id.clone()),
-            request: Request::GetSession { session_id },
-        }];
+        let mut reactions = vec![
+            select_tree,
+            Reaction::Send {
+                ask: Ask::Details(session_id.clone()),
+                request: Request::GetSession { session_id },
+            },
+        ];
         reactions.extend(self.attach_wanted());
         reactions
     }
@@ -1162,6 +1502,27 @@ fn queue_item(view: &AttentionView) -> QueueItem {
     }
 }
 
+fn session_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option<SessionId> {
+    match key {
+        HierarchyKey::Session { session_id } => Some(session_id.clone()),
+        HierarchyKey::Process { node_id } => snapshot.workspaces.iter().find_map(|workspace| {
+            workspace.sessions.iter().find_map(|session| {
+                session
+                    .nodes
+                    .iter()
+                    .any(|node| &node.node_id == node_id)
+                    .then(|| session.session.id.clone())
+            })
+        }),
+        HierarchyKey::Workspace { workspace_id } => snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace.id == workspace_id)
+            .and_then(|workspace| workspace.sessions.first())
+            .map(|session| session.session.id.clone()),
+    }
+}
+
 /// Whether a desync is worth telling the user about.
 ///
 /// A missed update is normal on a busy pane and repairs itself by resynchronising; a
@@ -1267,12 +1628,7 @@ mod tests {
         let ops: Vec<&str> = sent(&reactions).iter().map(Request::op).collect();
         assert_eq!(
             ops,
-            vec![
-                "list_workspaces",
-                "list_sessions",
-                "list_templates",
-                "list_attention"
-            ]
+            vec!["get_hierarchy", "list_templates", "list_attention"]
         );
         assert!(desk.connection().is_live());
     }
@@ -1337,12 +1693,14 @@ mod tests {
             }),
             T0,
         );
-        // The first session is selected automatically, which produces the fetch.
+        // The first session is selected automatically. Re-selecting it still persists
+        // the authoritative tree selection, but it does not fetch the detail twice.
         let reactions = desk.select(session.id.clone());
-        assert!(
-            sent(&reactions).is_empty(),
-            "it was already selected by the list arriving"
-        );
+        assert!(matches!(
+            sent(&reactions).as_slice(),
+            [Request::SelectTreeNode { selected: Some(HierarchyKey::Session { session_id }), .. }]
+                if session_id == &session.id
+        ));
 
         let reactions = desk.apply_inbound(
             answer(Response::SessionDetails {

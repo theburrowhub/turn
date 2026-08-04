@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use turn_core::ids::{PaneId, SessionId};
+use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_proto::{ProtoError, Request, RequestId, Response, ServerEvent};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
@@ -50,11 +50,17 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// "could not split the pane" rather than "error".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ask {
+    Hierarchy,
     Workspaces,
     Sessions,
     Details(SessionId),
     Templates,
     AttentionQueue,
+    Preview {
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    NodePane,
     Attach {
         session_id: SessionId,
         pane_id: PaneId,
@@ -77,11 +83,14 @@ impl Ask {
     /// What the window was doing, for an error message.
     pub fn describing(&self) -> &str {
         match self {
+            Ask::Hierarchy => "loading the workspace hierarchy",
             Ask::Workspaces => "loading workspaces",
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",
             Ask::Templates => "loading templates",
             Ask::AttentionQueue => "loading the attention queue",
+            Ask::Preview { .. } => "loading an activity preview",
+            Ask::NodePane => "opening a node as a pane",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",
