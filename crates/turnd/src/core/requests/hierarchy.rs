@@ -587,3 +587,241 @@ fn state_key(kind: HierarchyNodeKind, id: &str) -> HierarchyKey {
         HierarchyNodeKind::Process => HierarchyKey::process(NodeId::from_stored(id.to_string())),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+    use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
+    use turn_core::model::{PaneKind, ProcessNode};
+    use turn_core::state::Lifecycle;
+    use turn_proto::{CloseDisposition, NewPane, Request};
+
+    const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn the_reviewer_vertical_survives_a_ui_restart_without_changing_layout() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace_id = match harness
+            .core
+            .create_workspace("space-troopers".into(), root, NOW)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_session(
+                &workspace_id,
+                "Fix climbing bugs".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::Agent)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .expect("the main Session owns the checkout");
+        assert_eq!(lease.session_id, session_id);
+
+        let mut claude = ProcessNode::agent(session_id.clone(), "claude", "/repo", NOW + 2);
+        claude.title = "Claude Code".into();
+        claude.lifecycle = Lifecycle::Alive;
+        let claude_id = claude.id.clone();
+        let main_pane = harness.core.sessions[&session_id].layout.panes()[0]
+            .id
+            .clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(claude);
+            session.layout.get_mut(&main_pane).unwrap().node_id = Some(claude_id.clone());
+        }
+        harness.core.persist_session(&session_id).unwrap();
+        let saved_layout = harness.core.sessions[&session_id].layout.clone();
+
+        let event = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSpawned {
+                declared_name: Some("Reviewer".into()),
+                agent_type: Some("code-reviewer".into()),
+                agent_id: Some("reviewer-1".into()),
+                task: Some("Reviewing climb_system.gd…".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStart".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_node(claude_id.clone());
+        harness.core.ingest(event, NOW + 3);
+
+        let reviewer_id = harness.core.sessions[&session_id].tree.children(&claude_id)[0]
+            .id
+            .clone();
+        let (first_client, _frames) = harness.add_client(64);
+        let snapshot = match harness
+            .core
+            .dispatch(
+                first_client,
+                Request::GetHierarchy {
+                    surface_id: "main-window".into(),
+                    include_archived: false,
+                },
+                NOW + 4,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => *snapshot,
+            other => panic!("unexpected {other:?}"),
+        };
+        let branch = &snapshot.workspaces[0].sessions[0];
+        let reviewer = branch
+            .nodes
+            .iter()
+            .find(|node| node.node_id == reviewer_id)
+            .unwrap();
+        assert_eq!(reviewer.parent.as_ref(), Some(&claude_id));
+        assert_eq!(
+            reviewer
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.name.declared_name.as_deref()),
+            Some("Reviewer")
+        );
+        assert_eq!(reviewer.relationship.confidence, Confidence::Explicit);
+        assert_eq!(
+            reviewer
+                .activity_preview
+                .as_ref()
+                .map(|preview| preview.normalized_text.as_str()),
+            Some("Reviewing climb_system.gd…")
+        );
+        assert!(reviewer.pane_bindings.is_empty());
+        assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
+
+        harness
+            .core
+            .set_tree_expanded(
+                "main-window".into(),
+                HierarchyKey::workspace(workspace_id.clone()),
+                true,
+                NOW + 5,
+            )
+            .unwrap();
+        harness
+            .core
+            .set_tree_expanded(
+                "main-window".into(),
+                HierarchyKey::session(session_id.clone()),
+                true,
+                NOW + 6,
+            )
+            .unwrap();
+        harness
+            .core
+            .select_tree_node(
+                "main-window".into(),
+                Some(HierarchyKey::process(reviewer_id.clone())),
+                NOW + 7,
+            )
+            .unwrap();
+
+        let history = harness
+            .core
+            .get_preview_history(&session_id, &reviewer_id, Some(8))
+            .unwrap();
+        assert!(matches!(
+            history,
+            Response::PreviewHistory { ref entries, .. }
+                if entries.last().is_some_and(|preview| preview.normalized_text == "Reviewing climb_system.gd…")
+        ));
+
+        let temporary = match harness
+            .core
+            .open_node_as_temporary_pane("main-window".into(), &session_id, &reviewer_id, NOW + 8)
+            .unwrap()
+        {
+            Response::NodePane { pane } => pane,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(temporary.binding.temporary);
+        assert_eq!(temporary.capability, NodePaneCapability::PreviewDetails);
+        assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&reviewer_id)
+            .unwrap()
+            .is_running());
+
+        harness
+            .core
+            .close_pane(
+                first_client,
+                &session_id,
+                &temporary.binding.pane_id,
+                CloseDisposition::KeepProcesses,
+                NOW + 9,
+            )
+            .unwrap();
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&reviewer_id)
+            .unwrap()
+            .is_running());
+        assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
+
+        harness.core.client_closed(first_client);
+        let (second_client, _frames) = harness.add_client(64);
+        let restored = match harness
+            .core
+            .dispatch(
+                second_client,
+                Request::GetHierarchy {
+                    surface_id: "main-window".into(),
+                    include_archived: false,
+                },
+                NOW + 10,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => *snapshot,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            restored.tree_state.selected,
+            Some(HierarchyKey::process(reviewer_id.clone()))
+        );
+        assert!(restored
+            .tree_state
+            .expanded
+            .contains(&HierarchyKey::workspace(workspace_id)));
+        let reviewer = restored.workspaces[0].sessions[0]
+            .nodes
+            .iter()
+            .find(|node| node.node_id == reviewer_id)
+            .unwrap();
+        assert_eq!(reviewer.parent.as_ref(), Some(&claude_id));
+        assert_eq!(
+            reviewer
+                .activity_preview
+                .as_ref()
+                .map(|preview| preview.normalized_text.as_str()),
+            Some("Reviewing climb_system.gd…")
+        );
+        assert!(reviewer.pane_bindings.is_empty());
+    }
+}
