@@ -366,9 +366,11 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
         ServerEvent::TurnEventEmitted {
             turn_event: TurnEvent::new(
                 session_id.clone(),
-                EventKind::AgentSubagentStarted {
+                EventKind::AgentSpawned {
+                    declared_name: None,
                     agent_type: Some("Explore".into()),
                     agent_id: Some("sub-1".into()),
+                    task: None,
                 },
                 EventSource::Hook {
                     tool: "claude-code".into(),

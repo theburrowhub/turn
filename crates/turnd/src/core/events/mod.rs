@@ -59,6 +59,7 @@ impl Core {
         let policy = session.attention.clone();
 
         let changed = self.apply(&event, now_ms);
+        let preview_changed = self.update_preview_from_event(&event, changed.node.as_ref(), now_ms);
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.touch(now_ms);
         }
@@ -79,7 +80,7 @@ impl Core {
         self.push_all(ServerEvent::TurnEventEmitted {
             turn_event: event.clone(),
         });
-        if changed.structure {
+        if changed.structure || preview_changed {
             self.push_tree(&session_id, now_ms);
         }
         if let Some(node) = &changed.node {
@@ -106,16 +107,20 @@ impl Core {
         };
 
         // Subagents are the one case that creates a node rather than changing one.
-        if let EventKind::AgentSubagentStarted {
+        if let EventKind::AgentSpawned {
+            declared_name,
             agent_type,
             agent_id,
+            task,
         } = &event.kind
         {
             return self.insert_subagent(
                 &session_id,
                 &node_id,
+                declared_name.clone(),
                 agent_type.clone(),
                 agent_id.clone(),
+                task.clone(),
                 now_ms,
             );
         }
@@ -344,7 +349,7 @@ impl Core {
             }
 
             // Handled above, before the mutable borrow.
-            EventKind::AgentSubagentStarted { .. }
+            EventKind::AgentSpawned { .. }
             | EventKind::AgentSubagentStopped { .. }
             | EventKind::ProcessSpawnedChild { .. } => return Changed::default(),
         }

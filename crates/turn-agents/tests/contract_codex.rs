@@ -487,7 +487,7 @@ fn every_recorded_payload_maps_to_the_event_the_ui_expects() {
             "SessionStart" => matches!(event.kind, EventKind::AgentStarted { .. }),
             "UserPromptSubmit" => matches!(event.kind, EventKind::AgentTurnStarted { .. }),
             "PermissionRequest" => matches!(event.kind, EventKind::AgentPermissionRequired { .. }),
-            "SubagentStart" => matches!(event.kind, EventKind::AgentSubagentStarted { .. }),
+            "SubagentStart" => matches!(event.kind, EventKind::AgentSpawned { .. }),
             "SubagentStop" => matches!(event.kind, EventKind::AgentSubagentStopped { .. }),
             "SessionEnd" => matches!(event.kind, EventKind::AgentIdle),
             _ => matches!(event.kind, EventKind::AgentTurnCompleted { .. }),
@@ -574,9 +574,10 @@ fn subagent_events_give_a_confirmed_hierarchy() {
 
     let started = adapter.normalise(&fixtures["SubagentStart"], &ctx());
     match &started[0].kind {
-        EventKind::AgentSubagentStarted {
+        EventKind::AgentSpawned {
             agent_id,
             agent_type,
+            ..
         } => {
             assert_eq!(
                 agent_id.as_deref(),

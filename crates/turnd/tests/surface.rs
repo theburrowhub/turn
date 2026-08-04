@@ -383,7 +383,10 @@ async fn panes_can_be_swapped_focused_by_name_and_detached_without_stopping_anyt
         .find(|view| view.node_id == node)
         .expect("the process is still tracked");
     assert!(kept.lifecycle.is_running());
-    assert!(kept.pane_ids.is_empty(), "it has no pane, and it is not hidden");
+    assert!(
+        kept.pane_ids.is_empty(),
+        "it has no pane, and it is not hidden"
+    );
 
     daemon.shutdown().await;
 }

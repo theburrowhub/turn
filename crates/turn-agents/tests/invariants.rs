@@ -198,7 +198,7 @@ fn a_guessed_confirmation_is_never_presented_as_a_permission_turn_can_resolve() 
                     "Turn must not read a command out of screen text and present it as fact: \
                      {summary:?}"
                 ),
-                EventKind::AgentSubagentStarted { .. } | EventKind::AgentSubagentStopped { .. } => {
+                EventKind::AgentSpawned { .. } | EventKind::AgentSubagentStopped { .. } => {
                     panic!("hierarchy must never be inferred from output: {event:?}")
                 }
                 _ => {}
@@ -299,7 +299,7 @@ fn subagent_hierarchy_only_ever_comes_from_an_explicit_report() {
     .into_iter()
     .flat_map(|(adapter, payload)| adapter.normalise(&payload, &ctx()))
     .inspect(|event| {
-        assert!(matches!(event.kind, EventKind::AgentSubagentStarted { .. }));
+        assert!(matches!(event.kind, EventKind::AgentSpawned { .. }));
         assert_eq!(event.confidence, Confidence::Explicit);
     })
     .map(|event| event.source)

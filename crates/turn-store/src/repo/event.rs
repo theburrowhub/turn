@@ -438,9 +438,11 @@ mod tests {
                 last_message: Some("done".into()),
                 background_tasks: 3,
             },
-            EventKind::AgentSubagentStarted {
+            EventKind::AgentSpawned {
+                declared_name: None,
                 agent_type: Some("Explore".into()),
                 agent_id: Some("sub-1".into()),
+                task: None,
             },
             EventKind::AgentTaskCompleted {
                 summary: Some("all green".into()),

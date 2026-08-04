@@ -458,10 +458,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
             // Confirmed hierarchy, straight from the tool. No inference.
             //
-            // `agent_type` becomes the subagent's label in the tree and
-            // `agent_id` becomes its external id, so one is filtered for display
-            // and the other validated as an identifier.
-            "SubagentStart" => vec![make(EventKind::AgentSubagentStarted {
+            // Newer runtimes may report the parent's declared worker name separately
+            // from its generic type. Preserve both: `Reviewer` must not restore as
+            // merely `default` or `Explore`.
+            "SubagentStart" => vec![make(EventKind::AgentSpawned {
+                declared_name: payload
+                    .get("agent_name")
+                    .or_else(|| payload.get("name"))
+                    .and_then(Value::as_str)
+                    .and_then(text::field),
                 agent_type: payload
                     .get("agent_type")
                     .and_then(Value::as_str)
@@ -470,6 +475,11 @@ impl AgentAdapter for ClaudeCodeAdapter {
                     .get("agent_id")
                     .and_then(Value::as_str)
                     .and_then(text::identifier),
+                task: payload
+                    .get("task")
+                    .or_else(|| payload.get("prompt"))
+                    .and_then(Value::as_str)
+                    .map(|task| excerpt(task, 240)),
             })],
 
             "SubagentStop" => vec![make(EventKind::AgentSubagentStopped {
@@ -1028,12 +1038,16 @@ mod tests {
             "agent_type": "Explore"
         }));
         match &started[0].kind {
-            EventKind::AgentSubagentStarted {
+            EventKind::AgentSpawned {
+                declared_name,
                 agent_type,
                 agent_id,
+                task,
             } => {
+                assert_eq!(declared_name, &None);
                 assert_eq!(agent_type.as_deref(), Some("Explore"));
                 assert_eq!(agent_id.as_deref(), Some("sub-42"));
+                assert_eq!(task, &None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -1047,6 +1061,30 @@ mod tests {
             stopped[0].kind,
             EventKind::AgentSubagentStopped { .. }
         ));
+    }
+
+    #[test]
+    fn a_parent_declared_subagent_name_is_not_confused_with_its_type() {
+        let started = normalise(json!({
+            "hook_event_name": "SubagentStart",
+            "agent_id": "sub-reviewer",
+            "agent_name": "Reviewer",
+            "agent_type": "Explore",
+            "task": "Review the climbing diff"
+        }));
+        match &started[0].kind {
+            EventKind::AgentSpawned {
+                declared_name,
+                agent_type,
+                task,
+                ..
+            } => {
+                assert_eq!(declared_name.as_deref(), Some("Reviewer"));
+                assert_eq!(agent_type.as_deref(), Some("Explore"));
+                assert_eq!(task.as_deref(), Some("Review the climbing diff"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

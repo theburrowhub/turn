@@ -215,7 +215,6 @@ impl ProcessNode {
         };
     }
 
-
     pub fn is_running(&self) -> bool {
         self.lifecycle.is_running()
     }

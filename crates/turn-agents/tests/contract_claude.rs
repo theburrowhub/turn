@@ -289,9 +289,10 @@ fn the_recorded_subagent_callbacks_identify_the_child_on_both_ends() {
     );
 
     match &normalise(started)[0].kind {
-        EventKind::AgentSubagentStarted {
+        EventKind::AgentSpawned {
             agent_type,
             agent_id,
+            ..
         } => {
             assert_eq!(agent_type.as_deref(), Some("Explore"));
             assert_eq!(agent_id.as_deref(), Some(id));

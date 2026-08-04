@@ -23,6 +23,7 @@ pub mod clients;
 pub mod command;
 pub mod events;
 pub mod output;
+pub mod preview;
 pub mod requests;
 pub mod restore;
 pub mod screens;
@@ -161,6 +162,10 @@ pub struct Core {
     /// letting a session read as finished while a test run continues.
     pub(crate) background_tasks: HashMap<NodeId, usize>,
 
+    /// Per-node stability/rate-limit state for compact hierarchy previews. Raw
+    /// bytes never live here; only a candidate row and scheduling metadata do.
+    pub(crate) preview_probes: HashMap<NodeId, preview::PreviewProbe>,
+
     /// Nodes whose next exit was asked for, against the moment the request stops
     /// applying — see [`EXPECTED_EXIT_GRACE_MS`] for why it has to stop.
     ///
@@ -209,6 +214,7 @@ impl Core {
             user: UserContext::default(),
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
+            preview_probes: HashMap::new(),
             expected_exits: HashMap::new(),
             restore_reports: Vec::new(),
             supervisor: ProcessSupervisor::new(),
@@ -301,6 +307,7 @@ impl Core {
         let effects = self.attention.tick(&self.user.clone(), now_ms);
         self.emit_effects(effects, now_ms);
         self.observe_heuristics(now_ms);
+        self.observe_activity_previews(now_ms);
         self.resync_clients(now_ms);
         self.forget_stale_stop_requests(now_ms);
         self.reap_finished_processes(now_ms);

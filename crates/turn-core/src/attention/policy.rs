@@ -30,7 +30,7 @@ impl Trigger {
             EventKind::AgentWaitingForUser { .. } | EventKind::SessionNeedsAttention { .. } => {
                 Some(Trigger::WaitingForUser)
             }
-            EventKind::AgentSubagentStarted { .. } => Some(Trigger::SubagentAppeared),
+            EventKind::AgentSpawned { .. } => Some(Trigger::SubagentAppeared),
             _ => None,
         }
     }

@@ -170,10 +170,18 @@ pub enum EventKind {
     AgentFailed { reason: String },
     #[serde(rename = "agent.idle")]
     AgentIdle,
-    #[serde(rename = "agent.subagent_started")]
-    AgentSubagentStarted {
+    /// A child agent was declared by its parent or an integrated runtime.
+    ///
+    /// `declared_name` is intentionally separate from `agent_type`: tools often
+    /// report a generic type such as `default` or `Explore`, while the parent gave
+    /// the worker a human name such as `Reviewer`. Losing that distinction makes
+    /// restoration unable to reproduce the hierarchy the user saw.
+    #[serde(rename = "agent.spawned")]
+    AgentSpawned {
+        declared_name: Option<String>,
         agent_type: Option<String>,
         agent_id: Option<String>,
+        task: Option<String>,
     },
     #[serde(rename = "agent.subagent_stopped")]
     AgentSubagentStopped { agent_id: Option<String> },
@@ -372,7 +380,7 @@ fn default_severity(kind: &EventKind) -> Severity {
         | EventKind::ProcessExited { .. }
         | EventKind::ProcessSpawnedChild { .. }
         | EventKind::AgentStarted { .. }
-        | EventKind::AgentSubagentStarted { .. }
+        | EventKind::AgentSpawned { .. }
         | EventKind::AgentSubagentStopped { .. }
         | EventKind::AgentPermissionResolved { .. }
         | EventKind::SessionAttentionResolved => Severity::Info,
@@ -397,7 +405,7 @@ fn kind_slug(kind: &EventKind) -> Cow<'static, str> {
         EventKind::AgentTaskCompleted { .. } => "agent.task_completed".into(),
         EventKind::AgentFailed { .. } => "agent.failed".into(),
         EventKind::AgentIdle => "agent.idle".into(),
-        EventKind::AgentSubagentStarted { .. } => "agent.subagent_started".into(),
+        EventKind::AgentSpawned { .. } => "agent.spawned".into(),
         EventKind::AgentSubagentStopped { .. } => "agent.subagent_stopped".into(),
         EventKind::SessionNeedsAttention { .. } => "session.needs_attention".into(),
         EventKind::SessionAttentionResolved => "session.attention_resolved".into(),

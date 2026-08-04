@@ -399,11 +399,13 @@ impl AgentAdapter for CodexAdapter {
             // Turn must never treat an intercepted tool call as approval.
             "pre_tool_use" | "post_tool_use" | "pre_compact" | "post_compact" => Vec::new(),
 
-            "subagent_start" => vec![make(EventKind::AgentSubagentStarted {
-                agent_type: pick(payload, &["agent_type", "agent-type", "name"])
+            "subagent_start" => vec![make(EventKind::AgentSpawned {
+                declared_name: pick(payload, &["agent_name", "agent-name", "name"])
                     .and_then(text::field),
+                agent_type: pick(payload, &["agent_type", "agent-type"]).and_then(text::field),
                 agent_id: pick(payload, &["agent_id", "agent-id", "subagent_id"])
                     .and_then(text::identifier),
+                task: pick(payload, &["task", "prompt"]).map(|task| excerpt(task, 240)),
             })],
 
             "subagent_stop" => vec![make(EventKind::AgentSubagentStopped {
@@ -1067,15 +1069,19 @@ mod tests {
             "agent_type": "default"
         }));
         match &started[0].kind {
-            EventKind::AgentSubagentStarted {
+            EventKind::AgentSpawned {
+                declared_name,
                 agent_type,
                 agent_id,
+                task,
             } => {
+                assert_eq!(declared_name, &None);
                 assert_eq!(agent_type.as_deref(), Some("default"));
                 assert_eq!(
                     agent_id.as_deref(),
                     Some("019fcdc0-1463-74b2-a80c-969dff2cdfae")
                 );
+                assert_eq!(task, &None);
             }
             other => panic!("unexpected {other:?}"),
         }

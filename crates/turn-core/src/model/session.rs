@@ -2,8 +2,8 @@
 
 use crate::attention::AttentionPolicy;
 use crate::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
-use crate::model::layout::Layout;
 use crate::model::hierarchy::SessionMode;
+use crate::model::layout::Layout;
 use crate::model::node::SessionTree;
 use crate::state::DisplayState;
 use serde::{Deserialize, Serialize};
