@@ -9,19 +9,22 @@ use crate::error::{Result, StoreError};
 use crate::redact::{redact_layout, redact_pairs};
 use crate::repo::node::{build_tree, from_row as node_from_row, upsert_node};
 use rusqlite::{params, Connection, Row};
-use turn_core::ids::{SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::session::{RestoreState, SessionStatus};
-use turn_core::model::{Layout, ProcessNode, Session, SessionTree};
+use turn_core::model::{Layout, ProcessNode, Session, SessionMode, SessionTree};
 use turn_core::state::Lifecycle;
 use turn_core::AttentionPolicy;
 
-const COLUMNS: &str = "s.id, s.workspace_id, s.name, s.note, s.cwd, s.env_json, \
+const COLUMNS: &str = "s.id, s.workspace_id, s.name, s.note, s.cwd, s.mode, s.checkout_id, \
+     s.worktree_path, s.read_only_enforced, s.env_json, \
      s.attention_json, s.template_id, s.status, s.restore_state, s.tags_json, s.git_branch, \
      s.linked_ref, s.favourite, s.pinned, s.sort_key, s.parent_session, s.created_ms, \
      s.last_activity_ms, s.tmux, l.layout_json";
 
 const NODE_COLUMNS: &str = "id, session_id, seq, kind, title, command, args_json, cwd, pid, \
      ppid, lifecycle_json, turn_json, agent_json, external_id, parent, relation, pane_id, \
+     declared_name, display_name, name_source, name_confidence, user_renamed, \
+     relationship_kind, relationship_confidence, preview_visibility, activity_preview_json, \
      started_ms, ended_ms, exit_code, env_highlights_json, interaction_pending";
 
 pub struct SessionRepo<'a> {
@@ -43,13 +46,17 @@ impl<'a> SessionRepo<'a> {
 
         tx.execute(
             "INSERT INTO sessions (id, workspace_id, name, note, cwd, env_json, attention_json, \
-                 template_id, status, restore_state, tags_json, git_branch, linked_ref, \
-                 favourite, pinned, sort_key, parent_session, created_ms, last_activity_ms, tmux) \
+                 mode, checkout_id, worktree_path, read_only_enforced, template_id, status, \
+                 restore_state, tags_json, git_branch, linked_ref, favourite, pinned, sort_key, \
+                 parent_session, created_ms, last_activity_ms, tmux) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19, ?20) \
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
              ON CONFLICT(id) DO UPDATE SET \
                  workspace_id = excluded.workspace_id, name = excluded.name, \
                  note = excluded.note, cwd = excluded.cwd, env_json = excluded.env_json, \
+                 mode = excluded.mode, checkout_id = excluded.checkout_id, \
+                 worktree_path = excluded.worktree_path, \
+                 read_only_enforced = excluded.read_only_enforced, \
                  attention_json = excluded.attention_json, template_id = excluded.template_id, \
                  status = excluded.status, restore_state = excluded.restore_state, \
                  tags_json = excluded.tags_json, git_branch = excluded.git_branch, \
@@ -65,6 +72,10 @@ impl<'a> SessionRepo<'a> {
                 session.cwd,
                 json("session env", &redact_pairs(&session.env))?,
                 json("attention policy", &session.attention)?,
+                tag("session mode", &session.mode)?,
+                session.checkout_id.as_str(),
+                session.worktree_path,
+                session.read_only_enforced,
                 session.template_id.as_ref().map(|t| t.as_str()),
                 tag("session status", &session.status)?,
                 tag("restore state", &session.restore_state)?,
@@ -91,6 +102,7 @@ impl<'a> SessionRepo<'a> {
             keep.push(node.id.to_string());
         }
         prune_nodes(&tx, &session.id, &keep)?;
+        sync_layout_bindings(&tx, session)?;
 
         tx.commit()?;
         Ok(())
@@ -281,6 +293,32 @@ fn write_layout(conn: &Connection, id: &SessionId, layout: &Layout, now_ms: i64)
     Ok(())
 }
 
+/// Replaces only durable Layout bindings. Temporary preview panes live outside
+/// the saved Layout and survive an unrelated session save until explicitly closed.
+fn sync_layout_bindings(conn: &Connection, session: &Session) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pane_node_bindings WHERE session_id = ?1 AND temporary = 0",
+        params![session.id.as_str()],
+    )?;
+    for pane in session.layout.panes() {
+        let Some(node_id) = &pane.node_id else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO pane_node_bindings \
+                 (pane_id, session_id, node_id, temporary, surface_id, opened_ms) \
+             VALUES (?1, ?2, ?3, 0, NULL, ?4)",
+            params![
+                pane.id.as_str(),
+                session.id.as_str(),
+                node_id.as_str(),
+                session.last_activity_ms
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Deletes stored nodes the in-memory tree no longer contains.
 fn prune_nodes(conn: &Connection, session: &SessionId, keep: &[String]) -> Result<()> {
     if keep.is_empty() {
@@ -319,6 +357,21 @@ fn from_row(row: &Row<'_>) -> Result<Session> {
         name: row.get("name")?,
         note: row.get("note")?,
         cwd: row.get("cwd")?,
+        mode: from_tag::<SessionMode>(
+            "session mode",
+            &id,
+            &row.get::<_, String>("mode")?,
+        )?,
+        checkout_id: row
+            .get::<_, Option<String>>("checkout_id")?
+            .map(CheckoutId::from_stored)
+            .unwrap_or_else(|| {
+                CheckoutId::primary_for(&WorkspaceId::from_stored(
+                    row.get::<_, String>("workspace_id").unwrap_or_default(),
+                ))
+            }),
+        worktree_path: row.get("worktree_path")?,
+        read_only_enforced: row.get("read_only_enforced")?,
         env: from_json("session env", &id, &row.get::<_, String>("env_json")?)?,
         layout: from_json::<Layout>("layout", &id, &layout_json)?,
         tree: SessionTree::new(),

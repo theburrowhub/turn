@@ -344,7 +344,7 @@ async fn panes_can_be_swapped_focused_by_name_and_detached_without_stopping_anyt
     // Attaching and detaching is about who is watching, not about what is running.
     let node = details.tree[0].node_id.clone();
     let pid = details.tree[0].pid.expect("a pid");
-    let pane_of_node = details.tree[0].pane_id.clone().expect("its pane");
+    let pane_of_node = details.tree[0].pane_ids[0].clone();
     ui.attach_cells(&session.id, &pane_of_node, PtySize::new(24, 80))
         .await;
     ui.ask(Request::ResizePty {
@@ -383,7 +383,7 @@ async fn panes_can_be_swapped_focused_by_name_and_detached_without_stopping_anyt
         .find(|view| view.node_id == node)
         .expect("the process is still tracked");
     assert!(kept.lifecycle.is_running());
-    assert_eq!(kept.pane_id, None, "it has no pane, and it is not hidden");
+    assert!(kept.pane_ids.is_empty(), "it has no pane, and it is not hidden");
 
     daemon.shutdown().await;
 }

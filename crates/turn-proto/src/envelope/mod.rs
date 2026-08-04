@@ -37,22 +37,26 @@ use crate::response::Response;
 /// bump it — nothing here uses `deny_unknown_fields`, so an older client ignores
 /// what it does not know and a newer client tolerates a daemon that omits it.
 ///
+/// **3** replaces the singular `TreeNodeView.pane_id` with `pane_ids` and adds the
+/// unified Workspace hierarchy/lease contracts. A v2 client would silently read a
+/// live node as having no pane, so this is deliberately not an additive rollout.
+///
 /// **2** is the version where a pane's screen became cells. `attach_pane` gained a
 /// `stream` field whose default is [`OutputEncoding`]-independent and is
 /// [`crate::PaneStream::Cells`], so a version 1 client — which omits the field and
 /// expects `pane_output` bytes — would attach and then be sent `pane_screen` frames
 /// it has no code for. That is a change of meaning for an existing request rather
 /// than an addition, which is exactly what this constant is for.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest version this build still accepts from a peer.
 ///
 /// Kept separate from [`PROTOCOL_VERSION`] so a daemon can support a window of
 /// versions during a rollout rather than requiring both sides to move at once. The
-/// window is a single version at the moment because version 1's default pane stream
-/// was bytes, and a daemon cannot serve both defaults from one attachment without
-/// guessing which one a silent client meant.
-pub const MIN_PROTOCOL_VERSION: u32 = 2;
+/// window is a single version at the moment because both v1→v2 and v2→v3 changed
+/// the meaning of existing fields. Half-compatible supervision is less safe than a
+/// loud upgrade requirement.
+pub const MIN_PROTOCOL_VERSION: u32 = 3;
 
 /// How binary payloads are carried.
 ///

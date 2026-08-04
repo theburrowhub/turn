@@ -75,11 +75,6 @@ impl Core {
             (Some(node), CloseDisposition::KeepProcesses) => {
                 // The process stays, and stays visible: a node with no pane is how a
                 // background process keeps its place in the tree.
-                if let Ok(session) = self.session_mut(session_id) {
-                    if let Some(node) = session.tree.get_mut(node) {
-                        node.pane_id = None;
-                    }
-                }
                 self.stop_pump_if_unwatched(node);
             }
             // The pane is going away, so the pty goes with it. That is what closing a

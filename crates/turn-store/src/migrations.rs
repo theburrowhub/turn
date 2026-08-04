@@ -38,6 +38,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "attention_queue",
         statements: MIGRATION_002_ATTENTION_QUEUE,
     },
+    Migration {
+        version: 3,
+        name: "unified_hierarchy_and_leases",
+        statements: MIGRATION_003_UNIFIED_HIERARCHY,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -289,6 +294,150 @@ CREATE UNIQUE INDEX idx_attention_dedup ON attention_entries(dedup_key);
 CREATE INDEX idx_attention_session ON attention_entries(session_id);
 "#;
 
+/// ADR-040: checkout exclusivity, AgentNode/view separation, activity previews and
+/// persisted tree interaction. The old `process_nodes.pane_id` column is retained as
+/// migration input; all new writes use `pane_node_bindings`.
+const MIGRATION_003_UNIFIED_HIERARCHY: &str = r#"
+ALTER TABLE workspaces ADD COLUMN lease_reconciliation_required INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'read_only';
+ALTER TABLE sessions ADD COLUMN checkout_id TEXT;
+ALTER TABLE sessions ADD COLUMN worktree_path TEXT;
+ALTER TABLE sessions ADD COLUMN read_only_enforced INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE process_nodes ADD COLUMN declared_name TEXT;
+ALTER TABLE process_nodes ADD COLUMN display_name TEXT;
+ALTER TABLE process_nodes ADD COLUMN name_source TEXT NOT NULL DEFAULT 'fallback';
+ALTER TABLE process_nodes ADD COLUMN name_confidence TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE process_nodes ADD COLUMN user_renamed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE process_nodes ADD COLUMN relationship_kind TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE process_nodes ADD COLUMN relationship_confidence TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE process_nodes ADD COLUMN preview_visibility TEXT NOT NULL DEFAULT 'inherit';
+ALTER TABLE process_nodes ADD COLUMN activity_preview_json TEXT;
+
+-- Preserve what is known without fabricating a parent-declared name.
+UPDATE process_nodes
+SET display_name = title,
+    name_source = CASE WHEN kind IN ('agent', 'subagent') THEN 'process_title' ELSE 'fallback' END,
+    name_confidence = CASE WHEN kind IN ('agent', 'subagent') THEN 'integrated' ELSE 'unknown' END,
+    relationship_kind = CASE WHEN relation IN ('confirmed', 'inferred') THEN 'spawned_by' ELSE 'unknown' END,
+    relationship_confidence = CASE
+        WHEN relation = 'confirmed' THEN 'explicit'
+        WHEN relation = 'inferred' THEN 'inferred_high'
+        ELSE 'unknown'
+    END;
+
+CREATE TABLE workspace_checkouts (
+    id                    TEXT PRIMARY KEY,
+    workspace_id          TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    path                  TEXT NOT NULL,
+    canonical_path        TEXT NOT NULL,
+    branch                TEXT,
+    is_primary            INTEGER NOT NULL,
+    shared_resources_json TEXT NOT NULL DEFAULT '[]',
+    created_ms            INTEGER NOT NULL,
+    UNIQUE(workspace_id, canonical_path)
+) STRICT;
+
+CREATE INDEX idx_checkouts_canonical_path ON workspace_checkouts(canonical_path);
+
+-- Stable primary checkout identities for old rows. No lease is granted here: a
+-- migration cannot prove that an old process is not still writing.
+INSERT INTO workspace_checkouts
+    (id, workspace_id, path, canonical_path, branch, is_primary, shared_resources_json, created_ms)
+SELECT 'checkout_primary_' || id, id, root, root, NULL, 1, '[]', created_ms FROM workspaces;
+
+UPDATE sessions
+SET checkout_id = 'checkout_primary_' || workspace_id;
+
+CREATE TABLE workspace_write_leases (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    checkout_id  TEXT NOT NULL REFERENCES workspace_checkouts(id) ON DELETE CASCADE,
+    mode         TEXT NOT NULL,
+    state        TEXT NOT NULL,
+    acquired_ms  INTEGER NOT NULL,
+    heartbeat_ms INTEGER NOT NULL,
+    released_ms  INTEGER
+    , generation INTEGER NOT NULL DEFAULT 1
+) STRICT;
+
+CREATE UNIQUE INDEX idx_one_unreconciled_workspace_writer
+ON workspace_write_leases(workspace_id, checkout_id)
+WHERE state != 'released';
+CREATE UNIQUE INDEX idx_one_unreconciled_lease_per_session
+ON workspace_write_leases(session_id)
+WHERE state != 'released';
+CREATE INDEX idx_workspace_leases_session ON workspace_write_leases(session_id, state);
+
+CREATE TABLE activity_previews (
+    id                      INTEGER PRIMARY KEY,
+    node_id                 TEXT NOT NULL REFERENCES process_nodes(id) ON DELETE CASCADE,
+    raw_source_sequence     INTEGER,
+    normalized_text         TEXT NOT NULL,
+    source_type             TEXT NOT NULL,
+    confidence              TEXT NOT NULL,
+    stable                  INTEGER NOT NULL,
+    contains_sensitive_data INTEGER NOT NULL,
+    redacted                INTEGER NOT NULL,
+    created_ms              INTEGER NOT NULL
+) STRICT;
+
+CREATE INDEX idx_activity_preview_latest
+ON activity_previews(node_id, created_ms DESC, id DESC);
+
+CREATE TABLE pane_node_bindings (
+    pane_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    node_id    TEXT NOT NULL REFERENCES process_nodes(id) ON DELETE CASCADE,
+    temporary  INTEGER NOT NULL DEFAULT 0,
+    surface_id TEXT,
+    opened_ms  INTEGER NOT NULL,
+    PRIMARY KEY(session_id, pane_id)
+) STRICT;
+
+CREATE INDEX idx_pane_bindings_node ON pane_node_bindings(node_id, opened_ms);
+
+-- Import the old one-pane projection without changing a process or layout.
+INSERT INTO pane_node_bindings (pane_id, session_id, node_id, temporary, surface_id, opened_ms)
+SELECT pane_id, session_id, id, 0, NULL, started_ms
+FROM process_nodes
+WHERE pane_id IS NOT NULL;
+
+CREATE TABLE tree_ui_state (
+    surface_id      TEXT NOT NULL,
+    node_kind       TEXT NOT NULL,
+    node_id         TEXT NOT NULL,
+    expanded        INTEGER NOT NULL DEFAULT 0,
+    selected        INTEGER NOT NULL DEFAULT 0,
+    manual_order    INTEGER,
+    visibility_mode TEXT,
+    updated_ms      INTEGER NOT NULL,
+    PRIMARY KEY(surface_id, node_kind, node_id)
+) STRICT;
+
+CREATE UNIQUE INDEX idx_tree_one_selected_per_client
+ON tree_ui_state(surface_id)
+WHERE selected = 1;
+
+-- Workspace-scoped audit facts that can exist before a Session does. Runtime
+-- TurnEvents remain session-scoped and are not weakened for this use case.
+CREATE TABLE workspace_audit_events (
+    id             TEXT PRIMARY KEY,
+    workspace_id   TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    event_name     TEXT NOT NULL,
+    timestamp_ms   INTEGER NOT NULL,
+    session_id     TEXT,
+    payload_json   TEXT NOT NULL,
+    confidence     TEXT NOT NULL,
+    dedup_key      TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX idx_workspace_audit_time
+ON workspace_audit_events(workspace_id, timestamp_ms DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,17 +481,30 @@ mod tests {
 
         assert_eq!(applied.from, 0);
         assert_eq!(applied.to, LATEST_VERSION);
-        assert_eq!(applied.names, vec!["core_entities", "attention_queue"]);
+        assert_eq!(
+            applied.names,
+            vec![
+                "core_entities",
+                "attention_queue",
+                "unified_hierarchy_and_leases"
+            ]
+        );
 
         let tables = table_names(&conn);
         for expected in [
             "attention_entries",
+            "activity_previews",
             "events",
+            "pane_node_bindings",
             "process_nodes",
             "session_layouts",
             "sessions",
             "settings",
             "templates",
+            "tree_ui_state",
+            "workspace_audit_events",
+            "workspace_checkouts",
+            "workspace_write_leases",
             "workspaces",
         ] {
             assert!(
@@ -387,7 +549,10 @@ mod tests {
         let applied = apply(&conn).unwrap();
         assert_eq!(applied.from, 1);
         assert_eq!(applied.to, LATEST_VERSION);
-        assert_eq!(applied.names, vec!["attention_queue"]);
+        assert_eq!(
+            applied.names,
+            vec!["attention_queue", "unified_hierarchy_and_leases"]
+        );
 
         let name: String = conn
             .query_row("SELECT name FROM workspaces WHERE id = 'ws_old'", [], |r| {

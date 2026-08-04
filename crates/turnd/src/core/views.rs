@@ -96,7 +96,7 @@ impl Core {
     /// A session's process tree in draw order.
     pub(crate) fn tree_views(&self, id: &SessionId, now_ms: i64) -> Vec<TreeNodeView> {
         match self.sessions.get(id) {
-            Some(session) => TreeNodeView::flatten(&session.tree, now_ms),
+            Some(session) => TreeNodeView::for_session(session, now_ms),
             None => Vec::new(),
         }
     }

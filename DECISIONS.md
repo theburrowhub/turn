@@ -2179,3 +2179,76 @@ is in the retirement report; the load-bearing items are:
   or a crash-looping daemon becomes a hot reconnect loop. Plus the reason `welcome` carries
   `daemon_pid` + `daemon_started_ms`: the pair distinguishes "my socket blipped and every pty is where I
   left it" from "a different daemon is running", which need different recoveries.
+
+---
+
+<a id="adr-040"></a>
+## ADR-040 — One unified hierarchy, one main-checkout writer, background subagents
+
+**Status:** Accepted. Normative product correction. Amends only conflicting UI inventories and projections
+in ADR-017, ADR-032, ADR-033 and ADR-039. Their architectural decisions—daemon ownership, derived view
+models, append-only migrations and native egui/wgpu—remain in force.
+
+### Context
+
+The backend already models `Workspace → Session → ProcessNode`, but the native client projects only a
+flat list of Sessions and an optional, separate process view. That duplicates the product's hierarchy and
+makes an Agent appear to be a pane rather than a long-lived runtime entity. It also lets two Sessions start
+against one checkout without arbitration. For coding agents this is not merely untidy: two independent
+writers can change the same index, branch and files while each assumes exclusive control.
+
+A subagent is work, not a layout instruction. Automatically opening one spends screen space and focus on
+an event the parent produced, violating Turn's rule that the user decides what to view.
+
+### Decision
+
+The left sidebar is the single persistent navigation tree: Workspace → Session → Agent/Tool → child.
+Sessions are not duplicated in top tabs, bottom strips or a permanent overview, and Agents are not
+duplicated in a second persistent tree. The right side is an optional contextual inspector. The centre is
+only the user/template-chosen Layout.
+
+Every primary checkout has at most one active `exclusive_write` lease. A second Session must focus the
+owner, be technically read-only, or use an isolated worktree. Worktrees declare the shared resources they
+do not isolate.
+
+An AgentNode exists independently of any Pane and may have zero or many pane bindings. A subagent reported
+by its parent is inserted under that parent, preserving its declared name and relation confidence. It
+starts in the background, never opens a Pane, changes Layout, steals focus or resolves attention. `Space`
+opens a cheap Quick Preview; `Cmd+Enter` explicitly creates a temporary pane. Closing a pane never stops
+the agent.
+
+The full normative model, migration, events, API and wireframe are in
+`docs/UNIFIED_HIERARCHY_UPGRADE.md`.
+
+This ADR also amends ADR-036 narrowly. Activity Preview is not restored scrollback or a conversation
+summary: it is one short, provenance-labelled navigation status. Turn persists no raw PTY bytes or grid,
+redacts before write, keeps at most 20 preview snapshots per node and 2,000 globally, and may display a
+recovered preview only as stale until fresh activity arrives. ADR-036's rejection of terminal/scrollback
+persistence otherwise remains in force.
+
+### Alternatives considered
+
+**Keep separate Session and Agent navigators.** Rejected: identity, state and attention then have two
+persistent homes, and selection has ambiguous meaning.
+
+**Allow concurrent writers and show a warning.** Rejected: a warning does not prevent Git/index and file
+races. Isolation must be a daemon-owned invariant, not agent guidance.
+
+**Open every discovered child as a Pane.** Rejected: discovery is not user intent and a busy parent can
+destroy a carefully chosen Layout.
+
+**Make Pane the owner and reconstruct agents from open views.** Rejected: background work, restoration and
+attention all need an identity that survives with no view.
+
+### Consequences
+
+- Navigation reflects the domain directly at 3 or 30 Sessions; previews make background work legible
+  without rendering every terminal.
+- Session creation becomes a conflict-capable operation and clients must present explicit alternatives.
+- `ProcessNode.pane_id` migrates to a binding table; legacy single bindings remain readable through the
+  migration only.
+- UI selection, pane focus and attention are separate persisted concepts and require explicit tests.
+- A read-only Session needs OS/process enforcement where viable; model instructions alone are not a
+  security boundary.
+- Existing databases migrate conservatively: one recent active Session receives the main lease, other
+  same-checkout Sessions become read-only, and no process is relaunched or moved.

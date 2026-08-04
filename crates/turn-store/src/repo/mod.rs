@@ -12,6 +12,7 @@
 
 pub mod attention;
 pub mod event;
+pub mod hierarchy;
 pub mod node;
 pub mod session;
 pub mod settings;
@@ -20,6 +21,7 @@ pub mod workspace;
 
 pub use attention::AttentionRepo;
 pub use event::{EventRepo, PruneOutcome, Retention};
+pub use hierarchy::HierarchyRepo;
 pub use node::NodeRepo;
 pub use session::SessionRepo;
 pub use settings::SettingsRepo;

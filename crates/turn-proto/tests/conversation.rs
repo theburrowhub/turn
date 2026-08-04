@@ -86,7 +86,8 @@ fn session_with_blocked_agent() -> (Session, NodeId) {
         reason: AwaitingReason::Permission,
     });
     agent.pid = Some(4242);
-    agent.pane_id = Some(session.layout.panes()[0].id.clone());
+    session.layout.get_mut(&session.layout.panes()[0].id.clone()).unwrap().node_id =
+        Some(agent.id.clone());
     let node_id = session.tree.insert(agent);
     (session, node_id)
 }

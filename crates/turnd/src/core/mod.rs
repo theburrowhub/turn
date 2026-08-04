@@ -533,7 +533,6 @@ pub(crate) mod testing {
             );
             node.id = node_id.clone();
             node.pid = Some(pty.pid());
-            node.pane_id = Some(pane_id.clone());
             node.lifecycle = turn_core::state::Lifecycle::Alive;
 
             self.core.processes.insert(

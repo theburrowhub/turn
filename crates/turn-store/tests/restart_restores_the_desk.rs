@@ -51,7 +51,6 @@ fn seed(store: &Store) -> SessionId {
     agent.turn = Some(Turn::AwaitingUser {
         reason: AwaitingReason::Permission,
     });
-    agent.pane_id = Some(agent_pane.clone());
     agent.interaction_pending = true;
     if let Some(info) = agent.agent.as_mut() {
         info.external_id = Some("claude-thread-9f2c".into());

@@ -326,6 +326,11 @@ shown to the user verbatim and is never parsed. `detail` is for logs.
 
 ## 6. Requests — UI → daemon
 
+> **Protocol v3 upgrade in progress (ADR-040).** The canonical navigation surface is a unified Workspace
+> hierarchy, not independently rendered Workspace, Session and process lists. New Tree, Preview, Pane
+> binding and Lease operations are specified in `UNIFIED_HIERARCHY_UPGRADE.md`. Until the v3 types land,
+> the v2 endpoints below describe the legacy wire contract, not the accepted product navigation model.
+
 41 operations, tagged `op`. Every request carries a client-supplied `id`; the
 daemon echoes it untouched. Ids are client-supplied so the UI can key its pending
 map on something it already has, without a round trip to learn the key.

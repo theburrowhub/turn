@@ -1,8 +1,9 @@
 //! Sessions: the unit of work Turn is organised around.
 
 use crate::attention::AttentionPolicy;
-use crate::ids::{SessionId, TemplateId, WorkspaceId};
+use crate::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
 use crate::model::layout::Layout;
+use crate::model::hierarchy::SessionMode;
 use crate::model::node::SessionTree;
 use crate::state::DisplayState;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,14 @@ pub struct Session {
     pub name: String,
     pub note: Option<String>,
     pub cwd: String,
+    /// Checkout safety is a domain fact, never an instruction left to an agent.
+    #[serde(default)]
+    pub mode: SessionMode,
+    pub checkout_id: CheckoutId,
+    pub worktree_path: Option<String>,
+    /// Whether the platform launch guard for a read-only session is active.
+    #[serde(default)]
+    pub read_only_enforced: bool,
     pub env: Vec<(String, String)>,
     pub layout: Layout,
     #[serde(default)]
@@ -87,12 +96,19 @@ impl Session {
         layout: Layout,
         now_ms: i64,
     ) -> Self {
+        let checkout_id = CheckoutId::primary_for(&workspace_id);
         Self {
             id: SessionId::new(),
             workspace_id,
             name: name.into(),
             note: None,
             cwd: cwd.into(),
+            // A constructor cannot acquire a checkout lease. The daemon promotes
+            // this to MainCheckout only after the store grants one atomically.
+            mode: SessionMode::ReadOnly,
+            checkout_id,
+            worktree_path: None,
+            read_only_enforced: false,
             env: Vec::new(),
             layout,
             tree: SessionTree::new(),
@@ -154,6 +170,11 @@ impl Session {
         copy.created_ms = now_ms;
         copy.last_activity_ms = now_ms;
         copy.parent_session = Some(self.id.clone());
+        // A copy is useful immediately for review, but may not silently become a
+        // second writer against the same checkout. The daemon can later promote it
+        // after acquiring a lease, or create it in an isolated worktree.
+        copy.mode = SessionMode::ReadOnly;
+        copy.read_only_enforced = false;
         copy.favourite = false;
         copy.pinned = false;
         copy

@@ -46,6 +46,12 @@ its own promises", not "works".
 | M6 — The window | ~~Tauri shell, `xterm.js`~~ → native Rust on the GPU: sidebar, panes, queue, tree | **Reopened.** First version deleted (ADR-039); `turn-gui` is a spike, not a window |
 | M7 — First vertical | One real Session, one real Agent, end to end | **Not started.** Now blocked on M6: there is no client that can connect |
 | M8 — Hardening | Measurement, restore semantics, Linux parity, packaging | **Not started**; two CI boxes already green |
+| M9 — Unified hierarchy correction | ADR-040: write lease, AgentNode/View split, previews, one tree, restored Reviewer vertical | **In progress**; normative model and migration plan landed first |
+
+The M9 correction has priority over incompatible M6/M7 UI work. Its exit proof is the reproducible
+`Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
+Preview → temporary Pane → close without stop → restart and reattach` sequence in
+`docs/UNIFIED_HIERARCHY_UPGRADE.md`.
 
 ---
 

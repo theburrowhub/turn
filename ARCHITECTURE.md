@@ -1042,6 +1042,13 @@ testable without a test mutating process-global state every other test in the bi
 
 ### 6.3 The UI
 
+> **Normative correction (ADR-040).** The current paragraph-level inventory predates the unified hierarchy
+> upgrade. The target client has one persistent left tree containing Workspaces, Sessions, Agents, tools
+> and relevant child processes. It has no second Agent tree, permanent Session overview or permanent queue
+> navigator. The right side is a contextual inspector; AgentNodes and Pane bindings have independent
+> lifetimes. Domain, event, SQLite and protocol changes are specified in
+> `docs/UNIFIED_HIERARCHY_UPGRADE.md` and take precedence over conflicting text below.
+
 **Status: In progress.** `crates/turn-gui` is a **native window drawn on the GPU** — `eframe`/`egui` over
 `wgpu`, one binary named `turn`, no webview, no HTML and no TypeScript anywhere in the repository. The
 previous Tauri shell and TypeScript frontend were built, rejected by the product owner, and deleted; ADR-039

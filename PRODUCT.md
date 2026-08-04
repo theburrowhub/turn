@@ -80,7 +80,7 @@ being exhausting.
 These are load-bearing. Each one shows up as a constraint in the code, and each one has tests that
 exist specifically to stop a future change from quietly violating it.
 
-### 3.1 The Session is the unit of work
+### 3.1 Workspace is the navigation root; Session is the unit of work
 
 Not the tab, not the window, not the pane. A Session is one task or one run: a name in the user's own
 words, a working directory, a Layout of Panes, a process tree, an Attention policy and a history. It
@@ -91,6 +91,12 @@ not per-window. "The auth refactor needs me" is useful. "Pane 4 needs you" is no
 duplication a clear meaning: duplicating a Session copies the shape, the settings and the tags, and
 deliberately copies none of the live processes (`model::session::tests::duplicating_a_session_keeps_
 the_shape_and_drops_the_processes`).
+
+Navigation begins one level above it. The accepted hierarchy is Workspace → Session → Agent/Tool →
+Child, shown once in the left tree. A Workspace's primary checkout has one writing Session; concurrent
+work is read-only or isolated in a worktree. AgentNodes live independently from Panes, so a subagent can
+run, preview, ask for attention and finish without changing the centre Layout. ADR-040 and
+`docs/UNIFIED_HIERARCHY_UPGRADE.md` are normative where older UI wording conflicts.
 
 ### 3.2 Agents form a hierarchy, and Turn never invents one
 
@@ -240,9 +246,10 @@ requirement rather than an aspiration.
 
 **Application**
 - A daemon (`turnd`) that owns the ptys, so the UI can restart without killing the work.
-- A native desktop window, drawn on the GPU rather than in a webview (ADR-039): sidebar of Sessions ranked
-  by what needs the user, Panes showing a real terminal, the Attention Queue, the agent tree, an event log,
-  and a permission banner that the user answers.
+- A native desktop window, drawn on the GPU rather than in a webview (ADR-039): one unified Workspace tree
+  containing Sessions, Agents, tools and relevant processes; user-chosen Panes showing real terminals; a
+  logical Attention Queue reached through the tree/commands; an optional contextual inspector; and a
+  permission banner that the user answers (ADR-040).
 - SQLite persistence of Workspaces, Sessions, Layouts, Templates and event history.
 
 **Explicit non-goals inside the MVP**

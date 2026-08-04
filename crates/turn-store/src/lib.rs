@@ -64,7 +64,7 @@ pub use location::{DATABASE_FILE, DATA_DIR_ENV};
 pub use migrations::{Applied, LATEST_VERSION};
 pub use redact::{is_sensitive_key, REDACTED};
 pub use repo::{
-    AttentionRepo, EventRepo, NodeRepo, PruneOutcome, Retention, SessionRepo, SettingsRepo,
+    AttentionRepo, EventRepo, HierarchyRepo, NodeRepo, PruneOutcome, Retention, SessionRepo, SettingsRepo,
     TemplateRepo, WorkspaceRepo,
 };
 
@@ -238,6 +238,10 @@ impl Store {
 
     pub fn nodes(&self) -> NodeRepo<'_> {
         NodeRepo::new(&self.conn)
+    }
+
+    pub fn hierarchy(&self) -> HierarchyRepo<'_> {
+        HierarchyRepo::new(&self.conn)
     }
 
     pub fn templates(&self) -> TemplateRepo<'_> {

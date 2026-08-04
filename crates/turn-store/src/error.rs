@@ -55,6 +55,15 @@ pub enum StoreError {
     #[error("session {id} has no stored layout; the database is inconsistent")]
     MissingLayout { id: String },
 
+    /// Another unreconciled Session already owns the checkout. Structured fields
+    /// let the daemon build a typed conflict response rather than parse this text.
+    #[error("checkout {checkout_id} is held by session {owner_session_id} (lease {lease_id})")]
+    WriteLeaseHeld {
+        checkout_id: String,
+        owner_session_id: String,
+        lease_id: String,
+    },
+
     #[error("could not create the data directory {path}: {cause}")]
     DataDir {
         path: String,

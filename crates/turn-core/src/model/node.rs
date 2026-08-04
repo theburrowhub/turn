@@ -1,7 +1,11 @@
 //! Process and agent nodes, and the tree they form inside a session.
 
 use crate::event::AgentRef;
-use crate::ids::{NodeId, PaneId, SessionId};
+use crate::event::Confidence;
+use crate::ids::{NodeId, SessionId};
+use crate::model::hierarchy::{
+    ActivityPreview, AgentName, PreviewVisibility, Relationship, RelationshipKind,
+};
 use crate::state::{DisplayState, Lifecycle, Turn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,6 +73,8 @@ impl Relation {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub agent: AgentRef,
+    #[serde(default)]
+    pub name: AgentName,
     /// The agent's own conversation/thread id, used to resume it.
     pub external_id: Option<String>,
     /// Subagent type reported by the tool ("Explore", "code-reviewer").
@@ -118,9 +124,14 @@ pub struct ProcessNode {
     pub agent: Option<AgentInfo>,
     pub parent: Option<NodeId>,
     pub relation: Relation,
-    /// The pane currently showing this node, if any. A node can exist without a
-    /// pane — that is how background children stay visible in the tree.
-    pub pane_id: Option<PaneId>,
+    /// Typed edge plus the five-level confidence ladder. `relation` remains the
+    /// compact legacy projection used by old event paths; this is authoritative.
+    #[serde(default)]
+    pub relationship: Relationship,
+    #[serde(default)]
+    pub activity_preview: Option<ActivityPreview>,
+    #[serde(default)]
+    pub preview_visibility: PreviewVisibility,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     pub exit_code: Option<i32>,
@@ -156,7 +167,9 @@ impl ProcessNode {
             agent: None,
             parent: None,
             relation: Relation::Unknown,
-            pane_id: None,
+            relationship: Relationship::default(),
+            activity_preview: None,
+            preview_visibility: PreviewVisibility::Inherit,
             started_ms,
             ended_ms: None,
             exit_code: None,
@@ -174,7 +187,9 @@ impl ProcessNode {
     ) -> Self {
         let mut node = Self::process(session_id, NodeKind::Agent, command, cwd, started_ms);
         node.turn = Some(Turn::Idle);
-        node.agent = Some(AgentInfo::default());
+        let mut info = AgentInfo::default();
+        info.name = AgentName::fallback(node.title.clone());
+        node.agent = Some(info);
         node
     }
 
@@ -187,7 +202,19 @@ impl ProcessNode {
     pub fn link_to(&mut self, parent: NodeId, relation: Relation) {
         self.parent = Some(parent);
         self.relation = relation;
+        self.relationship = match relation {
+            Relation::Confirmed => Relationship {
+                kind: RelationshipKind::SpawnedBy,
+                confidence: Confidence::Explicit,
+            },
+            Relation::Inferred => Relationship {
+                kind: RelationshipKind::SpawnedBy,
+                confidence: Confidence::InferredHigh,
+            },
+            Relation::Unknown => Relationship::default(),
+        };
     }
+
 
     pub fn is_running(&self) -> bool {
         self.lifecycle.is_running()

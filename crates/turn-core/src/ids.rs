@@ -59,6 +59,18 @@ typed_id!(PaneId, "pane");
 typed_id!(TemplateId, "tpl");
 typed_id!(EventId, "evt");
 typed_id!(AttentionId, "attn");
+typed_id!(CheckoutId, "checkout");
+typed_id!(LeaseId, "lease");
+
+impl CheckoutId {
+    /// Stable identity for the checkout a Workspace was created with.
+    ///
+    /// A stable value matters during migration: opening an old database twice must
+    /// refer to the same checkout rather than minting a second identity each time.
+    pub fn primary_for(workspace: &WorkspaceId) -> Self {
+        Self::from_stored(format!("checkout_primary_{}", workspace.as_str()))
+    }
+}
 
 #[cfg(test)]
 mod tests {

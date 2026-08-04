@@ -117,7 +117,14 @@ impl Core {
                 "That process is still running",
             ));
         }
-        let Some(pane_id) = node.pane_id.clone() else {
+        let Some(pane_id) = self
+            .session(session_id)?
+            .layout
+            .panes()
+            .into_iter()
+            .find(|pane| pane.node_id.as_ref() == Some(node_id))
+            .map(|pane| pane.id.clone())
+        else {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
                 "Turn did not start this process, so it cannot start it again",

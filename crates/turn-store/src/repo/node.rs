@@ -12,16 +12,22 @@
 
 use crate::codec::{from_json, from_json_opt, from_tag, json, tag};
 use crate::error::{Result, StoreError};
-use crate::redact::redact_map;
-use rusqlite::{params, Connection, Row};
+use crate::redact::{redact_map, redact_secrets};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashSet;
-use turn_core::ids::{NodeId, PaneId, SessionId};
+use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::node::{AgentInfo, NodeKind, ProcessNode, Relation, SessionTree};
+use turn_core::model::{
+    AgentName, NameSource, PreviewVisibility, Relationship, RelationshipKind,
+};
+use turn_core::Confidence;
 use turn_core::state::{Lifecycle, Turn};
 
 const COLUMNS: &str = "id, session_id, seq, kind, title, command, args_json, cwd, pid, ppid, \
-     lifecycle_json, turn_json, agent_json, external_id, parent, relation, pane_id, started_ms, \
-     ended_ms, exit_code, env_highlights_json, interaction_pending";
+     lifecycle_json, turn_json, agent_json, external_id, parent, relation, pane_id, \
+     declared_name, display_name, name_source, name_confidence, user_renamed, \
+     relationship_kind, relationship_confidence, preview_visibility, activity_preview_json, \
+     started_ms, ended_ms, exit_code, env_highlights_json, interaction_pending";
 
 pub struct NodeRepo<'a> {
     conn: &'a Connection,
@@ -164,13 +170,38 @@ pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Re
         .as_ref()
         .and_then(|agent| agent.external_id.clone());
     let env = redact_map(&node.env_highlights);
+    let name = node.agent.as_ref().map(|agent| &agent.name);
+    let safe_preview = node.activity_preview.as_ref().map(|preview| {
+        let mut safe = preview.clone();
+        let redacted = redact_secrets(&safe.normalized_text);
+        if redacted != safe.normalized_text {
+            safe.normalized_text = redacted;
+            safe.contains_sensitive_data = true;
+            safe.redacted = true;
+        }
+        safe
+    });
+    let preview_json = safe_preview
+        .as_ref()
+        .map(|preview| json("activity preview", preview))
+        .transpose()?;
+    let previous_preview: Option<String> = conn
+        .query_row(
+            "SELECT activity_preview_json FROM process_nodes WHERE id = ?1",
+            params![node.id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
 
     conn.execute(
         "INSERT INTO process_nodes (id, session_id, seq, kind, title, command, args_json, cwd, \
              pid, ppid, lifecycle_json, turn_json, agent_json, external_id, parent, relation, \
-             pane_id, started_ms, ended_ms, exit_code, env_highlights_json, interaction_pending) \
+             pane_id, declared_name, display_name, name_source, name_confidence, user_renamed, \
+             relationship_kind, relationship_confidence, preview_visibility, activity_preview_json, \
+             started_ms, ended_ms, exit_code, env_highlights_json, interaction_pending) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22) \
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31) \
          ON CONFLICT(id) DO UPDATE SET \
              session_id = excluded.session_id, seq = excluded.seq, kind = excluded.kind, \
              title = excluded.title, command = excluded.command, args_json = excluded.args_json, \
@@ -178,7 +209,14 @@ pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Re
              lifecycle_json = excluded.lifecycle_json, turn_json = excluded.turn_json, \
              agent_json = excluded.agent_json, external_id = excluded.external_id, \
              parent = excluded.parent, relation = excluded.relation, \
-             pane_id = excluded.pane_id, started_ms = excluded.started_ms, \
+             pane_id = excluded.pane_id, declared_name = excluded.declared_name, \
+             display_name = excluded.display_name, name_source = excluded.name_source, \
+             name_confidence = excluded.name_confidence, user_renamed = excluded.user_renamed, \
+             relationship_kind = excluded.relationship_kind, \
+             relationship_confidence = excluded.relationship_confidence, \
+             preview_visibility = excluded.preview_visibility, \
+             activity_preview_json = excluded.activity_preview_json, \
+             started_ms = excluded.started_ms, \
              ended_ms = excluded.ended_ms, exit_code = excluded.exit_code, \
              env_highlights_json = excluded.env_highlights_json, \
              interaction_pending = excluded.interaction_pending",
@@ -202,7 +240,24 @@ pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Re
             external_id,
             node.parent.as_ref().map(|p| p.as_str()),
             tag("relation", &node.relation)?,
-            node.pane_id.as_ref().map(|p| p.as_str()),
+            Option::<&str>::None,
+            name.and_then(|name| name.declared_name.as_deref()),
+            name.map(|name| name.display_name.as_str()),
+            tag(
+                "agent name source",
+                &name.map(|name| name.source).unwrap_or(NameSource::Fallback),
+            )?,
+            tag(
+                "agent name confidence",
+                &name
+                    .map(|name| name.confidence)
+                    .unwrap_or(Confidence::Unknown),
+            )?,
+            name.is_some_and(|name| name.user_renamed),
+            tag("relationship kind", &node.relationship.kind)?,
+            tag("relationship confidence", &node.relationship.confidence)?,
+            tag("preview visibility", &node.preview_visibility)?,
+            preview_json,
             node.started_ms,
             node.ended_ms,
             node.exit_code,
@@ -211,6 +266,40 @@ pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Re
         ],
     )
     .map_err(|error| StoreError::from_write("process node", node.session_id.as_str(), error))?;
+
+    if previous_preview != preview_json {
+        if let Some(preview) = safe_preview {
+            conn.execute(
+                "INSERT INTO activity_previews (node_id, raw_source_sequence, normalized_text, \
+                     source_type, confidence, stable, contains_sensitive_data, redacted, created_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    node.id.as_str(),
+                    preview.raw_source_sequence.map(|value| value as i64),
+                    preview.normalized_text,
+                    tag("preview source", &preview.source)?,
+                    tag("preview confidence", &preview.confidence)?,
+                    preview.stable,
+                    preview.contains_sensitive_data,
+                    preview.redacted,
+                    preview.updated_ms,
+                ],
+            )?;
+            // A preview is navigation state, not scrollback. Bound both per node
+            // and globally so a noisy agent cannot grow the database forever.
+            conn.execute(
+                "DELETE FROM activity_previews WHERE node_id = ?1 AND id NOT IN ( \
+                     SELECT id FROM activity_previews WHERE node_id = ?1 \
+                     ORDER BY created_ms DESC, id DESC LIMIT 20)",
+                params![node.id.as_str()],
+            )?;
+            conn.execute(
+                "DELETE FROM activity_previews WHERE id NOT IN ( \
+                     SELECT id FROM activity_previews ORDER BY created_ms DESC, id DESC LIMIT 2000)",
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -239,11 +328,33 @@ pub(crate) fn build_tree(nodes: Vec<ProcessNode>) -> SessionTree {
 
 pub(crate) fn from_row(row: &Row<'_>) -> Result<ProcessNode> {
     let id: String = row.get("id")?;
+    let title: String = row.get("title")?;
+    let mut agent = from_json_opt::<AgentInfo>("agent info", &id, row.get("agent_json")?)?;
+    if let Some(info) = agent.as_mut() {
+        info.name = AgentName {
+            declared_name: row.get("declared_name")?,
+            display_name: row
+                .get::<_, Option<String>>("display_name")?
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| title.clone()),
+            source: from_tag::<NameSource>(
+                "agent name source",
+                &id,
+                &row.get::<_, String>("name_source")?,
+            )?,
+            confidence: from_tag::<Confidence>(
+                "agent name confidence",
+                &id,
+                &row.get::<_, String>("name_confidence")?,
+            )?,
+            user_renamed: row.get("user_renamed")?,
+        };
+    }
     Ok(ProcessNode {
         id: NodeId::from_stored(id.clone()),
         session_id: SessionId::from_stored(row.get::<_, String>("session_id")?),
         kind: from_tag::<NodeKind>("node kind", &id, &row.get::<_, String>("kind")?)?,
-        title: row.get("title")?,
+        title,
         command: row.get("command")?,
         args: from_json("node args", &id, &row.get::<_, String>("args_json")?)?,
         cwd: row.get("cwd")?,
@@ -255,14 +366,33 @@ pub(crate) fn from_row(row: &Row<'_>) -> Result<ProcessNode> {
             &row.get::<_, String>("lifecycle_json")?,
         )?,
         turn: from_json_opt::<Turn>("turn", &id, row.get("turn_json")?)?,
-        agent: from_json_opt::<AgentInfo>("agent info", &id, row.get("agent_json")?)?,
+        agent,
         parent: row
             .get::<_, Option<String>>("parent")?
             .map(NodeId::from_stored),
         relation: from_tag::<Relation>("relation", &id, &row.get::<_, String>("relation")?)?,
-        pane_id: row
-            .get::<_, Option<String>>("pane_id")?
-            .map(PaneId::from_stored),
+        relationship: Relationship {
+            kind: from_tag::<RelationshipKind>(
+                "relationship kind",
+                &id,
+                &row.get::<_, String>("relationship_kind")?,
+            )?,
+            confidence: from_tag::<Confidence>(
+                "relationship confidence",
+                &id,
+                &row.get::<_, String>("relationship_confidence")?,
+            )?,
+        },
+        activity_preview: from_json_opt(
+            "activity preview",
+            &id,
+            row.get("activity_preview_json")?,
+        )?,
+        preview_visibility: from_tag::<PreviewVisibility>(
+            "preview visibility",
+            &id,
+            &row.get::<_, String>("preview_visibility")?,
+        )?,
         started_ms: row.get("started_ms")?,
         ended_ms: row.get("ended_ms")?,
         exit_code: row.get("exit_code")?,
@@ -300,13 +430,13 @@ mod tests {
         });
         node.interaction_pending = true;
         node.args = vec!["--resume".into()];
-        node.pane_id = Some(PaneId::from_stored("pane_left"));
         node.agent = Some(AgentInfo {
             agent: AgentRef {
                 provider: Some("anthropic".into()),
                 tool: Some("claude-code".into()),
                 model: Some("opus".into()),
             },
+            name: AgentName::fallback("Claude Code"),
             external_id: Some("claude-abc123".into()),
             agent_type: None,
             current_task: Some("run the tests".into()),

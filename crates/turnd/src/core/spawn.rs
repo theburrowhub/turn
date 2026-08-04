@@ -146,7 +146,6 @@ impl Core {
         };
         node.title = title;
         node.args = user_args.clone();
-        node.pane_id = Some(pane_id.clone());
         if let Some(agent) = node.agent.as_mut() {
             agent.agent = AgentRef {
                 provider: Some(selection.adapter.provider().to_string()),

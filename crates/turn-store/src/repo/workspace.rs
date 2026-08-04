@@ -4,13 +4,13 @@ use crate::codec::{from_json, json};
 use crate::error::Result;
 use crate::redact::redact_pairs;
 use rusqlite::{params, Connection, Row};
-use turn_core::ids::{TemplateId, WorkspaceId};
+use turn_core::ids::{CheckoutId, TemplateId, WorkspaceId};
 use turn_core::model::Workspace;
 use turn_core::AttentionPolicy;
 
 const COLUMNS: &str = "id, name, root, git_remote, env_json, default_shell, default_agent, \
      init_commands_json, default_template, attention_json, colour, icon, created_ms, \
-     last_used_ms, tmux_enabled, archived";
+     last_used_ms, tmux_enabled, archived, lease_reconciliation_required";
 
 pub struct WorkspaceRepo<'a> {
     conn: &'a Connection,
@@ -28,11 +28,13 @@ impl<'a> WorkspaceRepo<'a> {
     /// passed in.
     pub fn save(&self, workspace: &Workspace) -> Result<()> {
         let env = redact_pairs(&workspace.env);
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO workspaces (id, name, root, git_remote, env_json, default_shell, \
                  default_agent, init_commands_json, default_template, attention_json, colour, \
-                 icon, created_ms, last_used_ms, tmux_enabled, archived) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+                 icon, created_ms, last_used_ms, tmux_enabled, archived, \
+                 lease_reconciliation_required) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
              ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, root = excluded.root, git_remote = excluded.git_remote, \
                  env_json = excluded.env_json, default_shell = excluded.default_shell, \
@@ -42,7 +44,8 @@ impl<'a> WorkspaceRepo<'a> {
                  attention_json = excluded.attention_json, colour = excluded.colour, \
                  icon = excluded.icon, created_ms = excluded.created_ms, \
                  last_used_ms = excluded.last_used_ms, tmux_enabled = excluded.tmux_enabled, \
-                 archived = excluded.archived",
+                 archived = excluded.archived, \
+                 lease_reconciliation_required = excluded.lease_reconciliation_required",
             params![
                 workspace.id.as_str(),
                 workspace.name,
@@ -60,8 +63,29 @@ impl<'a> WorkspaceRepo<'a> {
                 workspace.last_used_ms,
                 workspace.tmux_enabled,
                 workspace.archived,
+                workspace.lease_reconciliation_required,
             ],
         )?;
+        let canonical = std::fs::canonicalize(&workspace.root)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&workspace.root))
+            .to_string_lossy()
+            .to_string();
+        tx.execute(
+            "INSERT INTO workspace_checkouts \
+                 (id, workspace_id, path, canonical_path, branch, is_primary, \
+                  shared_resources_json, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 1, '[]', ?5) \
+             ON CONFLICT(id) DO UPDATE SET path = excluded.path, \
+                 canonical_path = excluded.canonical_path",
+            params![
+                CheckoutId::primary_for(&workspace.id).as_str(),
+                workspace.id.as_str(),
+                workspace.root,
+                canonical,
+                workspace.created_ms
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -156,6 +180,7 @@ fn from_row(row: &Row<'_>) -> Result<Workspace> {
         last_used_ms: row.get("last_used_ms")?,
         tmux_enabled: row.get("tmux_enabled")?,
         archived: row.get("archived")?,
+        lease_reconciliation_required: row.get("lease_reconciliation_required")?,
     })
 }
 

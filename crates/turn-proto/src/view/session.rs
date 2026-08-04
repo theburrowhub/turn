@@ -203,7 +203,7 @@ impl SessionDetails {
         Self {
             summary: SessionSummary::from_session(session, badge_count, muted, now_ms),
             layout: session.layout.clone(),
-            tree: TreeNodeView::flatten(&session.tree, now_ms),
+            tree: TreeNodeView::for_session(session, now_ms),
             attention: session.attention.clone(),
             env: session.env.clone(),
         }

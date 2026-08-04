@@ -1200,7 +1200,6 @@ mod tests {
         let mut agent = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
         agent.lifecycle = Lifecycle::Alive;
         agent.turn = Some(Turn::Active);
-        agent.pane_id = Some(pane_id.clone());
         let node_id = session.tree.insert(agent);
         pane.node_id = Some(node_id.clone());
         if let Some(slot) = session.layout.get_mut(&pane_id) {

@@ -53,7 +53,8 @@ pub struct TreeNodeView {
     pub needs_user: bool,
     pub interaction_pending: bool,
 
-    pub pane_id: Option<PaneId>,
+    /// Zero or more visual bindings. An empty list is the normal background state.
+    pub pane_ids: Vec<PaneId>,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     /// How long it has been running, or how long it ran.
@@ -92,7 +93,7 @@ impl TreeNodeView {
             severity: display_state.severity(),
             needs_user: display_state.demands_user(),
             interaction_pending: node.interaction_pending,
-            pane_id: node.pane_id.clone(),
+            pane_ids: Vec::new(),
             started_ms: node.started_ms,
             ended_ms: node.ended_ms,
             runtime_ms: node.runtime_ms(now_ms),
@@ -138,6 +139,22 @@ impl TreeNodeView {
         }
 
         out
+    }
+
+    /// Flattens a Session and projects its normalised Pane→Node bindings. The
+    /// ProcessNode deliberately carries no reverse pointer: a view is not part of
+    /// process identity and several Panes may show the same node.
+    pub fn for_session(session: &turn_core::model::Session, now_ms: i64) -> Vec<TreeNodeView> {
+        let mut rows = Self::flatten(&session.tree, now_ms);
+        for pane in session.layout.panes() {
+            let Some(node_id) = &pane.node_id else {
+                continue;
+            };
+            if let Some(row) = rows.iter_mut().find(|row| &row.node_id == node_id) {
+                row.pane_ids.push(pane.id.clone());
+            }
+        }
+        rows
     }
 }
 

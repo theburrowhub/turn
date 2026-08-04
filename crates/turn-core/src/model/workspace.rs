@@ -29,6 +29,10 @@ pub struct Workspace {
     /// Whether Turn may route this workspace's sessions through tmux.
     pub tmux_enabled: bool,
     pub archived: bool,
+    /// Set only for legacy state where Turn cannot prove which still-live Session
+    /// owns the primary checkout. No lease is granted until reconciled.
+    #[serde(default)]
+    pub lease_reconciliation_required: bool,
 }
 
 impl Workspace {
@@ -50,6 +54,7 @@ impl Workspace {
             last_used_ms: now_ms,
             tmux_enabled: false,
             archived: false,
+            lease_reconciliation_required: false,
         }
     }
 
