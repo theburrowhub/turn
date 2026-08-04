@@ -37,9 +37,10 @@ use crate::response::Response;
 /// bump it — nothing here uses `deny_unknown_fields`, so an older client ignores
 /// what it does not know and a newer client tolerates a daemon that omits it.
 ///
-/// **3** replaces the singular `TreeNodeView.pane_id` with `pane_ids` and adds the
-/// unified Workspace hierarchy/lease contracts. A v2 client would silently read a
-/// live node as having no pane, so this is deliberately not an additive rollout.
+/// **3** replaces the singular reverse Pane pointer with authoritative
+/// `pane_bindings` and adds the unified Workspace hierarchy/lease contracts. A
+/// v2 client would silently misread a live node's view bindings, so this is
+/// deliberately not an additive rollout.
 ///
 /// **2** is the version where a pane's screen became cells. `attach_pane` gained a
 /// `stream` field whose default is [`OutputEncoding`]-independent and is

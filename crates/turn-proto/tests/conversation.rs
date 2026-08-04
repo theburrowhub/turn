@@ -674,9 +674,12 @@ fn a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing() {
     assert_eq!(nodes[0].depth, 0);
     let confirmed = nodes.iter().find(|n| n.command == "explore").unwrap();
     let inferred = nodes.iter().find(|n| n.command == "cc").unwrap();
-    assert!(!confirmed.relation_is_provisional, "the tool reported it");
     assert!(
-        inferred.relation_is_provisional,
+        !confirmed.relationship_is_provisional,
+        "the tool reported it"
+    );
+    assert!(
+        inferred.relationship_is_provisional,
         "a process-table match is a guess and must be drawn as one"
     );
 }

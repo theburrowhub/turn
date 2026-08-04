@@ -13,15 +13,16 @@
 
 use serde::{Deserialize, Serialize};
 use turn_core::attention::Effect;
-use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::Layout;
+use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::model::{ActivityPreview, Layout, WorkspaceWriteLease};
 
 use crate::bytes::TerminalBytes;
 use crate::cells::Grid;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
 use crate::view::{
-    AttentionView, SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, WorkspaceSummary,
+    AttentionView, HierarchySnapshot, NodePaneView, PaneFocusView, SessionDetails, SessionSummary,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
 };
 
 /// What a client needs to rebuild a terminal on attach.
@@ -91,6 +92,20 @@ pub enum Response {
         workspace: WorkspaceSummary,
     },
 
+    /// Full replacement for the unified navigation projection.
+    Hierarchy {
+        snapshot: Box<HierarchySnapshot>,
+    },
+    /// The daemon-authoritative state for one surface after expand/select.
+    TreeState {
+        state: TreeSurfaceState,
+    },
+    WorkspaceWriteLease {
+        workspace_id: WorkspaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<WorkspaceWriteLease>,
+    },
+
     Sessions {
         sessions: Vec<SessionSummary>,
     },
@@ -146,6 +161,22 @@ pub enum Response {
     Node {
         node: Box<TreeNodeView>,
     },
+    PreviewHistory {
+        session_id: SessionId,
+        node_id: NodeId,
+        /// Newest last, bounded and already stable/redacted.
+        entries: Vec<ActivityPreview>,
+    },
+    /// One explicit temporary Pane binding. It never mutates saved Layout.
+    NodePane {
+        pane: NodePaneView,
+    },
+    /// `None` is the normal "this node has no existing Pane" outcome. The
+    /// request never opens one implicitly.
+    PaneFocus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<PaneFocusView>,
+    },
 
     /// The next demand, or `None` when the queue is empty.
     Attention {
@@ -173,6 +204,9 @@ impl Response {
             Response::Ack => "ack",
             Response::Workspaces { .. } => "workspaces",
             Response::Workspace { .. } => "workspace",
+            Response::Hierarchy { .. } => "hierarchy",
+            Response::TreeState { .. } => "tree_state",
+            Response::WorkspaceWriteLease { .. } => "workspace_write_lease",
             Response::Sessions { .. } => "sessions",
             Response::Session { .. } => "session",
             Response::SessionDetails { .. } => "session_details",
@@ -183,6 +217,9 @@ impl Response {
             Response::Screen { .. } => "screen",
             Response::Tree { .. } => "tree",
             Response::Node { .. } => "node",
+            Response::PreviewHistory { .. } => "preview_history",
+            Response::NodePane { .. } => "node_pane",
+            Response::PaneFocus { .. } => "pane_focus",
             Response::Attention { .. } => "attention",
             Response::AttentionList { .. } => "attention_list",
             Response::Effects { .. } => "effects",
@@ -195,6 +232,9 @@ impl Response {
         "ack",
         "workspaces",
         "workspace",
+        "hierarchy",
+        "tree_state",
+        "workspace_write_lease",
         "sessions",
         "session",
         "session_details",
@@ -205,6 +245,9 @@ impl Response {
         "screen",
         "tree",
         "node",
+        "preview_history",
+        "node_pane",
+        "pane_focus",
         "attention",
         "attention_list",
         "effects",
@@ -216,8 +259,9 @@ pub(crate) mod tests {
     use super::*;
     use crate::cells::Grid;
     use turn_core::attention::{DeferReason, Sound};
-    use turn_core::ids::{AttentionId, WorkspaceId};
-    use turn_core::model::{Pane, PaneKind, Session, Template};
+    use turn_core::event::Confidence;
+    use turn_core::ids::{AttentionId, CheckoutId, WorkspaceId};
+    use turn_core::model::{Pane, PaneKind, PaneNodeBinding, PreviewSource, Session, Template};
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -424,9 +468,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 16 result shapes. Asserted so adding one without documenting it in
+        // 22 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 16, "the response catalogue changed size");
+        assert_eq!(declared.len(), 22, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -438,6 +482,33 @@ pub(crate) mod tests {
             std::slice::from_ref(&summary),
         );
         let template = TemplateSummary::from_template(&Template::coding(T0));
+        let node_id = NodeId::from_stored("proc_a");
+        let pane_id = PaneId::from_stored("pane_node_a");
+        let lease = WorkspaceWriteLease::active(
+            s.workspace_id.clone(),
+            s.id.clone(),
+            CheckoutId::primary_for(&s.workspace_id),
+            T0,
+        );
+        let preview = ActivityPreview {
+            node_id: node_id.clone(),
+            raw_source_sequence: Some(11),
+            normalized_text: "Reviewing auth.rs".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: T0 + 1,
+        };
+        let binding = PaneNodeBinding {
+            pane_id: pane_id.clone(),
+            session_id: s.id.clone(),
+            node_id: node_id.clone(),
+            temporary: true,
+            surface_id: Some("window-a".into()),
+            opened_ms: T0 + 2,
+        };
 
         vec![
             Response::Ack,
@@ -445,6 +516,20 @@ pub(crate) mod tests {
                 workspaces: vec![workspace.clone()],
             },
             Response::Workspace { workspace },
+            Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot::empty("window-a", 7)),
+            },
+            Response::TreeState {
+                state: TreeSurfaceState {
+                    surface_id: "window-a".into(),
+                    selected: Some(crate::HierarchyKey::session(s.id.clone())),
+                    expanded: vec![crate::HierarchyKey::workspace(s.workspace_id.clone())],
+                },
+            },
+            Response::WorkspaceWriteLease {
+                workspace_id: s.workspace_id.clone(),
+                lease: Some(lease),
+            },
             Response::Sessions {
                 sessions: vec![summary.clone()],
             },
@@ -494,6 +579,25 @@ pub(crate) mod tests {
                     0,
                     T0,
                 )),
+            },
+            Response::PreviewHistory {
+                session_id: s.id.clone(),
+                node_id: node_id.clone(),
+                entries: vec![preview],
+            },
+            Response::NodePane {
+                pane: NodePaneView {
+                    binding,
+                    capability: crate::NodePaneCapability::PreviewDetails,
+                },
+            },
+            Response::PaneFocus {
+                focus: Some(PaneFocusView {
+                    surface_id: "window-a".into(),
+                    session_id: s.id.clone(),
+                    node_id,
+                    pane_id,
+                }),
             },
             Response::Attention { entry: None },
             Response::AttentionList {

@@ -143,6 +143,23 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
         pane_id: PaneId::from_stored("pane_a"),
     }
     .is_mutating());
+    assert!(!Request::GetHierarchy {
+        surface_id: "window-a".into(),
+        include_archived: false,
+    }
+    .is_mutating());
+    assert!(!Request::GetPreviewHistory {
+        session_id: session(),
+        node_id: node(),
+        limit: Some(20),
+    }
+    .is_mutating());
+    assert!(Request::SetTreeExpanded {
+        surface_id: "window-a".into(),
+        key: HierarchyKey::session(session()),
+        expanded: true,
+    }
+    .is_mutating());
     assert!(Request::GotoAttention { attention_id: None }.is_mutating());
     assert!(Request::KillNode {
         session_id: session(),
@@ -190,6 +207,27 @@ fn closing_requires_an_explicit_decision_about_the_processes() {
             disposition: CloseDisposition::KeepProcesses,
         }
     );
+}
+
+#[test]
+fn releasing_a_write_lease_requires_its_fencing_generation() {
+    let missing = serde_json::from_str::<Request>(
+        "{\"op\":\"release_workspace_write_lease\",\"workspace_id\":\"ws_a\",\
+         \"lease_id\":\"lease_a\"}",
+    );
+    assert!(
+        missing.is_err(),
+        "a stale client must not release a newer lease generation"
+    );
+
+    let request = Request::ReleaseWorkspaceWriteLease {
+        workspace_id: WorkspaceId::from_stored("ws_a"),
+        lease_id: LeaseId::from_stored("lease_a"),
+        expected_generation: 9,
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"expected_generation\":9"), "got {json}");
+    assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
 }
 
 /// The protocol has no way to say "approve that permission", and no way to say
@@ -285,6 +323,8 @@ pub(crate) fn all_requests() -> Vec<Request> {
     let pane_id = PaneId::from_stored("pane_req0001");
     let template_id = TemplateId::from_stored("tpl_req00001");
     let attention_id = AttentionId::from_stored("attn_req0001");
+    let checkout_id = CheckoutId::from_stored("checkout_req001");
+    let lease_id = LeaseId::from_stored("lease_req0001");
 
     vec![
         Request::ListWorkspaces {
@@ -310,6 +350,32 @@ pub(crate) fn all_requests() -> Vec<Request> {
             workspace_id: workspace_id.clone(),
             disposition: CloseDisposition::KeepProcesses,
         },
+        Request::GetHierarchy {
+            surface_id: "window-a".into(),
+            include_archived: false,
+        },
+        Request::SetTreeExpanded {
+            surface_id: "window-a".into(),
+            key: HierarchyKey::workspace(workspace_id.clone()),
+            expanded: true,
+        },
+        Request::SelectTreeNode {
+            surface_id: "window-a".into(),
+            selected: Some(HierarchyKey::process(node_id.clone())),
+        },
+        Request::GetWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+        },
+        Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: checkout_id.clone(),
+        },
+        Request::ReleaseWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            lease_id,
+            expected_generation: 4,
+        },
         Request::ListSessions {
             workspace_id: Some(workspace_id.clone()),
             include_archived: false,
@@ -321,6 +387,23 @@ pub(crate) fn all_requests() -> Vec<Request> {
             panes: Some(vec![NewPane::new(PaneKind::Agent).with_command("claude")]),
             note: None,
             tags: vec!["bug".into()],
+        },
+        Request::CreateReadOnlySession {
+            workspace_id: workspace_id.clone(),
+            name: "Review the change".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Agent).with_command("claude")]),
+            note: Some("No writes".into()),
+            tags: vec!["review".into()],
+        },
+        Request::CreateWorktreeSession {
+            workspace_id: workspace_id.clone(),
+            name: "Fix independently".into(),
+            branch: "turn/fix-independently".into(),
+            worktree_path: None,
+            panes: Some(vec![NewPane::new(PaneKind::Agent).with_command("codex")]),
+            note: None,
+            tags: vec!["isolated".into()],
         },
         Request::CreateSessionFromTemplate {
             workspace_id: workspace_id.clone(),
@@ -350,6 +433,11 @@ pub(crate) fn all_requests() -> Vec<Request> {
         },
         Request::GetProcessTree {
             session_id: session_id.clone(),
+        },
+        Request::GetPreviewHistory {
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            limit: Some(20),
         },
         Request::ListTemplates,
         Request::SaveLayoutAsTemplate {
@@ -388,6 +476,16 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::ZoomPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+        },
+        Request::OpenNodeAsTemporaryPane {
+            surface_id: "window-a".into(),
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+        },
+        Request::FocusPaneForNode {
+            surface_id: "window-a".into(),
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
         },
         Request::AttachPane {
             session_id: session_id.clone(),
@@ -477,7 +575,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 41 operations. This number is asserted so that adding one without
+    // 52 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 41, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 52, "the catalogue changed size: {names:?}");
 }

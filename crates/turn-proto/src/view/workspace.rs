@@ -17,6 +17,9 @@ pub struct WorkspaceSummary {
     pub colour: Option<String>,
     pub icon: Option<String>,
     pub archived: bool,
+    /// Legacy live state whose sole writer cannot yet be proven. No UI may
+    /// present the primary checkout as safely writable while this is true.
+    pub lease_reconciliation_required: bool,
 
     pub session_count: usize,
     /// Sessions inside this workspace that are blocked on the human. This is what
@@ -53,6 +56,7 @@ impl WorkspaceSummary {
             colour: workspace.colour.clone(),
             icon: workspace.icon.clone(),
             archived: workspace.archived,
+            lease_reconciliation_required: workspace.lease_reconciliation_required,
             session_count: mine.len(),
             sessions_needing_user: mine.iter().filter(|s| s.needs_user).count(),
             badge_count: mine.iter().map(|s| s.badge_count).sum(),

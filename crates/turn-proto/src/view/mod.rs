@@ -20,11 +20,16 @@
 //!   guess as a guess instead of promoting it to a fact.
 
 mod attention;
+mod hierarchy;
 mod session;
 mod tree;
 mod workspace;
 
 pub use attention::AttentionView;
+pub use hierarchy::{
+    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
+    SessionTreeView, TreeSurfaceState, WorkspaceTreeView,
+};
 pub use session::{AgentSummary, SessionDetails, SessionSummary};
 pub use tree::TreeNodeView;
 pub use workspace::{TemplateSummary, WorkspaceSummary};

@@ -13,15 +13,15 @@
 //!
 //! ```text
 //! UI                                             turnd
-//!  │  {"v":2,"type":"hello",…}                      │
+//!  │  {"v":3,"type":"hello",…}                      │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                    {"v":2,"type":"welcome",…}  │   negotiate()
+//!  │                    {"v":3,"type":"welcome",…}  │   negotiate()
 //!  │ ◄───────────────────────────────────────────── │
-//!  │  {"v":2,"type":"request","id":"r-1",…}         │
+//!  │  {"v":3,"type":"request","id":"r-1",…}         │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                   {"v":2,"type":"response",…}  │   correlated by id
+//!  │                   {"v":3,"type":"response",…}  │   correlated by id
 //!  │ ◄───────────────────────────────────────────── │
-//!  │                      {"v":2,"type":"event",…}  │   unsolicited, any time
+//!  │                      {"v":3,"type":"event",…}  │   unsolicited, any time
 //!  │ ◄───────────────────────────────────────────── │
 //! ```
 //!
@@ -98,7 +98,9 @@ pub use envelope::{
     Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome, MIN_PROTOCOL_VERSION,
     PROTOCOL_VERSION,
 };
-pub use error::{ErrorCode, ProtoError};
+pub use error::{
+    ErrorCode, ProtoError, ProtoErrorContext, SessionConflictAlternative, WriteLeaseOwnerView,
+};
 pub use events::{PaneRestoreOutcome, ServerEvent};
 pub use framing::{
     encode, encode_checked, encode_into, FrameError, LineDecoder, MAX_LINE_BYTES,
@@ -109,6 +111,7 @@ pub use request::{CloseDisposition, FocusTarget, NewPane, Request, RequestId};
 pub use response::{PaneAttachment, Response};
 pub use screen::{GridRow, PaneStream, ScreenUpdate};
 pub use view::{
-    AgentSummary, AttentionView, SessionDetails, SessionSummary, TemplateSummary, TreeNodeView,
-    WorkspaceSummary,
+    AgentSummary, AttentionView, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
+    PaneFocusView, SessionDetails, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
+    TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };

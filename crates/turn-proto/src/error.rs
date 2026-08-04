@@ -8,6 +8,60 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use turn_core::ids::{CheckoutId, LeaseId, SessionId, WorkspaceId};
+use turn_core::model::{SessionMode, WorkspaceWriteLease};
+
+/// The current writer shown when a main-checkout Session cannot be created or
+/// promoted. Kept smaller than a complete Session view so an error never leaks
+/// environment/configuration fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WriteLeaseOwnerView {
+    pub session_id: SessionId,
+    pub session_name: String,
+    pub mode: SessionMode,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub last_activity_ms: i64,
+}
+
+/// Safe next actions for a checkout conflict. The daemon supplies the set that
+/// is actually available; the UI does not parse an error string to invent it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionConflictAlternative {
+    FocusOwner,
+    CreateReadOnly,
+    CreateIsolatedWorktree,
+    Cancel,
+}
+
+/// Machine-readable detail for failures on which a client has a product flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProtoErrorContext {
+    /// Exactly one Session may own the primary checkout write lease. This shape
+    /// is also used when a stale/recovery-required owner must be reconciled; the
+    /// lease state tells the UI which explanation to show.
+    WorkspaceWriteLeaseConflict {
+        workspace_id: WorkspaceId,
+        checkout_id: CheckoutId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requesting_session_id: Option<SessionId>,
+        lease: Box<WorkspaceWriteLease>,
+        owner: Box<WriteLeaseOwnerView>,
+        alternatives: Vec<SessionConflictAlternative>,
+    },
+    /// Optimistic fencing rejected a client that retained an older generation.
+    /// The client must refresh the lease; it may not retry the stale release.
+    StaleLeaseGeneration {
+        workspace_id: WorkspaceId,
+        lease_id: LeaseId,
+        expected_generation: u64,
+        actual_generation: u64,
+    },
+}
 
 /// Machine-readable failure classes.
 ///
@@ -109,6 +163,10 @@ pub struct ProtoError {
     /// was not found. Never required for the UI to render something sensible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Typed context required to render a recovery flow. `detail` remains only
+    /// diagnostic text and must never be parsed for control flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Box<ProtoErrorContext>>,
 }
 
 impl ProtoError {
@@ -117,12 +175,30 @@ impl ProtoError {
             code,
             message: message.into(),
             detail: None,
+            context: None,
         }
     }
 
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
+    }
+
+    pub fn with_context(mut self, context: ProtoErrorContext) -> Self {
+        self.context = Some(Box::new(context));
+        self
+    }
+
+    pub fn workspace_write_lease_conflict(context: ProtoErrorContext) -> Self {
+        debug_assert!(matches!(
+            &context,
+            ProtoErrorContext::WorkspaceWriteLeaseConflict { .. }
+        ));
+        Self::new(
+            ErrorCode::Conflict,
+            "The primary checkout already has a write owner",
+        )
+        .with_context(context)
     }
 
     pub fn not_found(what: &str, id: &str) -> Self {
@@ -172,6 +248,7 @@ mod tests {
     fn an_error_without_detail_omits_the_field_rather_than_sending_null() {
         let json = serde_json::to_string(&ProtoError::invalid("bad delta")).unwrap();
         assert!(!json.contains("detail"), "got {json}");
+        assert!(!json.contains("context"), "got {json}");
     }
 
     #[test]
@@ -232,5 +309,66 @@ mod tests {
         let shown = error.to_string();
         assert!(shown.starts_with("[refused] Turn never approves"));
         assert!(shown.ends_with("(agent.permission_required)"));
+    }
+
+    #[test]
+    fn a_write_conflict_carries_owner_and_alternatives_as_typed_context() {
+        let workspace_id = WorkspaceId::from_stored("ws_a");
+        let checkout_id = CheckoutId::from_stored("checkout_a");
+        let owner_id = SessionId::from_stored("sess_owner");
+        let lease = WorkspaceWriteLease::active(
+            workspace_id.clone(),
+            owner_id.clone(),
+            checkout_id.clone(),
+            10,
+        );
+        let context = ProtoErrorContext::WorkspaceWriteLeaseConflict {
+            workspace_id,
+            checkout_id,
+            requesting_session_id: None,
+            lease: Box::new(lease),
+            owner: Box::new(WriteLeaseOwnerView {
+                session_id: owner_id,
+                session_name: "Fix auth".into(),
+                mode: SessionMode::MainCheckout,
+                cwd: "/repo".into(),
+                branch: Some("fix/auth".into()),
+                last_activity_ms: 12,
+            }),
+            alternatives: vec![
+                SessionConflictAlternative::FocusOwner,
+                SessionConflictAlternative::CreateReadOnly,
+                SessionConflictAlternative::CreateIsolatedWorktree,
+                SessionConflictAlternative::Cancel,
+            ],
+        };
+        let error = ProtoError::workspace_write_lease_conflict(context.clone());
+        let json = serde_json::to_string(&error).unwrap();
+
+        assert!(json.contains("\"kind\":\"workspace_write_lease_conflict\""));
+        assert!(json.contains("\"focus_owner\""));
+        assert!(json.contains("\"create_isolated_worktree\""));
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(error.context, Some(Box::new(context)));
+        assert_eq!(serde_json::from_str::<ProtoError>(&json).unwrap(), error);
+    }
+
+    #[test]
+    fn a_stale_fencing_generation_is_machine_readable() {
+        let error = ProtoError::new(
+            ErrorCode::Conflict,
+            "The write lease changed before it could be released",
+        )
+        .with_context(ProtoErrorContext::StaleLeaseGeneration {
+            workspace_id: WorkspaceId::from_stored("ws_a"),
+            lease_id: LeaseId::from_stored("lease_a"),
+            expected_generation: 4,
+            actual_generation: 5,
+        });
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"kind\":\"stale_lease_generation\""));
+        assert!(json.contains("\"expected_generation\":4"));
+        assert!(json.contains("\"actual_generation\":5"));
+        assert_eq!(serde_json::from_str::<ProtoError>(&json).unwrap(), error);
     }
 }

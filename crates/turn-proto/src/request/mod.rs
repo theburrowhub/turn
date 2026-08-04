@@ -21,13 +21,16 @@
 
 use serde::{Deserialize, Serialize};
 use turn_core::attention::UserContext;
-use turn_core::ids::{AttentionId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{
+    AttentionId, CheckoutId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
+};
 use turn_core::model::{Direction, PaneKind, RestoreBehaviour};
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
+use crate::view::HierarchyKey;
 
 /// A client-supplied correlation id.
 ///
@@ -162,6 +165,47 @@ pub enum Request {
         disposition: CloseDisposition,
     },
 
+    // ----------------------------------------------------------- unified tree
+    /// The complete Workspace -> Session -> Process projection for one window.
+    /// Also serves as the resync operation after a revision gap.
+    GetHierarchy {
+        surface_id: String,
+        #[serde(default)]
+        include_archived: bool,
+    },
+    /// Persists one expansion decision without broadcasting it to other windows.
+    SetTreeExpanded {
+        surface_id: String,
+        key: HierarchyKey,
+        expanded: bool,
+    },
+    /// Persists selection for one window. Selection does not focus a Pane or
+    /// resolve Attention. `None` clears a stale selection.
+    SelectTreeNode {
+        surface_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<HierarchyKey>,
+    },
+
+    // --------------------------------------------------------- checkout lease
+    GetWorkspaceWriteLease {
+        workspace_id: WorkspaceId,
+    },
+    /// Promotes an existing eligible Session only when the daemon can acquire
+    /// the lease atomically. A conflict returns typed owner/alternative context.
+    AcquireWorkspaceWriteLease {
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        checkout_id: CheckoutId,
+    },
+    ReleaseWorkspaceWriteLease {
+        workspace_id: WorkspaceId,
+        lease_id: LeaseId,
+        /// Fencing token returned by acquisition. A stale client may not release
+        /// a newer owner's generation even if it retained the lease id.
+        expected_generation: u64,
+    },
+
     // ------------------------------------------------------------------ sessions
     ListSessions {
         /// `None` lists every workspace's sessions, for the global view.
@@ -170,12 +214,44 @@ pub enum Request {
         #[serde(default)]
         include_archived: bool,
     },
+    /// Creates a main-checkout Session and acquires its exclusive write lease in
+    /// the same daemon transaction, before initialisation or Process launch. An
+    /// existing owner is a typed conflict, never a silent second writer.
     CreateSession {
         workspace_id: WorkspaceId,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         /// The panes to start with. `None` gives a single shell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panes: Option<Vec<NewPane>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+    },
+    /// The explicit safe alternative when the primary checkout already has a
+    /// writer. The daemon applies its technical write guard before launching.
+    CreateReadOnlySession {
+        workspace_id: WorkspaceId,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panes: Option<Vec<NewPane>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+    },
+    /// The explicit concurrent-writer alternative. The daemon creates and
+    /// records the checkout; it never reuses a caller-provided path silently.
+    CreateWorktreeSession {
+        workspace_id: WorkspaceId,
+        name: String,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         panes: Option<Vec<NewPane>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +298,15 @@ pub enum Request {
     /// pulling the layout it already has.
     GetProcessTree {
         session_id: SessionId,
+    },
+    /// Bounded stable/redacted facts for the Quick Preview overlay. Never raw
+    /// terminal bytes, terminal grids, scrollback or conversation history.
+    GetPreviewHistory {
+        session_id: SessionId,
+        node_id: NodeId,
+        /// The daemon clamps this to its protocol/store limit (currently 20).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u16>,
     },
 
     // ----------------------------------------------------------------- templates
@@ -270,6 +355,20 @@ pub enum Request {
     ZoomPane {
         session_id: SessionId,
         pane_id: PaneId,
+    },
+    /// Creates a surface-scoped binding without mutating the saved Layout or the
+    /// Process lifetime. A semantic-only node returns Preview/Details capability.
+    OpenNodeAsTemporaryPane {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    /// Chooses an existing binding for this surface. It never opens one
+    /// implicitly; an empty focus result is a normal outcome.
+    FocusPaneForNode {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
     },
 
     /// Subscribes to a pane's screen and returns the current one.
@@ -426,8 +525,16 @@ impl Request {
             Request::ArchiveWorkspace { .. } => "archive_workspace",
             Request::DuplicateWorkspace { .. } => "duplicate_workspace",
             Request::CloseWorkspace { .. } => "close_workspace",
+            Request::GetHierarchy { .. } => "get_hierarchy",
+            Request::SetTreeExpanded { .. } => "set_tree_expanded",
+            Request::SelectTreeNode { .. } => "select_tree_node",
+            Request::GetWorkspaceWriteLease { .. } => "get_workspace_write_lease",
+            Request::AcquireWorkspaceWriteLease { .. } => "acquire_workspace_write_lease",
+            Request::ReleaseWorkspaceWriteLease { .. } => "release_workspace_write_lease",
             Request::ListSessions { .. } => "list_sessions",
             Request::CreateSession { .. } => "create_session",
+            Request::CreateReadOnlySession { .. } => "create_read_only_session",
+            Request::CreateWorktreeSession { .. } => "create_worktree_session",
             Request::CreateSessionFromTemplate { .. } => "create_session_from_template",
             Request::RenameSession { .. } => "rename_session",
             Request::ArchiveSession { .. } => "archive_session",
@@ -435,6 +542,7 @@ impl Request {
             Request::CloseSession { .. } => "close_session",
             Request::GetSession { .. } => "get_session",
             Request::GetProcessTree { .. } => "get_process_tree",
+            Request::GetPreviewHistory { .. } => "get_preview_history",
             Request::ListTemplates => "list_templates",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
             Request::SplitPane { .. } => "split_pane",
@@ -443,6 +551,8 @@ impl Request {
             Request::FocusPane { .. } => "focus_pane",
             Request::SwapPanes { .. } => "swap_panes",
             Request::ZoomPane { .. } => "zoom_pane",
+            Request::OpenNodeAsTemporaryPane { .. } => "open_node_as_temporary_pane",
+            Request::FocusPaneForNode { .. } => "focus_pane_for_node",
             Request::AttachPane { .. } => "attach_pane",
             Request::ResyncPane { .. } => "resync_pane",
             Request::DetachPane { .. } => "detach_pane",
@@ -478,8 +588,16 @@ impl Request {
             | Request::DuplicateWorkspace { .. } => "workspace",
             Request::CloseWorkspace { .. } => "ack",
 
+            Request::GetHierarchy { .. } => "hierarchy",
+            Request::SetTreeExpanded { .. } | Request::SelectTreeNode { .. } => "tree_state",
+            Request::GetWorkspaceWriteLease { .. }
+            | Request::AcquireWorkspaceWriteLease { .. }
+            | Request::ReleaseWorkspaceWriteLease { .. } => "workspace_write_lease",
+
             Request::ListSessions { .. } => "sessions",
             Request::CreateSession { .. }
+            | Request::CreateReadOnlySession { .. }
+            | Request::CreateWorktreeSession { .. }
             | Request::CreateSessionFromTemplate { .. }
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }
@@ -487,6 +605,7 @@ impl Request {
             Request::CloseSession { .. } => "ack",
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
+            Request::GetPreviewHistory { .. } => "preview_history",
 
             Request::ListTemplates => "templates",
             Request::SaveLayoutAsTemplate { .. } => "template",
@@ -500,6 +619,8 @@ impl Request {
             | Request::FocusPane { .. }
             | Request::SwapPanes { .. }
             | Request::ZoomPane { .. } => "layout",
+            Request::OpenNodeAsTemporaryPane { .. } => "node_pane",
+            Request::FocusPaneForNode { .. } => "pane_focus",
             Request::AttachPane { .. } => "attached",
             Request::ResyncPane { .. } => "screen",
             Request::DetachPane { .. } => "ack",
@@ -534,9 +655,12 @@ impl Request {
         !matches!(
             self,
             Request::ListWorkspaces { .. }
+                | Request::GetHierarchy { .. }
+                | Request::GetWorkspaceWriteLease { .. }
                 | Request::ListSessions { .. }
                 | Request::GetSession { .. }
                 | Request::GetProcessTree { .. }
+                | Request::GetPreviewHistory { .. }
                 | Request::ListTemplates
                 | Request::NextAttention
                 | Request::ListAttention { .. }
@@ -558,6 +682,7 @@ impl Request {
             | Request::CloseSession { session_id, .. }
             | Request::GetSession { session_id }
             | Request::GetProcessTree { session_id }
+            | Request::GetPreviewHistory { session_id, .. }
             | Request::SaveLayoutAsTemplate { session_id, .. }
             | Request::SplitPane { session_id, .. }
             | Request::ClosePane { session_id, .. }
@@ -565,6 +690,8 @@ impl Request {
             | Request::FocusPane { session_id, .. }
             | Request::SwapPanes { session_id, .. }
             | Request::ZoomPane { session_id, .. }
+            | Request::OpenNodeAsTemporaryPane { session_id, .. }
+            | Request::FocusPaneForNode { session_id, .. }
             | Request::AttachPane { session_id, .. }
             | Request::ResyncPane { session_id, .. }
             | Request::DetachPane { session_id, .. }
@@ -576,6 +703,7 @@ impl Request {
             | Request::RelaunchNode { session_id, .. }
             | Request::MuteSession { session_id, .. }
             | Request::CorrectState { session_id, .. } => Some(session_id),
+            Request::AcquireWorkspaceWriteLease { session_id, .. } => Some(session_id),
             Request::ListAttention { session_id } => session_id.as_ref(),
             _ => None,
         }

@@ -13,13 +13,15 @@ use serde::{Deserialize, Serialize};
 use turn_core::attention::Effect;
 use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{Layout, RestoreState};
+use turn_core::model::{
+    ActivityPreview, Layout, PaneNodeBinding, RestoreState, WorkspaceWriteLease,
+};
 use turn_core::state::{DisplayState, Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::ScreenUpdate;
-use crate::view::{AttentionView, SessionSummary, TreeNodeView};
+use crate::view::{AttentionView, HierarchySnapshot, SessionSummary, TreeNodeView};
 
 /// What happened to one pane's process when a session was restored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +160,40 @@ pub enum ServerEvent {
         nodes: Vec<TreeNodeView>,
     },
 
+    /// Full replacement of the one navigation projection. The embedded
+    /// `surface_id` keeps expansion/selection private to that window. Structural
+    /// revision gaps are repaired with `get_hierarchy`, never guessed locally.
+    HierarchyChanged { snapshot: Box<HierarchySnapshot> },
+
+    /// Coalesced replacement of one node's compact semantic preview. The
+    /// hierarchy revision lets a client reject an update for a node it has not
+    /// yet learned about and request a full snapshot.
+    ActivityPreviewChanged {
+        hierarchy_revision: u64,
+        session_id: SessionId,
+        node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<ActivityPreview>,
+    },
+
+    /// Complete binding set for one node, not an add/remove delta. Pane closure
+    /// does not imply Process termination.
+    PaneBindingsChanged {
+        hierarchy_revision: u64,
+        session_id: SessionId,
+        node_id: NodeId,
+        bindings: Vec<PaneNodeBinding>,
+    },
+
+    /// Current lease replacement. `None` means no active lease; reconciliation
+    /// state still comes from the Workspace branch in a hierarchy snapshot.
+    WorkspaceWriteLeaseChanged {
+        hierarchy_revision: u64,
+        workspace_id: WorkspaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<WorkspaceWriteLease>,
+    },
+
     /// The pane arrangement changed for a reason the client did not ask for — a
     /// second client split a pane, or a pane's process ended and its pane closed.
     LayoutChanged {
@@ -202,6 +238,10 @@ impl ServerEvent {
             ServerEvent::AttentionEffect { .. } => "attention_effect",
             ServerEvent::AttentionQueueChanged { .. } => "attention_queue_changed",
             ServerEvent::TreeChanged { .. } => "tree_changed",
+            ServerEvent::HierarchyChanged { .. } => "hierarchy_changed",
+            ServerEvent::ActivityPreviewChanged { .. } => "activity_preview_changed",
+            ServerEvent::PaneBindingsChanged { .. } => "pane_bindings_changed",
+            ServerEvent::WorkspaceWriteLeaseChanged { .. } => "workspace_write_lease_changed",
             ServerEvent::LayoutChanged { .. } => "layout_changed",
             ServerEvent::PtyResized { .. } => "pty_resized",
             ServerEvent::RestoreResult { .. } => "restore_result",
@@ -218,6 +258,8 @@ impl ServerEvent {
             | ServerEvent::NodeStateChanged { session_id, .. }
             | ServerEvent::SessionRemoved { session_id, .. }
             | ServerEvent::TreeChanged { session_id, .. }
+            | ServerEvent::ActivityPreviewChanged { session_id, .. }
+            | ServerEvent::PaneBindingsChanged { session_id, .. }
             | ServerEvent::LayoutChanged { session_id, .. }
             | ServerEvent::PtyResized { session_id, .. }
             | ServerEvent::RestoreResult { session_id, .. } => Some(session_id),
@@ -225,6 +267,8 @@ impl ServerEvent {
             ServerEvent::TurnEventEmitted { turn_event } => Some(&turn_event.session_id),
             ServerEvent::AttentionEffect { effect } => Some(effect_session(effect)),
             ServerEvent::AttentionQueueChanged { .. } => None,
+            ServerEvent::HierarchyChanged { .. }
+            | ServerEvent::WorkspaceWriteLeaseChanged { .. } => None,
         }
     }
 

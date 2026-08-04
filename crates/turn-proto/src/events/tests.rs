@@ -5,8 +5,11 @@ use super::*;
 use crate::screen::ScreenUpdate;
 use turn_core::attention::{DeferReason, FocusDenial};
 use turn_core::event::{Confidence, EventKind, EventSource};
-use turn_core::ids::WorkspaceId;
-use turn_core::model::{Pane, PaneKind, ProcessNode, Relation, Session, SessionTree};
+use turn_core::ids::{CheckoutId, WorkspaceId};
+use turn_core::model::{
+    ActivityPreview, Pane, PaneKind, PaneNodeBinding, PreviewSource, ProcessNode, Relation,
+    Session, SessionTree, WorkspaceWriteLease,
+};
 use turn_core::state::AwaitingReason;
 
 const T0: i64 = 1_700_000_000_000;
@@ -204,7 +207,8 @@ fn a_subagent_appearing_pushes_the_whole_tree_with_its_confirmed_edge() {
     };
     let json = serde_json::to_string(&event).unwrap();
     assert!(json.contains("\"event\":\"tree_changed\""), "got {json}");
-    assert!(json.contains("\"relation\":\"confirmed\""));
+    assert!(json.contains("\"kind\":\"spawned_by\""));
+    assert!(json.contains("\"confidence\":\"explicit\""));
     assert_eq!(serde_json::from_str::<ServerEvent>(&json).unwrap(), event);
     assert_eq!(event.session_id(), Some(&s.id));
 }
@@ -322,6 +326,31 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
     let session_id = s.id.clone();
     let pane_id = s.layout.panes()[0].id.clone();
     let node_id = NodeId::from_stored("proc_evt0001");
+    let preview = ActivityPreview {
+        node_id: node_id.clone(),
+        raw_source_sequence: Some(4),
+        normalized_text: "Reviewing auth.rs".into(),
+        source: PreviewSource::SemanticEvent,
+        confidence: Confidence::Explicit,
+        stable: true,
+        contains_sensitive_data: false,
+        redacted: false,
+        updated_ms: T0 + 4,
+    };
+    let binding = PaneNodeBinding {
+        pane_id: PaneId::from_stored("pane_temp_evt"),
+        session_id: session_id.clone(),
+        node_id: node_id.clone(),
+        temporary: true,
+        surface_id: Some("window-a".into()),
+        opened_ms: T0 + 5,
+    };
+    let lease = WorkspaceWriteLease::active(
+        s.workspace_id.clone(),
+        session_id.clone(),
+        CheckoutId::primary_for(&s.workspace_id),
+        T0,
+    );
 
     vec![
         ServerEvent::PaneScreen {
@@ -393,6 +422,26 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
             session_id: session_id.clone(),
             nodes: Vec::new(),
         },
+        ServerEvent::HierarchyChanged {
+            snapshot: Box::new(crate::HierarchySnapshot::empty("window-a", 8)),
+        },
+        ServerEvent::ActivityPreviewChanged {
+            hierarchy_revision: 8,
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            preview: Some(preview),
+        },
+        ServerEvent::PaneBindingsChanged {
+            hierarchy_revision: 8,
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            bindings: vec![binding],
+        },
+        ServerEvent::WorkspaceWriteLeaseChanged {
+            hierarchy_revision: 8,
+            workspace_id: s.workspace_id.clone(),
+            lease: Some(lease),
+        },
         ServerEvent::LayoutChanged {
             session_id: session_id.clone(),
             layout: s.layout.clone(),
@@ -428,7 +477,7 @@ fn every_variant_is_covered_by_the_push_fixture() {
     );
     assert_eq!(
         names.len(),
-        13,
+        17,
         "the push catalogue changed size: {names:?}"
     );
 }

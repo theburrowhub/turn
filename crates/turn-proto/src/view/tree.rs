@@ -2,11 +2,15 @@
 //! about which edges are guesses.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{NodeKind, ProcessNode, Relation, SessionTree};
+use std::collections::{HashMap, HashSet};
+use turn_core::ids::{NodeId, SessionId};
+use turn_core::model::{
+    ActivityPreview, NodeKind, PaneNodeBinding, PreviewVisibility, ProcessNode, Relationship,
+    SessionTree,
+};
 use turn_core::state::{DisplayState, Lifecycle, Turn};
 
+use super::hierarchy::NodePaneCapability;
 use super::session::AgentSummary;
 
 /// One row of the agent/process tree.
@@ -21,12 +25,10 @@ pub struct TreeNodeView {
     pub node_id: NodeId,
     pub session_id: SessionId,
     pub parent: Option<NodeId>,
-    /// How the parent link was established.
-    pub relation: Relation,
-    /// Whether the UI must mark this edge as a guess. Derived from `relation` so
-    /// the rule lives in one place: a node reported by a tool is drawn as a fact,
-    /// a pid whose ppid happened to match is drawn as provisional.
-    pub relation_is_provisional: bool,
+    /// What the parent edge means and how confidently it was established.
+    pub relationship: Relationship,
+    /// Derived from the five-level confidence ladder; never guessed by the UI.
+    pub relationship_is_provisional: bool,
     /// Indentation level. Roots are 0.
     pub depth: usize,
     pub child_count: usize,
@@ -53,8 +55,19 @@ pub struct TreeNodeView {
     pub needs_user: bool,
     pub interaction_pending: bool,
 
-    /// Zero or more visual bindings. An empty list is the normal background state.
-    pub pane_ids: Vec<PaneId>,
+    /// The last stable, redacted semantic fact suitable for the navigation row.
+    /// This is never raw PTY output or restored conversation history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_preview: Option<ActivityPreview>,
+    pub preview_visibility: PreviewVisibility,
+
+    /// Zero or more visual bindings. An empty list is the normal background
+    /// state; it does not say that the Process is stopped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pane_bindings: Vec<PaneNodeBinding>,
+    /// What an explicit open action may render. It is independent of whether a
+    /// Pane is already bound.
+    pub pane_capability: NodePaneCapability,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     /// How long it has been running, or how long it ran.
@@ -74,8 +87,12 @@ impl TreeNodeView {
             node_id: node.id.clone(),
             session_id: node.session_id.clone(),
             parent: node.parent.clone(),
-            relation: node.relation,
-            relation_is_provisional: node.relation.is_provisional(),
+            relationship: node.relationship,
+            // A root has no edge to qualify. Unknown confidence is shown only on
+            // an actual parent relationship, never invented between Session and
+            // its structurally contained root Process.
+            relationship_is_provisional: node.parent.is_some()
+                && node.relationship.confidence.is_provisional(),
             depth,
             child_count,
             kind: node.kind,
@@ -93,7 +110,10 @@ impl TreeNodeView {
             severity: display_state.severity(),
             needs_user: display_state.demands_user(),
             interaction_pending: node.interaction_pending,
-            pane_ids: Vec::new(),
+            activity_preview: node.activity_preview.clone(),
+            preview_visibility: node.preview_visibility,
+            pane_bindings: Vec::new(),
+            pane_capability: NodePaneCapability::default(),
             started_ms: node.started_ms,
             ended_ms: node.ended_ms,
             runtime_ms: node.runtime_ms(now_ms),
@@ -141,17 +161,33 @@ impl TreeNodeView {
         out
     }
 
-    /// Flattens a Session and projects its normalised Pane→Node bindings. The
-    /// ProcessNode deliberately carries no reverse pointer: a view is not part of
-    /// process identity and several Panes may show the same node.
+    /// Legacy convenience projection when no binding/capability repository is
+    /// available. The rows remain honest: no Pane or attachable terminal is
+    /// invented from Layout alone.
     pub fn for_session(session: &turn_core::model::Session, now_ms: i64) -> Vec<TreeNodeView> {
+        Self::flatten(&session.tree, now_ms)
+    }
+
+    /// Projects a Session with the normalised Pane→Node records and runtime
+    /// capabilities supplied by the daemon. This is the constructor used by the
+    /// unified hierarchy; `pane_node_bindings` is authoritative in protocol v3.
+    pub fn for_session_with_panes(
+        session: &turn_core::model::Session,
+        bindings: &[PaneNodeBinding],
+        capabilities: &HashMap<NodeId, NodePaneCapability>,
+        now_ms: i64,
+    ) -> Vec<TreeNodeView> {
         let mut rows = Self::flatten(&session.tree, now_ms);
-        for pane in session.layout.panes() {
-            let Some(node_id) = &pane.node_id else {
-                continue;
-            };
-            if let Some(row) = rows.iter_mut().find(|row| &row.node_id == node_id) {
-                row.pane_ids.push(pane.id.clone());
+        for row in &mut rows {
+            row.pane_bindings = bindings
+                .iter()
+                .filter(|binding| {
+                    binding.session_id == session.id && binding.node_id == row.node_id
+                })
+                .cloned()
+                .collect();
+            if let Some(capability) = capabilities.get(&row.node_id) {
+                row.pane_capability = capability.clone();
             }
         }
         rows
@@ -194,7 +230,9 @@ fn push_subtree<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turn_core::ids::SessionId;
+    use turn_core::event::Confidence;
+    use turn_core::ids::{PaneId, SessionId};
+    use turn_core::model::{PreviewSource, Relation, RelationshipKind};
     use turn_core::state::AwaitingReason;
 
     const T0: i64 = 1_700_000_000_000;
@@ -232,9 +270,10 @@ mod tests {
 
         assert_eq!(rows[1].node_id, sub_id);
         assert_eq!(rows[1].depth, 1);
-        assert_eq!(rows[1].relation, Relation::Confirmed);
+        assert_eq!(rows[1].relationship.kind, RelationshipKind::SpawnedBy);
+        assert_eq!(rows[1].relationship.confidence, Confidence::Explicit);
         assert!(
-            !rows[1].relation_is_provisional,
+            !rows[1].relationship_is_provisional,
             "a tool-reported subagent is a fact, not a guess"
         );
         assert!(rows[1].is_agentic);
@@ -253,8 +292,9 @@ mod tests {
 
         let rows = TreeNodeView::flatten(&tree, T0);
         let row = rows.iter().find(|r| r.node_id == guessed_id).unwrap();
-        assert_eq!(row.relation, Relation::Inferred);
-        assert!(row.relation_is_provisional);
+        assert_eq!(row.relationship.kind, RelationshipKind::SpawnedBy);
+        assert_eq!(row.relationship.confidence, Confidence::InferredHigh);
+        assert!(row.relationship_is_provisional);
         assert!(row.turn.is_none(), "a test runner owes the user nothing");
         assert_eq!(row.display_state, DisplayState::Running);
     }
@@ -268,8 +308,12 @@ mod tests {
         let rows = TreeNodeView::flatten(&tree, T0);
         let row = rows.iter().find(|r| r.node_id == orphan_id).unwrap();
         assert_eq!(row.depth, 0);
-        assert_eq!(row.relation, Relation::Unknown);
-        assert!(row.relation_is_provisional);
+        assert_eq!(row.relationship.kind, RelationshipKind::Unknown);
+        assert_eq!(row.relationship.confidence, Confidence::Unknown);
+        assert!(
+            !row.relationship_is_provisional,
+            "a root has no parent edge to mark as provisional"
+        );
         assert_eq!(rows.len(), 3, "every process is accounted for");
     }
 
@@ -288,6 +332,10 @@ mod tests {
         assert!(
             rows[0].parent.is_some(),
             "but we do not pretend it had no parent"
+        );
+        assert!(
+            rows[0].relationship_is_provisional,
+            "the dangling parent edge remains an inferred edge"
         );
     }
 
@@ -442,9 +490,65 @@ mod tests {
         let (tree, _, _) = tree_with_confirmed_subagent();
         let rows = TreeNodeView::flatten(&tree, T0);
         let json = serde_json::to_string(&rows).unwrap();
-        assert!(json.contains("\"relation\":\"confirmed\""), "got {json}");
-        assert!(json.contains("\"relation_is_provisional\""));
+        assert!(json.contains("\"kind\":\"spawned_by\""), "got {json}");
+        assert!(json.contains("\"confidence\":\"explicit\""), "got {json}");
+        assert!(json.contains("\"relationship_is_provisional\""));
         let back: Vec<TreeNodeView> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rows);
+    }
+
+    #[test]
+    fn hierarchy_rows_project_preview_bindings_and_runtime_capability_without_coupling_lifetimes() {
+        let mut s = turn_core::model::Session::new(
+            turn_core::ids::WorkspaceId::from_stored("ws_tree0001"),
+            "Review",
+            "/repo",
+            turn_core::model::Layout::single(turn_core::model::Pane::new(
+                turn_core::model::PaneKind::Agent,
+            )),
+            T0,
+        );
+        let mut reviewer = ProcessNode::agent(s.id.clone(), "reviewer", "/repo", T0);
+        reviewer.activity_preview = Some(ActivityPreview {
+            node_id: reviewer.id.clone(),
+            raw_source_sequence: Some(7),
+            normalized_text: "Reviewing auth.rs".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: T0 + 10,
+        });
+        let node_id = s.tree.insert(reviewer);
+        let binding = PaneNodeBinding {
+            pane_id: PaneId::from_stored("pane_review"),
+            session_id: s.id.clone(),
+            node_id: node_id.clone(),
+            temporary: true,
+            surface_id: Some("window-a".into()),
+            opened_ms: T0 + 20,
+        };
+        let capabilities = HashMap::from([(
+            node_id.clone(),
+            NodePaneCapability::Terminal {
+                streams: vec![crate::PaneStream::Cells],
+            },
+        )]);
+
+        let rows = TreeNodeView::for_session_with_panes(
+            &s,
+            std::slice::from_ref(&binding),
+            &capabilities,
+            T0 + 30,
+        );
+
+        assert_eq!(
+            rows[0].activity_preview.as_ref().unwrap().normalized_text,
+            "Reviewing auth.rs"
+        );
+        assert_eq!(rows[0].pane_bindings, vec![binding]);
+        assert_eq!(rows[0].pane_capability, capabilities[&node_id]);
+        assert!(rows[0].pane_bindings[0].temporary);
     }
 }

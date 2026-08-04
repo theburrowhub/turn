@@ -3,9 +3,10 @@
 use serde::{Deserialize, Serialize};
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::AgentRef;
-use turn_core::ids::{NodeId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    Layout, PendingPermission, ProcessNode, RestoreState, Session, SessionStatus,
+    AgentName, Layout, PendingPermission, ProcessNode, RestoreState, Session, SessionMode,
+    SessionStatus,
 };
 use turn_core::state::{DisplayState, Turn};
 
@@ -20,6 +21,9 @@ use super::tree::TreeNodeView;
 pub struct AgentSummary {
     pub node_id: NodeId,
     pub agent: AgentRef,
+    /// Lossless naming metadata. A user rename changes `display_name` without
+    /// destroying a name explicitly declared by the parent agent/integration.
+    pub name: AgentName,
     /// The agent's own session/thread id, which is what a resume needs.
     pub external_id: Option<String>,
     /// Subagent type as the tool reported it ("Explore", "code-reviewer").
@@ -48,6 +52,7 @@ impl AgentSummary {
         Some(Self {
             node_id: node.id.clone(),
             agent: info.agent.clone(),
+            name: info.name.clone(),
             external_id: info.external_id.clone(),
             agent_type: info.agent_type.clone(),
             turn: node.turn.clone().unwrap_or(Turn::Unknown),
@@ -74,6 +79,14 @@ pub struct SessionSummary {
     pub note: Option<String>,
     pub cwd: String,
     pub status: SessionStatus,
+
+    /// Checkout safety is visible product state. A client must never infer write
+    /// authority from the path or from whether a terminal happens to be focused.
+    pub mode: SessionMode,
+    pub checkout_id: CheckoutId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    pub read_only_enforced: bool,
 
     /// The flattened state, from [`DisplayState::derive`] over the session's
     /// process tree. The UI renders this; it never computes it.
@@ -137,6 +150,10 @@ impl SessionSummary {
             note: session.note.clone(),
             cwd: session.cwd.clone(),
             status: session.status,
+            mode: session.mode,
+            checkout_id: session.checkout_id.clone(),
+            worktree_path: session.worktree_path.clone(),
+            read_only_enforced: session.read_only_enforced,
             display_state,
             state_label: display_state.label().to_string(),
             severity: display_state.severity(),
