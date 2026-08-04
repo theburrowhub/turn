@@ -357,11 +357,7 @@ fn from_row(row: &Row<'_>) -> Result<Session> {
         name: row.get("name")?,
         note: row.get("note")?,
         cwd: row.get("cwd")?,
-        mode: from_tag::<SessionMode>(
-            "session mode",
-            &id,
-            &row.get::<_, String>("mode")?,
-        )?,
+        mode: from_tag::<SessionMode>("session mode", &id, &row.get::<_, String>("mode")?)?,
         checkout_id: row
             .get::<_, Option<String>>("checkout_id")?
             .map(CheckoutId::from_stored)

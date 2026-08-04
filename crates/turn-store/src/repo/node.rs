@@ -17,11 +17,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashSet;
 use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::node::{AgentInfo, NodeKind, ProcessNode, Relation, SessionTree};
-use turn_core::model::{
-    AgentName, NameSource, PreviewVisibility, Relationship, RelationshipKind,
-};
-use turn_core::Confidence;
+use turn_core::model::{AgentName, NameSource, PreviewVisibility, Relationship, RelationshipKind};
 use turn_core::state::{Lifecycle, Turn};
+use turn_core::Confidence;
 
 const COLUMNS: &str = "id, session_id, seq, kind, title, command, args_json, cwd, pid, ppid, \
      lifecycle_json, turn_json, agent_json, external_id, parent, relation, pane_id, \
