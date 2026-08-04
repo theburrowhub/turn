@@ -2,7 +2,7 @@
 
 use crate::codec::{from_tag, tag};
 use crate::error::{Result, StoreError};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, TreeUiState,
@@ -40,22 +40,37 @@ impl<'a> HierarchyRepo<'a> {
         checkout: &CheckoutId,
         now_ms: i64,
     ) -> Result<WorkspaceWriteLease> {
-        let tx = self.conn.unchecked_transaction()?;
-        let canonical: String = tx.query_row(
-            "SELECT canonical_path FROM workspace_checkouts \
-             WHERE id = ?1 AND workspace_id = ?2",
-            params![checkout.as_str(), workspace.as_str()],
-            |row| row.get(0),
-        )?;
+        // `IMMEDIATE` serialises the read-check-generation-write sequence across
+        // daemon processes. The global partial unique index remains the final
+        // arbiter, but no contender can read a generation that another writer is
+        // concurrently about to consume.
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let canonical: Option<String> = tx
+            .query_row(
+                "SELECT c.canonical_path \
+                 FROM sessions s \
+                 JOIN workspace_checkouts c ON c.workspace_id = s.workspace_id \
+                 WHERE s.id = ?1 AND s.workspace_id = ?2 \
+                   AND c.id = ?3 AND c.workspace_id = ?2",
+                params![session.as_str(), workspace.as_str(), checkout.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(canonical) = canonical else {
+            return Err(StoreError::InvalidLeaseOwnership {
+                workspace_id: workspace.to_string(),
+                session_id: session.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        };
 
         let held: Option<WorkspaceWriteLease> = tx
             .query_row(
                 "SELECT l.id, l.workspace_id, l.session_id, l.checkout_id, l.mode, l.state, \
                         l.acquired_ms, l.heartbeat_ms, l.released_ms, l.generation \
                  FROM workspace_write_leases l \
-                 JOIN workspace_checkouts c ON c.id = l.checkout_id \
-                 WHERE c.canonical_path = ?1 AND l.state != 'released' LIMIT 1",
-                params![canonical],
+                 WHERE l.canonical_path = ?1 AND l.state != 'released' LIMIT 1",
+                params![&canonical],
                 lease_from_row,
             )
             .optional()?;
@@ -70,12 +85,21 @@ impl<'a> HierarchyRepo<'a> {
             });
         }
 
+        let changed = tx.execute(
+            "UPDATE checkout_write_fences SET generation = generation + 1 \
+             WHERE canonical_path = ?1",
+            params![&canonical],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidLeaseOwnership {
+                workspace_id: workspace.to_string(),
+                session_id: session.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        }
         let generation: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(l.generation), 0) + 1 \
-             FROM workspace_write_leases l \
-             JOIN workspace_checkouts c ON c.id = l.checkout_id \
-             WHERE c.canonical_path = ?1",
-            params![canonical],
+            "SELECT generation FROM checkout_write_fences WHERE canonical_path = ?1",
+            params![&canonical],
             |row| row.get(0),
         )?;
         let mut lease = WorkspaceWriteLease::active(
@@ -87,14 +111,15 @@ impl<'a> HierarchyRepo<'a> {
         lease.generation = generation as u64;
         tx.execute(
             "INSERT INTO workspace_write_leases \
-                 (id, workspace_id, session_id, checkout_id, mode, state, acquired_ms, \
-                  heartbeat_ms, released_ms, generation) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                 (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                  acquired_ms, heartbeat_ms, released_ms, generation) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
             params![
                 lease.id.as_str(),
                 lease.workspace_id.as_str(),
                 lease.session_id.as_str(),
                 lease.checkout_id.as_str(),
+                canonical,
                 tag("lease mode", &lease.mode)?,
                 tag("lease state", &lease.state)?,
                 lease.acquired_ms,
@@ -146,12 +171,21 @@ impl<'a> HierarchyRepo<'a> {
         )? > 0)
     }
 
-    pub fn release_lease_for_session(&self, session: &SessionId, now_ms: i64) -> Result<bool> {
-        Ok(self.conn.execute(
-            "UPDATE workspace_write_leases SET state = 'released', released_ms = ?2, \
-                    heartbeat_ms = ?2 WHERE session_id = ?1 AND state != 'released'",
-            params![session.as_str(), now_ms],
-        )? > 0)
+    /// Releases exactly the lease generation the caller observed.
+    ///
+    /// Addressing a Session alone is not fencing: after a handoff, a stale caller
+    /// could release the new owner's lease. Both the immutable lease id and its
+    /// monotonic checkout generation must match.
+    pub fn release_write_lease(&self, id: &LeaseId, generation: u64, now_ms: i64) -> Result<bool> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE workspace_write_leases SET state = 'released', released_ms = ?3, \
+                    heartbeat_ms = ?3 \
+             WHERE id = ?1 AND generation = ?2 AND state != 'released'",
+            params![id.as_str(), generation as i64, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn assign_read_only(&self, session: &SessionId, enforced: bool) -> Result<bool> {
@@ -345,10 +379,28 @@ fn preview_from_row(row: &Row<'_>) -> rusqlite::Result<ActivityPreview> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing;
-    use turn_core::model::{HierarchyNodeKind, ProcessNode};
+    use crate::{testing, Store};
+    use std::path::Path;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use turn_core::model::{HierarchyNodeKind, ProcessNode, Session, Workspace};
 
     const T0: i64 = 1_700_000_000_000;
+
+    fn saved_workspace_at(store: &Store, name: &str, root: &Path) -> Workspace {
+        let workspace = Workspace::new(name, root.to_string_lossy(), T0);
+        store.workspaces().save(&workspace).unwrap();
+        workspace
+    }
+
+    fn saved_alias_pair(store: &Store, root: &Path) -> [(Workspace, Session, CheckoutId); 2] {
+        ["first", "second"].map(|name| {
+            let workspace = saved_workspace_at(store, name, root);
+            let session = testing::saved_session(store, &workspace.id, name);
+            let checkout = CheckoutId::primary_for(&workspace.id);
+            (workspace, session, checkout)
+        })
+    }
 
     #[test]
     fn only_one_session_can_hold_a_checkout_and_release_is_explicit() {
@@ -369,13 +421,279 @@ mod tests {
         assert!(matches!(error, StoreError::WriteLeaseHeld { .. }));
         assert!(store
             .hierarchy()
-            .release_lease_for_session(&first.id, T0 + 2)
+            .release_write_lease(&lease.id, lease.generation, T0 + 2)
             .unwrap());
         let second_lease = store
             .hierarchy()
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_release_a_newer_lease() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "fenced-release");
+        let first = testing::saved_session(&store, &workspace.id, "first");
+        let second = testing::saved_session(&store, &workspace.id, "second");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+
+        let old = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &first.id, &checkout, T0)
+            .unwrap();
+        assert!(!store
+            .hierarchy()
+            .release_write_lease(&old.id, old.generation + 1, T0 + 1)
+            .unwrap());
+        assert_eq!(
+            store
+                .hierarchy()
+                .active_lease(&workspace.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            old.id
+        );
+
+        assert!(store
+            .hierarchy()
+            .release_write_lease(&old.id, old.generation, T0 + 2)
+            .unwrap());
+        let current = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
+            .unwrap();
+        assert!(current.generation > old.generation);
+
+        assert!(!store
+            .hierarchy()
+            .release_write_lease(&current.id, old.generation, T0 + 4)
+            .unwrap());
+        assert_eq!(
+            store
+                .hierarchy()
+                .active_lease(&workspace.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            current.id,
+            "a stale fence must leave the current owner's claim intact"
+        );
+    }
+
+    #[test]
+    fn lease_ownership_rejects_cross_workspace_session_and_checkout_ids() {
+        let store = testing::store();
+        let a = testing::saved_workspace(&store, "ownership-a");
+        let b = testing::saved_workspace(&store, "ownership-b");
+        let session_a = testing::saved_session(&store, &a.id, "session-a");
+        let session_b = testing::saved_session(&store, &b.id, "session-b");
+        let checkout_a = CheckoutId::primary_for(&a.id);
+        let checkout_b = CheckoutId::primary_for(&b.id);
+
+        for error in [
+            store
+                .hierarchy()
+                .acquire_write_lease(&a.id, &session_b.id, &checkout_a, T0)
+                .unwrap_err(),
+            store
+                .hierarchy()
+                .acquire_write_lease(&a.id, &session_a.id, &checkout_b, T0)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, StoreError::InvalidLeaseOwnership { .. }));
+        }
+
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_write_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a rejected ownership tuple writes no partial lease"
+        );
+    }
+
+    #[test]
+    fn concurrent_aliasing_workspaces_have_one_global_winner() {
+        #[derive(Debug)]
+        enum Outcome {
+            Acquired(u64),
+            Held,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("turn.db");
+        let checkout_root = temp.path().join("same-checkout");
+        std::fs::create_dir(&checkout_root).unwrap();
+
+        let setup = Store::open_at(&database).unwrap();
+        let [first, second] = saved_alias_pair(&setup, &checkout_root);
+        drop(setup);
+
+        let stores = [
+            Store::open_at(&database).unwrap(),
+            Store::open_at(&database).unwrap(),
+        ];
+        let barrier = Arc::new(Barrier::new(2));
+        let contenders = [first, second]
+            .into_iter()
+            .zip(stores)
+            .map(|((workspace, session, checkout), store)| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    match store.hierarchy().acquire_write_lease(
+                        &workspace.id,
+                        &session.id,
+                        &checkout,
+                        T0,
+                    ) {
+                        Ok(lease) => Outcome::Acquired(lease.generation),
+                        Err(StoreError::WriteLeaseHeld { .. }) => Outcome::Held,
+                        Err(error) => panic!("unexpected contender failure: {error}"),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let outcomes: Vec<Outcome> = contenders
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Outcome::Acquired(_)))
+                .count(),
+            1,
+            "exactly one canonical checkout writer: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Outcome::Held))
+                .count(),
+            1,
+            "the loser receives the current owner, not a SQLite race: {outcomes:?}"
+        );
+        assert!(outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Acquired(generation) if *generation == 1)));
+
+        let check = Store::open_at(&database).unwrap();
+        let active: i64 = check
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_write_leases WHERE state != 'released'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn canonical_generation_survives_a_cross_workspace_handoff() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout_root = temp.path().join("same-checkout");
+        std::fs::create_dir(&checkout_root).unwrap();
+        let store = testing::store();
+        let [first, second] = saved_alias_pair(&store, &checkout_root);
+
+        let old = store
+            .hierarchy()
+            .acquire_write_lease(&first.0.id, &first.1.id, &first.2, T0)
+            .unwrap();
+        assert!(store
+            .hierarchy()
+            .release_write_lease(&old.id, old.generation, T0 + 1)
+            .unwrap());
+        let current = store
+            .hierarchy()
+            .acquire_write_lease(&second.0.id, &second.1.id, &second.2, T0 + 2)
+            .unwrap();
+        assert_eq!(current.generation, old.generation + 1);
+    }
+
+    #[test]
+    fn the_global_unique_index_is_the_final_claim_arbiter() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout_root = temp.path().join("same-checkout");
+        std::fs::create_dir(&checkout_root).unwrap();
+        let store = testing::store();
+        let [first, second] = saved_alias_pair(&store, &checkout_root);
+
+        store
+            .hierarchy()
+            .acquire_write_lease(&first.0.id, &first.1.id, &first.2, T0)
+            .unwrap();
+        let canonical = store
+            .hierarchy()
+            .primary_checkout(&second.0.id)
+            .unwrap()
+            .unwrap()
+            .canonical_path;
+        let competing_id = LeaseId::new();
+        let error = store
+            .connection()
+            .execute(
+                "INSERT INTO workspace_write_leases \
+                     (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                      acquired_ms, heartbeat_ms, released_ms, generation) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'exclusive_write', 'active', ?6, ?6, NULL, 2)",
+                params![
+                    competing_id.as_str(),
+                    second.0.id.as_str(),
+                    second.1.id.as_str(),
+                    second.2.as_str(),
+                    canonical,
+                    T0 + 1,
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ));
+    }
+
+    #[test]
+    fn the_schema_allows_only_one_primary_checkout_per_workspace() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "one-primary");
+        let other_path = "/repos/one-primary-other";
+        store
+            .connection()
+            .execute(
+                "INSERT INTO checkout_write_fences (canonical_path, generation) VALUES (?1, 0)",
+                params![other_path],
+            )
+            .unwrap();
+        let error = store
+            .connection()
+            .execute(
+                "INSERT INTO workspace_checkouts \
+                     (id, workspace_id, path, canonical_path, branch, is_primary, \
+                      shared_resources_json, created_ms) \
+                 VALUES (?1, ?2, ?3, ?3, NULL, 1, '[]', ?4)",
+                params![
+                    CheckoutId::new().as_str(),
+                    workspace.id.as_str(),
+                    other_path,
+                    T0
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ));
     }
 
     #[test]

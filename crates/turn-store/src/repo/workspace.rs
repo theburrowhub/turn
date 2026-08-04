@@ -70,6 +70,14 @@ impl<'a> WorkspaceRepo<'a> {
             .unwrap_or_else(|_| std::path::PathBuf::from(&workspace.root))
             .to_string_lossy()
             .to_string();
+        // The fence is global and deliberately outlives a Workspace. A second
+        // Workspace aliasing this checkout reuses the same counter rather than
+        // minting a competing lease namespace.
+        tx.execute(
+            "INSERT INTO checkout_write_fences (canonical_path, generation) \
+             VALUES (?1, 0) ON CONFLICT(canonical_path) DO NOTHING",
+            params![canonical],
+        )?;
         tx.execute(
             "INSERT INTO workspace_checkouts \
                  (id, workspace_id, path, canonical_path, branch, is_primary, \

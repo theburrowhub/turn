@@ -64,6 +64,18 @@ pub enum StoreError {
         lease_id: String,
     },
 
+    /// The requested Session or Checkout does not belong to the named Workspace.
+    /// Keeping all three ids makes the programming error diagnosable without
+    /// weakening it into a generic missing-row response.
+    #[error(
+        "session {session_id} and checkout {checkout_id} are not both owned by workspace {workspace_id}"
+    )]
+    InvalidLeaseOwnership {
+        workspace_id: String,
+        session_id: String,
+        checkout_id: String,
+    },
+
     #[error("could not create the data directory {path}: {cause}")]
     DataDir {
         path: String,

@@ -327,22 +327,37 @@ SET display_name = title,
         ELSE 'unknown'
     END;
 
+-- A canonical checkout keeps its fencing generation even if every Workspace
+-- pointing at it is later deleted. Reusing a generation would let a stale helper
+-- from the old Workspace look current again.
+CREATE TABLE checkout_write_fences (
+    canonical_path TEXT PRIMARY KEY,
+    generation     INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0)
+) STRICT;
+
 CREATE TABLE workspace_checkouts (
     id                    TEXT PRIMARY KEY,
     workspace_id          TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     path                  TEXT NOT NULL,
-    canonical_path        TEXT NOT NULL,
+    canonical_path        TEXT NOT NULL REFERENCES checkout_write_fences(canonical_path),
     branch                TEXT,
-    is_primary            INTEGER NOT NULL,
+    is_primary            INTEGER NOT NULL CHECK(is_primary IN (0, 1)),
     shared_resources_json TEXT NOT NULL DEFAULT '[]',
     created_ms            INTEGER NOT NULL,
+    UNIQUE(workspace_id, id),
     UNIQUE(workspace_id, canonical_path)
 ) STRICT;
 
 CREATE INDEX idx_checkouts_canonical_path ON workspace_checkouts(canonical_path);
+CREATE UNIQUE INDEX idx_one_primary_checkout_per_workspace
+ON workspace_checkouts(workspace_id)
+WHERE is_primary = 1;
 
 -- Stable primary checkout identities for old rows. No lease is granted here: a
 -- migration cannot prove that an old process is not still writing.
+INSERT OR IGNORE INTO checkout_write_fences (canonical_path, generation)
+SELECT root, 0 FROM workspaces;
+
 INSERT INTO workspace_checkouts
     (id, workspace_id, path, canonical_path, branch, is_primary, shared_resources_json, created_ms)
 SELECT 'checkout_primary_' || id, id, root, root, NULL, 1, '[]', created_ms FROM workspaces;
@@ -350,26 +365,56 @@ SELECT 'checkout_primary_' || id, id, root, root, NULL, 1, '[]', created_ms FROM
 UPDATE sessions
 SET checkout_id = 'checkout_primary_' || workspace_id;
 
+-- Composite parent keys let the lease table enforce that its Session and
+-- Checkout really belong to the Workspace named on the same row. Independent
+-- foreign keys would accept a Session from Workspace B beside a Checkout from A.
+CREATE UNIQUE INDEX idx_sessions_workspace_identity
+ON sessions(workspace_id, id);
+
 CREATE TABLE workspace_write_leases (
-    id           TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    checkout_id  TEXT NOT NULL REFERENCES workspace_checkouts(id) ON DELETE CASCADE,
-    mode         TEXT NOT NULL,
-    state        TEXT NOT NULL,
-    acquired_ms  INTEGER NOT NULL,
-    heartbeat_ms INTEGER NOT NULL,
-    released_ms  INTEGER
-    , generation INTEGER NOT NULL DEFAULT 1
+    id             TEXT PRIMARY KEY,
+    workspace_id   TEXT NOT NULL,
+    session_id     TEXT NOT NULL,
+    checkout_id    TEXT NOT NULL,
+    canonical_path TEXT NOT NULL REFERENCES checkout_write_fences(canonical_path),
+    mode           TEXT NOT NULL,
+    state          TEXT NOT NULL,
+    acquired_ms    INTEGER NOT NULL,
+    heartbeat_ms   INTEGER NOT NULL,
+    released_ms    INTEGER,
+    generation     INTEGER NOT NULL CHECK(generation > 0),
+    FOREIGN KEY(workspace_id, session_id)
+        REFERENCES sessions(workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY(workspace_id, checkout_id)
+        REFERENCES workspace_checkouts(workspace_id, id) ON DELETE CASCADE
 ) STRICT;
 
-CREATE UNIQUE INDEX idx_one_unreconciled_workspace_writer
-ON workspace_write_leases(workspace_id, checkout_id)
+-- This is the final race arbiter. It is global by canonical filesystem identity,
+-- not scoped to a Workspace id: two Workspace records may point through different
+-- symlinks or names to the same checkout.
+CREATE UNIQUE INDEX idx_one_unreconciled_canonical_writer
+ON workspace_write_leases(canonical_path)
 WHERE state != 'released';
 CREATE UNIQUE INDEX idx_one_unreconciled_lease_per_session
 ON workspace_write_leases(session_id)
 WHERE state != 'released';
 CREATE INDEX idx_workspace_leases_session ON workspace_write_leases(session_id, state);
+
+-- The repository always copies canonical_path from workspace_checkouts. Keep the
+-- same invariant for any future writer that talks to SQLite directly, so it cannot
+-- evade the global claim by supplying a different string.
+CREATE TRIGGER validate_write_lease_canonical
+BEFORE INSERT ON workspace_write_leases
+FOR EACH ROW
+WHEN NOT EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.id = NEW.checkout_id
+      AND c.workspace_id = NEW.workspace_id
+      AND c.canonical_path = NEW.canonical_path
+)
+BEGIN
+    SELECT RAISE(ABORT, 'write lease checkout identity mismatch');
+END;
 
 CREATE TABLE activity_previews (
     id                      INTEGER PRIMARY KEY,
@@ -494,6 +539,7 @@ mod tests {
         for expected in [
             "attention_entries",
             "activity_previews",
+            "checkout_write_fences",
             "events",
             "pane_node_bindings",
             "process_nodes",

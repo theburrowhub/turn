@@ -11,7 +11,9 @@ use turn_core::attention::{AttentionEntry, EntryState};
 use turn_core::ids::{AttentionId, WorkspaceId};
 use turn_core::model::layout::{Direction, Pane, PaneKind};
 use turn_core::model::node::NodeKind;
-use turn_core::model::{Layout, ProcessNode, Session, Template, Workspace};
+use turn_core::model::{
+    ActivityPreview, Layout, PreviewSource, ProcessNode, Session, Template, Workspace,
+};
 use turn_core::state::AwaitingReason;
 use turn_core::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_store::{Store, REDACTED};
@@ -20,7 +22,7 @@ const T0: i64 = 1_700_000_000_000;
 
 /// Values that must never appear on disk, one per write path that touches an
 /// environment or a captured payload.
-const SECRETS: [&str; 7] = [
+const SECRETS: [&str; 8] = [
     "ghp_workspace_level_secret",
     "sk-ant-session-level-secret",
     "npm_pane_level_secret",
@@ -30,6 +32,7 @@ const SECRETS: [&str; 7] = [
     // no key beside it to give the game away.
     "sk-ant-api03-attention-summary-secret",
     "ghp_QUEUEDSUMMARYSECRET0123456789ABCDEF",
+    "sk-ant-api03-preview-secret-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
 ];
 
 /// Tables `write_everything` puts a row in, because each of them can hold text an
@@ -41,7 +44,8 @@ const SECRETS: [&str; 7] = [
 /// existence. A table added to a migration lands in neither list and fails
 /// [`every_table_in_the_schema_is_accounted_for`] until someone decides which side
 /// it belongs on.
-const TABLES_THIS_TEST_WRITES: [&str; 7] = [
+const TABLES_THIS_TEST_WRITES: [&str; 8] = [
+    "activity_previews",
     "attention_entries",
     "events",
     "process_nodes",
@@ -54,9 +58,19 @@ const TABLES_THIS_TEST_WRITES: [&str; 7] = [
 /// Tables holding nothing an agent or an environment ever supplied, so there is
 /// nothing here for a secret to hide in.
 ///
-/// `settings` is UI preferences, written by Turn itself and keyed by a name this
-/// build chose.
-const TABLES_WITH_NOTHING_TO_LEAK: [&str; 1] = ["settings"];
+/// `settings` and `tree_ui_state` are UI preferences. Checkout/lease tables hold
+/// filesystem identity, typed ids, states and timestamps. Pane bindings are ids.
+/// Workspace audit events are restricted to structured lease/tree facts; raw
+/// agent payloads remain in the separately redacted `events` table.
+const TABLES_WITH_NOTHING_TO_LEAK: [&str; 7] = [
+    "checkout_write_fences",
+    "pane_node_bindings",
+    "settings",
+    "tree_ui_state",
+    "workspace_audit_events",
+    "workspace_checkouts",
+    "workspace_write_leases",
+];
 
 /// The tables the schema actually declares, read out of the migrations so a new
 /// one cannot be missed by anybody's memory.
@@ -93,6 +107,17 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
     highlights.insert("AWS_SESSION_TOKEN".to_string(), SECRETS[3].to_string());
     highlights.insert("NODE_ENV".to_string(), "development".to_string());
     node.env_highlights = highlights;
+    node.activity_preview = Some(ActivityPreview {
+        node_id: node.id.clone(),
+        raw_source_sequence: Some(1),
+        normalized_text: format!("Waiting with {}", SECRETS[7]),
+        source: PreviewSource::SemanticEvent,
+        confidence: Confidence::Explicit,
+        stable: true,
+        contains_sensitive_data: false,
+        redacted: false,
+        updated_ms: T0 + 1,
+    });
     session.tree.insert(node);
 
     store.sessions().save(&session).unwrap();
@@ -243,6 +268,15 @@ fn every_table_this_test_claims_to_cover_actually_has_rows_in_it() {
     let (workspace, session) = write_everything(&store);
 
     // One assertion per table in TABLES_THIS_TEST_WRITES, in the same order.
+    let node_id = session.tree.iter().next().unwrap().id.clone();
+    assert!(
+        !store
+            .hierarchy()
+            .preview_history(&node_id, 20)
+            .unwrap()
+            .is_empty(),
+        "activity_previews"
+    );
     assert!(store.attention().count().unwrap() > 0, "attention_entries");
     assert!(store.events().count().unwrap() > 0, "events");
     assert!(
