@@ -1,0 +1,575 @@
+//! Launching a pane's process.
+//!
+//! The order here is the whole integration story, and every step depends on the one
+//! before it:
+//!
+//! 1. Pick the adapter for the command the user asked for ([`AdapterRegistry`]).
+//! 2. Register the node with the hook server, which mints a token and hands back the
+//!    URL its callbacks must reach.
+//! 3. Ask the adapter to [`prepare`](turn_agents::AgentAdapter::prepare) a launch. It
+//!    writes whatever throwaway configuration it needs into a scratch directory Turn
+//!    owns, and returns the command line that will actually run.
+//! 4. Spawn *that* on a pty.
+//!
+//! The scratch directory is the reason the user's own configuration is never touched.
+//! Claude Code's hooks arrive through `--settings`, which adds a layer over
+//! `~/.claude/settings.json` rather than replacing it, and the file it points at lives
+//! under Turn's data directory keyed by session — so closing the session takes the
+//! configuration with it.
+
+use super::{Core, Process};
+use crate::paths;
+use turn_agents::{IntegrationLevel, LaunchContext, OutputHeuristic};
+use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
+use turn_core::ids::{NodeId, PaneId, SessionId};
+use turn_core::model::{NodeKind, PaneKind, ProcessNode};
+use turn_core::state::Lifecycle;
+use turn_proto::{ErrorCode, ProtoError};
+use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
+
+/// The size a pane starts at before a client tells us what it is rendering.
+///
+/// A pty must have a size from the moment it exists — a program asks for one
+/// immediately — and 24x80 is the size every terminal program copes with. An attach
+/// replaces it with the client's real geometry before taking the replay.
+const INITIAL_SIZE: ScreenSize = ScreenSize { rows: 24, cols: 80 };
+
+impl Core {
+    /// Starts a process for every pane of a session that describes one.
+    ///
+    /// A pane whose command cannot be launched is left empty and logged rather than
+    /// failing the session: a template that mentions a tool the user has not installed
+    /// should still give them the rest of their desk.
+    pub(crate) fn materialise_session(&mut self, session: &SessionId, now_ms: i64) {
+        let panes: Vec<PaneId> = match self.sessions.get(session) {
+            Some(session) => session
+                .layout
+                .panes()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect(),
+            None => return,
+        };
+        for pane in panes {
+            match self.materialise_pane(session, &pane, now_ms) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%session, %pane, %error, "could not start a pane's process");
+                }
+            }
+        }
+    }
+
+    /// Starts the process a pane describes, if it describes one.
+    ///
+    /// Returns `None` for a pane that is deliberately empty: one of Turn's own views,
+    /// or a terminal pane with no command, which is a placeholder until something is
+    /// put in it.
+    pub(crate) fn materialise_pane(
+        &mut self,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        now_ms: i64,
+    ) -> std::result::Result<Option<NodeId>, ProtoError> {
+        self.materialise_pane_with(session_id, pane_id, &[], now_ms)
+    }
+
+    /// As [`Self::materialise_pane`], with arguments the pane itself does not carry.
+    ///
+    /// The only caller that needs this is a relaunch asking to resume a conversation:
+    /// `--resume <id>` belongs to one launch, not to the pane's definition, and writing
+    /// it into the pane would make every later relaunch resume a conversation that has
+    /// moved on.
+    pub(crate) fn materialise_pane_with(
+        &mut self,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        extra_args: &[String],
+        now_ms: i64,
+    ) -> std::result::Result<Option<NodeId>, ProtoError> {
+        let session = self.session(session_id)?;
+        let pane = session
+            .layout
+            .get(pane_id)
+            .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
+
+        if !pane.kind.is_terminal() {
+            return Ok(None);
+        }
+
+        let workspace = self.workspaces.get(&session.workspace_id);
+        let Some(command) = pane_command(pane.kind, pane.command.as_deref(), workspace) else {
+            return Ok(None);
+        };
+
+        let cwd = resolve_cwd(pane.cwd.as_deref(), &session.cwd);
+        let title = pane
+            .title
+            .clone()
+            .unwrap_or_else(|| command.rsplit('/').next().unwrap_or(&command).to_string());
+        let mut env: Vec<(String, String)> = Vec::new();
+        if let Some(workspace) = workspace {
+            env.extend(workspace.env.iter().cloned());
+        }
+        env.extend(session.env.iter().cloned());
+        env.extend(pane.env.iter().cloned());
+        let mut user_args = pane.args.clone();
+        user_args.extend(extra_args.iter().cloned());
+
+        let command_line = if user_args.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {}", user_args.join(" "))
+        };
+        let selection = self.registry.select(&command_line);
+
+        if !selection.is_installed() {
+            // Named plainly, with the adapter's own explanation, because the reason
+            // has nothing to do with Turn: the program is not there.
+            return Err(
+                ProtoError::new(ErrorCode::Unavailable, selection.note.clone())
+                    .with_detail(command_line),
+            );
+        }
+
+        let kind = node_kind(pane.kind, selection.level);
+        let mut node = if kind.is_agentic() {
+            ProcessNode::agent(session_id.clone(), command.clone(), cwd.clone(), now_ms)
+        } else {
+            ProcessNode::process(
+                session_id.clone(),
+                kind,
+                command.clone(),
+                cwd.clone(),
+                now_ms,
+            )
+        };
+        node.title = title;
+        node.args = user_args.clone();
+        node.pane_id = Some(pane_id.clone());
+        if let Some(agent) = node.agent.as_mut() {
+            agent.agent = AgentRef {
+                provider: Some(selection.adapter.provider().to_string()),
+                tool: Some(selection.adapter.id().to_string()),
+                model: None,
+            };
+            agent.resumable = selection.capabilities.resumable;
+        }
+        let node_id = node.id.clone();
+
+        // A token is only issued to an adapter that has somewhere to report from.
+        // Handing one to a plain terminal would be a credential for a channel nothing
+        // will ever use.
+        let reports_back = selection.level >= IntegrationLevel::Wrapper;
+        let endpoint = if reports_back {
+            self.hooks.register(
+                session_id.clone(),
+                node_id.clone(),
+                std::sync::Arc::clone(&selection.adapter),
+            )
+        } else {
+            turn_agents::HookEndpoint {
+                base_url: self.hooks.base_url().to_string(),
+                token: String::new(),
+                helper_path: None,
+            }
+        };
+        let token = reports_back.then(|| endpoint.token.clone());
+
+        let scratch_dir = paths::node_scratch(&self.data_dir, session_id, &node_id);
+        let launch = LaunchContext {
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            cwd: cwd.clone(),
+            command: command.clone(),
+            user_args,
+            endpoint,
+            scratch_dir,
+        };
+
+        let plan = match selection.adapter.prepare(&launch) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.revoke(token.as_deref());
+                return Err(ProtoError::new(
+                    ErrorCode::Unavailable,
+                    "Turn could not write the configuration this agent needs",
+                )
+                .with_detail(error.to_string()));
+            }
+        };
+
+        // The adapter's own environment goes last so it wins: a hook URL it just
+        // generated must not be shadowed by a stale value in the workspace.
+        env.extend(plan.env.iter().cloned());
+
+        let spec = ProcessSpec {
+            command: plan.command.clone(),
+            args: plan.args.clone(),
+            cwd: cwd.clone(),
+            env,
+            size: INITIAL_SIZE,
+            clean_env: false,
+        };
+
+        let pty = match PtyProcess::spawn(node_id.clone(), spec, now_ms) {
+            Ok(pty) => pty,
+            Err(error) => {
+                self.revoke(token.as_deref());
+                return Err(ProtoError::new(
+                    ErrorCode::Unavailable,
+                    format!("Could not start `{command}`"),
+                )
+                .with_detail(error.to_string()));
+            }
+        };
+
+        let pid = pty.pid();
+        // What actually runs, which is not always what the user typed: an adapter may
+        // have appended flags to make the tool report back. The tree shows the truth.
+        node.command = plan.command.clone();
+        node.args = plan.args.clone();
+        node.env_highlights.insert(
+            "TURN_INTEGRATION".to_string(),
+            plan.level.label().to_string(),
+        );
+        node.lifecycle = Lifecycle::Spawning;
+
+        self.watch_exit(&node_id, &pty);
+        // The heuristic tier is defined by the level a launch achieved, not by one
+        // adapter's name: anything that ends up inferring from output needs the
+        // observer, and nothing above that tier should have one.
+        let heuristic = (plan.level == IntegrationLevel::Heuristic).then(OutputHeuristic::new);
+        self.processes.insert(
+            node_id.clone(),
+            Process {
+                pty,
+                adapter_id: selection.adapter.id().to_string(),
+                level: plan.level,
+                hook_token: token,
+                heuristic,
+                size: INITIAL_SIZE,
+                session_id: session_id.clone(),
+                exited_ms: None,
+            },
+        );
+
+        {
+            let session = self.session_mut(session_id)?;
+            session.tree.insert(node);
+            if let Some(pane) = session.layout.get_mut(pane_id) {
+                pane.node_id = Some(node_id.clone());
+            }
+            session.touch(now_ms);
+        }
+
+        // A new process is a reason to look for children — shortly, not now: it has not
+        // had time to start any yet.
+        self.request_sweep(now_ms);
+
+        tracing::info!(
+            %session_id, %node_id, pid,
+            adapter = selection.adapter.id(),
+            level = plan.level.label(),
+            command = %plan.command,
+            "started a process"
+        );
+
+        // Recorded as an event so the start is in the log with everything else, and so
+        // the lifecycle reaches `Alive` through the same path every other state change
+        // takes rather than by being assigned twice.
+        let started = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ProcessStarted {
+                pid,
+                command: plan.command.clone(),
+            },
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            now_ms,
+        )
+        .with_node(node_id.clone());
+        self.ingest(started, now_ms);
+
+        Ok(Some(node_id))
+    }
+
+    /// Runs one of the session's configured start-up commands.
+    ///
+    /// It gets a node but no pane: it is a job, not a place to type. The node is what
+    /// makes it visible — a failing `nvm use` should be something the user can see in
+    /// the tree, not a silent reason their agent behaves oddly.
+    ///
+    /// This is not Turn running something it decided to run. The command comes from the
+    /// workspace or template the user configured, which is the whole difference between
+    /// this and the thing the product refuses to do.
+    pub(crate) fn spawn_init_command(
+        &mut self,
+        session_id: &SessionId,
+        command: &str,
+        now_ms: i64,
+    ) -> std::result::Result<NodeId, ProtoError> {
+        let session = self.session(session_id)?;
+        let cwd = session.cwd.clone();
+        let mut env: Vec<(String, String)> = Vec::new();
+        if let Some(workspace) = self.workspaces.get(&session.workspace_id) {
+            env.extend(workspace.env.iter().cloned());
+        }
+        env.extend(session.env.iter().cloned());
+        let shell = default_shell(self.workspaces.get(&session.workspace_id));
+
+        let mut node = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Background,
+            command,
+            cwd.clone(),
+            now_ms,
+        );
+        node.title = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("init")
+            .to_string();
+        node.args = vec!["-c".to_string(), command.to_string()];
+        let node_id = node.id.clone();
+
+        let spec = ProcessSpec {
+            command: shell.clone(),
+            args: vec!["-c".to_string(), command.to_string()],
+            cwd,
+            env,
+            size: INITIAL_SIZE,
+            clean_env: false,
+        };
+        let pty = PtyProcess::spawn(node_id.clone(), spec, now_ms).map_err(|error| {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                format!("Could not run the start-up command `{command}`"),
+            )
+            .with_detail(error.to_string())
+        })?;
+        let pid = pty.pid();
+
+        self.watch_exit(&node_id, &pty);
+        self.processes.insert(
+            node_id.clone(),
+            Process {
+                pty,
+                adapter_id: "generic-terminal".to_string(),
+                level: IntegrationLevel::GenericTerminal,
+                hook_token: None,
+                heuristic: None,
+                size: INITIAL_SIZE,
+                session_id: session_id.clone(),
+                exited_ms: None,
+            },
+        );
+        self.session_mut(session_id)?.tree.insert(node);
+
+        let started = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ProcessStarted {
+                pid,
+                command: command.to_string(),
+            },
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            now_ms,
+        )
+        .with_node(node_id.clone());
+        self.ingest(started, now_ms);
+        Ok(node_id)
+    }
+
+    /// Revokes a hook token for a launch that did not happen.
+    fn revoke(&self, token: Option<&str>) {
+        if let Some(token) = token {
+            self.hooks.unregister(token);
+        }
+    }
+
+    /// Watches a process for its exit and reports it to the core loop.
+    fn watch_exit(&self, node: &NodeId, pty: &PtyProcess) {
+        let mut watcher = pty.exit_watcher();
+        let commands = self.commands.clone();
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                // The borrow is scoped so nothing is held across the await.
+                let seen = watcher.borrow_and_update().clone();
+                if let Some(info) = seen {
+                    let _ = commands.send(super::Command::Exited { node, info }).await;
+                    return;
+                }
+                if watcher.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Stops a node's process and forgets our handle on it.
+    ///
+    /// Dropping a [`PtyProcess`] ends the process it owns — that is the ownership model
+    /// `turn-pty` documents — so this is also how a pane's process is stopped.
+    pub(crate) fn discard_process(&mut self, node: &NodeId) -> Option<ExitInfo> {
+        if let Some(pump) = self.pumps.remove(node) {
+            pump.abort();
+        }
+        let process = self.processes.remove(node)?;
+        // The screen was a view of this pty. With the pty gone there is nothing for it
+        // to be a view of, and a stale grid would be diffed against on the next attach.
+        self.forget_screen(node);
+        self.revoke(process.hook_token.as_deref());
+        let info = process.pty.exit_info();
+        drop(process);
+        info
+    }
+}
+
+/// The command a pane will run, if any.
+///
+/// A shell pane with no command gets the workspace's shell, then `$SHELL`, then
+/// `/bin/sh`. Any other terminal pane with no command stays empty: guessing what a
+/// pane labelled "server" should run would start something the user did not ask for.
+fn pane_command(
+    kind: PaneKind,
+    declared: Option<&str>,
+    workspace: Option<&turn_core::model::Workspace>,
+) -> Option<String> {
+    if let Some(command) = declared.filter(|c| !c.trim().is_empty()) {
+        return Some(command.to_string());
+    }
+    match kind {
+        PaneKind::Shell => Some(default_shell(workspace)),
+        PaneKind::Agent => workspace.and_then(|w| w.default_agent.clone()),
+        _ => None,
+    }
+}
+
+/// The shell to run when a pane asks for one without saying which.
+pub(crate) fn default_shell(workspace: Option<&turn_core::model::Workspace>) -> String {
+    workspace
+        .and_then(|w| w.default_shell.clone())
+        .or_else(|| std::env::var("SHELL").ok())
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string())
+}
+
+/// Resolves a pane's working directory against the session's.
+fn resolve_cwd(pane_cwd: Option<&str>, session_cwd: &str) -> String {
+    match pane_cwd.filter(|c| !c.trim().is_empty()) {
+        Some(cwd) if cwd.starts_with('/') => cwd.to_string(),
+        Some(cwd) => format!("{}/{}", session_cwd.trim_end_matches('/'), cwd),
+        None => session_cwd.to_string(),
+    }
+}
+
+/// What kind of node a pane's process is.
+///
+/// The adapter has the final say on whether something is an agent: a `Terminal` pane
+/// the user typed `claude` into is an agent, and an `Agent` pane running a program
+/// Turn has no integration for is not — it gets the turn axis it can actually fill,
+/// which is none.
+fn node_kind(pane: PaneKind, level: IntegrationLevel) -> NodeKind {
+    if level >= IntegrationLevel::Heuristic {
+        return NodeKind::Agent;
+    }
+    match pane {
+        PaneKind::Agent | PaneKind::Terminal => NodeKind::Terminal,
+        PaneKind::Shell => NodeKind::Shell,
+        PaneKind::Tui => NodeKind::Tui,
+        PaneKind::Server => NodeKind::Server,
+        PaneKind::TestOutput => NodeKind::TestRunner,
+        PaneKind::Logs => NodeKind::Background,
+        PaneKind::TmuxTerminal => NodeKind::TmuxPane,
+        _ => NodeKind::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turn_core::model::Workspace;
+
+    fn workspace_with_shell(shell: Option<&str>) -> Workspace {
+        let mut workspace = Workspace::new("w", "/tmp", 0);
+        workspace.default_shell = shell.map(str::to_string);
+        workspace
+    }
+
+    #[test]
+    fn a_shell_pane_with_no_command_falls_back_through_workspace_then_environment() {
+        let workspace = workspace_with_shell(Some("/bin/zsh"));
+        assert_eq!(
+            pane_command(PaneKind::Shell, None, Some(&workspace)).as_deref(),
+            Some("/bin/zsh")
+        );
+        // With no workspace preference the environment decides, and failing that a
+        // shell that exists on every unix.
+        let bare = workspace_with_shell(None);
+        let resolved = pane_command(PaneKind::Shell, None, Some(&bare)).unwrap();
+        assert!(!resolved.trim().is_empty());
+    }
+
+    #[test]
+    fn a_pane_with_no_command_and_no_default_starts_nothing() {
+        // The failure this prevents: a pane labelled "server" quietly running
+        // something Turn guessed at.
+        for kind in [
+            PaneKind::Terminal,
+            PaneKind::Server,
+            PaneKind::Logs,
+            PaneKind::TestOutput,
+            PaneKind::Tui,
+        ] {
+            assert_eq!(pane_command(kind, None, None), None, "{kind:?}");
+        }
+        assert_eq!(pane_command(PaneKind::Agent, None, None), None);
+    }
+
+    #[test]
+    fn a_declared_command_always_wins_and_blank_ones_do_not_count() {
+        let workspace = workspace_with_shell(Some("/bin/zsh"));
+        assert_eq!(
+            pane_command(PaneKind::Shell, Some("fish"), Some(&workspace)).as_deref(),
+            Some("fish")
+        );
+        assert_eq!(
+            pane_command(PaneKind::Shell, Some("   "), Some(&workspace)).as_deref(),
+            Some("/bin/zsh"),
+            "whitespace is not a command"
+        );
+    }
+
+    #[test]
+    fn a_relative_pane_directory_is_resolved_against_the_session() {
+        assert_eq!(
+            resolve_cwd(Some("crates/turnd"), "/repo"),
+            "/repo/crates/turnd"
+        );
+        assert_eq!(resolve_cwd(Some("/elsewhere"), "/repo"), "/elsewhere");
+        assert_eq!(resolve_cwd(None, "/repo"), "/repo");
+        assert_eq!(resolve_cwd(Some(" "), "/repo/"), "/repo/");
+    }
+
+    #[test]
+    fn the_adapter_decides_what_counts_as_an_agent_not_the_pane_kind() {
+        // `claude` typed into a plain terminal pane is an agent.
+        assert_eq!(
+            node_kind(PaneKind::Terminal, IntegrationLevel::Structured),
+            NodeKind::Agent
+        );
+        // An "agent" pane running something Turn cannot integrate with does not get a
+        // turn axis it would never be able to fill.
+        assert_eq!(
+            node_kind(PaneKind::Agent, IntegrationLevel::GenericTerminal),
+            NodeKind::Terminal
+        );
+        assert_eq!(
+            node_kind(PaneKind::Shell, IntegrationLevel::GenericTerminal),
+            NodeKind::Shell
+        );
+        assert!(node_kind(PaneKind::Terminal, IntegrationLevel::Heuristic).is_agentic());
+    }
+}

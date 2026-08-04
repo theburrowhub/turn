@@ -1,0 +1,670 @@
+# Turn — Product
+
+**Run agents in parallel. Step in when it's your turn.**
+
+Status of this document: it describes the product Turn is being built to be, and it distinguishes
+throughout between what exists in the repository today and what does not. Every claim marked as met is
+backed by a named test that runs and passes in this workspace, in one of the six library crates. The
+daemon (`turnd`) is being written concurrently; nothing in this document treats its behaviour as verified,
+and no acceptance item is checked on the strength of a test in it. Treat the test counts in §7 as a
+snapshot and reproduce them per crate rather than trusting them:
+
+```sh
+for c in turn-core turn-pty turn-agents turn-proto turn-store turn-hook; do cargo test -p $c; done
+```
+
+See `ROADMAP.md` for sequencing and `ARCHITECTURE.md` for how the pieces fit — its §0 holds the
+authoritative per-crate status table.
+
+---
+
+## 1. Executive summary
+
+Turn is a desktop terminal workspace for running, organising and supervising AI coding agents on
+macOS and Linux.
+
+The premise is narrow and specific. Coding agents are now good enough that one person can usefully
+run five or ten of them at once, on different tasks, in different repositories. The bottleneck is no
+longer the agents' capability; it is the human's ability to notice which one needs them, and when.
+Every agent is a long-running interactive process that periodically stops and waits — for an answer,
+for an approval, for a decision — and every second it spends blocked is a second of parallelism
+thrown away. Meanwhile the same agent finishes a hundred things that need no human at all, and each
+of those is a chance to interrupt someone who did not need interrupting.
+
+Turn's job is to be correct about that distinction. It runs each agent in a real pty inside a
+persistent Workspace, organises work into Sessions, tracks the agent hierarchy, and maintains one
+ordered Attention Queue whose top item is the thing the user should look at next. It tells the user
+when it is their turn, and otherwise stays out of the way.
+
+Turn is not an agent, not a model client, and not a chat interface. It supervises the agent CLIs the
+user already installs and pays for — Claude Code, Codex CLI, Gemini CLI, and any other interactive
+terminal program — as they exist today, without asking their vendors for anything.
+
+---
+
+## 2. The problem
+
+Someone running several coding agents in a terminal today has three unpleasant options, and in
+practice uses all three at once.
+
+**Tabs.** One agent per terminal tab or tmux window. This works up to about three. Past that, the
+tab bar stops being a map and becomes a memory test: which tab was the refactor, which was the flaky
+test, which one is waiting on you, which one died forty minutes ago. Nothing in the tab strip
+distinguishes "thinking hard" from "blocked on a yes/no question", so the only way to find out is to
+visit each one in turn. Visiting them all is the exact cost the parallelism was supposed to avoid.
+
+**Notifications.** Wire up every agent to post an OS notification when it stops. This surfaces the
+blocked ones, at the price of a notification stream that is mostly noise: an agent that finishes
+twenty tool calls and asks nothing produces twenty notifications, none of which require action. The
+predictable outcome is that notifications get muted, at which point the blocked agents are invisible
+again — and worse than before, because now the user believes they have a system.
+
+**Polling.** Keep glancing. This is what most people actually do, and it is where the time goes.
+
+Underneath all three is a modelling failure that no amount of UI polish fixes: existing tools collapse
+*the process is running* and *the agent owes me a reply* into a single notion of "busy" or "done". They
+are different axes and they change independently. Claude Code can finish its turn while a `cargo test`
+it launched keeps running for another two minutes. A shell can stay alive for a week without ever
+owing anybody anything. An agent can crash while its last reported state was "waiting for you", and
+then sit in a queue forever claiming to await a human who can no longer help it. Tools that collapse
+the two axes report "done" while work continues, and "busy" while an agent sits blocked.
+
+Turn's thesis is that if you model those two axes separately, rank the resulting demands honestly, and
+put a hard governor in front of anything that moves the user's viewport, the parallel workflow stops
+being exhausting.
+
+---
+
+## 3. Product principles
+
+These are load-bearing. Each one shows up as a constraint in the code, and each one has tests that
+exist specifically to stop a future change from quietly violating it.
+
+### 3.1 The Session is the unit of work
+
+Not the tab, not the window, not the pane. A Session is one task or one run: a name in the user's own
+words, a working directory, a Layout of Panes, a process tree, an Attention policy and a history. It
+belongs to a Workspace, which is the persistent project that outlives it.
+
+This matters because tasks are what users think in, and because the interesting states are per-task,
+not per-window. "The auth refactor needs me" is useful. "Pane 4 needs you" is not. It also gives
+duplication a clear meaning: duplicating a Session copies the shape, the settings and the tags, and
+deliberately copies none of the live processes (`model::session::tests::duplicating_a_session_keeps_
+the_shape_and_drops_the_processes`).
+
+### 3.2 Agents form a hierarchy, and Turn never invents one
+
+A main Agent spawns subagents. Agents spawn processes: test runners, dev servers, builds, editors,
+sometimes a GUI application. Turn shows that tree, because "which of the eleven things under this
+Session is the one that failed" is a question users actually have.
+
+The hard rule is that the tree is only as confident as its evidence. A parent link reported by the
+tool itself is `Relation::Confirmed`. A link derived from the OS process table is
+`Relation::Inferred` and is labelled as a guess in the UI. Anything else is `Relation::Unknown` and
+renders at the Session root rather than under a plausible-looking parent. Confirmed links are never
+overwritten by inferred ones — once the tool has told the truth, a coincidence in the process table
+must not undo it (`model::node::tests::a_confirmed_link_is_not_overwritten_by_an_inferred_one`).
+
+### 3.3 The user's attention is a scarce resource, and Turn spends it deliberately
+
+Every interruption has a price. Turn therefore treats "move the user's focus" as the most expensive
+operation in the product and puts it behind a governor that no per-Session policy can opt out of:
+never interrupt mid-keystroke, never move more than three times in ten seconds, never let a Session
+the user was just moved away from immediately drag them back.
+
+Two consequences that follow from taking this seriously:
+
+- **A deferral is not a dropped signal.** When a focus change is held back because the user is
+  typing, the demand stays in the queue and the badge stays on the Session; the jump lands once the
+  user's hands stop. But it expires after sixty seconds, because being yanked somewhere on account of
+  something that happened two minutes ago is worse than not being moved at all.
+- **Silence is a decision, not an absence.** `Action::Nothing` is an explicit variant, so a Session
+  configured to stay quiet is distinguishable from one that was never configured.
+
+### 3.4 Confidence is part of the data, and a guess may never act like a fact
+
+Turn mixes reliable signals (a hook payload, an exit status) with unreliable ones (pattern matching
+on terminal output). Presenting them identically would mean lying to the user in the tool's own voice.
+So every event carries a `Confidence`, the event's source caps how much confidence it is allowed to
+claim, and provisional states render as provisional.
+
+The sharpest form of this rule: **a heuristic can never move the user's focus.** It is enforced twice,
+independently — once when the event is built (`EventSource::PtyHeuristic` caps at
+`Confidence::InferredHigh`) and once when policy is resolved (any focus action from a
+non-focus-worthy confidence degrades to a badge). See §6.10.
+
+### 3.5 It must work with the tools as they exist today
+
+Turn integrates with agent CLIs through mechanisms those tools already ship: Claude Code's hook
+engine, Codex's hooks and `notify` callback, and — for everything else — the OS process table and the
+terminal output itself. No vendor cooperation is required, no forks, no patched binaries, and
+crucially **no modification of the user's own configuration**. Claude Code hooks are injected with
+`--settings`, which adds a settings layer and leaves `~/.claude/settings.json` and
+`.claude/settings.json` untouched (`claude::tests::preparing_writes_a_settings_file_and_passes_it_
+without_touching_user_config`).
+
+The corollary is that integration quality varies by tool, so Turn states it plainly rather than
+pretending to a uniform experience: four Integration Levels, shown per Session, with a note explaining
+what was set up and therefore why detection is or is not working.
+
+### 3.6 Turn observes; the user decides
+
+Turn is a supervisor, not an autopilot. It never approves a permission, never relaunches a process on
+restore without being asked, and never executes a command it read out of agent output. Risk ratings on
+a pending permission are a display and ordering aid, explicitly not an authorisation decision. When a
+process cannot be recovered after a restart, Turn reports `Lifecycle::Lost` — an honest "we don't
+know" — rather than a silent respawn.
+
+---
+
+## 4. Personas and use cases
+
+### Persona A — the parallel operator (primary)
+
+A senior engineer who runs four to ten agents at once across two or three repositories: one doing a
+refactor, one writing tests, one reviewing a PR, one investigating a production issue. They know
+exactly what they want each agent to do; their problem is scheduling themselves across all of them.
+They will happily configure per-Session policy if it buys them quiet.
+
+What they need: an ordered Attention Queue with a keyboard shortcut that always lands on the right
+next thing; badges that distinguish "blocked" from "finished a turn"; the ability to mute a Session
+they want to check on manually; and confidence that a quiet Session is quiet because nothing needs
+them, not because a signal was lost.
+
+### Persona B — the long-run supervisor
+
+Runs one or two agents on jobs measured in tens of minutes, alongside their own editing work in
+another window. They are not watching; they are working. Being pulled out of their own flow by
+anything less than a genuine blocker is a net loss.
+
+What they need: notifications that fire on blockers only; `FocusIfBackground` semantics so Turn does
+nothing while the window is frontmost; and Session state that is still true when they come back an
+hour later — including "the agent finished, but the test run it started is still going".
+
+### Persona C — the reviewer
+
+Uses agents to inspect work rather than produce it: a review Agent beside `lazygit`, a Session per
+PR. Sessions are short-lived and highly repetitive, so the setup cost per Session has to be near zero.
+
+What they need: Templates (the shipped `PR Review` Template is exactly this shape), name patterns that
+fill in the branch, and Session duplication that copies the shape without the processes.
+
+### Use cases the design is aimed at
+
+1. **Fan out one task across agents.** Two Panes, two different agents, same repository, same prompt;
+   compare. The `Pair of Agents` Template exists for this.
+2. **Watch a long run without babysitting it.** Start an agent on a large refactor, keep working, get
+   pulled in only when it is blocked — and not when it merely finished a turn.
+3. **Handle a burst of simultaneous blockers.** Three agents block within a second of each other.
+   Exactly one focus change happens; the other two are badged and queued; the shortcut walks all
+   three in priority order.
+4. **Understand a failure inside a big tree.** A Session with an Agent, two subagents, a dev server
+   and a test runner reads as failed because one child failed, and the tree says which.
+5. **Come back after closing the window.** Reattach to Sessions whose processes are still alive; be
+   told honestly about the ones that are not, and be offered — never forced — a relaunch.
+   *(Not yet implemented; see §6 and §7.)*
+
+---
+
+## 5. MVP scope
+
+The MVP is a desktop application that does the following, on macOS and Linux, with parity as a
+requirement rather than an aspiration.
+
+**Terminal and process substrate**
+- Real ptys per Pane. Interactive programs, full-screen TUIs (`vim`, `lazygit`, `btop`), correct
+  resize, correct working directory and environment.
+- Bounded buffers per Pane: a raw byte ring for replay and a parsed vt100 screen for snapshots.
+- Backpressure that degrades cleanly: a slow consumer is told it lost data and resynchronises from a
+  replay rather than growing an unbounded queue.
+- Process supervision: discovery of what the processes Turn started went on to start, scanned on
+  demand rather than polled.
+
+**Domain and attention**
+- Workspaces, Sessions, Panes, Layouts, Templates.
+- The two-axis state model (`Lifecycle` × `Turn`) with a derived `DisplayState` for the UI.
+- The Attention Queue: deduplication, priority, ageing without starvation, snooze, acknowledge,
+  dismiss, and a `next-attention` command that is deterministic rather than a lottery.
+- Focus governance: typing guard, rate limit, ping-pong guard, per-Session cooldown, mute.
+- Per-Session Attention policy with quiet defaults.
+
+**Agent integration**
+- Claude Code at Integration Level `Structured`: turn boundaries, permission requests with a risk
+  rating, confirmed subagent hierarchy, and `background_tasks` so "turn finished" is never confused
+  with "work finished".
+- Codex CLI at `Structured` where its hook trust model allows, degrading to its `notify` channel and
+  reporting the lower level rather than failing to launch.
+- A generic heuristic layer for every other interactive tool, capped at `InferredHigh` confidence and
+  therefore incapable of moving focus.
+- A local hook server bound to `127.0.0.1` only, with a per-node token.
+
+**Application**
+- A daemon (`turnd`) that owns the ptys, so the UI can restart without killing the work.
+- A native desktop window, drawn on the GPU rather than in a webview (ADR-039): sidebar of Sessions ranked
+  by what needs the user, Panes showing a real terminal, the Attention Queue, the agent tree, an event log,
+  and a permission banner that the user answers.
+- SQLite persistence of Workspaces, Sessions, Layouts, Templates and event history.
+
+**Explicit non-goals inside the MVP**
+- Turn does not write a terminal emulator. The daemon embeds `vt100` and the window paints the cells that
+  parser produces — one emulator, one parse, no second opinion (ADR-008, ADR-039).
+- Turn does not run models, hold API keys, or proxy agent traffic.
+- Turn does not modify the user's agent configuration files.
+
+---
+
+## 6. Deferred, post-MVP
+
+Listed because each one is a thing the architecture must not foreclose, not because it is planned for
+the first release.
+
+| Deferred | Why it waits | What must not be foreclosed |
+| --- | --- | --- |
+| tmux-backed Sessions | The daemon already provides persistence across UI restarts, which was tmux's main draw. Persistence across daemon exit is a real gap tmux would close, but it is not worth the MVP's complexity budget. | `Workspace::tmux_enabled` and `Session::tmux` flags and the `TmuxSession`/`TmuxPane`/`TmuxTerminal` kinds already exist in the model. |
+| Codex `app-server` (JSON-RPC over a unix socket) | Far richer than hooks — `turn/started`, `turn/completed`, `thread/status/changed`, `ProcessExited`, approval requests, token usage — but a second, differently-shaped integration path. | The `EventSource::SideChannel` variant and the adapter trait already accommodate it without a redesign. |
+| Remote and SSH Sessions | The whole pty/supervision layer assumes local processes. | Nothing in the domain layer assumes locality; `ProcessNode` holds a `cwd` string, not a handle. |
+| Session sharing, multi-user, web access | Contradicts the 127.0.0.1-only security posture; needs an auth model Turn does not have. | The daemon↔UI protocol is a real protocol, not in-process calls. |
+| Cost and token dashboards | `Capabilities::usage_events` is false for the Claude Code adapter today because the hooks Turn subscribes to do not carry usage. | `AgentInfo` already has `tokens_used` and `cost_usd`. |
+| Agent-authored workflows, task queues, cron-style scheduling | This is agent orchestration. Turn supervises; it does not drive. Crossing that line changes the product. | — |
+| Windows support | The pty layer, signal handling and process supervision are unix-shaped, and `PtyProcess::terminate` uses `libc::kill` on unix with a `kill()` fallback elsewhere. | `portable-pty` and `sysinfo` are cross-platform; the `#[cfg(unix)]` seams are already narrow. |
+| Plugin API for third-party adapters | The adapter trait is not yet stable enough to expose. | `AgentAdapter` is already the only tool-specific seam. |
+| Heuristic correction UI ("this state is wrong") | Needs the heuristic layer to exist first. | `EventSource::UserCorrection` is already in the vocabulary at `Explicit` confidence. |
+
+---
+
+## 7. MVP acceptance criteria
+
+Checked items are demonstrated by named tests that **run and pass** in this workspace. Counts observed
+during this survey, per crate:
+
+| Crate | Tests | Note |
+| --- | --- | --- |
+| `turn-core` | 116 | |
+| `turn-proto` | 127 | |
+| `turn-store` | 119 | |
+| `turn-pty` | 46 | grew from 38 during the survey |
+| `turn-hook` | 15 | |
+| `turn-agents` | 110 | when last green; mid-refactor and not compiling at the final check |
+
+The five settled crates total **423 passing, re-verified together**. `turn-agents` is being refactored as
+this is read, so its 110 is the last figure observed rather than a current one. Every `turn-agents` test
+cited below was passing when checked; if one is failing when you read this, that crate is mid-edit, and the
+crate — not this list — is the thing to look at.
+
+These counts exclude `turnd` entirely. The daemon has 71 test functions written and is being written now;
+**no item below is checked on the basis of any of them.** An item that depends on the daemon is unchecked
+here even where daemon code for it exists, because "written" and "demonstrated" are different claims and
+this checklist only makes the second one.
+
+Reproduce the counts per crate rather than trusting them (see the command at the head of this document).
+Unchecked items say what is missing, not when it will arrive.
+
+### Terminal substrate
+
+- [x] **An interactive program runs on a real pty and its output reaches the screen.**
+  `turn-pty::process::tests::a_process_runs_and_its_output_reaches_the_screen`,
+  `input_written_to_the_pty_reaches_the_process`.
+- [x] **The process sees the geometry Turn gave it.** Verified against the tty itself via `stty size`:
+  `process::tests::a_process_sees_the_size_we_gave_it`.
+- [x] **Resize reaches both the kernel and Turn's own screen model.**
+  `process::tests::resize_reaches_both_the_kernel_and_our_screen_model`. Both halves matter: without
+  the ioctl the program draws at the old width; without the buffer update Turn's snapshots and
+  heuristics read a screen the user is not looking at.
+- [x] **Full-screen TUIs are handled and detected.** Alternate-screen entry and exit are tracked so
+  output heuristics can stand down inside a TUI redraw:
+  `process::tests::a_full_screen_application_is_recognised`,
+  `buffer::tests::a_full_screen_app_is_detected_so_heuristics_can_stand_down`.
+- [x] **ANSI escapes are interpreted, not displayed.**
+  `buffer::tests::ansi_colour_and_cursor_movement_are_interpreted_not_shown`.
+- [x] **Buffers are bounded and admit when they dropped data.**
+  `buffer::tests::the_byte_ring_is_bounded_and_admits_when_it_dropped_data`,
+  `a_single_write_larger_than_the_ring_keeps_its_tail`,
+  `heavy_output_does_not_grow_memory_without_bound`.
+- [x] **A slow consumer is told it fell behind rather than buffering forever.** Four thousand lines
+  flooded past an idle subscriber produce a `Lagged` error carrying the skipped count, while the
+  authoritative buffer stays correct:
+  `process::tests::a_slow_subscriber_is_told_it_fell_behind_rather_than_buffering_forever`.
+- [x] **One noisy process does not stall another.**
+  `process::tests::heavy_output_does_not_block_a_second_process`.
+- [x] **A re-attaching Pane can rebuild the screen exactly.**
+  `process::tests::a_reattaching_pane_can_rebuild_the_screen_from_replay`,
+  `buffer::tests::replay_reconstructs_the_screen_without_replaying_the_whole_ring`.
+- [x] **A signal death is never reported as a clean exit.**
+  `process::tests::killing_a_process_is_reported_as_a_signal_death`,
+  `state::tests::signals_count_as_failure`.
+- [x] **Interrupt reaches the foreground process group, not just the direct child.** Sent as the
+  control character through the tty, which is what reaches the children an agent spawned:
+  `process::tests::interrupting_reaches_the_foreground_process_group`.
+- [x] **A missing binary fails cleanly instead of panicking.**
+  `process::tests::spawning_a_command_that_does_not_exist_fails_cleanly`.
+- [x] **A zero-sized terminal is clamped rather than crashing the parser.**
+  `buffer::tests::a_zero_sized_terminal_is_clamped_instead_of_panicking`.
+
+### State model
+
+- [x] **Finishing a turn is not the same as exiting.**
+  `state::tests::finishing_a_turn_is_not_the_same_as_exiting`, and at Session level
+  `model::session::tests::a_session_whose_agent_finished_but_child_still_runs_reads_as_running`.
+- [x] **A crashed Agent never keeps claiming it awaits the user.** A dead process outranks any stale
+  turn state, so it leaves the queue: `state::tests::a_crashed_process_never_keeps_claiming_it_
+  awaits_you`, `attention::manager::tests::a_dead_process_leaves_the_queue_behind`.
+- [x] **A clean exit after a reported task completion reads as done, not merely stopped.**
+  `state::tests::a_clean_exit_after_task_done_reads_as_done_not_stopped`.
+- [x] **A plain process carries no turn axis.** A shell owes the user nothing:
+  `state::tests::a_plain_process_with_no_agent_axis_is_just_running`,
+  `model::node::tests::an_agent_gets_the_turn_axis_and_a_shell_does_not`.
+- [x] **An unrecoverable process is reported as lost, not assumed dead or alive.**
+  `state::tests::a_lost_process_is_reported_rather_than_assumed_dead_or_alive`.
+
+### Attention
+
+- [x] **Simultaneous demands produce one ordered next item.** Three Sessions block at once; the
+  blocked permission goes first and the full order is deterministic:
+  `attention::queue::tests::simultaneous_demands_produce_one_ordered_next`,
+  `attention::manager::tests::three_simultaneous_demands_are_walked_one_at_a_time`.
+- [x] **A chatty Agent is still one demand, and cannot reset its own age to jump the queue.**
+  `queue::tests::repeated_demands_collapse_instead_of_piling_up`,
+  `a_repeated_demand_cannot_reset_its_age_to_jump_the_queue`.
+- [x] **Two subagents blocked at once are two demands, not one.**
+  `queue::tests::two_subagents_in_one_session_are_two_demands`,
+  `event::tests::two_subagents_waiting_at_once_do_not_collapse`.
+- [x] **Ageing prevents starvation without reordering priority classes.** An hour-old idle prompt
+  still loses to a fresh blocked permission, but beats an equally-ranked fresher demand:
+  `queue::tests::aging_prevents_starvation_without_reordering_priority_classes`.
+- [x] **Snooze, acknowledge and dismiss behave as specified,** including that asking again
+  un-acknowledges: `queue::tests::snoozed_demands_disappear_until_their_deadline`,
+  `acknowledged_demands_rank_below_pending_ones_but_stay_reachable`,
+  `asking_again_un_acknowledges_a_demand`.
+- [x] **The user is never interrupted mid-keystroke, and the signal is not lost.** Deferred, then
+  delivered when their hands stop: `attention::focus::tests::typing_defers_focus_rather_than_
+  dropping_the_signal`, `manager::tests::focus_waits_for_the_user_to_stop_typing_then_happens`.
+- [x] **A stale deferred jump is dropped rather than fired late.**
+  `manager::tests::a_stale_deferred_jump_is_dropped_rather_than_fired_late`.
+- [x] **A per-Session policy cannot opt out of the typing guard.** The guard lives in the governor,
+  not the policy: `focus::tests::a_policy_cannot_opt_out_of_the_typing_guard`.
+- [x] **A burst of simultaneous completions moves the user exactly once.**
+  `focus::tests::agents_finishing_at_the_same_instant_produce_one_focus_change`, and the sliding
+  window holds under sustained load: `focus_changes_never_exceed_the_ceiling_within_any_single_window`.
+- [x] **A Session cannot immediately reclaim focus it just lost.**
+  `focus::tests::a_session_cannot_immediately_reclaim_focus_it_just_lost`.
+- [x] **Manual navigation always works and is never rate limited.** Pressing the shortcut is consent:
+  `manager::tests::walking_the_queue_manually_is_not_rate_limited`.
+- [x] **A new subagent badges and never moves the user,** even at `Explicit` confidence:
+  `policy::tests::a_new_subagent_never_moves_focus_even_when_explicit`,
+  `manager::tests::a_new_subagent_badges_without_moving_the_user`.
+- [x] **A completed turn badges but does not queue a blocking demand.**
+  `manager::tests::a_completed_turn_badges_but_does_not_queue_a_blocking_demand`.
+- [x] **A muted Session badges and does nothing else.**
+  `manager::tests::a_muted_session_badges_and_nothing_more`.
+- [x] **Answering the Agent clears the demand.**
+  `manager::tests::answering_the_agent_clears_the_demand`.
+
+### Confidence and integration
+
+- [x] **A heuristic cannot promote itself to a fact.** The event source clamps the requested
+  confidence: `event::tests::a_heuristic_cannot_promote_itself_to_explicit`.
+- [x] **A heuristic can never move the user's focus,** enforced at both the policy layer and the
+  manager: `policy::tests::a_guessed_permission_badges_instead_of_stealing_focus`,
+  `manager::tests::a_guessed_permission_never_produces_a_focus_effect`.
+- [x] **Provisional demands rank below confirmed ones of the same kind, and are upgraded in place
+  when a hook confirms them.** `queue::tests::provisional_demands_rank_below_confirmed_ones_of_the_
+  same_kind`, `upsert_upgrades_confidence_when_a_hook_confirms_a_guess`.
+- [x] **Claude Code hooks are installed without touching the user's own configuration.** The settings
+  file is written into Turn's per-Session scratch directory and passed with `--settings`; the user's
+  own flags keep their position: `claude::tests::preparing_writes_a_settings_file_and_passes_it_
+  without_touching_user_config`.
+- [x] **Claude Code's payloads map to the event vocabulary,** including the three `Notification`
+  types told apart rather than flattened, permission requests carrying a command and a risk rating,
+  and confirmed subagent start/stop: `claude::tests::notification_types_are_told_apart`,
+  `a_permission_request_carries_the_command_and_a_risk_rating`,
+  `subagents_are_reported_explicitly_with_their_type`.
+- [x] **`background_tasks` makes "turn finished while work continues" a reported fact, not an
+  inference.** `tests/contract_claude.rs::a_stop_with_background_work_is_reported_as_such`.
+- [x] **The adapter survives malformed, mistyped and truncated payloads without panicking.** An
+  adapter that panics takes the daemon's event loop with it:
+  `claude::tests::malformed_payloads_do_not_panic`,
+  `tests/contract_claude.rs::no_recorded_or_corrupted_payload_can_panic_the_adapter`.
+- [x] **An unrecognised hook event is dropped rather than guessed at.** New releases add events; they
+  must not become noise: `claude::tests::an_unknown_hook_event_is_ignored_rather_than_guessed_at`.
+- [x] **Real recorded payloads are pinned by a contract test** against
+  `tests/fixtures/claude-code-2.1.221.json`, captured from a live run:
+  `tests/contract_claude.rs::the_recorded_hook_payloads_still_carry_the_fields_the_adapter_reads`.
+- [x] **A command that merely mentions an agent is not classified as one.** `echo "ask claude"` is not
+  a coding agent: `turn-pty::supervisor::tests::a_command_that_only_mentions_an_agent_is_not_
+  classified_as_one`.
+- [x] **An unrecognised process is admitted as unknown rather than mislabelled,** including a GUI
+  application an Agent launched: `supervisor::tests::an_unrecognised_process_is_admitted_as_unknown_
+  rather_than_guessed`.
+- [x] **Descendants are walked transitively from the real process table.**
+  `supervisor::tests::a_child_we_spawn_is_found_as_a_descendant`.
+- [x] **Risk ratings err upward and cannot be laundered by a reassuring tool name.** `Read` with
+  `rm -rf` is High: `risk::tests::the_command_outweighs_a_reassuring_tool_name`,
+  `an_unrecognised_tool_defaults_upward`.
+- [x] **Codex is configured through inline TOML hooks, not a file path,** with PascalCase event keys, the
+  handler list spelled `hooks` exactly as in Claude Code, a shell-quoted command because Codex runs it
+  through a shell, and `notify` naming the program only:
+  `tests/contract_codex.rs::hooks_are_configured_as_an_inline_toml_struct_and_never_as_a_path`,
+  `the_handler_list_key_is_hooks_because_handlers_fires_nothing`,
+  `subscribed_event_keys_are_pascal_case_and_from_the_known_set`,
+  `notify_names_the_program_only_and_the_url_travels_in_the_environment`.
+- [x] **A per-node token never travels in a process's argv.** `/proc/<pid>/cmdline` is world-readable, so a
+  token passed as `--url` would let any agent Turn launched harvest every other Codex session's token with
+  one `ps` and forge events for all of them. Both Codex mechanisms take the URL from `TURN_HOOK_URL`
+  instead: `tests/contract_codex.rs::notify_names_the_program_only_and_the_url_travels_in_the_environment`. This
+  reverses part of ADR-027's reasoning and landed during this survey.
+- [x] **A full Codex launch configures both mechanisms, because neither is sufficient alone,** and
+  degrades honestly when hook trust is unavailable:
+  `tests/contract_codex.rs::a_first_launch_configures_both_mechanisms_but_claims_only_what_it_can_prove`,
+  `without_hook_trust_the_adapter_reports_wrapper_and_says_what_is_missing`.
+- [x] **A Codex tool-call payload is never turned into an approval or a command to run.**
+  `tests/contract_codex.rs::a_tool_call_payload_is_never_turned_into_an_approval_or_a_command_to_run`,
+  `a_permission_request_is_reported_for_the_user_and_never_answered`.
+- [x] **The heuristic layer stands down inside a full-screen application,** because a `vim` buffer
+  containing `(y/n)` is not a permission prompt, and it counts how often it did.
+  `heuristic::tests` (19 tests), `OutputHeuristic::stood_down()`.
+- [x] **A quiet terminal is not, on its own, treated as an Agent waiting for the user.** The single most
+  common false positive available is ruled out by construction: the "awaiting input" rule requires a
+  positive marker of an agent input affordance. `heuristic::tests`.
+- [x] **Heuristic inference is debounced, so a spinner clearing between frames does not produce a stream
+  of started/waiting/started events,** and it is testable without sleeping because the caller passes the
+  time in. `heuristic::tests`, `HeuristicConfig { idle_after_ms: 2_000, debounce_ms: 750 }`.
+- [x] **Inference is only pointed at programs that hold a conversation.** `HEURISTIC_EXECUTABLES` is a
+  closed list; anything unlisted gets a plain terminal and no claims. `registry::tests`.
+- [x] **Adapter selection always answers.** An unrecognised command runs as a plain terminal rather than
+  being refused, and the reason is reported in plain language for the Session details panel — including
+  the distinct case of "Turn knows this tool but it is not on your PATH". `registry::tests` (12 tests),
+  `Selection::is_installed`.
+- [x] **`RUST_LOG=debug claude` is still recognised as Claude Code,** and a shell one-liner is
+  deliberately not unpicked. `registry::tests`, `registry::executable_of`.
+- [x] **The hook server binds `127.0.0.1` only, on an ephemeral port, and refuses an unknown token.**
+  A request without a valid per-node 256-bit token is rejected and counted in `HookStats::refused`, so
+  another process on the machine cannot forge "your Agent is waiting for you". `server::tests`
+  (13 tests), including a real HTTP client over a real socket.
+- [x] **The hook server never answers with a decision.** Claude Code's protocol permits a response body
+  that allows or denies a tool call; Turn always replies with an empty 200. `server::tests`.
+- [x] **A hostile `Content-Length` costs nothing.** The 256 KiB body limit is applied by the server
+  before the bytes are buffered. `server::tests`.
+- [x] **A daemon that stops draining loses events rather than slowing every Agent on the machine.** The
+  event channel is bounded at 1,024 and a full channel drops and counts; a dropped receiver does not stop
+  the server answering agents. `server::tests`.
+- [x] **A broken `turn-hook` helper can never break an agent session.** No URL, no daemon listening, an
+  unreadable payload, a refused connection — the process exits 0 and prints nothing.
+  `turn-hook` (15 tests).
+- [x] **The helper accepts both payload conventions,** stdin as Claude Code's `command` hooks deliver it
+  and argv as Codex's `notify` does, and takes its destination from `--url` or `TURN_HOOK_URL`.
+  `turn-hook` tests.
+
+### Hierarchy
+
+- [x] **A tool-reported subagent link is confirmed; a process-table guess is inferred; anything else
+  renders at the root.** `model::node::tests::subagents_hang_off_their_parent_with_a_confirmed_link`,
+  `an_unattributable_process_stays_at_the_root_rather_than_being_guessed_under_a_parent`.
+- [x] **A confirmed link is never overwritten by an inferred one, and an inferred link is upgraded
+  when the tool confirms it.** `node::tests::a_confirmed_link_is_not_overwritten_by_an_inferred_one`,
+  `an_inferred_link_is_upgraded_when_the_tool_confirms_it`.
+- [x] **Removing a parent promotes its children instead of deleting them,** and cycles are refused:
+  `node::tests::removing_a_parent_promotes_its_children_instead_of_deleting_them`,
+  `relinking_refuses_to_build_a_cycle`.
+- [x] **A Session's aggregate state is the most severe, not the most recent.** One failure among nine
+  healthy processes reads as failed: `node::tests::the_aggregate_state_is_the_most_severe_not_the_
+  most_recent`.
+
+### Layouts and Templates
+
+- [x] **Splits, close, resize, swap, zoom and focus cycling behave correctly and keep the geometry
+  invariant.** 16 tests in `model::layout::tests`, including that three same-direction splits produce
+  one flat split of three equal siblings rather than a lopsided nest, that a Pane cannot be resized
+  out of existence, that the last Pane cannot be closed, and that operations on an unknown Pane fail
+  instead of corrupting the tree.
+- [x] **Two Sessions instantiated from one Template share no Pane identity but have identical shape
+  and commands.** `model::template::tests::two_sessions_from_one_template_share_no_pane_ids`.
+- [x] **Saving a live Layout as a Template drops process bindings.**
+  `template::tests::saving_a_live_layout_as_a_template_drops_process_bindings`.
+- [x] **A hand-edited Layout with sizes that do not add up is normalised on load.**
+  `layout::tests::a_hand_edited_layout_with_bad_sizes_is_normalised_on_load`.
+- [x] **The four built-in Templates are present and structurally valid.**
+  `template::tests::the_built_in_set_is_present_and_valid`.
+
+### Security
+
+- [x] **A process cannot rewrite the user's clipboard by printing an escape sequence.** OSC 52 writes
+  are refused and counted so the UI can say a process tried:
+  `buffer::tests::a_clipboard_write_from_the_process_is_refused_but_recorded`. A clipboard *read* request
+  is refused too, so a process cannot exfiltrate what the user last copied:
+  `a_clipboard_read_request_from_the_process_is_refused_and_recorded`.
+- [x] **A process cannot resize its own terminal by printing an escape sequence.** Geometry is Turn's to
+  decide, not the program's: `buffer::tests::a_resize_request_from_the_process_is_refused`.
+- [x] **A process-supplied title is stripped of whole escape sequences, not just control characters,
+  and length-capped.** `ESC [ 2 J` must not leave a visible `[2J` in the sidebar, and a nested OSC
+  must not leave its payload behind:
+  `buffer::tests::a_malicious_title_is_stripped_of_control_characters`. The cap is applied when the title
+  arrives rather than when it is read, so an enormous title is never retained:
+  `an_enormous_title_is_capped_when_it_arrives_not_when_it_is_read`. Invalid UTF-8 is replaced rather than
+  fatal: `a_title_of_invalid_utf8_is_replaced_rather_than_fatal`.
+- [x] **A title cannot lie about itself with Unicode.** A bidirectional override must not let a title
+  render reversed, and invisible tag characters must not be smuggled into a label:
+  `buffer::tests::a_title_cannot_reverse_its_own_rendering_with_a_direction_override`,
+  `a_title_cannot_smuggle_invisible_tag_characters_into_a_label`. The same rule holds for screen content
+  the UI renders: `screen_rows_never_carry_invisible_or_direction_changing_characters`.
+- [x] **One enormous line cannot grow the screen model without bound.** It is bounded by the terminal
+  geometry: `buffer::tests::one_enormous_line_is_bounded_by_the_terminal_geometry`.
+
+### Persistence
+
+- [x] **A whole desk survives a restart, and reports what it cannot vouch for.** Workspaces, Sessions, the
+  layout tree, process metadata, Templates, settings and the event log all come back.
+  `restart_restores_the_desk::a_whole_desk_survives_a_restart_and_reports_what_it_cannot_vouch_for`,
+  `settings_templates_and_preferences_come_back_too`,
+  `a_second_session_from_the_same_template_is_stored_independently`.
+- [x] **A stored `Alive` is never believed after a restart.** `SessionRepo::load_for_restore` downgrades
+  anything stored as running to `Lifecycle::Orphaned`, because a stored `Alive` only ever meant "alive when
+  we last wrote". `restart_restores_the_desk::a_partial_restore_is_recorded_so_the_ui_can_explain_itself`.
+- [x] **A pending demand for the user outlives the daemon that recorded it.** An Agent that blocked on a
+  permission at 17:58 is still blocked at 18:02, and a queue rebuilt from nothing would drop it silently.
+  `restart_restores_the_desk::a_pending_demand_for_the_user_outlives_the_daemon_that_recorded_it`.
+- [x] **The event log still says which states were guesses,** weeks later — every row keeps its
+  `Confidence` and its source. `restart_restores_the_desk::the_event_log_still_says_which_states_were_guesses`.
+- [x] **Renaming a Session does not erase its history.** Writes are `INSERT ... ON CONFLICT DO UPDATE`, never
+  `REPLACE`, which would delete the old row first and cascade away the Session's nodes, events and pending
+  attention. `repo::session::tests`,
+  `restart_restores_the_desk::closing_a_pane_in_a_stored_session_does_not_leave_the_process_row_behind`.
+- [x] **A database written by a newer build is refused at open time,** rather than being written to and
+  silently losing the fields that build depends on.
+  `turn_store::tests::a_database_from_a_newer_build_is_refused_at_open_time`.
+- [x] **A long-running install prunes its history without losing the recent past.**
+  `restart_restores_the_desk::a_long_running_install_prunes_its_history_without_losing_the_recent_past`.
+- [x] **No secret value is present anywhere in the files on disk** — asserted by writing real SQLite files
+  and searching them, not by unit-testing the redactor.
+  `secrets_never_reach_the_disk::no_secret_value_is_present_anywhere_in_the_files_on_disk`,
+  `a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes`,
+  `a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent`.
+- [x] **A restored Pane is never given a scrollback the Agent no longer remembers.** Only process metadata
+  is persisted — pid, command, cwd, lifecycle, relation, exit code, external id — never the pty, the
+  terminal grid or the parser state. `repo::node::tests` (12 tests).
+
+### The daemon↔UI boundary
+
+- [x] **A full working conversation completes over the real framing.** Handshake, correlated
+  request/response, unsolicited pushes.
+  `turn-proto::conversation::a_full_working_conversation_completes_over_the_real_framing`.
+- [x] **A guessed state reaches the client as a guess, and never as a focus jump.** The confidence rule
+  survives the serialisation boundary.
+  `conversation::a_guessed_state_reaches_the_client_as_a_guess_and_never_as_a_focus_jump`,
+  `the_governors_verdicts_stay_distinguishable_across_the_boundary`.
+- [x] **A UI restart rebuilds its terminals without touching the processes.**
+  `conversation::a_ui_restart_rebuilds_its_terminals_without_touching_the_processes`.
+- [x] **A partial restore offers a relaunch that only the user can accept.**
+  `conversation::a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept`.
+- [x] **A firehose of output reassembles in order and admits what was dropped.**
+  `conversation::a_firehose_of_output_reassembles_in_order_and_admits_what_was_dropped`.
+- [x] **A hostile stream of rubbish never costs more than the bad lines.** A malformed frame from a buggy
+  client cannot take the connection down.
+  `conversation::a_hostile_stream_of_rubbish_never_costs_more_than_the_bad_lines`,
+  `contract::the_catalogue_reassembles_correctly_under_pathological_chunking`.
+- [x] **A stale client is told which side is old, and the connection ends** rather than half working.
+  `conversation::a_stale_client_is_told_which_side_is_old_and_the_connection_ends`.
+- [x] **Every request names a response that exists, and every response is produced by some request.** The
+  pairing is load-bearing rather than documentation that might be stale.
+  `contract::every_request_names_a_response_variant_that_exists`,
+  `every_response_variant_is_produced_by_at_least_one_request`.
+- [x] **The protocol has no way to say "approve this permission", no way to say "run this command", and
+  exactly one way to restart anything.** Enforced by omission, which is the strongest form available to a
+  type definition. `request::tests`.
+- [x] **A subagent appearing pushes a tree the client can draw without guessing.**
+  `conversation::a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing`.
+
+### Not demonstrated
+
+Two different things appear below, and the distinction is the point. Some items have **no code at all**.
+Others have code on every side of the boundary and tests that pass on each side separately, which is not the
+same as demonstrated: the pieces have never been run together against a real agent, so nothing in this
+section may be checked off. Each item says which case it is.
+
+- [ ] **Anything runs end to end.** *Code exists, unverified.* `turnd` is no longer a stub: `main.rs`
+  parses options and starts a daemon, and the crate carries 71 test functions. Whether a Session actually
+  runs an Agent end to end has not been observed here, and the exit criterion in `ROADMAP.md` M5 — a
+  scripted client creating a Session whose hook POST changes what the client is told — remains unmet as far
+  as this document can attest.
+- [ ] **Process and pty facts become events.** *Code exists, unverified.* `turn-pty` still constructs no
+  `TurnEvent`s, by design. The conversion now lives in `turnd`: `core/spawn.rs` and `core/events/exit.rs`
+  build `process.started` / `process.exited` / `process.failed`, and `core/supervise.rs` builds
+  `process.spawned_child`. The join of a supervisor observation, a pty exit and a hook payload into one
+  `SessionTree` is `core/events/mod.rs`. **This remains the riskiest code in the system** — see
+  `ROADMAP.md` §Risks 4 — and its adversarial cases (out-of-order arrival, a hook for a dead node, a reused
+  pid) are exactly what has not been shown to work.
+- [ ] **Attention effects reach a user.** *Daemon side exists; client side regressed.* `turnd` owns an
+  `AttentionManager` and forwards `Effect`s over the protocol. **The client side regressed:** all four
+  channels — badge, highlight in words as well as colour, sound, OS notification — were built and tested in
+  the frontend that has since been deleted (ADR-039), and none of them exists in `turn-gui` yet. The daemon's
+  half is unchanged and still tested; the perceptible half has to be written again. What has not happened,
+  and is now further away, is a real notification arriving from a real agent on a real desktop.
+- [ ] **`UserContext` is real.** *Daemon side exists; client side regressed.* `turnd` holds a `UserContext`
+  and accepts `update_user_activity`. The reporter that fed it — every keystroke, every window focus change,
+  every open modal, with the burst coalescing tested — was in the deleted frontend and does not exist in
+  `turn-gui`. Until it does, `is_typing()` is always false in a running system, which makes the focus
+  governor's typing guard inert. That is the most consequential single thing lost with the old client, and it
+  is not optional polish: ADR-039's carry-over list names it.
+- [ ] **The heuristic layer is actually driven.** *Code exists, unverified.* `turnd` constructs an
+  `OutputHeuristic` for panes selected at `IntegrationLevel::Heuristic` and calls `observe` against a
+  snapshot. Whether a `PtyHeuristic` event has ever been produced by a running system is not established
+  here.
+- [ ] **Re-attaching to a live process.** *Code exists, unverified, and incomplete by its own admission.*
+  `turn-store` still produces `Lifecycle::Orphaned` on restore. `turnd/src/core/restore.rs` assigns
+  `Lifecycle::Lost` where a pid cannot be found and reads `RestoreBehaviour` when deciding what may be
+  offered, so neither is dead code any more. Its own module documentation records that
+  `Lifecycle::Reconnected` is deliberately never produced there. Pid-reuse defence is still an open
+  decision (`ROADMAP.md` Open decision 5).
+- [ ] **The window shows a real agent.** *Started over.* The first window — a Tauri shell around a
+  TypeScript/`xterm.js` frontend — was built with sidebar, draggable dividers, attention queue, agent tree,
+  event log, overview, palette, keymap sheet and permission banner, and was **rejected by the product owner
+  on sight and deleted** (ADR-039). What exists now is `crates/turn-gui`: a native `eframe`/`egui` window on
+  `wgpu` that paints the status bar, the permission banner, the session sidebar, a terminal pane cell by cell
+  and the attention queue, verified by 11 unit tests and 2 snapshot tests rendered through `wgpu` with no
+  display. It has no daemon connection, so it has never shown any agent, real or otherwise.
+- [ ] **tmux-backed Sessions.** *No code.* Flags and node kinds exist; nothing reads them. Deliberate
+  (see §6).
+- [x] **Clean `cargo fmt --check` and clippy.** Both pass across the workspace as of 2026-08-04:
+  `cargo fmt --all -- --check` reports no diff and `cargo clippy --workspace --all-targets -- -D warnings`
+  is silent. The 30 unformatted files and four clippy findings this list used to name are fixed, as is one
+  further clippy finding that appeared in `turn-gui` while the old frontend was being retired. Details in
+  `ROADMAP.md` §Technical debt.

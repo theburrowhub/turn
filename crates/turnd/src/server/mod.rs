@@ -1,0 +1,203 @@
+//! Starting the daemon, and accepting connections.
+
+mod client;
+
+use crate::config::Config;
+use crate::core::{ClientId, Command, Core, COMMAND_CAPACITY};
+use crate::error::Result;
+use crate::{instance, paths};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::net::UnixListener;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use turn_agents::HookServer;
+use turn_store::Store;
+
+/// Facts about this daemon that every handshake repeats.
+///
+/// `pid` and `started_ms` are what let a reconnecting UI tell "my socket hiccupped"
+/// from "the daemon restarted and is holding nothing of mine" — which decides whether
+/// it has to re-attach every pane.
+#[derive(Debug, Clone)]
+pub struct DaemonInfo {
+    pub version: String,
+    pub pid: u32,
+    pub started_ms: i64,
+}
+
+/// A running daemon.
+///
+/// Dropping this does not stop anything: the tasks own their work and the processes
+/// outlive the handle by design. Call [`DaemonHandle::shutdown`] to stop, or
+/// [`DaemonHandle::run_until_signal`] to hand control to the operating system.
+pub struct DaemonHandle {
+    socket_path: PathBuf,
+    hook_base_url: String,
+    data_dir: PathBuf,
+    info: DaemonInfo,
+    commands: mpsc::Sender<Command>,
+    accept: JoinHandle<()>,
+    core: JoinHandle<()>,
+    /// Kept alive for as long as the daemon runs: dropping it stops the hook server,
+    /// and an agent whose callbacks start failing is a worse outcome than an idle port.
+    hooks: Arc<HookServer>,
+}
+
+impl DaemonHandle {
+    /// The socket clients connect to.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// The loopback base URL agents post their hooks to.
+    pub fn hook_base_url(&self) -> &str {
+        &self.hook_base_url
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    pub fn info(&self) -> &DaemonInfo {
+        &self.info
+    }
+
+    /// Counters from the hook server, including how many posts were refused for an
+    /// unknown token.
+    pub fn hook_stats(&self) -> turn_agents::HookStats {
+        self.hooks.stats()
+    }
+
+    /// Flushes state, stops the tasks and removes the socket.
+    pub async fn shutdown(self) {
+        let (done, wait) = oneshot::channel();
+        if self.commands.send(Command::Shutdown { done }).await.is_ok() {
+            // The core flushes the store before answering. Bounded so a wedged handler
+            // cannot keep the process alive forever, at the cost of the last write.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await;
+        }
+        self.accept.abort();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.core).await;
+        instance::remove_socket(&self.socket_path);
+        self.hooks.shutdown();
+    }
+
+    /// Runs until the operating system asks the daemon to stop.
+    ///
+    /// Both signals are handled the same way: flush and go. A daemon that ignored
+    /// `SIGTERM` would be killed a moment later with its last few minutes of state
+    /// unwritten.
+    pub async fn run_until_signal(self) {
+        wait_for_signal().await;
+        tracing::info!("stopping on a signal");
+        self.shutdown().await;
+    }
+}
+
+/// Starts a daemon: store, hook server, socket, core task, accept loop.
+pub async fn start(config: Config) -> Result<DaemonHandle> {
+    paths::ensure_dir(&config.data_dir)?;
+
+    let store = if config.persist {
+        Store::open_in(&config.data_dir)?
+    } else {
+        // Everything else behaves identically; nothing survives the process.
+        Store::open_in_memory()?
+    };
+
+    let (hooks, hook_events) = HookServer::start_with_helper(config.hook_helper.clone()).await?;
+    let hooks = Arc::new(hooks);
+    let hook_base_url = hooks.base_url().to_string();
+
+    // Bound the socket before doing anything else that a second daemon would also do,
+    // so contention is detected before two processes touch the same store.
+    let listener = instance::bind_exclusive(&config.socket_path).await?;
+
+    let (commands, inbox) = mpsc::channel(COMMAND_CAPACITY);
+    let core = Core::new(
+        store,
+        Arc::clone(&hooks),
+        config.registry,
+        config.data_dir.clone(),
+        commands.clone(),
+    )?;
+
+    let info = DaemonInfo {
+        version: crate::DAEMON_VERSION.to_string(),
+        pid: std::process::id(),
+        started_ms: turn_core::now_ms(),
+    };
+
+    let core_task = tokio::spawn(core.run(inbox, hook_events));
+    let accept_task = tokio::spawn(accept_loop(listener, commands.clone(), info.clone()));
+
+    tracing::info!(
+        socket = %config.socket_path.display(),
+        data_dir = %config.data_dir.display(),
+        hooks = %hook_base_url,
+        pid = info.pid,
+        version = %info.version,
+        persist = config.persist,
+        "turnd is listening"
+    );
+
+    Ok(DaemonHandle {
+        socket_path: config.socket_path,
+        hook_base_url,
+        data_dir: config.data_dir,
+        info,
+        commands,
+        accept: accept_task,
+        core: core_task,
+        hooks,
+    })
+}
+
+/// Accepts connections until the task is aborted.
+async fn accept_loop(listener: UnixListener, commands: mpsc::Sender<Command>, info: DaemonInfo) {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let id = ClientId(NEXT.fetch_add(1, Ordering::Relaxed));
+                tokio::spawn(client::serve(stream, id, commands.clone(), info.clone()));
+            }
+            Err(error) => {
+                // Per-connection failures are normal — a client that vanished between
+                // the kernel queueing it and us accepting it. Refusing to serve anyone
+                // else because of one of those would be the wrong response.
+                tracing::warn!(%error, "could not accept a connection");
+                if error.kind() == std::io::ErrorKind::InvalidInput {
+                    // The listener itself is unusable; nothing will improve by looping.
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Waits for `SIGINT` or `SIGTERM`.
+#[cfg(unix)]
+async fn wait_for_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::error!(%error, "could not listen for SIGTERM; only SIGINT will stop the daemon");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}

@@ -1,0 +1,20 @@
+[package]
+name = "turn-hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# No dependencies, on purpose. This binary runs inside the user's agent process
+# tree, possibly on every tool call, so it must start in microseconds and cannot
+# afford to pull in an async runtime or a TLS stack to POST a few hundred bytes to
+# loopback.
+[dependencies]
+
+[lib]
+name = "turn_hook"
+path = "src/lib.rs"
+
+[[bin]]
+name = "turn-hook"
+path = "src/main.rs"

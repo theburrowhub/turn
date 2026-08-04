@@ -1,0 +1,39 @@
+[package]
+name = "turnd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# A library as well as a binary. The integration tests drive a daemon over a real
+# unix socket in-process, which is the only way to assert on a live pty, a live
+# hook server and a live store in one test without a fixture that lies about one
+# of them. `main.rs` is a thin edge over the same API.
+[lib]
+name = "turnd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "turnd"
+path = "src/main.rs"
+
+[dependencies]
+turn-core = { workspace = true }
+turn-proto = { workspace = true }
+turn-store = { workspace = true }
+turn-pty = { workspace = true }
+turn-agents = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Posts hook payloads to the daemon's own hook server exactly as an agent would.
+# No TLS backend: the server binds loopback and speaks plain HTTP by design.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

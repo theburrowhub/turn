@@ -1,0 +1,36 @@
+[package]
+name = "turn-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "turn"
+path = "src/main.rs"
+
+[dependencies]
+turn-core = { workspace = true }
+turn-proto = { workspace = true }
+eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.35"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+# The window must be able to tell the user something finished while they are looking
+# at another application, which is the entire product. Reaching the OS notification
+# centre needs a platform binding; everything that *decides* whether to notify lives
+# in `announce.rs` and is tested without it.
+notify-rust = { version = "4.11", default-features = false }
+
+[dev-dependencies]
+# `eframe` lets the harness run the real `TurnApp` rather than only its view, which is
+# what makes the idle-repaint measurement a test of the application.
+egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
+# `start_paused` lets the reconnect backoff be tested in microseconds rather than by
+# waiting out a real thirty seconds.
+tokio = { workspace = true, features = ["test-util"] }

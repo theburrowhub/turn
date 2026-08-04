@@ -1,0 +1,167 @@
+{
+  "_recording": {
+    "tool": "codex-cli 0.146.0 (aarch64-apple-darwin, homebrew cask)",
+    "recorded": "2026-08-04",
+    "how": "A `command` hook handler that appended its argv, its stdin and its environment to a JSONL file, plus the same script as the `notify` program. Runs were made in a throwaway git repo under /tmp with CODEX_HOME pointed at an isolated directory, so the user's own ~/.codex was never written to.",
+    "clients": "hook payloads captured from both `codex exec` and the interactive TUI under a pty; they were identical. The `notify` payload differs between them only in `client`.",
+    "delivery": "Hook payloads arrive on STDIN as a single JSON object. argv is empty: a handler `args` array parses but is silently ignored. The `notify` payload arrives as one extra argv entry appended after the configured arguments.",
+    "environment": "The environment of the `codex` process is inherited by hook handlers and by the notify program; TURN_HOOK_URL and TURN_SESSION_ID were both observed arriving intact.",
+    "identifiers": "Within one session the hooks' `session_id` and notify's `thread-id` were byte-identical (019fcdc4-5f91-7980-b743-11575462cd61 in the TUI run), so Turn has one external id whichever mechanism reports it. The payloads below come from several runs, so their ids differ between entries.",
+    "not_captured": [
+      "PreToolUse / PostToolUse / PreCompact / PostCompact — accepted by the config parser and listed by `hooks/list`, but Turn does not subscribe to them so they were never exercised.",
+      "A SessionEnd `reason` other than \"other\"."
+    ]
+  },
+
+  "_config": {
+    "flag": "codex -c 'hooks={SessionStart=[{matcher=\"*\",hooks=[{type=\"command\",command=\"'\\''/abs/path/turn-hook'\\''\"}]}]}'",
+    "event_keys_are_pascal_case": [
+      "PreToolUse",
+      "PermissionRequest",
+      "PostToolUse",
+      "PreCompact",
+      "PostCompact",
+      "SessionStart",
+      "SessionEnd",
+      "UserPromptSubmit",
+      "SubagentStart",
+      "SubagentStop",
+      "Stop"
+    ],
+    "handler_list_key": "hooks",
+    "rejected_spellings": {
+      "session_start": "snake_case event keys are accepted by the TOML parser and then never match any event: `hooks/list` reports zero hooks",
+      "sessionStart": "camelCase likewise parses and never fires; camelCase is the app-server wire spelling, not the config spelling",
+      "handlers": "the per-matcher handler list key `handlers` parses and never fires; Codex calls it `hooks`, same as Claude Code",
+      "hooks=\"/path/file.json\"": "rejected outright: invalid type: string, expected struct HooksToml"
+    },
+    "handler_keys": {
+      "type": "command | prompt | agent — only `command` runs; `prompt` and `agent` warn \"prompt/agent hooks are not supported yet\"",
+      "command": "executed THROUGH A SHELL: $HOME expands and globs expand, and an unquoted path containing a space fails outright. Must be POSIX-quoted.",
+      "timeout": "seconds; default 600, clamped to 1 for SessionEnd",
+      "async": "parses, then warns \"async hooks are not supported yet\"",
+      "args": "parses and is silently ignored — argv reaches the handler empty",
+      "statusMessage": "accepted",
+      "additionalContextLimit": "accepted"
+    },
+    "file_form": "$CODEX_HOME/hooks.json is also discovered, as {\"description\": …, \"hooks\": {<same PascalCase event map>}}, reported with source=\"user\". The top-level object rejects unknown keys; nothing deeper does.",
+    "oracle": "`codex app-server` + a JSON-RPC `hooks/list` call reports every hook Codex actually parsed, with its trustStatus. It is the only way to tell a working config from one that parsed and will never fire.",
+    "notify": "notify=[\"/abs/path/turn-hook\"] — an array of program and arguments, with the JSON payload appended as one further argument. The recording used a `--url http://127.0.0.1:PORT/hook/TOKEN` pair here and that is why the shape is known, but Turn must not: argv is world-readable (/proc/<pid>/cmdline), so the per-node token would be harvestable by any local account. The URL travels in TURN_HOOK_URL, which this recording also proved the notify program inherits."
+  },
+
+  "_trust": {
+    "summary": "A freshly configured hook is `untrusted` and will not run.",
+    "codex_exec": "Silently runs nothing. No warning, no error, no non-zero exit — the session looks entirely normal and zero callbacks arrive.",
+    "interactive_tui": "Blocks at startup on a modal, transcribed verbatim from a pty capture: \"Hooks need review / 7 hooks are new or changed. / Hooks can run outside the sandbox after you trust them. / 1. Review hooks / 2. Trust all and continue / 3. Continue without trusting (hooks won't run)\"",
+    "granting": "\"Trust all and continue\" appends to $CODEX_HOME/config.toml one entry per handler: [hooks.state.\"/<session-flags>/config.toml:<snake_case_event>:<matcher_index>:<handler_index>\"] with trusted_hash = \"sha256:…\". After that `codex exec` runs the hooks with no extra flags.",
+    "invalidation": "Changing the handler command flips trustStatus to \"modified\" and the review is required again. So Turn's helper path is part of what the user trusted.",
+    "bypass": "--dangerously-bypass-hook-trust makes hooks run without trust and prints a warning twice. `codex app-server` does not accept the flag. Turn must never pass it: granting hook trust is the user's security decision.",
+    "notify_is_not_gated": "With hooks left untrusted in a fresh CODEX_HOME, notify still delivered agent-turn-complete. notify has no trust gate."
+  },
+
+  "SessionStart": {
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "SessionStart",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "session_id": "019fcdb2-c194-7d10-810f-13075a093cab",
+    "source": "startup",
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T18-54-32-019fcdb2-c194-7d10-810f-13075a093cab.jsonl"
+  },
+
+  "UserPromptSubmit": {
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "UserPromptSubmit",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "prompt": "Reply with exactly: OK",
+    "session_id": "019fcdb2-c194-7d10-810f-13075a093cab",
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T18-54-32-019fcdb2-c194-7d10-810f-13075a093cab.jsonl",
+    "turn_id": "019fcdb2-c1de-71a0-9abb-faa765b0896c"
+  },
+
+  "PermissionRequest": {
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "default",
+    "session_id": "019fcdb7-3453-78c0-985f-27d3a0e4b733",
+    "tool_input": {
+      "command": "touch approval-probe.txt"
+    },
+    "tool_name": "Bash",
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T18-59-23-019fcdb7-3453-78c0-985f-27d3a0e4b733.jsonl",
+    "turn_id": "019fcdb7-3584-7e62-8b0e-d50d2f04abfa"
+  },
+
+  "SubagentStart": {
+    "agent_id": "019fcdc0-1463-74b2-a80c-969dff2cdfae",
+    "agent_type": "default",
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "SubagentStart",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "session_id": "019fcdbf-fec8-73c1-8e40-5ce893a5948a",
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T19-09-05-019fcdc0-1463-74b2-a80c-969dff2cdfae.jsonl",
+    "turn_id": "019fcdc0-14d4-70a0-b59a-f271eb5225d5"
+  },
+
+  "SubagentStop": {
+    "agent_id": "019fcdc0-1463-74b2-a80c-969dff2cdfae",
+    "agent_transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T19-09-05-019fcdc0-1463-74b2-a80c-969dff2cdfae.jsonl",
+    "agent_type": "default",
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "SubagentStop",
+    "last_assistant_message": "BANANA",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "session_id": "019fcdbf-fec8-73c1-8e40-5ce893a5948a",
+    "stop_hook_active": false,
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T19-08-59-019fcdbf-fec8-73c1-8e40-5ce893a5948a.jsonl",
+    "turn_id": "019fcdc0-14d4-70a0-b59a-f271eb5225d5"
+  },
+
+  "Stop": {
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "Stop",
+    "last_assistant_message": "OK",
+    "model": "gpt-5.6-sol",
+    "permission_mode": "bypassPermissions",
+    "session_id": "019fcdb2-c194-7d10-810f-13075a093cab",
+    "stop_hook_active": false,
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T18-54-32-019fcdb2-c194-7d10-810f-13075a093cab.jsonl",
+    "turn_id": "019fcdb2-c1de-71a0-9abb-faa765b0896c"
+  },
+
+  "SessionEnd": {
+    "cwd": "/tmp/spike/work",
+    "hook_event_name": "SessionEnd",
+    "reason": "other",
+    "session_id": "019fcdb2-c194-7d10-810f-13075a093cab",
+    "transcript_path": "/tmp/spike/codexhome/sessions/2026/08/04/rollout-2026-08-04T18-54-32-019fcdb2-c194-7d10-810f-13075a093cab.jsonl"
+  },
+
+  "notify:agent-turn-complete": {
+    "client": "codex_exec",
+    "cwd": "/tmp/spike/work",
+    "input-messages": [
+      "Run the shell command: touch spike-artifact.txt"
+    ],
+    "last-assistant-message": "Created `spike-artifact.txt`.",
+    "thread-id": "019fcdb3-60d8-7733-83a8-813720d5c490",
+    "turn-id": "019fcdb3-6134-7122-9708-cd6f4f9f0718",
+    "type": "agent-turn-complete"
+  },
+
+  "notify:agent-turn-complete:tui": {
+    "client": "codex-tui",
+    "cwd": "/tmp/spike/work",
+    "input-messages": [
+      "Reply with exactly: OK"
+    ],
+    "last-assistant-message": "OK",
+    "thread-id": "019fcdc4-5f91-7980-b743-11575462cd61",
+    "turn-id": "019fcdc4-60ce-70b2-b48e-02e80a451846",
+    "type": "agent-turn-complete"
+  }
+}

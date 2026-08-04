@@ -1,0 +1,22 @@
+[package]
+name = "turn-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The one reading of what a parsed screen means as cells (`cells::from_screen`) lives
+# beside the grid types, so the daemon and a Rust client cannot drift into two of
+# them. It is a feature, and on by default because the daemon needs it, so that a
+# client which only ever renders cells can build this crate without a terminal parser
+# and the protocol's own surface stays serde and nothing else.
+default = ["vt100"]
+vt100 = ["dep:vt100"]
+
+[dependencies]
+turn-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+vt100 = { workspace = true, optional = true }

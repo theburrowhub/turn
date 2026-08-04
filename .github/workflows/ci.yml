@@ -1,0 +1,136 @@
+name: CI
+
+# Linux is a first-class target, not an afterthought, so it is tested on every push
+# from the very first milestone.
+#
+# There is no `ui` job any more, and no node, pnpm, vite or vitest anywhere in this
+# file. The frontend is native Rust drawn through `wgpu` (`crates/turn-gui`), so the
+# whole product is one `cargo` workspace and CI is the same three commands on both
+# platforms — see ADR-039 in DECISIONS.md.
+#
+# It also needs **no system packages on Linux**, which is worth stating because the
+# old webview job needed five. Checked rather than assumed: the only `-sys` crates in
+# `turn-gui`'s Linux dependency tree are `dirs-sys`, `linux-raw-sys`, `renderdoc-sys`
+# and `wayland-sys`, and `wayland-sys` is pulled with its `dlopen` feature on, so its
+# build script deliberately links nothing. X11 goes through `x11-dl`, the keymap
+# through `xkbcommon-dl` and Vulkan through `ash`, all of which dlopen at runtime. A
+# headless runner therefore compiles and links the window with neither libwayland nor
+# libX11 installed. What it cannot do without a driver is *render* — see the snapshot
+# note below.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rust / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # `--all-targets` on both platforms is what keeps the window honest on Linux: it
+      # compiles `crates/turn-gui` including `tests/snapshots.rs`, even though that
+      # test binary is only *run* on macOS for now. A snapshot test that stopped
+      # compiling fails here, rather than rotting until someone opens a Mac.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The pty tests spawn real processes and open real ptys. Limiting concurrency
+      # keeps a runner from exhausting the pty table, which surfaces as a confusing
+      # openpty failure rather than a test failure.
+      - name: Test (macOS — the whole workspace, GPU snapshots included)
+        if: runner.os == 'macOS'
+        run: cargo test --workspace -- --test-threads=4
+
+      # Two commands rather than one, so the log states plainly what ran and what did
+      # not. `--exclude turn-gui` drops that package's test binaries; the step after
+      # puts its logic tests back. Exactly one thing does not run on Linux — the
+      # snapshot image comparison — and the reason is written out below rather than
+      # being left as a silent gap.
+      - name: Test (Linux — everything except the GPU snapshot tests)
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --exclude turn-gui -- --test-threads=4
+
+      - name: Test (Linux — turn-gui's logic tests, which need no GPU)
+        if: runner.os == 'Linux'
+        run: cargo test -p turn-gui --lib --bins
+
+      # The two steps above name what they run, which means they can stop running
+      # something without anyone noticing: `--exclude turn-gui` drops *every* integration
+      # target in that crate, and only `tests/snapshots.rs` actually needs a GPU. So this
+      # asserts that assumption instead of trusting it. Adding `tests/keymap.rs` to
+      # `turn-gui` fails here with instructions, rather than quietly never running on Linux.
+      - name: Guard — snapshots.rs is turn-gui's only integration test target
+        if: runner.os == 'Linux'
+        run: |
+          found=$(cd crates/turn-gui/tests && ls *.rs | tr '\n' ' ' | sed 's/ $//')
+          if [ "$found" != "snapshots.rs" ]; then
+            echo "::error::turn-gui has integration test targets beyond snapshots.rs: $found"
+            echo "The Linux job runs '--exclude turn-gui' plus '--lib --bins', so a new target"
+            echo "would not run on Linux at all. Either name it in the Linux test step above,"
+            echo "or move its tests into the crate if they need no GPU."
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------------
+      # Why the snapshot tests are macOS-only, and what it takes to lift that.
+      #
+      # They could run here. `egui_kittest` renders headlessly through `wgpu`, and its
+      # default adapter selector sorts `DeviceType::Cpu` first, so a software Vulkan
+      # device is precisely what it prefers: `sudo apt-get install -y
+      # mesa-vulkan-drivers libvulkan1` puts lavapipe on the runner and an adapter is
+      # then found. Note that a missing driver is not a skip — `create_render_state`
+      # panics with "Failed to create render state" and the job goes red.
+      #
+      # The blocker is the baseline, not the driver. Every PNG in
+      # `crates/turn-gui/tests/snapshots/` was recorded on macOS through Metal, and
+      # `egui_kittest`'s defaults are a per-pixel threshold of 0.6 with a
+      # `failed_pixel_count_threshold` of 0 — one pixel over the line fails the test.
+      # The library ships an `OsThreshold` type for exactly this problem, and its own
+      # documented example allows 53 differing pixels on macOS and 10 on Windows,
+      # which is the maintainers saying one widget tree does not render identically
+      # across platforms. Enabling this from a Mac would mean choosing a Linux
+      # tolerance blind: too tight and every PR is red for reasons nobody here can
+      # reproduce, too loose and the tests stop catching what they were added to catch
+      # (the first of them caught two labels drawn on top of each other).
+      #
+      # To lift it, on a Linux machine with lavapipe: `UPDATE_SNAPSHOTS=1 cargo test
+      # -p turn-gui`, look at the images, commit them as a Linux baseline (or set a
+      # measured `OsThreshold`), then delete the `if:` guards above, fold the two
+      # Linux steps back into one `cargo test --workspace`, and add the apt line.
+      # Tracked in ROADMAP.md under "Technical debt".
+      # ---------------------------------------------------------------------------
+
+      # Both binaries on both platforms. Building `turn` here is what proves the
+      # window links on Linux, which is the half of "Linux is a first-class target"
+      # that type-checking alone does not cover.
+      - name: Build release binaries
+        run: cargo build --release --bin turnd --bin turn

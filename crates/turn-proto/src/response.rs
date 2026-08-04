@@ -1,0 +1,507 @@
+//! Responses: one typed result per request, plus the single error shape.
+//!
+//! Every successful response is a variant of [`Response`], tagged with `result`.
+//! [`Request::expected_result`](crate::Request::expected_result) names which one to
+//! expect, and a test in this crate checks that every name it produces exists
+//! here — so a client can treat the pairing as load-bearing rather than as
+//! documentation that might be stale.
+//!
+//! Failures never arrive as a `Response`. They arrive as
+//! [`ServerMessage::Error`](crate::ServerMessage::Error) carrying a
+//! [`ProtoError`](crate::ProtoError), which keeps the success path free of
+//! per-request error variants and gives a client one place to handle them.
+
+use serde::{Deserialize, Serialize};
+use turn_core::attention::Effect;
+use turn_core::ids::{NodeId, PaneId, SessionId};
+use turn_core::model::Layout;
+
+use crate::bytes::TerminalBytes;
+use crate::cells::Grid;
+use crate::geometry::PtySize;
+use crate::screen::PaneStream;
+use crate::view::{
+    AttentionView, SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, WorkspaceSummary,
+};
+
+/// What a client needs to rebuild a terminal on attach.
+///
+/// This structure is what makes "processes survive UI restarts" a visible feature
+/// rather than a claim. The daemon has held the pty the whole time; attaching hands
+/// over the screen it has been keeping and the pane looks exactly as the user left
+/// it.
+///
+/// Which of the two payloads is filled in depends on `stream`, and exactly one of
+/// them ever is: a cells attachment gets `screen` and no bytes, a byte attachment
+/// gets `replay` and no grid. Sending both would double the cost of every attach to
+/// serve a client that asked for one of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PaneAttachment {
+    pub session_id: SessionId,
+    pub pane_id: PaneId,
+    /// The process behind the pane. `None` for a pane that has no process yet —
+    /// an empty slot after a partial restore, or one of Turn's own views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<NodeId>,
+    /// Which representation this attachment will receive from now on.
+    #[serde(default)]
+    pub stream: PaneStream,
+    /// The screen as cells, for a [`PaneStream::Cells`] attachment.
+    ///
+    /// Boxed because a grid is the largest thing in this catalogue by a wide margin
+    /// and `Response` is moved through the daemon's channels for every keystroke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<Box<Grid>>,
+    /// Bytes to feed a terminal emulator, for a [`PaneStream::Bytes`] attachment.
+    /// Empty otherwise.
+    ///
+    /// This is the parsed screen re-emitted, not the raw scrollback: the raw ring can
+    /// begin mid-escape-sequence after being truncated, which would corrupt the
+    /// receiving terminal.
+    #[serde(default, skip_serializing_if = "TerminalBytes::is_empty")]
+    pub replay: TerminalBytes,
+    /// The size the screen was taken at, which is the size the client asked for.
+    pub size: PtySize,
+    /// Whether output was dropped from the daemon's ring before this replay. The
+    /// screen is still correct; the scrollback above it is incomplete, and the UI
+    /// should say so rather than let the user scroll up into a lie.
+    pub scrollback_truncated: bool,
+    /// Total bytes this pane has ever produced, for staleness checks.
+    pub bytes_seen: u64,
+    /// Sequence number the next update for this attachment will carry — a
+    /// [`ServerEvent::PaneScreen`](crate::ServerEvent::PaneScreen) for a cells
+    /// attachment, a [`ServerEvent::PaneOutput`](crate::ServerEvent::PaneOutput) for
+    /// a byte one. Lets a client detect a gap between what it was handed here and
+    /// the live stream.
+    pub next_seq: u64,
+}
+
+/// A successful result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum Response {
+    /// The request succeeded and has nothing to report.
+    Ack,
+
+    Workspaces {
+        workspaces: Vec<WorkspaceSummary>,
+    },
+    Workspace {
+        workspace: WorkspaceSummary,
+    },
+
+    Sessions {
+        sessions: Vec<SessionSummary>,
+    },
+    /// Boxed, like every other large payload here. The hot response by a wide
+    /// margin is [`Response::Ack`] — one per keystroke written to a pty — and an
+    /// enum sized for its biggest variant would make every one of those a
+    /// kilobyte-wide move through the daemon's channels.
+    Session {
+        session: Box<SessionSummary>,
+    },
+    SessionDetails {
+        details: Box<SessionDetails>,
+    },
+
+    Templates {
+        templates: Vec<TemplateSummary>,
+    },
+    Template {
+        template: TemplateSummary,
+    },
+
+    /// The layout after a pane operation. Returned rather than acked so the UI
+    /// renders the daemon's arrangement instead of its own guess at what a split,
+    /// a close or a clamped resize did.
+    Layout {
+        session_id: SessionId,
+        layout: Layout,
+    },
+    Attached {
+        attachment: Box<PaneAttachment>,
+    },
+    /// A pane's whole screen, after a client asked for it again.
+    ///
+    /// The same grid an attach would return, so a client's recovery path and its
+    /// first-render path are one piece of code rather than two.
+    Screen {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<NodeId>,
+        /// The sequence number the next update for this attachment will carry. The
+        /// grid is the state as of just before it, so a client can apply what arrives
+        /// next without wondering whether it has already been applied.
+        next_seq: u64,
+        grid: Box<Grid>,
+    },
+
+    Tree {
+        session_id: SessionId,
+        nodes: Vec<TreeNodeView>,
+    },
+    /// A single node after it changed — a relaunch, or a user correction.
+    Node {
+        node: Box<TreeNodeView>,
+    },
+
+    /// The next demand, or `None` when the queue is empty.
+    Attention {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry: Option<AttentionView>,
+    },
+    AttentionList {
+        entries: Vec<AttentionView>,
+    },
+    /// Effects for the UI to perform, straight from the attention manager.
+    ///
+    /// The domain type is sent as-is: the manager already decided what may happen,
+    /// including whether a focus change was granted, deferred or refused, and
+    /// re-describing that decision here would be a second place for it to be got
+    /// wrong.
+    Effects {
+        effects: Vec<Effect>,
+    },
+}
+
+impl Response {
+    /// The stable `result` tag.
+    pub fn result_name(&self) -> &'static str {
+        match self {
+            Response::Ack => "ack",
+            Response::Workspaces { .. } => "workspaces",
+            Response::Workspace { .. } => "workspace",
+            Response::Sessions { .. } => "sessions",
+            Response::Session { .. } => "session",
+            Response::SessionDetails { .. } => "session_details",
+            Response::Templates { .. } => "templates",
+            Response::Template { .. } => "template",
+            Response::Layout { .. } => "layout",
+            Response::Attached { .. } => "attached",
+            Response::Screen { .. } => "screen",
+            Response::Tree { .. } => "tree",
+            Response::Node { .. } => "node",
+            Response::Attention { .. } => "attention",
+            Response::AttentionList { .. } => "attention_list",
+            Response::Effects { .. } => "effects",
+        }
+    }
+
+    /// Every tag this catalogue defines. Used to check the request-to-response
+    /// mapping is complete.
+    pub const RESULT_NAMES: &'static [&'static str] = &[
+        "ack",
+        "workspaces",
+        "workspace",
+        "sessions",
+        "session",
+        "session_details",
+        "templates",
+        "template",
+        "layout",
+        "attached",
+        "screen",
+        "tree",
+        "node",
+        "attention",
+        "attention_list",
+        "effects",
+    ];
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::cells::Grid;
+    use turn_core::attention::{DeferReason, Sound};
+    use turn_core::ids::{AttentionId, WorkspaceId};
+    use turn_core::model::{Pane, PaneKind, Session, Template};
+
+    const T0: i64 = 1_700_000_000_000;
+
+    fn session() -> Session {
+        Session::new(
+            WorkspaceId::from_stored("ws_resp00001"),
+            "Fix the flaky test",
+            "/repo",
+            Layout::single(Pane::new(PaneKind::Agent).with_command("claude")),
+            T0,
+        )
+    }
+
+    #[test]
+    fn an_ack_is_a_tag_and_nothing_else() {
+        let json = serde_json::to_string(&Response::Ack).unwrap();
+        assert_eq!(json, "{\"result\":\"ack\"}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Ack
+        );
+    }
+
+    /// The default attach: the screen the daemon has been keeping, as cells, with no
+    /// escape stream for the client to parse.
+    #[test]
+    fn an_attachment_carries_the_screen_the_daemon_already_parsed() {
+        let mut screen = Grid::from_lines(&["ready"], 80);
+        if let Some(cell) = screen.cell_mut(0, 0) {
+            cell.fg = Some(crate::cells::Rgb::new(0, 205, 0));
+        }
+        let response = Response::Attached {
+            attachment: Box::new(PaneAttachment {
+                session_id: session().id,
+                pane_id: PaneId::from_stored("pane_a"),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                stream: PaneStream::Cells,
+                screen: Some(Box::new(screen.clone())),
+                replay: TerminalBytes::default(),
+                size: PtySize::new(24, 80),
+                scrollback_truncated: true,
+                bytes_seen: 1_048_576,
+                next_seq: 9_001,
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"result\":\"attached\""), "got {json}");
+        assert!(
+            !json.contains("\"replay\""),
+            "a cells attachment must not also pay for the byte replay: {json}"
+        );
+
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::Attached { attachment } => {
+                assert_eq!(attachment.screen.as_deref(), Some(&screen));
+                assert!(
+                    attachment.scrollback_truncated,
+                    "the UI must be able to admit the scrollback is partial"
+                );
+                assert_eq!(attachment.next_seq, 9_001);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The byte path is still here for whatever genuinely needs the stream itself,
+    /// and it carries bytes rather than a grid.
+    #[test]
+    fn a_byte_attachment_carries_the_replay_bytes_intact() {
+        // A realistic replay: colour, cursor placement, and the alternate screen a
+        // TUI leaves the terminal in.
+        let replay = b"\x1b[?1049h\x1b[H\x1b[2J\x1b[32mready\x1b[0m".to_vec();
+        let attachment = PaneAttachment {
+            session_id: session().id,
+            pane_id: PaneId::from_stored("pane_a"),
+            node_id: Some(NodeId::from_stored("proc_a")),
+            stream: PaneStream::Bytes,
+            screen: None,
+            replay: TerminalBytes::new(replay.clone()),
+            size: PtySize::new(24, 80),
+            scrollback_truncated: false,
+            bytes_seen: 12,
+            next_seq: 0,
+        };
+        let json = serde_json::to_string(&attachment).unwrap();
+        assert!(json.contains("\"stream\":\"bytes\""), "got {json}");
+        assert!(!json.contains("\"screen\""), "got {json}");
+        let back: PaneAttachment = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.replay.as_slice(), replay.as_slice());
+        assert_eq!(back, attachment);
+    }
+
+    /// The resync answer and the attach answer carry the same grid, so a client has
+    /// one piece of code for "here is the screen".
+    #[test]
+    fn a_resync_answers_with_the_whole_screen_and_the_sequence_it_starts_from() {
+        let response = Response::Screen {
+            session_id: session().id,
+            pane_id: PaneId::from_stored("pane_a"),
+            node_id: Some(NodeId::from_stored("proc_a")),
+            next_seq: 77,
+            grid: Box::new(Grid::from_lines(&["recovered"], 20)),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"result\":\"screen\""), "got {json}");
+        assert!(json.contains("\"next_seq\":77"));
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+    }
+
+    #[test]
+    fn a_pane_with_no_process_attaches_without_inventing_a_node() {
+        let attachment = PaneAttachment {
+            session_id: session().id,
+            pane_id: PaneId::from_stored("pane_empty"),
+            node_id: None,
+            stream: PaneStream::Cells,
+            // An empty pane still has a screen: a blank one at the client's size,
+            // which is better than a renderer with nothing to draw.
+            screen: Some(Box::new(Grid::blank(24, 80))),
+            replay: TerminalBytes::default(),
+            size: PtySize::default(),
+            scrollback_truncated: false,
+            bytes_seen: 0,
+            next_seq: 0,
+        };
+        let json = serde_json::to_string(&attachment).unwrap();
+        assert!(
+            !json.contains("node_id"),
+            "an empty pane has no node: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PaneAttachment>(&json).unwrap(),
+            attachment
+        );
+    }
+
+    #[test]
+    fn an_empty_attention_queue_answers_with_no_entry_rather_than_an_error() {
+        let json = serde_json::to_string(&Response::Attention { entry: None }).unwrap();
+        assert_eq!(json, "{\"result\":\"attention\"}");
+        assert_eq!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Attention { entry: None }
+        );
+    }
+
+    /// The governor's verdicts travel as themselves. A deferral must not reach the
+    /// UI looking like a granted focus change.
+    #[test]
+    fn focus_effects_keep_the_governors_verdict_distinguishable() {
+        let session_id = session().id;
+        let response = Response::Effects {
+            effects: vec![
+                Effect::Enqueued {
+                    attention_id: AttentionId::from_stored("attn_a"),
+                    session_id: session_id.clone(),
+                },
+                Effect::FocusDeferred {
+                    session_id: session_id.clone(),
+                    until_ms: T0 + 1_500,
+                    reason: DeferReason::UserTyping,
+                },
+                Effect::PlaySound {
+                    session_id,
+                    sound: Sound::Subtle,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"effect\":\"focus_deferred\""), "got {json}");
+        assert!(json.contains("\"reason\":\"user_typing\""));
+        assert!(
+            !json.contains("\"effect\":\"focus\""),
+            "a deferral must not be mistakable for a jump: {json}"
+        );
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), response);
+    }
+
+    #[test]
+    fn every_response_round_trips_and_its_tag_matches_result_name() {
+        for response in all_responses() {
+            let value = serde_json::to_value(&response).unwrap();
+            let tag = value.get("result").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(tag, response.result_name(), "tag mismatch for {response:?}");
+
+            let json = serde_json::to_string(&response).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Response>(&json).unwrap(),
+                response,
+                "round trip lost information: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_declared_tag_list_matches_the_variants_that_exist() {
+        let actual: std::collections::HashSet<&'static str> =
+            all_responses().iter().map(|r| r.result_name()).collect();
+        let declared: std::collections::HashSet<&'static str> =
+            Response::RESULT_NAMES.iter().copied().collect();
+        assert_eq!(actual, declared, "RESULT_NAMES has drifted from the enum");
+        assert_eq!(
+            declared.len(),
+            Response::RESULT_NAMES.len(),
+            "duplicate tag"
+        );
+        // 16 result shapes. Asserted so adding one without documenting it in
+        // docs/PROTOCOL.md becomes a deliberate act.
+        assert_eq!(declared.len(), 16, "the response catalogue changed size");
+    }
+
+    /// One of each variant, shared with the crate-wide contract tests.
+    pub(crate) fn all_responses() -> Vec<Response> {
+        let s = session();
+        let summary = SessionSummary::from_session(&s, 0, false, T0);
+        let workspace = WorkspaceSummary::from_workspace(
+            &turn_core::model::Workspace::new("turn", "/Users/x/turn", T0),
+            std::slice::from_ref(&summary),
+        );
+        let template = TemplateSummary::from_template(&Template::coding(T0));
+
+        vec![
+            Response::Ack,
+            Response::Workspaces {
+                workspaces: vec![workspace.clone()],
+            },
+            Response::Workspace { workspace },
+            Response::Sessions {
+                sessions: vec![summary.clone()],
+            },
+            Response::Session {
+                session: Box::new(summary),
+            },
+            Response::SessionDetails {
+                details: Box::new(SessionDetails::from_session(&s, 1, false, T0)),
+            },
+            Response::Templates {
+                templates: vec![template.clone()],
+            },
+            Response::Template { template },
+            Response::Layout {
+                session_id: s.id.clone(),
+                layout: s.layout.clone(),
+            },
+            Response::Attached {
+                attachment: Box::new(PaneAttachment {
+                    session_id: s.id.clone(),
+                    pane_id: s.layout.panes()[0].id.clone(),
+                    node_id: Some(NodeId::from_stored("proc_a")),
+                    stream: PaneStream::Cells,
+                    screen: Some(Box::new(Grid::from_lines(&["ready"], 80))),
+                    replay: TerminalBytes::default(),
+                    size: PtySize::new(24, 80),
+                    scrollback_truncated: false,
+                    bytes_seen: 42,
+                    next_seq: 1,
+                }),
+            },
+            Response::Screen {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                next_seq: 12,
+                grid: Box::new(Grid::blank(24, 80)),
+            },
+            Response::Tree {
+                session_id: s.id.clone(),
+                nodes: Vec::new(),
+            },
+            Response::Node {
+                node: Box::new(TreeNodeView::from_node(
+                    &turn_core::model::ProcessNode::agent(s.id.clone(), "claude", "/repo", T0),
+                    0,
+                    0,
+                    T0,
+                )),
+            },
+            Response::Attention { entry: None },
+            Response::AttentionList {
+                entries: Vec::new(),
+            },
+            Response::Effects {
+                effects: vec![Effect::Cleared { session_id: s.id }],
+            },
+        ]
+    }
+}

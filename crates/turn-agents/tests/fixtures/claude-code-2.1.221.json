@@ -1,0 +1,159 @@
+{
+  "NotificationIdlePrompt": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "Notification",
+    "message": "Claude is waiting for your input",
+    "notification_type": "idle_prompt",
+    "prompt_id": "c38cf7f6-334c-4c38-8377-2c5fe7e1766c",
+    "session_id": "d20f375a-05e4-4fdf-a8e9-58a17c56f7ae",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/d20f375a-05e4-4fdf-a8e9-58a17c56f7ae.jsonl"
+  },
+  "NotificationPermissionPrompt": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "Notification",
+    "message": "Claude needs your permission",
+    "notification_type": "permission_prompt",
+    "prompt_id": "c38cf7f6-334c-4c38-8377-2c5fe7e1766c",
+    "session_id": "d20f375a-05e4-4fdf-a8e9-58a17c56f7ae",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/d20f375a-05e4-4fdf-a8e9-58a17c56f7ae.jsonl"
+  },
+  "PermissionRequestBash": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "effort": {
+      "level": "high"
+    },
+    "hook_event_name": "PermissionRequest",
+    "permission_mode": "default",
+    "permission_suggestions": [
+      {
+        "destination": "session",
+        "directories": [
+          "/private/tmp/turn-hook-spike/work"
+        ],
+        "type": "addDirectories"
+      },
+      {
+        "destination": "session",
+        "mode": "acceptEdits",
+        "type": "setMode"
+      }
+    ],
+    "prompt_id": "c38cf7f6-334c-4c38-8377-2c5fe7e1766c",
+    "session_id": "d20f375a-05e4-4fdf-a8e9-58a17c56f7ae",
+    "tool_input": {
+      "command": "touch probe-from-turn.txt",
+      "description": "Create empty file probe-from-turn.txt"
+    },
+    "tool_name": "Bash",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/d20f375a-05e4-4fdf-a8e9-58a17c56f7ae.jsonl"
+  },
+  "PermissionRequestFileWrite": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "effort": {
+      "level": "high"
+    },
+    "hook_event_name": "PermissionRequest",
+    "permission_mode": "default",
+    "permission_suggestions": [
+      {
+        "destination": "session",
+        "mode": "acceptEdits",
+        "type": "setMode"
+      }
+    ],
+    "prompt_id": "5cae5f15-cd27-4642-8a5f-0b3a6771c7fc",
+    "session_id": "b27838de-cc22-4598-9643-066b00ecef2b",
+    "tool_input": {
+      "content": "hello\n",
+      "file_path": "/private/tmp/turn-hook-spike/work/notes.txt"
+    },
+    "tool_name": "Write",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/b27838de-cc22-4598-9643-066b00ecef2b.jsonl"
+  },
+  "SessionEnd": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "SessionEnd",
+    "prompt_id": "c6c2d7d2-d032-414a-a000-8b9f67e2234c",
+    "reason": "other",
+    "session_id": "df26d373-a8c5-4f9c-964b-f526051433b9",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/df26d373-a8c5-4f9c-964b-f526051433b9.jsonl"
+  },
+  "SessionEndPromptInputExit": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "SessionEnd",
+    "prompt_id": "aa87cf69-4f12-48b2-a7a1-4dc8b3e164d1",
+    "reason": "prompt_input_exit",
+    "session_id": "2dffb893-b5ab-4513-869e-16da1a566f1b",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/2dffb893-b5ab-4513-869e-16da1a566f1b.jsonl"
+  },
+  "SessionStart": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "SessionStart",
+    "session_id": "228fb90a-e4c6-4a78-8dec-35ae32977459",
+    "source": "startup",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/228fb90a-e4c6-4a78-8dec-35ae32977459.jsonl"
+  },
+  "Stop": {
+    "background_tasks": [],
+    "cwd": "/private/tmp",
+    "effort": {
+      "level": "high"
+    },
+    "hook_event_name": "Stop",
+    "last_assistant_message": "OK",
+    "permission_mode": "dontAsk",
+    "prompt_id": "e91db812-4562-43ee-82fc-c1aa851e70bc",
+    "session_crons": [],
+    "session_id": "84cde77e-f54f-41e7-bb05-2716cb61b6bf",
+    "stop_hook_active": false,
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp/84cde77e-f54f-41e7-bb05-2716cb61b6bf.jsonl"
+  },
+  "StopFailure": {
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "effort": {
+      "level": "high"
+    },
+    "error": "model_not_found",
+    "hook_event_name": "StopFailure",
+    "last_assistant_message": "There's an issue with the selected model (claude-does-not-exist-99). It may not exist or you may not have access to it. Run --model to pick a different model.",
+    "prompt_id": "f527a417-386f-4a44-a360-20fdb9bfdd6f",
+    "session_id": "57976963-bb21-425f-a7e1-06a4b3674262",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/57976963-bb21-425f-a7e1-06a4b3674262.jsonl"
+  },
+  "SubagentStart": {
+    "agent_id": "af054d1a23ba111b3",
+    "agent_type": "Explore",
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "hook_event_name": "SubagentStart",
+    "prompt_id": "0755f7c8-17a3-4b46-afe5-864daaac676d",
+    "session_id": "b3e15612-addf-46d6-bbd0-558883d8c440",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/b3e15612-addf-46d6-bbd0-558883d8c440.jsonl"
+  },
+  "SubagentStop": {
+    "agent_id": "af054d1a23ba111b3",
+    "agent_transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/b3e15612-addf-46d6-bbd0-558883d8c440/subagents/agent-af054d1a23ba111b3.jsonl",
+    "agent_type": "Explore",
+    "background_tasks": [],
+    "cwd": "/private/tmp/turn-hook-spike/work",
+    "effort": {
+      "level": "high"
+    },
+    "hook_event_name": "SubagentStop",
+    "last_assistant_message": "a.txt",
+    "permission_mode": "default",
+    "prompt_id": "0755f7c8-17a3-4b46-afe5-864daaac676d",
+    "session_crons": [],
+    "session_id": "b3e15612-addf-46d6-bbd0-558883d8c440",
+    "stop_hook_active": false,
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp-turn-hook-spike-work/b3e15612-addf-46d6-bbd0-558883d8c440.jsonl"
+  },
+  "UserPromptSubmit": {
+    "cwd": "/private/tmp",
+    "hook_event_name": "UserPromptSubmit",
+    "permission_mode": "dontAsk",
+    "prompt": "Reply with exactly: OK",
+    "prompt_id": "e91db812-4562-43ee-82fc-c1aa851e70bc",
+    "session_id": "84cde77e-f54f-41e7-bb05-2716cb61b6bf",
+    "transcript_path": "/Users/jamuriano/.claude/projects/-private-tmp/84cde77e-f54f-41e7-bb05-2716cb61b6bf.jsonl"
+  }
+}

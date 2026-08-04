@@ -1,0 +1,14 @@
+/target
+.DS_Store
+*.db
+*.db-wal
+*.db-shm
+/.remember
+
+# Snapshot test byproducts. `egui_kittest` writes these next to the committed
+# baseline when a comparison fails or when re-recording: the render that did not
+# match, the previous baseline, and the diff image. They are debugging output, not
+# the baseline, and only `<name>.png` belongs in the repository.
+crates/turn-gui/tests/snapshots/*.new.png
+crates/turn-gui/tests/snapshots/*.old.png
+crates/turn-gui/tests/snapshots/*.diff.png
