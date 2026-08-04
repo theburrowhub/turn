@@ -49,14 +49,80 @@ impl Core {
         self.store
             .hierarchy()
             .create_session(&session, now_ms)
-            .map_err(store)?;
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
         self.sessions.insert(id.clone(), session);
 
         self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
         self.materialise_session(&id, now_ms);
         self.touch_workspace(workspace_id, now_ms);
         self.persist_session(&id)?;
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_session(&id, now_ms)
+    }
+
+    /// Creates the explicit safe alternative to a second checkout writer.
+    ///
+    /// Until a platform process sandbox is available Turn persists the Session
+    /// but deliberately launches no configured process. `read_only_enforced`
+    /// remains false, so the UI cannot imply that an agent is safely confined.
+    /// This degraded mode is useful for organising the task and is strictly safer
+    /// than launching an unguarded shell that could write silently.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_read_only_session(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        name: String,
+        cwd: Option<String>,
+        panes: Option<Vec<NewPane>>,
+        note: Option<String>,
+        tags: Vec<String>,
+        now_ms: i64,
+    ) -> Answer {
+        let name = check_name(&name)?;
+        let workspace = self.workspace(workspace_id)?.clone();
+        let cwd = cwd
+            .filter(|cwd| !cwd.trim().is_empty())
+            .unwrap_or_else(|| workspace.root.clone());
+        let layout = match panes {
+            Some(panes) if !panes.is_empty() => layout_from_panes(&panes),
+            _ => Layout::single(default_shell_pane()),
+        };
+        let mut session = Session::new(workspace_id.clone(), name, cwd, layout, now_ms);
+        session.note = note;
+        session.tags = tags;
+        session.attention = workspace.attention.clone();
+        session.env = workspace.env.clone();
+        session.mode = SessionMode::ReadOnly;
+        session.read_only_enforced = false;
+        let id = session.id.clone();
+        self.store
+            .hierarchy()
+            .create_session(&session, now_ms)
+            .map_err(store)?;
+        self.sessions.insert(id.clone(), session);
+        self.touch_workspace(workspace_id, now_ms);
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        self.answer_session(&id, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_worktree_session(
+        &mut self,
+        _workspace_id: &WorkspaceId,
+        _name: String,
+        _branch: String,
+        _worktree_path: Option<String>,
+        _panes: Option<Vec<NewPane>>,
+        _note: Option<String>,
+        _tags: Vec<String>,
+        _now_ms: i64,
+    ) -> Answer {
+        Err(turn_proto::ProtoError::new(
+            turn_proto::ErrorCode::Unavailable,
+            "Isolated worktree creation is not available in this build",
+        ))
     }
 
     /// Creates a session from a template.
@@ -119,7 +185,7 @@ impl Core {
         self.store
             .hierarchy()
             .create_session(&session, now_ms)
-            .map_err(store)?;
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
         self.sessions.insert(id.clone(), session);
 
         let init: Vec<String> = workspace
@@ -132,6 +198,8 @@ impl Core {
         self.materialise_session(&id, now_ms);
         self.touch_workspace(workspace_id, now_ms);
         self.persist_session(&id)?;
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_session(&id, now_ms)
     }
 
@@ -456,10 +524,14 @@ mod tests {
                 12,
             )
             .expect_err("the existing lease must win");
-        assert!(error
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("is held by session")));
+        assert!(matches!(
+            error.context.as_deref(),
+            Some(turn_proto::ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                alternatives,
+                ..
+            }) if alternatives.contains(&turn_proto::SessionConflictAlternative::CreateReadOnly)
+                && alternatives.contains(&turn_proto::SessionConflictAlternative::CreateIsolatedWorktree)
+        ));
         assert_eq!(harness.core.sessions.len(), sessions_before);
         assert_eq!(harness.core.processes.len(), processes_before);
         assert_eq!(harness.core.store.sessions().count().unwrap(), 1);

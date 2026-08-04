@@ -56,12 +56,52 @@ impl Core {
         disposition: CloseDisposition,
         now_ms: i64,
     ) -> Answer {
+        // Temporary panes are surface-scoped views, not Layout children. Closing
+        // one removes only the view binding; stopping the Agent remains a
+        // separate explicit node-control operation.
+        if self.session(session_id)?.layout.get(pane_id).is_none() {
+            let binding = self
+                .store
+                .hierarchy()
+                .bindings_for_session(session_id)
+                .map_err(store)?
+                .into_iter()
+                .find(|binding| binding.pane_id == *pane_id && binding.temporary)
+                .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
+            if disposition != CloseDisposition::KeepProcesses {
+                return Err(ProtoError::refused(
+                    "Closing an Agent view cannot stop its process; use Stop Agent explicitly",
+                ));
+            }
+            self.detach_everyone(session_id, pane_id);
+            self.store
+                .hierarchy()
+                .unbind_pane(session_id, pane_id)
+                .map_err(store)?;
+            self.stop_pump_if_unwatched(&binding.node_id);
+            self.bump_hierarchy();
+            self.push_pane_bindings(session_id, &binding.node_id, now_ms);
+            return self.answer_layout(session_id);
+        }
+
         let session = self.session(session_id)?;
         let pane = session
             .layout
             .get(pane_id)
             .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
         let node = pane.node_id.clone();
+        if disposition != CloseDisposition::KeepProcesses
+            && node.as_ref().is_some_and(|node_id| {
+                session
+                    .tree
+                    .get(node_id)
+                    .is_some_and(|node| node.kind.is_agentic())
+            })
+        {
+            return Err(ProtoError::refused(
+                "Closing an Agent pane cannot stop its process; use Stop Agent explicitly",
+            ));
+        }
         if session.layout.pane_count() <= 1 {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
@@ -232,11 +272,36 @@ impl Core {
         }
 
         let session = self.session(session_id)?;
-        let pane = session
-            .layout
-            .get(pane_id)
-            .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
-        let node_id = pane.node_id.clone();
+        let node_id = match session.layout.get(pane_id) {
+            Some(pane) => pane.node_id.clone(),
+            None => {
+                let surface_id = self
+                    .clients
+                    .get(&client)
+                    .and_then(|client| client.surface_id.as_deref());
+                let binding = self
+                    .store
+                    .hierarchy()
+                    .bindings_for_session(session_id)
+                    .map_err(store)?
+                    .into_iter()
+                    .find(|binding| {
+                        binding.pane_id == *pane_id
+                            && binding.temporary
+                            && binding.surface_id.as_deref() == surface_id
+                    })
+                    .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
+                match self.node_pane_capability(&binding.node_id) {
+                    turn_proto::NodePaneCapability::Terminal { .. } => Some(binding.node_id),
+                    turn_proto::NodePaneCapability::PreviewDetails => {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "This Agent has semantic preview details but no attachable terminal",
+                        ));
+                    }
+                }
+            }
+        };
 
         let mut truncated = false;
         let mut bytes_seen = 0u64;

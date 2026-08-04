@@ -130,7 +130,7 @@ impl Core {
                 now_ms,
             ) {
                 self.persist_session_quietly(&session_id);
-                self.push_tree(&session_id, now_ms);
+                self.push_activity_preview(&session_id, &node_id, now_ms);
             }
         }
     }

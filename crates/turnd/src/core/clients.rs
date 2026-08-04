@@ -93,8 +93,8 @@ impl SessionDebt {
 ///
 /// The mapping is possible at all because every state push carries the whole of what it
 /// names. Two kinds of push are deliberately unrepairable and both say so here.
-fn repair_for(event: &ServerEvent) -> (Option<(SessionId, SessionDebt)>, bool) {
-    let session = |id: &SessionId, debt: SessionDebt| (Some((id.clone(), debt)), false);
+fn repair_for(event: &ServerEvent) -> (Option<(SessionId, SessionDebt)>, bool, bool) {
+    let session = |id: &SessionId, debt: SessionDebt| (Some((id.clone(), debt)), false, false);
     match event {
         // Output has its own admission path, which says exactly how many frames went
         // missing and lets the client replay from the pty's own buffer. A screen update
@@ -103,10 +103,10 @@ fn repair_for(event: &ServerEvent) -> (Option<(SessionId, SessionDebt)>, bool) {
         // `super::screens`.
         ServerEvent::PaneScreen { .. }
         | ServerEvent::PaneOutput { .. }
-        | ServerEvent::PaneOutputGap { .. } => (None, false),
+        | ServerEvent::PaneOutputGap { .. } => (None, false, false),
         // History, not state. There is no "current value" of an event that already
         // happened, and the state it changed is re-sent by the pushes beside it.
-        ServerEvent::TurnEventEmitted { .. } => (None, false),
+        ServerEvent::TurnEventEmitted { .. } => (None, false, false),
         ServerEvent::SessionStateChanged { session: summary } => {
             session(&summary.id, SessionDebt::summary())
         }
@@ -133,8 +133,13 @@ fn repair_for(event: &ServerEvent) -> (Option<(SessionId, SessionDebt)>, bool) {
                 .cloned()
                 .map(|id| (id, SessionDebt::summary())),
             true,
+            false,
         ),
-        ServerEvent::AttentionQueueChanged { .. } => (None, true),
+        ServerEvent::AttentionQueueChanged { .. } => (None, true, false),
+        ServerEvent::HierarchyChanged { .. }
+        | ServerEvent::ActivityPreviewChanged { .. }
+        | ServerEvent::PaneBindingsChanged { .. }
+        | ServerEvent::WorkspaceWriteLeaseChanged { .. } => (None, false, true),
     }
 }
 
@@ -143,6 +148,7 @@ struct Owed {
     client: ClientId,
     sessions: Vec<(SessionId, SessionDebt)>,
     queue: bool,
+    hierarchy: bool,
 }
 
 /// One pane a client is watching.
@@ -176,6 +182,8 @@ pub struct Client {
     /// rather than with the daemon's newest, so a rollout window means something.
     pub agreed_version: u32,
     pub attachments: HashMap<AttachmentKey, Attachment>,
+    /// Stable window identity supplied by `get_hierarchy`.
+    pub surface_id: Option<String>,
     /// Frames dropped because this client was not draining. Surfaced in logs; a
     /// non-zero value means a UI that cannot keep up.
     pub dropped_frames: u64,
@@ -183,6 +191,9 @@ pub struct Client {
     pub owed_state: HashMap<SessionId, SessionDebt>,
     /// Whether it also lost an attention queue push, which names no session.
     pub owed_queue: bool,
+    /// Any dropped hierarchy-visible replacement is repaired with one full
+    /// revisioned snapshot, never by replaying structural deltas.
+    pub owed_hierarchy: bool,
 }
 
 impl Client {
@@ -191,15 +202,17 @@ impl Client {
             frames,
             agreed_version,
             attachments: HashMap::new(),
+            surface_id: None,
             dropped_frames: 0,
             owed_state: HashMap::new(),
             owed_queue: false,
+            owed_hierarchy: false,
         }
     }
 
     /// Sends one event, recording what has to be said again if the frame is lost.
     fn push(&mut self, event: ServerEvent) -> bool {
-        let (session, queue) = repair_for(&event);
+        let (session, queue, hierarchy) = repair_for(&event);
         if self.send(ServerMessage::Event { event }) {
             return true;
         }
@@ -208,6 +221,9 @@ impl Client {
         }
         if queue {
             self.owed_queue = true;
+        }
+        if hierarchy && self.surface_id.is_some() {
+            self.owed_hierarchy = true;
         }
         false
     }
@@ -235,7 +251,7 @@ impl Client {
 
     /// Whether this client is owed anything.
     pub fn is_behind(&self) -> bool {
-        self.owed_queue || !self.owed_state.is_empty()
+        self.owed_queue || self.owed_hierarchy || !self.owed_state.is_empty()
     }
 }
 
@@ -358,6 +374,7 @@ impl Core {
                     .map(|(session, debt)| (session.clone(), *debt))
                     .collect(),
                 queue: client.owed_queue,
+                hierarchy: client.owed_hierarchy,
             })
             .collect();
 
@@ -365,14 +382,16 @@ impl Core {
             client: id,
             sessions,
             queue,
+            hierarchy,
         } in behind
         {
             if let Some(client) = self.clients.get_mut(&id) {
                 client.owed_state.clear();
                 client.owed_queue = false;
+                client.owed_hierarchy = false;
             }
             tracing::debug!(
-                client = %id, sessions = sessions.len(), queue,
+                client = %id, sessions = sessions.len(), queue, hierarchy,
                 "re-sending state to a client that fell behind"
             );
             for (session_id, debt) in sessions {
@@ -381,6 +400,9 @@ impl Core {
             if queue {
                 let entries = self.attention_views(now_ms);
                 self.push_to(id, ServerEvent::AttentionQueueChanged { entries });
+            }
+            if hierarchy {
+                self.push_hierarchy_to(id, now_ms);
             }
         }
     }

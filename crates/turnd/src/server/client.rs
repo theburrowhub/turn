@@ -290,7 +290,7 @@ mod tests {
         assert!(error.code.is_fatal_to_connection());
 
         // The same broken shape at a version this build does serve is simply broken.
-        let current = br#"{"v":2,"type":"request","id":"r-1","request":{"op":"resize_pane"}}"#;
+        let current = br#"{"v":3,"type":"request","id":"r-1","request":{"op":"resize_pane"}}"#;
         let error = parse(current).expect_err("must be refused");
         assert_eq!(error.code, ErrorCode::MalformedMessage);
     }
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_frame_that_is_merely_wrong_is_reported_as_malformed() {
-        let line = br#"{"v":2,"type":"request","id":"r-1","request":{"op":"fly_to_the_moon"}}"#;
+        let line = br#"{"v":3,"type":"request","id":"r-1","request":{"op":"fly_to_the_moon"}}"#;
         let error = parse(line).expect_err("must be refused");
         assert_eq!(error.code, ErrorCode::MalformedMessage);
         assert!(
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn a_valid_frame_parses_at_the_current_version() {
-        let line = br#"{"v":2,"type":"hello","client":"turn-ui","client_version":"0.1.0"}"#;
+        let line = br#"{"v":3,"type":"hello","client":"turn-ui","client_version":"0.1.0"}"#;
         let frame = parse(line).expect("must parse");
         assert_eq!(frame.v, turn_proto::PROTOCOL_VERSION);
         assert!(matches!(frame.message, ClientMessage::Hello(_)));

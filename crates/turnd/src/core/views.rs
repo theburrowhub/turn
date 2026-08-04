@@ -7,11 +7,12 @@
 
 use super::command::ClientId;
 use super::Core;
+use std::collections::HashMap;
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
 use turn_core::model::SessionStatus;
 use turn_proto::{
-    AttentionView, ServerEvent, SessionDetails, SessionSummary, TemplateSummary, TreeNodeView,
-    WorkspaceSummary,
+    AttentionView, NodePaneCapability, PaneStream, ServerEvent, SessionDetails, SessionSummary,
+    TemplateSummary, TreeNodeView, WorkspaceSummary,
 };
 
 impl Core {
@@ -96,7 +97,31 @@ impl Core {
     /// A session's process tree in draw order.
     pub(crate) fn tree_views(&self, id: &SessionId, now_ms: i64) -> Vec<TreeNodeView> {
         match self.sessions.get(id) {
-            Some(session) => TreeNodeView::for_session(session, now_ms),
+            Some(session) => {
+                let bindings = self
+                    .store
+                    .hierarchy()
+                    .bindings_for_session(id)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(%error, session = %id, "could not load Pane bindings");
+                        Vec::new()
+                    });
+                let capabilities: HashMap<NodeId, NodePaneCapability> = session
+                    .tree
+                    .iter()
+                    .map(|node| {
+                        let capability = if self.processes.contains_key(&node.id) {
+                            NodePaneCapability::Terminal {
+                                streams: vec![PaneStream::Cells, PaneStream::Bytes],
+                            }
+                        } else {
+                            NodePaneCapability::PreviewDetails
+                        };
+                        (node.id.clone(), capability)
+                    })
+                    .collect();
+                TreeNodeView::for_session_with_panes(session, &bindings, &capabilities, now_ms)
+            }
             None => Vec::new(),
         }
     }
@@ -126,6 +151,8 @@ impl Core {
                 session: Box::new(session),
             });
         }
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
     }
 
     /// Tells every client the process tree changed.
@@ -135,6 +162,8 @@ impl Core {
             session_id: id.clone(),
             nodes,
         });
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
     }
 
     /// Tells the other clients the layout changed. The client that asked already has
@@ -151,6 +180,8 @@ impl Core {
             Some(client) => self.push_others(client, event),
             None => self.push_all(event),
         }
+        self.bump_hierarchy();
+        self.push_hierarchy_all(turn_core::now_ms());
     }
 
     /// Tells every client a node's state changed, on both axes plus the projection.
@@ -171,6 +202,98 @@ impl Core {
             turn: view.turn.clone(),
             display_state: view.display_state,
             caused_by: caused_by.map(Box::new),
+        });
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+    }
+
+    /// Sends the complete unified projection to one registered window.
+    pub(crate) fn push_hierarchy_to(&mut self, client: ClientId, now_ms: i64) {
+        let Some(surface_id) = self
+            .clients
+            .get(&client)
+            .and_then(|client| client.surface_id.clone())
+        else {
+            return;
+        };
+        match self.hierarchy_snapshot(&surface_id, false, now_ms) {
+            Ok(snapshot) => self.push_to(
+                client,
+                ServerEvent::HierarchyChanged {
+                    snapshot: Box::new(snapshot),
+                },
+            ),
+            Err(error) => tracing::warn!(%error, %client, "could not project hierarchy"),
+        }
+    }
+
+    /// Each window receives the same domain hierarchy with its own persisted
+    /// expansion and selection state.
+    pub(crate) fn push_hierarchy_all(&mut self, now_ms: i64) {
+        let clients: Vec<ClientId> = self
+            .clients
+            .iter()
+            .filter_map(|(id, client)| client.surface_id.as_ref().map(|_| *id))
+            .collect();
+        for client in clients {
+            self.push_hierarchy_to(client, now_ms);
+        }
+    }
+
+    pub(crate) fn push_workspace_lease(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        lease: Option<turn_core::model::WorkspaceWriteLease>,
+        now_ms: i64,
+    ) {
+        self.push_all(ServerEvent::WorkspaceWriteLeaseChanged {
+            hierarchy_revision: self.hierarchy_revision,
+            workspace_id: workspace_id.clone(),
+            lease,
+        });
+        self.push_hierarchy_all(now_ms);
+    }
+
+    pub(crate) fn push_pane_bindings(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        now_ms: i64,
+    ) {
+        let bindings = self
+            .store
+            .hierarchy()
+            .bindings_for_session(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|binding| binding.node_id == *node_id)
+            .collect();
+        self.push_all(ServerEvent::PaneBindingsChanged {
+            hierarchy_revision: self.hierarchy_revision,
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            bindings,
+        });
+        self.push_hierarchy_all(now_ms);
+    }
+
+    pub(crate) fn push_activity_preview(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        _now_ms: i64,
+    ) {
+        let preview = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.tree.get(node_id))
+            .and_then(|node| node.activity_preview.clone());
+        self.bump_hierarchy();
+        self.push_all(ServerEvent::ActivityPreviewChanged {
+            hierarchy_revision: self.hierarchy_revision,
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            preview,
         });
     }
 

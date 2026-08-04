@@ -166,6 +166,15 @@ pub struct Core {
     /// bytes never live here; only a candidate row and scheduling metadata do.
     pub(crate) preview_probes: HashMap<NodeId, preview::PreviewProbe>,
 
+    /// Monotonic revision of the single Workspace -> Session -> Process
+    /// navigation projection. Clients never apply a structural delta across a
+    /// gap: they request a complete snapshot at the newest revision.
+    pub(crate) hierarchy_revision: u64,
+
+    /// Lease heartbeats are durable fencing evidence, not a 500 ms polling
+    /// workload. The core tick uses this timestamp to coalesce writes.
+    pub(crate) last_lease_heartbeat_ms: i64,
+
     /// Nodes whose next exit was asked for, against the moment the request stops
     /// applying — see [`EXPECTED_EXIT_GRACE_MS`] for why it has to stop.
     ///
@@ -215,6 +224,8 @@ impl Core {
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
             preview_probes: HashMap::new(),
+            hierarchy_revision: 1,
+            last_lease_heartbeat_ms: 0,
             expected_exits: HashMap::new(),
             restore_reports: Vec::new(),
             supervisor: ProcessSupervisor::new(),
@@ -308,6 +319,7 @@ impl Core {
         self.emit_effects(effects, now_ms);
         self.observe_heuristics(now_ms);
         self.observe_activity_previews(now_ms);
+        self.heartbeat_workspace_leases(now_ms);
         self.resync_clients(now_ms);
         self.forget_stale_stop_requests(now_ms);
         self.reap_finished_processes(now_ms);

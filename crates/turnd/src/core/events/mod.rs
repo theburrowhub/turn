@@ -80,8 +80,12 @@ impl Core {
         self.push_all(ServerEvent::TurnEventEmitted {
             turn_event: event.clone(),
         });
-        if changed.structure || preview_changed {
+        if changed.structure {
             self.push_tree(&session_id, now_ms);
+        } else if preview_changed {
+            if let Some(node) = &changed.node {
+                self.push_activity_preview(&session_id, node, now_ms);
+            }
         }
         if let Some(node) = &changed.node {
             self.push_node_state(&session_id, node, Some(event.clone()), now_ms);

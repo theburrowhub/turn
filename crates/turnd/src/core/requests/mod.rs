@@ -7,6 +7,7 @@
 //! request interleaving halfway through.
 
 mod attention;
+mod hierarchy;
 mod nodes;
 mod panes;
 mod sessions;
@@ -43,6 +44,43 @@ impl Core {
                 disposition,
             } => self.close_workspace(&workspace_id, disposition, now_ms),
 
+            // ------------------------------------------------------- unified tree
+            Request::GetHierarchy {
+                surface_id,
+                include_archived,
+            } => self.get_hierarchy_for_client(client, surface_id, include_archived, now_ms),
+            Request::SetTreeExpanded {
+                surface_id,
+                key,
+                expanded,
+            } => self.set_tree_expanded(surface_id, key, expanded, now_ms),
+            Request::SelectTreeNode {
+                surface_id,
+                selected,
+            } => self.select_tree_node(surface_id, selected, now_ms),
+
+            // ----------------------------------------------------- checkout lease
+            Request::GetWorkspaceWriteLease { workspace_id } => {
+                self.workspace_write_lease(&workspace_id)
+            }
+            Request::AcquireWorkspaceWriteLease {
+                workspace_id,
+                session_id,
+                checkout_id,
+            } => {
+                self.acquire_workspace_write_lease(&workspace_id, &session_id, &checkout_id, now_ms)
+            }
+            Request::ReleaseWorkspaceWriteLease {
+                workspace_id,
+                lease_id,
+                expected_generation,
+            } => self.release_workspace_write_lease(
+                &workspace_id,
+                &lease_id,
+                expected_generation,
+                now_ms,
+            ),
+
             // ------------------------------------------------------------ sessions
             Request::ListSessions {
                 workspace_id,
@@ -58,6 +96,32 @@ impl Core {
                 note,
                 tags,
             } => self.create_session(&workspace_id, name, cwd, panes, note, tags, now_ms),
+            Request::CreateReadOnlySession {
+                workspace_id,
+                name,
+                cwd,
+                panes,
+                note,
+                tags,
+            } => self.create_read_only_session(&workspace_id, name, cwd, panes, note, tags, now_ms),
+            Request::CreateWorktreeSession {
+                workspace_id,
+                name,
+                branch,
+                worktree_path,
+                panes,
+                note,
+                tags,
+            } => self.create_worktree_session(
+                &workspace_id,
+                name,
+                branch,
+                worktree_path,
+                panes,
+                note,
+                tags,
+                now_ms,
+            ),
             Request::CreateSessionFromTemplate {
                 workspace_id,
                 template_id,
@@ -101,6 +165,11 @@ impl Core {
                     session_id,
                 })
             }
+            Request::GetPreviewHistory {
+                session_id,
+                node_id,
+                limit,
+            } => self.get_preview_history(&session_id, &node_id, limit),
 
             // ----------------------------------------------------------- templates
             Request::ListTemplates => Ok(Response::Templates {
@@ -138,6 +207,16 @@ impl Core {
                 session_id,
                 pane_id,
             } => self.zoom_pane(client, &session_id, &pane_id),
+            Request::OpenNodeAsTemporaryPane {
+                surface_id,
+                session_id,
+                node_id,
+            } => self.open_node_as_temporary_pane(surface_id, &session_id, &node_id, now_ms),
+            Request::FocusPaneForNode {
+                surface_id,
+                session_id,
+                node_id,
+            } => self.focus_pane_for_node(surface_id, &session_id, &node_id),
             Request::AttachPane {
                 session_id,
                 pane_id,
