@@ -2,11 +2,12 @@
 
 use crate::codec::{from_tag, tag};
 use crate::error::{Result, StoreError};
+use crate::repo::session::SessionRepo;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, TreeUiState,
-    WorkspaceCheckout, WorkspaceWriteLease,
+    ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, Session, SessionMode,
+    TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
 };
 
 pub struct HierarchyRepo<'a> {
@@ -45,6 +46,42 @@ impl<'a> HierarchyRepo<'a> {
         // arbiter, but no contender can read a generation that another writer is
         // concurrently about to consume.
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let lease = Self::acquire_in(&tx, workspace, session, checkout, now_ms)?;
+        tx.commit()?;
+        Ok(lease)
+    }
+
+    /// Persists a new Session and arbitrates its checkout in one `BEGIN
+    /// IMMEDIATE` transaction. No init command or PTY may be started until this
+    /// succeeds; a lease conflict therefore leaves no half-created Session row.
+    pub fn create_session(
+        &self,
+        session: &Session,
+        now_ms: i64,
+    ) -> Result<Option<WorkspaceWriteLease>> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        SessionRepo::save_in_transaction(&tx, session)?;
+        let lease = match session.mode {
+            SessionMode::MainCheckout => Some(Self::acquire_in(
+                &tx,
+                &session.workspace_id,
+                &session.id,
+                &session.checkout_id,
+                now_ms,
+            )?),
+            SessionMode::ReadOnly | SessionMode::IsolatedWorktree => None,
+        };
+        tx.commit()?;
+        Ok(lease)
+    }
+
+    fn acquire_in(
+        tx: &Transaction<'_>,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+        now_ms: i64,
+    ) -> Result<WorkspaceWriteLease> {
         let canonical: Option<String> = tx
             .query_row(
                 "SELECT c.canonical_path \
@@ -136,7 +173,6 @@ impl<'a> HierarchyRepo<'a> {
             "UPDATE workspaces SET lease_reconciliation_required = 0 WHERE id = ?1",
             params![workspace.as_str()],
         )?;
-        tx.commit()?;
         Ok(lease)
     }
 
@@ -383,7 +419,9 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use turn_core::model::{HierarchyNodeKind, ProcessNode, Session, Workspace};
+    use turn_core::model::{
+        HierarchyNodeKind, Layout, Pane, PaneKind, ProcessNode, Session, SessionMode, Workspace,
+    };
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -428,6 +466,54 @@ mod tests {
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+    }
+
+    #[test]
+    fn creating_a_main_session_and_lease_is_atomic_on_conflict() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "atomic");
+        let make = |name: &str| {
+            let mut session = Session::new(
+                workspace.id.clone(),
+                name,
+                workspace.root.clone(),
+                Layout::single(Pane::new(PaneKind::Agent).with_command("claude")),
+                T0,
+            );
+            session.mode = SessionMode::MainCheckout;
+            session
+        };
+        let first = make("first writer");
+        let second = make("second writer");
+
+        let lease = store
+            .hierarchy()
+            .create_session(&first, T0)
+            .unwrap()
+            .expect("main checkout receives a lease");
+        assert_eq!(lease.session_id, first.id);
+
+        let error = store
+            .hierarchy()
+            .create_session(&second, T0 + 1)
+            .expect_err("the second writer is refused");
+        assert!(matches!(error, StoreError::WriteLeaseHeld { .. }));
+        assert!(
+            store.sessions().get(&second.id).unwrap().is_none(),
+            "the rejected Session row must roll back with the lease attempt"
+        );
+
+        let mut review = make("review");
+        review.mode = SessionMode::ReadOnly;
+        assert!(store
+            .hierarchy()
+            .create_session(&review, T0 + 2)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.sessions().get(&review.id).unwrap().unwrap().mode,
+            SessionMode::ReadOnly
+        );
     }
 
     #[test]

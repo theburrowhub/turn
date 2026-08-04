@@ -43,69 +43,16 @@ impl<'a> SessionRepo<'a> {
     /// own and every pane's — are redacted on the way in.
     pub fn save(&self, session: &Session) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-
-        tx.execute(
-            "INSERT INTO sessions (id, workspace_id, name, note, cwd, env_json, attention_json, \
-                 mode, checkout_id, worktree_path, read_only_enforced, template_id, status, \
-                 restore_state, tags_json, git_branch, linked_ref, favourite, pinned, sort_key, \
-                 parent_session, created_ms, last_activity_ms, tmux) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
-             ON CONFLICT(id) DO UPDATE SET \
-                 workspace_id = excluded.workspace_id, name = excluded.name, \
-                 note = excluded.note, cwd = excluded.cwd, env_json = excluded.env_json, \
-                 mode = excluded.mode, checkout_id = excluded.checkout_id, \
-                 worktree_path = excluded.worktree_path, \
-                 read_only_enforced = excluded.read_only_enforced, \
-                 attention_json = excluded.attention_json, template_id = excluded.template_id, \
-                 status = excluded.status, restore_state = excluded.restore_state, \
-                 tags_json = excluded.tags_json, git_branch = excluded.git_branch, \
-                 linked_ref = excluded.linked_ref, favourite = excluded.favourite, \
-                 pinned = excluded.pinned, sort_key = excluded.sort_key, \
-                 parent_session = excluded.parent_session, created_ms = excluded.created_ms, \
-                 last_activity_ms = excluded.last_activity_ms, tmux = excluded.tmux",
-            params![
-                session.id.as_str(),
-                session.workspace_id.as_str(),
-                session.name,
-                session.note,
-                session.cwd,
-                json("session env", &redact_pairs(&session.env))?,
-                json("attention policy", &session.attention)?,
-                tag("session mode", &session.mode)?,
-                session.checkout_id.as_str(),
-                session.worktree_path,
-                session.read_only_enforced,
-                session.template_id.as_ref().map(|t| t.as_str()),
-                tag("session status", &session.status)?,
-                tag("restore state", &session.restore_state)?,
-                json("session tags", &session.tags)?,
-                session.git_branch,
-                session.linked_ref,
-                session.favourite,
-                session.pinned,
-                session.sort_key,
-                session.parent_session.as_ref().map(|s| s.as_str()),
-                session.created_ms,
-                session.last_activity_ms,
-                session.tmux,
-            ],
-        )
-        .map_err(|error| StoreError::from_write("session", session.workspace_id.as_str(), error))?;
-
-        write_layout(&tx, &session.id, &session.layout, session.last_activity_ms)?;
-
-        // Replace the node set wholesale: the tree in memory is authoritative.
-        let mut keep: Vec<String> = Vec::new();
-        for (index, node) in session.tree.iter().enumerate() {
-            upsert_node(&tx, node, index as i64)?;
-            keep.push(node.id.to_string());
-        }
-        prune_nodes(&tx, &session.id, &keep)?;
-        sync_layout_bindings(&tx, session)?;
-
+        save_in(&tx, session)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Inserts a session as part of a wider store transaction. This is the seam
+    /// the lease arbiter uses so a Main-checkout Session and its write lease either
+    /// both exist or neither does.
+    pub(crate) fn save_in_transaction(conn: &Connection, session: &Session) -> Result<()> {
+        save_in(conn, session)
     }
 
     /// Loads a session exactly as it was stored.
@@ -279,6 +226,69 @@ impl<'a> SessionRepo<'a> {
         }
         Ok(out)
     }
+}
+
+fn save_in(conn: &Connection, session: &Session) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions (id, workspace_id, name, note, cwd, env_json, attention_json, \
+             mode, checkout_id, worktree_path, read_only_enforced, template_id, status, \
+             restore_state, tags_json, git_branch, linked_ref, favourite, pinned, sort_key, \
+             parent_session, created_ms, last_activity_ms, tmux) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24) \
+         ON CONFLICT(id) DO UPDATE SET \
+             workspace_id = excluded.workspace_id, name = excluded.name, \
+             note = excluded.note, cwd = excluded.cwd, env_json = excluded.env_json, \
+             mode = excluded.mode, checkout_id = excluded.checkout_id, \
+             worktree_path = excluded.worktree_path, \
+             read_only_enforced = excluded.read_only_enforced, \
+             attention_json = excluded.attention_json, template_id = excluded.template_id, \
+             status = excluded.status, restore_state = excluded.restore_state, \
+             tags_json = excluded.tags_json, git_branch = excluded.git_branch, \
+             linked_ref = excluded.linked_ref, favourite = excluded.favourite, \
+             pinned = excluded.pinned, sort_key = excluded.sort_key, \
+             parent_session = excluded.parent_session, created_ms = excluded.created_ms, \
+             last_activity_ms = excluded.last_activity_ms, tmux = excluded.tmux",
+        params![
+            session.id.as_str(),
+            session.workspace_id.as_str(),
+            session.name,
+            session.note,
+            session.cwd,
+            json("session env", &redact_pairs(&session.env))?,
+            json("attention policy", &session.attention)?,
+            tag("session mode", &session.mode)?,
+            session.checkout_id.as_str(),
+            session.worktree_path,
+            session.read_only_enforced,
+            session.template_id.as_ref().map(|t| t.as_str()),
+            tag("session status", &session.status)?,
+            tag("restore state", &session.restore_state)?,
+            json("session tags", &session.tags)?,
+            session.git_branch,
+            session.linked_ref,
+            session.favourite,
+            session.pinned,
+            session.sort_key,
+            session.parent_session.as_ref().map(|s| s.as_str()),
+            session.created_ms,
+            session.last_activity_ms,
+            session.tmux,
+        ],
+    )
+    .map_err(|error| StoreError::from_write("session", session.workspace_id.as_str(), error))?;
+
+    write_layout(conn, &session.id, &session.layout, session.last_activity_ms)?;
+
+    // Replace the node set wholesale: the tree in memory is authoritative.
+    let mut keep: Vec<String> = Vec::new();
+    for (index, node) in session.tree.iter().enumerate() {
+        upsert_node(conn, node, index as i64)?;
+        keep.push(node.id.to_string());
+    }
+    prune_nodes(conn, &session.id, &keep)?;
+    sync_layout_bindings(conn, session)?;
+    Ok(())
 }
 
 fn write_layout(conn: &Connection, id: &SessionId, layout: &Layout, now_ms: i64) -> Result<()> {
