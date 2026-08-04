@@ -5,7 +5,9 @@ use super::{check_name, Answer};
 use crate::core::Core;
 use crate::paths;
 use turn_core::ids::{SessionId, TemplateId, WorkspaceId};
-use turn_core::model::{Direction, Layout, Pane, PaneKind, Session, SessionStatus, Template};
+use turn_core::model::{
+    Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template,
+};
 use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
 
 impl Core {
@@ -39,9 +41,16 @@ impl Core {
         session.tags = tags;
         session.attention = workspace.attention.clone();
         session.env = workspace.env.clone();
+        session.mode = SessionMode::MainCheckout;
         let id = session.id.clone();
+        // The store arbitrates and persists this Session in one IMMEDIATE
+        // transaction. Nothing user-configured is executed before the exclusive
+        // primary-checkout lease exists.
+        self.store
+            .hierarchy()
+            .create_session(&session, now_ms)
+            .map_err(store)?;
         self.sessions.insert(id.clone(), session);
-        self.persist_session(&id)?;
 
         self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
         self.materialise_session(&id, now_ms);
@@ -105,9 +114,13 @@ impl Core {
             .collect();
         session.tmux = template.tmux;
         session.git_branch = branch;
+        session.mode = SessionMode::MainCheckout;
         let id = session.id.clone();
+        self.store
+            .hierarchy()
+            .create_session(&session, now_ms)
+            .map_err(store)?;
         self.sessions.insert(id.clone(), session);
-        self.persist_session(&id)?;
 
         let init: Vec<String> = workspace
             .init_commands
@@ -352,6 +365,7 @@ pub(super) fn pane_from_spec(spec: &NewPane) -> Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::testing::Harness;
 
     #[test]
     fn a_list_of_panes_becomes_one_split_in_the_order_it_was_given() {
@@ -399,5 +413,55 @@ mod tests {
         assert_eq!(pane.env.len(), 1);
         assert_eq!(pane.restore, turn_core::model::RestoreBehaviour::Relaunch);
         assert!(pane.node_id.is_none(), "a pane starts with no process");
+    }
+
+    #[tokio::test]
+    async fn a_second_main_checkout_session_is_rejected_before_any_runtime_state_exists() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace = match harness
+            .core
+            .create_workspace("space-troopers".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let panes = Some(vec![NewPane::new(PaneKind::AgentTree)]);
+
+        harness
+            .core
+            .create_session(
+                &workspace,
+                "Fix climbing bugs".into(),
+                None,
+                panes.clone(),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap();
+        let sessions_before = harness.core.sessions.len();
+        let processes_before = harness.core.processes.len();
+
+        let error = harness
+            .core
+            .create_session(
+                &workspace,
+                "Alternative writer".into(),
+                None,
+                panes,
+                None,
+                Vec::new(),
+                12,
+            )
+            .expect_err("the existing lease must win");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("is held by session")));
+        assert_eq!(harness.core.sessions.len(), sessions_before);
+        assert_eq!(harness.core.processes.len(), processes_before);
+        assert_eq!(harness.core.store.sessions().count().unwrap(), 1);
     }
 }
