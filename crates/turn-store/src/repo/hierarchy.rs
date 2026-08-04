@@ -1,9 +1,10 @@
 //! ADR-040 persistence: checkout leases, view bindings, previews and per-surface tree state.
 
-use crate::codec::{from_tag, tag};
+use crate::codec::{from_tag, json, tag};
 use crate::error::{Result, StoreError};
 use crate::repo::session::SessionRepo;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use std::path::{Path, PathBuf};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, Session, SessionMode,
@@ -29,6 +30,40 @@ impl<'a> HierarchyRepo<'a> {
                 checkout_from_row,
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    /// Returns one checkout only when it belongs to the requested Workspace.
+    pub fn checkout(
+        &self,
+        workspace: &WorkspaceId,
+        checkout: &CheckoutId,
+    ) -> Result<Option<WorkspaceCheckout>> {
+        self.conn
+            .query_row(
+                "SELECT id, workspace_id, path, canonical_path, branch, is_primary, \
+                        shared_resources_json, created_ms \
+                 FROM workspace_checkouts WHERE workspace_id = ?1 AND id = ?2",
+                params![workspace.as_str(), checkout.as_str()],
+                checkout_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// All roots known to a Workspace, with the primary checkout first.
+    pub fn checkouts_for_workspace(
+        &self,
+        workspace: &WorkspaceId,
+    ) -> Result<Vec<WorkspaceCheckout>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, path, canonical_path, branch, is_primary, \
+                    shared_resources_json, created_ms \
+             FROM workspace_checkouts WHERE workspace_id = ?1 \
+             ORDER BY is_primary DESC, created_ms, id",
+        )?;
+        let rows = stmt.query_map(params![workspace.as_str()], checkout_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
@@ -60,19 +95,346 @@ impl<'a> HierarchyRepo<'a> {
         now_ms: i64,
     ) -> Result<Option<WorkspaceWriteLease>> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
-        SessionRepo::save_in_transaction(&tx, session)?;
         let lease = match session.mode {
-            SessionMode::MainCheckout => Some(Self::acquire_in(
-                &tx,
-                &session.workspace_id,
-                &session.id,
-                &session.checkout_id,
-                now_ms,
-            )?),
-            SessionMode::ReadOnly | SessionMode::IsolatedWorktree => None,
+            SessionMode::MainCheckout => {
+                SessionRepo::save_in_transaction(&tx, session)?;
+                Some(Self::acquire_in(
+                    &tx,
+                    &session.workspace_id,
+                    &session.id,
+                    &session.checkout_id,
+                    now_ms,
+                )?)
+            }
+            // Compatibility for callers that do not need to report technical
+            // enforcement. The explicit API below is required to persist `true`.
+            SessionMode::ReadOnly => {
+                Self::create_read_only_in(&tx, session, false)?;
+                None
+            }
+            SessionMode::IsolatedWorktree => {
+                return Err(StoreError::InvalidSessionCreation {
+                    session_id: session.id.to_string(),
+                    reason: "an isolated worktree must be registered atomically with create_worktree_session"
+                        .into(),
+                });
+            }
         };
         tx.commit()?;
         Ok(lease)
+    }
+
+    /// Persists a new review/research Session against this Workspace's primary
+    /// checkout without acquiring a write lease.
+    ///
+    /// `read_only_enforced` is an explicit fact supplied by the launcher after it
+    /// installs a technical guard. The field on `session` is deliberately ignored
+    /// so this method defaults to honest `false` unless its caller opts in here.
+    pub fn create_read_only_session(
+        &self,
+        session: &Session,
+        read_only_enforced: bool,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        Self::create_read_only_in(&tx, session, read_only_enforced)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn create_read_only_in(
+        tx: &Transaction<'_>,
+        session: &Session,
+        read_only_enforced: bool,
+    ) -> Result<()> {
+        Self::validate_id("Session", session.id.as_str(), SessionId::PREFIX)?;
+        Self::validate_id(
+            "Workspace",
+            session.workspace_id.as_str(),
+            WorkspaceId::PREFIX,
+        )?;
+        if session.mode != SessionMode::ReadOnly {
+            return Err(Self::invalid_session(
+                session,
+                "create_read_only_session requires mode read_only",
+            ));
+        }
+        if session.worktree_path.is_some() {
+            return Err(Self::invalid_session(
+                session,
+                "a read-only Session cannot carry a worktree path",
+            ));
+        }
+        Self::ensure_new_session(tx, session)?;
+
+        let primary: Option<String> = tx
+            .query_row(
+                "SELECT id FROM workspace_checkouts \
+                 WHERE workspace_id = ?1 AND is_primary = 1",
+                params![session.workspace_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(primary) = primary else {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: session.checkout_id.to_string(),
+                reason: format!(
+                    "workspace {} has no registered primary checkout",
+                    session.workspace_id
+                ),
+            });
+        };
+        if primary != session.checkout_id.as_str() {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: session.checkout_id.to_string(),
+                reason: format!(
+                    "read-only Session {} must reference Workspace {} primary checkout {primary}",
+                    session.id, session.workspace_id
+                ),
+            });
+        }
+
+        let mut stored = session.clone();
+        stored.read_only_enforced = read_only_enforced;
+        SessionRepo::save_in_transaction(tx, &stored)
+    }
+
+    /// Registers an existing, independent Git worktree and its Session as one
+    /// transaction. This never acquires the primary checkout lease.
+    ///
+    /// The filesystem is resolved before SQLite is touched. Once the transaction
+    /// begins, the checkout fence, checkout metadata, Session, Layout, and nodes
+    /// either all commit or all roll back.
+    pub fn create_worktree_session(
+        &self,
+        session: &Session,
+        checkout: &WorkspaceCheckout,
+    ) -> Result<()> {
+        let canonical = Self::validate_worktree_shape(session, checkout)?;
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        Self::ensure_new_session(&tx, session)?;
+
+        let primary: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, canonical_path FROM workspace_checkouts \
+                 WHERE workspace_id = ?1 AND is_primary = 1",
+                params![session.workspace_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((_primary_id, primary_canonical)) = primary else {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: format!(
+                    "workspace {} has no registered primary checkout",
+                    session.workspace_id
+                ),
+            });
+        };
+        if canonical == primary_canonical {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: "isolated worktree resolves to the primary checkout".into(),
+            });
+        }
+
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT id FROM workspace_checkouts WHERE canonical_path = ?1 LIMIT 1",
+                params![&canonical],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_checkout_id) = existing {
+            return Err(StoreError::CheckoutPathConflict {
+                canonical_path: canonical,
+                existing_checkout_id,
+            });
+        }
+        let reused_id: Option<String> = tx
+            .query_row(
+                "SELECT canonical_path FROM workspace_checkouts WHERE id = ?1",
+                params![checkout.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_path) = reused_id {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: format!("checkout id is already registered for {existing_path}"),
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO checkout_write_fences (canonical_path, generation) \
+             VALUES (?1, 0) ON CONFLICT(canonical_path) DO NOTHING",
+            params![&canonical],
+        )?;
+        tx.execute(
+            "INSERT INTO workspace_checkouts \
+                 (id, workspace_id, path, canonical_path, branch, is_primary, \
+                  shared_resources_json, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
+            params![
+                checkout.id.as_str(),
+                checkout.workspace_id.as_str(),
+                checkout.path,
+                canonical,
+                checkout.branch,
+                json("checkout shared resources", &checkout.shared_resources)?,
+                checkout.created_ms,
+            ],
+        )
+        .map_err(|error| {
+            StoreError::from_write("worktree checkout", checkout.workspace_id.as_str(), error)
+        })?;
+
+        let mut stored = session.clone();
+        stored.read_only_enforced = false;
+        SessionRepo::save_in_transaction(&tx, &stored)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn validate_worktree_shape(session: &Session, checkout: &WorkspaceCheckout) -> Result<String> {
+        Self::validate_id("Session", session.id.as_str(), SessionId::PREFIX)?;
+        Self::validate_id(
+            "Workspace",
+            session.workspace_id.as_str(),
+            WorkspaceId::PREFIX,
+        )?;
+        Self::validate_id("Checkout", checkout.id.as_str(), CheckoutId::PREFIX)?;
+        if session.mode != SessionMode::IsolatedWorktree {
+            return Err(Self::invalid_session(
+                session,
+                "create_worktree_session requires mode isolated_worktree",
+            ));
+        }
+        if session.read_only_enforced {
+            return Err(Self::invalid_session(
+                session,
+                "read_only_enforced is only valid for a read-only Session",
+            ));
+        }
+        if checkout.primary {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: "an isolated worktree cannot be marked primary".into(),
+            });
+        }
+        if checkout.id == CheckoutId::primary_for(&session.workspace_id) {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: "an isolated worktree cannot reuse the primary checkout id".into(),
+            });
+        }
+        if checkout.workspace_id != session.workspace_id {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: format!(
+                    "checkout belongs to Workspace {}, not {}",
+                    checkout.workspace_id, session.workspace_id
+                ),
+            });
+        }
+        if checkout.id != session.checkout_id {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: format!("Session {} references {}", session.id, session.checkout_id),
+            });
+        }
+        if session.worktree_path.as_deref() != Some(checkout.path.as_str()) {
+            return Err(Self::invalid_session(
+                session,
+                "worktree_path must exactly match the registered checkout path",
+            ));
+        }
+        let branch = checkout
+            .branch
+            .as_deref()
+            .filter(|branch| !branch.trim().is_empty())
+            .ok_or_else(|| StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: "an isolated worktree requires a branch".into(),
+            })?;
+        if session.git_branch.as_deref() != Some(branch) {
+            return Err(Self::invalid_session(
+                session,
+                "Session branch must match its worktree checkout branch",
+            ));
+        }
+
+        let canonical_path = Self::canonicalize_checkout(&checkout.path)?;
+        let supplied_canonical = PathBuf::from(&checkout.canonical_path);
+        if supplied_canonical != canonical_path {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: checkout.id.to_string(),
+                reason: format!(
+                    "canonical_path {} does not match resolved path {}",
+                    checkout.canonical_path,
+                    canonical_path.display()
+                ),
+            });
+        }
+        let cwd = Self::canonicalize_checkout(&session.cwd)?;
+        if !cwd.starts_with(&canonical_path) {
+            return Err(Self::invalid_session(
+                session,
+                "cwd must be inside the isolated worktree",
+            ));
+        }
+        Ok(canonical_path.to_string_lossy().into_owned())
+    }
+
+    fn canonicalize_checkout(path: &str) -> Result<PathBuf> {
+        let resolved =
+            std::fs::canonicalize(Path::new(path)).map_err(|cause| StoreError::CheckoutPath {
+                path: path.to_owned(),
+                cause,
+            })?;
+        let metadata = std::fs::metadata(&resolved).map_err(|cause| StoreError::CheckoutPath {
+            path: path.to_owned(),
+            cause,
+        })?;
+        if !metadata.is_dir() {
+            return Err(StoreError::InvalidCheckout {
+                checkout_id: "<unregistered>".into(),
+                reason: format!("{} is not a directory", resolved.display()),
+            });
+        }
+        Ok(resolved)
+    }
+
+    fn ensure_new_session(tx: &Transaction<'_>, session: &Session) -> Result<()> {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session.id.as_str()],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(Self::invalid_session(
+                session,
+                "a Session with this id already exists",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_id(what: &'static str, value: &str, prefix: &str) -> Result<()> {
+        let expected = format!("{prefix}_");
+        if !value.starts_with(&expected) || value.len() == expected.len() {
+            return Err(StoreError::InvalidSessionCreation {
+                session_id: value.to_owned(),
+                reason: format!("{what} id must start with {expected} and have a suffix"),
+            });
+        }
+        Ok(())
+    }
+
+    fn invalid_session(session: &Session, reason: impl Into<String>) -> StoreError {
+        StoreError::InvalidSessionCreation {
+            session_id: session.id.to_string(),
+            reason: reason.into(),
+        }
     }
 
     fn acquire_in(
@@ -431,6 +793,42 @@ mod tests {
         workspace
     }
 
+    fn worktree_pair(
+        workspace: &Workspace,
+        path: &Path,
+        name: &str,
+    ) -> (Session, WorkspaceCheckout) {
+        let checkout_id = CheckoutId::new();
+        let branch = format!("turn/{name}");
+        let path = path.to_string_lossy().into_owned();
+        let canonical_path = std::fs::canonicalize(&path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let checkout = WorkspaceCheckout {
+            id: checkout_id.clone(),
+            workspace_id: workspace.id.clone(),
+            path: path.clone(),
+            canonical_path,
+            branch: Some(branch.clone()),
+            primary: false,
+            shared_resources: vec!["docker".into()],
+            created_ms: T0,
+        };
+        let mut session = Session::new(
+            workspace.id.clone(),
+            name,
+            path.clone(),
+            Layout::single(Pane::new(PaneKind::Agent).with_command("claude")),
+            T0,
+        );
+        session.mode = SessionMode::IsolatedWorktree;
+        session.checkout_id = checkout_id;
+        session.worktree_path = Some(path);
+        session.git_branch = Some(branch);
+        (session, checkout)
+    }
+
     fn saved_alias_pair(store: &Store, root: &Path) -> [(Workspace, Session, CheckoutId); 2] {
         ["first", "second"].map(|name| {
             let workspace = saved_workspace_at(store, name, root);
@@ -514,6 +912,276 @@ mod tests {
             store.sessions().get(&review.id).unwrap().unwrap().mode,
             SessionMode::ReadOnly
         );
+    }
+
+    #[test]
+    fn read_only_creation_uses_the_primary_without_claiming_its_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        let store = testing::store();
+        let workspace = saved_workspace_at(&store, "read-only", &primary);
+
+        let mut writer = Session::new(
+            workspace.id.clone(),
+            "writer",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Agent).with_command("claude")),
+            T0,
+        );
+        writer.mode = SessionMode::MainCheckout;
+        let lease = store
+            .hierarchy()
+            .create_session(&writer, T0)
+            .unwrap()
+            .unwrap();
+
+        let mut review = Session::new(
+            workspace.id.clone(),
+            "review",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Shell)),
+            T0 + 1,
+        );
+        // A stale/optimistic field on the object is not evidence that a launcher
+        // installed a real guard. Only the explicit method argument is trusted.
+        review.read_only_enforced = true;
+        store
+            .hierarchy()
+            .create_read_only_session(&review, false)
+            .unwrap();
+
+        let stored = store.sessions().get(&review.id).unwrap().unwrap();
+        assert_eq!(stored.mode, SessionMode::ReadOnly);
+        assert_eq!(stored.checkout_id, CheckoutId::primary_for(&workspace.id));
+        assert!(stored.worktree_path.is_none());
+        assert!(!stored.read_only_enforced);
+        assert_eq!(
+            store
+                .hierarchy()
+                .active_lease(&workspace.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            lease.id,
+            "a reader must not disturb the primary writer's lease"
+        );
+
+        let guarded = Session::new(
+            workspace.id.clone(),
+            "guarded review",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Shell)),
+            T0 + 2,
+        );
+        store
+            .hierarchy()
+            .create_read_only_session(&guarded, true)
+            .unwrap();
+        assert!(
+            store
+                .sessions()
+                .get(&guarded.id)
+                .unwrap()
+                .unwrap()
+                .read_only_enforced,
+            "true is persisted only when the launcher says the guard is active"
+        );
+
+        let lease_count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_write_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 1);
+    }
+
+    #[test]
+    fn worktree_checkout_and_session_roll_back_together() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let store = testing::store();
+        let workspace = saved_workspace_at(&store, "atomic-worktree", &primary);
+        let (mut session, checkout) = worktree_pair(&workspace, &worktree, "alternative");
+        session.parent_session = Some(SessionId::new());
+
+        let error = store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+            .expect_err("the unknown parent must fail after checkout insertion");
+        assert!(matches!(error, StoreError::UnknownReference { .. }));
+        assert!(store.sessions().get(&session.id).unwrap().is_none());
+        let checkout_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_checkouts WHERE id = ?1",
+                params![checkout.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkout_count, 0, "no orphan checkout may survive");
+        let fence_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM checkout_write_fences WHERE canonical_path = ?1",
+                params![checkout.canonical_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fence_count, 0, "the failed checkout fence also rolls back");
+
+        session.parent_session = None;
+        store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+            .unwrap();
+        let stored = store.sessions().get(&session.id).unwrap().unwrap();
+        assert_eq!(stored.mode, SessionMode::IsolatedWorktree);
+        assert_eq!(stored.checkout_id, checkout.id);
+        assert_eq!(
+            stored.worktree_path.as_deref(),
+            Some(checkout.path.as_str())
+        );
+        let worktree_leases: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_write_leases WHERE session_id = ?1",
+                params![session.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            worktree_leases, 0,
+            "worktrees do not claim the primary lease"
+        );
+    }
+
+    #[test]
+    fn worktree_creation_rejects_foreign_ownership_without_partial_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary_a = temp.path().join("primary-a");
+        let primary_b = temp.path().join("primary-b");
+        let worktree = temp.path().join("worktree");
+        for path in [&primary_a, &primary_b, &worktree] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let store = testing::store();
+        let a = saved_workspace_at(&store, "owner-a", &primary_a);
+        let b = saved_workspace_at(&store, "owner-b", &primary_b);
+        let (session, mut checkout) = worktree_pair(&a, &worktree, "foreign");
+        checkout.workspace_id = b.id.clone();
+
+        let error = store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidCheckout { .. }));
+        assert!(store.sessions().get(&session.id).unwrap().is_none());
+        let checkout_count: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_checkouts WHERE id = ?1",
+                params![checkout.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkout_count, 0);
+
+        // The schema enforces the ownership relation even for a caller that
+        // bypasses HierarchyRepo and writes through the generic SessionRepo.
+        let mut foreign_reader = Session::new(
+            a.id.clone(),
+            "bad reader",
+            a.root.clone(),
+            Layout::single(Pane::new(PaneKind::Shell)),
+            T0,
+        );
+        foreign_reader.checkout_id = CheckoutId::primary_for(&b.id);
+        assert!(store.sessions().save(&foreign_reader).is_err());
+        assert!(store.sessions().get(&foreign_reader.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn isolated_worktree_has_an_independent_canonical_path_and_no_primary_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let store = testing::store();
+        let workspace = saved_workspace_at(&store, "parallel", &primary);
+
+        let mut writer = Session::new(
+            workspace.id.clone(),
+            "writer",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Agent)),
+            T0,
+        );
+        writer.mode = SessionMode::MainCheckout;
+        let writer_lease = store
+            .hierarchy()
+            .create_session(&writer, T0)
+            .unwrap()
+            .unwrap();
+        let (isolated, checkout) = worktree_pair(&workspace, &worktree, "parallel-fix");
+        store
+            .hierarchy()
+            .create_worktree_session(&isolated, &checkout)
+            .unwrap();
+
+        let primary_checkout = store
+            .hierarchy()
+            .primary_checkout(&workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(checkout.canonical_path, primary_checkout.canonical_path);
+        assert_eq!(
+            store
+                .hierarchy()
+                .checkout(&workspace.id, &checkout.id)
+                .unwrap()
+                .unwrap(),
+            checkout
+        );
+        assert_eq!(
+            store
+                .hierarchy()
+                .checkouts_for_workspace(&workspace.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .hierarchy()
+                .active_lease(&workspace.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            writer_lease.id
+        );
+
+        let alias = temp.path().join("worktree-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&worktree, &alias).unwrap();
+        let (alias_session, mut alias_checkout) =
+            worktree_pair(&workspace, &alias, "same-directory");
+        // worktree_pair has already resolved the symlink. The API must detect
+        // the existing canonical checkout rather than trusting the new id/path.
+        alias_checkout.canonical_path = checkout.canonical_path.clone();
+        let error = store
+            .hierarchy()
+            .create_worktree_session(&alias_session, &alias_checkout)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::CheckoutPathConflict { .. }));
+        assert!(store.sessions().get(&alias_session.id).unwrap().is_none());
     }
 
     #[test]

@@ -76,6 +76,34 @@ pub enum StoreError {
         checkout_id: String,
     },
 
+    /// A specialised Session creation API received a shape that would make the
+    /// persisted mode ambiguous or unsafe. The caller must fix the domain object;
+    /// the store never silently converts a writer into another mode.
+    #[error("cannot create session {session_id}: {reason}")]
+    InvalidSessionCreation { session_id: String, reason: String },
+
+    /// A worktree must already exist so its filesystem identity can be fenced
+    /// against the primary checkout and every other registered checkout.
+    #[error("could not resolve checkout path {path}: {cause}")]
+    CheckoutPath {
+        path: String,
+        #[source]
+        cause: std::io::Error,
+    },
+
+    /// The supplied checkout metadata disagrees with its workspace, Session, or
+    /// canonical filesystem identity.
+    #[error("checkout {checkout_id} is invalid: {reason}")]
+    InvalidCheckout { checkout_id: String, reason: String },
+
+    /// Isolated worktrees may not alias any existing checkout. Primary checkout
+    /// aliases are supported, but an isolated writer must have its own directory.
+    #[error("checkout path {canonical_path} is already registered as {existing_checkout_id}")]
+    CheckoutPathConflict {
+        canonical_path: String,
+        existing_checkout_id: String,
+    },
+
     #[error("could not create the data directory {path}: {cause}")]
     DataDir {
         path: String,

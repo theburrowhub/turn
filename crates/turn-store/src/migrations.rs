@@ -43,6 +43,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "unified_hierarchy_and_leases",
         statements: MIGRATION_003_UNIFIED_HIERARCHY,
     },
+    Migration {
+        version: 4,
+        name: "safe_session_checkout_modes",
+        statements: MIGRATION_004_SAFE_SESSION_CHECKOUT_MODES,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -483,6 +488,116 @@ CREATE INDEX idx_workspace_audit_time
 ON workspace_audit_events(workspace_id, timestamp_ms DESC);
 "#;
 
+/// Makes the Session -> Checkout relation a database invariant. SQLite cannot
+/// add a composite foreign key to the existing `sessions` table without a table
+/// rebuild, so guarded inserts/updates provide the same protection while keeping
+/// the append-only v3 migration intact.
+const MIGRATION_004_SAFE_SESSION_CHECKOUT_MODES: &str = r#"
+-- The v3 generic API could persist an isolated mode without registering its
+-- checkout. Such a row is not proof that a worktree exists. Downgrade malformed
+-- relations to an honest, unenforced reader of the primary checkout before the
+-- guards become active; valid registered worktrees are preserved.
+UPDATE sessions
+SET mode = 'read_only',
+    checkout_id = (
+        SELECT c.id FROM workspace_checkouts c
+        WHERE c.workspace_id = sessions.workspace_id AND c.is_primary = 1
+    ),
+    worktree_path = NULL,
+    read_only_enforced = 0
+WHERE NOT EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.id = sessions.checkout_id
+      AND c.workspace_id = sessions.workspace_id
+      AND (
+          (sessions.mode IN ('main_checkout', 'read_only')
+              AND c.is_primary = 1
+              AND sessions.worktree_path IS NULL)
+          OR
+          (sessions.mode = 'isolated_worktree'
+              AND c.is_primary = 0
+              AND sessions.worktree_path = c.path)
+      )
+);
+
+CREATE TRIGGER validate_session_checkout_insert
+BEFORE INSERT ON sessions
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM workspaces w WHERE w.id = NEW.workspace_id)
+AND (
+    NOT EXISTS (
+        SELECT 1 FROM workspace_checkouts c
+        WHERE c.id = NEW.checkout_id
+          AND c.workspace_id = NEW.workspace_id
+          AND (
+              (NEW.mode IN ('main_checkout', 'read_only')
+                  AND c.is_primary = 1
+                  AND NEW.worktree_path IS NULL)
+              OR
+              (NEW.mode = 'isolated_worktree'
+                  AND c.is_primary = 0
+                  AND NEW.worktree_path = c.path)
+          )
+    )
+    OR (NEW.read_only_enforced != 0 AND NEW.mode != 'read_only')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid session checkout mode');
+END;
+
+CREATE TRIGGER validate_session_checkout_update
+BEFORE UPDATE OF workspace_id, checkout_id, mode, worktree_path, read_only_enforced ON sessions
+FOR EACH ROW
+WHEN EXISTS (SELECT 1 FROM workspaces w WHERE w.id = NEW.workspace_id)
+AND (
+    NOT EXISTS (
+        SELECT 1 FROM workspace_checkouts c
+        WHERE c.id = NEW.checkout_id
+          AND c.workspace_id = NEW.workspace_id
+          AND (
+              (NEW.mode IN ('main_checkout', 'read_only')
+                  AND c.is_primary = 1
+                  AND NEW.worktree_path IS NULL)
+              OR
+              (NEW.mode = 'isolated_worktree'
+                  AND c.is_primary = 0
+                  AND NEW.worktree_path = c.path)
+          )
+    )
+    OR (NEW.read_only_enforced != 0 AND NEW.mode != 'read_only')
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid session checkout mode');
+END;
+
+-- Primary checkout aliases are intentional. An isolated worktree, however,
+-- must never share a canonical directory with any checkout, primary or isolated.
+CREATE TRIGGER isolate_checkout_path_insert
+BEFORE INSERT ON workspace_checkouts
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.canonical_path = NEW.canonical_path
+      AND (NEW.is_primary = 0 OR c.is_primary = 0)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'isolated checkout aliases an existing checkout');
+END;
+
+CREATE TRIGGER isolate_checkout_path_update
+BEFORE UPDATE OF canonical_path, is_primary ON workspace_checkouts
+FOR EACH ROW
+WHEN EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.canonical_path = NEW.canonical_path
+      AND c.id != NEW.id
+      AND (NEW.is_primary = 0 OR c.is_primary = 0)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'isolated checkout aliases an existing checkout');
+END;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +646,8 @@ mod tests {
             vec![
                 "core_entities",
                 "attention_queue",
-                "unified_hierarchy_and_leases"
+                "unified_hierarchy_and_leases",
+                "safe_session_checkout_modes"
             ]
         );
 
@@ -597,7 +713,11 @@ mod tests {
         assert_eq!(applied.to, LATEST_VERSION);
         assert_eq!(
             applied.names,
-            vec!["attention_queue", "unified_hierarchy_and_leases"]
+            vec![
+                "attention_queue",
+                "unified_hierarchy_and_leases",
+                "safe_session_checkout_modes"
+            ]
         );
 
         let name: String = conn
@@ -607,6 +727,52 @@ mod tests {
             .unwrap();
         assert_eq!(name, "legacy");
         assert!(table_names(&conn).iter().any(|t| t == "attention_entries"));
+    }
+
+    #[test]
+    fn v3_orphaned_worktree_claims_become_honest_primary_readers() {
+        let conn = fresh();
+        apply_to(&conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+             attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+             VALUES ('ws_old', 'legacy', '/repo', '[]', '[]', '{}', 1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        apply_to(&conn, 3).unwrap();
+        conn.execute(
+            "INSERT INTO sessions \
+                 (id, workspace_id, name, cwd, env_json, attention_json, status, \
+                  restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+                  last_activity_ms, tmux, mode, checkout_id, worktree_path, \
+                  read_only_enforced) \
+             VALUES ('sess_old', 'ws_old', 'unsafe worktree', '/missing', '[]', '{}', \
+                     'active', 'live', '[]', 0, 0, 0, 1, 1, 0, 'isolated_worktree', \
+                     'checkout_missing', '/missing', 1)",
+            [],
+        )
+        .unwrap();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names, vec!["safe_session_checkout_modes"]);
+        let repaired: (String, String, Option<String>, bool) = conn
+            .query_row(
+                "SELECT mode, checkout_id, worktree_path, read_only_enforced \
+                 FROM sessions WHERE id = 'sess_old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            repaired,
+            (
+                "read_only".into(),
+                "checkout_primary_ws_old".into(),
+                None,
+                false
+            )
+        );
     }
 
     #[test]
