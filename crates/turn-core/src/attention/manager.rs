@@ -164,7 +164,7 @@ impl AttentionManager {
                 Action::Enqueue => {
                     // Only demands that genuinely need the human get queued.
                     // A completed turn badges but does not necessarily block.
-                    if let Some(reason) = event.attention_reason() {
+                    if let Some(reason) = queue_reason(&event.kind) {
                         let entry = AttentionEntry {
                             id: AttentionId::new(),
                             session_id: session.clone(),
@@ -528,6 +528,24 @@ fn summarise(kind: &EventKind) -> Option<String> {
     }
 }
 
+/// Queue semantics are policy semantics, not the same thing as an agent saying it
+/// is blocked. A completed turn, completed task or failure can be configured to
+/// enter the queue even though none of them is an `AwaitingUser` turn state.
+fn queue_reason(kind: &EventKind) -> Option<crate::state::AwaitingReason> {
+    use crate::state::AwaitingReason;
+    match kind {
+        EventKind::AgentPermissionRequired { .. } => Some(AwaitingReason::Permission),
+        EventKind::AgentQuestionAsked { .. } => Some(AwaitingReason::Question),
+        EventKind::AgentWaitingForUser { reason, .. }
+        | EventKind::SessionNeedsAttention { reason } => Some(*reason),
+        EventKind::AgentTurnCompleted { .. }
+        | EventKind::AgentTaskCompleted { .. }
+        | EventKind::AgentFailed { .. }
+        | EventKind::ProcessFailed { .. } => Some(AwaitingReason::Input),
+        _ => None,
+    }
+}
+
 /// Title and body for an OS notification.
 fn notification_text(kind: &EventKind) -> (String, String) {
     match kind {
@@ -851,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_turn_badges_but_does_not_queue_a_blocking_demand() {
+    fn a_completed_turn_enters_the_logical_queue_without_claiming_the_agent_is_blocked() {
         let mut m = AttentionManager::new();
         let event = hook_event(
             "sess_a",
@@ -862,9 +880,17 @@ mod tests {
         );
         let effects = m.ingest(&event, &AttentionPolicy::default(), &ctx(), T0);
         assert!(effects.iter().any(|e| matches!(e, Effect::Badge { .. })));
-        assert!(
-            m.queue().is_empty(),
-            "finishing a turn is not the same as blocking on the user"
+        assert!(effects.iter().any(|e| matches!(e, Effect::Enqueued { .. })));
+        let queued = m
+            .queue()
+            .iter()
+            .next()
+            .expect("policy requested a queue entry");
+        assert_eq!(queued.reason, crate::state::AwaitingReason::Input);
+        assert_eq!(
+            event.attention_reason(),
+            None,
+            "the agent itself is not blocked"
         );
     }
 
