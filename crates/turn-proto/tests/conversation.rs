@@ -178,7 +178,7 @@ fn a_full_working_conversation_completes_over_the_real_framing() {
                 panic!("expected sessions, got {response:?}");
             };
             // The UI is told the state, the label and the badge. It derives nothing.
-            assert_eq!(sessions[0].state_label, "PERMISSION");
+            assert_eq!(sessions[0].state_label, "YOUR TURN");
             assert!(sessions[0].needs_user);
             assert_eq!(sessions[0].badge_count, 1);
         }

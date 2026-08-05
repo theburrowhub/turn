@@ -211,13 +211,13 @@ impl DisplayState {
         )
     }
 
-    /// Short label for the sidebar. Deliberately terse and uppercase-free
-    /// except for the one state that earns emphasis.
+    /// Short label for one process/node. Session-level attention is projected
+    /// separately as `YOUR TURN`; a waiting Agent remains honestly `WAITING`.
     pub fn label(&self) -> &'static str {
         match self {
             DisplayState::Starting => "starting",
             DisplayState::Running => "running",
-            DisplayState::WaitingForUser => "YOUR TURN",
+            DisplayState::WaitingForUser => "WAITING",
             DisplayState::NeedsPermission => "PERMISSION",
             DisplayState::AskingQuestion => "QUESTION",
             DisplayState::CompletedTurn => "turn done",
@@ -311,6 +311,12 @@ mod tests {
             assert_eq!(got, expected, "reason {reason:?}");
             assert!(got.demands_user());
         }
+    }
+
+    #[test]
+    fn a_waiting_agent_is_not_itself_labelled_your_turn() {
+        assert_eq!(DisplayState::WaitingForUser.label(), "WAITING");
+        assert!(DisplayState::WaitingForUser.demands_user());
     }
 
     /// Stopping something on purpose is not a failure, and the distinction must

@@ -1235,7 +1235,10 @@ fn every_hierarchy_level_is_a_reachable_tree_item() {
 
     for (fragment, level) in [
         ("Workspace space-troopers — 1 sessions", 1),
-        ("Session Fix climbing bugs — mode MAIN — PERMISSION", 2),
+        (
+            "Session Fix climbing bugs — mode MAIN — YOUR TURN — 1 attention demand",
+            2,
+        ),
         ("AGENT Claude Code — PERMISSION", 3),
         ("SUBAGENT Reviewer — running", 4),
         ("SUBAGENT Tests — running", 4),

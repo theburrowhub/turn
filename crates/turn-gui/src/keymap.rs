@@ -72,8 +72,7 @@ pub enum Command {
     InterruptProcess,
     StopProcess,
 
-    ToggleAgentTree,
-    ToggleEventLog,
+    FocusWorkspaceTree,
 
     CopySelection,
     PasteClipboard,
@@ -109,8 +108,7 @@ impl Command {
         Command::CloseSession,
         Command::InterruptProcess,
         Command::StopProcess,
-        Command::ToggleAgentTree,
-        Command::ToggleEventLog,
+        Command::FocusWorkspaceTree,
         Command::CopySelection,
         Command::PasteClipboard,
         Command::OpenSettings,
@@ -149,8 +147,7 @@ impl Command {
             Command::LaunchTui => "launch.tui",
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
-            Command::ToggleAgentTree => "view.agentTree",
-            Command::ToggleEventLog => "view.eventLog",
+            Command::FocusWorkspaceTree => "view.focusTree",
             Command::CopySelection => "edit.copy",
             Command::PasteClipboard => "edit.paste",
         }
@@ -188,8 +185,7 @@ impl Command {
             Command::LaunchTui => "Launch a full-screen tool in this pane",
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
-            Command::ToggleAgentTree => "Show or hide the agent tree",
-            Command::ToggleEventLog => "Show or hide the event log",
+            Command::FocusWorkspaceTree => "Focus the workspace tree",
             Command::CopySelection => "Copy the selection",
             Command::PasteClipboard => "Paste",
         }
@@ -201,8 +197,7 @@ impl Command {
             Command::OpenPalette
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
-            | Command::ToggleAgentTree
-            | Command::ToggleEventLog => "View",
+            | Command::FocusWorkspaceTree => "View",
             Command::NewSession
             | Command::QuickNewSession
             | Command::SwitchSession
@@ -618,8 +613,7 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     // interrupt through the tty to the whole foreground group.
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
     shared(Command::StopProcess, Chord::cmd_shift(Key::Comma)),
-    shared(Command::ToggleAgentTree, Chord::cmd_shift(Key::T)),
-    shared(Command::ToggleEventLog, Chord::cmd_shift(Key::E)),
+    shared(Command::FocusWorkspaceTree, Chord::cmd_shift(Key::T)),
     // Copy and paste: `Mod+C` is Command+C on a Mac, which no program sees, but
     // Ctrl+C elsewhere, which is the interrupt. Every terminal on Linux solves this
     // the same way, with Shift.
@@ -912,6 +906,12 @@ mod tests {
     #[test]
     fn the_removed_session_overview_has_no_command_palette_or_shortcut_entry() {
         assert!(Command::from_id("view.overview").is_none());
+        assert!(Command::from_id("view.agentTree").is_none());
+        assert!(Command::from_id("view.eventLog").is_none());
+        assert_eq!(
+            Command::from_id("view.focusTree"),
+            Some(Command::FocusWorkspaceTree)
+        );
         assert!(Command::ALL
             .iter()
             .all(|command| command.id() != "view.overview"));

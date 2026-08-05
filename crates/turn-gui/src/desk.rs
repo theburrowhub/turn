@@ -1561,8 +1561,7 @@ impl Desk {
             | Command::OpenSettings
             | Command::SwitchSession
             | Command::ToggleAttentionPanel
-            | Command::ToggleAgentTree
-            | Command::ToggleEventLog
+            | Command::FocusWorkspaceTree
             | Command::CopySelection
             | Command::PasteClipboard => {
                 let _ = now_ms;

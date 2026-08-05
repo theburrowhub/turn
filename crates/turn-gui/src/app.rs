@@ -222,9 +222,7 @@ impl TurnApp {
                 self.state.attention_panel_open = !self.state.attention_panel_open;
                 true
             }
-            // This legacy command now focuses the sole, always-present hierarchy. It
-            // never shows or hides a second agent tree.
-            Command::ToggleAgentTree => {
+            Command::FocusWorkspaceTree => {
                 self.state.tree_has_focus = true;
                 true
             }

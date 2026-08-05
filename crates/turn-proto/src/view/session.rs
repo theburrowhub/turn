@@ -143,6 +143,7 @@ impl SessionSummary {
     /// many demands it has raised, and it should not have to.
     pub fn from_session(session: &Session, badge_count: usize, muted: bool, now_ms: i64) -> Self {
         let display_state = session.display_state();
+        let session_needs_attention = display_state.demands_user() || badge_count > 0;
         Self {
             id: session.id.clone(),
             workspace_id: session.workspace_id.clone(),
@@ -155,7 +156,11 @@ impl SessionSummary {
             worktree_path: session.worktree_path.clone(),
             read_only_enforced: session.read_only_enforced,
             display_state,
-            state_label: display_state.label().to_string(),
+            state_label: if session_needs_attention {
+                "YOUR TURN".to_string()
+            } else {
+                display_state.label().to_string()
+            },
             severity: display_state.severity(),
             needs_user: session.needs_user(),
             subagent_count: session.tree.subagent_count(),
@@ -311,7 +316,7 @@ mod tests {
 
         let summary = SessionSummary::from_session(&s, 1, false, T0);
         assert_eq!(summary.display_state, DisplayState::NeedsPermission);
-        assert_eq!(summary.state_label, "PERMISSION");
+        assert_eq!(summary.state_label, "YOUR TURN");
         assert!(summary.needs_user);
 
         let agent = summary.primary_agent.expect("the agent is the headline");

@@ -454,7 +454,11 @@ impl HierarchyRow<'_> {
                     summary.state_label
                 );
                 if summary.badge_count > 0 {
-                    name.push_str(&format!(" — {} waiting", summary.badge_count));
+                    name.push_str(&format!(
+                        " — {} attention demand{}",
+                        summary.badge_count,
+                        if summary.badge_count == 1 { "" } else { "s" }
+                    ));
                 }
                 if summary.muted {
                     name.push_str(" — muted");
@@ -1491,7 +1495,12 @@ impl<'a> TurnView<'a> {
             .hline(area.x_range(), area.max.y, Stroke::new(1.0, theme.border));
 
         let summary = &session.session;
-        let (state_colour, glyph) = theme.state_marker(summary.display_state);
+        let session_needs_attention = summary.needs_user || summary.badge_count > 0;
+        let (state_colour, glyph) = if session_needs_attention {
+            (theme.attention, "◆")
+        } else {
+            theme.state_marker(summary.display_state)
+        };
         let branch = summary
             .git_branch
             .as_deref()
@@ -1566,13 +1575,13 @@ impl<'a> TurnView<'a> {
             ui.painter().text(
                 area.right_center() + Vec2::new(-12.0, -8.0),
                 Align2::RIGHT_CENTER,
-                if summary.needs_user {
+                if session_needs_attention {
                     "YOUR TURN"
                 } else {
                     summary.mode.label()
                 },
                 FontId::new(10.0, egui::FontFamily::Monospace),
-                if summary.needs_user {
+                if session_needs_attention {
                     theme.attention
                 } else {
                     theme.text_dim
@@ -2668,7 +2677,9 @@ fn hierarchy_row(
 
     let needs_user = match row {
         HierarchyRow::Workspace(workspace) => workspace.workspace.sessions_needing_user > 0,
-        HierarchyRow::Session { session, .. } => session.session.needs_user,
+        HierarchyRow::Session { session, .. } => {
+            session.session.needs_user || session.session.badge_count > 0
+        }
         HierarchyRow::Process { node, .. } => node.needs_user,
     };
     if focused_pane || active_session {
@@ -2717,10 +2728,14 @@ fn hierarchy_row(
                 workspace.workspace.sessions_needing_user
             ))
         }
-        HierarchyRow::Session { .. } if active_session => Some("ACTIVE".into()),
         HierarchyRow::Session { session, .. } if session.session.badge_count > 0 => {
-            Some(format!("{} WAITING", session.session.badge_count))
+            Some(if session.session.badge_count > 1 {
+                format!("YOUR TURN · {}", session.session.badge_count)
+            } else {
+                "YOUR TURN".into()
+            })
         }
+        HierarchyRow::Session { .. } if active_session => Some("ACTIVE".into()),
         HierarchyRow::Process { .. } if focused_pane => Some("FOCUSED".into()),
         HierarchyRow::Process { node, .. } if !node.pane_bindings.is_empty() => Some(
             if node.pane_bindings.iter().any(|binding| binding.temporary) {
@@ -2772,7 +2787,11 @@ fn hierarchy_row(
                 theme.ui_font.clone(),
                 theme.text,
             );
-            let (colour, glyph) = theme.state_marker(summary.display_state);
+            let (colour, glyph) = if summary.needs_user || summary.badge_count > 0 {
+                (theme.attention, "◆")
+            } else {
+                theme.state_marker(summary.display_state)
+            };
             let mut detail = format!(
                 "{} · {glyph} {} · {} running",
                 summary.mode.label(),
@@ -3531,6 +3550,14 @@ mod tests {
         assert_eq!(root.display_state, DisplayState::Running);
         assert!(!root.needs_user);
         assert_eq!(session.session.badge_count, 1);
+        assert_eq!(session.session.state_label, "YOUR TURN");
+        assert!(!session.session.needs_user);
+        assert!(HierarchyRow::Session {
+            workspace: &snapshot.workspaces[0],
+            session,
+        }
+        .accessible_name(false)
+        .contains("1 attention demand"));
     }
 
     #[test]

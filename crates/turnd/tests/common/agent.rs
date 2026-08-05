@@ -83,5 +83,12 @@ pub async fn wait_for_state(
         )
         .await;
     assert_eq!(got.display_state, want);
-    assert_eq!(got.state_label, want.label());
+    assert_eq!(
+        got.state_label,
+        if want.demands_user() {
+            "YOUR TURN"
+        } else {
+            want.label()
+        }
+    );
 }
