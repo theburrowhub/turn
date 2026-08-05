@@ -2682,6 +2682,8 @@ mod tests {
             updated_ms: T0,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
 
         let mut desk = Desk::new();
@@ -2756,6 +2758,8 @@ mod tests {
             updated_ms: T0 + 1,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         let mut desk = Desk::new();
         desk.sessions.push(summary(&session, 1));
@@ -2883,6 +2887,8 @@ mod tests {
             updated_ms: T0,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         let mut desk = Desk::new();
         desk.apply_inbound(

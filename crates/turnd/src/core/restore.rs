@@ -120,11 +120,17 @@ impl Core {
             // to receive one, and putting it back would have the user open Turn to a
             // question nobody is asking any more.
             if let Some(node) = &entry.node_id {
-                let still_there = session
-                    .tree
-                    .get(node)
-                    .is_some_and(|node| node.lifecycle.is_running());
-                if !still_there {
+                let Some(subject) = session.tree.get(node) else {
+                    tracing::debug!(
+                        session = %entry.session_id, %node,
+                        "dropped a stored demand: its subject no longer exists"
+                    );
+                    return false;
+                };
+                if entry.survives_owner_exit {
+                    return true;
+                }
+                if !subject.lifecycle.is_running() {
                     tracing::debug!(
                         session = %entry.session_id, %node,
                         "dropped a stored demand: its process did not survive"
@@ -132,16 +138,49 @@ impl Core {
                     return false;
                 }
             } else if let Some(parent) = &entry.parent_node_id {
-                let parent_still_there = session
-                    .tree
-                    .get(parent)
-                    .is_some_and(|node| node.lifecycle.is_running());
-                if !parent_still_there {
+                let Some(owner) = session.tree.get(parent) else {
+                    tracing::debug!(
+                        session = %entry.session_id, %parent,
+                        "dropped a stored unresolved demand: its hook parent is missing"
+                    );
+                    return false;
+                };
+                if entry.survives_owner_exit {
+                    return true;
+                }
+                if !owner.lifecycle.is_running() {
                     tracing::debug!(
                         session = %entry.session_id, %parent,
                         "dropped a stored unresolved demand: its hook parent did not survive"
                     );
                     return false;
+                }
+            } else if entry.survives_owner_exit {
+                // Session-level post-mortem evidence has no process identity to
+                // validate; the existing Session remains its durable boundary.
+                return true;
+            }
+            if entry.node_id.is_none() {
+                if let Some(external_id) = entry.subject_external_id.as_deref() {
+                    if let Some(subject) = session.tree.find_by_external_id(external_id) {
+                        let belongs_to_scope = entry.parent_node_id.as_ref().is_none_or(|parent| {
+                            subject.id == *parent
+                                || session
+                                    .tree
+                                    .descendants(parent)
+                                    .into_iter()
+                                    .any(|descendant| descendant.id == subject.id)
+                        });
+                        if belongs_to_scope && !subject.lifecycle.is_running() {
+                            tracing::debug!(
+                                session = %entry.session_id,
+                                node = %subject.id,
+                                external_id,
+                                "dropped a stored unresolved demand: its declared subject is terminal"
+                            );
+                            return false;
+                        }
+                    }
                 }
             }
             true
@@ -207,6 +246,7 @@ impl Core {
             if let Some(node) = session.tree.get_mut(&node_id) {
                 if verdict == Lifecycle::Lost {
                     node.ended_ms.get_or_insert(now_ms);
+                    super::events::clear_interaction_state(node);
                 }
                 node.lifecycle = verdict;
             }
@@ -316,8 +356,13 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
 #[cfg(test)]
 mod migration_tests {
     use super::*;
-    use turn_core::ids::WorkspaceId;
-    use turn_core::model::{Direction, Layout, Pane};
+    use crate::core::testing::Harness;
+    use turn_core::event::Risk;
+    use turn_core::ids::{PaneId, WorkspaceId};
+    use turn_core::model::{Direction, Layout, Pane, PendingPermission, ProcessNode};
+    use turn_core::state::{AwaitingReason, Turn};
+
+    const NOW: i64 = 1_775_000_000_000;
 
     #[test]
     fn a_legacy_session_keeps_its_geometry_but_not_a_second_navigator() {
@@ -359,5 +404,64 @@ mod migration_tests {
             .iter()
             .all(|pane| pane.kind != PaneKind::AgentTree));
         assert!(!migrate_obsolete_navigation_panes(&mut session));
+    }
+
+    #[tokio::test]
+    async fn a_runtime_lost_during_restore_cannot_keep_interaction_metadata() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_restore_lost_waiting");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut agent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        agent.lifecycle = Lifecycle::Orphaned;
+        agent.pid = Some(u32::MAX);
+        agent.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        });
+        agent.interaction_pending = true;
+        if let Some(info) = agent.agent.as_mut() {
+            info.pending_permission = Some(PendingPermission {
+                summary: "stale permission".into(),
+                command: Some("cargo test".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::Low,
+                requested_ms: NOW,
+                cwd: Some("/tmp".into()),
+            });
+            info.pending_question = Some("stale question".into());
+        }
+        let node_id = agent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(agent);
+
+        harness.core.decide_session(&session_id, NOW + 1);
+
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap();
+        assert_eq!(node.lifecycle, Lifecycle::Lost);
+        assert!(!node.interaction_pending);
+        assert!(!node.turn.as_ref().is_some_and(Turn::needs_user));
+        assert!(node.agent.as_ref().is_some_and(|agent| {
+            agent.pending_permission.is_none() && agent.pending_question.is_none()
+        }));
+        let persisted = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let node = persisted.tree.get(&node_id).unwrap();
+        assert_eq!(node.lifecycle, Lifecycle::Lost);
+        assert!(!node.interaction_pending);
+        assert!(node.agent.as_ref().is_some_and(|agent| {
+            agent.pending_permission.is_none() && agent.pending_question.is_none()
+        }));
     }
 }

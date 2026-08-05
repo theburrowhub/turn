@@ -54,7 +54,7 @@ impl AttentionView {
         F: FnMut(&SessionId) -> Option<String>,
     {
         queue
-            .ordered(now_ms)
+            .ordered_all(now_ms)
             .into_iter()
             .map(|entry| {
                 let name = name_of(&entry.session_id)
@@ -93,6 +93,8 @@ mod tests {
             updated_ms: T0,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         }
     }
 
@@ -166,6 +168,32 @@ mod tests {
 
         let after = AttentionView::from_entry(&snoozed, "Later", T0 + 60_000);
         assert!(after.actionable, "and comes back on time");
+    }
+
+    #[test]
+    fn the_whole_queue_projection_keeps_sleeping_snoozes_at_the_bottom() {
+        let mut queue = AttentionQueue::new();
+        let mut snoozed = entry(
+            "sess_later",
+            AwaitingReason::Permission,
+            Confidence::Explicit,
+        );
+        snoozed.state = EntryState::Snoozed {
+            until_ms: T0 + 60_000,
+        };
+        queue.upsert(snoozed);
+        queue.upsert(entry(
+            "sess_now",
+            AwaitingReason::Input,
+            Confidence::Explicit,
+        ));
+
+        let views = AttentionView::from_queue(&queue, T0, |_| None);
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].session_id().as_str(), "sess_now");
+        assert!(views[0].actionable);
+        assert_eq!(views[1].session_id().as_str(), "sess_later");
+        assert!(!views[1].actionable);
     }
 
     #[test]

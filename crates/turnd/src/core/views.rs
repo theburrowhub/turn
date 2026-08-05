@@ -312,10 +312,10 @@ impl Core {
     /// come back. Snoozed entries score far below everything else, so they sort to
     /// the bottom on their own.
     pub(crate) fn attention_views(&self, now_ms: i64) -> Vec<AttentionView> {
-        let mut out: Vec<AttentionView> = self
-            .attention
+        self.attention
             .queue()
-            .iter()
+            .ordered_all(now_ms)
+            .into_iter()
             .map(|entry| {
                 let name = self
                     .sessions
@@ -324,15 +324,7 @@ impl Core {
                     .unwrap_or_else(|| entry.session_id.as_str().to_string());
                 AttentionView::from_entry(entry, name, now_ms)
             })
-            .collect();
-        out.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                // Ties break toward the older demand, so the list drains predictably
-                // instead of shuffling between pushes.
-                .then_with(|| a.entry.created_ms.cmp(&b.entry.created_ms))
-        });
-        out
+            .collect()
     }
 
     /// Tells every client the queue changed shape.

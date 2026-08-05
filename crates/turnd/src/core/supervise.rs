@@ -175,7 +175,7 @@ impl Core {
     /// processes and did not see them end, so it has no exit code to report and will
     /// not make one up.
     fn retire_vanished_children(&mut self, now_ms: i64) {
-        let mut gone: Vec<(SessionId, NodeId)> = Vec::new();
+        let mut gone: Vec<(SessionId, NodeId, Option<NodeId>, Option<String>)> = Vec::new();
         for session in self.sessions.values() {
             for node in session.tree.iter() {
                 if node.relation != Relation::Inferred || !node.is_running() {
@@ -183,20 +183,45 @@ impl Core {
                 }
                 let Some(pid) = node.pid else { continue };
                 if !self.supervisor.is_alive(pid) {
-                    gone.push((session.id.clone(), node.id.clone()));
+                    gone.push((
+                        session.id.clone(),
+                        node.id.clone(),
+                        node.parent.clone(),
+                        node.agent.as_ref().and_then(|agent| {
+                            agent
+                                .external_id
+                                .clone()
+                                .or_else(|| agent.agent.external_id.clone())
+                        }),
+                    ));
                 }
             }
         }
 
         let mut touched: Vec<SessionId> = Vec::new();
-        for (session_id, node_id) in gone {
-            if let Some(session) = self.sessions.get_mut(&session_id) {
-                if let Some(node) = session.tree.get_mut(&node_id) {
+        for (session_id, node_id, parent_id, external_id) in gone {
+            let retired_root = if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(node) = session
+                    .tree
+                    .get_mut(&node_id)
+                    .filter(|node| node.is_running())
+                {
                     node.lifecycle = Lifecycle::Lost;
                     node.ended_ms = Some(now_ms);
+                    super::events::clear_interaction_state(node);
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if !retired_root {
+                continue;
             }
-            self.attention.resolve_node(&node_id);
+            let mut retired = vec![(node_id.clone(), parent_id, external_id)];
+            retired.extend(self.mark_runtime_dependents(&session_id, &node_id, now_ms));
+            self.resolve_lifecycle_attention(&session_id, &retired, now_ms);
             if !touched.contains(&session_id) {
                 touched.push(session_id);
             }
@@ -206,5 +231,99 @@ impl Core {
             self.push_tree(&session_id, now_ms);
             self.push_session_state(&session_id, now_ms);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+    use turn_core::event::{Confidence, EventSource, Risk};
+    use turn_core::ids::PaneId;
+    use turn_core::model::{NodeKind, ProcessNode};
+    use turn_core::state::Turn;
+
+    const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn a_vanished_inferred_runtime_retires_virtual_descendants_and_their_attention() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_vanished_runtime_tree");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+
+        let mut root = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        root.lifecycle = Lifecycle::Alive;
+        let root_id = root.id.clone();
+        let mut runtime = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Background,
+            "worker-runtime",
+            "/tmp",
+            NOW,
+        );
+        runtime.lifecycle = Lifecycle::Alive;
+        runtime.pid = Some(u32::MAX);
+        runtime.link_to(root_id.clone(), Relation::Inferred);
+        let runtime_id = runtime.id.clone();
+        let mut reviewer = ProcessNode::agent(session_id.clone(), "reviewer", "/tmp", NOW);
+        reviewer.kind = NodeKind::Subagent;
+        reviewer.lifecycle = Lifecycle::Alive;
+        reviewer.turn = Some(Turn::Active);
+        reviewer.link_to(runtime_id.clone(), Relation::Confirmed);
+        let reviewer_id = reviewer.id.clone();
+        let tree = &mut harness.core.sessions.get_mut(&session_id).unwrap().tree;
+        tree.insert(root);
+        tree.insert(runtime);
+        tree.insert(reviewer);
+
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer needs permission".into(),
+                command: Some("cargo test".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::Low,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_node(reviewer_id.clone());
+        harness.core.ingest(permission, NOW + 1);
+        assert_eq!(harness.core.attention.queue().len(), 1);
+
+        harness.core.retire_vanished_children(NOW + 2);
+
+        let session = &harness.core.sessions[&session_id];
+        assert_eq!(
+            session.tree.get(&runtime_id).unwrap().lifecycle,
+            Lifecycle::Lost
+        );
+        let reviewer = session.tree.get(&reviewer_id).unwrap();
+        assert_eq!(reviewer.lifecycle, Lifecycle::Lost);
+        assert!(!reviewer.interaction_pending);
+        assert!(!reviewer.turn.as_ref().is_some_and(Turn::needs_user));
+        assert!(reviewer.agent.as_ref().is_some_and(|agent| {
+            agent.pending_permission.is_none() && agent.pending_question.is_none()
+        }));
+        assert!(harness.core.attention.queue().is_empty());
+        assert!(harness.core.store.attention().list().unwrap().is_empty());
+
+        let persisted = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let reviewer = persisted.tree.get(&reviewer_id).unwrap();
+        assert_eq!(reviewer.lifecycle, Lifecycle::Lost);
+        assert!(!reviewer.interaction_pending);
+        assert!(reviewer.agent.as_ref().is_some_and(|agent| {
+            agent.pending_permission.is_none() && agent.pending_question.is_none()
+        }));
     }
 }

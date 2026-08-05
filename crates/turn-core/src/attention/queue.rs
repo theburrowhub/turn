@@ -9,6 +9,7 @@ use crate::event::Confidence;
 use crate::ids::{AttentionId, NodeId, SessionId};
 use crate::state::AwaitingReason;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 
 /// Lifecycle of a single queued demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,22 @@ pub enum EntryState {
     /// The user has seen it but has not finished with it. Stays in the queue,
     /// ranked below anything pending.
     Acknowledged,
+}
+
+/// Semantic source of a queued demand.
+///
+/// Several events share the coarse `Input` priority but have different
+/// lifecycle semantics. Persisting this kind lets failure supersede completion
+/// and lets exact callback replays preserve acknowledgement/snooze state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionDemandKind {
+    #[default]
+    Interaction,
+    TurnCompleted,
+    TaskCompleted,
+    AgentFailed,
+    ProcessFailed,
 }
 
 /// One demand for the user's attention.
@@ -48,6 +65,16 @@ pub struct AttentionEntry {
     pub state: EntryState,
     /// Session-level ranking adjustment, copied in at insert time.
     pub priority_boost: i16,
+    /// Whether the demand remains meaningful after its owning runtime exits.
+    ///
+    /// Ordinary questions and permissions disappear with the process that could
+    /// receive the answer. A process failure is different: it is post-mortem
+    /// evidence for the user and must survive daemon restart until explicitly
+    /// handled. Persisting the distinction avoids guessing from `reason` or text.
+    #[serde(default)]
+    pub survives_owner_exit: bool,
+    #[serde(default)]
+    pub demand_kind: AttentionDemandKind,
 }
 
 impl AttentionEntry {
@@ -79,8 +106,13 @@ impl AttentionEntry {
         let base = self.reason.base_priority() as i32;
         let state_penalty = match self.state {
             EntryState::Pending => 0,
-            EntryState::Acknowledged => -40,
-            EntryState::Snoozed { .. } => -1000,
+            EntryState::Snoozed { until_ms } if now_ms >= until_ms => 0,
+            // Larger than the complete i16 boost range plus every other score
+            // component. The projected score therefore preserves the same
+            // actionability classes as the queue comparator for clients that
+            // keep an already-pushed list ordered locally.
+            EntryState::Acknowledged => -100_000,
+            EntryState::Snoozed { .. } => -200_000,
         };
         // Provisional demands rank below confirmed ones.
         let confidence_penalty = if self.confidence.is_provisional() {
@@ -100,10 +132,21 @@ impl AttentionEntry {
             EntryState::Snoozed { until_ms } => now_ms >= until_ms,
         }
     }
+
+    /// Pending-like entries always precede acknowledged ones, independently of
+    /// trigger priority or a session boost. An expired snooze is pending again.
+    fn actionability_rank(&self, now_ms: i64) -> u8 {
+        match self.state {
+            EntryState::Pending => 2,
+            EntryState::Snoozed { until_ms } if now_ms >= until_ms => 2,
+            EntryState::Acknowledged => 1,
+            EntryState::Snoozed { .. } => 0,
+        }
+    }
 }
 
 /// An ordered set of attention demands, deduplicated by session+node+reason.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttentionQueue {
     entries: Vec<AttentionEntry>,
 }
@@ -124,6 +167,16 @@ impl AttentionQueue {
             existing.updated_ms = entry.updated_ms;
             existing.confidence = existing.confidence.max(entry.confidence);
             existing.priority_boost = entry.priority_boost;
+            // A different semantic demand can share the same queue key (for
+            // example, a completed turn followed by an ordinary Input wait).
+            // Persistence belongs to the current demand kind; inheriting it
+            // would let that later live interaction survive its owner's exit.
+            if existing.demand_kind == entry.demand_kind {
+                existing.survives_owner_exit |= entry.survives_owner_exit;
+            } else {
+                existing.survives_owner_exit = entry.survives_owner_exit;
+            }
+            existing.demand_kind = entry.demand_kind;
             if entry.summary.is_some() {
                 existing.summary = entry.summary;
             }
@@ -140,16 +193,7 @@ impl AttentionQueue {
 
     /// The demand the user should handle next, if any.
     pub fn next(&self, now_ms: i64) -> Option<&AttentionEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.is_actionable(now_ms))
-            .max_by(|a, b| {
-                a.score(now_ms)
-                    .cmp(&b.score(now_ms))
-                    // Ties break toward the older demand, so the queue drains
-                    // in a predictable order instead of shuffling.
-                    .then_with(|| b.created_ms.cmp(&a.created_ms))
-            })
+        self.ordered(now_ms).first().copied()
     }
 
     /// All actionable demands, most urgent first. Drives the queue panel.
@@ -159,12 +203,16 @@ impl AttentionQueue {
             .iter()
             .filter(|e| e.is_actionable(now_ms))
             .collect();
-        visible.sort_by(|a, b| {
-            b.score(now_ms)
-                .cmp(&a.score(now_ms))
-                .then_with(|| a.created_ms.cmp(&b.created_ms))
-        });
+        visible.sort_by(|a, b| compare_entries(a, b, now_ms));
         visible
+    }
+
+    /// Every demand in the same order as [`Self::next`], with sleeping snoozes
+    /// retained at the bottom for the queue panel.
+    pub fn ordered_all(&self, now_ms: i64) -> Vec<&AttentionEntry> {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by(|a, b| compare_entries(a, b, now_ms));
+        entries
     }
 
     /// The demand after the one currently being visited, for repeated presses of
@@ -228,9 +276,66 @@ impl AttentionQueue {
         parent: Option<&NodeId>,
         external_id: Option<&str>,
     ) -> usize {
+        self.resolve_subject_at_most(session, node, parent, external_id, Confidence::Explicit)
+    }
+
+    /// Drops matching evidence no stronger than the event withdrawing it.
+    ///
+    /// This is load-bearing for PTY heuristics: disappearance of a guessed
+    /// prompt may retract that guess, but can never erase a hook-confirmed
+    /// permission for the same node (or a sibling).
+    pub fn resolve_subject_at_most(
+        &mut self,
+        session: &SessionId,
+        node: Option<&NodeId>,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+        confidence: Confidence,
+    ) -> usize {
         let before = self.entries.len();
-        self.entries
-            .retain(|entry| !subject_is_resolved_by(entry, session, node, parent, external_id));
+        self.entries.retain(|entry| {
+            entry.confidence > confidence
+                || !subject_is_resolved_by(entry, session, node, parent, external_id)
+        });
+        before - self.entries.len()
+    }
+
+    /// Drops only live interaction evidence for a matching subject.
+    ///
+    /// Runtime-idle callbacks close prompts, but are not an acknowledgement of
+    /// a completed turn or failure that remains useful after the runtime exits.
+    pub fn resolve_interaction_subject_at_most(
+        &mut self,
+        session: &SessionId,
+        node: Option<&NodeId>,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+        confidence: Confidence,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            entry.demand_kind != AttentionDemandKind::Interaction
+                || entry.confidence > confidence
+                || !subject_is_resolved_by(entry, session, node, parent, external_id)
+        });
+        before - self.entries.len()
+    }
+
+    /// Clears interaction demands for a subject while retaining post-mortem or
+    /// completion evidence that does not depend on a live owner.
+    pub fn prepare_informational_subject(
+        &mut self,
+        session: &SessionId,
+        node: Option<&NodeId>,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+        incoming_kind: AttentionDemandKind,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            (entry.survives_owner_exit && entry.demand_kind == incoming_kind)
+                || !subject_is_resolved_by(entry, session, node, parent, external_id)
+        });
         before - self.entries.len()
     }
 
@@ -250,10 +355,98 @@ impl AttentionQueue {
         })
     }
 
+    /// Whether the exact subject behind a deferred focus is still actionable.
+    pub fn has_actionable_subject(
+        &self,
+        session: &SessionId,
+        node: Option<&NodeId>,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+        now_ms: i64,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.session_id == *session
+                && entry.node_id.as_ref() == node
+                && entry.parent_node_id.as_ref() == parent
+                && entry.subject_external_id.as_deref() == external_id
+                && entry.is_actionable(now_ms)
+        })
+    }
+
     /// Drops demands for one node, leaving its siblings alone.
     pub fn resolve_node(&mut self, node: &NodeId) -> usize {
         let before = self.entries.len();
         self.entries.retain(|e| e.node_id.as_ref() != Some(node));
+        before - self.entries.len()
+    }
+
+    /// Drops demands owned by a runtime that has terminated.
+    ///
+    /// A node-less callback anchored at `node` belongs to that runtime even
+    /// though its exact child was not known yet. Exact child demands are not
+    /// owned by the parent and deliberately survive its exit.
+    pub fn resolve_owner(&mut self, session: &SessionId, node: &NodeId) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !owner_is_resolved(entry, session, node));
+        before - self.entries.len()
+    }
+
+    /// Drops one exact node inside its Session boundary.
+    pub fn resolve_node_in_session(&mut self, session: &SessionId, node: &NodeId) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.session_id != *session || entry.node_id.as_ref() != Some(node));
+        before - self.entries.len()
+    }
+
+    /// Removes every demand whose subject or unresolved owner is being deleted.
+    /// Unlike lifecycle cleanup this is an explicit structural action, so even
+    /// post-mortem evidence must not retain a dangling NodeId.
+    pub fn remove_owner_in_session(&mut self, session: &SessionId, node: &NodeId) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            entry.session_id != *session
+                || (entry.node_id.as_ref() != Some(node)
+                    && entry.parent_node_id.as_ref() != Some(node))
+        });
+        before - self.entries.len()
+    }
+
+    /// Drops an exact lifecycle subject and its older out-of-order scope.
+    ///
+    /// This is intentionally separate from [`Self::resolve_subject`]. A process
+    /// ending is an ownership fact, not evidence that the user answered another
+    /// callback, so lifecycle correlation must not broaden response semantics.
+    pub fn resolve_lifecycle_subject(
+        &mut self,
+        session: &SessionId,
+        node: &NodeId,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            !lifecycle_subject_is_resolved(entry, session, node, parent, external_id)
+        });
+        before - self.entries.len()
+    }
+
+    /// Drops a terminal tool-owned scope whose AgentNode never materialised.
+    pub fn resolve_lifecycle_scope(
+        &mut self,
+        session: &SessionId,
+        parent: Option<&NodeId>,
+        external_id: &str,
+    ) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| {
+            entry.survives_owner_exit
+                || entry.session_id != *session
+                || entry.node_id.is_some()
+                || entry.parent_node_id.as_ref() != parent
+                || entry.subject_external_id.as_deref() != Some(external_id)
+        });
         before - self.entries.len()
     }
 
@@ -291,6 +484,14 @@ impl AttentionQueue {
     pub fn retain(&mut self, mut keep: impl FnMut(&AttentionEntry) -> bool) {
         self.entries.retain(|entry| keep(entry));
     }
+}
+
+fn compare_entries(a: &AttentionEntry, b: &AttentionEntry, now_ms: i64) -> Ordering {
+    b.actionability_rank(now_ms)
+        .cmp(&a.actionability_rank(now_ms))
+        .then_with(|| b.score(now_ms).cmp(&a.score(now_ms)))
+        .then_with(|| a.created_ms.cmp(&b.created_ms))
+        .then_with(|| a.id.as_str().cmp(b.id.as_str()))
 }
 
 /// Shared matching rule for queue entries and deferred focus requests.
@@ -357,6 +558,40 @@ fn subject_is_resolved_by(
     )
 }
 
+fn owner_is_resolved(entry: &AttentionEntry, session: &SessionId, owner: &NodeId) -> bool {
+    !entry.survives_owner_exit
+        && entry.session_id == *session
+        && (entry.node_id.as_ref() == Some(owner)
+            || (entry.node_id.is_none() && entry.parent_node_id.as_ref() == Some(owner)))
+}
+
+fn lifecycle_subject_is_resolved(
+    entry: &AttentionEntry,
+    session: &SessionId,
+    node: &NodeId,
+    parent: Option<&NodeId>,
+    external_id: Option<&str>,
+) -> bool {
+    if entry.survives_owner_exit {
+        return false;
+    }
+    if entry.session_id != *session {
+        return false;
+    }
+    if entry.node_id.as_ref() == Some(node) {
+        return true;
+    }
+
+    // An out-of-order callback can predate its AgentNode. Once lifecycle reports
+    // the declared node together with the same tool-owned identity, that old
+    // node-less scope is the same subject. The parent must match as an Option:
+    // `None` is itself the boundary for an unanchored tool-owned identity.
+    entry.node_id.is_none()
+        && external_id.is_some()
+        && entry.parent_node_id.as_ref() == parent
+        && entry.subject_external_id.as_deref() == external_id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +612,8 @@ mod tests {
             updated_ms: created_ms,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: AttentionDemandKind::Interaction,
         }
     }
 
@@ -460,13 +697,32 @@ mod tests {
     #[test]
     fn acknowledged_demands_rank_below_pending_ones_but_stay_reachable() {
         let mut q = AttentionQueue::new();
-        // Acknowledge the higher-priority one; the pending lesser one wins.
-        let permission = q.upsert(entry("sess_p", AwaitingReason::Permission, T0));
-        q.upsert(entry("sess_q", AwaitingReason::Input, T0));
+        // State class wins even across the largest possible policy boosts.
+        let mut acknowledged = entry("sess_p", AwaitingReason::Permission, T0);
+        acknowledged.priority_boost = i16::MAX;
+        let permission = q.upsert(acknowledged);
+        let mut pending = entry("sess_q", AwaitingReason::Input, T0);
+        pending.priority_boost = i16::MIN;
+        q.upsert(pending);
         q.acknowledge(&permission);
 
         assert_eq!(q.next(T0).unwrap().session_id.as_str(), "sess_q");
         assert_eq!(q.ordered(T0).len(), 2, "acknowledged is still listed");
+    }
+
+    #[test]
+    fn an_expired_snooze_reenters_the_pending_class_without_starving() {
+        let mut q = AttentionQueue::new();
+        let due = q.upsert(entry("sess_due", AwaitingReason::Input, T0));
+        q.snooze(&due, T0 + 1_000);
+        let acknowledged = q.upsert(entry("sess_seen", AwaitingReason::Permission, T0));
+        q.acknowledge(&acknowledged);
+
+        assert_eq!(
+            q.next(T0 + 1_000).unwrap().id,
+            due,
+            "an expired snooze is pending again and outranks seen work"
+        );
     }
 
     #[test]
@@ -493,6 +749,20 @@ mod tests {
         assert_ne!(first, second);
         assert_ne!(second, third);
         assert_eq!(wrapped, first, "cycling wraps around");
+    }
+
+    #[test]
+    fn panel_order_and_next_share_one_stable_comparator() {
+        let mut q = AttentionQueue::new();
+        q.upsert(entry("sess_a", AwaitingReason::Question, T0));
+        q.upsert(entry("sess_b", AwaitingReason::Question, T0));
+        let snoozed = q.upsert(entry("sess_c", AwaitingReason::Permission, T0));
+        q.snooze(&snoozed, T0 + 60_000);
+
+        let all = q.ordered_all(T0);
+        assert_eq!(q.next(T0).unwrap().id, all[0].id);
+        assert_eq!(all.last().unwrap().id, snoozed);
+        assert_eq!(q.ordered(T0)[0].id, all[0].id);
     }
 
     #[test]
@@ -634,6 +904,136 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_owner_clears_its_unresolved_scopes_but_not_exact_children() {
+        let mut q = AttentionQueue::new();
+        let owner = NodeId::from_stored("parent_a");
+        let other_parent = NodeId::from_stored("parent_b");
+        let child = NodeId::from_stored("reviewer");
+
+        let mut exact_owner = entry("sess_a", AwaitingReason::Question, T0);
+        exact_owner.node_id = Some(owner.clone());
+        q.upsert(exact_owner);
+        let mut unresolved_owner = entry("sess_a", AwaitingReason::Permission, T0);
+        unresolved_owner.parent_node_id = Some(owner.clone());
+        unresolved_owner.subject_external_id = Some("future-reviewer".into());
+        q.upsert(unresolved_owner);
+        let mut exact_child = entry("sess_a", AwaitingReason::Permission, T0);
+        exact_child.node_id = Some(child.clone());
+        exact_child.parent_node_id = Some(owner.clone());
+        q.upsert(exact_child);
+        let mut unresolved_other = entry("sess_a", AwaitingReason::Permission, T0);
+        unresolved_other.parent_node_id = Some(other_parent.clone());
+        q.upsert(unresolved_other);
+
+        assert_eq!(
+            q.resolve_owner(&SessionId::from_stored("sess_a"), &owner),
+            2
+        );
+        assert_eq!(q.len(), 2);
+        assert!(q.iter().any(|entry| entry.node_id.as_ref() == Some(&child)));
+        assert!(q.iter().any(|entry| {
+            entry.node_id.is_none() && entry.parent_node_id.as_ref() == Some(&other_parent)
+        }));
+    }
+
+    #[test]
+    fn owner_cleanup_never_crosses_a_session_boundary_even_when_node_ids_match() {
+        let mut q = AttentionQueue::new();
+        let shared = NodeId::from_stored("imported-node");
+        for session in ["sess_a", "sess_b"] {
+            let mut demand = entry(session, AwaitingReason::Permission, T0);
+            demand.node_id = Some(shared.clone());
+            q.upsert(demand);
+        }
+
+        assert_eq!(
+            q.resolve_owner(&SessionId::from_stored("sess_a"), &shared),
+            1
+        );
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.iter().next().unwrap().session_id.as_str(), "sess_b");
+    }
+
+    #[test]
+    fn lifecycle_keeps_postmortem_evidence_but_explicit_deletion_removes_it() {
+        let mut q = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        let node = NodeId::from_stored("agent_a");
+        let mut failure = entry("sess_a", AwaitingReason::Input, T0);
+        failure.node_id = Some(node.clone());
+        failure.survives_owner_exit = true;
+        failure.demand_kind = AttentionDemandKind::ProcessFailed;
+        q.upsert(failure);
+
+        assert_eq!(q.resolve_owner(&session, &node), 0);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.remove_owner_in_session(&session, &node), 1);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_correlation_closes_predeclaration_and_unanchored_external_scopes() {
+        let session = SessionId::from_stored("sess_a");
+        let parent = NodeId::from_stored("parent_a");
+        let reviewer = NodeId::from_stored("reviewer");
+
+        let mut anchored = AttentionQueue::new();
+        let mut demand = entry("sess_a", AwaitingReason::Permission, T0);
+        demand.parent_node_id = Some(parent.clone());
+        demand.subject_external_id = Some("future-reviewer".into());
+        anchored.upsert(demand);
+        assert_eq!(
+            anchored.resolve_lifecycle_subject(
+                &session,
+                &reviewer,
+                Some(&parent),
+                Some("future-reviewer"),
+            ),
+            1
+        );
+
+        let mut unanchored = AttentionQueue::new();
+        let mut demand = entry("sess_a", AwaitingReason::Permission, T0);
+        demand.subject_external_id = Some("future-reviewer".into());
+        unanchored.upsert(demand);
+        assert_eq!(
+            unanchored.resolve_lifecycle_subject(
+                &session,
+                &reviewer,
+                None,
+                Some("future-reviewer"),
+            ),
+            1
+        );
+        assert!(unanchored.is_empty());
+    }
+
+    #[test]
+    fn terminal_external_scope_can_close_before_its_node_is_declared() {
+        let mut queue = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        let parent = NodeId::from_stored("claude");
+        let mut reviewer = entry("sess_a", AwaitingReason::Permission, T0);
+        reviewer.parent_node_id = Some(parent.clone());
+        reviewer.subject_external_id = Some("worker-reviewer".into());
+        queue.upsert(reviewer);
+        let mut sibling = entry("sess_a", AwaitingReason::Permission, T0);
+        sibling.parent_node_id = Some(parent.clone());
+        sibling.subject_external_id = Some("worker-tests".into());
+        queue.upsert(sibling);
+
+        assert_eq!(
+            queue.resolve_lifecycle_scope(&session, Some(&parent), "worker-reviewer"),
+            1
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.iter().next().unwrap().subject_external_id.as_deref(),
+            Some("worker-tests")
+        );
+    }
+
+    #[test]
     fn an_unanchored_node_less_resume_resolves_nothing() {
         let mut q = AttentionQueue::new();
         let session = SessionId::from_stored("sess_a");
@@ -672,10 +1072,14 @@ mod tests {
         let object = wire.as_object_mut().unwrap();
         object.remove("parent_node_id");
         object.remove("subject_external_id");
+        object.remove("survives_owner_exit");
+        object.remove("demand_kind");
 
         let legacy: AttentionEntry = serde_json::from_value(wire).unwrap();
         assert_eq!(legacy.parent_node_id, None);
         assert_eq!(legacy.subject_external_id, None);
+        assert!(!legacy.survives_owner_exit);
+        assert_eq!(legacy.demand_kind, AttentionDemandKind::Interaction);
     }
 
     #[test]

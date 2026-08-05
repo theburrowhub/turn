@@ -16,4 +16,4 @@ pub mod queue;
 pub use focus::{DeferReason, FocusDecision, FocusDenial, FocusGovernor, UserContext};
 pub use manager::{AttentionManager, Effect};
 pub use policy::{Action, AttentionPolicy, Sound, Trigger};
-pub use queue::{AttentionEntry, AttentionQueue, EntryState};
+pub use queue::{AttentionDemandKind, AttentionEntry, AttentionQueue, EntryState};

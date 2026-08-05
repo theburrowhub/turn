@@ -360,6 +360,22 @@ impl AgentAdapter for CodexAdapter {
             .with_raw(text::raw_for_storage(payload))
         };
 
+        // Subagent lifecycle callbacks are delivered through the parent's
+        // integration endpoint. Keep that runtime as an authenticated boundary
+        // and let the daemon resolve the child against its live tree.
+        let make_descendant = |kind: EventKind| -> TurnEvent {
+            TurnEvent::new(
+                ctx.session_id.clone(),
+                kind,
+                source.clone(),
+                Confidence::Explicit,
+                ctx.timestamp_ms,
+            )
+            .with_parent(ctx.node_id.clone())
+            .with_agent(agent.clone())
+            .with_raw(text::raw_for_storage(payload))
+        };
+
         // Codex calls its conversation a thread and reports its id twice over: as
         // `session_id` in every hook payload and as `thread-id` from notify. The two
         // held the same value within one live session, so either spelling gives the
@@ -410,7 +426,7 @@ impl AgentAdapter for CodexAdapter {
                 task: pick(payload, &["task", "prompt"]).map(|task| excerpt(task, 240)),
             })],
 
-            "subagent_stop" => vec![make(EventKind::AgentSubagentStopped {
+            "subagent_stop" => vec![make_descendant(EventKind::AgentSubagentStopped {
                 agent_id: pick(payload, &["agent_id", "agent-id", "subagent_id"])
                     .and_then(text::identifier),
             })],
@@ -1103,6 +1119,8 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert_eq!(stopped[0].node_id, None);
+        assert_eq!(stopped[0].parent_node_id.as_ref(), Some(&ctx().node_id));
     }
 
     #[test]

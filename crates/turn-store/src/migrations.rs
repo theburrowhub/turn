@@ -63,6 +63,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "attention_correlation_scope",
         statements: MIGRATION_007_ATTENTION_CORRELATION_SCOPE,
     },
+    Migration {
+        version: 8,
+        name: "postmortem_attention",
+        statements: MIGRATION_008_POSTMORTEM_ATTENTION,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -812,6 +817,18 @@ ON attention_entries(session_id, parent_node_id, subject_external_id)
 WHERE node_id IS NULL;
 "#;
 
+/// A failed process can no longer receive an answer, but its failure is still a
+/// durable item for the user to inspect. Store that semantic explicitly so
+/// restore does not infer it from a generic `Input` reason or agent text.
+const MIGRATION_008_POSTMORTEM_ATTENTION: &str = r#"
+ALTER TABLE attention_entries
+ADD COLUMN survives_owner_exit INTEGER NOT NULL DEFAULT 0
+CHECK (survives_owner_exit IN (0, 1));
+
+ALTER TABLE attention_entries
+ADD COLUMN demand_kind TEXT NOT NULL DEFAULT 'interaction';
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,7 +891,8 @@ mod tests {
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
-                "attention_correlation_scope"
+                "attention_correlation_scope",
+                "postmortem_attention"
             ]
         );
 
@@ -961,7 +979,7 @@ mod tests {
         )
         .unwrap();
 
-        let applied = apply(&conn).unwrap();
+        let applied = apply_to(&conn, 7).unwrap();
         assert_eq!(applied.names, vec!["attention_correlation_scope"]);
         let after = column_names(&conn, "attention_entries");
         assert!(after.iter().any(|column| column == "parent_node_id"));
@@ -977,6 +995,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rekeyed, "sess_scope|unassigned|Permission");
+    }
+
+    #[test]
+    fn v8_marks_postmortem_attention_without_reclassifying_legacy_rows() {
+        let conn = fresh();
+        apply_to(&conn, 7).unwrap();
+        assert!(!column_names(&conn, "attention_entries")
+            .iter()
+            .any(|column| column == "survives_owner_exit"));
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names, vec!["postmortem_attention"]);
+        assert!(column_names(&conn, "attention_entries")
+            .iter()
+            .any(|column| column == "survives_owner_exit"));
+        assert!(column_names(&conn, "attention_entries")
+            .iter()
+            .any(|column| column == "demand_kind"));
     }
 
     #[test]
@@ -1009,7 +1045,8 @@ mod tests {
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
-                "attention_correlation_scope"
+                "attention_correlation_scope",
+                "postmortem_attention"
             ]
         );
 
@@ -1054,7 +1091,8 @@ mod tests {
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
-                "attention_correlation_scope"
+                "attention_correlation_scope",
+                "postmortem_attention"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1192,7 +1230,8 @@ mod tests {
             applied.names,
             vec![
                 "require_explicit_legacy_lease_reconciliation",
-                "attention_correlation_scope"
+                "attention_correlation_scope",
+                "postmortem_attention"
             ]
         );
         let (required, state): (bool, String) = conn

@@ -371,6 +371,8 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
                 updated_ms: created_ms + 333,
                 state,
                 priority_boost: boost,
+                survives_owner_exit: false,
+                demand_kind: Default::default(),
             };
             store
                 .attention()
@@ -393,6 +395,8 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
                 until_ms: turn_core::now_ms() + 300_000,
             },
             priority_boost: 11,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         store
             .attention()
@@ -412,6 +416,8 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
             updated_ms: turn_core::now_ms() - 239_000,
             state: EntryState::Pending,
             priority_boost: 100,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         discarded_id = discarded.id.clone();
         store

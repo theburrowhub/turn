@@ -38,8 +38,20 @@ impl Core {
         }
         // A repeated SubagentStart for an id we already have is the same subagent.
         if let Some(id) = &agent_id {
-            if let Some(existing) = session.tree.find_by_external_id(id) {
+            if let Some(existing) = session.tree.children(parent).into_iter().find(|node| {
+                node.agent.as_ref().is_some_and(|agent| {
+                    agent
+                        .external_id
+                        .as_deref()
+                        .or(agent.agent.external_id.as_deref())
+                        == Some(id.as_str())
+                })
+            }) {
                 let existing = existing.id.clone();
+                let terminal = session
+                    .tree
+                    .get(&existing)
+                    .is_some_and(|node| node.lifecycle.is_terminal());
                 if let Some(node) = session.tree.get_mut(&existing) {
                     if let Some(agent) = node.agent.as_mut() {
                         if let Some(name) = declared_name.filter(|name| !name.trim().is_empty()) {
@@ -62,8 +74,10 @@ impl Core {
                 }
                 return Changed {
                     node: Some(existing),
-                    structure: false,
-                    refused: false,
+                    structure: true,
+                    // A delayed declaration may enrich a terminal tombstone, but
+                    // it cannot start a new lifecycle for the same tool identity.
+                    refused: terminal,
                 };
             }
         }
@@ -124,43 +138,107 @@ impl Core {
         }
     }
 
-    /// Ends a subagent.
-    pub(super) fn stop_subagent(
+    /// Materialises a durable terminal identity when Stop wins the race against
+    /// Start. A later declaration enriches this node through `insert_subagent`
+    /// but deliberately cannot revive it.
+    pub(super) fn insert_stopped_subagent(
         &mut self,
         session_id: &SessionId,
         parent: &NodeId,
-        agent_id: Option<&str>,
+        agent_id: String,
         now_ms: i64,
     ) -> Changed {
         let Some(session) = self.sessions.get_mut(session_id) else {
             return Changed::default();
         };
-        let target = match agent_id {
-            Some(id) => session.tree.find_by_external_id(id).map(|n| n.id.clone()),
-            // With no id to match on, the most recently started running subagent of
-            // this parent is the only defensible guess, and it is only reached when the
-            // tool declines to tell us.
-            None => session
-                .tree
-                .children(parent)
-                .into_iter()
-                .filter(|n| n.kind == NodeKind::Subagent && n.is_running())
-                .max_by_key(|n| n.started_ms)
-                .map(|n| n.id.clone()),
-        };
-        let Some(target) = target else {
+        if session.tree.get(parent).is_none() {
+            return Changed::default();
+        }
+        if let Some(existing) = session.tree.children(parent).into_iter().find(|node| {
+            node.agent.as_ref().is_some_and(|agent| {
+                agent
+                    .external_id
+                    .as_deref()
+                    .or(agent.agent.external_id.as_deref())
+                    == Some(agent_id.as_str())
+            })
+        }) {
+            let existing = existing.id.clone();
+            if let Some(node) = session.tree.get_mut(&existing) {
+                node.lifecycle = Lifecycle::Exited { code: 0 };
+                node.turn = Some(Turn::Done);
+                node.ended_ms = Some(now_ms);
+                super::clear_interaction_state(node);
+            }
+            return Changed {
+                node: Some(existing),
+                structure: true,
+                refused: false,
+            };
+        }
+
+        let title = format!("Subagent {}", session.tree.subagent_count() + 1);
+        let parent_command = session
+            .tree
+            .get(parent)
+            .map(|node| node.command.clone())
+            .unwrap_or_default();
+        let cwd = session
+            .tree
+            .get(parent)
+            .map(|node| node.cwd.clone())
+            .unwrap_or_else(|| session.cwd.clone());
+        let mut node = ProcessNode::agent(session_id.clone(), parent_command, cwd, now_ms);
+        node.kind = NodeKind::Subagent;
+        node.title = title.clone();
+        node.lifecycle = Lifecycle::Exited { code: 0 };
+        node.turn = Some(Turn::Done);
+        node.ended_ms = Some(now_ms);
+        if let Some(agent) = node.agent.as_mut() {
+            agent.external_id = Some(agent_id.clone());
+            agent.agent.external_id = Some(agent_id);
+            agent.name = AgentName {
+                declared_name: None,
+                display_name: title,
+                source: NameSource::Fallback,
+                confidence: Confidence::Unknown,
+                user_renamed: false,
+            };
+        }
+        node.link_to(parent.clone(), Relation::Confirmed);
+        let id = session.tree.insert(node);
+        Changed {
+            node: Some(id),
+            structure: true,
+            refused: false,
+        }
+    }
+
+    /// Ends a subagent.
+    pub(super) fn stop_subagent(
+        &mut self,
+        session_id: &SessionId,
+        target: &NodeId,
+        now_ms: i64,
+    ) -> Changed {
+        let Some(session) = self.sessions.get_mut(session_id) else {
             return Changed::default();
         };
-        if let Some(node) = session.tree.get_mut(&target) {
+        if session
+            .tree
+            .get(target)
+            .is_none_or(|node| node.kind != NodeKind::Subagent)
+        {
+            return Changed::default();
+        }
+        if let Some(node) = session.tree.get_mut(target) {
             node.lifecycle = Lifecycle::Exited { code: 0 };
             node.turn = Some(Turn::Done);
             node.ended_ms = Some(now_ms);
-            node.interaction_pending = false;
+            super::clear_interaction_state(node);
         }
-        // A subagent that has finished cannot still be waiting for you.
-        self.attention.resolve_node(&target);
         Changed {
-            node: Some(target),
+            node: Some(target.clone()),
             structure: true,
             refused: false,
         }
@@ -919,5 +997,662 @@ mod tests {
         assert_eq!(remaining[0].node_id, None);
         assert_eq!(remaining[0].parent_node_id.as_ref(), Some(&parents[1]));
         assert_eq!(remaining[0].confidence, Confidence::Unknown);
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_clears_predeclaration_attention_in_memory_and_sqlite() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_stop_out_of_order");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.turn = Some(Turn::Active);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        let reviewer_agent = AgentRef {
+            provider: Some("anthropic".into()),
+            tool: Some("claude-code".into()),
+            model: None,
+            external_id: Some("worker-reviewer".into()),
+        };
+
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_parent(parent_id.clone())
+        .with_agent(reviewer_agent.clone());
+        harness.core.ingest(permission, NOW + 1);
+        assert_eq!(harness.core.attention.queue().len(), 1);
+        assert_eq!(harness.core.store.attention().list().unwrap().len(), 1);
+
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-reviewer".into()),
+            None,
+            NOW + 2,
+        );
+        let reviewer_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-reviewer")
+            .unwrap()
+            .id
+            .clone();
+        let stopped = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some("worker-reviewer".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_parent(parent_id.clone())
+        .with_agent(reviewer_agent);
+        harness.core.ingest(stopped, NOW + 3);
+
+        assert!(harness.core.attention.queue().is_empty());
+        assert!(
+            harness.core.store.attention().list().unwrap().is_empty(),
+            "Cleared must reach SQLite or restore resurrects the stopped worker"
+        );
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&reviewer_id)
+            .unwrap()
+            .lifecycle
+            .is_terminal());
+        let persisted_stop = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted_stop.node_id.as_ref(), Some(&reviewer_id));
+        assert_eq!(persisted_stop.parent_node_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            persisted_stop.agent.external_id.as_deref(),
+            Some("worker-reviewer")
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_parent_publishes_and_persists_nested_only_attention_cleanup() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_nested_stop_attention");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Coordinator".into()),
+            None,
+            Some("worker-coordinator".into()),
+            None,
+            NOW + 1,
+        );
+        let coordinator_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-coordinator")
+            .unwrap()
+            .id
+            .clone();
+        harness.core.insert_subagent(
+            &session_id,
+            &coordinator_id,
+            Some("Reviewer".into()),
+            None,
+            Some("worker-reviewer".into()),
+            None,
+            NOW + 2,
+        );
+        let reviewer_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-reviewer")
+            .unwrap()
+            .id
+            .clone();
+
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Nested reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_node(reviewer_id.clone());
+        harness.core.ingest(permission, NOW + 3);
+        assert_eq!(harness.core.attention.queue().len(), 1);
+        assert_eq!(harness.core.store.attention().list().unwrap().len(), 1);
+
+        let (_client, mut frames) = harness.add_client(64);
+        let stopped = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some("worker-coordinator".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_parent(parent_id)
+        .with_agent(AgentRef {
+            external_id: Some("worker-coordinator".into()),
+            ..AgentRef::default()
+        });
+        harness.core.ingest(stopped, NOW + 4);
+
+        assert!(harness.core.attention.queue().is_empty());
+        assert!(harness.core.store.attention().list().unwrap().is_empty());
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&reviewer_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Lost
+        );
+        let mut published_empty_queue = false;
+        while let Ok(frame) = frames.try_recv() {
+            if let turn_proto::ServerMessage::Event {
+                event: turn_proto::ServerEvent::AttentionQueueChanged { entries },
+            } = frame.message
+            {
+                published_empty_queue |= entries.is_empty();
+            }
+        }
+        assert!(
+            published_empty_queue,
+            "the client must not retain nested attention after SQLite is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_before_start_materialises_a_terminal_tombstone_that_cannot_be_revived() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_stop_before_start");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        let worker = AgentRef {
+            external_id: Some("worker-reviewer".into()),
+            ..AgentRef::default()
+        };
+
+        let stopped = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some("worker-reviewer".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_parent(parent_id.clone())
+        .with_agent(worker.clone());
+        harness.core.ingest(stopped, NOW + 1);
+
+        let tombstone_id = harness.core.sessions[&session_id]
+            .tree
+            .children(&parent_id)
+            .into_iter()
+            .next()
+            .expect("Stop materialises the missing identity")
+            .id
+            .clone();
+        let tombstone = harness.core.sessions[&session_id]
+            .tree
+            .get(&tombstone_id)
+            .unwrap();
+        assert_eq!(tombstone.kind, NodeKind::Subagent);
+        assert!(tombstone.lifecycle.is_terminal());
+        assert_eq!(tombstone.pid, None);
+        assert_eq!(
+            tombstone.agent.as_ref().unwrap().name.source,
+            NameSource::Fallback
+        );
+        assert_eq!(
+            tombstone.agent.as_ref().unwrap().name.confidence,
+            Confidence::Unknown
+        );
+        let persisted_stop = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted_stop.node_id.as_ref(), Some(&tombstone_id));
+        assert_eq!(persisted_stop.parent_node_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            persisted_stop.agent.external_id.as_deref(),
+            Some("worker-reviewer")
+        );
+
+        let late_start = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSpawned {
+                declared_name: Some("Reviewer".into()),
+                agent_type: Some("Explore".into()),
+                agent_id: Some("worker-reviewer".into()),
+                task: Some("Review current diff".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStart".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_node(parent_id.clone())
+        .with_agent(worker.clone());
+        harness.core.ingest(late_start, NOW + 2);
+
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .children(&parent_id)
+                .len(),
+            1,
+            "a repeated Start enriches the tombstone rather than creating a grandchild"
+        );
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&tombstone_id)
+                .unwrap()
+                .parent
+                .as_ref(),
+            Some(&parent_id)
+        );
+
+        let late_permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "stale permission".into(),
+                command: Some("rm stale".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::High,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_parent(parent_id)
+        .with_agent(worker);
+        harness.core.ingest(late_permission, NOW + 3);
+
+        let tombstone = harness.core.sessions[&session_id]
+            .tree
+            .get(&tombstone_id)
+            .unwrap();
+        assert!(tombstone.lifecycle.is_terminal());
+        assert_eq!(
+            tombstone.title, "Reviewer",
+            "late Start may enrich metadata"
+        );
+        assert_eq!(tombstone.turn, Some(Turn::Done));
+        assert!(!tombstone.interaction_pending);
+        assert!(tombstone
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.pending_permission.is_none()));
+        assert_eq!(
+            tombstone.activity_preview, None,
+            "a refused late state event cannot write an active preview"
+        );
+        assert!(harness.core.attention.queue().is_empty());
+
+        let original_command = tombstone.command.clone();
+        let late_process_start = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ProcessStarted {
+                pid: 4242,
+                command: "stale-process".into(),
+            },
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_node(tombstone_id.clone());
+        harness.core.ingest(late_process_start, NOW + 4);
+        let tombstone = harness.core.sessions[&session_id]
+            .tree
+            .get(&tombstone_id)
+            .unwrap();
+        assert!(tombstone.lifecycle.is_terminal());
+        assert_eq!(tombstone.pid, None);
+        assert_eq!(tombstone.command, original_command);
+        assert_eq!(tombstone.activity_preview, None);
+
+        let persisted = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        assert!(persisted
+            .tree
+            .get(&tombstone_id)
+            .is_some_and(|node| node.lifecycle.is_terminal()));
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_cannot_cross_its_authenticated_parent_boundary() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_stop_two_parents");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parents = Vec::new();
+        let mut children = Vec::new();
+        for (offset, (parent_external, child_external)) in
+            [("parent-a", "worker-a"), ("parent-b", "worker-b")]
+                .into_iter()
+                .enumerate()
+        {
+            let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+            parent.lifecycle = Lifecycle::Alive;
+            parent.turn = Some(Turn::Active);
+            let parent_id = parent.id.clone();
+            if let Some(agent) = parent.agent.as_mut() {
+                agent.external_id = Some(parent_external.into());
+                agent.agent.external_id = Some(parent_external.into());
+            }
+            harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .insert(parent);
+            harness.core.insert_subagent(
+                &session_id,
+                &parent_id,
+                Some(format!("Worker {offset}")),
+                Some("Explore".into()),
+                Some(child_external.into()),
+                None,
+                NOW + offset as i64 + 1,
+            );
+            let child_id = harness.core.sessions[&session_id]
+                .tree
+                .find_by_external_id(child_external)
+                .unwrap()
+                .id
+                .clone();
+            parents.push(parent_id);
+            children.push(child_id);
+        }
+
+        let demand = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Worker B needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 10,
+        )
+        .with_node(children[1].clone());
+        harness.core.ingest(demand, NOW + 10);
+
+        let cross_parent_stop = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some("worker-b".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 11,
+        )
+        .with_parent(parents[0].clone())
+        .with_agent(AgentRef {
+            external_id: Some("worker-b".into()),
+            ..AgentRef::default()
+        });
+        harness.core.ingest(cross_parent_stop, NOW + 11);
+
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&children[1])
+            .unwrap()
+            .is_running());
+        assert_eq!(harness.core.attention.queue().len(), 1);
+        assert_eq!(
+            harness
+                .core
+                .attention
+                .queue()
+                .iter()
+                .next()
+                .unwrap()
+                .node_id
+                .as_ref(),
+            Some(&children[1])
+        );
+
+        let invalid_parent_target = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some("parent-a".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 12,
+        )
+        .with_parent(parents[0].clone())
+        .with_agent(AgentRef {
+            external_id: Some("parent-a".into()),
+            ..AgentRef::default()
+        });
+        harness.core.ingest(invalid_parent_target, NOW + 12);
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&parents[0])
+            .unwrap()
+            .is_running());
+        assert_eq!(harness.core.attention.queue().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idless_subagent_stop_is_recorded_as_inferred_not_explicit() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_idless_stop");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-reviewer".into()),
+            None,
+            NOW + 1,
+        );
+
+        let stopped = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped { agent_id: None },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_parent(parent_id);
+        harness.core.ingest(stopped, NOW + 2);
+
+        let persisted = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted.confidence, Confidence::InferredHigh);
+        assert!(persisted.node_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn declared_subagent_process_exit_clears_its_predeclaration_scope() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_worker_os_exit");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        let worker = AgentRef {
+            external_id: Some("worker-reviewer".into()),
+            ..AgentRef::default()
+        };
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_parent(parent_id.clone())
+        .with_agent(worker);
+        harness.core.ingest(permission, NOW + 1);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-reviewer".into()),
+            None,
+            NOW + 2,
+        );
+        let reviewer_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-reviewer")
+            .unwrap()
+            .id
+            .clone();
+
+        let exited = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ProcessExited { code: 0 },
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_node(reviewer_id.clone());
+        harness.core.ingest(exited, NOW + 3);
+
+        assert!(harness.core.attention.queue().is_empty());
+        let persisted = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted.node_id.as_ref(), Some(&reviewer_id));
+        assert_eq!(persisted.parent_node_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            persisted.agent.external_id.as_deref(),
+            Some("worker-reviewer")
+        );
     }
 }

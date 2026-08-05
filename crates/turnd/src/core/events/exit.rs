@@ -3,7 +3,7 @@
 use crate::core::{Core, FINISHED_PTY_RETENTION_MS};
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::Relation;
+use turn_core::model::{NodeKind, Relation};
 use turn_core::state::Lifecycle;
 use turn_pty::ExitInfo;
 
@@ -162,42 +162,102 @@ impl Core {
         }
         self.ingest(event, now_ms);
 
-        // Children we only ever saw through the process table go with their parent:
-        // we cannot see them any more and will not claim they are running.
-        self.orphan_inferred_children(&session_id, node, now_ms);
+        // Inferred processes and virtual subagents depend on this runtime's
+        // observation channel. They cannot remain running after it disappears.
+        self.orphan_runtime_dependents(&session_id, node, now_ms);
         self.request_sweep(now_ms);
     }
 
-    /// Marks inferred children of a dead node as no longer observable.
-    pub(super) fn orphan_inferred_children(
+    /// Marks descendants that cannot outlive a dead runtime as unobservable.
+    pub(super) fn orphan_runtime_dependents(
         &mut self,
         session_id: &SessionId,
         parent: &NodeId,
         now_ms: i64,
     ) {
-        let Some(session) = self.sessions.get_mut(session_id) else {
-            return;
-        };
-        let children: Vec<NodeId> = session
-            .tree
-            .children(parent)
-            .into_iter()
-            .filter(|node| node.relation == Relation::Inferred && node.is_running())
-            .map(|node| node.id.clone())
-            .collect();
+        let children = self.mark_runtime_dependents(session_id, parent, now_ms);
         if children.is_empty() {
             return;
         }
-        for child in &children {
+        self.persist_session_quietly(session_id);
+        self.resolve_lifecycle_attention(session_id, &children, now_ms);
+        self.push_tree(session_id, now_ms);
+        self.push_session_state(session_id, now_ms);
+    }
+
+    /// Applies only the in-memory part of dependent retirement. Event ingestion
+    /// uses this form so its normal session/queue checkpoint and push remain the
+    /// single publication boundary for a SubagentStop.
+    pub(in crate::core) fn mark_runtime_dependents(
+        &mut self,
+        session_id: &SessionId,
+        parent: &NodeId,
+        now_ms: i64,
+    ) -> Vec<(NodeId, Option<NodeId>, Option<String>)> {
+        self.supervisor.refresh();
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return Vec::new();
+        };
+        let mut children = Vec::new();
+        let mut stack: Vec<NodeId> = session
+            .tree
+            .children(parent)
+            .into_iter()
+            .map(|node| node.id.clone())
+            .rev()
+            .collect();
+        while let Some(node_id) = stack.pop() {
+            let Some(node) = session.tree.get(&node_id) else {
+                continue;
+            };
+
+            // A living PID is an independent observation channel. Neither it
+            // nor its descendants depend on the runtime that just died.
+            if node.is_running() && node.pid.is_some_and(|pid| self.supervisor.is_alive(pid)) {
+                continue;
+            }
+
+            let child_ids: Vec<NodeId> = session
+                .tree
+                .children(&node_id)
+                .into_iter()
+                .map(|child| child.id.clone())
+                .rev()
+                .collect();
+            stack.extend(child_ids);
+
+            // A PID the supervisor confirms is gone is lost regardless of how
+            // confidently its parent edge was learned. Virtual subagents and
+            // inferred PID-less nodes also relied on the dead owner's channel.
+            let depends_on_owner = node.pid.is_some()
+                || node.kind == NodeKind::Subagent
+                || node.relation == Relation::Inferred;
+            if node.is_running() && depends_on_owner {
+                children.push((
+                    node.id.clone(),
+                    node.parent.clone(),
+                    node.agent.as_ref().and_then(|agent| {
+                        agent
+                            .external_id
+                            .clone()
+                            .or_else(|| agent.agent.external_id.clone())
+                    }),
+                ));
+            }
+        }
+        if children.is_empty() {
+            return children;
+        }
+        for (child, _, _) in &children {
             if let Some(node) = session.tree.get_mut(child) {
                 // `Lost`, not `Exited`: we never held this process and did not see it
                 // end. Claiming a clean exit would be inventing an exit code.
                 node.lifecycle = Lifecycle::Lost;
                 node.ended_ms = Some(now_ms);
+                super::clear_interaction_state(node);
             }
-            self.attention.resolve_node(child);
         }
-        self.push_tree(session_id, now_ms);
+        children
     }
 
     /// Runs output inference for the panes that have it, and feeds anything it
@@ -276,8 +336,82 @@ mod tests {
     use crate::core::testing::Harness;
     use crate::core::Command;
     use turn_core::ids::{PaneId, SessionId};
+    use turn_core::model::ProcessNode;
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn a_confirmed_child_with_a_dead_pid_is_lost_with_its_runtime_owner() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_dead_confirmed_child");
+        harness.add_session(session.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        let mut child = ProcessNode::agent(session.clone(), "worker", "/tmp", NOW);
+        child.kind = NodeKind::Subagent;
+        child.lifecycle = Lifecycle::Alive;
+        child.pid = Some(u32::MAX);
+        child.link_to(parent_id.clone(), Relation::Confirmed);
+        let child_id = child.id.clone();
+        let tree = &mut harness.core.sessions.get_mut(&session).unwrap().tree;
+        tree.insert(parent);
+        tree.insert(child);
+
+        let retired = harness
+            .core
+            .mark_runtime_dependents(&session, &parent_id, NOW + 1);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].0, child_id);
+        assert_eq!(
+            harness.core.sessions[&session]
+                .tree
+                .get(&child_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Lost
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_pid_is_a_boundary_for_its_virtual_descendants() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_live_runtime_boundary");
+        harness.add_session(session.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        let mut independent = ProcessNode::agent(session.clone(), "worker", "/tmp", NOW);
+        independent.kind = NodeKind::Subagent;
+        independent.lifecycle = Lifecycle::Alive;
+        independent.pid = Some(std::process::id());
+        independent.link_to(parent_id.clone(), Relation::Confirmed);
+        let independent_id = independent.id.clone();
+        let mut nested = ProcessNode::agent(session.clone(), "reviewer", "/tmp", NOW);
+        nested.kind = NodeKind::Subagent;
+        nested.lifecycle = Lifecycle::Alive;
+        nested.link_to(independent_id.clone(), Relation::Confirmed);
+        let nested_id = nested.id.clone();
+        let tree = &mut harness.core.sessions.get_mut(&session).unwrap().tree;
+        tree.insert(parent);
+        tree.insert(independent);
+        tree.insert(nested);
+
+        let retired = harness
+            .core
+            .mark_runtime_dependents(&session, &parent_id, NOW + 1);
+        assert!(retired.is_empty());
+        assert!(harness.core.sessions[&session]
+            .tree
+            .get(&independent_id)
+            .unwrap()
+            .is_running());
+        assert!(harness.core.sessions[&session]
+            .tree
+            .get(&nested_id)
+            .unwrap()
+            .is_running());
+    }
 
     /// Waits for the exit watcher to report, then applies it the way the loop does.
     async fn run_until_it_exits(harness: &mut Harness, node: &NodeId, now_ms: i64) {

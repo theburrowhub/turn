@@ -24,7 +24,7 @@ mod tree;
 use super::Core;
 use turn_core::event::{Confidence, EventKind, TurnEvent};
 use turn_core::ids::NodeId;
-use turn_core::model::{NodeKind, PendingPermission};
+use turn_core::model::{NodeKind, PendingPermission, ProcessNode};
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::ServerEvent;
 
@@ -56,31 +56,80 @@ impl Core {
         if event.workspace_id.is_none() {
             event.workspace_id = Some(session.workspace_id.clone());
         }
-        if let Some(external_id) = event.agent.external_id.as_deref() {
-            if let Some(subject) = session.tree.find_by_external_id(external_id) {
-                let belongs_to_hook_parent = event.parent_node_id.as_ref().is_none_or(|parent| {
-                    subject.id == *parent
-                        || session
-                            .tree
-                            .descendants(parent)
-                            .into_iter()
-                            .any(|descendant| descendant.id == subject.id)
-                });
-                // Hook connections belong to the main runtime process, but a
-                // worker-aware payload names its own Agent. Resolve that identity
-                // before state, preview and Attention handling so Reviewer can be
-                // YOUR TURN without pretending it owns a separate PTY.
-                if belongs_to_hook_parent {
-                    event.node_id = Some(subject.id.clone());
-                    event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
+        // Legacy adapters attached SubagentStop to the hook runtime as `node_id`.
+        // Preserve that authenticated boundary before external-id lookup; otherwise
+        // a same-session id from another parent could be accepted globally.
+        if event.parent_node_id.is_none() {
+            if let EventKind::AgentSubagentStopped { agent_id } = &event.kind {
+                let node_is_exact_subject = event
+                    .node_id
+                    .as_ref()
+                    .and_then(|node| session.tree.get(node))
+                    .is_some_and(|node| {
+                        node.kind == NodeKind::Subagent
+                            && agent_id.as_deref().is_some()
+                            && node.agent.as_ref().is_some_and(|agent| {
+                                agent
+                                    .external_id
+                                    .as_deref()
+                                    .or(agent.agent.external_id.as_deref())
+                                    == agent_id.as_deref()
+                            })
+                    });
+                if !node_is_exact_subject {
+                    event.parent_node_id = event.node_id.take();
+                }
+            }
+        }
+        // AgentSpawned names the child in `agent`, while `node_id` is the
+        // authenticated parent. Remapping that event to an existing child would
+        // pass the child back as its own parent and create a phantom grandchild.
+        if !matches!(&event.kind, EventKind::AgentSpawned { .. }) {
+            if let Some(external_id) = event.agent.external_id.as_deref() {
+                if let Some(subject) = session.tree.find_by_external_id(external_id) {
+                    let belongs_to_hook_parent =
+                        event.parent_node_id.as_ref().is_none_or(|parent| {
+                            subject.id == *parent
+                                || session
+                                    .tree
+                                    .descendants(parent)
+                                    .into_iter()
+                                    .any(|descendant| descendant.id == subject.id)
+                        });
+                    // Hook connections belong to the main runtime process, but a
+                    // worker-aware payload names its own Agent. Resolve that identity
+                    // before state, preview and Attention handling so Reviewer can be
+                    // YOUR TURN without pretending it owns a separate PTY.
+                    if belongs_to_hook_parent {
+                        event.node_id = Some(subject.id.clone());
+                        event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
+                    }
                 }
             }
         }
         self.correlate_unbound_agent_event(&mut event);
+        self.correlate_lifecycle_subject(&mut event);
         let policy = session.attention.clone();
 
-        let changed = self.apply(&event, now_ms);
-        let preview_changed = self.update_preview_from_event(&event, changed.node.as_ref(), now_ms);
+        let mut changed = self.apply(&event, now_ms);
+        if matches!(&event.kind, EventKind::AgentSubagentStopped { .. }) && event.node_id.is_none()
+        {
+            if let Some(node) = changed.node.as_ref() {
+                event.node_id = Some(node.clone());
+                event.dedup_key = format!("{}|lifecycle-subject:{node}", event.dedup_key);
+            }
+        }
+        let stopped_dependents = if matches!(&event.kind, EventKind::AgentSubagentStopped { .. }) {
+            let stopped = changed.node.clone();
+            stopped.map_or_else(Vec::new, |node| {
+                self.mark_runtime_dependents(&session_id, &node, now_ms)
+            })
+        } else {
+            Vec::new()
+        };
+        changed.structure |= !stopped_dependents.is_empty();
+        let preview_changed = !changed.refused
+            && self.update_preview_from_event(&event, changed.node.as_ref(), now_ms);
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.touch(now_ms);
         }
@@ -91,12 +140,29 @@ impl Core {
         // Letting a refused guess into the queue would produce the worst of both: the
         // node saying one thing and the sidebar asking about another. It is still
         // recorded and still pushed, so the user can see what the heuristic thought.
+        let attention_before = self.attention.queue().clone();
+        for (node, parent, external_id) in &stopped_dependents {
+            self.attention.resolve_lifecycle(
+                &session_id,
+                node,
+                parent.as_ref(),
+                external_id.as_deref(),
+            );
+        }
         let effects = if changed.refused {
             Vec::new()
         } else {
             self.attention
                 .ingest(&event, &policy, &self.user.clone(), now_ms)
         };
+        let attention_changed = self.attention.queue() != &attention_before;
+        let attention_change_reported = effects.iter().any(|effect| {
+            matches!(
+                effect,
+                turn_core::attention::Effect::Enqueued { .. }
+                    | turn_core::attention::Effect::Cleared { .. }
+            )
+        });
 
         self.push_all(ServerEvent::TurnEventEmitted {
             turn_event: event.clone(),
@@ -113,6 +179,10 @@ impl Core {
         }
         self.push_session_state(&session_id, now_ms);
         self.emit_effects(effects, now_ms);
+        if attention_changed && !attention_change_reported {
+            self.persist_attention();
+            self.push_attention_queue(now_ms);
+        }
 
         if changed.refused {
             tracing::debug!(
@@ -208,9 +278,149 @@ impl Core {
         }
     }
 
+    /// Gives terminal lifecycle events the exact tree identity Attention needs.
+    ///
+    /// Supervisor exits start with only a node id, while `SubagentStop` arrives
+    /// through its parent's hook endpoint. The tree already knows the declared
+    /// node, parent and tool-owned id; filling only missing fields lets lifecycle
+    /// retire a pre-declaration attention scope without making response callbacks
+    /// any broader.
+    fn correlate_lifecycle_subject(&self, event: &mut TurnEvent) {
+        let is_process_terminal = matches!(
+            &event.kind,
+            EventKind::ProcessExited { .. } | EventKind::ProcessFailed { .. }
+        );
+        let stopped_external = match &event.kind {
+            EventKind::AgentSubagentStopped { agent_id } => Some(agent_id.clone()),
+            _ => None,
+        };
+        if !is_process_terminal && stopped_external.is_none() {
+            return;
+        }
+
+        let Some(session) = self.sessions.get(&event.session_id) else {
+            return;
+        };
+        let mut target = event.node_id.clone();
+
+        if let Some(agent_id) = stopped_external {
+            if event.agent.external_id.is_none() {
+                event.agent.external_id = agent_id.clone();
+            }
+            let hook_parent = event.parent_node_id.clone().or_else(|| {
+                target.as_ref().and_then(|target| {
+                    session.tree.get(target).and_then(|node| {
+                        if node.kind == NodeKind::Subagent {
+                            node.parent.clone()
+                        } else {
+                            Some(node.id.clone())
+                        }
+                    })
+                })
+            });
+            let belongs_to_hook_parent = |candidate: &NodeId| {
+                hook_parent.as_ref().is_none_or(|parent| {
+                    session
+                        .tree
+                        .descendants(parent)
+                        .into_iter()
+                        .any(|descendant| descendant.id == *candidate)
+                })
+            };
+            let current_is_valid_subagent = target
+                .as_ref()
+                .and_then(|node| session.tree.get(node))
+                .is_some_and(|node| {
+                    let external_matches = agent_id.as_deref().is_none_or(|external_id| {
+                        node.agent.as_ref().is_some_and(|agent| {
+                            agent
+                                .external_id
+                                .as_deref()
+                                .or(agent.agent.external_id.as_deref())
+                                == Some(external_id)
+                        })
+                    });
+                    node.kind == NodeKind::Subagent
+                        && belongs_to_hook_parent(&node.id)
+                        && external_matches
+                });
+            if !current_is_valid_subagent {
+                let mut inferred = false;
+                target = match agent_id.as_deref() {
+                    Some(external_id) => session
+                        .tree
+                        .find_by_external_id(external_id)
+                        .filter(|node| {
+                            node.kind == NodeKind::Subagent && belongs_to_hook_parent(&node.id)
+                        })
+                        .map(|node| node.id.clone()),
+                    None => hook_parent.as_ref().and_then(|parent| {
+                        let candidates: Vec<_> = session
+                            .tree
+                            .children(parent)
+                            .into_iter()
+                            .filter(|node| node.kind == NodeKind::Subagent && node.is_running())
+                            .map(|node| node.id.clone())
+                            .collect();
+                        match candidates.as_slice() {
+                            [only] => {
+                                inferred = true;
+                                Some(only.clone())
+                            }
+                            _ => {
+                                event.confidence = Confidence::Unknown;
+                                None
+                            }
+                        }
+                    }),
+                };
+                if target.is_none() {
+                    event.parent_node_id = hook_parent;
+                    event.node_id = None;
+                    return;
+                }
+                if inferred {
+                    event.confidence = event.confidence.min(Confidence::InferredHigh);
+                }
+            }
+            event.parent_node_id = hook_parent;
+        }
+
+        let Some(target_id) = target else {
+            return;
+        };
+        let Some(node) = session.tree.get(&target_id) else {
+            return;
+        };
+        event.node_id = Some(target_id.clone());
+        if event.parent_node_id.is_none() {
+            event.parent_node_id = node.parent.clone();
+        }
+        if event.agent.external_id.is_none() {
+            event.agent.external_id = node.agent.as_ref().and_then(|agent| {
+                agent
+                    .external_id
+                    .clone()
+                    .or_else(|| agent.agent.external_id.clone())
+            });
+        }
+        event.dedup_key = format!("{}|lifecycle-subject:{target_id}", event.dedup_key);
+    }
+
     /// Applies an event to the session's process tree.
     fn apply(&mut self, event: &TurnEvent, now_ms: i64) -> Changed {
         let session_id = event.session_id.clone();
+        if let EventKind::AgentSubagentStopped { agent_id } = &event.kind {
+            return match event.node_id.as_ref() {
+                Some(target) => self.stop_subagent(&session_id, target, now_ms),
+                None => match (event.parent_node_id.as_ref(), agent_id.as_ref()) {
+                    (Some(parent), Some(agent_id)) => {
+                        self.insert_stopped_subagent(&session_id, parent, agent_id.clone(), now_ms)
+                    }
+                    _ => Changed::default(),
+                },
+            };
+        }
         let Some(node_id) = event.node_id.clone() else {
             return Changed::default();
         };
@@ -254,10 +464,6 @@ impl Core {
                 now_ms,
             );
         }
-        if let EventKind::AgentSubagentStopped { agent_id } = &event.kind {
-            return self.stop_subagent(&session_id, &node_id, agent_id.as_deref(), now_ms);
-        }
-
         let touches_turn = turn_axis_change(&event.kind).is_some();
         if touches_turn && !self.may_set_turn_for_event(event, &node_id) {
             return Changed {
@@ -277,11 +483,16 @@ impl Core {
 
         match &event.kind {
             EventKind::ProcessStarted { pid, command } => {
+                if node.lifecycle.is_terminal() {
+                    return Changed {
+                        node: Some(node_id),
+                        structure: false,
+                        refused: true,
+                    };
+                }
                 node.pid = Some(*pid);
                 node.command = command.clone();
-                if !node.lifecycle.is_terminal() {
-                    node.lifecycle = Lifecycle::Alive;
-                }
+                node.lifecycle = Lifecycle::Alive;
             }
             EventKind::ProcessExited { code } => {
                 // Left alone when it is already terminal: `node_exited` records what
@@ -292,19 +503,7 @@ impl Core {
                 }
                 node.exit_code = Some(*code);
                 node.ended_ms = Some(now_ms);
-                node.interaction_pending = false;
-                // A dead process is not waiting for anybody. Clearing the turn axis
-                // here is what stops a crashed agent sitting in the sidebar for the
-                // rest of the day claiming it is your turn.
-                if let Some(turn) = node.turn.as_mut() {
-                    if turn.needs_user() {
-                        *turn = Turn::Unknown;
-                    }
-                }
-                if let Some(agent) = node.agent.as_mut() {
-                    agent.pending_permission = None;
-                    agent.pending_question = None;
-                }
+                clear_interaction_state(node);
             }
             EventKind::ProcessFailed { code, .. } => {
                 if !node.lifecycle.is_terminal() {
@@ -323,12 +522,7 @@ impl Core {
                     node.exit_code = Some(*code);
                 }
                 node.ended_ms = Some(now_ms);
-                node.interaction_pending = false;
-                if let Some(turn) = node.turn.as_mut() {
-                    if turn.needs_user() {
-                        *turn = Turn::Unknown;
-                    }
-                }
+                clear_interaction_state(node);
             }
 
             EventKind::AgentStarted {
@@ -412,7 +606,7 @@ impl Core {
                 background_tasks,
             } => {
                 node.turn = Some(Turn::Done);
-                node.interaction_pending = false;
+                clear_interaction_state(node);
                 if let Some(agent) = node.agent.as_mut() {
                     if last_message.is_some() {
                         agent.last_message = last_message.clone();
@@ -438,7 +632,7 @@ impl Core {
             }
             EventKind::AgentTaskCompleted { summary } => {
                 node.turn = Some(Turn::TaskDone);
-                node.interaction_pending = false;
+                clear_interaction_state(node);
                 if let Some(agent) = node.agent.as_mut() {
                     if summary.is_some() {
                         agent.last_message = summary.clone();
@@ -449,11 +643,11 @@ impl Core {
                 node.turn = Some(Turn::Failed {
                     reason: reason.clone(),
                 });
-                node.interaction_pending = false;
+                clear_interaction_state(node);
             }
             EventKind::AgentIdle => {
                 node.turn = Some(Turn::Idle);
-                node.interaction_pending = false;
+                clear_interaction_state(node);
             }
 
             // Session-level events say nothing about a particular node.
@@ -495,6 +689,14 @@ impl Core {
     /// The resulting state retains `inferred_high` authority: the callback was a
     /// fact, while choosing this child was still a correlation.
     fn may_set_turn_for_event(&self, event: &TurnEvent, node: &NodeId) -> bool {
+        if self
+            .sessions
+            .get(&event.session_id)
+            .and_then(|session| session.tree.get(node))
+            .is_some_and(|subject| subject.lifecycle.is_terminal())
+        {
+            return false;
+        }
         if self.may_set_turn(node, event.confidence) {
             return true;
         }
@@ -506,6 +708,22 @@ impl Core {
                 .get(&event.session_id)
                 .and_then(|session| session.tree.get(node))
                 .is_some_and(|subject| subject.interaction_pending)
+    }
+}
+
+/// A node that is no longer waiting cannot still expose an actionable permission
+/// or question. Keep this cleanup shared across semantic completion and runtime
+/// termination so the persisted inspector state stays honest.
+pub(super) fn clear_interaction_state(node: &mut ProcessNode) {
+    node.interaction_pending = false;
+    if let Some(turn) = node.turn.as_mut() {
+        if turn.needs_user() {
+            *turn = Turn::Unknown;
+        }
+    }
+    if let Some(agent) = node.agent.as_mut() {
+        agent.pending_permission = None;
+        agent.pending_question = None;
     }
 }
 

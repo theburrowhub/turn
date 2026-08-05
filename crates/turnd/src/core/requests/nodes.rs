@@ -155,6 +155,7 @@ impl Core {
 
         // Retire the old record and everything that hung off it before the new process
         // takes the pane.
+        let mut retired_nodes = Vec::new();
         if let Ok(session) = self.session_mut(session_id) {
             let descendants: Vec<NodeId> = session
                 .tree
@@ -162,6 +163,11 @@ impl Core {
                 .into_iter()
                 .map(|node| node.id.clone())
                 .collect();
+            for id in std::iter::once(node_id).chain(descendants.iter()) {
+                if let Some(retired) = session.tree.get(id) {
+                    retired_nodes.push(retired.id.clone());
+                }
+            }
             for id in descendants {
                 session.tree.remove(&id);
             }
@@ -170,7 +176,7 @@ impl Core {
                 pane.node_id = None;
             }
         }
-        self.attention.resolve_node(node_id);
+        self.remove_attention_for_deleted_nodes(session_id, &retired_nodes, now_ms);
         self.turn_authority.remove(node_id);
         self.background_tasks.remove(node_id);
         self.expected_exits.remove(node_id);

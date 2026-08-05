@@ -9,13 +9,14 @@ use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
 use crate::redact::redact_secrets;
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use turn_core::attention::{AttentionEntry, AttentionQueue, EntryState};
+use turn_core::attention::{AttentionDemandKind, AttentionEntry, AttentionQueue, EntryState};
 use turn_core::ids::{AttentionId, NodeId, SessionId};
 use turn_core::state::AwaitingReason;
 use turn_core::Confidence;
 
 const COLUMNS: &str = "id, session_id, node_id, parent_node_id, subject_external_id, reason, \
-     summary, confidence, created_ms, updated_ms, state_json, priority_boost";
+     summary, confidence, created_ms, updated_ms, state_json, priority_boost, \
+     survives_owner_exit, demand_kind";
 
 pub struct AttentionRepo<'a> {
     conn: &'a Connection,
@@ -155,12 +156,18 @@ fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId
     conn.execute(
         "INSERT INTO attention_entries (id, session_id, node_id, parent_node_id, \
              subject_external_id, reason, summary, confidence, created_ms, updated_ms, \
-             state_json, priority_boost, dedup_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             state_json, priority_boost, survives_owner_exit, demand_kind, dedup_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(dedup_key) DO UPDATE SET \
              summary = COALESCE(excluded.summary, summary), \
              confidence = excluded.confidence, updated_ms = excluded.updated_ms, \
-             state_json = excluded.state_json, priority_boost = excluded.priority_boost",
+             state_json = excluded.state_json, priority_boost = excluded.priority_boost, \
+             survives_owner_exit = CASE \
+                 WHEN demand_kind = excluded.demand_kind \
+                 THEN MAX(survives_owner_exit, excluded.survives_owner_exit) \
+                 ELSE excluded.survives_owner_exit \
+             END, \
+             demand_kind = excluded.demand_kind",
         params![
             entry.id.as_str(),
             entry.session_id.as_str(),
@@ -174,6 +181,8 @@ fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId
             entry.updated_ms,
             json("attention state", &entry.state)?,
             entry.priority_boost,
+            entry.survives_owner_exit,
+            tag("attention demand kind", &entry.demand_kind)?,
             key,
         ],
     )
@@ -252,6 +261,12 @@ fn from_row(row: &Row<'_>) -> Result<AttentionEntry> {
             &row.get::<_, String>("state_json")?,
         )?,
         priority_boost: row.get("priority_boost")?,
+        survives_owner_exit: row.get("survives_owner_exit")?,
+        demand_kind: from_tag::<AttentionDemandKind>(
+            "attention demand kind",
+            &id,
+            &row.get::<_, String>("demand_kind")?,
+        )?,
     })
 }
 
@@ -276,6 +291,8 @@ mod tests {
             updated_ms: created_ms,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: AttentionDemandKind::Interaction,
         }
     }
 
@@ -289,6 +306,8 @@ mod tests {
         demand.summary = Some("run make verify".into());
         demand.confidence = Confidence::InferredHigh;
         demand.priority_boost = -20;
+        demand.survives_owner_exit = true;
+        demand.demand_kind = AttentionDemandKind::ProcessFailed;
         demand.updated_ms = T0 + 500;
 
         store.attention().upsert(&demand).unwrap();
@@ -343,6 +362,24 @@ mod tests {
         assert_eq!(back.created_ms, T0, "age cannot be reset by asking again");
         assert_eq!(back.updated_ms, T0 + 600_000, "recency still moves");
         assert_eq!(back.summary.as_deref(), Some("still waiting"));
+    }
+
+    #[test]
+    fn changing_demand_kind_replaces_its_postmortem_lifetime() {
+        let store = testing::store();
+        let session = testing::saved_session_anywhere(&store, "new live interaction");
+        let mut completed = entry(&session.id, AwaitingReason::Input, T0);
+        completed.survives_owner_exit = true;
+        completed.demand_kind = AttentionDemandKind::TurnCompleted;
+        store.attention().upsert(&completed).unwrap();
+
+        let mut waiting = entry(&session.id, AwaitingReason::Input, T0 + 1);
+        waiting.updated_ms = T0 + 1;
+        store.attention().upsert(&waiting).unwrap();
+
+        let stored = store.attention().list().unwrap().pop().unwrap();
+        assert_eq!(stored.demand_kind, AttentionDemandKind::Interaction);
+        assert!(!stored.survives_owner_exit);
     }
 
     #[test]

@@ -370,6 +370,8 @@ pub(crate) mod testing {
             updated_ms: at_ms,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         store.attention().upsert(&entry).expect("stored");
     }

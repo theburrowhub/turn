@@ -177,6 +177,8 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         updated_ms: T0 + 20,
         state: EntryState::Pending,
         priority_boost: 0,
+        survives_owner_exit: false,
+        demand_kind: Default::default(),
     };
     store.attention().upsert(&demand).unwrap();
 
@@ -195,6 +197,8 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         updated_ms: T0 + 30,
         state: EntryState::Pending,
         priority_boost: 0,
+        survives_owner_exit: false,
+        demand_kind: Default::default(),
     });
     queue.upsert(demand);
     store.attention().replace_all(&queue).unwrap();

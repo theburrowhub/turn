@@ -479,7 +479,12 @@ fn every_recorded_payload_maps_to_the_event_the_ui_expects() {
         assert_eq!(events.len(), 1, "{name} produced {events:?}");
         let event = &events[0];
         assert_eq!(event.session_id.as_str(), "sess_codex_contract");
-        assert!(event.node_id.is_some());
+        if name == "SubagentStop" {
+            assert_eq!(event.node_id, None);
+            assert_eq!(event.parent_node_id.as_ref(), Some(&ctx().node_id));
+        } else {
+            assert!(event.node_id.is_some());
+        }
         assert_eq!(event.agent.provider.as_deref(), Some("openai"));
         assert_eq!(event.agent.tool.as_deref(), Some("codex"));
 
@@ -599,6 +604,8 @@ fn subagent_events_give_a_confirmed_hierarchy() {
         }
         other => panic!("unexpected {other:?}"),
     }
+    assert_eq!(stopped[0].node_id, None);
+    assert_eq!(stopped[0].parent_node_id.as_ref(), Some(&ctx().node_id));
 
     // The subagent's id is a different value from the parent session's, which is
     // what makes the pair a hierarchy rather than an echo.

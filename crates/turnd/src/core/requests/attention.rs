@@ -44,17 +44,12 @@ impl Core {
     ) -> Answer {
         let effect = match attention_id {
             None => self.attention.goto_next(now_ms),
-            Some(id) => {
-                let Some(entry) = self.attention.queue().get(id) else {
+            Some(id) => match self.attention.goto(id, now_ms) {
+                Some(effect) => Some(effect),
+                None => {
                     return Err(ProtoError::not_found("attention entry", id.as_str()));
-                };
-                let target = Effect::Focus {
-                    session_id: entry.session_id.clone(),
-                    node_id: entry.node_id.clone(),
-                };
-                self.acknowledge(id, now_ms);
-                Some(target)
-            }
+                }
+            },
         };
 
         let effects: Vec<Effect> = effect.into_iter().collect();
@@ -90,11 +85,15 @@ impl Core {
             // the button having done nothing.
             return Err(ProtoError::invalid("A snooze must end in the future"));
         }
+        let session = self.attention_session(id);
         if !self.attention.snooze(id, until_ms) {
             return Err(ProtoError::not_found("attention entry", id.as_str()));
         }
         self.persist_attention();
         self.push_attention_queue(now_ms);
+        if let Some(session) = session {
+            self.push_session_state(&session, now_ms);
+        }
         Ok(Response::Ack)
     }
 
@@ -173,7 +172,17 @@ impl Core {
         }
 
         let kind = correction_kind(lifecycle.as_ref(), turn.as_ref(), note.as_deref(), &node);
-        let still_needs_user = turn.as_ref().is_some_and(Turn::needs_user);
+        let corrected_needs_user = turn.as_ref().map(Turn::needs_user);
+        let lifecycle_is_terminal = lifecycle.as_ref().is_some_and(Lifecycle::is_terminal);
+        let clears_attention = lifecycle_is_terminal || corrected_needs_user == Some(false);
+        let lifecycle_parent = node.parent.clone();
+        let lifecycle_agent = node.agent.as_ref().map(|agent| {
+            let mut identity = agent.agent.clone();
+            if identity.external_id.is_none() {
+                identity.external_id = agent.external_id.clone();
+            }
+            identity
+        });
 
         {
             let session = self.session_mut(session_id)?;
@@ -191,8 +200,12 @@ impl Core {
             if let Some(turn) = turn.clone() {
                 node.turn = Some(turn);
             }
-            node.interaction_pending = still_needs_user;
-            if !still_needs_user {
+            if lifecycle_is_terminal {
+                node.interaction_pending = false;
+            } else if let Some(needs_user) = corrected_needs_user {
+                node.interaction_pending = needs_user;
+            }
+            if clears_attention {
                 if let Some(agent) = node.agent.as_mut() {
                     agent.pending_permission = None;
                     agent.pending_question = None;
@@ -205,9 +218,20 @@ impl Core {
             self.turn_authority
                 .insert(node_id.clone(), Confidence::Explicit);
         }
-        if !still_needs_user {
+        if clears_attention {
             // Whatever Turn thought this node wanted, it does not want it.
-            self.attention.resolve_node(node_id);
+            if lifecycle_is_terminal {
+                let external_id = lifecycle_agent
+                    .as_ref()
+                    .and_then(|agent| agent.external_id.clone());
+                self.resolve_lifecycle_attention(
+                    session_id,
+                    &[(node_id.clone(), lifecycle_parent.clone(), external_id)],
+                    now_ms,
+                );
+            } else {
+                self.resolve_exact_attention(session_id, node_id, now_ms);
+            }
         }
 
         let mut event = TurnEvent::new(
@@ -218,6 +242,14 @@ impl Core {
             now_ms,
         )
         .with_node(node_id.clone());
+        if lifecycle_is_terminal {
+            if let Some(parent) = lifecycle_parent {
+                event = event.with_parent(parent);
+            }
+            if let Some(agent) = lifecycle_agent {
+                event = event.with_agent(agent);
+            }
+        }
         // The whole correction is kept, in the user's words, so a misfiring rule can be
         // found later rather than guessed at.
         event = event.with_raw(

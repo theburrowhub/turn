@@ -3,7 +3,7 @@
 
 use super::Core;
 use turn_core::attention::Effect;
-use turn_core::ids::{AttentionId, SessionId};
+use turn_core::ids::{AttentionId, NodeId, SessionId};
 use turn_proto::ServerEvent;
 
 impl Core {
@@ -47,41 +47,121 @@ impl Core {
         }
     }
 
+    /// Clears terminal subjects and publishes the durable queue change once.
+    ///
+    /// Some lifecycle paths do not travel through `Core::ingest` (process-table
+    /// disappearance, relaunch and user correction). They must still use the same
+    /// ownership rules and, crucially, persist the removal before restart can
+    /// resurrect it.
+    pub(crate) fn resolve_lifecycle_attention(
+        &mut self,
+        session_id: &SessionId,
+        subjects: &[(NodeId, Option<NodeId>, Option<String>)],
+        now_ms: i64,
+    ) -> usize {
+        let cleared = subjects
+            .iter()
+            .map(|(node, parent, external_id)| {
+                self.attention.resolve_lifecycle(
+                    session_id,
+                    node,
+                    parent.as_ref(),
+                    external_id.as_deref(),
+                )
+            })
+            .sum();
+        if cleared > 0 {
+            if self
+                .attention
+                .queue()
+                .iter()
+                .any(|entry| &entry.session_id == session_id)
+            {
+                self.persist_attention();
+                self.push_attention_queue(now_ms);
+            } else {
+                self.emit_effects(
+                    vec![Effect::Cleared {
+                        session_id: session_id.clone(),
+                    }],
+                    now_ms,
+                );
+            }
+        }
+        cleared
+    }
+
+    /// Clears only one exact node for a non-terminal user correction, with the
+    /// same durable notification contract as lifecycle cleanup.
+    pub(crate) fn resolve_exact_attention(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        now_ms: i64,
+    ) -> usize {
+        let cleared = self.attention.resolve_node_in_session(session_id, node_id);
+        if cleared > 0 {
+            if self
+                .attention
+                .queue()
+                .iter()
+                .any(|entry| &entry.session_id == session_id)
+            {
+                self.persist_attention();
+                self.push_attention_queue(now_ms);
+            } else {
+                self.emit_effects(
+                    vec![Effect::Cleared {
+                        session_id: session_id.clone(),
+                    }],
+                    now_ms,
+                );
+            }
+        }
+        cleared
+    }
+
+    /// Removes all queue/deferred references to nodes that an explicit user
+    /// action deletes from the tree. Lifecycle evidence may survive a crash, but
+    /// it must never point at an identity that no longer exists.
+    pub(crate) fn remove_attention_for_deleted_nodes(
+        &mut self,
+        session_id: &SessionId,
+        nodes: &[NodeId],
+        now_ms: i64,
+    ) -> usize {
+        let cleared = nodes
+            .iter()
+            .map(|node| self.attention.remove_owner_in_session(session_id, node))
+            .sum();
+        if cleared > 0 {
+            if self
+                .attention
+                .queue()
+                .iter()
+                .any(|entry| &entry.session_id == session_id)
+            {
+                self.persist_attention();
+                self.push_attention_queue(now_ms);
+            } else {
+                self.emit_effects(
+                    vec![Effect::Cleared {
+                        session_id: session_id.clone(),
+                    }],
+                    now_ms,
+                );
+            }
+        }
+        cleared
+    }
+
     /// Marks a demand as seen without jumping to it.
     ///
-    /// [`turn_core::AttentionManager`] exposes acknowledgement only through its jump
-    /// operations, because acknowledging is what happens when the user is taken
-    /// somewhere. `acknowledge_attention` asks for the mark without the jump, so this
-    /// drives the same primitive against the entry *before* the target and discards
-    /// the focus effect the manager returns — `goto_after(previous)` acknowledges
-    /// exactly the entry we mean, and `goto_next` covers the case where the target is
-    /// already at the head of the queue.
-    ///
-    /// The side effect that survives is the governor being reset, which is correct
-    /// here for the reason it is documented in `turn-core`: the user acting by hand is
-    /// not an interruption, and automatic focus should not immediately fight it.
+    /// Acknowledgement is deliberately not navigation: it must not record a focus
+    /// grant or perturb the governor when the user merely marks an item seen.
     pub(crate) fn acknowledge(&mut self, id: &AttentionId, now_ms: i64) -> bool {
-        if self.attention.queue().get(id).is_none() {
-            return false;
-        }
-        let ordered: Vec<AttentionId> = self
-            .attention
-            .queue()
-            .ordered(now_ms)
-            .into_iter()
-            .map(|entry| entry.id.clone())
-            .collect();
-        let Some(position) = ordered.iter().position(|candidate| candidate == id) else {
-            // Snoozed and not yet due. It is already out of the user's way, and
-            // marking it seen would say something untrue about a demand they have
-            // deliberately postponed.
-            return true;
-        };
-        let _discarded_focus = match position {
-            0 => self.attention.goto_next(now_ms),
-            index => self.attention.goto_after(&ordered[index - 1], now_ms),
-        };
-        true
+        let _ = now_ms;
+        self.attention.acknowledge(id)
     }
 
     /// The session a demand belongs to, for routing a jump.

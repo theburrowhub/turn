@@ -527,7 +527,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                     .map(|task| excerpt(task, 240)),
             })],
 
-            "SubagentStop" => vec![make(EventKind::AgentSubagentStopped {
+            "SubagentStop" => vec![make_descendant(EventKind::AgentSubagentStopped {
                 agent_id: payload
                     .get("agent_id")
                     .and_then(Value::as_str)
@@ -1121,6 +1121,8 @@ mod tests {
             stopped[0].kind,
             EventKind::AgentSubagentStopped { .. }
         ));
+        assert_eq!(stopped[0].node_id, None);
+        assert_eq!(stopped[0].parent_node_id.as_ref(), Some(&ctx().node_id));
     }
 
     #[test]

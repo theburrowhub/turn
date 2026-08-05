@@ -299,12 +299,15 @@ fn the_recorded_subagent_callbacks_identify_the_child_on_both_ends() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    match &normalise(stopped)[0].kind {
+    let stopped = normalise(stopped);
+    match &stopped[0].kind {
         EventKind::AgentSubagentStopped { agent_id } => {
             assert_eq!(agent_id.as_deref(), Some(id));
         }
         other => panic!("unexpected {other:?}"),
     }
+    assert_eq!(stopped[0].node_id, None);
+    assert_eq!(stopped[0].parent_node_id.as_ref(), Some(&ctx().node_id));
 }
 
 /// CAPTURED, but only through the helper transport: Claude Code 2.1.221 filters

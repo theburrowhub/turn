@@ -110,11 +110,13 @@ async fn a_muted_session_still_badges_and_a_snooze_takes_a_demand_out_of_the_way
     )
     .await;
 
-    // Muting silences the interruption, not the evidence: a badge still arrives, and
-    // nothing else does.
+    // Muting silences interruption, not evidence: queue bookkeeping may arrive,
+    // a badge still does, and no perceptible interruption follows.
     let effect = ui
         .wait_for("a badge", |event| match event {
-            ServerEvent::AttentionEffect { effect } => Some(effect.clone()),
+            ServerEvent::AttentionEffect {
+                effect: effect @ Effect::Badge { .. },
+            } => Some(effect.clone()),
             _ => None,
         })
         .await;
@@ -156,14 +158,18 @@ async fn a_muted_session_still_badges_and_a_snooze_takes_a_demand_out_of_the_way
         until_ms: now + 3_600_000,
     })
     .await;
-    assert!(
-        attention_of(ui.ask(Request::NextAttention).await).is_none(),
+    let next = attention_of(ui.ask(Request::NextAttention).await)
+        .expect("the other retained demand remains actionable");
+    assert_ne!(
+        next.entry.id, entry,
         "a snoozed demand is not the next thing to do"
     );
     // Still listed, though: hiding it would make a snooze feel like a deletion.
     let entries = attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await);
-    assert_eq!(entries.len(), 1);
-    assert!(!entries[0].actionable);
+    assert_eq!(entries.len(), 2, "muting did not discard the first demand");
+    assert!(entries
+        .iter()
+        .any(|view| view.entry.id == entry && !view.actionable));
 
     daemon.shutdown().await;
 }

@@ -467,6 +467,8 @@ fn a_pending_demand_for_the_user_outlives_the_daemon_that_recorded_it() {
                 updated_ms: T0,
                 state: EntryState::Pending,
                 priority_boost: -20,
+                survives_owner_exit: false,
+                demand_kind: Default::default(),
             })
             .unwrap();
         session_id
