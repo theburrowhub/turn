@@ -68,6 +68,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "postmortem_attention",
         statements: MIGRATION_008_POSTMORTEM_ATTENTION,
     },
+    Migration {
+        version: 9,
+        name: "purge_legacy_durable_secrets",
+        statements: MIGRATION_009_PURGE_LEGACY_DURABLE_SECRETS,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -829,6 +834,18 @@ ALTER TABLE attention_entries
 ADD COLUMN demand_kind TEXT NOT NULL DEFAULT 'interaction';
 "#;
 
+/// Schedules the Rust half of the historical credential purge.
+///
+/// Pattern-aware redaction and filesystem-identity validation do not belong in
+/// SQL, while physical page rebuilding cannot run inside this migration's
+/// transaction. The durable marker bridges those phases: `Store::prepare`
+/// removes it only after the logical scrub, VACUUM and WAL truncation succeed.
+const MIGRATION_009_PURGE_LEGACY_DURABLE_SECRETS: &str = r#"
+INSERT INTO settings (key, value_json, updated_ms)
+VALUES ('security.legacy_free_text_purge_pending', 'true', 0)
+ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_ms = 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,7 +909,8 @@ mod tests {
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
-                "postmortem_attention"
+                "postmortem_attention",
+                "purge_legacy_durable_secrets"
             ]
         );
 
@@ -1005,7 +1023,7 @@ mod tests {
             .iter()
             .any(|column| column == "survives_owner_exit"));
 
-        let applied = apply(&conn).unwrap();
+        let applied = apply_to(&conn, 8).unwrap();
         assert_eq!(applied.names, vec!["postmortem_attention"]);
         assert!(column_names(&conn, "attention_entries")
             .iter()
@@ -1013,6 +1031,33 @@ mod tests {
         assert!(column_names(&conn, "attention_entries")
             .iter()
             .any(|column| column == "demand_kind"));
+    }
+
+    #[test]
+    fn v9_schedules_retryable_security_maintenance_without_rebuilding_the_schema() {
+        let conn = fresh();
+        apply_to(&conn, 8).unwrap();
+        let before_tables = table_names(&conn);
+        let before_columns: Vec<_> = before_tables
+            .iter()
+            .map(|table| (table.clone(), column_names(&conn, table)))
+            .collect();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names, vec!["purge_legacy_durable_secrets"]);
+        assert_eq!(table_names(&conn), before_tables);
+        for (table, columns) in before_columns {
+            assert_eq!(column_names(&conn, &table), columns, "changed {table}");
+        }
+        let pending: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings \
+                 WHERE key = 'security.legacy_free_text_purge_pending')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pending);
     }
 
     #[test]
@@ -1046,7 +1091,8 @@ mod tests {
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
-                "postmortem_attention"
+                "postmortem_attention",
+                "purge_legacy_durable_secrets"
             ]
         );
 
@@ -1092,7 +1138,8 @@ mod tests {
                 "drop_persisted_hook_payloads",
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
-                "postmortem_attention"
+                "postmortem_attention",
+                "purge_legacy_durable_secrets"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1231,7 +1278,8 @@ mod tests {
             vec![
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
-                "postmortem_attention"
+                "postmortem_attention",
+                "purge_legacy_durable_secrets"
             ]
         );
         let (required, state): (bool, String) = conn

@@ -28,6 +28,8 @@ const T0: i64 = 1_700_000_000_000;
 /// A correctly-shaped classic GitHub token. The same value is deliberately planted
 /// in every durable free-text field so a single missed field fails the byte scan.
 const DURABLE_SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+const HISTORICAL_SECRET: &str = "ghp_legacy0123456789abcdefghijklmnopqrst";
+const HISTORICAL_ENV_VALUE: &str = "old-value-hidden-only-by-a-sensitive-key";
 
 const SECRETS: [&str; 9] = [
     "ghp_workspace_level_secret",
@@ -374,6 +376,60 @@ fn assert_absent(dir: &Path, moment: &str) {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn logical_text_hits(conn: &rusqlite::Connection, needle: &str) -> Vec<(String, String, i64)> {
+    let tables = {
+        let mut statement = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let mut hits = Vec::new();
+    for table in tables {
+        let columns = {
+            let mut statement = conn
+                .prepare("SELECT name FROM pragma_table_info(?1) WHERE upper(type) = 'TEXT'")
+                .unwrap();
+            statement
+                .query_map([&table], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for column in columns {
+            assert!(table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+            assert!(column
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'));
+            let sql = format!("SELECT rowid FROM \"{table}\" WHERE instr(\"{column}\", ?1) > 0");
+            let mut statement = conn.prepare(&sql).unwrap();
+            let rows = statement
+                .query_map([needle], |row| row.get::<_, i64>(0))
+                .unwrap();
+            for row in rows {
+                hits.push((table.clone(), column.clone(), row.unwrap()));
+            }
+        }
+    }
+    hits
+}
+
+fn assert_needles_absent(dir: &Path, needles: &[&str], moment: &str) {
+    for (name, bytes) in all_bytes(dir) {
+        for needle in needles {
+            assert!(
+                !contains(&bytes, needle.as_bytes()),
+                "{needle} was found in {name} {moment}"
+            );
+        }
+    }
 }
 
 fn assert_scrubbed(label: &str, value: &str) {
@@ -765,6 +821,373 @@ fn upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wa
         !pending,
         "a successful physical purge must clear its retry marker"
     );
+}
+
+/// Builds state through the real repositories, then emulates a v8 binary which
+/// wrote credentials without the current durable boundary. The v9 migration is
+/// intentionally marker-only, so resetting `user_version` is an exact old-schema
+/// fixture rather than pretending a table changed shape.
+fn historical_v8_fixture(
+    dir: &Path,
+) -> (
+    std::path::PathBuf,
+    WorkspaceId,
+    turn_core::ids::SessionId,
+    turn_core::ids::NodeId,
+) {
+    let path = dir.join(turn_store::DATABASE_FILE);
+    let (workspace_id, session_id, node_id) = {
+        let store = Store::open_at(&path).unwrap();
+        let (workspace_id, session) = write_everything(&store);
+        let node_id = session.tree.iter().next().unwrap().id.clone();
+        store.compact().unwrap();
+        (workspace_id, session.id, node_id)
+    };
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; \
+         DELETE FROM settings WHERE key IN ( \
+             'security.hook_raw_purge_pending', \
+             'security.legacy_free_text_purge_pending' \
+         ); \
+         PRAGMA user_version = 8;",
+    )
+    .unwrap();
+
+    let historical_env = serde_json::to_string(&vec![
+        ("GITHUB_TOKEN", HISTORICAL_ENV_VALUE),
+        ("ORDINARY", HISTORICAL_SECRET),
+    ])
+    .unwrap();
+    conn.execute(
+        "UPDATE workspaces SET name = ?2, env_json = ?3 WHERE id = ?1",
+        rusqlite::params![
+            workspace_id.as_str(),
+            format!("historical {HISTORICAL_SECRET}"),
+            historical_env
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET note = ?2 WHERE id = ?1",
+        rusqlite::params![session_id.as_str(), format!("note {HISTORICAL_SECRET}")],
+    )
+    .unwrap();
+
+    let layout: String = conn
+        .query_row(
+            "SELECT layout_json FROM session_layouts WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tainted_layout = layout.replacen(REDACTED, HISTORICAL_SECRET, 1);
+    assert_ne!(
+        tainted_layout, layout,
+        "fixture layout had no text to taint"
+    );
+    conn.execute(
+        "UPDATE session_layouts SET layout_json = ?2 WHERE session_id = ?1",
+        rusqlite::params![session_id.as_str(), tainted_layout],
+    )
+    .unwrap();
+
+    let agent_json: String = conn
+        .query_row(
+            "SELECT agent_json FROM process_nodes WHERE id = ?1",
+            [node_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut agent_json: serde_json::Value = serde_json::from_str(&agent_json).unwrap();
+    agent_json["tokens_used"] = serde_json::json!(4242);
+    agent_json["cost_usd"] = serde_json::json!(12.5);
+    let agent_json =
+        serde_json::to_string(&agent_json)
+            .unwrap()
+            .replacen(REDACTED, HISTORICAL_SECRET, 1);
+    let preview_json: String = conn
+        .query_row(
+            "SELECT activity_preview_json FROM process_nodes WHERE id = ?1",
+            [node_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE process_nodes SET command = ?2, args_json = ?3, agent_json = ?4, \
+             activity_preview_json = ?5 WHERE id = ?1",
+        rusqlite::params![
+            node_id.as_str(),
+            format!("claude --token {HISTORICAL_SECRET}"),
+            serde_json::to_string(&vec![HISTORICAL_SECRET]).unwrap(),
+            agent_json,
+            preview_json.replacen(REDACTED, HISTORICAL_SECRET, 1),
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE templates SET description = ?1 WHERE rowid = (SELECT MIN(rowid) FROM templates)",
+        [format!("template {HISTORICAL_SECRET}")],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE events SET raw = ?1, dedup_key = dedup_key || ?2 \
+         WHERE rowid = (SELECT MIN(rowid) FROM events)",
+        rusqlite::params![
+            serde_json::to_string(&format!("diagnostic {HISTORICAL_SECRET}")).unwrap(),
+            HISTORICAL_SECRET
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE settings SET value_json = ?2 WHERE key = ?1",
+        rusqlite::params![
+            "test.durable-secret",
+            serde_json::to_string(&format!("setting {HISTORICAL_SECRET}")).unwrap()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE attention_entries SET summary = ?1, subject_external_id = ?2, \
+             dedup_key = dedup_key || '|' || ?2 \
+         WHERE rowid = (SELECT MIN(rowid) FROM attention_entries)",
+        rusqlite::params![format!("permission {HISTORICAL_SECRET}"), HISTORICAL_SECRET],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE workspace_checkouts SET branch = ?2 WHERE workspace_id = ?1 AND is_primary = 0",
+        rusqlite::params![workspace_id.as_str(), format!("legacy/{HISTORICAL_SECRET}")],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE activity_previews SET normalized_text = ?2, \
+             contains_sensitive_data = 0, redacted = 0 WHERE node_id = ?1",
+        rusqlite::params![node_id.as_str(), format!("preview {HISTORICAL_SECRET}")],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO workspace_audit_events \
+             (id, workspace_id, event_name, timestamp_ms, session_id, payload_json, \
+              confidence, dedup_key) \
+         VALUES ('audit_legacy', ?1, 'tree.node_selected', 1, ?2, ?3, 'explicit', ?4)",
+        rusqlite::params![
+            workspace_id.as_str(),
+            session_id.as_str(),
+            serde_json::to_string(&serde_json::json!({
+                "diagnostic": HISTORICAL_SECRET
+            }))
+            .unwrap(),
+            format!("audit-{HISTORICAL_SECRET}")
+        ],
+    )
+    .unwrap();
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(conn);
+
+    let bytes = all_bytes(dir);
+    assert!(
+        bytes
+            .iter()
+            .any(|(_, bytes)| contains(bytes, HISTORICAL_SECRET.as_bytes())),
+        "the v8 fixture never put the credential in SQLite"
+    );
+    assert!(
+        bytes
+            .iter()
+            .any(|(_, bytes)| contains(bytes, HISTORICAL_ENV_VALUE.as_bytes())),
+        "the v8 fixture never put the sensitive-key value in SQLite"
+    );
+
+    (path, workspace_id, session_id, node_id)
+}
+
+#[test]
+fn v9_physically_scrubs_all_historical_text_classes_and_reopens_cleanly() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, workspace_id, session_id, node_id) = historical_v8_fixture(temp.path());
+
+    {
+        let store = Store::open_at(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), turn_store::LATEST_VERSION);
+        assert_eq!(
+            store.workspaces().get(&workspace_id).unwrap().unwrap().id,
+            workspace_id,
+            "redaction changed a Workspace identity"
+        );
+        let session = store.sessions().get(&session_id).unwrap().unwrap();
+        assert_eq!(
+            session.id, session_id,
+            "redaction changed a Session identity"
+        );
+        let node = store
+            .nodes()
+            .get(&node_id)
+            .unwrap()
+            .expect("redaction changed a Process Node identity");
+        let agent = node.agent.expect("the agent metadata must remain readable");
+        assert_eq!(agent.tokens_used, Some(4242));
+        assert_eq!(agent.cost_usd, Some(12.5));
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        let (sensitive, redacted): (bool, bool) = sqlite
+            .query_row(
+                "SELECT contains_sensitive_data, redacted FROM activity_previews \
+                 WHERE node_id = ?1 ORDER BY id DESC LIMIT 1",
+                [node_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(sensitive && redacted, "preview provenance was not repaired");
+        let pending: bool = sqlite
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN ( \
+                     'security.hook_raw_purge_pending', \
+                     'security.legacy_free_text_purge_pending'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!pending, "a successful purge left its retry marker");
+        assert_eq!(
+            logical_text_hits(&sqlite, HISTORICAL_SECRET),
+            Vec::<(String, String, i64)>::new(),
+            "a durable TEXT value was not redacted"
+        );
+        assert_eq!(
+            logical_text_hits(&sqlite, HISTORICAL_ENV_VALUE),
+            Vec::<(String, String, i64)>::new(),
+            "a sensitive environment value was not redacted"
+        );
+    }
+
+    assert_needles_absent(
+        temp.path(),
+        &[HISTORICAL_SECRET, HISTORICAL_ENV_VALUE],
+        "after v9's checkpoint and rebuild",
+    );
+
+    let reopened = Store::open_at(&path).unwrap();
+    assert_eq!(
+        reopened.schema_version().unwrap(),
+        turn_store::LATEST_VERSION
+    );
+    assert!(reopened.sessions().get(&session_id).unwrap().is_some());
+    drop(reopened);
+    assert_needles_absent(
+        temp.path(),
+        &[HISTORICAL_SECRET, HISTORICAL_ENV_VALUE],
+        "after a second daemon open",
+    );
+}
+
+#[test]
+fn a_busy_wal_keeps_the_marker_and_the_next_open_retries_the_physical_purge() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, workspace_id, _, _) = historical_v8_fixture(temp.path());
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    reader
+        .execute_batch("PRAGMA journal_mode = WAL; BEGIN;")
+        .unwrap();
+    let visible: String = reader
+        .query_row(
+            "SELECT name FROM workspaces WHERE id = ?1",
+            [workspace_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(visible.contains(HISTORICAL_SECRET));
+
+    let error = Store::open_at(&path).expect_err("the pinned WAL must defer physical erasure");
+    assert!(matches!(
+        error,
+        turn_store::StoreError::SecurityMaintenanceIncomplete { .. }
+    ));
+    drop(reader);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let pending: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key = 'security.legacy_free_text_purge_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(pending, "the failed physical pass lost its retry marker");
+    drop(conn);
+
+    let store = Store::open_at(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), turn_store::LATEST_VERSION);
+    drop(store);
+    assert_needles_absent(
+        temp.path(),
+        &[HISTORICAL_SECRET, HISTORICAL_ENV_VALUE],
+        "after retrying without the busy reader",
+    );
+}
+
+#[test]
+fn v9_fails_explicitly_instead_of_rewriting_a_historical_checkout_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join(turn_store::DATABASE_FILE);
+    let root = temp.path().join(HISTORICAL_SECRET);
+    std::fs::create_dir(&root).unwrap();
+    let root = std::fs::canonicalize(root)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        turn_store::migrations::apply_to(&conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+             attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+             VALUES ('ws_old', 'legacy', ?1, '[]', '[]', '{}', 1, 1, 0, 0)",
+            [&root],
+        )
+        .unwrap();
+        turn_store::migrations::apply_to(&conn, 8).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+    }
+
+    let error = Store::open_at(&path).expect_err("a checkout identity must never be redacted");
+    assert!(matches!(
+        error,
+        turn_store::StoreError::SecretInStructuralField {
+            what: "workspace root",
+            ..
+        }
+    ));
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        turn_store::migrations::schema_version(&conn).unwrap(),
+        turn_store::LATEST_VERSION,
+        "the append-only migration must remain applied so maintenance retries"
+    );
+    let stored: (String, String, String) = conn
+        .query_row(
+            "SELECT w.root, c.path, c.canonical_path FROM workspaces w \
+             JOIN workspace_checkouts c ON c.workspace_id = w.id AND c.is_primary = 1 \
+             WHERE w.id = 'ws_old'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (root.clone(), root.clone(), root));
+    let pending: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key = 'security.legacy_free_text_purge_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(pending, "the structural-path gate lost the retry marker");
 }
 
 /// The control for the control: absence of a secret from a table proves nothing

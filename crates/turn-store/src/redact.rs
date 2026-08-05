@@ -567,7 +567,7 @@ fn attention_policy_for_persistence(policy: &AttentionPolicy) -> AttentionPolicy
     safe
 }
 
-fn activity_preview_for_persistence(preview: &ActivityPreview) -> ActivityPreview {
+pub(crate) fn activity_preview_for_persistence(preview: &ActivityPreview) -> ActivityPreview {
     let mut safe = preview.clone();
     let text = redact_secrets(&safe.normalized_text);
     if text != safe.normalized_text {
@@ -608,7 +608,7 @@ fn pending_permission_for_persistence(permission: &PendingPermission) -> Pending
     }
 }
 
-fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
+pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
     AgentInfo {
         agent: agent_ref_for_persistence(&agent.agent),
         name: agent_name_for_persistence(&agent.name),

@@ -155,6 +155,12 @@ pub enum StoreError {
         owner_id: String,
     },
 
+    /// A one-shot security cleanup could not complete. Its durable marker stays
+    /// in place, so the next open retries rather than pretending the old bytes
+    /// are gone.
+    #[error("legacy credential cleanup is incomplete and will retry on next open: {reason}")]
+    SecurityMaintenanceIncomplete { reason: String },
+
     #[error("could not create the data directory {path}: {cause}")]
     DataDir {
         path: String,

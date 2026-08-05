@@ -60,6 +60,7 @@
 mod codec;
 pub mod error;
 pub mod location;
+mod maintenance;
 pub mod migrations;
 pub mod redact;
 pub mod repo;
@@ -189,28 +190,11 @@ impl Store {
             }
         }
         let applied = migrations::apply(&self.conn)?;
-        // v5 removes callback bodies from rows, but an UPDATE alone is not a
-        // physical erasure: the old bytes can remain in free database pages or
-        // in the WAL. Its durable marker makes this rebuild retryable if a busy
-        // database or full disk interrupts the first upgraded open.
-        let hook_raw_purge_pending: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM settings \
-             WHERE key = 'security.hook_raw_purge_pending')",
-            [],
-            |row| row.get(0),
-        )?;
-        if hook_raw_purge_pending {
-            self.conn.execute_batch(
-                "PRAGMA wal_checkpoint(TRUNCATE); \
-                 PRAGMA secure_delete = ON; \
-                 VACUUM; \
-                 PRAGMA wal_checkpoint(TRUNCATE);",
-            )?;
-            self.conn.execute(
-                "DELETE FROM settings WHERE key = 'security.hook_raw_purge_pending'",
-                [],
-            )?;
-        }
+        // SQL migrations can mark a physical purge as required, but VACUUM may
+        // not run inside their transaction. The marker remains until this
+        // retryable pass has redacted every historical free-text column,
+        // rebuilt the database and truncated the WAL.
+        maintenance::run(&self.conn, self.path.is_some())?;
         // SQL cannot resolve symlinks or prove a checkout still exists. Perform
         // that part of the v6 safety migration against the real filesystem. The
         // pass is idempotent and deliberately never clears a reconciliation flag.
