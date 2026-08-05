@@ -12,7 +12,7 @@ use super::Answer;
 use crate::core::Core;
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    HierarchyNodeKind, PaneNodeBinding, PreviewVisibility, SessionMode, TreeUiState,
+    HierarchyNodeKind, LeaseState, PaneNodeBinding, PreviewVisibility, SessionMode, TreeUiState,
 };
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
@@ -279,12 +279,11 @@ impl Core {
                 entries: Vec::new(),
             });
         }
-        let mut entries = self
+        let entries = self
             .store
             .hierarchy()
             .preview_history(node_id, usize::from(limit.unwrap_or(8)))
             .map_err(store)?;
-        entries.reverse();
         Ok(Response::PreviewHistory {
             session_id: session_id.clone(),
             node_id: node_id.clone(),
@@ -505,7 +504,7 @@ impl Core {
             let Ok(Some(lease)) = self.store.hierarchy().active_lease(workspace) else {
                 continue;
             };
-            if self.sessions.contains_key(&lease.session_id) {
+            if lease.state == LeaseState::Active && self.sessions.contains_key(&lease.session_id) {
                 if let Err(error) =
                     self.store
                         .hierarchy()
@@ -870,15 +869,48 @@ mod tests {
             )
             .unwrap();
 
+        // The wire contract is newest-first. Persist enough distinct facts to
+        // prove both ordering and that the limit is applied to the newest end.
+        for sequence in 2..=6_u64 {
+            let reviewer = harness.core.sessions[&session_id]
+                .tree
+                .get(&reviewer_id)
+                .unwrap();
+            let mut preview = reviewer.activity_preview.clone().unwrap();
+            preview.raw_source_sequence = Some(sequence);
+            preview.normalized_text = format!("Reviewer preview {sequence}");
+            preview.updated_ms = NOW + 7 + sequence as i64;
+            harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .get_mut(&reviewer_id)
+                .unwrap()
+                .activity_preview = Some(preview);
+            harness.core.persist_session(&session_id).unwrap();
+        }
+
         let history = harness
             .core
-            .get_preview_history(&session_id, &reviewer_id, Some(8))
+            .get_preview_history(&session_id, &reviewer_id, Some(4))
             .unwrap();
-        assert!(matches!(
-            history,
-            Response::PreviewHistory { ref entries, .. }
-                if entries.last().is_some_and(|preview| preview.normalized_text == "Reviewing climb_system.gd…")
-        ));
+        let Response::PreviewHistory { entries, .. } = history else {
+            panic!("unexpected preview response");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|preview| preview.normalized_text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Reviewer preview 6",
+                "Reviewer preview 5",
+                "Reviewer preview 4",
+                "Reviewer preview 3",
+            ]
+        );
 
         harness
             .core
@@ -1013,7 +1045,7 @@ mod tests {
                 .activity_preview
                 .as_ref()
                 .map(|preview| preview.normalized_text.as_str()),
-            Some("Reviewing climb_system.gd…")
+            Some("Reviewer preview 6")
         );
         assert!(reviewer.pane_bindings.is_empty());
     }

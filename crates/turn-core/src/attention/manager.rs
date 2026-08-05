@@ -117,6 +117,19 @@ impl AttentionManager {
         Self::default()
     }
 
+    /// Restores the durable queue without replaying old demands as new events.
+    ///
+    /// Focus cooldowns, deferred focus requests and transient mute timers belong
+    /// to the daemon process that created them, so they intentionally start
+    /// empty. Queue entries, by contrast, retain their exact persisted identity,
+    /// age, state and priority.
+    pub fn from_persisted_queue(queue: AttentionQueue) -> Self {
+        Self {
+            queue,
+            ..Self::default()
+        }
+    }
+
     pub fn queue(&self) -> &AttentionQueue {
         &self.queue
     }

@@ -401,6 +401,10 @@ can list them as implemented.
 snapshots omit the current activity preview and `get_preview_history` returns no entries. It does not erase
 the Process stream or stop the Agent; restoring `inherit` or `show` exposes only stable, redacted preview facts.
 
+`preview_history.entries` is ordered **newest first**. The optional limit is applied to that newest end, so
+with six stored facts and `limit: 4` the response contains `[6, 5, 4, 3]`; entry zero is the item Quick Preview
+highlights as current.
+
 ### Workspaces
 
 | `op` | Fields | Answers with |
@@ -586,7 +590,9 @@ user wanted kept or leak processes they thought were gone.
 
 `keep_processes`, closing the UI and archiving a Session with a live writer do not release its checkout
 lease. A fenced explicit release is valid only after write-capable processes stopped or the Session changed
-mode; daemon restart reconciliation never treats a silent heartbeat alone as proof.
+mode. Before restoring Sessions or emitting any heartbeat, a new daemon changes every non-`released` lease
+to `recovery_required` while preserving its id, generation and previous heartbeat. Loading the former owner
+never auto-adopts that authority; release/reacquisition remains explicit.
 
 ### Examples
 
@@ -641,7 +647,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
 | `hierarchy` | `snapshot: HierarchySnapshot` |
-| `preview_history` | `session_id`, `node_id`, `previews: [ActivityPreview]` |
+| `preview_history` | `session_id`, `node_id`, `entries: [ActivityPreview]` (newest first) |
 | `pane_binding` | `binding: PaneBindingView`, `capability` |
 | `workspace_write_lease` | `workspace_id`, `lease?: WorkspaceWriteLeaseView` |
 

@@ -22,8 +22,7 @@ use super::Core;
 use crate::error::Result;
 use crate::paths;
 use std::collections::HashSet;
-use turn_core::attention::{Action, AttentionPolicy, Trigger};
-use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
+use turn_core::attention::AttentionManager;
 use turn_core::ids::SessionId;
 use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
 use turn_core::state::Lifecycle;
@@ -32,6 +31,14 @@ use turn_proto::{PaneRestoreOutcome, ServerEvent};
 impl Core {
     /// Loads everything from the store and decides what became of each process.
     pub(crate) fn restore(&mut self, now_ms: i64) -> Result<()> {
+        // This must be the first state transition of a new daemon generation.
+        // Loading a Session is not proof that its previous daemon relinquished
+        // checkout authority, and no heartbeat or launch may auto-adopt it.
+        let leases_requiring_recovery = self
+            .store
+            .hierarchy()
+            .require_recovery_after_daemon_restart()?;
+
         let installed = self.store.templates().install_built_ins(now_ms)?;
         for template in self.store.templates().list()? {
             self.templates.insert(template.id.clone(), template);
@@ -75,7 +82,7 @@ impl Core {
 
         // After the verdicts, so a demand raised by a process that turned out to be gone
         // is not put back in front of the user.
-        self.restore_queue(now_ms)?;
+        self.restore_queue()?;
         // Written straight back, so the demands this start-up decided against do not sit
         // on disk waiting to be reconsidered by the next one.
         self.persist_attention();
@@ -89,41 +96,24 @@ impl Core {
             templates = self.templates.len(),
             built_ins_installed = installed,
             attention = self.attention.queue().len(),
+            leases_requiring_recovery,
             scratch_pruned = pruned,
             "restored"
         );
         Ok(())
     }
 
-    /// Rebuilds the attention queue from the store.
+    /// Rebuilds the attention manager around its exact durable queue.
     ///
-    /// Replayed through the manager rather than assigned, because the manager owns the
-    /// queue and its deduplication rules. The replay uses a policy that does nothing
-    /// but enqueue: a daemon starting must not fire the notifications and sounds for
-    /// demands the user has already seen, and it must certainly not move their focus
-    /// before a window even exists.
-    ///
-    /// Two things do not survive, and it is better to say so than to imply otherwise:
-    /// an entry's original age (the ranking clock starts again now) and a snooze (a
-    /// postponed demand comes back pending). Both would need the manager to accept a
-    /// queue wholesale.
-    fn restore_queue(&mut self, now_ms: i64) -> Result<()> {
-        let policy = AttentionPolicy {
-            on_waiting_for_user: vec![Action::Enqueue],
-            ..AttentionPolicy::silent()
-        };
-        debug_assert!(
-            policy
-                .resolve(Trigger::WaitingForUser, Confidence::Explicit)
-                .iter()
-                .all(|action| !action.is_focus()),
-            "restoring the queue must not be able to move the user"
-        );
-
-        let context = turn_core::UserContext::default();
-        for entry in self.store.attention().list()? {
+    /// Entries are not replayed as events: replay would mint identities, reset
+    /// age, wake snoozes, discard acknowledgements and potentially emit effects.
+    /// Reconciliation may only remove an entry whose owning runtime invariant no
+    /// longer holds.
+    fn restore_queue(&mut self) -> Result<()> {
+        let mut queue = self.store.attention().load_queue()?;
+        queue.retain(|entry| {
             let Some(session) = self.sessions.get(&entry.session_id) else {
-                continue;
+                return false;
             };
             // A demand belongs to a process. If that process turned out to be gone, the
             // demand went with it: the agent that was waiting for an answer is not there
@@ -139,37 +129,12 @@ impl Core {
                         session = %entry.session_id, %node,
                         "dropped a stored demand: its process did not survive"
                     );
-                    continue;
+                    return false;
                 }
             }
-            let mut event = TurnEvent::new(
-                entry.session_id.clone(),
-                EventKind::AgentWaitingForUser {
-                    reason: entry.reason,
-                    summary: entry.summary.clone(),
-                },
-                // The confidence the demand was originally raised with is preserved, so
-                // a demand a heuristic guessed at still ranks as provisional and still
-                // cannot be promoted into a focus change by coming back from disk.
-                EventSource::Hook {
-                    tool: "restore".to_string(),
-                    event_name: "attention".to_string(),
-                },
-                entry.confidence,
-                now_ms,
-            );
-            if let Some(node) = &entry.node_id {
-                event = event.with_node(node.clone());
-            }
-            let effects = self.attention.ingest(&event, &policy, &context, now_ms);
-            debug_assert!(
-                effects.iter().all(|effect| !matches!(
-                    effect,
-                    turn_core::Effect::Focus { .. } | turn_core::Effect::Notify { .. }
-                )),
-                "restoring a demand produced an effect the user would notice"
-            );
-        }
+            true
+        });
+        self.attention = AttentionManager::from_persisted_queue(queue);
         Ok(())
     }
 

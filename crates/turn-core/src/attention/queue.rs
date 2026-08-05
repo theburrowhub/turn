@@ -227,6 +227,17 @@ impl AttentionQueue {
     pub fn get(&self, id: &AttentionId) -> Option<&AttentionEntry> {
         self.entries.iter().find(|e| &e.id == id)
     }
+
+    /// Keeps only demands that still have a live owner after durable state is
+    /// reconciled with runtime state.
+    ///
+    /// This deliberately does not replay entries through [`Self::upsert`]: a
+    /// restart must preserve every durable field, including acknowledgement,
+    /// snooze deadline, age and identity. The predicate is only allowed to
+    /// remove entries whose Session or live Process can no longer own a demand.
+    pub fn retain(&mut self, mut keep: impl FnMut(&AttentionEntry) -> bool) {
+        self.entries.retain(|entry| keep(entry));
+    }
 }
 
 #[cfg(test)]

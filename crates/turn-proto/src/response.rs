@@ -164,7 +164,8 @@ pub enum Response {
     PreviewHistory {
         session_id: SessionId,
         node_id: NodeId,
-        /// Newest last, bounded and already stable/redacted.
+        /// Newest first, bounded and already stable/redacted. Entry zero is the
+        /// current item highlighted by Quick Preview.
         entries: Vec<ActivityPreview>,
     },
     /// One explicit temporary Pane binding. It never mutates saved Layout.

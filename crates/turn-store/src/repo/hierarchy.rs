@@ -680,6 +680,22 @@ impl<'a> HierarchyRepo<'a> {
         )? > 0)
     }
 
+    /// Fences every lease inherited from an earlier daemon generation.
+    ///
+    /// No live lease may be adopted merely because its owning Session was loaded
+    /// from SQLite. Keeping the old heartbeat is intentional: it records the last
+    /// proof emitted by the previous daemon and must not be confused with proof
+    /// from this one. Released rows are historical and remain untouched.
+    pub fn require_recovery_after_daemon_restart(&self) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE workspace_write_leases SET state = 'recovery_required' \
+                 WHERE state != 'released'",
+                [],
+            )
+            .map_err(Into::into)
+    }
+
     pub fn require_recovery(&self, id: &LeaseId, now_ms: i64) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE workspace_write_leases SET state = 'recovery_required', heartbeat_ms = ?2 \
@@ -900,8 +916,10 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use turn_core::event::Confidence;
     use turn_core::model::{
-        HierarchyNodeKind, Layout, Pane, PaneKind, ProcessNode, Session, SessionMode, Workspace,
+        ActivityPreview, HierarchyNodeKind, Layout, Pane, PaneKind, PreviewSource, ProcessNode,
+        Session, SessionMode, Workspace,
     };
 
     const T0: i64 = 1_700_000_000_000;
@@ -1053,6 +1071,97 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1, "verification must not mint a replacement lease");
+    }
+
+    #[test]
+    fn daemon_restart_fences_every_unreleased_lease_without_forging_a_heartbeat() {
+        let store = testing::store();
+        let mut leases = Vec::new();
+        for (name, state, heartbeat) in [
+            ("active", LeaseState::Active, T0 + 10),
+            ("stale", LeaseState::Stale, T0 + 20),
+            ("recovery", LeaseState::RecoveryRequired, T0 + 30),
+            ("released", LeaseState::Released, T0 + 40),
+        ] {
+            let workspace = testing::saved_workspace(&store, name);
+            let session = testing::saved_session(&store, &workspace.id, name);
+            let checkout = CheckoutId::primary_for(&workspace.id);
+            let lease = store
+                .hierarchy()
+                .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+                .unwrap();
+            store
+                .connection()
+                .execute(
+                    "UPDATE workspace_write_leases SET state = ?2, heartbeat_ms = ?3, \
+                     released_ms = CASE WHEN ?2 = 'released' THEN ?3 ELSE NULL END \
+                     WHERE id = ?1",
+                    params![
+                        lease.id.as_str(),
+                        tag("lease state", &state).unwrap(),
+                        heartbeat
+                    ],
+                )
+                .unwrap();
+            leases.push((lease, state, heartbeat));
+        }
+
+        assert_eq!(
+            store
+                .hierarchy()
+                .require_recovery_after_daemon_restart()
+                .unwrap(),
+            3
+        );
+
+        for (before, prior_state, heartbeat) in leases {
+            let after = store
+                .hierarchy()
+                .lease(&before.id)
+                .unwrap()
+                .expect("the historical lease row");
+            let expected = if prior_state == LeaseState::Released {
+                LeaseState::Released
+            } else {
+                LeaseState::RecoveryRequired
+            };
+            assert_eq!(after.state, expected);
+            assert_eq!(after.heartbeat_ms, heartbeat, "restart is not a heartbeat");
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.generation, before.generation);
+        }
+    }
+
+    #[test]
+    fn preview_history_is_newest_first_and_applies_the_limit_to_the_newest_entries() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "previews");
+        let session = testing::saved_session(&store, &workspace.id, "history");
+        let mut node = ProcessNode::agent(session.id.clone(), "claude", &session.cwd, T0);
+
+        for sequence in 1..=6_u64 {
+            node.activity_preview = Some(ActivityPreview {
+                node_id: node.id.clone(),
+                raw_source_sequence: Some(sequence),
+                normalized_text: format!("preview {sequence}"),
+                source: PreviewSource::SemanticEvent,
+                confidence: Confidence::Explicit,
+                stable: true,
+                contains_sensitive_data: false,
+                redacted: false,
+                updated_ms: T0 + sequence as i64,
+            });
+            store.nodes().upsert(&node).unwrap();
+        }
+
+        let texts: Vec<_> = store
+            .hierarchy()
+            .preview_history(&node.id, 4)
+            .unwrap()
+            .into_iter()
+            .map(|preview| preview.normalized_text)
+            .collect();
+        assert_eq!(texts, ["preview 6", "preview 5", "preview 4", "preview 3"]);
     }
 
     #[test]

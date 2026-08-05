@@ -537,6 +537,19 @@ fn visible_preview(node: &TreeNodeView) -> Option<&turn_core::model::ActivityPre
     }
 }
 
+/// Quick Preview consumes the protocol's newest-first history as-is. Keeping
+/// this selection separate from painting makes the ordering contract testable:
+/// index zero is the highlighted current item, followed by the three preceding
+/// stable facts.
+fn quick_preview_history(history: &[ActivityPreview]) -> Vec<ActivityPreview> {
+    history
+        .iter()
+        .filter(|preview| !preview.contains_sensitive_data || preview.redacted)
+        .take(4)
+        .cloned()
+        .collect()
+}
+
 fn effective_selection(snapshot: &HierarchySnapshot, state: &ViewState) -> Option<HierarchyKey> {
     state
         .selected_tree
@@ -2366,15 +2379,13 @@ impl<'a> TurnView<'a> {
         state: &mut ViewState,
         full: Rect,
     ) {
-        let history: Vec<ActivityPreview> = state
-            .preview_history
-            .get(&node.node_id)
-            .into_iter()
-            .flatten()
-            .filter(|preview| !preview.contains_sensitive_data || preview.redacted)
-            .take(4)
-            .cloned()
-            .collect();
+        let history = quick_preview_history(
+            state
+                .preview_history
+                .get(&node.node_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
         let width = 600.0_f32.min((full.width() - 36.0).max(0.0));
         let height = 260.0_f32.min((full.height() - 36.0).max(0.0));
         let panel = Rect::from_center_size(full.center(), Vec2::new(width, height));
@@ -3570,6 +3581,36 @@ mod tests {
         preview.contains_sensitive_data = true;
         preview.redacted = false;
         assert!(visible_preview(node).is_none());
+    }
+
+    #[test]
+    fn quick_preview_shows_and_highlights_the_four_newest_entries() {
+        let (snapshot, root_id, _, _) = hierarchy_fixture();
+        let base = snapshot.workspaces[0].sessions[0]
+            .nodes
+            .iter()
+            .find(|node| node.node_id == root_id)
+            .and_then(|node| node.activity_preview.clone())
+            .unwrap();
+        let newest_first: Vec<_> = (1..=6_u64)
+            .rev()
+            .map(|sequence| ActivityPreview {
+                raw_source_sequence: Some(sequence),
+                normalized_text: sequence.to_string(),
+                updated_ms: T0 + sequence as i64,
+                ..base.clone()
+            })
+            .collect();
+
+        let visible = quick_preview_history(&newest_first);
+        assert_eq!(
+            visible
+                .iter()
+                .map(|preview| preview.normalized_text.as_str())
+                .collect::<Vec<_>>(),
+            ["6", "5", "4", "3"]
+        );
+        assert_eq!(visible[0].normalized_text, "6", "index zero is highlighted");
     }
 
     /// The accessible name has to carry everything the visuals do, because that is all

@@ -3,9 +3,12 @@
 mod common;
 
 use common::*;
-use turn_core::model::{PaneKind, RestoreState};
-use turn_core::state::Lifecycle;
-use turn_proto::{Request, Response, ServerEvent};
+use turn_core::attention::{AttentionEntry, EntryState};
+use turn_core::ids::{AttentionId, CheckoutId};
+use turn_core::model::{LeaseState, PaneKind, RestoreState};
+use turn_core::state::{AwaitingReason, Lifecycle};
+use turn_core::Confidence;
+use turn_proto::{ErrorCode, ProtoErrorContext, Request, Response, ServerEvent};
 
 /// Creates a workspace and a session from the Coding template.
 async fn seed(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionDetails {
@@ -58,6 +61,17 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         "Claude and the shell must run; Fang also runs when installed"
     );
     assert!(pids.iter().all(|pid| pid_is_alive(*pid)));
+    let before_lease = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected an active write lease, got {other:?}"),
+    };
     drop(ui);
 
     let daemon = daemon.restart().await;
@@ -76,6 +90,25 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
     assert_eq!(workspaces.len(), 1);
     assert_eq!(workspaces[0].id, workspace_id);
     assert_eq!(workspaces[0].name, "restarted");
+
+    let recovery_lease = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the fenced write lease, got {other:?}"),
+    };
+    assert_eq!(recovery_lease.id, before_lease.id);
+    assert_eq!(recovery_lease.generation, before_lease.generation);
+    assert_eq!(recovery_lease.state, LeaseState::RecoveryRequired);
+    assert_eq!(
+        recovery_lease.heartbeat_ms, before_lease.heartbeat_ms,
+        "starting a new daemon must not forge the previous owner's heartbeat"
+    );
 
     let sessions = match ui
         .ask(Request::ListSessions {
@@ -154,7 +187,8 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         );
     }
 
-    // The offer is answered by the user, and only then does anything run.
+    // A restart never auto-adopts the old write authority. Even an explicit process
+    // relaunch fails closed until the user reconciles the fenced lease.
     let shell_pane = after
         .layout
         .panes()
@@ -163,6 +197,65 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         .cloned()
         .expect("the shell pane");
     let dead_node = shell_pane.node_id.clone().expect("its lost node record");
+    let refused = ui
+        .try_ask(Request::RelaunchNode {
+            session_id: session_id.clone(),
+            node_id: dead_node.clone(),
+            resume: false,
+        })
+        .await
+        .expect_err("recovery-required is not launch authority");
+    assert_eq!(refused.code, ErrorCode::Refused);
+    assert!(refused
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("reconciliation")));
+
+    // Re-acquiring without releasing is also not adoption. It remains a typed
+    // conflict naming the durable owner and the recovery-required lease.
+    let conflict = ui
+        .try_ask(Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: CheckoutId::primary_for(&workspace_id),
+        })
+        .await
+        .expect_err("the inherited claim must be reconciled explicitly");
+    assert_eq!(conflict.code, ErrorCode::Conflict);
+    assert!(matches!(
+        conflict.context.as_deref(),
+        Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+            lease,
+            owner,
+            ..
+        }) if lease.id == before_lease.id
+            && lease.state == LeaseState::RecoveryRequired
+            && owner.session_id == session_id
+    ));
+
+    ui.ask(Request::ReleaseWorkspaceWriteLease {
+        workspace_id: workspace_id.clone(),
+        lease_id: recovery_lease.id,
+        expected_generation: recovery_lease.generation,
+    })
+    .await;
+    let acquired = match ui
+        .ask(Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: CheckoutId::primary_for(&workspace_id),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected an explicitly reacquired lease, got {other:?}"),
+    };
+    assert_eq!(acquired.state, LeaseState::Active);
+    assert!(acquired.generation > before_lease.generation);
+
+    // The offer is answered by the user only after explicit reconciliation.
     let relaunched = node_of(
         ui.ask(Request::RelaunchNode {
             session_id: session_id.clone(),
@@ -205,6 +298,8 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
         .spawn()
         .expect("sleep must start");
     let survivor_pid = survivor.id();
+    let mut expected_entries = Vec::new();
+    let discarded_id;
 
     {
         let store = turn_store::Store::open_in(&data_dir).expect("the store must open");
@@ -234,29 +329,70 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
         impostor.title = "impostor".to_string();
         store.nodes().upsert(&impostor).expect("the node must save");
 
-        // A demand each. One process survives and one did not, which is what decides
-        // whether its demand should be put back in front of the user.
-        for (node_id, reason) in [
-            (node.id.clone(), turn_core::state::AwaitingReason::Question),
-            (impostor.id.clone(), turn_core::state::AwaitingReason::Input),
-        ] {
-            let entry = turn_core::attention::AttentionEntry {
-                id: turn_core::ids::AttentionId::new(),
+        // Every durable field and state must survive for a process that survives.
+        // The fourth demand belongs to the pid-reuse impostor and must be the only
+        // one removed by runtime reconciliation.
+        for (index, (reason, state, confidence, boost)) in [
+            (
+                AwaitingReason::Question,
+                EntryState::Pending,
+                Confidence::Explicit,
+                7,
+            ),
+            (
+                AwaitingReason::Permission,
+                EntryState::Snoozed {
+                    until_ms: turn_core::now_ms() + 600_000,
+                },
+                Confidence::Integrated,
+                19,
+            ),
+            (
+                AwaitingReason::Credentials,
+                EntryState::Acknowledged,
+                Confidence::InferredHigh,
+                -4,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let created_ms = turn_core::now_ms() - 120_000 + index as i64 * 1_000;
+            let entry = AttentionEntry {
+                id: AttentionId::new(),
                 session_id: session_id.clone(),
-                node_id: Some(node_id),
+                node_id: Some(node.id.clone()),
                 reason,
-                summary: Some("from before the restart".to_string()),
-                confidence: turn_core::Confidence::Explicit,
-                created_ms: turn_core::now_ms(),
-                updated_ms: turn_core::now_ms(),
-                state: turn_core::attention::EntryState::Pending,
-                priority_boost: 0,
+                summary: Some(format!("durable demand {index}")),
+                confidence,
+                created_ms,
+                updated_ms: created_ms + 333,
+                state,
+                priority_boost: boost,
             };
             store
                 .attention()
                 .upsert(&entry)
                 .expect("the entry must save");
+            expected_entries.push(entry);
         }
+        let discarded = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session_id.clone(),
+            node_id: Some(impostor.id.clone()),
+            reason: AwaitingReason::Input,
+            summary: Some("nobody remains to answer this".into()),
+            confidence: Confidence::Explicit,
+            created_ms: turn_core::now_ms() - 240_000,
+            updated_ms: turn_core::now_ms() - 239_000,
+            state: EntryState::Pending,
+            priority_boost: 100,
+        };
+        discarded_id = discarded.id.clone();
+        store
+            .attention()
+            .upsert(&discarded)
+            .expect("the discarded entry must save");
     }
 
     let daemon = TestDaemon::adopt(dir).await;
@@ -297,23 +433,26 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
         "some of the work is alive and some of it is not"
     );
 
-    // The demand for the surviving process comes back. The one for the process that
-    // turned out to be gone does not: there is nobody left to answer it.
+    // The three demands for the surviving process come back byte-for-byte as domain
+    // values. The one for the process that turned out to be gone does not: there is
+    // nobody left to answer it.
     let entries = attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await);
-    assert_eq!(entries.len(), 1, "{entries:#?}");
-    assert_eq!(
-        entries[0].entry.node_id.as_ref(),
-        Some(&survivor_view.node_id)
-    );
-    assert_eq!(
-        entries[0].entry.reason,
-        turn_core::state::AwaitingReason::Question
-    );
-    assert_eq!(
-        entries[0].entry.summary.as_deref(),
-        Some("from before the restart"),
-        "what the agent was asking for survives with it"
-    );
+    assert_eq!(entries.len(), expected_entries.len(), "{entries:#?}");
+    assert!(!entries.iter().any(|view| view.entry.id == discarded_id));
+    for expected in &expected_entries {
+        let restored = entries
+            .iter()
+            .find(|view| view.entry.id == expected.id)
+            .unwrap_or_else(|| panic!("missing restored demand {}", expected.id));
+        assert_eq!(
+            &restored.entry, expected,
+            "id, age, snooze/ack state and boost must be preserved"
+        );
+        assert_eq!(
+            restored.entry.node_id.as_ref(),
+            Some(&survivor_view.node_id)
+        );
+    }
 
     // Nothing Turn does not hold can be written to, however alive it looks.
     let error = ui
