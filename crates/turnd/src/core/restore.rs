@@ -131,6 +131,18 @@ impl Core {
                     );
                     return false;
                 }
+            } else if let Some(parent) = &entry.parent_node_id {
+                let parent_still_there = session
+                    .tree
+                    .get(parent)
+                    .is_some_and(|node| node.lifecycle.is_running());
+                if !parent_still_there {
+                    tracing::debug!(
+                        session = %entry.session_id, %parent,
+                        "dropped a stored unresolved demand: its hook parent did not survive"
+                    );
+                    return false;
+                }
             }
             true
         });

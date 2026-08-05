@@ -14,8 +14,8 @@ use turn_core::ids::{AttentionId, NodeId, SessionId};
 use turn_core::state::AwaitingReason;
 use turn_core::Confidence;
 
-const COLUMNS: &str = "id, session_id, node_id, reason, summary, confidence, created_ms, \
-     updated_ms, state_json, priority_boost";
+const COLUMNS: &str = "id, session_id, node_id, parent_node_id, subject_external_id, reason, \
+     summary, confidence, created_ms, updated_ms, state_json, priority_boost";
 
 pub struct AttentionRepo<'a> {
     conn: &'a Connection,
@@ -153,9 +153,10 @@ fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId
     let confidence = confidence_to_store(conn, &key, entry.confidence)?;
 
     conn.execute(
-        "INSERT INTO attention_entries (id, session_id, node_id, reason, summary, \
-             confidence, created_ms, updated_ms, state_json, priority_boost, dedup_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+        "INSERT INTO attention_entries (id, session_id, node_id, parent_node_id, \
+             subject_external_id, reason, summary, confidence, created_ms, updated_ms, \
+             state_json, priority_boost, dedup_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
          ON CONFLICT(dedup_key) DO UPDATE SET \
              summary = COALESCE(excluded.summary, summary), \
              confidence = excluded.confidence, updated_ms = excluded.updated_ms, \
@@ -164,6 +165,8 @@ fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId
             entry.id.as_str(),
             entry.session_id.as_str(),
             entry.node_id.as_ref().map(|n| n.as_str()),
+            entry.parent_node_id.as_ref().map(|n| n.as_str()),
+            entry.subject_external_id.as_deref(),
             tag("attention reason", &entry.reason)?,
             summary,
             tag("confidence", &confidence)?,
@@ -226,6 +229,10 @@ fn from_row(row: &Row<'_>) -> Result<AttentionEntry> {
         node_id: row
             .get::<_, Option<String>>("node_id")?
             .map(NodeId::from_stored),
+        parent_node_id: row
+            .get::<_, Option<String>>("parent_node_id")?
+            .map(NodeId::from_stored),
+        subject_external_id: row.get("subject_external_id")?,
         reason: from_tag::<AwaitingReason>(
             "attention reason",
             &id,
@@ -260,6 +267,8 @@ mod tests {
             id: AttentionId::new(),
             session_id: session.clone(),
             node_id: None,
+            parent_node_id: None,
+            subject_external_id: None,
             reason,
             summary: None,
             confidence: Confidence::Explicit,
@@ -275,7 +284,8 @@ mod tests {
         let store = testing::store();
         let session = testing::saved_session_anywhere(&store, "blocked");
         let mut demand = entry(&session.id, AwaitingReason::Permission, T0);
-        demand.node_id = Some(NodeId::from_stored("proc_agent"));
+        demand.parent_node_id = Some(NodeId::from_stored("proc_parent"));
+        demand.subject_external_id = Some("worker-reviewer".into());
         demand.summary = Some("run make verify".into());
         demand.confidence = Confidence::InferredHigh;
         demand.priority_boost = -20;

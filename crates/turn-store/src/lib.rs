@@ -361,6 +361,8 @@ pub(crate) mod testing {
             id: AttentionId::new(),
             session_id: session.clone(),
             node_id: None,
+            parent_node_id: None,
+            subject_external_id: None,
             reason: AwaitingReason::Permission,
             summary: None,
             confidence: Confidence::Explicit,

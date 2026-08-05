@@ -10,7 +10,7 @@ use common::agent::*;
 use common::*;
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, EventKind, EventSource};
-use turn_core::model::PaneKind;
+use turn_core::model::{NodeKind, PaneKind};
 use turn_core::state::{AwaitingReason, DisplayState, Turn};
 use turn_proto::{CloseDisposition, HierarchyKey, NewPane, Request, Response, ServerEvent};
 
@@ -369,6 +369,316 @@ async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer()
     assert!(attention_list_of(
         ui.ask(Request::ListAttention {
             session_id: Some(agent.session.clone()),
+        })
+        .await
+    )
+    .is_empty());
+
+    daemon.shutdown().await;
+}
+
+/// Adversarial correlation regression: two authenticated parent runtimes share a
+/// Session, callbacks arrive before declarations, and id-less resumes interleave.
+/// No event may borrow a sibling's identity or clear another parent's demand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_hook_parents_keep_out_of_order_and_idless_attention_in_their_own_scopes() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let root = daemon
+        .data_dir()
+        .join("workspaces")
+        .join(turn_core::ids::WorkspaceId::new().as_str());
+    std::fs::create_dir_all(&root).expect("two-parent workspace root");
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "two-parent-correlation".into(),
+            root: root.display().to_string(),
+        })
+        .await,
+    );
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "two authenticated parents".into(),
+            cwd: None,
+            panes: Some(vec![
+                NewPane::new(PaneKind::Agent).with_command("cat"),
+                NewPane::new(PaneKind::Agent).with_command("cat"),
+            ]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let parents: Vec<_> = details
+        .tree
+        .iter()
+        .filter(|node| node.kind == NodeKind::Agent && node.parent.is_none())
+        .map(|node| node.node_id.clone())
+        .collect();
+    assert_eq!(
+        parents.len(),
+        2,
+        "the test needs two independent hook parents"
+    );
+    let parent_a = parents[0].clone();
+    let parent_b = parents[1].clone();
+    let hook_a = hook_url(daemon.data_dir(), &session.id, &parent_a);
+    let hook_b = hook_url(daemon.data_dir(), &session.id, &parent_b);
+
+    // A different child already exists when a callback names Future Reviewer.
+    // The old bug assigned that callback to Existing simply because it was the
+    // only child visible at that instant.
+    post_hook(
+        &hook_a,
+        &serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "agent_name": "Existing",
+            "agent_type": "Explore",
+            "agent_id": "worker-existing",
+            "session_id": fixture_session_id(),
+        }),
+    )
+    .await;
+    let existing = ui
+        .wait_for("Existing under parent A", |event| match event {
+            ServerEvent::TreeChanged { session_id, nodes } if session_id == &session.id => nodes
+                .iter()
+                .find(|node| node.title == "Existing")
+                .map(|node| node.node_id.clone()),
+            _ => None,
+        })
+        .await;
+
+    let mut out_of_order = notification(
+        "worker_permission_prompt",
+        "Future Reviewer needs permission",
+    );
+    out_of_order["agent_id"] = serde_json::json!("worker-future-reviewer");
+    post_hook(&hook_a, &out_of_order).await;
+    let unresolved = ui
+        .wait_for("the out-of-order worker demand", |event| match event {
+            ServerEvent::TurnEventEmitted { turn_event }
+                if turn_event.session_id == session.id
+                    && matches!(
+                        &turn_event.kind,
+                        EventKind::AgentPermissionRequired { summary, .. }
+                            if summary == "Future Reviewer needs permission"
+                    ) =>
+            {
+                Some(turn_event.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(unresolved.node_id, None);
+    assert_eq!(unresolved.parent_node_id.as_ref(), Some(&parent_a));
+    assert_eq!(
+        unresolved.agent.external_id.as_deref(),
+        Some("worker-future-reviewer")
+    );
+    assert_eq!(unresolved.confidence, Confidence::Unknown);
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].entry.node_id, None);
+    assert_eq!(queued[0].entry.parent_node_id.as_ref(), Some(&parent_a));
+    assert_eq!(
+        queued[0].entry.subject_external_id.as_deref(),
+        Some("worker-future-reviewer")
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        details
+            .tree
+            .iter()
+            .find(|node| node.node_id == existing)
+            .unwrap()
+            .turn,
+        Some(Turn::Active),
+        "an explicit unknown id must not fall through to the unique other child"
+    );
+
+    // The missing declarations arrive. Parent A now has two children and parent
+    // B gets two as well, making every following id-less worker callback
+    // deliberately ambiguous within its own subtree.
+    post_hook(
+        &hook_a,
+        &serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "agent_name": "Future Reviewer",
+            "agent_type": "Explore",
+            "agent_id": "worker-future-reviewer",
+            "session_id": fixture_session_id(),
+        }),
+    )
+    .await;
+    let future_reviewer = ui
+        .wait_for("Future Reviewer under parent A", |event| match event {
+            ServerEvent::TreeChanged { session_id, nodes } if session_id == &session.id => nodes
+                .iter()
+                .find(|node| node.title == "Future Reviewer")
+                .map(|node| node.node_id.clone()),
+            _ => None,
+        })
+        .await;
+    for (name, id) in [
+        ("B Reviewer", "worker-b-reviewer"),
+        ("B Tests", "worker-b-tests"),
+    ] {
+        post_hook(
+            &hook_b,
+            &serde_json::json!({
+                "hook_event_name": "SubagentStart",
+                "agent_name": name,
+                "agent_type": "Explore",
+                "agent_id": id,
+                "session_id": fixture_session_id(),
+            }),
+        )
+        .await;
+        ui.wait_for(name, |event| match event {
+            ServerEvent::TreeChanged { session_id, nodes } if session_id == &session.id => {
+                nodes.iter().any(|node| node.title == name).then_some(())
+            }
+            _ => None,
+        })
+        .await;
+    }
+
+    post_hook(
+        &hook_a,
+        &notification("worker_permission_prompt", "an A worker needs permission"),
+    )
+    .await;
+    ui.wait_for("A's id-less demand", |event| match event {
+        ServerEvent::TurnEventEmitted { turn_event }
+            if turn_event.session_id == session.id
+                && turn_event.parent_node_id.as_ref() == Some(&parent_a)
+                && turn_event.node_id.is_none()
+                && matches!(&turn_event.kind, EventKind::AgentPermissionRequired { .. }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    post_hook(
+        &hook_b,
+        &notification("worker_permission_prompt", "a B worker needs permission"),
+    )
+    .await;
+    ui.wait_for("B's id-less demand", |event| match event {
+        ServerEvent::TurnEventEmitted { turn_event }
+            if turn_event.session_id == session.id
+                && turn_event.parent_node_id.as_ref() == Some(&parent_b)
+                && turn_event.node_id.is_none()
+                && matches!(&turn_event.kind, EventKind::AgentPermissionRequired { .. }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 3, "external A + id-less A + id-less B");
+
+    // A's anonymous answer clears A's anonymous demand only. It cannot clear
+    // the explicit unknown-id flow under A, nor B's anonymous flow.
+    post_hook(&hook_a, &fixtures()["UserPromptSubmit"]).await;
+    let resumed_a = ui
+        .wait_for("A's scoped id-less resume", |event| match event {
+            ServerEvent::TurnEventEmitted { turn_event }
+                if turn_event.session_id == session.id
+                    && turn_event.parent_node_id.as_ref() == Some(&parent_a)
+                    && matches!(&turn_event.kind, EventKind::AgentTurnStarted { .. }) =>
+            {
+                Some(turn_event.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(resumed_a.node_id, None);
+    assert_eq!(resumed_a.confidence, Confidence::Unknown);
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 2);
+    assert!(queued.iter().any(|view| {
+        view.entry.parent_node_id.as_ref() == Some(&parent_a)
+            && view.entry.subject_external_id.as_deref() == Some("worker-future-reviewer")
+    }));
+    assert!(queued.iter().any(|view| {
+        view.entry.parent_node_id.as_ref() == Some(&parent_b)
+            && view.entry.subject_external_id.is_none()
+    }));
+
+    // Once the delayed identity exists, an exact callback closes only its old
+    // external-id scope. B still waits until B's own parent reports a resume.
+    let mut exact_resume = fixtures()["UserPromptSubmit"].clone();
+    exact_resume["agent_id"] = serde_json::json!("worker-future-reviewer");
+    post_hook(&hook_a, &exact_resume).await;
+    let exact = ui
+        .wait_for("Future Reviewer's exact resume", |event| match event {
+            ServerEvent::TurnEventEmitted { turn_event }
+                if turn_event.session_id == session.id
+                    && matches!(&turn_event.kind, EventKind::AgentTurnStarted { .. })
+                    && turn_event.agent.external_id.as_deref()
+                        == Some("worker-future-reviewer") =>
+            {
+                Some(turn_event.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(exact.node_id.as_ref(), Some(&future_reviewer));
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].entry.parent_node_id.as_ref(), Some(&parent_b));
+
+    post_hook(&hook_b, &fixtures()["UserPromptSubmit"]).await;
+    ui.wait_for("B's scoped id-less resume", |event| match event {
+        ServerEvent::TurnEventEmitted { turn_event }
+            if turn_event.session_id == session.id
+                && turn_event.parent_node_id.as_ref() == Some(&parent_b)
+                && matches!(&turn_event.kind, EventKind::AgentTurnStarted { .. }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
         })
         .await
     )

@@ -58,6 +58,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "require_explicit_legacy_lease_reconciliation",
         statements: MIGRATION_006_REQUIRE_EXPLICIT_LEASE_RECONCILIATION,
     },
+    Migration {
+        version: 7,
+        name: "attention_correlation_scope",
+        statements: MIGRATION_007_ATTENTION_CORRELATION_SCOPE,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -777,6 +782,36 @@ BEGIN
 END;
 "#;
 
+/// A node-less worker callback still has an authenticated hook parent and may
+/// carry the tool's own worker id before the matching AgentNode is declared.
+/// Persist both so restart, deduplication and resolution keep the same narrow
+/// boundary instead of falling back to every demand in the Session.
+const MIGRATION_007_ATTENTION_CORRELATION_SCOPE: &str = r#"
+ALTER TABLE attention_entries ADD COLUMN parent_node_id TEXT;
+ALTER TABLE attention_entries ADD COLUMN subject_external_id TEXT;
+
+-- The in-memory key now names the kind of subject explicitly. Re-key legacy
+-- rows in place so the first post-upgrade callback deduplicates even before a
+-- daemon has had an opportunity to load and checkpoint the queue.
+UPDATE attention_entries
+SET dedup_key = session_id || '|' ||
+    CASE
+        WHEN node_id IS NOT NULL THEN 'node:' || node_id
+        ELSE 'unassigned'
+    END || '|' ||
+    CASE reason
+        WHEN 'question' THEN 'Question'
+        WHEN 'permission' THEN 'Permission'
+        WHEN 'input' THEN 'Input'
+        WHEN 'credentials' THEN 'Credentials'
+        ELSE reason
+    END;
+
+CREATE INDEX idx_attention_correlation_scope
+ON attention_entries(session_id, parent_node_id, subject_external_id)
+WHERE node_id IS NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,6 +832,16 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         names
+    }
+
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
     }
 
     #[test]
@@ -828,7 +873,8 @@ mod tests {
                 "unified_hierarchy_and_leases",
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
-                "require_explicit_legacy_lease_reconciliation"
+                "require_explicit_legacy_lease_reconciliation",
+                "attention_correlation_scope"
             ]
         );
 
@@ -871,6 +917,69 @@ mod tests {
     }
 
     #[test]
+    fn v7_adds_durable_attention_correlation_scope_append_only() {
+        let conn = fresh();
+        apply_to(&conn, 6).unwrap();
+        let before = column_names(&conn, "attention_entries");
+        assert!(!before.iter().any(|column| column == "parent_node_id"));
+        assert!(!before.iter().any(|column| column == "subject_external_id"));
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+             attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+             VALUES ('ws_scope', 'scope', '/scope', '[]', '[]', '{}', 1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO checkout_write_fences (canonical_path, generation) \
+             VALUES ('/scope', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_checkouts (id, workspace_id, path, canonical_path, branch, \
+             is_primary, shared_resources_json, created_ms) VALUES ('checkout_scope', \
+             'ws_scope', '/scope', '/scope', NULL, 1, '[]', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, name, cwd, env_json, attention_json, \
+             status, restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+             last_activity_ms, tmux, mode, checkout_id, read_only_enforced) VALUES \
+             ('sess_scope', 'ws_scope', 'scope', '/scope', '[]', '{}', 'active', 'live', \
+             '[]', 0, 0, 0, 1, 1, 0, 'read_only', 'checkout_scope', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attention_entries (id, session_id, node_id, reason, summary, \
+             confidence, created_ms, updated_ms, state_json, priority_boost, dedup_key) \
+             VALUES ('att_scope', 'sess_scope', NULL, 'permission', NULL, 'explicit', \
+             1, 1, '{\"kind\":\"pending\"}', 0, 'sess_scope|-|Permission')",
+            [],
+        )
+        .unwrap();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names, vec!["attention_correlation_scope"]);
+        let after = column_names(&conn, "attention_entries");
+        assert!(after.iter().any(|column| column == "parent_node_id"));
+        assert!(after.iter().any(|column| column == "subject_external_id"));
+        for column in before {
+            assert!(after.contains(&column), "v7 removed legacy column {column}");
+        }
+        let rekeyed: String = conn
+            .query_row(
+                "SELECT dedup_key FROM attention_entries WHERE id = 'att_scope'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rekeyed, "sess_scope|unassigned|Permission");
+    }
+
+    #[test]
     fn an_older_database_is_upgraded_in_place_without_losing_its_rows() {
         let conn = fresh();
         apply_to(&conn, 1).unwrap();
@@ -899,7 +1008,8 @@ mod tests {
                 "unified_hierarchy_and_leases",
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
-                "require_explicit_legacy_lease_reconciliation"
+                "require_explicit_legacy_lease_reconciliation",
+                "attention_correlation_scope"
             ]
         );
 
@@ -943,7 +1053,8 @@ mod tests {
             vec![
                 "safe_session_checkout_modes",
                 "drop_persisted_hook_payloads",
-                "require_explicit_legacy_lease_reconciliation"
+                "require_explicit_legacy_lease_reconciliation",
+                "attention_correlation_scope"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1079,7 +1190,10 @@ mod tests {
         let applied = apply(&conn).unwrap();
         assert_eq!(
             applied.names,
-            vec!["require_explicit_legacy_lease_reconciliation"]
+            vec![
+                "require_explicit_legacy_lease_reconciliation",
+                "attention_correlation_scope"
+            ]
         );
         let (required, state): (bool, String) = conn
             .query_row(

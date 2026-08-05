@@ -458,6 +458,8 @@ fn a_pending_demand_for_the_user_outlives_the_daemon_that_recorded_it() {
                 id: AttentionId::new(),
                 session_id: session_id.clone(),
                 node_id: Some(node),
+                parent_node_id: None,
+                subject_external_id: None,
                 reason: AwaitingReason::Permission,
                 summary: Some("run make verify".into()),
                 confidence: Confidence::Explicit,

@@ -58,12 +58,22 @@ impl Core {
         }
         if let Some(external_id) = event.agent.external_id.as_deref() {
             if let Some(subject) = session.tree.find_by_external_id(external_id) {
+                let belongs_to_hook_parent = event.parent_node_id.as_ref().is_none_or(|parent| {
+                    subject.id == *parent
+                        || session
+                            .tree
+                            .descendants(parent)
+                            .into_iter()
+                            .any(|descendant| descendant.id == subject.id)
+                });
                 // Hook connections belong to the main runtime process, but a
                 // worker-aware payload names its own Agent. Resolve that identity
                 // before state, preview and Attention handling so Reviewer can be
                 // YOUR TURN without pretending it owns a separate PTY.
-                event.node_id = Some(subject.id.clone());
-                event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
+                if belongs_to_hook_parent {
+                    event.node_id = Some(subject.id.clone());
+                    event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
+                }
             }
         }
         self.correlate_unbound_agent_event(&mut event);
@@ -133,6 +143,16 @@ impl Core {
             return;
         };
 
+        // An explicit tool-owned identity is stronger evidence than the shape of
+        // today's tree, even when that identity has not been declared yet. In
+        // particular, an out-of-order callback must not be assigned to the one
+        // *different* child that happens to exist. Keep the authenticated parent
+        // and external id as a durable correlation scope instead.
+        if let Some(external_id) = event.agent.external_id.clone() {
+            preserve_unresolved_external_subject(event, &parent, &external_id);
+            return;
+        }
+
         match &event.kind {
             EventKind::AgentPermissionRequired { .. } | EventKind::AgentWaitingForUser { .. } => {
                 let candidates: Vec<_> = session
@@ -152,9 +172,9 @@ impl Core {
                 // correlation target. Resolve that provisional flow, not a known
                 // sibling which may still be waiting for an unrelated answer.
                 let has_unassigned =
-                    self.attention.queue().iter().any(|entry| {
-                        entry.session_id == event.session_id && entry.node_id.is_none()
-                    });
+                    self.attention
+                        .queue()
+                        .has_unresolved_scope(&event.session_id, &parent, None);
                 if has_unassigned {
                     preserve_unresolved_subject(event, &parent);
                     return;
@@ -503,6 +523,14 @@ fn bind_inferred_subject(event: &mut TurnEvent, subject: &NodeId) {
 fn preserve_unresolved_subject(event: &mut TurnEvent, parent: &NodeId) {
     event.confidence = Confidence::Unknown;
     event.dedup_key = format!("{}|subject:unresolved-under:{parent}", event.dedup_key);
+}
+
+fn preserve_unresolved_external_subject(event: &mut TurnEvent, parent: &NodeId, external_id: &str) {
+    event.confidence = Confidence::Unknown;
+    event.dedup_key = format!(
+        "{}|subject:external:{external_id}-unresolved-under:{parent}",
+        event.dedup_key
+    );
 }
 
 /// Whether an event kind moves the agent turn axis, and to what.

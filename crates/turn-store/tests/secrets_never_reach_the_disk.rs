@@ -165,6 +165,8 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         id: AttentionId::new(),
         session_id: session.id.clone(),
         node_id: None,
+        parent_node_id: None,
+        subject_external_id: None,
         reason: AwaitingReason::Permission,
         summary: Some(format!(
             "Run `curl -H 'Authorization: Bearer {}'`",
@@ -184,6 +186,8 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         id: AttentionId::new(),
         session_id: session.id.clone(),
         node_id: None,
+        parent_node_id: None,
+        subject_external_id: None,
         reason: AwaitingReason::Question,
         summary: Some(format!("Should I push with {}?", SECRETS[6])),
         confidence: Confidence::Explicit,

@@ -687,4 +687,237 @@ mod tests {
             Some(Turn::Active)
         );
     }
+
+    #[tokio::test]
+    async fn an_unknown_explicit_worker_id_never_falls_through_to_unique_child_inference() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_out_of_order_worker");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_out_of_order_worker"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.turn = Some(Turn::Active);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Existing tests worker".into()),
+            Some("Explore".into()),
+            Some("worker-existing".into()),
+            None,
+            NOW + 1,
+        );
+        let existing_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-existing")
+            .unwrap()
+            .id
+            .clone();
+
+        let out_of_order = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Future Reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_parent(parent_id.clone())
+        .with_agent(AgentRef {
+            provider: Some("anthropic".into()),
+            tool: Some("claude-code".into()),
+            model: None,
+            external_id: Some("worker-future-reviewer".into()),
+        });
+        harness.core.ingest(out_of_order, NOW + 2);
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert_eq!(tree.get(&existing_id).unwrap().turn, Some(Turn::Active));
+        assert_eq!(tree.get(&parent_id).unwrap().turn, Some(Turn::Active));
+        let queued = harness.core.attention.queue().iter().next().unwrap();
+        assert_eq!(queued.node_id, None);
+        assert_eq!(queued.parent_node_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            queued.subject_external_id.as_deref(),
+            Some("worker-future-reviewer")
+        );
+        assert_eq!(queued.confidence, Confidence::Unknown);
+        let persisted = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(persisted.node_id, None);
+        assert_eq!(persisted.parent_node_id.as_ref(), Some(&parent_id));
+        assert_eq!(
+            persisted.agent.external_id.as_deref(),
+            Some("worker-future-reviewer")
+        );
+        assert_eq!(persisted.confidence, Confidence::Unknown);
+
+        // The declaration arrives after the demand. A later callback carrying
+        // that same identity now resolves exactly to the newly known node and
+        // closes the earlier external-id scope without touching Existing.
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Future Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-future-reviewer".into()),
+            None,
+            NOW + 3,
+        );
+        let future_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-future-reviewer")
+            .unwrap()
+            .id
+            .clone();
+        let resumed = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentTurnStarted {
+                prompt_excerpt: Some("continue".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "UserPromptSubmit".into(),
+            },
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_parent(parent_id)
+        .with_agent(AgentRef {
+            provider: Some("anthropic".into()),
+            tool: Some("claude-code".into()),
+            model: None,
+            external_id: Some("worker-future-reviewer".into()),
+        });
+        harness.core.ingest(resumed, NOW + 4);
+
+        assert!(harness.core.attention.queue().is_empty());
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&future_id)
+                .unwrap()
+                .turn,
+            Some(Turn::Active)
+        );
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&existing_id)
+                .unwrap()
+                .turn,
+            Some(Turn::Active)
+        );
+    }
+
+    #[tokio::test]
+    async fn idless_resumes_are_scoped_to_one_of_two_parents_in_the_same_session() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_two_agent_parents");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_two_agent_parents"),
+            NOW,
+        );
+        let mut parents = Vec::new();
+        for title in ["Claude A", "Claude B"] {
+            let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+            parent.title = title.into();
+            parent.lifecycle = Lifecycle::Alive;
+            parent.turn = Some(Turn::Active);
+            let parent_id = parent.id.clone();
+            harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .insert(parent);
+            for suffix in ["reviewer", "tests"] {
+                harness.core.insert_subagent(
+                    &session_id,
+                    &parent_id,
+                    Some(format!("{title} {suffix}")),
+                    Some("Explore".into()),
+                    Some(format!(
+                        "{}-{suffix}",
+                        title.replace(' ', "-").to_lowercase()
+                    )),
+                    None,
+                    NOW + 1,
+                );
+            }
+            parents.push(parent_id);
+        }
+
+        for (offset, parent) in parents.iter().enumerate() {
+            let demand = TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentWaitingForUser {
+                    reason: turn_core::state::AwaitingReason::Input,
+                    summary: Some(format!("worker under {parent} needs input")),
+                },
+                EventSource::Hook {
+                    tool: "claude-code".into(),
+                    event_name: "Notification".into(),
+                },
+                Confidence::Explicit,
+                NOW + 10 + offset as i64,
+            )
+            .with_parent(parent.clone());
+            harness.core.ingest(demand, NOW + 10 + offset as i64);
+        }
+        assert_eq!(harness.core.attention.queue().len(), 2);
+        assert!(parents.iter().all(
+            |parent| harness
+                .core
+                .attention
+                .queue()
+                .has_unresolved_scope(&session_id, parent, None)
+        ));
+
+        let resumed_a = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentTurnStarted {
+                prompt_excerpt: Some("answer A".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "UserPromptSubmit".into(),
+            },
+            Confidence::Explicit,
+            NOW + 20,
+        )
+        .with_parent(parents[0].clone());
+        harness.core.ingest(resumed_a, NOW + 20);
+
+        let remaining: Vec<_> = harness.core.attention.queue().iter().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].node_id, None);
+        assert_eq!(remaining[0].parent_node_id.as_ref(), Some(&parents[1]));
+        assert_eq!(remaining[0].confidence, Confidence::Unknown);
+    }
 }

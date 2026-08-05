@@ -10,7 +10,9 @@ use crate::attention::focus::{
     DeferReason, FocusDecision, FocusDenial, FocusGovernor, UserContext,
 };
 use crate::attention::policy::{Action, AttentionPolicy, Sound, Trigger};
-use crate::attention::queue::{AttentionEntry, AttentionQueue, EntryState};
+use crate::attention::queue::{
+    subject_is_resolved, AttentionEntry, AttentionQueue, EntryState, SubjectRef,
+};
 use crate::event::{EventKind, TurnEvent};
 use crate::ids::{AttentionId, NodeId, SessionId};
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,8 @@ pub enum Effect {
 struct DeferredFocus {
     session_id: SessionId,
     node_id: Option<NodeId>,
+    parent_node_id: Option<NodeId>,
+    subject_external_id: Option<String>,
     action: Action,
     until_ms: i64,
     created_ms: i64,
@@ -90,6 +94,8 @@ struct DeferredFocus {
 struct FocusRequest<'a> {
     session: &'a SessionId,
     node_id: Option<NodeId>,
+    parent_node_id: Option<NodeId>,
+    subject_external_id: Option<String>,
     action: Action,
     policy: &'a AttentionPolicy,
 }
@@ -182,6 +188,8 @@ impl AttentionManager {
                             id: AttentionId::new(),
                             session_id: session.clone(),
                             node_id: event.node_id.clone(),
+                            parent_node_id: event.parent_node_id.clone(),
+                            subject_external_id: event.agent.external_id.clone(),
                             reason,
                             summary: summarise(&event.kind),
                             confidence: event.confidence,
@@ -244,6 +252,8 @@ impl AttentionManager {
                         FocusRequest {
                             session: &session,
                             node_id: event.node_id.clone(),
+                            parent_node_id: event.parent_node_id.clone(),
+                            subject_external_id: event.agent.external_id.clone(),
                             action: *focus_action,
                             policy,
                         },
@@ -435,6 +445,8 @@ impl AttentionManager {
         let FocusRequest {
             session,
             node_id,
+            parent_node_id,
+            subject_external_id,
             action,
             policy,
         } = request;
@@ -451,6 +463,8 @@ impl AttentionManager {
                 self.deferred.push(DeferredFocus {
                     session_id: session.clone(),
                     node_id,
+                    parent_node_id,
+                    subject_external_id,
                     action,
                     until_ms,
                     created_ms: now_ms,
@@ -501,22 +515,31 @@ impl AttentionManager {
         let cleared = if clear_entire_session {
             self.queue.resolve_session(&event.session_id)
         } else {
-            match &event.node_id {
-                Some(node) => self.queue.resolve_node(node),
-                None => self.queue.resolve_unassigned_for_session(&event.session_id),
-            }
+            self.queue.resolve_subject(
+                &event.session_id,
+                event.node_id.as_ref(),
+                event.parent_node_id.as_ref(),
+                event.agent.external_id.as_deref(),
+            )
         };
         self.deferred.retain(|deferred| {
-            if deferred.session_id != event.session_id {
-                return true;
-            }
             if clear_entire_session {
-                return false;
+                return deferred.session_id != event.session_id;
             }
-            match &event.node_id {
-                Some(node) => deferred.node_id.as_ref() != Some(node),
-                None => deferred.node_id.is_some(),
-            }
+            !subject_is_resolved(
+                SubjectRef {
+                    session: &deferred.session_id,
+                    node: deferred.node_id.as_ref(),
+                    parent: deferred.parent_node_id.as_ref(),
+                    external_id: deferred.subject_external_id.as_deref(),
+                },
+                SubjectRef {
+                    session: &event.session_id,
+                    node: event.node_id.as_ref(),
+                    parent: event.parent_node_id.as_ref(),
+                    external_id: event.agent.external_id.as_deref(),
+                },
+            )
         });
         let _ = now_ms;
         Some(if cleared > 0 {
@@ -819,8 +842,9 @@ mod tests {
     #[test]
     fn answering_the_agent_clears_the_demand() {
         let mut m = AttentionManager::new();
+        let node = NodeId::from_stored("agent_a");
         m.ingest(
-            &permission("sess_a"),
+            &permission("sess_a").with_node(node.clone()),
             &AttentionPolicy::default(),
             &ctx(),
             T0,
@@ -832,41 +856,53 @@ mod tests {
             EventKind::AgentTurnStarted {
                 prompt_excerpt: Some("yes".into()),
             },
-        );
+        )
+        .with_node(node);
         let effects = m.ingest(&resumed, &AttentionPolicy::default(), &ctx(), T0 + 1_000);
         assert!(effects.iter().any(|e| matches!(e, Effect::Cleared { .. })));
         assert!(m.queue().is_empty());
     }
 
     #[test]
-    fn an_unassigned_resume_only_clears_the_unassigned_flow() {
+    fn an_unassigned_resume_only_clears_its_parent_scope_and_deferral() {
         let mut m = AttentionManager::new();
+        let parent_a = NodeId::from_stored("parent_a");
+        let parent_b = NodeId::from_stored("parent_b");
         let reviewer = NodeId::from_stored("reviewer");
         let tests = NodeId::from_stored("tests");
 
+        // B lands first and gets the focus grant. A is deferred by the cooldown,
+        // which lets this test prove the deferral is scoped as narrowly as the
+        // queue entry itself.
         m.ingest(
-            &permission("sess_a"),
+            &permission("sess_a").with_parent(parent_b.clone()),
             &AttentionPolicy::default(),
             &ctx(),
             T0,
         );
         m.ingest(
-            &permission("sess_a").with_node(reviewer.clone()),
+            &permission("sess_a").with_parent(parent_a.clone()),
             &AttentionPolicy::default(),
             &ctx(),
             T0 + 1,
         );
         m.ingest(
-            &permission("sess_a").with_node(tests.clone()),
+            &permission("sess_a").with_node(reviewer.clone()),
             &AttentionPolicy::default(),
             &ctx(),
             T0 + 2,
         );
-        assert_eq!(m.queue().len(), 3);
+        m.ingest(
+            &permission("sess_a").with_node(tests.clone()),
+            &AttentionPolicy::default(),
+            &ctx(),
+            T0 + 3,
+        );
+        assert_eq!(m.queue().len(), 4);
         assert_eq!(
             m.deferred_count(),
-            2,
-            "the two sibling focus requests are waiting behind the session cooldown"
+            3,
+            "A and the two exact siblings wait behind B's focus grant"
         );
 
         let resumed = hook_event(
@@ -874,21 +910,25 @@ mod tests {
             EventKind::AgentTurnStarted {
                 prompt_excerpt: Some("continue".into()),
             },
-        );
-        m.ingest(&resumed, &AttentionPolicy::default(), &ctx(), T0 + 3);
+        )
+        .with_parent(parent_a.clone());
+        m.ingest(&resumed, &AttentionPolicy::default(), &ctx(), T0 + 4);
 
-        let remaining: Vec<_> = m
-            .queue()
+        let remaining: Vec<_> = m.queue().iter().collect();
+        assert_eq!(remaining.len(), 3);
+        assert!(remaining.iter().any(|entry| {
+            entry.node_id.is_none() && entry.parent_node_id.as_ref() == Some(&parent_b)
+        }));
+        assert!(remaining
             .iter()
-            .map(|entry| entry.node_id.clone())
-            .collect();
-        assert_eq!(remaining.len(), 2);
-        assert!(remaining.contains(&Some(reviewer)));
-        assert!(remaining.contains(&Some(tests)));
+            .any(|entry| entry.node_id.as_ref() == Some(&reviewer)));
+        assert!(remaining
+            .iter()
+            .any(|entry| entry.node_id.as_ref() == Some(&tests)));
         assert_eq!(
             m.deferred_count(),
             2,
-            "an unassigned resume must not cancel sibling focus deferrals"
+            "only A's deferred focus is cancelled"
         );
     }
 

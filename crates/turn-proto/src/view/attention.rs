@@ -84,6 +84,8 @@ mod tests {
             id: AttentionId::new(),
             session_id: SessionId::from_stored(session),
             node_id: None,
+            parent_node_id: None,
+            subject_external_id: None,
             reason,
             summary: Some("run make verify".into()),
             confidence,

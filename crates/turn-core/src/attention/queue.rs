@@ -30,6 +30,16 @@ pub struct AttentionEntry {
     pub session_id: SessionId,
     /// The specific process inside the session, so jumping lands on the right pane.
     pub node_id: Option<NodeId>,
+    /// Authenticated runtime that received the callback when the callback could
+    /// not identify its exact child. This is a correlation boundary, not the
+    /// subject of the demand: focusing it must not pretend the parent asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_node_id: Option<NodeId>,
+    /// Tool-owned identity supplied by an out-of-order callback. It remains
+    /// useful even before the matching AgentNode exists and prevents two unknown
+    /// children beneath one parent from collapsing into one demand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_external_id: Option<String>,
     pub reason: AwaitingReason,
     pub summary: Option<String>,
     pub confidence: Confidence,
@@ -44,12 +54,20 @@ impl AttentionEntry {
     /// Stable identity for deduplication: the same agent blocking on the same
     /// kind of thing is one demand, however many times it says so.
     pub fn dedup_key(&self) -> String {
-        format!(
-            "{}|{}|{:?}",
-            self.session_id,
-            self.node_id.as_ref().map(|n| n.as_str()).unwrap_or("-"),
-            self.reason
-        )
+        let subject = match (
+            self.node_id.as_ref(),
+            self.parent_node_id.as_ref(),
+            self.subject_external_id.as_deref(),
+        ) {
+            (Some(node), _, _) => format!("node:{node}"),
+            (None, Some(parent), Some(external)) => {
+                format!("parent:{parent}|external:{external}")
+            }
+            (None, Some(parent), None) => format!("parent:{parent}|unassigned"),
+            (None, None, Some(external)) => format!("external:{external}|unanchored"),
+            (None, None, None) => "unassigned".to_string(),
+        };
+        format!("{}|{}|{:?}", self.session_id, subject, self.reason)
     }
 
     /// Ranking score. Higher comes first.
@@ -197,14 +215,39 @@ impl AttentionQueue {
         before - self.entries.len()
     }
 
-    /// Drops only demands whose subject could not be identified inside a
-    /// session. A node-less agent event is uncertainty, not permission to erase
-    /// every sibling that is independently waiting.
-    pub fn resolve_unassigned_for_session(&mut self, session: &SessionId) -> usize {
+    /// Drops only the demand identified by a resolving event.
+    ///
+    /// A concrete node resolves that node. A node-less callback must carry its
+    /// authenticated parent and resolves only the unresolved scope below that
+    /// parent. An external id narrows the scope further. Nothing without either
+    /// an exact node or parent is allowed to erase session-wide state.
+    pub fn resolve_subject(
+        &mut self,
+        session: &SessionId,
+        node: Option<&NodeId>,
+        parent: Option<&NodeId>,
+        external_id: Option<&str>,
+    ) -> usize {
         let before = self.entries.len();
         self.entries
-            .retain(|e| &e.session_id != session || e.node_id.is_some());
+            .retain(|entry| !subject_is_resolved_by(entry, session, node, parent, external_id));
         before - self.entries.len()
+    }
+
+    /// Whether a provisional, node-less demand already occupies this exact
+    /// parent/external-id correlation scope.
+    pub fn has_unresolved_scope(
+        &self,
+        session: &SessionId,
+        parent: &NodeId,
+        external_id: Option<&str>,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.session_id == *session
+                && entry.node_id.is_none()
+                && entry.parent_node_id.as_ref() == Some(parent)
+                && entry.subject_external_id.as_deref() == external_id
+        })
     }
 
     /// Drops demands for one node, leaving its siblings alone.
@@ -250,6 +293,70 @@ impl AttentionQueue {
     }
 }
 
+/// Shared matching rule for queue entries and deferred focus requests.
+///
+/// An exact node may additionally close an older out-of-order demand carrying
+/// the same parent and external id. That is not a session-wide guess: the tool's
+/// own identity has become resolvable since the first callback arrived.
+pub(super) struct SubjectRef<'a> {
+    pub(super) session: &'a SessionId,
+    pub(super) node: Option<&'a NodeId>,
+    pub(super) parent: Option<&'a NodeId>,
+    pub(super) external_id: Option<&'a str>,
+}
+
+pub(super) fn subject_is_resolved(candidate: SubjectRef<'_>, resolving: SubjectRef<'_>) -> bool {
+    if candidate.session != resolving.session {
+        return false;
+    }
+
+    if let Some(node) = resolving.node {
+        if candidate.node == Some(node) {
+            return true;
+        }
+        return candidate.node.is_none()
+            && resolving.external_id.is_some()
+            && candidate.parent == resolving.parent
+            && candidate.external_id == resolving.external_id;
+    }
+
+    if let Some(parent) = resolving.parent {
+        return candidate.node.is_none()
+            && candidate.parent == Some(parent)
+            && candidate.external_id == resolving.external_id;
+    }
+
+    // A tool-owned id is also an exact scope when no hook parent is available.
+    // A completely anonymous event still resolves nothing.
+    resolving.external_id.is_some()
+        && candidate.node.is_none()
+        && candidate.parent.is_none()
+        && candidate.external_id == resolving.external_id
+}
+
+fn subject_is_resolved_by(
+    entry: &AttentionEntry,
+    session: &SessionId,
+    node: Option<&NodeId>,
+    parent: Option<&NodeId>,
+    external_id: Option<&str>,
+) -> bool {
+    subject_is_resolved(
+        SubjectRef {
+            session: &entry.session_id,
+            node: entry.node_id.as_ref(),
+            parent: entry.parent_node_id.as_ref(),
+            external_id: entry.subject_external_id.as_deref(),
+        },
+        SubjectRef {
+            session,
+            node,
+            parent,
+            external_id,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,6 +368,8 @@ mod tests {
             id: AttentionId::new(),
             session_id: SessionId::from_stored(session),
             node_id: None,
+            parent_node_id: None,
+            subject_external_id: None,
             reason,
             summary: None,
             confidence: Confidence::Explicit,
@@ -442,27 +551,131 @@ mod tests {
     }
 
     #[test]
-    fn resolving_an_unassigned_flow_keeps_identified_siblings() {
+    fn resolving_an_unassigned_flow_is_scoped_to_its_parent() {
         let mut q = AttentionQueue::new();
-        q.upsert(entry("sess_a", AwaitingReason::Input, T0));
+        let parent_a = NodeId::from_stored("parent_a");
+        let parent_b = NodeId::from_stored("parent_b");
+        let mut under_a = entry("sess_a", AwaitingReason::Input, T0);
+        under_a.parent_node_id = Some(parent_a.clone());
+        q.upsert(under_a);
+        let mut under_b = entry("sess_a", AwaitingReason::Input, T0);
+        under_b.parent_node_id = Some(parent_b.clone());
+        q.upsert(under_b);
         let mut reviewer = entry("sess_a", AwaitingReason::Permission, T0);
         reviewer.node_id = Some(NodeId::from_stored("reviewer"));
         q.upsert(reviewer);
-        q.upsert(entry("sess_b", AwaitingReason::Question, T0));
 
         assert_eq!(
-            q.resolve_unassigned_for_session(&SessionId::from_stored("sess_a")),
+            q.resolve_subject(
+                &SessionId::from_stored("sess_a"),
+                None,
+                Some(&parent_a),
+                None,
+            ),
             1
         );
         assert_eq!(q.len(), 2);
+        assert!(q
+            .iter()
+            .any(|entry| entry.parent_node_id.as_ref() == Some(&parent_b)));
         assert!(q.iter().any(|entry| {
-            entry.session_id.as_str() == "sess_a"
-                && entry
-                    .node_id
-                    .as_ref()
-                    .is_some_and(|node| node.as_str() == "reviewer")
+            entry
+                .node_id
+                .as_ref()
+                .is_some_and(|node| node.as_str() == "reviewer")
         }));
-        assert!(q.iter().any(|entry| entry.session_id.as_str() == "sess_b"));
+    }
+
+    #[test]
+    fn unknown_external_subjects_do_not_deduplicate_or_resolve_each_other() {
+        let mut q = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        let parent = NodeId::from_stored("parent_a");
+        for external in ["future-reviewer", "existing-tests"] {
+            let mut demand = entry("sess_a", AwaitingReason::Permission, T0);
+            demand.parent_node_id = Some(parent.clone());
+            demand.subject_external_id = Some(external.into());
+            q.upsert(demand);
+        }
+        assert_eq!(q.len(), 2);
+
+        assert_eq!(
+            q.resolve_subject(&session, None, Some(&parent), Some("future-reviewer"),),
+            1
+        );
+        let remaining = q.iter().next().unwrap();
+        assert_eq!(
+            remaining.subject_external_id.as_deref(),
+            Some("existing-tests")
+        );
+    }
+
+    #[test]
+    fn an_exact_node_can_close_its_earlier_out_of_order_external_scope() {
+        let mut q = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        let parent = NodeId::from_stored("parent_a");
+        let reviewer = NodeId::from_stored("reviewer");
+        let mut provisional = entry("sess_a", AwaitingReason::Permission, T0);
+        provisional.parent_node_id = Some(parent.clone());
+        provisional.subject_external_id = Some("future-reviewer".into());
+        q.upsert(provisional);
+
+        assert_eq!(
+            q.resolve_subject(
+                &session,
+                Some(&reviewer),
+                Some(&parent),
+                Some("future-reviewer"),
+            ),
+            1
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn an_unanchored_node_less_resume_resolves_nothing() {
+        let mut q = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        let parent = NodeId::from_stored("parent_a");
+        let mut demand = entry("sess_a", AwaitingReason::Input, T0);
+        demand.parent_node_id = Some(parent);
+        q.upsert(demand);
+
+        assert_eq!(q.resolve_subject(&session, None, None, None), 0);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn an_unanchored_external_id_is_still_an_exact_scope() {
+        let mut q = AttentionQueue::new();
+        let session = SessionId::from_stored("sess_a");
+        for external in ["worker-a", "worker-b"] {
+            let mut demand = entry("sess_a", AwaitingReason::Input, T0);
+            demand.subject_external_id = Some(external.into());
+            q.upsert(demand);
+        }
+
+        assert_eq!(q.resolve_subject(&session, None, None, Some("worker-a")), 1);
+        assert_eq!(
+            q.iter().next().unwrap().subject_external_id.as_deref(),
+            Some("worker-b")
+        );
+    }
+
+    #[test]
+    fn legacy_serialised_entries_default_to_no_correlation_scope() {
+        let mut scoped = entry("sess_a", AwaitingReason::Input, T0);
+        scoped.parent_node_id = Some(NodeId::from_stored("parent_a"));
+        scoped.subject_external_id = Some("worker-a".into());
+        let mut wire = serde_json::to_value(scoped).unwrap();
+        let object = wire.as_object_mut().unwrap();
+        object.remove("parent_node_id");
+        object.remove("subject_external_id");
+
+        let legacy: AttentionEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.parent_node_id, None);
+        assert_eq!(legacy.subject_external_id, None);
     }
 
     #[test]

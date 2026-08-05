@@ -330,7 +330,7 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
         store.nodes().upsert(&impostor).expect("the node must save");
 
         // Every durable field and state must survive for a process that survives.
-        // The fourth demand belongs to the pid-reuse impostor and must be the only
+        // The final demand belongs to the pid-reuse impostor and must be the only
         // one removed by runtime reconciliation.
         for (index, (reason, state, confidence, boost)) in [
             (
@@ -362,6 +362,8 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
                 id: AttentionId::new(),
                 session_id: session_id.clone(),
                 node_id: Some(node.id.clone()),
+                parent_node_id: None,
+                subject_external_id: None,
                 reason,
                 summary: Some(format!("durable demand {index}")),
                 confidence,
@@ -376,10 +378,33 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
                 .expect("the entry must save");
             expected_entries.push(entry);
         }
+        let scoped = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session_id.clone(),
+            node_id: None,
+            parent_node_id: Some(node.id.clone()),
+            subject_external_id: Some("worker-not-declared-yet".into()),
+            reason: AwaitingReason::Permission,
+            summary: Some("out-of-order worker demand".into()),
+            confidence: Confidence::Unknown,
+            created_ms: turn_core::now_ms() - 90_000,
+            updated_ms: turn_core::now_ms() - 89_000,
+            state: EntryState::Snoozed {
+                until_ms: turn_core::now_ms() + 300_000,
+            },
+            priority_boost: 11,
+        };
+        store
+            .attention()
+            .upsert(&scoped)
+            .expect("the scoped entry must save");
+        expected_entries.push(scoped);
         let discarded = AttentionEntry {
             id: AttentionId::new(),
             session_id: session_id.clone(),
-            node_id: Some(impostor.id.clone()),
+            node_id: None,
+            parent_node_id: Some(impostor.id.clone()),
+            subject_external_id: Some("worker-with-dead-parent".into()),
             reason: AwaitingReason::Input,
             summary: Some("nobody remains to answer this".into()),
             confidence: Confidence::Explicit,
@@ -433,9 +458,9 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
         "some of the work is alive and some of it is not"
     );
 
-    // The three demands for the surviving process come back byte-for-byte as domain
-    // values. The one for the process that turned out to be gone does not: there is
-    // nobody left to answer it.
+    // Exact and unresolved scoped demands for the surviving process come back
+    // byte-for-byte as domain values. The unresolved demand whose hook parent
+    // turned out to be gone does not: there is nobody left to answer it.
     let entries = attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await);
     assert_eq!(entries.len(), expected_entries.len(), "{entries:#?}");
     assert!(!entries.iter().any(|view| view.entry.id == discarded_id));
@@ -448,10 +473,22 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
             &restored.entry, expected,
             "id, age, snooze/ack state and boost must be preserved"
         );
-        assert_eq!(
-            restored.entry.node_id.as_ref(),
-            Some(&survivor_view.node_id)
-        );
+        if expected.node_id.is_some() {
+            assert_eq!(
+                restored.entry.node_id.as_ref(),
+                Some(&survivor_view.node_id)
+            );
+        } else {
+            assert_eq!(restored.entry.node_id, None);
+            assert_eq!(
+                restored.entry.parent_node_id.as_ref(),
+                Some(&survivor_view.node_id)
+            );
+            assert_eq!(
+                restored.entry.subject_external_id.as_deref(),
+                Some("worker-not-declared-yet")
+            );
+        }
     }
 
     // Nothing Turn does not hold can be written to, however alive it looks.
