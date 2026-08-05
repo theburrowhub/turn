@@ -1803,25 +1803,28 @@ impl<'a> TurnView<'a> {
             let Some(draft) = state.workspace_draft.as_mut() else {
                 return;
             };
-            ui.label(RichText::new("Name").color(theme.text_dim).small());
-            let name_field =
-                ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY));
+            let name_label = ui.label(RichText::new("Name").color(theme.text_dim).small());
+            let name_field = ui
+                .add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY))
+                .labelled_by(name_label.id);
             if draft.request_name_focus {
                 name_field.request_focus();
                 draft.request_name_focus = false;
             }
             let submit_from_name =
                 name_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-            ui.label(
+            let root_label = ui.label(
                 RichText::new("Absolute project directory")
                     .color(theme.text_dim)
                     .small(),
             );
-            let root_field = ui.add(
-                egui::TextEdit::singleline(&mut draft.root)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("/Users/you/projects/my-project"),
-            );
+            let root_field = ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.root)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/Users/you/projects/my-project"),
+                )
+                .labelled_by(root_label.id);
             let submit_from_root =
                 root_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
@@ -1951,14 +1954,15 @@ impl<'a> TurnView<'a> {
                 draft.template_id = self.preferred_template_id(&draft.workspace_id);
             }
 
-            ui.label(RichText::new("Workspace").color(theme.text_dim).small());
+            let workspace_label =
+                ui.label(RichText::new("Workspace").color(theme.text_dim).small());
             let workspace_name = self
                 .workspaces
                 .iter()
                 .find(|workspace| workspace.id == draft.workspace_id)
                 .map(|workspace| workspace.name.as_str())
                 .unwrap_or("No workspace available");
-            egui::ComboBox::from_id_salt("new-session-workspace")
+            let workspace_combo = egui::ComboBox::from_id_salt("new-session-workspace")
                 .selected_text(workspace_name)
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
@@ -1970,15 +1974,17 @@ impl<'a> TurnView<'a> {
                         );
                     }
                 });
+            workspace_combo.response.labelled_by(workspace_label.id);
 
-            ui.label(RichText::new("Template").color(theme.text_dim).small());
+            let template_label =
+                ui.label(RichText::new("Template").color(theme.text_dim).small());
             let template_name = draft
                 .template_id
                 .as_ref()
                 .and_then(|id| self.templates.iter().find(|template| &template.id == id))
                 .map(|template| template.name.as_str())
                 .unwrap_or("Templates are loading…");
-            egui::ComboBox::from_id_salt("new-session-template")
+            let template_combo = egui::ComboBox::from_id_salt("new-session-template")
                 .selected_text(template_name)
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
@@ -1990,24 +1996,27 @@ impl<'a> TurnView<'a> {
                         );
                     }
                 });
+            template_combo.response.labelled_by(template_label.id);
 
-            ui.label(
+            let name_label = ui.label(
                 RichText::new("Task / session name")
                     .color(theme.text_dim)
                     .small(),
             );
-            let name_field = ui.add(
-                egui::TextEdit::singleline(&mut draft.name)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Fix climbing bugs"),
-            );
+            let name_field = ui
+                .add(
+                    egui::TextEdit::singleline(&mut draft.name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Fix climbing bugs"),
+                )
+                .labelled_by(name_label.id);
             if draft.request_name_focus {
                 name_field.request_focus();
                 draft.request_name_focus = false;
             }
             let submit_from_name = name_field.lost_focus()
                 && ui.input(|input| input.key_pressed(Key::Enter));
-            ui.label(
+            let task_label = ui.label(
                 RichText::new("Task note (optional)")
                     .color(theme.text_dim)
                     .small(),
@@ -2016,7 +2025,8 @@ impl<'a> TurnView<'a> {
                 egui::TextEdit::multiline(&mut draft.task)
                     .desired_width(f32::INFINITY)
                     .desired_rows(2),
-            );
+            )
+            .labelled_by(task_label.id);
 
             if let Some(template) = draft
                 .template_id

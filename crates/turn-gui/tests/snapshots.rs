@@ -871,6 +871,14 @@ fn workspace_onboarding_owns_keyboard_events_even_while_a_pane_remains_focused()
         dialog.accesskit_node().label().as_deref(),
         Some("Create Workspace")
     );
+    let field_labels: Vec<_> = h
+        .query_all_by_role(egui::accesskit::Role::TextInput)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    assert!(field_labels.iter().any(|label| label == "Name"));
+    assert!(field_labels
+        .iter()
+        .any(|label| label == "Absolute project directory"));
     h.state_mut().actions.clear();
     h.event(egui::Event::Text("-typed".into()));
     h.event(egui::Event::Paste("-pasted".into()));
@@ -954,6 +962,22 @@ fn session_onboarding_captures_input_and_enter_submits_without_writing_to_the_pt
             .any(|node| node.is_focused()),
         "the session name must receive real egui focus"
     );
+    assert_eq!(
+        h.query_by_role(egui::accesskit::Role::TextInput)
+            .and_then(|node| node.accesskit_node().label()),
+        Some("Task / session name".into())
+    );
+    assert_eq!(
+        h.query_by_role(egui::accesskit::Role::MultilineTextInput)
+            .and_then(|node| node.accesskit_node().label()),
+        Some("Task note (optional)".into())
+    );
+    let combo_labels: Vec<_> = h
+        .query_all_by_role(egui::accesskit::Role::ComboBox)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    assert!(combo_labels.iter().any(|label| label == "Workspace"));
+    assert!(combo_labels.iter().any(|label| label == "Template"));
     h.state_mut().actions.clear();
     h.event(egui::Event::Text(" safely".into()));
     h.event(egui::Event::Paste(" now".into()));
