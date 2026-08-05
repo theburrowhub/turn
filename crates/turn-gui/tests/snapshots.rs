@@ -15,26 +15,35 @@
 //!   explicit performance criterion. `Harness::run` returns the number of frames it took
 //!   before nothing asked for another one, so a window that repainted continuously would
 //!   run to the harness's step limit and fail rather than quietly burning a core.
-//! * `every_session_row_is_reachable_by_its_accessible_name` drives the same AccessKit
-//!   tree a screen reader would read. A GPU-drawn terminal has no DOM, so this is the one
+//! * `every_hierarchy_level_is_a_reachable_tree_item` drives the same AccessKit tree a
+//!   screen reader would read. A GPU-drawn terminal has no DOM, so this is the one
 //!   requirement no snapshot can cover.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
-use turn_core::event::Risk;
-use turn_core::ids::{AttentionId, PaneId, SessionId};
-use turn_core::model::{Direction, Layout, Pane, PaneKind};
-use turn_core::state::{AwaitingReason, DisplayState};
+use turn_core::event::{AgentRef, Confidence, Risk};
+use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::model::{
+    ActivityPreview, AgentName, Direction, Layout, NodeKind, Pane, PaneKind, PaneNodeBinding,
+    PreviewSource, ProcessNode, Relation, Session, SessionMode, Workspace, WorkspaceCheckout,
+    WorkspaceWriteLease,
+};
+use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
-use turn_proto::{PtySize, Welcome};
+use turn_proto::{
+    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, ProtoErrorContext, PtySize,
+    SessionConflictAlternative, SessionSummary, SessionTreeView, TreeNodeView, TreeSurfaceState,
+    Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
+};
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    Overview, PaneContent, PendingPermission, QueueItem, SessionRow, TurnView, ViewState,
+    Overview, PaneContent, PendingPermission, QueueItem, SessionRow, TemporaryPaneContent,
+    TurnView, ViewState,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -54,6 +63,8 @@ fn cursor_on() -> i64 {
 /// undo the work the run encoding does.
 #[derive(Default)]
 struct Fixture {
+    /// The normative Workspace -> Session -> Process navigation projection.
+    hierarchy: Option<HierarchySnapshot>,
     sessions: Vec<SessionRow>,
     selected: Option<SessionId>,
     layout: Option<Layout>,
@@ -66,9 +77,10 @@ struct Fixture {
     queue: Vec<QueueItem>,
     connection: Option<ConnectionState>,
     notice: Option<String>,
-    overview_open: bool,
-    /// One screen per session, for the overview's thumbnails.
-    overview_screens: Vec<(SessionId, Grid)>,
+    preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
+    temporary_pane: Option<NodePaneView>,
+    temporary_previews: Vec<ActivityPreview>,
+    write_conflict: Option<ProtoErrorContext>,
 }
 
 impl Fixture {
@@ -89,25 +101,35 @@ impl Fixture {
                 history_complete: !self.incomplete_history.contains(pane_id),
             })
             .collect();
+        let temporary_pane = self.temporary_pane.as_ref().map(|pane| {
+            let node = self.hierarchy.as_ref().and_then(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.sessions)
+                    .flat_map(|session| &session.nodes)
+                    .find(|node| node.node_id == pane.binding.node_id)
+            });
+            TemporaryPaneContent {
+                pane,
+                node,
+                previews: &self.temporary_previews,
+                grid: self.grids.get(&pane.binding.pane_id),
+            }
+        });
         TurnView {
             sessions: self.sessions.clone(),
             selected: self.selected.clone(),
             layout: self.layout.clone(),
             panes,
-            temporary_pane: None,
-            overview_screens: self
-                .overview_screens
-                .iter()
-                .map(|(session, grid)| (session.clone(), grid))
-                .collect(),
+            temporary_pane,
+            overview_screens: Vec::new(),
             permission: self.permission.clone(),
             queue: self.queue.clone(),
             connection: self.connection.clone(),
             notice: self.notice.clone(),
-            write_conflict: None,
-            overview: Overview {
-                open: self.overview_open,
-            },
+            write_conflict: self.write_conflict.as_ref(),
+            overview: Overview::default(),
             policy: None,
             now_ms: cursor_on(),
         }
@@ -123,9 +145,12 @@ struct Window {
 }
 
 fn window(fixture: Fixture) -> Window {
+    let mut state = ViewState::default();
+    state.hierarchy = fixture.hierarchy.clone();
+    state.preview_history = fixture.preview_history.clone();
     Window {
         fixture,
-        state: ViewState::default(),
+        state,
         theme: Theme::dark(),
         keymap: Keymap::build(&Overrides::new(), Platform::MAC),
     }
@@ -151,29 +176,6 @@ fn harness(fixture: Fixture) -> Harness<'static, Window> {
 
 fn connected() -> ConnectionState {
     DaemonIdentity::new().observe(&Welcome::new(1, "0.1.0", 51234, T0))
-}
-
-fn session(name: &str, state: DisplayState) -> SessionRow {
-    SessionRow {
-        id: SessionId::from_stored(format!(
-            "sess_{:0>11}",
-            name.replace(' ', "").to_lowercase()
-        )),
-        name: name.into(),
-        state,
-        state_label: state.label().to_string(),
-        detail: String::new(),
-        badge: 0,
-        provisional: false,
-        depth: 0,
-        muted: false,
-    }
-}
-
-fn with_detail(mut row: SessionRow, detail: &str, badge: usize) -> SessionRow {
-    row.detail = detail.into();
-    row.badge = badge;
-    row
 }
 
 /// A grid of a fixed height, padded like a real terminal screen.
@@ -229,65 +231,6 @@ fn agent_screen() -> Grid {
     grid
 }
 
-/// A session's screen for the overview: each one shaped differently, because a thumbnail
-/// earns its place only if a build, a diff and a prompt are tellable apart at that size.
-fn overview_screen(index: usize) -> Grid {
-    match index % 4 {
-        0 => {
-            let mut grid = Grid::blank(30, 100);
-            for row in 0..28u16 {
-                let line = format!("   Compiling crate-number-{row} v0.1.0 (/Users/x/turn)");
-                for (col, ch) in line.chars().enumerate().take(100) {
-                    if let Some(cell) = grid.cell_mut(row, col as u16) {
-                        cell.text = ch.to_string();
-                        if row % 7 == 0 {
-                            cell.fg = Some(Rgb::new(0xe0, 0x5a, 0x5a));
-                        }
-                    }
-                }
-            }
-            grid
-        }
-        1 => screen(&["~/turn on main $ "], 30, 100),
-        2 => {
-            let mut grid = Grid::blank(30, 100);
-            for row in 0..24u16 {
-                let line = if row % 3 == 0 {
-                    "+    let grid = from_screen(parser.screen());"
-                } else {
-                    "-    let grid = parser.screen();"
-                };
-                for (col, ch) in line.chars().enumerate().take(100) {
-                    if let Some(cell) = grid.cell_mut(row, col as u16) {
-                        cell.text = ch.to_string();
-                        cell.fg = Some(if row % 3 == 0 {
-                            Rgb::new(0x6e, 0xb0, 0x7e)
-                        } else {
-                            Rgb::new(0xe0, 0x5a, 0x5a)
-                        });
-                    }
-                }
-            }
-            grid
-        }
-        _ => {
-            let mut grid = Grid::blank(30, 100);
-            for row in 0..30u16 {
-                for col in 0..100u16 {
-                    if let Some(cell) = grid.cell_mut(row, col) {
-                        cell.bg = Some(Rgb::new(0x1a, 0x1e, 0x24));
-                        if row % 4 == 1 && col < 60 {
-                            cell.text = "─".into();
-                        }
-                    }
-                }
-            }
-            grid.alternate_screen = true;
-            grid
-        }
-    }
-}
-
 fn permission(risk: Risk, provisional: bool) -> PendingPermission {
     PendingPermission {
         attention_id: Some(AttentionId::from_stored("att_snapshot001")),
@@ -328,7 +271,7 @@ fn three_pane_layout() -> (Layout, Vec<PaneId>) {
     layout.split(
         &first,
         Direction::Horizontal,
-        Pane::new(PaneKind::TestOutput).with_title("cargo test"),
+        Pane::new(PaneKind::Tui).with_title("fang · files"),
     );
     let second = layout.panes()[1].id.clone();
     layout.split(
@@ -345,10 +288,358 @@ fn three_pane_layout() -> (Layout, Vec<PaneId>) {
     (layout, ids)
 }
 
+struct UnifiedHierarchy {
+    snapshot: HierarchySnapshot,
+    session_id: SessionId,
+    reviewer_id: NodeId,
+    workspace_id: WorkspaceId,
+    checkout_id: CheckoutId,
+    lease: WorkspaceWriteLease,
+}
+
+fn add_preview(
+    node: &mut ProcessNode,
+    text: &str,
+    source: PreviewSource,
+    confidence: Confidence,
+) -> ActivityPreview {
+    let preview = ActivityPreview {
+        node_id: node.id.clone(),
+        raw_source_sequence: Some(42),
+        normalized_text: text.into(),
+        source,
+        confidence,
+        stable: true,
+        contains_sensitive_data: false,
+        redacted: false,
+        updated_ms: T0 + 12_000,
+    };
+    node.activity_preview = Some(preview.clone());
+    preview
+}
+
+/// A production-shaped hierarchy fixture. It is built from domain entities and projected
+/// through the same protocol views as `turnd`; no `SessionRow` or second agent tree is
+/// fabricated for the screenshot.
+fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
+    let mut workspace = Workspace::new(
+        "space-troopers",
+        "/Users/x/personal-workspace/space-troopers",
+        T0,
+    );
+    workspace.id = WorkspaceId::from_stored("ws_space_troopers");
+    workspace.default_agent = Some("claude".into());
+    let checkout_id = CheckoutId::from_stored("checkout_space_primary");
+
+    let mut session = Session::new(
+        workspace.id.clone(),
+        "Fix climbing bugs",
+        workspace.root.clone(),
+        layout.clone(),
+        T0,
+    );
+    session.id = SessionId::from_stored("sess_fixclimbing");
+    session.mode = SessionMode::MainCheckout;
+    session.checkout_id = checkout_id.clone();
+    session.git_branch = Some("fix/climbing-bugs".into());
+    session.last_activity_ms = T0 + 12_000;
+
+    let mut claude = ProcessNode::agent(
+        session.id.clone(),
+        "claude",
+        session.cwd.clone(),
+        T0 + 1_000,
+    );
+    claude.id = NodeId::from_stored("agent_claude_main");
+    claude.lifecycle = Lifecycle::Alive;
+    claude.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    });
+    claude.interaction_pending = true;
+    let claude_info = claude.agent.as_mut().expect("agent detail");
+    claude_info.name = AgentName::declared("Claude Code");
+    claude_info.agent = AgentRef {
+        provider: Some("anthropic".into()),
+        tool: Some("claude-code".into()),
+        model: Some("claude-3.5-sonnet".into()),
+    };
+    claude_info.current_task = Some("Fix the climbing transition and verify it".into());
+    add_preview(
+        &mut claude,
+        "Would you like me to commit these changes?",
+        PreviewSource::SemanticEvent,
+        Confidence::Explicit,
+    );
+    let claude_id = session.tree.insert(claude);
+
+    let mut reviewer = ProcessNode::agent(
+        session.id.clone(),
+        "claude --subagent reviewer",
+        session.cwd.clone(),
+        T0 + 3_000,
+    );
+    reviewer.id = NodeId::from_stored("agent_reviewer");
+    reviewer.kind = NodeKind::Subagent;
+    reviewer.lifecycle = Lifecycle::Alive;
+    reviewer.turn = Some(Turn::Active);
+    reviewer.link_to(claude_id.clone(), Relation::Confirmed);
+    let reviewer_info = reviewer.agent.as_mut().expect("agent detail");
+    reviewer_info.name = AgentName::declared("Reviewer");
+    reviewer_info.agent = AgentRef {
+        provider: Some("anthropic".into()),
+        tool: Some("claude-code".into()),
+        model: Some("claude-3.5-sonnet".into()),
+    };
+    reviewer_info.current_task = Some("Review the climbing logic changes".into());
+    add_preview(
+        &mut reviewer,
+        "Reviewing climb_system.gd…",
+        PreviewSource::AdapterState,
+        Confidence::Integrated,
+    );
+    let reviewer_id = session.tree.insert(reviewer);
+
+    let mut tests = ProcessNode::agent(
+        session.id.clone(),
+        "claude --subagent tests",
+        session.cwd.clone(),
+        T0 + 3_500,
+    );
+    tests.id = NodeId::from_stored("agent_tests");
+    tests.kind = NodeKind::Subagent;
+    tests.lifecycle = Lifecycle::Alive;
+    tests.turn = Some(Turn::Active);
+    tests.link_to(claude_id.clone(), Relation::Confirmed);
+    tests.agent.as_mut().expect("agent detail").name = AgentName::declared("Tests");
+    add_preview(
+        &mut tests,
+        "Running integration tests — 12/18",
+        PreviewSource::RelevantAction,
+        Confidence::Integrated,
+    );
+    let tests_id = session.tree.insert(tests);
+
+    let mut jest = ProcessNode::process(
+        session.id.clone(),
+        NodeKind::TestRunner,
+        "Jest worker",
+        session.cwd.clone(),
+        T0 + 4_000,
+    );
+    jest.id = NodeId::from_stored("proc_jest_worker");
+    jest.title = "Jest worker".into();
+    jest.lifecycle = Lifecycle::Alive;
+    jest.link_to(tests_id.clone(), Relation::Confirmed);
+    session.tree.insert(jest);
+
+    let mut typecheck = ProcessNode::process(
+        session.id.clone(),
+        NodeKind::Background,
+        "Typecheck",
+        session.cwd.clone(),
+        T0 + 4_200,
+    );
+    typecheck.id = NodeId::from_stored("proc_typecheck");
+    typecheck.title = "Typecheck".into();
+    typecheck.lifecycle = Lifecycle::Exited { code: 0 };
+    typecheck.ended_ms = Some(T0 + 11_000);
+    typecheck.link_to(tests_id.clone(), Relation::Confirmed);
+    session.tree.insert(typecheck);
+
+    let mut shell = ProcessNode::process(
+        session.id.clone(),
+        NodeKind::Shell,
+        "zsh",
+        session.cwd.clone(),
+        T0 + 1_500,
+    );
+    shell.id = NodeId::from_stored("proc_shell");
+    shell.title = "Shell".into();
+    shell.lifecycle = Lifecycle::Alive;
+    let shell_id = session.tree.insert(shell);
+
+    let mut fang = ProcessNode::process(
+        session.id.clone(),
+        NodeKind::Tui,
+        "fang",
+        session.cwd.clone(),
+        T0 + 1_800,
+    );
+    fang.id = NodeId::from_stored("proc_fang");
+    fang.title = "Fang (files)".into();
+    fang.lifecycle = Lifecycle::Alive;
+    add_preview(
+        &mut fang,
+        "src/ai/climb_system.gd",
+        PreviewSource::StableScreenLine,
+        Confidence::Integrated,
+    );
+    let fang_id = session.tree.insert(fang);
+
+    let bindings = vec![
+        PaneNodeBinding {
+            pane_id: panes[0].clone(),
+            session_id: session.id.clone(),
+            node_id: claude_id.clone(),
+            temporary: false,
+            surface_id: None,
+            opened_ms: T0 + 2_000,
+        },
+        PaneNodeBinding {
+            pane_id: panes[1].clone(),
+            session_id: session.id.clone(),
+            node_id: fang_id,
+            temporary: false,
+            surface_id: None,
+            opened_ms: T0 + 2_000,
+        },
+        PaneNodeBinding {
+            pane_id: panes[2].clone(),
+            session_id: session.id.clone(),
+            node_id: shell_id,
+            temporary: false,
+            surface_id: None,
+            opened_ms: T0 + 2_000,
+        },
+    ];
+    let nodes =
+        TreeNodeView::for_session_with_panes(&session, &bindings, &HashMap::new(), T0 + 15_000);
+    let session_summary = SessionSummary::from_session(&session, 1, false, T0 + 15_000);
+    let workspace_summary =
+        WorkspaceSummary::from_workspace(&workspace, std::slice::from_ref(&session_summary));
+    let checkout = WorkspaceCheckout {
+        id: checkout_id.clone(),
+        workspace_id: workspace.id.clone(),
+        path: workspace.root.clone(),
+        canonical_path: workspace.root.clone(),
+        branch: session.git_branch.clone(),
+        primary: true,
+        shared_resources: vec!["Docker daemon".into(), "localhost:3000".into()],
+        created_ms: T0,
+    };
+    let lease = WorkspaceWriteLease::active(
+        workspace.id.clone(),
+        session.id.clone(),
+        checkout_id.clone(),
+        T0,
+    );
+    let session_id = session.id.clone();
+    let workspace_id = workspace.id.clone();
+    let first_workspace = WorkspaceTreeView {
+        workspace: workspace_summary,
+        checkouts: vec![checkout],
+        write_lease: Some(lease.clone()),
+        sessions: vec![SessionTreeView {
+            session: session_summary,
+            nodes,
+        }],
+    };
+
+    let mut turn_workspace = Workspace::new("turn", "/Users/x/personal-workspace/turn", T0);
+    turn_workspace.id = WorkspaceId::from_stored("ws_turn");
+    let mut turn_session = Session::new(
+        turn_workspace.id.clone(),
+        "Build persistent PTY backend",
+        turn_workspace.root.clone(),
+        Layout::single(Pane::new(PaneKind::Agent).with_command("codex")),
+        T0,
+    );
+    turn_session.id = SessionId::from_stored("sess_build_pty");
+    turn_session.mode = SessionMode::MainCheckout;
+    let mut codex = ProcessNode::agent(
+        turn_session.id.clone(),
+        "codex",
+        turn_session.cwd.clone(),
+        T0 + 2_000,
+    );
+    codex.id = NodeId::from_stored("agent_codex");
+    codex.lifecycle = Lifecycle::Alive;
+    codex.turn = Some(Turn::Active);
+    codex.agent.as_mut().expect("agent detail").name = AgentName::declared("Codex");
+    add_preview(
+        &mut codex,
+        "Implementing reconnect protocol…",
+        PreviewSource::SemanticEvent,
+        Confidence::Integrated,
+    );
+    turn_session.tree.insert(codex);
+    let turn_summary = SessionSummary::from_session(&turn_session, 0, false, T0 + 15_000);
+    let turn_workspace_summary =
+        WorkspaceSummary::from_workspace(&turn_workspace, std::slice::from_ref(&turn_summary));
+    let second_workspace = WorkspaceTreeView {
+        workspace: turn_workspace_summary,
+        checkouts: Vec::new(),
+        write_lease: None,
+        sessions: vec![SessionTreeView {
+            session: turn_summary,
+            nodes: TreeNodeView::for_session(&turn_session, T0 + 15_000),
+        }],
+    };
+
+    let mut infra = Workspace::new("personal-infra", "/Users/x/personal-infra", T0);
+    infra.id = WorkspaceId::from_stored("ws_personal_infra");
+    let third_workspace = WorkspaceTreeView {
+        workspace: WorkspaceSummary::from_workspace(&infra, &[]),
+        checkouts: Vec::new(),
+        write_lease: None,
+        sessions: Vec::new(),
+    };
+
+    UnifiedHierarchy {
+        snapshot: HierarchySnapshot {
+            revision: 23,
+            tree_state: TreeSurfaceState {
+                surface_id: "window-snapshot".into(),
+                selected: Some(HierarchyKey::process(claude_id.clone())),
+                expanded: vec![
+                    HierarchyKey::workspace(workspace_id.clone()),
+                    HierarchyKey::session(session_id.clone()),
+                    HierarchyKey::process(claude_id),
+                    HierarchyKey::process(tests_id.clone()),
+                    HierarchyKey::workspace(turn_workspace.id.clone()),
+                    HierarchyKey::session(turn_session.id.clone()),
+                ],
+            },
+            workspaces: vec![first_workspace, second_workspace, third_workspace],
+        },
+        session_id,
+        reviewer_id,
+        workspace_id,
+        checkout_id,
+        lease,
+    }
+}
+
 /// A window in the state the product exists for: one session blocked on a permission,
 /// others working, one failed, with three panes on screen.
 fn busy_desk() -> Fixture {
     let (layout, panes) = three_pane_layout();
+    let hierarchy = unified_hierarchy(&layout, &panes);
+    let reviewer_preview = hierarchy
+        .snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.node_id == hierarchy.reviewer_id)
+        .and_then(|node| node.activity_preview.clone())
+        .expect("Reviewer preview");
+    let mut reviewer_history = vec![reviewer_preview.clone()];
+    reviewer_history.push(ActivityPreview {
+        raw_source_sequence: Some(41),
+        normalized_text: "Checking state transitions and edge cases".into(),
+        updated_ms: T0 + 10_000,
+        ..reviewer_preview.clone()
+    });
+    reviewer_history.push(ActivityPreview {
+        raw_source_sequence: Some(40),
+        normalized_text: "Opened src/ai/climb_system.gd".into(),
+        source: PreviewSource::RelevantAction,
+        updated_ms: T0 + 8_000,
+        ..reviewer_preview
+    });
+    let mut preview_history = HashMap::new();
+    preview_history.insert(hierarchy.reviewer_id.clone(), reviewer_history);
     let mut grids = BTreeMap::new();
     let mut titles = BTreeMap::new();
     grids.insert(panes[0].clone(), agent_screen());
@@ -357,60 +648,27 @@ fn busy_desk() -> Fixture {
         panes[1].clone(),
         screen(
             &[
-                "running 128 tests",
-                "test physics::climbing::grips ... ok",
-                "test physics::climbing::ledges ... FAILED",
+                "src/ai/climb_system.gd",
+                "  198  func _on_jump():",
+                "  199    var new_state = _calculate_state()",
+                "+ 200    if new_state == STATE_WALL or STATE_CEILING:",
+                "  201      _transition_to(new_state)",
             ],
             20,
             46,
         ),
     );
-    titles.insert(panes[1].clone(), "cargo test -p physics".to_string());
+    titles.insert(panes[1].clone(), "fang · files".to_string());
     grids.insert(
         panes[2].clone(),
         screen(&["~/space-troopers on climb $ "], 20, 46),
     );
     titles.insert(panes[2].clone(), "zsh".to_string());
 
-    let mut reviewer = session("Reviewer", DisplayState::Running);
-    reviewer.depth = 1;
-    reviewer.detail = "subagent".into();
-    let mut inferred = session("npm run dev", DisplayState::Running);
-    inferred.depth = 1;
-    inferred.provisional = true;
-    inferred.detail = "inferred".into();
-
     Fixture {
-        sessions: vec![
-            with_detail(
-                session("Fix climbing bugs", DisplayState::NeedsPermission),
-                "1 running · 3 panes",
-                1,
-            ),
-            reviewer,
-            inferred,
-            with_detail(
-                session("Improve targeting", DisplayState::CompletedTurn),
-                "2 running",
-                0,
-            ),
-            with_detail(
-                session("Dockerize tests", DisplayState::Failed),
-                "exit 1",
-                0,
-            ),
-            with_detail(
-                session("Draft release notes", DisplayState::Idle),
-                "12m idle",
-                0,
-            ),
-            with_detail(
-                session("Port the supervisor", DisplayState::Running),
-                "3 panes",
-                0,
-            ),
-        ],
-        selected: Some(SessionId::from_stored("sess_fixclimbingbugs")),
+        hierarchy: Some(hierarchy.snapshot),
+        sessions: Vec::new(),
+        selected: Some(hierarchy.session_id),
         layout: Some(layout),
         grids,
         titles,
@@ -421,6 +679,7 @@ fn busy_desk() -> Fixture {
             queue_item("Dockerize tests", AwaitingReason::Input, true, false),
         ],
         connection: Some(connected()),
+        preview_history,
         ..Fixture::default()
     }
 }
@@ -435,6 +694,7 @@ fn a_busy_desk_with_a_pending_permission() {
 #[test]
 fn an_empty_window_says_so_rather_than_looking_broken() {
     let mut h = harness(Fixture {
+        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
         connection: Some(ConnectionState::Disconnected {
             message: "no Turn daemon is listening. Your processes keep running; reconnecting"
                 .into(),
@@ -469,8 +729,24 @@ fn a_high_risk_permission_shows_the_command_and_the_directory() {
 fn an_inferred_permission_and_an_inferred_relationship_are_drawn_as_guesses() {
     let mut fixture = busy_desk();
     fixture.permission = Some(permission(Risk::Medium, true));
+    let reviewer = fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| {
+            node.agent
+                .as_ref()
+                .is_some_and(|agent| agent.name.display_name == "Reviewer")
+        })
+        .expect("Reviewer node");
+    reviewer.relationship.confidence = Confidence::InferredHigh;
+    reviewer.relationship_is_provisional = true;
     fixture.queue = vec![
-        queue_item("npm run dev", AwaitingReason::Input, true, true),
+        queue_item("Reviewer", AwaitingReason::Input, true, true),
         queue_item("Fix climbing bugs", AwaitingReason::Permission, true, false),
         queue_item(
             "Draft release notes",
@@ -484,37 +760,85 @@ fn an_inferred_permission_and_an_inferred_relationship_are_drawn_as_guesses() {
     h.snapshot("inferred_relationship");
 }
 
-/// Thirty sessions is the desk the product is designed for, and the case where a sidebar
-/// stops being legible. Worth an image.
+/// Thirty real Session branches exercise density in the one persistent hierarchy.
 #[test]
-fn thirty_sessions_stay_legible_in_the_sidebar() {
-    let states = [
-        DisplayState::Running,
-        DisplayState::NeedsPermission,
-        DisplayState::CompletedTurn,
-        DisplayState::Failed,
-        DisplayState::Idle,
-        DisplayState::WaitingForUser,
-        DisplayState::Starting,
-        DisplayState::Stopped,
-        DisplayState::AskingQuestion,
-        DisplayState::CompletedTask,
-    ];
+fn thirty_sessions_stay_legible_in_the_unified_tree() {
     let mut fixture = busy_desk();
-    fixture.sessions = (0..30)
-        .map(|index| {
-            let state = states[index % states.len()];
-            let mut row = with_detail(
-                session(&format!("Task {index:02} on a longish branch name"), state),
-                "2 running · 4 panes",
-                if state.demands_user() { index % 4 } else { 0 },
-            );
-            row.muted = index % 7 == 0;
-            row.provisional = index % 5 == 0;
-            row
-        })
-        .collect();
-    fixture.selected = fixture.sessions.get(1).map(|row| row.id.clone());
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    let workspace = &mut snapshot.workspaces[0];
+    let workspace_id = workspace.workspace.id.clone();
+    let mut sessions = Vec::new();
+    for index in 0..30 {
+        let mut session = Session::new(
+            workspace_id.clone(),
+            format!("Task {index:02} on a longish branch name"),
+            "/Users/x/personal-workspace/space-troopers",
+            fixture.layout.clone().expect("layout"),
+            T0 + index as i64,
+        );
+        session.id = SessionId::from_stored(format!("sess_scale_{index:02}"));
+        session.mode = if index == 0 {
+            SessionMode::MainCheckout
+        } else if index % 2 == 0 {
+            session.read_only_enforced = true;
+            SessionMode::ReadOnly
+        } else {
+            session.worktree_path = Some(format!("/Users/x/worktrees/task-{index:02}"));
+            session.checkout_id = CheckoutId::from_stored(format!("checkout_task_{index:02}"));
+            SessionMode::IsolatedWorktree
+        };
+        let mut agent = ProcessNode::agent(
+            session.id.clone(),
+            "claude",
+            session.cwd.clone(),
+            T0 + index as i64,
+        );
+        agent.id = NodeId::from_stored(format!("agent_scale_{index:02}"));
+        agent.lifecycle = if index % 9 == 4 {
+            Lifecycle::Exited { code: 1 }
+        } else {
+            Lifecycle::Alive
+        };
+        agent.turn = Some(match index % 9 {
+            1 => Turn::AwaitingUser {
+                reason: AwaitingReason::Permission,
+            },
+            2 => Turn::Done,
+            3 => Turn::TaskDone,
+            5 => Turn::AwaitingUser {
+                reason: AwaitingReason::Question,
+            },
+            _ => Turn::Active,
+        });
+        agent.agent.as_mut().expect("agent detail").name =
+            AgentName::declared(format!("Agent {index:02}"));
+        add_preview(
+            &mut agent,
+            &format!("Working on task {index:02}…"),
+            PreviewSource::SemanticEvent,
+            Confidence::Integrated,
+        );
+        session.tree.insert(agent);
+        let badge = usize::from(session.needs_user());
+        let summary = SessionSummary::from_session(&session, badge, index % 7 == 0, T0 + 15_000);
+        sessions.push(SessionTreeView {
+            session: summary,
+            nodes: TreeNodeView::for_session(&session, T0 + 15_000),
+        });
+    }
+    workspace.workspace.session_count = sessions.len();
+    workspace.workspace.sessions_needing_user = sessions
+        .iter()
+        .filter(|session| session.session.needs_user)
+        .count();
+    workspace.workspace.badge_count = workspace.workspace.sessions_needing_user;
+    workspace.sessions = sessions;
+    let selected = workspace.sessions[1].session.id.clone();
+    snapshot.tree_state.selected = Some(HierarchyKey::session(selected.clone()));
+    snapshot.tree_state.expanded = vec![HierarchyKey::workspace(workspace_id)];
+    fixture.selected = Some(selected);
     let mut h = harness(fixture);
     h.run();
     h.snapshot("thirty_sessions");
@@ -563,6 +887,36 @@ fn a_full_screen_application_fills_its_pane() {
     fixture.focused = Some(panes[0].clone());
     fixture.permission = None;
     fixture.queue = Vec::new();
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
+    for node in nodes.iter_mut() {
+        node.pane_bindings.clear();
+    }
+    let fang = nodes
+        .iter_mut()
+        .find(|node| node.kind == NodeKind::Tui)
+        .expect("TUI node");
+    fang.title = "lazygit".into();
+    fang.activity_preview = Some(ActivityPreview {
+        node_id: fang.node_id.clone(),
+        raw_source_sequence: Some(80),
+        normalized_text: "On branch climb · 2 modified files".into(),
+        source: PreviewSource::StableScreenLine,
+        confidence: Confidence::Integrated,
+        stable: true,
+        contains_sensitive_data: false,
+        redacted: false,
+        updated_ms: T0 + 15_000,
+    });
+    fang.pane_bindings.push(PaneNodeBinding {
+        pane_id: panes[0].clone(),
+        session_id: fang.session_id.clone(),
+        node_id: fang.node_id.clone(),
+        temporary: false,
+        surface_id: None,
+        opened_ms: T0 + 15_000,
+    });
+    snapshot.tree_state.selected = Some(HierarchyKey::process(fang.node_id.clone()));
     let mut h = harness(fixture);
     h.run();
     h.snapshot("alternate_screen");
@@ -605,40 +959,143 @@ fn a_scrolled_pane_says_where_its_record_begins() {
     h.snapshot("scrolled_history");
 }
 
-/// The overview: thirty postage stamps, which is what makes "what is my desk doing" a
-/// glance rather than a scroll.
 #[test]
-fn the_session_overview_shows_a_picture_of_every_session() {
-    let mut fixture = busy_desk();
-    fixture.overview_open = true;
-    fixture.sessions = (0..12)
-        .map(|index| {
-            with_detail(
-                session(
-                    &format!("Session {index:02}"),
-                    if index % 3 == 0 {
-                        DisplayState::NeedsPermission
-                    } else {
-                        DisplayState::Running
-                    },
-                ),
-                "2 running",
-                index % 3,
-            )
-        })
-        .collect();
-    fixture.selected = fixture.sessions.first().map(|row| row.id.clone());
-    // A screen per session, so the overview shows what it is for rather than a grid of
-    // empty tiles: a build scrolling, a diff, a prompt, a full-screen tool.
-    fixture.overview_screens = fixture
-        .sessions
+fn quick_preview_is_semantic_and_does_not_replace_the_layout() {
+    let fixture = busy_desk();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
         .iter()
-        .enumerate()
-        .map(|(index, row)| (row.id.clone(), overview_screen(index)))
-        .collect();
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| {
+            node.agent
+                .as_ref()
+                .is_some_and(|agent| agent.name.display_name == "Reviewer")
+        })
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    let expected_layout = fixture.layout.clone();
+    let mut h = harness(fixture);
+    h.state_mut().state.quick_preview = Some(HierarchyKey::process(reviewer_id));
+    h.run();
+    assert_eq!(
+        h.state().fixture.layout,
+        expected_layout,
+        "quick preview must not mutate the saved layout"
+    );
+    h.snapshot("quick_preview");
+}
+
+#[test]
+fn a_temporary_reviewer_pane_is_visually_distinct_from_the_saved_layout() {
+    let mut fixture = busy_desk();
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    let reviewer = snapshot
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| {
+            node.agent
+                .as_ref()
+                .is_some_and(|agent| agent.name.display_name == "Reviewer")
+        })
+        .expect("Reviewer");
+    let binding = PaneNodeBinding {
+        pane_id: PaneId::from_stored("pane_reviewer_temporary"),
+        session_id: reviewer.session_id.clone(),
+        node_id: reviewer.node_id.clone(),
+        temporary: true,
+        surface_id: Some(snapshot.tree_state.surface_id.clone()),
+        opened_ms: T0 + 15_000,
+    };
+    reviewer.pane_bindings.push(binding.clone());
+    fixture.temporary_previews = fixture
+        .preview_history
+        .get(&reviewer.node_id)
+        .cloned()
+        .unwrap_or_default();
+    fixture.temporary_pane = Some(NodePaneView {
+        binding,
+        capability: NodePaneCapability::PreviewDetails,
+    });
+    let expected_layout = fixture.layout.clone();
     let mut h = harness(fixture);
     h.run();
-    h.snapshot("overview");
+    assert_eq!(
+        h.state().fixture.layout,
+        expected_layout,
+        "temporary panes live outside the saved layout"
+    );
+    h.run();
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::Group)
+            .filter_map(|node| node.accesskit_node().label())
+            .any(|label| {
+                label.contains("Temporary pane for Reviewer")
+                    && label.contains("closing keeps the process alive")
+            }),
+        "assistive technology must distinguish a temporary view from process lifetime"
+    );
+    h.snapshot("temporary_reviewer_pane");
+}
+
+#[test]
+fn a_write_lease_conflict_offers_only_explicit_safe_alternatives() {
+    let mut fixture = busy_desk();
+    let hierarchy = unified_hierarchy(
+        fixture.layout.as_ref().expect("layout"),
+        &fixture
+            .layout
+            .as_ref()
+            .expect("layout")
+            .panes()
+            .into_iter()
+            .map(|pane| pane.id.clone())
+            .collect::<Vec<_>>(),
+    );
+    fixture.write_conflict = Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+        workspace_id: hierarchy.workspace_id,
+        checkout_id: hierarchy.checkout_id,
+        requesting_session_id: Some(SessionId::from_stored("sess_second_writer")),
+        lease: Box::new(hierarchy.lease),
+        owner: Box::new(WriteLeaseOwnerView {
+            session_id: hierarchy.session_id,
+            session_name: "Fix climbing bugs".into(),
+            mode: SessionMode::MainCheckout,
+            cwd: "/Users/x/personal-workspace/space-troopers".into(),
+            branch: Some("fix/climbing-bugs".into()),
+            last_activity_ms: T0 + 12_000,
+        }),
+        alternatives: vec![
+            SessionConflictAlternative::FocusOwner,
+            SessionConflictAlternative::CreateReadOnly,
+            SessionConflictAlternative::CreateIsolatedWorktree,
+            SessionConflictAlternative::Cancel,
+        ],
+    });
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    let buttons: Vec<String> = h
+        .query_all_by_role(egui::accesskit::Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    for alternative in [
+        "Focus existing session",
+        "Open read-only session",
+        "Create isolated worktree",
+        "Cancel",
+    ] {
+        assert!(
+            buttons.iter().any(|label| label == alternative),
+            "missing typed conflict alternative {alternative:?}; found {buttons:?}"
+        );
+    }
+    h.snapshot("write_lease_conflict");
 }
 
 #[test]
@@ -729,64 +1186,78 @@ fn an_idle_window_settles_instead_of_repainting_in_a_loop() {
 /// `kittest` drives the same AccessKit tree a screen reader would read, so this asserts
 /// the real thing rather than a parallel description of it.
 ///
-/// The rows are queried by **role and label** rather than by label alone. That is the fix
-/// for what made an earlier version of this test fail: a session's name legitimately
-/// appears in more than one place — the sidebar row and the permission banner both name
-/// "Fix climbing bugs" — so a query by label was ambiguous and panicked. The row carries
-/// `Role::ListItem`, which is both unambiguous and the thing a screen reader needs in
-/// order to announce it as one of a list.
+/// The hierarchy is a real AccessKit `Tree` with `TreeItem` descendants. This guards the
+/// product correction itself: falling back to the removed flat `SessionRow` list would
+/// make this test fail even if a PNG happened to look plausible.
 #[test]
-fn every_session_row_is_reachable_by_its_accessible_name() {
+fn every_hierarchy_level_is_a_reachable_tree_item() {
     let mut h = harness(busy_desk());
     // Two frames: egui builds the AccessKit tree from the previous frame's widgets, so a
     // single pass has nothing in it yet.
     h.run();
     h.run();
 
-    let rows: Vec<String> = h
-        .query_all_by_role(egui::accesskit::Role::ListItem)
-        .filter_map(|node| node.accesskit_node().label())
-        .collect();
+    let tree = h
+        .query_by_role(egui::accesskit::Role::Tree)
+        .expect("the unified workspace hierarchy is an accessibility tree");
     assert!(
-        rows.len() >= 7,
-        "every session must be a row in the tree; found {rows:?}"
+        tree.accesskit_node()
+            .label()
+            .is_some_and(|label| label.contains("Workspaces, sessions and processes")),
+        "the tree describes its unified contents"
+    );
+    assert_eq!(
+        h.query_all_by_role(egui::accesskit::Role::ListItem).count(),
+        0,
+        "the normative fixture must not silently render the removed flat SessionRow list"
     );
 
-    // Each row's accessible name carries its state in words, not only in colour, so
-    // querying for name-and-state together proves both reach the tree.
-    for (name, state_word) in [
-        ("Fix climbing bugs", "PERMISSION"),
-        ("Dockerize tests", "failed"),
-        ("Improve targeting", "turn done"),
-        ("Draft release notes", "idle"),
+    let rows: Vec<(String, Option<usize>)> = h
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
+        .filter_map(|node| {
+            node.accesskit_node()
+                .label()
+                .map(|label| (label, node.accesskit_node().level()))
+        })
+        .collect();
+    assert!(
+        rows.len() >= 12,
+        "workspace, sessions, agents, tools and child processes must be tree rows; found {rows:?}"
+    );
+
+    for (fragment, level) in [
+        ("Workspace space-troopers — 1 sessions", 1),
+        ("Session Fix climbing bugs — mode MAIN — PERMISSION", 2),
+        ("AGENT Claude Code — PERMISSION", 3),
+        ("SUBAGENT Reviewer — running", 4),
+        ("SUBAGENT Tests — running", 4),
+        ("TESTS Jest worker — running", 5),
+        ("SHELL Shell — running", 3),
+        ("TUI Fang (files) — running", 3),
     ] {
-        let expected = format!("{name} — {state_word}");
         assert!(
-            rows.iter().any(|label| label.contains(&expected)),
-            "{name}'s accessible name must state its condition ({state_word}), or a \
-             screen-reader user cannot tell what it is doing. Found {rows:?}"
+            rows.iter()
+                .any(|(label, actual_level)| label.contains(fragment)
+                    && *actual_level == Some(level)),
+            "expected hierarchy row {fragment:?} at level {level}; found {rows:?}"
         );
     }
 
-    // A guess must be audible as a guess.
     assert!(
         rows.iter()
-            .any(|label| label.contains("npm run dev") && label.contains("(inferred)")),
-        "an inferred state must say so in words: {rows:?}"
+            .any(|(label, _)| label.contains("Reviewer")
+                && label.contains("Reviewing climb_system.gd")),
+        "stable semantic previews must be audible: {rows:?}"
     );
 
-    // And the selected row is marked as selected, which is how a screen reader says
-    // "this is the one you are looking at".
     let selected: Vec<String> = h
-        .query_all_by_role(egui::accesskit::Role::ListItem)
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
         .filter(|node| node.accesskit_node().is_selected() == Some(true))
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(
-        selected
-            .iter()
-            .any(|label| label.contains("Fix climbing bugs")),
-        "the selected session must be marked selected in the tree; found {selected:?}"
+        selected.iter().any(|label| label.contains("Claude Code")),
+        "selection is independent and belongs to the selected AgentNode; found {selected:?}"
     );
 }
 
@@ -830,34 +1301,33 @@ fn a_terminal_pane_offers_its_screen_to_a_screen_reader() {
 /// A window with nothing in it still has to be navigable, and must not claim to have rows
 /// it does not have.
 #[test]
-fn an_empty_window_has_a_list_with_nothing_in_it_rather_than_a_missing_list() {
+fn an_empty_window_has_an_empty_unified_tree() {
     let mut h = harness(Fixture {
+        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
         connection: Some(connected()),
         ..Fixture::default()
     });
     h.run();
     h.run();
     assert_eq!(
-        h.query_all_by_role(egui::accesskit::Role::ListItem).count(),
+        h.query_all_by_role(egui::accesskit::Role::TreeItem).count(),
         0
     );
-    let list = h
-        .query_by_role(egui::accesskit::Role::List)
-        .expect("the list exists even when it is empty");
+    let tree = h
+        .query_by_role(egui::accesskit::Role::Tree)
+        .expect("the unified tree exists even when it is empty");
     assert!(
-        list.accesskit_node()
+        tree.accesskit_node()
             .label()
             .is_some_and(|label| label.contains('0')),
-        "the list must say how many rows it has: {:?}",
-        list.accesskit_node().label()
+        "the tree must say how many rows it has: {:?}",
+        tree.accesskit_node().label()
     );
 }
 
-/// The queue's next item has to be identifiable from the tree, because "press the shortcut
-/// and land on the right thing" is the product's core promise and a screen-reader user
-/// gets no visual rule to look at.
+/// Attention remains a logical queue and is not rendered as a second persistent navigator.
 #[test]
-fn the_next_demand_in_the_queue_is_marked_as_next() {
+fn attention_is_exposed_without_reintroducing_a_second_navigation_list() {
     let mut fixture = busy_desk();
     // A snoozed demand first, so "next" is not simply "the top row".
     fixture.queue = vec![
@@ -874,18 +1344,18 @@ fn the_next_demand_in_the_queue_is_marked_as_next() {
     h.run();
 
     let rows: Vec<String> = h
-        .query_all_by_role(egui::accesskit::Role::ListItem)
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(
         rows.iter()
-            .any(|label| label.starts_with("next: Fix climbing bugs")),
-        "the first actionable demand is the next one, not the first row: {rows:?}"
+            .any(|label| label.contains("Claude Code") && label.contains("PERMISSION")),
+        "the exact AgentNode needing attention remains explicit: {rows:?}"
     );
-    assert!(
-        rows.iter()
-            .any(|label| label.contains("Draft release notes") && label.contains("snoozed")),
-        "a snoozed demand is still listed, and says so: {rows:?}"
+    assert_eq!(
+        h.query_all_by_role(egui::accesskit::Role::ListItem).count(),
+        0,
+        "the logical queue must not reappear as a persistent navigation list"
     );
 }
 
