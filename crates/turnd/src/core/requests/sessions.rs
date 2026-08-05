@@ -317,15 +317,32 @@ impl Core {
 
     /// Files a session away, or brings it back.
     ///
-    /// Processes are untouched either way: archiving is about the sidebar. A session
-    /// with an agent mid-turn that the user files away keeps working, and comes back
-    /// exactly as it was.
+    /// Processes are untouched either way: archiving is about the sidebar. A Session
+    /// that owns the primary checkout cannot be hidden while its write lease remains
+    /// live, because clients exclude archived Sessions from normal navigation and the
+    /// authority would become impossible to reach or release. The user must stop or
+    /// detach write-capable work and release the lease first.
     pub(super) fn archive_session(
         &mut self,
         id: &SessionId,
         archived: bool,
         now_ms: i64,
     ) -> Answer {
+        if archived {
+            let workspace_id = self.session(id)?.workspace_id.clone();
+            let owns_unreleased_lease = self
+                .store
+                .hierarchy()
+                .active_lease(&workspace_id)
+                .map_err(store)?
+                .is_some_and(|lease| lease.session_id == *id);
+            if owns_unreleased_lease {
+                return Err(ProtoError::new(
+                    turn_proto::ErrorCode::Conflict,
+                    "Release this Session's primary-checkout write lease before archiving it",
+                ));
+            }
+        }
         let session = self.session_mut(id)?;
         if archived {
             session.archive();
@@ -775,6 +792,92 @@ mod tests {
         assert_eq!(harness.core.sessions.len(), sessions_before);
         assert_eq!(harness.core.processes.len(), processes_before);
         assert_eq!(harness.core.store.sessions().count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_primary_writer_must_release_its_lease_before_it_can_be_archived() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace = match harness
+            .core
+            .create_workspace("archive-safety".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session = match harness
+            .core
+            .create_session(
+                &workspace,
+                "Visible writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .expect("the main Session owns the primary checkout");
+
+        let error = harness
+            .core
+            .archive_session(&session, true, 12)
+            .expect_err("archiving must not hide live checkout authority");
+        assert_eq!(error.code, turn_proto::ErrorCode::Conflict);
+        assert_eq!(
+            harness.core.sessions[&session].status,
+            SessionStatus::Active
+        );
+        assert_eq!(
+            harness
+                .core
+                .store
+                .sessions()
+                .get(&session)
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Active
+        );
+        assert_eq!(
+            harness
+                .core
+                .store
+                .hierarchy()
+                .active_lease(&workspace)
+                .unwrap()
+                .unwrap()
+                .id,
+            lease.id
+        );
+
+        harness
+            .core
+            .release_workspace_write_lease(&workspace, &lease.id, lease.generation, 13)
+            .unwrap();
+        harness.core.archive_session(&session, true, 14).unwrap();
+        assert_eq!(
+            harness.core.sessions[&session].status,
+            SessionStatus::Archived
+        );
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
