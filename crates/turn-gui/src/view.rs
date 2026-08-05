@@ -268,6 +268,8 @@ pub struct WorkspaceDraft {
     /// `Cmd+N` with an empty desk is a two-step onboarding flow. An explicit New
     /// Workspace command stops after the Workspace is created.
     pub continue_to_session: bool,
+    /// One-shot focus request for the first editable field when the sheet opens.
+    pub request_name_focus: bool,
     pub submitting: bool,
     pub error: Option<String>,
 }
@@ -288,6 +290,7 @@ impl WorkspaceDraft {
             name,
             root,
             continue_to_session,
+            request_name_focus: true,
             submitting: false,
             error: None,
         }
@@ -300,6 +303,8 @@ pub struct SessionDraft {
     pub template_id: Option<TemplateId>,
     pub name: String,
     pub task: String,
+    /// One-shot focus request for the task name when the sheet opens.
+    pub request_name_focus: bool,
     pub submitting: bool,
     pub error: Option<String>,
 }
@@ -311,6 +316,7 @@ impl SessionDraft {
             template_id,
             name: String::new(),
             task: String::new(),
+            request_name_focus: true,
             submitting: false,
             error: None,
         }
@@ -711,6 +717,23 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    fn preferred_template_id(&self, workspace_id: &WorkspaceId) -> Option<TemplateId> {
+        let configured = self
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.id == workspace_id)
+            .and_then(|workspace| workspace.default_template.as_ref());
+        configured
+            .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            .or_else(|| {
+                self.templates
+                    .iter()
+                    .find(|template| template.name == "Coding")
+            })
+            .or_else(|| self.templates.first())
+            .map(|template| template.id.clone())
+    }
+
     fn new_session_draft(
         &self,
         snapshot: &HierarchySnapshot,
@@ -725,20 +748,7 @@ impl<'a> TurnView<'a> {
                     .first()
                     .map(|branch| branch.workspace.id.clone())
             })?;
-        let configured = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .and_then(|workspace| workspace.default_template.as_ref());
-        let template_id = configured
-            .and_then(|id| self.templates.iter().find(|template| &template.id == id))
-            .or_else(|| {
-                self.templates
-                    .iter()
-                    .find(|template| template.name == "Coding")
-            })
-            .or_else(|| self.templates.first())
-            .map(|template| template.id.clone());
+        let template_id = self.preferred_template_id(&workspace_id);
         Some(SessionDraft::new(workspace_id, template_id))
     }
 
@@ -943,6 +953,18 @@ impl<'a> TurnView<'a> {
             if let Some(node) = selected_node {
                 self.inspector_overlay(ui, theme, node, state, body);
             }
+        }
+
+        // Our overlays are custom-drawn rather than `egui::Window`s, so they need an
+        // explicit hit-test shield. Registered after the background and before the
+        // sheet's own controls, it swallows clicks/drags aimed through the dimmed layer
+        // while leaving the foreground controls interactive.
+        if state.is_sensitive() || self.write_conflict.is_some() {
+            ui.interact(
+                full,
+                ui.id().with("modal-input-shield"),
+                Sense::click_and_drag(),
+            );
         }
 
         if let (Some(snapshot), Some(key)) = (hierarchy.as_ref(), state.quick_preview.clone()) {
@@ -1766,6 +1788,11 @@ impl<'a> TurnView<'a> {
             egui::StrokeKind::Outside,
         );
         ui.scope_builder(region(panel.shrink(16.0), "workspace-creator"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_label("Create Workspace");
+                node.set_modal();
+            });
             ui.label(RichText::new("CREATE WORKSPACE").color(theme.text).strong());
             ui.label(
                 RichText::new("Choose the existing project directory Turn will supervise.")
@@ -1777,17 +1804,26 @@ impl<'a> TurnView<'a> {
                 return;
             };
             ui.label(RichText::new("Name").color(theme.text_dim).small());
-            ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY));
+            let name_field =
+                ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY));
+            if draft.request_name_focus {
+                name_field.request_focus();
+                draft.request_name_focus = false;
+            }
+            let submit_from_name =
+                name_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             ui.label(
                 RichText::new("Absolute project directory")
                     .color(theme.text_dim)
                     .small(),
             );
-            ui.add(
+            let root_field = ui.add(
                 egui::TextEdit::singleline(&mut draft.root)
                     .desired_width(f32::INFINITY)
                     .hint_text("/Users/you/projects/my-project"),
             );
+            let submit_from_root =
+                root_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
             let valid = connected
                 && !draft.submitting
@@ -1821,6 +1857,7 @@ impl<'a> TurnView<'a> {
                         .small(),
                 );
             }
+            let mut submit_clicked = false;
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -1829,7 +1866,7 @@ impl<'a> TurnView<'a> {
                     {
                         actions.push(ViewAction::CloseOverlay);
                     }
-                    if ui
+                    submit_clicked = ui
                         .add_enabled(
                             valid,
                             egui::Button::new(if draft.submitting {
@@ -1840,18 +1877,18 @@ impl<'a> TurnView<'a> {
                                 "Create workspace"
                             }),
                         )
-                        .clicked()
-                    {
-                        draft.submitting = true;
-                        draft.error = None;
-                        actions.push(ViewAction::CreateWorkspace {
-                            name: draft.name.trim().to_string(),
-                            root: draft.root.trim().to_string(),
-                            continue_to_session: draft.continue_to_session,
-                        });
-                    }
+                        .clicked();
                 });
             });
+            if valid && (submit_clicked || submit_from_name || submit_from_root) {
+                draft.submitting = true;
+                draft.error = None;
+                actions.push(ViewAction::CreateWorkspace {
+                    name: draft.name.trim().to_string(),
+                    root: draft.root.trim().to_string(),
+                    continue_to_session: draft.continue_to_session,
+                });
+            }
         });
         actions
     }
@@ -1881,6 +1918,11 @@ impl<'a> TurnView<'a> {
             egui::StrokeKind::Outside,
         );
         ui.scope_builder(region(panel.shrink(16.0), "session-creator"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_label("New Session");
+                node.set_modal();
+            });
             ui.label(RichText::new("NEW SESSION").color(theme.text).strong());
             ui.label(
                 RichText::new(
@@ -1906,7 +1948,7 @@ impl<'a> TurnView<'a> {
             if draft.template_id.as_ref().is_none_or(|id| {
                 !self.templates.iter().any(|template| &template.id == id)
             }) {
-                draft.template_id = self.templates.first().map(|template| template.id.clone());
+                draft.template_id = self.preferred_template_id(&draft.workspace_id);
             }
 
             ui.label(RichText::new("Workspace").color(theme.text_dim).small());
@@ -1954,11 +1996,17 @@ impl<'a> TurnView<'a> {
                     .color(theme.text_dim)
                     .small(),
             );
-            ui.add(
+            let name_field = ui.add(
                 egui::TextEdit::singleline(&mut draft.name)
                     .desired_width(f32::INFINITY)
                     .hint_text("Fix climbing bugs"),
             );
+            if draft.request_name_focus {
+                name_field.request_focus();
+                draft.request_name_focus = false;
+            }
+            let submit_from_name = name_field.lost_focus()
+                && ui.input(|input| input.key_pressed(Key::Enter));
             ui.label(
                 RichText::new("Task note (optional)")
                     .color(theme.text_dim)
@@ -2014,6 +2062,7 @@ impl<'a> TurnView<'a> {
                     .workspaces
                     .iter()
                     .any(|workspace| workspace.id == draft.workspace_id);
+            let mut submit_clicked = false;
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -2022,7 +2071,7 @@ impl<'a> TurnView<'a> {
                     {
                         actions.push(ViewAction::CloseOverlay);
                     }
-                    if ui
+                    submit_clicked = ui
                         .add_enabled(
                             valid,
                             egui::Button::new(if draft.submitting {
@@ -2031,21 +2080,21 @@ impl<'a> TurnView<'a> {
                                 "Create session"
                             }),
                         )
-                        .clicked()
-                    {
-                        let template_id = draft.template_id.clone().expect("validated above");
-                        draft.submitting = true;
-                        draft.error = None;
-                        actions.push(ViewAction::CreateSessionFromTemplate {
-                            workspace_id: draft.workspace_id.clone(),
-                            template_id,
-                            name: draft.name.trim().to_string(),
-                            task: (!draft.task.trim().is_empty())
-                                .then(|| draft.task.trim().to_string()),
-                        });
-                    }
+                        .clicked();
                 });
             });
+            if valid && (submit_clicked || submit_from_name) {
+                let template_id = draft.template_id.clone().expect("validated above");
+                draft.submitting = true;
+                draft.error = None;
+                actions.push(ViewAction::CreateSessionFromTemplate {
+                    workspace_id: draft.workspace_id.clone(),
+                    template_id,
+                    name: draft.name.trim().to_string(),
+                    task: (!draft.task.trim().is_empty())
+                        .then(|| draft.task.trim().to_string()),
+                });
+            }
         });
         actions
     }
@@ -2294,6 +2343,10 @@ impl<'a> TurnView<'a> {
         };
 
         let arrangement = panes::arrange(layout, area);
+        // Persisted pane focus and the window's keyboard lease are different things.
+        // Keep the visual focus in place behind a sheet, but never let that sheet's
+        // Text/Paste/Key events reach a PTY.
+        let accepts_terminal_input = !state.is_sensitive() && self.write_conflict.is_none();
         for placed in &arrangement.panes {
             let header =
                 Rect::from_min_size(placed.rect.min, Vec2::new(placed.rect.width(), PANE_HEADER));
@@ -2340,6 +2393,7 @@ impl<'a> TurnView<'a> {
                 Some(content) => {
                     let options = PaneOptions {
                         focused,
+                        accepts_input: focused && accepts_terminal_input,
                         now_ms: self.now_ms,
                         scrolled: content.scrolled,
                         history_complete: content.history_complete,
@@ -2436,6 +2490,7 @@ impl<'a> TurnView<'a> {
             (NodePaneCapability::Terminal { .. }, Some(grid)) => {
                 let options = PaneOptions {
                     focused: true,
+                    accepts_input: !state.is_sensitive() && self.write_conflict.is_none(),
                     now_ms: self.now_ms,
                     scrolled: false,
                     history_complete: true,

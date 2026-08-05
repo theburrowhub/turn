@@ -39,11 +39,12 @@ use turn_proto::{
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
+use turn_gui::terminal::PaneAction;
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
     PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRow, TemporaryPaneContent,
-    TurnView, ViewState, WorkspaceDraft,
+    TurnView, ViewAction, ViewState, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -144,6 +145,7 @@ struct Window {
     state: ViewState,
     theme: Theme,
     keymap: Keymap,
+    actions: Vec<ViewAction>,
 }
 
 fn window(fixture: Fixture) -> Window {
@@ -155,6 +157,7 @@ fn window(fixture: Fixture) -> Window {
         state,
         theme: Theme::dark(),
         keymap: Keymap::build(&Overrides::new(), Platform::MAC),
+        actions: Vec::new(),
     }
 }
 
@@ -168,9 +171,10 @@ fn harness(fixture: Fixture) -> Harness<'static, Window> {
                     state,
                     theme,
                     keymap,
+                    actions,
                 } = window;
                 theme.install(ui.ctx());
-                fixture.view().ui(ui, theme, keymap, state);
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
             },
             window(fixture),
         )
@@ -776,6 +780,7 @@ fn the_workspace_form_is_a_visible_first_step_not_a_log_message() {
         name: "turn".into(),
         root: "/Users/x/personal-workspace/turn".into(),
         continue_to_session: true,
+        request_name_focus: true,
         submitting: false,
         error: None,
     });
@@ -795,6 +800,238 @@ fn cmd_n_has_a_real_session_form_with_workspace_template_and_task() {
     h.state_mut().state.session_draft = Some(draft);
     h.run();
     h.snapshot("new_session");
+}
+
+/// `Cmd+N` can beat the daemon's template response. When the choices arrive on a later
+/// frame, the sheet must apply the same Workspace default -> Coding -> first policy as
+/// an immediately populated draft, rather than silently choosing alphabetic Blank.
+#[test]
+fn templates_arriving_after_the_session_sheet_prefer_coding_over_blank() {
+    let mut fixture = workspace_without_sessions();
+    fixture.workspaces[0].default_template = None;
+    let blank = TemplateSummary::from_template(&Template::blank(T0));
+    let coding = TemplateSummary::from_template(&Template::coding(T0));
+    let coding_id = coding.id.clone();
+    fixture.templates = vec![blank, coding];
+    let workspace_id = fixture.workspaces[0].id.clone();
+
+    let mut h = harness(fixture);
+    h.state_mut().state.session_draft = Some(SessionDraft::new(workspace_id, None));
+    h.run_steps(1);
+
+    assert_eq!(
+        h.state()
+            .state
+            .session_draft
+            .as_ref()
+            .and_then(|draft| draft.template_id.as_ref()),
+        Some(&coding_id)
+    );
+}
+
+fn pane_writes(actions: &[ViewAction]) -> Vec<&[u8]> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ViewAction::Pane {
+                action: PaneAction::Write(bytes),
+                ..
+            } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A modal is a keyboard lease, not just dark paint over a still-focused terminal.
+/// This drives real egui Text, Paste and Key events through a focused pane and the
+/// workspace sheet in the same frame — the ordering that previously leaked into PTY.
+#[test]
+fn workspace_onboarding_owns_keyboard_events_even_while_a_pane_remains_focused() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
+        name: "turn".into(),
+        root: "/Users/x/personal-workspace/turn".into(),
+        continue_to_session: false,
+        request_name_focus: true,
+        submitting: false,
+        error: None,
+    });
+    h.run_steps(2);
+
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TextInput)
+            .any(|node| node.is_focused()),
+        "the first onboarding TextEdit must receive real egui focus"
+    );
+    let dialog = h
+        .query_by_role(egui::accesskit::Role::Dialog)
+        .expect("onboarding is exposed as a dialog, not an unrelated group of fields");
+    assert!(dialog.accesskit_node().is_modal());
+    assert_eq!(
+        dialog.accesskit_node().label().as_deref(),
+        Some("Create Workspace")
+    );
+    h.state_mut().actions.clear();
+    h.event(egui::Event::Text("-typed".into()));
+    h.event(egui::Event::Paste("-pasted".into()));
+    h.key_press(egui::Key::ArrowLeft);
+    h.run_steps(1);
+
+    assert!(
+        pane_writes(&h.state().actions).is_empty(),
+        "workspace Text/Paste/Key leaked into the focused PTY: {:?}",
+        pane_writes(&h.state().actions)
+    );
+    let draft = h.state().state.workspace_draft.as_ref().unwrap();
+    assert!(draft.name.contains("-typed"));
+    assert!(draft.name.contains("-pasted"));
+
+    h.state_mut().actions.clear();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+    assert!(pane_writes(&h.state().actions).is_empty());
+    assert!(h
+        .state()
+        .actions
+        .iter()
+        .any(|action| matches!(action, ViewAction::CreateWorkspace { .. })));
+}
+
+/// The dimmed background is inert, including controls that mutate ViewState directly
+/// instead of returning a ViewAction. This reproduces a click on `+ Session` while the
+/// Workspace sheet is already open and proves the click lands on the modal shield.
+#[test]
+fn onboarding_blocks_clicks_through_to_background_controls() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
+        name: "turn".into(),
+        root: "/Users/x/personal-workspace/turn".into(),
+        continue_to_session: false,
+        request_name_focus: true,
+        submitting: false,
+        error: None,
+    });
+    h.run_steps(2);
+
+    h.query_by_label("+ Session")
+        .expect("the background session control remains rendered")
+        .click();
+    h.run_steps(1);
+
+    assert!(
+        h.state().state.workspace_draft.is_some(),
+        "the foreground Workspace sheet must remain open"
+    );
+    assert!(
+        h.state().state.session_draft.is_none(),
+        "the click must not activate the background New Session control"
+    );
+}
+
+/// Session creation has the same keyboard boundary and its single-line name field
+/// submits with Enter. The Enter is a real event and must become exactly a creation
+/// intent, never terminal input.
+#[test]
+fn session_onboarding_captures_input_and_enter_submits_without_writing_to_the_pty() {
+    let mut fixture = busy_desk();
+    let workspace = fixture.hierarchy.as_ref().unwrap().workspaces[0]
+        .workspace
+        .clone();
+    let template = TemplateSummary::from_template(&Template::coding(T0));
+    let workspace_id = workspace.id.clone();
+    let template_id = template.id.clone();
+    fixture.workspaces = vec![workspace];
+    fixture.templates = vec![template];
+
+    let mut h = harness(fixture);
+    let mut draft = SessionDraft::new(workspace_id.clone(), Some(template_id.clone()));
+    draft.name = "Fix keyboard lease".into();
+    h.state_mut().state.session_draft = Some(draft);
+    h.run_steps(2);
+
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TextInput)
+            .any(|node| node.is_focused()),
+        "the session name must receive real egui focus"
+    );
+    h.state_mut().actions.clear();
+    h.event(egui::Event::Text(" safely".into()));
+    h.event(egui::Event::Paste(" now".into()));
+    h.key_press(egui::Key::ArrowLeft);
+    h.run_steps(1);
+    assert!(
+        pane_writes(&h.state().actions).is_empty(),
+        "session Text/Paste/Key leaked into the focused PTY: {:?}",
+        pane_writes(&h.state().actions)
+    );
+
+    h.state_mut().actions.clear();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+    assert!(
+        pane_writes(&h.state().actions).is_empty(),
+        "the submit Enter leaked into the focused PTY"
+    );
+    assert!(h.state().actions.iter().any(|action| matches!(
+        action,
+        ViewAction::CreateSessionFromTemplate {
+            workspace_id: created_workspace,
+            template_id: created_template,
+            name,
+            ..
+        } if created_workspace == &workspace_id
+            && created_template == &template_id
+            && name.contains("Fix keyboard lease")
+    )));
+}
+
+/// Enter keeps its ordinary editing meaning in the optional multiline task. Only the
+/// single-line name owns Enter as submit, so writing a multi-paragraph task cannot
+/// accidentally launch an agent halfway through the note.
+#[test]
+fn enter_in_the_session_task_inserts_a_newline_instead_of_submitting() {
+    let mut fixture = busy_desk();
+    let workspace = fixture.hierarchy.as_ref().unwrap().workspaces[0]
+        .workspace
+        .clone();
+    let template = TemplateSummary::from_template(&Template::coding(T0));
+    let workspace_id = workspace.id.clone();
+    let template_id = template.id.clone();
+    fixture.workspaces = vec![workspace];
+    fixture.templates = vec![template];
+
+    let mut h = harness(fixture);
+    let mut draft = SessionDraft::new(workspace_id, Some(template_id));
+    draft.name = "Fix keyboard lease".into();
+    draft.task = "First paragraph".into();
+    h.state_mut().state.session_draft = Some(draft);
+    h.run_steps(2);
+
+    let task = h
+        .query_by_role(egui::accesskit::Role::MultilineTextInput)
+        .expect("the task note is a multiline text input");
+    task.focus();
+    h.run_steps(2);
+    h.state_mut().actions.clear();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(1);
+
+    assert!(pane_writes(&h.state().actions).is_empty());
+    assert!(!h
+        .state()
+        .actions
+        .iter()
+        .any(|action| matches!(action, ViewAction::CreateSessionFromTemplate { .. })));
+    assert!(
+        h.state()
+            .state
+            .session_draft
+            .as_ref()
+            .unwrap()
+            .task
+            .contains('\n'),
+        "Enter in the task note must remain a newline"
+    );
 }
 
 /// The strongest form of the banner, which is the one most worth reviewing as an image:
@@ -1506,6 +1743,7 @@ fn the_window_survives_being_dragged_smaller_than_its_own_chrome() {
                     state,
                     theme,
                     keymap,
+                    ..
                 } = window;
                 theme.install(ui.ctx());
                 fixture.view().ui(ui, theme, keymap, state);

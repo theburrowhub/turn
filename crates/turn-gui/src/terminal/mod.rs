@@ -60,9 +60,17 @@ pub enum PaneAction {
 /// How a pane is being shown this frame.
 #[derive(Debug, Clone, Copy)]
 pub struct PaneOptions {
-    /// Whether this pane has the keyboard. Only a focused pane blinks its cursor, and
-    /// only a focused pane receives keystrokes.
+    /// Whether this pane is visually focused. Only a focused pane blinks its cursor,
+    /// and normally only a focused pane receives keystrokes. This is deliberately visual
+    /// state rather than the final input gate: an onboarding sheet can sit over a pane
+    /// that remains focused in the persisted Layout.
     pub focused: bool,
+    /// Whether keyboard events may be encoded for the PTY in this frame.
+    ///
+    /// Kept separate from [`Self::focused`] so a modal sheet can hold the window's
+    /// keyboard lease without lying about which pane will be focused when it closes.
+    /// Callers must set this to false whenever a sensitive overlay is open.
+    pub accepts_input: bool,
     /// Wall-clock milliseconds, for the cursor phase.
     pub now_ms: i64,
     /// Whether the pane is showing history rather than the live screen, which suppresses
@@ -77,6 +85,7 @@ impl Default for PaneOptions {
     fn default() -> Self {
         Self {
             focused: false,
+            accepts_input: false,
             now_ms: 0,
             scrolled: false,
             history_complete: true,
@@ -434,7 +443,7 @@ pub fn show(
         options,
         &mut actions,
     );
-    if options.focused {
+    if options.focused && options.accepts_input {
         collect_keys(ui, grid, state, &mut actions);
     }
     actions
