@@ -325,7 +325,7 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_full_screen_program_reports_its_alternate_screen_and_its_input_modes`,
 `the_indexed_palette_matches_the_xterm_cube_and_greys` — plus
 `every_state_has_a_glyph_as_well_as_a_colour` and
-`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 24
+`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 29
 tests, including 15 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
 `an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.

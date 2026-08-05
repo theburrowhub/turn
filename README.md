@@ -60,7 +60,7 @@ and no second lockfile. The tests are real: `turn-pty` spawns
 actual processes on actual ptys and asks the tty itself via `stty size`; `turn-agents` asserts against hook
 payloads recorded from a live Claude Code run; `turn-store` writes real SQLite files and searches them for
 secrets; `turn-gui`'s snapshot tests render the real widget tree through `wgpu` with no display attached and
-diff it against committed PNGs. The snapshot integration target contains 24 tests, 15 of which maintain
+diff it against committed PNGs. The snapshot integration target contains 29 tests, 15 of which maintain
 committed PNG baselines;
 the dense fixture contains 30 Sessions, not a measured 30-Agent performance result. See `ROADMAP.md` for
 what each milestone delivered and how it was verified.
