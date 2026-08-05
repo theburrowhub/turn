@@ -21,8 +21,9 @@ use crate::cells::Grid;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
 use crate::view::{
-    AttentionView, HierarchySnapshot, NodePaneView, PaneFocusView, SessionDetails, SessionSummary,
-    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
+    AttentionView, ContextHandoffView, HierarchySnapshot, NodePaneView, PaneFocusView,
+    SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    WorkspaceSummary,
 };
 
 /// What a client needs to rebuild a terminal on attach.
@@ -168,6 +169,10 @@ pub enum Response {
         /// current item highlighted by Quick Preview.
         entries: Vec<ActivityPreview>,
     },
+    /// A safe draft the client must show before requesting delivery.
+    ContextHandoff {
+        handoff: Box<ContextHandoffView>,
+    },
     /// One explicit temporary Pane binding. It never mutates saved Layout.
     NodePane {
         pane: NodePaneView,
@@ -219,6 +224,7 @@ impl Response {
             Response::Tree { .. } => "tree",
             Response::Node { .. } => "node",
             Response::PreviewHistory { .. } => "preview_history",
+            Response::ContextHandoff { .. } => "context_handoff",
             Response::NodePane { .. } => "node_pane",
             Response::PaneFocus { .. } => "pane_focus",
             Response::Attention { .. } => "attention",
@@ -247,6 +253,7 @@ impl Response {
         "tree",
         "node",
         "preview_history",
+        "context_handoff",
         "node_pane",
         "pane_focus",
         "attention",
@@ -469,9 +476,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 22 result shapes. Asserted so adding one without documenting it in
+        // 23 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 22, "the response catalogue changed size");
+        assert_eq!(declared.len(), 23, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -585,6 +592,19 @@ pub(crate) mod tests {
                 session_id: s.id.clone(),
                 node_id: node_id.clone(),
                 entries: vec![preview],
+            },
+            Response::ContextHandoff {
+                handoff: Box::new(ContextHandoffView {
+                    handoff_id: turn_core::ids::HandoffId::from_stored("handoff_resp001"),
+                    session_id: s.id.clone(),
+                    source_node_id: node_id.clone(),
+                    target_node_id: NodeId::from_stored("proc_target"),
+                    source_label: "Reviewer".into(),
+                    target_label: "Claude".into(),
+                    body: crate::ContextHandoffText::new("[Turn context handoff]\nSafe"),
+                    preview_count: 1,
+                    redacted: false,
+                }),
             },
             Response::NodePane {
                 pane: NodePaneView {

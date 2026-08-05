@@ -20,12 +20,14 @@
 //!   guess as a guess instead of promoting it to a fact.
 
 mod attention;
+mod handoff;
 mod hierarchy;
 mod session;
 mod tree;
 mod workspace;
 
 pub use attention::AttentionView;
+pub use handoff::{ContextHandoffText, ContextHandoffView};
 pub use hierarchy::{
     HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
     SessionTreeView, TreeSurfaceState, WorkspaceTreeView,

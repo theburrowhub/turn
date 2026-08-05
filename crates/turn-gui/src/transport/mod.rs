@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use turn_core::ids::{CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::ids::{CheckoutId, HandoffId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_proto::{CloseDisposition, ProtoError, Request, RequestId, Response, ServerEvent};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
@@ -60,6 +60,15 @@ pub enum Ask {
     Preview {
         session_id: SessionId,
         node_id: NodeId,
+    },
+    PrepareContextHandoff {
+        session_id: SessionId,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+    },
+    DeliverContextHandoff {
+        session_id: SessionId,
+        handoff_id: HandoffId,
     },
     /// Resolve keyboard focus for an exact semantic Attention subject. The
     /// response may name a different Pane-owning runtime node, but may never
@@ -124,6 +133,8 @@ impl Ask {
             Ask::Templates => "loading templates",
             Ask::AttentionQueue => "loading the attention queue",
             Ask::Preview { .. } => "loading an activity preview",
+            Ask::PrepareContextHandoff { .. } => "preparing an Agent context handoff",
+            Ask::DeliverContextHandoff { .. } => "delivering an Agent context handoff",
             Ask::AttentionFocus { .. } => "focusing the pane that can answer attention",
             Ask::NodePane => "opening a node as a pane",
             Ask::CreateWorkspace { .. } => "creating a workspace",

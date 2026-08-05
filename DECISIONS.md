@@ -56,6 +56,7 @@ Status values:
 | [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implemented for the first vertical; narrowly amends ADR-036 |
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
+| [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 
 ---
 
@@ -2534,3 +2535,60 @@ different daemon.
   that a background Agent is disposable.
 - **Downside:** serial creation prevents legitimate parallel setup. Add operation ids to the protocol and
   drafts before relaxing this gate; timing-based correlation is not an acceptable substitute.
+
+---
+
+<a id="adr-043"></a>
+## ADR-043 — Agent context handoffs are reviewed, bounded daemon capabilities
+
+**Status:** Accepted, implemented for same-Session, controllable Agents.
+
+### Context
+
+Agents working in parallel need a deliberate way to share useful findings. Copying raw terminal history is
+noisy, can contain secrets and control sequences, and cannot prove which text the user reviewed. Letting the
+GUI write an arbitrary second-step payload would make the review cosmetic. Treating an Agent's pending
+permission prompt as a convenient input boundary could also turn a handoff into an accidental approval.
+
+### Alternatives considered
+
+**Copy the visible terminal transcript.** Rejected. A rendered screen is transient, may omit scrollback and
+contains untrusted output that was never designed as a compact prompt.
+
+**Let the UI build and send a prompt directly with `write_pty`.** Rejected. The authority boundary would be
+duplicated across clients, the displayed and delivered payloads could diverge, and retries could submit twice.
+
+**Persist full handoff bodies for replay and audit.** Rejected. It creates a new durable secrets store and a
+daemon restart cannot know whether a PTY accepted a write before failure.
+
+**Prepare a daemon-owned capability, review its exact body, then deliver it once.** Chosen.
+
+### Decision
+
+Handoffs are limited to two distinct agentic nodes in the same non-archived Session. The source may be a
+historical Agent, but contributes only bounded, stable, visible Activity Preview facts. Raw PTY bytes,
+scrollback and inferred current-task prose are excluded. Labels, facts and the optional user instruction are
+sanitised and secret-redacted before the exact payload crosses the protocol.
+
+Preparation creates an in-memory `HandoffId` capability bound to the client, Session, source and destination;
+it performs no PTY write. Delivery names only that capability. The daemon revalidates all endpoints and
+requires the destination to own a live PTY, be at an idle/done turn boundary and have no pending permission,
+question or other interaction. The explicit Send action submits one bracketed paste plus Enter. The same
+connection may retry a confirmed success without another write. Any uncertain write consumes and fences the
+capability; Turn tells the user to inspect the Agent and never replays automatically.
+
+Sensitive bodies expire after ten minutes, disappear on client disconnect and are never persisted or placed
+in `Debug` output. The replay fence retains only ids/outcome metadata for one hour and is bounded. Pane state,
+tree selection, focus and layout are not part of the operation.
+
+### Consequences
+
+- The user sees exactly what will be submitted and nothing is sent during Review.
+- Secrets and terminal control sequences do not gain a new durable or visual exfiltration path.
+- Handoffs work for background Agents without opening panes or destabilising a Session layout.
+- A handoff cannot masquerade as an answer to an existing permission or question prompt.
+- **Downside:** only stable Preview facts are transferred, so early or poorly integrated Agents may provide
+  little automatic context; the user can add an instruction explicitly.
+- **Downside:** the destination must support bracketed paste and be at a safe input boundary.
+- **Downside:** delivery proves a PTY submission, not semantic receipt. End-to-end acknowledgement would need
+  an adapter-level protocol rather than a terminal heuristic.

@@ -7,6 +7,7 @@
 //! request interleaving halfway through.
 
 mod attention;
+mod handoff;
 mod hierarchy;
 mod nodes;
 mod panes;
@@ -235,6 +236,23 @@ impl Core {
                 node_id,
                 visibility,
             } => self.set_preview_visibility(&session_id, &node_id, visibility, now_ms),
+            Request::PrepareContextHandoff {
+                session_id,
+                source_node_id,
+                target_node_id,
+                instruction,
+            } => self.prepare_context_handoff(
+                client,
+                &session_id,
+                &source_node_id,
+                &target_node_id,
+                instruction.as_ref(),
+                now_ms,
+            ),
+            Request::DeliverContextHandoff {
+                session_id,
+                handoff_id,
+            } => self.deliver_context_handoff(client, &session_id, &handoff_id, now_ms),
 
             // ----------------------------------------------------------- templates
             Request::ListTemplates => Ok(Response::Templates {

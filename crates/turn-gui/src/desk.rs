@@ -14,8 +14,9 @@
 //!
 //! ## Three product rules live here as code paths that do not exist
 //!
-//! There is no path from a permission to a write: answering an agent is
-//! [`Reaction::Send`] carrying `write_pty` with bytes the user typed. There is no path
+//! There is no path from a permission to an automatic write: answering an agent is
+//! [`Reaction::Send`] carrying `write_pty` with bytes the user typed. The distinct
+//! reviewed context-handoff route is refused while any interaction is pending. There is no path
 //! from a heuristic to a focus change: focus moves only when [`turn_core::Effect::Focus`]
 //! arrives, and `focus_deferred` and `focus_denied` are dropped by
 //! [`crate::announce::Announcement`]. And nothing relaunches: `relaunch_node` is only
@@ -24,17 +25,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turn_core::attention::{AttentionPolicy, Effect};
-use turn_core::ids::{NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, Direction, Layout, LeaseState, PaneKind, PreviewVisibility, SessionStatus,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
 use turn_proto::{
-    AttentionView, CloseDisposition, FocusTarget, HierarchyKey, HierarchySnapshot, NewPane,
-    NodePaneCapability, NodePaneView, ProtoErrorContext, PtySize, Request, Response,
-    SessionConflictAlternative, SessionSummary, TemplateSummary, TerminalBytes, TreeNodeView,
-    WorkspaceSummary,
+    AttentionView, CloseDisposition, ContextHandoffText, ContextHandoffView, FocusTarget,
+    HierarchyKey, HierarchySnapshot, NewPane, NodePaneCapability, NodePaneView, ProtoErrorContext,
+    PtySize, Request, Response, SessionConflictAlternative, SessionSummary, TemplateSummary,
+    TerminalBytes, TreeNodeView, WorkspaceSummary,
 };
 
 use crate::announce::Announcement;
@@ -76,6 +77,21 @@ pub enum Reaction {
         template_id: TemplateId,
     },
     TemplateCreationFailed(String),
+    ContextHandoffPrepared(ContextHandoffView),
+    ContextHandoffDelivered {
+        handoff_id: HandoffId,
+    },
+    ContextHandoffPrepareFailed {
+        session_id: SessionId,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        message: String,
+    },
+    ContextHandoffDeliveryFailed {
+        handoff_id: HandoffId,
+        message: String,
+    },
+    ContextHandoffInvalidated,
 }
 
 /// The default geometry a pane is attached at, before it has been laid out.
@@ -412,6 +428,27 @@ impl Desk {
             Inbound::Answer { ask, response } => self.apply_answer(ask, *response),
             Inbound::Failed { ask, error } => {
                 match &ask {
+                    Ask::PrepareContextHandoff {
+                        session_id,
+                        source_node_id,
+                        target_node_id,
+                    } => {
+                        return vec![Reaction::ContextHandoffPrepareFailed {
+                            session_id: session_id.clone(),
+                            source_node_id: source_node_id.clone(),
+                            target_node_id: target_node_id.clone(),
+                            message: error.message,
+                        }];
+                    }
+                    Ask::DeliverContextHandoff { handoff_id, .. } => {
+                        return vec![Reaction::ContextHandoffDeliveryFailed {
+                            handoff_id: handoff_id.clone(),
+                            message: error.message,
+                        }];
+                    }
+                    _ => {}
+                }
+                match &ask {
                     Ask::RelaunchNode { node_id, .. } => {
                         self.relaunching.remove(node_id);
                     }
@@ -493,7 +530,7 @@ impl Desk {
         };
         self.connection = state;
         if !refetch {
-            return Vec::new();
+            return vec![Reaction::ContextHandoffInvalidated];
         }
         let workspace_creation_interrupted = self.pending_workspace_creation;
         let session_creation_interrupted = self.pending_session.is_some();
@@ -519,6 +556,7 @@ impl Desk {
         self.sessions.clear();
         self.selected = None;
         let mut reactions = vec![
+            Reaction::ContextHandoffInvalidated,
             Reaction::Send {
                 ask: Ask::Hierarchy,
                 request: Request::GetHierarchy {
@@ -898,6 +936,30 @@ impl Desk {
             ) => {
                 self.preview_history.insert(node_id, entries);
                 Vec::new()
+            }
+            (
+                Ask::PrepareContextHandoff {
+                    session_id,
+                    source_node_id,
+                    target_node_id,
+                },
+                Response::ContextHandoff { handoff },
+            ) => {
+                if handoff.session_id != session_id
+                    || handoff.source_node_id != source_node_id
+                    || handoff.target_node_id != target_node_id
+                {
+                    return vec![Reaction::ContextHandoffPrepareFailed {
+                        session_id,
+                        source_node_id,
+                        target_node_id,
+                        message: "the daemon returned a context draft for different Agents".into(),
+                    }];
+                }
+                vec![Reaction::ContextHandoffPrepared(*handoff)]
+            }
+            (Ask::DeliverContextHandoff { handoff_id, .. }, Response::Ack) => {
+                vec![Reaction::ContextHandoffDelivered { handoff_id }]
             }
             (_, Response::NodePane { pane }) => {
                 let session_id = pane.binding.session_id.clone();
@@ -2288,6 +2350,7 @@ impl Desk {
             | Command::SwitchSession
             | Command::ToggleAttentionPanel
             | Command::FocusWorkspaceTree
+            | Command::PassContext
             | Command::CopySelection
             | Command::PasteClipboard => {
                 let _ = now_ms;
@@ -2474,6 +2537,37 @@ impl Desk {
                     },
                 }]
             }
+            ViewAction::PrepareContextHandoff {
+                session_id,
+                source_node_id,
+                target_node_id,
+                instruction,
+            } => vec![Reaction::Send {
+                ask: Ask::PrepareContextHandoff {
+                    session_id: session_id.clone(),
+                    source_node_id: source_node_id.clone(),
+                    target_node_id: target_node_id.clone(),
+                },
+                request: Request::PrepareContextHandoff {
+                    session_id,
+                    source_node_id,
+                    target_node_id,
+                    instruction: instruction.map(ContextHandoffText::new),
+                },
+            }],
+            ViewAction::DeliverContextHandoff {
+                session_id,
+                handoff_id,
+            } => vec![Reaction::Send {
+                ask: Ask::DeliverContextHandoff {
+                    session_id: session_id.clone(),
+                    handoff_id: handoff_id.clone(),
+                },
+                request: Request::DeliverContextHandoff {
+                    session_id,
+                    handoff_id,
+                },
+            }],
             ViewAction::CreateWorkspace {
                 name,
                 root,
@@ -2633,8 +2727,9 @@ impl Desk {
                 let Some(node_id) = self.node_of(&pane_id) else {
                     return Vec::new();
                 };
-                // The only path to a pty. There is no approve request, and this is why:
-                // answering an agent is the human typing.
+                // The direct-input path to a pty. There is no approve request:
+                // answering a pending agent interaction is the human typing. Context
+                // handoff is a distinct reviewed operation for an idle/done Agent.
                 vec![Reaction::Send {
                     ask: Ask::Stream,
                     request: Request::WritePty {
@@ -3754,7 +3849,7 @@ mod tests {
         assert!(!desk.pane_owner.contains_key(&pane_id));
     }
 
-    /// Answering an agent is the human typing, and this is the only path to a pty.
+    /// Answering a pending agent interaction is human input through `WritePty`.
     #[test]
     fn typing_in_a_pane_writes_to_the_pty_and_nothing_else_does() {
         let (session, pane_id, node_id) = session_with_agent("Answer me");

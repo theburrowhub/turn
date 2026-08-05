@@ -10,9 +10,9 @@ use turn_pty::ScreenSize;
 impl Core {
     /// Sends keystrokes or pasted text to a process.
     ///
-    /// This is also how an agent's permission prompt is answered. There is no request
-    /// that approves anything: the only thing that reaches a pty is what the human
-    /// typed, and that is the point.
+    /// This is also how an agent's pending permission or question is answered. There
+    /// is no request that approves anything: a reviewed context handoff is refused at
+    /// a pending interaction and can only submit to an idle or done Agent.
     pub(super) fn write_pty(
         &mut self,
         session_id: &SessionId,

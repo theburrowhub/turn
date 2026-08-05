@@ -60,8 +60,9 @@
 //!    attention manager already cleared through the focus governor, and
 //!    [`Confidence`](turn_core::Confidence) travels with every event so a guess
 //!    stays a guess.
-//! 2. **Turn never approves a permission.** No request says so. Answering an agent
-//!    is [`Request::WritePty`] — the human typing.
+//! 2. **Turn never approves a permission.** No request says so. Pending questions
+//!    and permissions are answered only by [`Request::WritePty`] — the human
+//!    typing. A context handoff can target only an idle or done Agent.
 //! 3. **Turn never runs a command it inferred.** Processes start from a template, a
 //!    pane definition, or [`Request::RelaunchNode`]. There is no "run this" verb.
 //! 4. **Turn never relaunches on its own.** A restore *reports* what it found and
@@ -112,7 +113,8 @@ pub use request::{CloseDisposition, FocusTarget, NewPane, Request, RequestId};
 pub use response::{PaneAttachment, Response};
 pub use screen::{GridRow, PaneStream, ScreenUpdate};
 pub use view::{
-    AgentSummary, AttentionView, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
-    PaneFocusView, SessionDetails, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
-    TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
+    AgentSummary, AttentionView, ContextHandoffText, ContextHandoffView, HierarchyKey,
+    HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView, SessionDetails,
+    SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    WorkspaceSummary, WorkspaceTreeView,
 };

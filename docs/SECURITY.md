@@ -465,6 +465,14 @@ that steers an agent. Turn's contribution is to refuse to be the mechanism: it
 never executes what an agent said, never approves on the user's behalf, and never
 lets agent-authored text misrepresent itself in the UI.
 
+**Passing context between Agents is an explicit prompt-injection boundary.** Turn includes only bounded,
+stable Activity Preview facts and an optional user instruction; it sanitises control and invisible
+characters, redacts secret-shaped values and shows the exact daemon-held body before Send. The capability
+cannot target an Agent with a pending question or permission, cannot be edited at delivery time and is never
+replayed after an uncertain write. The payload still contains untrusted Agent-authored claims, so it tells
+the destination to verify assumptions rather than treating them as authority. Full bodies remain
+memory-only and expire.
+
 **A worktree is not a sandbox.** It isolates a Git worktree and index, not credential helpers, ports,
 containers, databases, caches or external services. Turn accepts those collisions for the MVP only when the
 Workspace declares them and the conflict choice shows them. Calling the mode “isolated” must never imply

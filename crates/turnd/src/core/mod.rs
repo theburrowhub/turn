@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic};
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
-use turn_core::ids::{NodeId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{HandoffId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
@@ -116,6 +116,33 @@ pub struct Process {
     /// error — so this is what says when "a while" started. See
     /// [`FINISHED_PTY_RETENTION_MS`].
     pub exited_ms: Option<i64>,
+}
+
+/// Sensitive handoff material is ephemeral: it is never put in SQLite or an event.
+#[derive(Clone)]
+pub(crate) struct PendingContextHandoff {
+    pub owner_client: ClientId,
+    pub session_id: SessionId,
+    pub source_node_id: NodeId,
+    pub target_node_id: NodeId,
+    pub body: turn_proto::ContextHandoffText,
+    pub includes_activity: bool,
+    pub created_ms: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextHandoffOutcome {
+    Submitted,
+    /// A PTY write failed after it may have accepted a prefix. Retrying would risk
+    /// duplicate or interleaved context, so this capability is permanently fenced.
+    Uncertain,
+}
+
+pub(crate) struct FinishedContextHandoff {
+    pub owner_client: ClientId,
+    pub session_id: SessionId,
+    pub finished_ms: i64,
+    pub outcome: ContextHandoffOutcome,
 }
 
 /// An applied event waiting for its durable boundary before publication.
@@ -207,6 +234,11 @@ pub struct Core {
     /// bytes never live here; only a candidate row and scheduling metadata do.
     pub(crate) preview_probes: HashMap<NodeId, preview::PreviewProbe>,
 
+    /// Review-before-send drafts and a bounded replay fence. Bodies exist only in
+    /// `pending_context_handoffs`; delivered entries retain metadata, never text.
+    pub(crate) pending_context_handoffs: HashMap<HandoffId, PendingContextHandoff>,
+    pub(crate) finished_context_handoffs: HashMap<HandoffId, FinishedContextHandoff>,
+
     /// Monotonic revision of the single Workspace -> Session -> Process
     /// navigation projection. Clients never apply a structural delta across a
     /// gap: they request a complete snapshot at the newest revision.
@@ -269,6 +301,8 @@ impl Core {
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
             preview_probes: HashMap::new(),
+            pending_context_handoffs: HashMap::new(),
+            finished_context_handoffs: HashMap::new(),
             hierarchy_revision: 1,
             last_lease_heartbeat_ms: 0,
             expected_exits: HashMap::new(),
@@ -368,6 +402,7 @@ impl Core {
     /// behind, forgetting stop requests nothing answered, reclaiming finished terminals,
     /// and a process sweep only when something has suggested one is worth doing.
     fn tick(&mut self, now_ms: i64) {
+        self.expire_context_handoffs(now_ms);
         self.retry_failed_ingest_checkpoints(now_ms);
         if !self.failed_ingest_checkpoints.is_empty() {
             return;

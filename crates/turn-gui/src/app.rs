@@ -241,6 +241,62 @@ impl TurnApp {
                     draft.error = Some(message);
                 }
             }
+            Reaction::ContextHandoffPrepared(handoff) => {
+                if let Some(draft) = self.state.context_handoff.as_mut().filter(|draft| {
+                    draft.session_id == handoff.session_id
+                        && draft.source_node_id == handoff.source_node_id
+                        && draft.target_node_id.as_ref() == Some(&handoff.target_node_id)
+                }) {
+                    draft.preparing = false;
+                    draft.delivering = false;
+                    draft.error = None;
+                    draft.prepared = Some(handoff);
+                }
+            }
+            Reaction::ContextHandoffDelivered { handoff_id } => {
+                if let Some(draft) = self.state.context_handoff.as_mut().filter(|draft| {
+                    draft
+                        .prepared
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.handoff_id == handoff_id)
+                }) {
+                    draft.delivering = false;
+                    draft.delivered = true;
+                    draft.error = None;
+                }
+            }
+            Reaction::ContextHandoffPrepareFailed {
+                session_id,
+                source_node_id,
+                target_node_id,
+                message,
+            } => {
+                if let Some(draft) = self.state.context_handoff.as_mut().filter(|draft| {
+                    draft.session_id == session_id
+                        && draft.source_node_id == source_node_id
+                        && draft.target_node_id.as_ref() == Some(&target_node_id)
+                }) {
+                    draft.preparing = false;
+                    draft.error = Some(message);
+                }
+            }
+            Reaction::ContextHandoffDeliveryFailed {
+                handoff_id,
+                message,
+            } => {
+                if let Some(draft) = self.state.context_handoff.as_mut().filter(|draft| {
+                    draft
+                        .prepared
+                        .as_ref()
+                        .is_some_and(|handoff| handoff.handoff_id == handoff_id)
+                }) {
+                    draft.delivering = false;
+                    draft.error = Some(message);
+                }
+            }
+            Reaction::ContextHandoffInvalidated => {
+                self.state.context_handoff = None;
+            }
         }
     }
 
@@ -368,6 +424,11 @@ impl TurnApp {
                     .layout_draft
                     .as_ref()
                     .is_some_and(|draft| !draft.submitting)
+                || self
+                    .state
+                    .context_handoff
+                    .as_ref()
+                    .is_some_and(|draft| !draft.preparing && !draft.delivering)
                 || self.state.lifecycle_confirmation.is_some();
             if self.state.shortcuts_open
                 || self.state.settings_open
@@ -387,6 +448,7 @@ impl TurnApp {
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
                     self.state.lifecycle_confirmation = None;
+                    self.state.context_handoff = None;
                 }
             }
             return Vec::new();
@@ -425,7 +487,7 @@ impl TurnApp {
                 .as_ref()
                 .and_then(|hierarchy| hierarchy.tree_state.selected.clone())
         });
-        self.desk.set_navigation_hint(visible_selection);
+        self.desk.set_navigation_hint(visible_selection.clone());
 
         let form_submitting = self
             .state
@@ -471,6 +533,20 @@ impl TurnApp {
             }
             Command::FocusWorkspaceTree => {
                 self.state.tree_has_focus = true;
+                true
+            }
+            Command::PassContext => {
+                self.state.context_handoff = self.state.hierarchy.as_ref().and_then(|snapshot| {
+                    crate::view::ContextHandoffDraft::from_selection(
+                        snapshot,
+                        visible_selection.as_ref(),
+                    )
+                });
+                if self.state.context_handoff.is_none() {
+                    self.desk.show_notice(
+                        "select an Agent with another Agent in the same Session first",
+                    );
+                }
                 true
             }
             Command::NewWorkspace => {
@@ -597,6 +673,7 @@ impl eframe::App for TurnApp {
                     self.state.session_draft = None;
                     self.state.layout_draft = None;
                     self.state.lifecycle_confirmation = None;
+                    self.state.context_handoff = None;
                     self.pending_folder_request = None;
                     self.state.workspace_picker_pending = false;
                 }

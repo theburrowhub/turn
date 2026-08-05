@@ -69,6 +69,7 @@ pub enum Command {
     LaunchAgent,
     LaunchShell,
     LaunchTui,
+    PassContext,
 
     InterruptProcess,
     StopProcess,
@@ -104,6 +105,7 @@ impl Command {
         Command::LaunchAgent,
         Command::LaunchShell,
         Command::LaunchTui,
+        Command::PassContext,
         Command::SaveLayoutAsTemplate,
         Command::RenameSession,
         Command::ArchiveSession,
@@ -148,6 +150,7 @@ impl Command {
             Command::LaunchAgent => "launch.agent",
             Command::LaunchShell => "launch.shell",
             Command::LaunchTui => "launch.tui",
+            Command::PassContext => "agent.passContext",
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
             Command::FocusWorkspaceTree => "view.focusTree",
@@ -187,6 +190,7 @@ impl Command {
             Command::LaunchAgent => "Launch an agent in this pane",
             Command::LaunchShell => "Launch a shell in this pane",
             Command::LaunchTui => "Launch a full-screen tool in this pane",
+            Command::PassContext => "Pass context from the selected Agent…",
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
             Command::FocusWorkspaceTree => "Focus the workspace tree",
@@ -226,6 +230,7 @@ impl Command {
             Command::LaunchAgent
             | Command::LaunchShell
             | Command::LaunchTui
+            | Command::PassContext
             | Command::InterruptProcess
             | Command::StopProcess => "Process",
             Command::CopySelection | Command::PasteClipboard => "Edit",

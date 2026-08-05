@@ -12,7 +12,8 @@
 //! * There is no request that approves an agent's permission. Answering a
 //!   permission prompt is typing into the agent's terminal, which is
 //!   [`Request::WritePty`] — an explicit act by the human. Turn cannot approve on
-//!   the user's behalf because the protocol gives it no way to say so.
+//!   the user's behalf because the protocol gives it no way to say so. A context
+//!   handoff is structurally refused while any interaction is pending.
 //! * There is no request that runs a command Turn inferred from output. A process
 //!   starts from a template, a pane definition or an explicit relaunch, all of
 //!   which the user chose.
@@ -22,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 use turn_core::attention::UserContext;
 use turn_core::ids::{
-    AttentionId, CheckoutId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
+    AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
     Direction, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
@@ -32,7 +33,7 @@ use turn_core::state::{Lifecycle, Turn};
 use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
-use crate::view::HierarchyKey;
+use crate::view::{ContextHandoffText, HierarchyKey};
 
 /// A client-supplied correlation id.
 ///
@@ -353,6 +354,24 @@ pub enum Request {
         node_id: NodeId,
         visibility: PreviewVisibility,
     },
+    /// Builds a bounded, redacted draft from one Agent's stable semantic activity.
+    /// It creates an ephemeral, client-bound capability but touches no PTY; nothing
+    /// reaches the destination until a separate [`Request::DeliverContextHandoff`].
+    PrepareContextHandoff {
+        session_id: SessionId,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction: Option<ContextHandoffText>,
+    },
+    /// Types the exact reviewed handoff into a live Agent PTY. The daemon revalidates
+    /// both endpoints and the retained exact body without modifying it.
+    DeliverContextHandoff {
+        session_id: SessionId,
+        /// Capability returned by `prepare_context_handoff`. The daemon retains the
+        /// exact reviewed body, so a retry cannot alter or duplicate the transfer.
+        handoff_id: HandoffId,
+    },
 
     // ----------------------------------------------------------------- templates
     ListTemplates,
@@ -632,6 +651,8 @@ impl Request {
             Request::GetProcessTree { .. } => "get_process_tree",
             Request::GetPreviewHistory { .. } => "get_preview_history",
             Request::SetPreviewVisibility { .. } => "set_preview_visibility",
+            Request::PrepareContextHandoff { .. } => "prepare_context_handoff",
+            Request::DeliverContextHandoff { .. } => "deliver_context_handoff",
             Request::ListTemplates => "list_templates",
             Request::CreateLayoutTemplate { .. } => "create_layout_template",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
@@ -703,6 +724,8 @@ impl Request {
             Request::GetProcessTree { .. } => "tree",
             Request::GetPreviewHistory { .. } => "preview_history",
             Request::SetPreviewVisibility { .. } => "ack",
+            Request::PrepareContextHandoff { .. } => "context_handoff",
+            Request::DeliverContextHandoff { .. } => "ack",
 
             Request::ListTemplates => "templates",
             Request::CreateLayoutTemplate { .. } | Request::SaveLayoutAsTemplate { .. } => {
@@ -788,6 +811,8 @@ impl Request {
             | Request::GetProcessTree { session_id }
             | Request::GetPreviewHistory { session_id, .. }
             | Request::SetPreviewVisibility { session_id, .. }
+            | Request::PrepareContextHandoff { session_id, .. }
+            | Request::DeliverContextHandoff { session_id, .. }
             | Request::SaveLayoutAsTemplate { session_id, .. }
             | Request::SplitPane { session_id, .. }
             | Request::ClosePane { session_id, .. }

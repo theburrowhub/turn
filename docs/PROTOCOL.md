@@ -381,7 +381,7 @@ Operations are tagged `op`. Every request carries a client-supplied `id`; the
 daemon echoes it untouched. Ids are client-supplied so the UI can key its pending
 map on something it already has, without a round trip to learn the key.
 
-`session_id`, `workspace_id`, `pane_id`, `node_id`, `template_id` and
+`session_id`, `workspace_id`, `pane_id`, `node_id`, `template_id`, `handoff_id`,
 `attention_id`, `checkout_id` and `lease_id` are the prefixed string ids from `turn_core::ids`.
 `HierarchyKey` is tagged `workspace`, `session` or `process`; a raw string is never accepted where the
 kind matters.
@@ -566,6 +566,30 @@ dispositions apply only where process-control rules allow them, and an Agent req
 Addressed to the **node**, not the pane: the pty belongs to the process, and one
 process may be shown in more than one place.
 
+### Agent context handoff
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `prepare_context_handoff` | `session_id`, `source_node_id`, `target_node_id`, `instruction?` | `context_handoff` |
+| `deliver_context_handoff` | `session_id`, `handoff_id` | `ack` |
+
+This is a two-request, review-before-send capability. `prepare_context_handoff` verifies two distinct
+agentic nodes in one active Session, assembles a bounded packet from the source's stable Activity Preview
+history plus an optional user instruction, redacts secrets, and returns the **exact** text the daemon retains.
+It never reads raw terminal scrollback and never writes a PTY. Hidden previews remain hidden.
+
+The returned `handoff_id` is an opaque, short-lived capability bound to the preparing client, Session and
+destination. `deliver_context_handoff` accepts only that id; a client cannot replace the reviewed body on
+the delivery request. The daemon revalidates that the destination is an idle, controllable Agent with a
+live Turn-owned PTY and no pending question or permission, then submits one bracketed paste. Closing or
+opening panes is irrelevant and no layout operation is implied.
+
+A successful same-connection retry is idempotent. A possibly partial PTY write is fenced as `conflict` and
+is never replayed automatically. Drafts expire after ten minutes and are discarded when their client
+disconnects. Success means the payload was submitted to the PTY; it is not proof that the Agent accepted or
+acted on it. Handoffs deliberately cannot answer permission or question prompts; those remain explicit
+`write_pty` input.
+
 ### Node control
 
 | `op` | Fields | Answers with |
@@ -677,6 +701,17 @@ never auto-adopts that authority; release/reacquisition remains explicit.
 
 {"v":3,"type":"request","id":"r-5","request":{
   "op":"close_session","session_id":"sess_4b71e0","disposition":"keep_processes"}}
+
+// Review first. This response writes no PTY.
+{"v":3,"type":"request","id":"r-7","request":{
+  "op":"prepare_context_handoff","session_id":"sess_4b71e0",
+  "source_node_id":"proc_source","target_node_id":"proc_reviewer",
+  "instruction":"Check the assumptions before continuing."}}
+
+// After displaying the exact context_handoff.body and receiving explicit consent:
+{"v":3,"type":"request","id":"r-8","request":{
+  "op":"deliver_context_handoff","session_id":"sess_4b71e0",
+  "handoff_id":"handoff_86d451"}}
 ```
 
 ---
@@ -713,6 +748,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
 | `preview_history` | `session_id`, `node_id`, `entries: [ActivityPreview]` (newest first) |
+| `context_handoff` | `handoff: ContextHandoffView` — ids, safe labels, exact redacted `body`, fact count and redaction flag |
 
 ```jsonc
 {"v":3,"type":"response","id":"r-3","response":{"result":"ack"}}
@@ -1220,8 +1256,9 @@ descriptions has to argue with a test first.
    `inferred_high`, and `AttentionPolicy::resolve` degrades any focus action from a
    provisional event to a badge.
 2. **Turn never approves a permission.** No request says so — not
-   `approve_permission`, not `respond_permission`. Answering an agent is
-   `write_pty`: the human typing.
+   `approve_permission`, not `respond_permission`. Pending questions and permissions
+   are answered only through `write_pty`: the human typing. A context handoff is
+   refused while the destination has a pending interaction.
 3. **Turn never runs a command it inferred from agent output.** There is no "run
    this" verb. Processes start from a template, a pane definition, or
    `relaunch_node`, all of which the user chose.

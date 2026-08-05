@@ -35,6 +35,7 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 | --- | --- |
 | Unified navigation | One `Workspace → Session → Agent/Tool → Child` tree; no duplicate persistent navigators |
 | Background subagents | Discovered under their parent without opening panes, changing layout, or stealing focus |
+| Agent handoffs | Review a bounded, redacted context packet and explicitly pass it to another Agent in the same Session |
 | Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |
 | Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, scrollback, shells, and TUIs |
 | Stable layouts | Nested splits, reusable presets, drag-to-reorder, resize, balance, zoom, and per-session persistence |
@@ -64,6 +65,7 @@ Implemented today:
 - Portable first-run preset: two shell columns, with no dependency on optional tools.
 - Visual layout editor and reusable layout presets.
 - Persistent PTYs, terminal panes, process hierarchy, subagent previews, and temporary panes.
+- Review-before-send context handoffs between controllable Agents in one Session.
 - Claude Code and Codex adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
 - SQLite persistence, write leases, safe restart recovery, and explicit process relaunch.
@@ -112,6 +114,11 @@ cargo run -p turn-gui
 3. Choose the built-in **Two Shells** preset or create a layout from the same screen.
 4. Use **+ Pane** to add a shell or agent, and **Layout** to redistribute or save the current arrangement.
 5. Use **Next Attention** to jump to the next agent that actually needs you.
+
+To pass useful context without copying a terminal transcript, right-click an Agent in the hierarchy and
+choose **Pass context to Agent…**, or search for it in the Command Palette. Select an idle destination Agent in the same Session, optionally add an
+instruction, review the exact redacted payload, then send it. Preparing the handoff writes nothing; sending
+submits it once to the destination Agent without opening a pane or changing the layout.
 
 To finish work, choose **Session → End session…** or press **⌘⇧K**. This stops Turn-owned processes while
 keeping the Session's layout and history. **Detach all views · keep running** only closes the views.

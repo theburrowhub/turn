@@ -43,8 +43,8 @@ use selection::{cell_at, CellPos, Selection, SelectionKind};
 /// or approve anything, it can only report that a key was pressed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaneAction {
-    /// Bytes for the pty. Answering an agent's permission prompt is this and nothing
-    /// else: the human typing.
+    /// Bytes typed into the pane's pty. Pending permission prompts can be answered
+    /// only through this direct human-input action.
     Write(Vec<u8>),
     /// The pane is a different size in cells and the pty must be told.
     Resize(PtySize),

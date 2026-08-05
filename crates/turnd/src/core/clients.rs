@@ -336,6 +336,10 @@ impl Core {
         let Some(gone) = self.clients.remove(&client) else {
             return;
         };
+        // An unconfirmed draft is a capability owned by this connection. A reconnect
+        // must prepare and review again; it may never inherit a Send action silently.
+        self.pending_context_handoffs
+            .retain(|_, draft| draft.owner_client != client);
         let abandoned_surface = gone.surface_id.as_deref().filter(|surface_id| {
             !self
                 .clients

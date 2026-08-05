@@ -26,18 +26,21 @@ use egui::{
 };
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
-use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{
+    AttentionId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
+};
 use turn_core::model::{
     ActivityPreview, Direction, Layout, LayoutPreset, LeaseState, NodeKind, Pane, PaneKind,
     PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionStatus,
     WorkspaceWriteLease,
 };
-use turn_core::state::{AwaitingReason, DisplayState, Lifecycle};
+use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
 use turn_proto::{
-    CloseDisposition, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
-    PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative, SessionTreeView,
-    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
+    CloseDisposition, ContextHandoffView, HierarchyKey, HierarchySnapshot, NodePaneCapability,
+    NodePaneView, PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative,
+    SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
+    WorkspaceTreeView,
 };
 
 use crate::keymap::{Command, Keymap};
@@ -184,6 +187,84 @@ pub enum LifecycleConfirmation {
     },
 }
 
+/// Window-local review state. The body itself comes from the daemon and cannot be
+/// edited after review; changing source instruction or destination creates a new draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextHandoffDraft {
+    pub session_id: SessionId,
+    pub source_node_id: NodeId,
+    pub target_node_id: Option<NodeId>,
+    pub instruction: String,
+    pub prepared: Option<ContextHandoffView>,
+    pub preparing: bool,
+    pub delivering: bool,
+    pub delivered: bool,
+    pub error: Option<String>,
+}
+
+impl ContextHandoffDraft {
+    fn new(session: &SessionTreeView, source: &TreeNodeView) -> Self {
+        let target_node_id = session
+            .nodes
+            .iter()
+            .find(|candidate| {
+                candidate.is_agentic
+                    && candidate.node_id != source.node_id
+                    && context_target_unavailable_reason(candidate).is_none()
+            })
+            .or_else(|| {
+                session
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.is_agentic && candidate.node_id != source.node_id)
+            })
+            .map(|candidate| candidate.node_id.clone());
+        Self {
+            session_id: session.session.id.clone(),
+            source_node_id: source.node_id.clone(),
+            target_node_id,
+            instruction: String::new(),
+            prepared: None,
+            preparing: false,
+            delivering: false,
+            delivered: false,
+            error: None,
+        }
+    }
+
+    fn invalidate_review(&mut self) {
+        self.prepared = None;
+        self.delivered = false;
+        self.error = None;
+    }
+
+    /// Resolves the exact selected Agent and its owning Session without borrowing
+    /// pane focus or the active Session as a substitute.
+    pub(crate) fn from_selection(
+        snapshot: &HierarchySnapshot,
+        selected: Option<&HierarchyKey>,
+    ) -> Option<Self> {
+        let HierarchyKey::Process { node_id } = selected? else {
+            return None;
+        };
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .find_map(|session| {
+                let source = session
+                    .nodes
+                    .iter()
+                    .find(|node| &node.node_id == node_id && node.is_agentic)?;
+                session
+                    .nodes
+                    .iter()
+                    .any(|candidate| candidate.is_agentic && candidate.node_id != source.node_id)
+                    .then(|| Self::new(session, source))
+            })
+    }
+}
+
 /// What the window is showing.
 #[derive(Debug, Default)]
 pub struct TurnView<'a> {
@@ -268,6 +349,8 @@ pub struct ViewState {
     /// Confirmation for stopping a whole Session or Workspace. Process-row stop remains
     /// a separate, narrowly scoped action.
     pub lifecycle_confirmation: Option<LifecycleConfirmation>,
+    /// Explicit source → destination context review. It is an overlay and never a Pane.
+    pub context_handoff: Option<ContextHandoffDraft>,
     /// Bounded, stable/redacted semantic history fetched on demand for Quick Preview.
     pub preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     /// The inspector is contextual and only occupies space for a selected Process.
@@ -299,6 +382,7 @@ impl ViewState {
             || self.layout_draft.is_some()
             || self.quick_preview.is_some()
             || self.lifecycle_confirmation.is_some()
+            || self.context_handoff.is_some()
     }
 
     /// Drains typed hierarchy intents after drawing.
@@ -648,6 +732,16 @@ pub enum ViewAction {
         session_id: SessionId,
         checkout_id: turn_core::ids::CheckoutId,
     },
+    PrepareContextHandoff {
+        session_id: SessionId,
+        source_node_id: NodeId,
+        target_node_id: NodeId,
+        instruction: Option<String>,
+    },
+    DeliverContextHandoff {
+        session_id: SessionId,
+        handoff_id: HandoffId,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -854,6 +948,35 @@ fn process_title(node: &TreeNodeView) -> &str {
         .map(|agent| agent.name.display_name.as_str())
         .filter(|name| !name.is_empty())
         .unwrap_or(&node.title)
+}
+
+/// A visual explanation only; the daemon repeats every check authoritatively at
+/// preparation and delivery. In particular, a semantic subagent may be visible in the
+/// tree without owning a PTY Turn can type into.
+fn context_target_unavailable_reason(node: &TreeNodeView) -> Option<&'static str> {
+    if !node.is_agentic {
+        return Some("not an Agent");
+    }
+    if !matches!(node.lifecycle, Lifecycle::Alive | Lifecycle::Reconnected) {
+        return Some("Agent is not running under Turn");
+    }
+    if !matches!(node.pane_capability, NodePaneCapability::Terminal { .. }) {
+        return Some("Agent has no controllable PTY");
+    }
+    if node.interaction_pending
+        || node.agent.as_ref().is_some_and(|agent| {
+            agent.pending_permission.is_some() || agent.pending_question.is_some()
+        })
+    {
+        return Some("resolve its pending response first");
+    }
+    if !matches!(
+        node.turn.as_ref(),
+        Some(Turn::Idle | Turn::Done | Turn::TaskDone)
+    ) {
+        return Some("wait for its current turn to finish");
+    }
+    None
 }
 
 fn visible_preview(node: &TreeNodeView) -> Option<&turn_core::model::ActivityPreview> {
@@ -1248,7 +1371,13 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.lifecycle_confirmation.is_some() {
+        if state.context_handoff.is_some() {
+            if let Some(snapshot) = hierarchy.as_ref() {
+                actions.extend(self.context_handoff_overlay(ui, theme, snapshot, state, full));
+            } else {
+                state.context_handoff = None;
+            }
+        } else if state.lifecycle_confirmation.is_some() {
             actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
         } else if state.layout_draft.is_some() {
             actions.extend(self.layout_editor_overlay(ui, theme, state, full));
@@ -2158,6 +2287,25 @@ impl<'a> TurnView<'a> {
                                 });
                                 ui.close();
                             }
+                            if node.is_agentic {
+                                let has_target = session.nodes.iter().any(|candidate| {
+                                    candidate.is_agentic && candidate.node_id != node.node_id
+                                });
+                                if ui
+                                    .add_enabled(
+                                        has_target,
+                                        egui::Button::new("Pass context to Agent…"),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "This Session has no other Agent to receive context.",
+                                    )
+                                    .clicked()
+                                {
+                                    state.context_handoff =
+                                        Some(ContextHandoffDraft::new(session, node));
+                                    ui.close();
+                                }
+                            }
                             if ui.button("Open temporary pane").clicked() {
                                 state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
                                     surface_id: snapshot.tree_state.surface_id.clone(),
@@ -2254,7 +2402,6 @@ impl<'a> TurnView<'a> {
                         state.tree_has_focus = true;
                         response.request_focus();
                         set_hierarchy_selection(state, snapshot, key);
-                        state.inspector_open = matches!(row, HierarchyRow::Process { .. });
                     }
                 }
             });
@@ -4244,6 +4391,312 @@ impl<'a> TurnView<'a> {
         });
     }
 
+    fn context_handoff_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        snapshot: &HierarchySnapshot,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let Some(identity) = state
+            .context_handoff
+            .as_ref()
+            .map(|draft| (draft.session_id.clone(), draft.source_node_id.clone()))
+        else {
+            return actions;
+        };
+        let Some(session) = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .find(|session| session.session.id == identity.0)
+        else {
+            state.context_handoff = None;
+            return actions;
+        };
+        let Some(source) = session.nodes.iter().find(|node| node.node_id == identity.1) else {
+            state.context_handoff = None;
+            return actions;
+        };
+        let candidates: Vec<&TreeNodeView> = session
+            .nodes
+            .iter()
+            .filter(|node| node.is_agentic && node.node_id != source.node_id)
+            .collect();
+
+        let width = 720.0_f32.min((full.width() - 36.0).max(0.0));
+        let height = 560.0_f32.min((full.height() - 36.0).max(0.0));
+        let panel = Rect::from_center_size(full.center(), Vec2::new(width, height));
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(135));
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+
+        let mut close = false;
+        let draft = state
+            .context_handoff
+            .as_mut()
+            .expect("the handoff identity came from this draft");
+        ui.scope_builder(region(panel.shrink(18.0), "context-handoff"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("PASS CONTEXT")
+                        .color(theme.text_dim)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(process_title(source))
+                        .color(theme.text)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !draft.preparing && !draft.delivering,
+                            egui::Button::new(if draft.delivered { "Done" } else { "Cancel" }),
+                        )
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            ui.separator();
+
+            if draft.delivered {
+                let target = draft
+                    .prepared
+                    .as_ref()
+                    .map(|handoff| handoff.target_label.as_str())
+                    .unwrap_or("Agent");
+                ui.add_space(16.0);
+                ui.label(
+                    RichText::new(format!("✓ Context sent to {target}"))
+                        .color(theme.done)
+                        .size(18.0),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "The reviewed payload was submitted once. No Pane, selection or layout changed.",
+                    )
+                    .color(theme.text_dim),
+                );
+                return;
+            }
+
+            if let Some(handoff) = draft.prepared.as_ref() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}  →  {}",
+                            handoff.source_label, handoff.target_label
+                        ))
+                        .color(theme.text)
+                        .strong(),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} stable facts", handoff.preview_count))
+                            .monospace()
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    if handoff.redacted {
+                        ui.label(
+                            RichText::new("SECRETS REDACTED")
+                                .monospace()
+                                .color(theme.attention)
+                                .small(),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("EXACT PAYLOAD — CONTEXT IS UNTRUSTED UNTIL VERIFIED")
+                        .monospace()
+                        .color(theme.text_dim)
+                        .small(),
+                );
+                egui::Frame::new()
+                    .fill(theme.background)
+                    .stroke(Stroke::new(1.0, theme.border))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("context-handoff-body")
+                            .max_height(330.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(handoff.body.as_str())
+                                        .monospace()
+                                        .color(theme.text),
+                                );
+                            });
+                    });
+                ui.add_space(8.0);
+                let mut go_back = false;
+                let mut send = false;
+                let delivery_session_id = handoff.session_id.clone();
+                let delivery_handoff_id = handoff.handoff_id.clone();
+                ui.horizontal(|ui| {
+                    go_back = ui
+                        .add_enabled(!draft.delivering, egui::Button::new("Back"))
+                        .clicked();
+                    let send_label = if draft.delivering {
+                        "Sending…".to_string()
+                    } else {
+                        format!("Send to {}", handoff.target_label)
+                    };
+                    send = ui
+                        .add_enabled(
+                            !draft.delivering && draft.error.is_none(),
+                            egui::Button::new(send_label),
+                        )
+                        .clicked();
+                });
+                if go_back {
+                    draft.invalidate_review();
+                } else if send {
+                    draft.delivering = true;
+                    draft.error = None;
+                    actions.push(ViewAction::DeliverContextHandoff {
+                        session_id: delivery_session_id,
+                        handoff_id: delivery_handoff_id,
+                    });
+                }
+            } else {
+                ui.label(RichText::new("FROM").monospace().color(theme.text_dim).small());
+                ui.label(
+                    RichText::new(process_title(source))
+                        .color(theme.text)
+                        .strong(),
+                );
+                ui.add_space(10.0);
+                ui.label(RichText::new("TO").monospace().color(theme.text_dim).small());
+                let selected_label = draft
+                    .target_node_id
+                    .as_ref()
+                    .and_then(|id| candidates.iter().find(|node| &node.node_id == id))
+                    .map(|node| process_title(node).to_string())
+                    .unwrap_or_else(|| "Choose an Agent".to_string());
+                let previous_target = draft.target_node_id.clone();
+                egui::ComboBox::from_id_salt("context-handoff-target")
+                    .selected_text(selected_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for candidate in &candidates {
+                            let reason = context_target_unavailable_reason(candidate);
+                            ui.add_enabled_ui(reason.is_none(), |ui| {
+                                let label = match reason {
+                                    Some(reason) => {
+                                        format!("{} — {reason}", process_title(candidate))
+                                    }
+                                    None => process_title(candidate).to_string(),
+                                };
+                                ui.selectable_value(
+                                    &mut draft.target_node_id,
+                                    Some(candidate.node_id.clone()),
+                                    label,
+                                );
+                            });
+                        }
+                    });
+                if draft.target_node_id != previous_target {
+                    draft.invalidate_review();
+                }
+
+                if let Some(reason) = draft
+                    .target_node_id
+                    .as_ref()
+                    .and_then(|id| candidates.iter().find(|node| &node.node_id == id))
+                    .and_then(|node| context_target_unavailable_reason(node))
+                {
+                    ui.label(RichText::new(reason).color(theme.attention).small());
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new("OPTIONAL INSTRUCTION")
+                        .monospace()
+                        .color(theme.text_dim)
+                        .small(),
+                );
+                let instruction = ui.add(
+                    egui::TextEdit::multiline(&mut draft.instruction)
+                        .hint_text("What should the destination Agent do with this context?")
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                );
+                if instruction.changed() {
+                    draft.invalidate_review();
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Turn includes only stable, redacted activity facts — never raw terminal scrollback. Nothing is sent during Review.",
+                    )
+                    .color(theme.text_faint)
+                    .small(),
+                );
+                let target_ready = draft
+                    .target_node_id
+                    .as_ref()
+                    .and_then(|id| candidates.iter().find(|node| &node.node_id == id))
+                    .is_some_and(|node| context_target_unavailable_reason(node).is_none());
+                ui.add_space(10.0);
+                if ui
+                    .add_enabled(
+                        target_ready && !draft.preparing,
+                        egui::Button::new(if draft.preparing {
+                            "Preparing review…"
+                        } else {
+                            "Review exact context"
+                        }),
+                    )
+                    .clicked()
+                {
+                    let target_node_id = draft
+                        .target_node_id
+                        .clone()
+                        .expect("the enabled button has a destination");
+                    draft.preparing = true;
+                    draft.error = None;
+                    let instruction = (!draft.instruction.trim().is_empty())
+                        .then(|| draft.instruction.clone());
+                    actions.push(ViewAction::PrepareContextHandoff {
+                        session_id: draft.session_id.clone(),
+                        source_node_id: draft.source_node_id.clone(),
+                        target_node_id,
+                        instruction,
+                    });
+                }
+            }
+
+            if let Some(error) = &draft.error {
+                ui.add_space(8.0);
+                ui.label(RichText::new(error).color(theme.failure));
+            }
+        });
+
+        let id = ui.id().with("context-handoff-accessibility");
+        ui.ctx().accesskit_node_builder(id, |node| {
+            node.set_role(egui::accesskit::Role::Dialog);
+            node.set_label(format!("Pass context from {}", process_title(source)));
+            node.set_modal();
+        });
+        if close {
+            state.context_handoff = None;
+        }
+        actions
+    }
+
     fn palette_overlay(
         &self,
         ui: &mut Ui,
@@ -5406,6 +5859,25 @@ mod tests {
             }],
         };
         (snapshot, root_id, child_id, session_id)
+    }
+
+    #[test]
+    fn a_context_handoff_from_the_palette_uses_the_exact_selected_agent() {
+        let (snapshot, root_id, child_id, session_id) = hierarchy_fixture();
+        let draft = ContextHandoffDraft::from_selection(
+            &snapshot,
+            Some(&HierarchyKey::process(root_id.clone())),
+        )
+        .expect("the selected Agent has one same-Session destination");
+
+        assert_eq!(draft.session_id, session_id);
+        assert_eq!(draft.source_node_id, root_id);
+        assert_eq!(draft.target_node_id, Some(child_id));
+        assert!(ContextHandoffDraft::from_selection(
+            &snapshot,
+            Some(&HierarchyKey::session(draft.session_id))
+        )
+        .is_none());
     }
 
     #[test]

@@ -61,6 +61,7 @@ typed_id!(EventId, "evt");
 typed_id!(AttentionId, "attn");
 typed_id!(CheckoutId, "checkout");
 typed_id!(LeaseId, "lease");
+typed_id!(HandoffId, "handoff");
 
 impl CheckoutId {
     /// Stable identity for the checkout a Workspace was created with.

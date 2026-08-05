@@ -25,9 +25,10 @@
 //! 1. **A heuristic never moves the user.** Turn-axis changes carry the confidence
 //!    of the event that caused them, and a provisional event cannot overwrite a
 //!    state a hook or the user established ([`core::Core`]'s turn authority).
-//! 2. **Turn never answers an agent.** There is no code path from a permission
-//!    event to a write; the only thing that reaches a pty is
-//!    [`turn_proto::Request::WritePty`], which is the human typing.
+//! 2. **Turn never answers a pending agent interaction autonomously.** Permission
+//!    and question prompts are answered only by [`turn_proto::Request::WritePty`]
+//!    carrying human input. A reviewed context handoff is a separate explicit
+//!    operation accepted only while its destination Agent is idle or done.
 //! 3. **Turn never runs a command it inferred.** Processes start from a template, a
 //!    pane definition or an explicit relaunch.
 //! 4. **Turn never relaunches on restore.** Startup *reports* what it found and

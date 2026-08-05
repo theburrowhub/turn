@@ -1009,8 +1009,9 @@ reason to look at what the protocol *lacks*:
 1. **A heuristic cannot move the user.** Focus is never something a client is told to do directly; it
    arrives as an `Effect` the attention manager already cleared through the focus governor, and
    `Confidence` travels with every event so a guess stays a guess.
-2. **Turn never approves a permission.** No request says so. Answering an Agent is `Request::WritePty` —
-   the human typing.
+2. **Turn never approves a permission.** No request says so. Pending questions and permissions are answered
+   only by `Request::WritePty` — the human typing. A reviewed context handoff is refused at a pending prompt
+   and may target only an idle or done Agent.
 3. **Turn never runs a command it inferred.** Processes start from a Template, a Pane definition, or
    `Request::RelaunchNode`. There is no "run this" verb.
 4. **Turn never relaunches on its own.** A restore *reports* what it found and marks what could be started
@@ -1058,8 +1059,9 @@ against the response catalogue. Three product rules are enforced by the *shape* 
 than by the daemon remembering to check them:
 
 - **There is no request that approves an agent's permission.** Answering a permission prompt is typing
-  into the agent's terminal, which is `Request::WritePty` — an explicit act by the human. Turn cannot
-  approve on the user's behalf because the protocol gives it no way to say so.
+  into the agent's terminal, which is `Request::WritePty` — an explicit act by the human. The separate
+  reviewed context-handoff capability is refused while a question, permission or interaction is pending,
+  so it cannot become an approval side channel.
 - **There is no request that runs a command Turn inferred from output.** A process starts from a
   Template, a Pane definition or an explicit relaunch, all of which the user chose.
 - **`Request::RelaunchNode` exists and nothing else restarts anything.** Restore offers; the user

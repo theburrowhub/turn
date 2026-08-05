@@ -169,6 +169,13 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
         limit: Some(20),
     }
     .is_mutating());
+    assert!(Request::PrepareContextHandoff {
+        session_id: session(),
+        source_node_id: node(),
+        target_node_id: NodeId::from_stored("proc_target"),
+        instruction: None,
+    }
+    .is_mutating());
     assert!(Request::SetTreeExpanded {
         surface_id: "window-a".into(),
         key: HierarchyKey::session(session()),
@@ -340,6 +347,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
     let attention_id = AttentionId::from_stored("attn_req0001");
     let checkout_id = CheckoutId::from_stored("checkout_req001");
     let lease_id = LeaseId::from_stored("lease_req0001");
+    let handoff_id = HandoffId::from_stored("handoff_req001");
 
     vec![
         Request::ListWorkspaces {
@@ -476,6 +484,16 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             node_id: node_id.clone(),
             visibility: turn_core::model::PreviewVisibility::Hide,
+        },
+        Request::PrepareContextHandoff {
+            session_id: session_id.clone(),
+            source_node_id: node_id.clone(),
+            target_node_id: NodeId::from_stored("proc_req00002"),
+            instruction: Some(ContextHandoffText::new("Summarise the reviewed findings")),
+        },
+        Request::DeliverContextHandoff {
+            session_id: session_id.clone(),
+            handoff_id,
         },
         Request::ListTemplates,
         Request::CreateLayoutTemplate {
@@ -640,7 +658,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 60 operations. This number is asserted so that adding one without
+    // 62 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 60, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 62, "the catalogue changed size: {names:?}");
 }

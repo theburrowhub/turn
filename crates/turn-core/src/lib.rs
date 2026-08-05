@@ -20,7 +20,9 @@ pub mod state;
 
 pub use attention::{AttentionManager, AttentionPolicy, Effect, UserContext};
 pub use event::{Confidence, EventKind, EventSource, Severity, TurnEvent};
-pub use ids::{AttentionId, EventId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
+pub use ids::{
+    AttentionId, EventId, HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
+};
 pub use model::{
     AgentInfo, Layout, LayoutNode, Pane, PaneKind, ProcessNode, Session, SessionTree, Split,
     Template, Workspace,
