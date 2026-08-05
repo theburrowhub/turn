@@ -1,280 +1,195 @@
+<div align="center">
+
 # Turn
 
-**Run agents in parallel. Step in when it's your turn.**
+### Run agents in parallel. Step in when it's your turn.
 
-Turn is a desktop terminal workspace for running, organising and supervising AI coding agents on macOS
-and Linux. Agents work in parallel; Turn tells you which one needs you.
+Turn is a desktop terminal workspace for running, organising, and supervising AI coding agents.
+It keeps agents, shells, TUIs, and background work organised—and brings you back only when a task
+actually needs attention.
 
-It runs each agent in a real pty inside a persistent **Workspace**, organises work into **Sessions**,
-tracks the agent hierarchy, and maintains one ordered **Attention Queue** whose top item is the thing you
-should look at next. It integrates with the agent CLIs you already use — Claude Code, Codex CLI, and
-anything else interactive — through mechanisms those tools already ship, without modifying your
-configuration.
+[![CI](https://github.com/TheBurrowHub/turn/actions/workflows/ci.yml/badge.svg)](https://github.com/TheBurrowHub/turn/actions/workflows/ci.yml)
+[![Rust 1.85+](https://img.shields.io/badge/Rust-1.85%2B-b7410e?logo=rust)](rust-toolchain.toml)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-6e7681)](#platform-support)
+[![License: MIT](https://img.shields.io/badge/license-MIT-7aa2f7)](#license)
 
-Turn is not an agent, not a model client and not a chat interface. It supervises; you decide.
+</div>
 
-- `PRODUCT.md` — the problem, the principles, MVP scope, and acceptance criteria with test evidence.
-- `ARCHITECTURE.md` — module map, integration levels, the confidence ladder, security model, performance
-  budget.
-- `DECISIONS.md` — the ADR log, including the empirical findings that changed the design.
-- `ROADMAP.md` — milestones, risks, open decisions, technical debt.
-- `CONTRIBUTING.md` — house style and the rules a change must not break.
+![Turn supervising an agent, subagents, a shell, and a TUI](crates/turn-gui/tests/snapshots/busy_desk.png)
 
----
+## Why Turn
 
-## Current state, honestly
+Traditional terminals organise windows and tabs. Turn organises work.
 
-**The upgraded first vertical is implemented and covered end to end by deterministic tests.** The native
-window consumes the production daemon protocol and presents one Workspace → Session → Agent/Tool →
-Child hierarchy, user-chosen panes, background subagents, activity previews, temporary panes, a contextual
-inspector and the Attention Queue. The Reviewer scenario crosses the real loopback Claude hook transport,
-the production daemon/store boundary and a UI reconnect to that same live daemon without opening a Pane or
-changing the saved Layout. Separate daemon-restart tests restore durable metadata as `Orphaned`/`Lost` and
-prove that nothing is relaunched; they do not claim PTY reattachment.
-Primary-checkout conflicts are typed: a Template-origin request can focus the owner or create read-only /
-worktree variants without flattening the Template in the client. The daemon preserves its complete Layout,
-environment, Attention policy, tmux and naming intent; worktree cwd values are remapped into the isolated
-checkout. A read-only Session launches only behind a technical guard; when Turn cannot apply one, launch
-remains blocked and model instructions alone never count as enforcement.
+A **Workspace** represents a persistent project. Each **Session** represents one task inside it. Agents,
+subagents, shells, test runners, servers, and TUIs live in a single hierarchy, while the centre of the
+window contains only the panes you chose to open.
 
-That is not the same claim as a released product. Nobody has yet accepted the complete scenario with an
-authenticated, currently installed Claude Code binary inside the packaged native app. Packaging,
-performance measurement, manual VoiceOver/Orca acceptance, terminal IME sign-off and broader integration
-coverage remain open — see `ROADMAP.md` §M8 and §M9.
+When several agents work in parallel, Turn distinguishes activity from intervention. Finishing a tool
+call is not the same as asking a question; completing an agent turn is not the same as exiting a process.
+Actionable demands enter one ordered **Attention Queue**, so multiple agents never fight over focus.
 
-| Crate | What it is | Status |
-| --- | --- | --- |
-| `turn-core` | Domain, two-axis state model, event vocabulary, attention subsystem | Built; reproduce its suite |
-| `turn-proto` | The daemon↔client protocol: envelope, framing, requests, pushes, cells, view models | Built; protocol v3 |
-| `turn-store` | SQLite persistence, migrations, secret redaction and hierarchy repositories | Built; append-only migrations |
-| `turn-pty` | Ptys, bounded terminal buffers, process supervision | Built |
-| `turn-hook` | Zero-dependency helper for tools that shell out instead of POSTing | Built |
-| `turn-agents` | Adapter layer (Claude Code, Codex, heuristics), registry, loopback hook server | Built |
-| `turnd` | The daemon that owns PTYs, Sessions, hierarchy, leases and Attention | Built for the automated vertical |
-| `turn-gui` | Native GPU window with the unified hierarchy and terminal panes | Built for the automated vertical |
+## What makes it different
 
-The release audit runs the whole workspace serially, then format, Clippy and the native snapshot suite.
-Counts are deliberately not frozen here because this repository changes quickly: reproduce the evidence
-with the commands below. There is one test runner; the frontend is Rust, so there is no `pnpm`, no `vitest`
-and no second lockfile. The tests are real: `turn-pty` spawns
-actual processes on actual ptys and asks the tty itself via `stty size`; `turn-agents` asserts against hook
-payloads recorded from a live Claude Code run; `turn-store` writes real SQLite files and searches them for
-secrets; `turn-gui`'s snapshot tests render the real widget tree through `wgpu` with no display attached and
-diff it against committed PNGs. The snapshot integration target contains 29 tests, 15 of which maintain
-committed PNG baselines;
-the dense fixture contains 30 Sessions, not a measured 30-Agent performance result. See `ROADMAP.md` for
-what each milestone delivered and how it was verified.
+| Capability | Turn's approach |
+| --- | --- |
+| Unified navigation | One `Workspace → Session → Agent/Tool → Child` tree; no duplicate persistent navigators |
+| Background subagents | Discovered under their parent without opening panes, changing layout, or stealing focus |
+| Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |
+| Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, scrollback, shells, and TUIs |
+| Stable layouts | Nested splits, reusable presets, drag-to-reorder, resize, balance, zoom, and per-session persistence |
+| Checkout safety | One write lease for the main checkout; extra sessions are read-only or isolated in worktrees |
+| Honest recovery | Restore layout and metadata without silently rerunning saved commands or destructive work |
+| Integration without forks | Structured hooks where available, wrappers and heuristics where useful, generic terminal otherwise |
 
-**The frontend was replaced.** A Tauri shell around a TypeScript/`xterm.js` frontend was built, rejected by
-the product owner on sight, and deleted — `ui/` and `crates/turn-ui` are gone. The window is now native Rust
-drawn on the GPU. ADR-039 in `DECISIONS.md` records the decision, why the swap cost ~13k lines of TypeScript
-rather than the product, and what it costs from here.
+## Agent and tool support
 
-What is still missing, and worth knowing before you build:
+- **Claude Code** — structured hooks plus terminal/process observation.
+- **OpenAI Codex CLI** — structured hooks and notifications, with graceful fallback.
+- **Other agent CLIs** — run through the generic terminal adapter even without a dedicated integration.
+- **Shells and TUIs** — ordinary interactive processes remain first-class: shells, test runners, servers,
+  logs, file explorers, `lazygit`, `btop`, and similar tools.
 
-- **No authenticated live-CLI acceptance.** The production reducer, protocol, hook transport, persistence
-  and UI are joined by tests, but the packaged app has not completed the scenario against a user's live
-  Claude account. Treat “Built” as automated evidence, not release acceptance.
-- **Accessibility and input need human sign-off.** The hierarchy and terminal panes expose AccessKit
-  semantics and the input path preserves composed text, but VoiceOver/Orca and terminal IME behaviour still
-  require manual acceptance on supported platforms.
-- **Advanced product hardening remains.** Complete context menus, permanent Pane placement choices,
-  performance budgets at 30 Sessions, packaging and recovery UX are M9 work.
-- **The snapshot baselines are macOS-only.** They were recorded through Metal, and `egui_kittest` allows no
-  differing pixels by default, so CI runs the comparison on macOS and says why in the workflow instead of
-  skipping it silently. Linux still compiles the snapshot target every push.
-- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` are both clean.
+An absent integration never prevents a command from running. It only changes how confidently Turn can
+describe its semantic state.
 
----
+## Current status
 
-## Building and testing
+Turn is an early-stage product with a working vertical, not a finished distribution.
+
+Implemented today:
+
+- Native GPU desktop window written in Rust.
+- Workspace and Session creation with an optional task name.
+- Portable first-run preset: two shell columns, with no dependency on optional tools.
+- Visual layout editor and reusable layout presets.
+- Persistent PTYs, terminal panes, process hierarchy, subagent previews, and temporary panes.
+- Claude Code and Codex adapter infrastructure.
+- Attention policies, permission context, queue ordering, and typing-aware focus protection.
+- SQLite persistence, write leases, safe restart recovery, and explicit process relaunch.
+- Automated macOS and Linux builds plus native UI snapshot coverage.
+
+Still before a release-quality build:
+
+- Signed installers, packaging, automatic updates, and a supported upgrade channel.
+- Broad authenticated acceptance against current agent CLI releases.
+- Measured performance acceptance at the full 30-session target.
+- Manual VoiceOver, Orca, and IME sign-off.
+
+The detailed delivery state and remaining risks live in [ROADMAP.md](ROADMAP.md).
+
+## Quick start
 
 ### Prerequisites
 
-- **Rust** stable. `rust-toolchain.toml` pins the channel and requests `rustfmt` and `clippy`; the
-  workspace MSRV is 1.85.
-- **A C toolchain.** `rusqlite` is used with the `bundled` feature, so SQLite is compiled from source and
-  there is no system library to install.
-- **Nothing else.** There is no node, no pnpm and no system webkit any more: the window is Rust. On Linux it
-  needs no packages to build or link either — X11, Wayland, xkbcommon and Vulkan are all reached by `dlopen`
-  rather than linked — though *running* it of course needs a display and a working Vulkan driver.
-- **To run `turn-gui`'s snapshot tests on a headless Linux box** you need a software Vulkan device:
+- Rust 1.85 or newer; the repository pins the toolchain in [rust-toolchain.toml](rust-toolchain.toml).
+- A C toolchain for bundled SQLite.
+- macOS for the current priority experience, or Linux with a display and Vulkan driver at runtime.
 
-  ```sh
-  sudo apt-get install -y mesa-vulkan-drivers libvulkan1
-  ```
-
-  The committed baselines were recorded on macOS/Metal, so a Linux run needs its own baseline first — see
-  `.github/workflows/ci.yml`, which spells this out where CI can be seen to be honest about it.
-
-### Commands
+### Build and run
 
 ```sh
-# Everything. This is what CI runs.
-cargo test --workspace --all-targets -- --test-threads=4
-
-# One crate
-cargo test -p turn-core
-cargo test -p turn-pty -- --test-threads=4
-
-# --test-threads=4 matters: the turn-pty tests open real ptys, and a runner that
-# exhausts the pty table fails with a confusing openpty error rather than a test
-# failure.
-
-# The checks CI runs, in CI's order
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Build the binaries
-cargo build --release --bin turnd
-cargo build --release --bin turn        # the window
-cargo build --release --bin turn-hook
+git clone git@github.com:TheBurrowHub/turn.git
+cd turn
+make run
 ```
 
-The window:
+`make run` builds the release binaries, stops the previous development daemon, and opens the freshly
+built app. Use `make run-reuse` when you deliberately want to reconnect without restarting the daemon,
+or `make help` to see the complete development command set.
+
+You can also run the native window directly during development:
 
 ```sh
-cargo run -p turn-gui                   # the native window, 1440x900; starts turnd if needed
-
-# Its visual tests. They render the real widget tree through wgpu with no display
-# attached and diff against the PNGs in crates/turn-gui/tests/snapshots/.
-cargo test -p turn-gui
-UPDATE_SNAPSHOTS=1 cargo test -p turn-gui   # re-record after an intended change
-```
-
-### First run: create real work
-
-1. In an empty window, click **+ Workspace** in the left hierarchy. **⌘N** is the keyboard route to the
-   same first-run flow when no Workspace exists.
-2. Choose **Browse…** and select an existing project directory. Turn derives the Workspace name from the
-   folder; the name remains editable. **Create and continue** persists it and opens the Session form.
-3. Choose a Layout preset and select **Create session**. The Session name and task note are optional. A
-   fresh installation contains one portable preset, **Two Shells**, with two equal default-shell columns;
-   it never assumes Claude, Fang or any other optional executable is installed.
-
-**New layout…** in the Session form opens the visual preset editor. **+ Column** and **+ Row** split the
-selected cell, each cell has an explicit program and argv, cells can be dragged to swap them, and dividers
-can be dragged to resize them. Double-clicking a divider equalises that split. The same editor is available
-under **Settings → Layout presets**.
-
-Inside a Session, **+ Pane** adds shells or agents to the current Layout. The **Layout** menu balances or
-reflows existing panes into columns, rows, a main-left arrangement or a grid, and can save the result as a
-reusable preset. Those operations preserve the running processes.
-
-After first run, **+ Workspace** always creates another Workspace. Select a Workspace and use **+ Session**
-or **⌘N** to open the full Session form. **⌘⇧N** is **Quick New**: it creates a Session immediately in
-the visibly selected Workspace using that Workspace's default Layout preset, then the first available
-preset. It never silently chooses a different Workspace, and a second create is refused while the first is
-still awaiting its daemon response.
-
-### Ending work and restoring after a restart
-
-- **Session → End session…** (or **⌘⇧K**) asks for confirmation, then stops every
-  Turn-owned process in that Session. The Session, Layout and history remain available.
-- **Session → Detach all views · keep running** closes only this window's views; it does
-  not terminate agents or shells.
-- **Session → Stop all sessions…** stops every Session in the current Workspace. To file
-  the Workspace away afterward, release its write lease from the same menu and choose
-  **Archive workspace**. Enable **Archived** in the hierarchy header to restore it later.
-
-After a daemon restart Turn restores the tree and Layout without silently running saved
-commands. For a main-checkout Session, choose **Confirm write access** and then **Start
-pane** or **Start all**. If Turn reports a surviving process that the new daemon cannot
-control, stop that process outside Turn and use **Check & confirm access**; the daemon
-revalidates it at that moment. Archiving and ending work never delete the project directory.
-
-`turn` reuses a daemon already listening on its socket. When none is listening it starts `turnd` as a
-detached companion, so closing the window does not stop the daemon, its PTYs or its agents. Packaged builds
-place `turn`, `turnd` and `turn-hook` beside one another; `turnd` resolves the helper beside itself rather
-than searching `PATH`. A debug source build falls back to the exact Cargo workspace it was compiled from
-and builds both companions before starting the daemon.
-`TURN_TURND_BIN` can name an explicit companion binary for an unusual development layout. Companion output
-is appended to `turnd.log` under `TURN_DATA_DIR` (or Turn's platform data directory), and a launch failure is
-shown in the window.
-
-Starting the daemon yourself remains useful for debugging, but is not required:
-
-```sh
-cargo run --bin turnd &
 cargo run -p turn-gui
 ```
 
-Test names are full sentences describing the guaranteed behaviour, so `cargo test -- --list` is a readable
-specification:
+## First session
+
+1. Select **+ Workspace**, choose **Browse…**, and pick an existing project directory. Turn derives the
+   Workspace name from the folder; you can edit it before creating the Workspace.
+2. Select **+ Session** or press **⌘N**. A Session name is optional.
+3. Choose the built-in **Two Shells** preset or create a layout from the same screen.
+4. Use **+ Pane** to add a shell or agent, and **Layout** to redistribute or save the current arrangement.
+5. Use **Next Attention** to jump to the next agent that actually needs you.
+
+To finish work, choose **Session → End session…** or press **⌘⇧K**. This stops Turn-owned processes while
+keeping the Session's layout and history. **Detach all views · keep running** only closes the views.
+
+## Restart and recovery
+
+Turn never silently reruns saved commands after a daemon restart.
+
+For a main-checkout Session, choose **Confirm write access**, then **Start pane** or **Start all**. If a
+process survived but the new daemon cannot control it, stop that process outside Turn and choose
+**Check & confirm access**. The daemon revalidates ownership at that moment.
+
+Archiving Sessions or Workspaces never deletes the project directory.
+
+## Architecture
+
+Turn is one Rust workspace with a daemon-owned runtime and a thin native client.
+
+| Crate | Responsibility |
+| --- | --- |
+| `turn-gui` | Native `eframe`/`egui` desktop interface rendered through `wgpu` |
+| `turnd` | Authoritative owner of PTYs, Sessions, hierarchy, write leases, and Attention |
+| `turn-pty` | PTY processes, bounded terminal state, replay, resize, signals, and supervision |
+| `turn-agents` | Claude Code, Codex, heuristic, and generic terminal adapters |
+| `turn-store` | SQLite persistence, migrations, hierarchy records, and secret redaction |
+| `turn-proto` | Versioned daemon/client protocol, requests, events, terminal cells, and view models |
+| `turn-core` | Domain model, process/turn state machines, layouts, events, and Attention policy |
+| `turn-hook` | Small helper for agent integrations that report by spawning a command |
+
+The daemon owns runtime truth. The GUI renders revisioned projections and never invents process state,
+relationships, permissions, or write authority.
+
+## Safety principles
+
+- A heuristic can badge a Session, but it can never move focus.
+- Agent output is never interpreted as a command for Turn to execute.
+- Closing a pane never terminates the process behind it.
+- A main checkout has at most one active writing Session.
+- Permission prompts show the exact Session, process, command, and working directory available to Turn.
+- Restore never relaunches a process until the user explicitly asks.
+
+See [SECURITY.md](docs/SECURITY.md) for the complete threat model.
+
+## Development
 
 ```sh
-cargo test --workspace -- --list | grep ': test'
+# Format, lint, and test in the same order as CI
+make verify
+
+# Run the complete test suite
+make test
+
+# Update and inspect native UI snapshots after an intentional visual change
+make snapshots
 ```
 
-### Environment
+The PTY and agent integration suites use real operating-system resources. Test concurrency is intentionally
+bounded by the Makefile so local and CI runs do not exhaust PTYs or file descriptors.
 
-- `TURN_DATA_DIR` overrides where `turn-store` puts its database. Resolution is a pure function of an
-  explicit override and this variable, so tests never mutate process-global state that other tests read.
-- `TURN_HOOK_URL` is how `turn-hook` learns where to POST when the agent's configuration cannot carry an
-  argument.
-- `TURN_NODE_ID` is set on every process Turn spawns, so the supervisor can attribute strays.
+## Documentation
 
----
+- [PRODUCT.md](PRODUCT.md) — product requirements, principles, use cases, and acceptance criteria.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — module boundaries, integration levels, security, and performance.
+- [DECISIONS.md](DECISIONS.md) — architectural decision records and their trade-offs.
+- [ROADMAP.md](ROADMAP.md) — milestones, open risks, technical debt, and release work.
+- [Unified hierarchy upgrade](docs/UNIFIED_HIERARCHY_UPGRADE.md) — tree, Agent/Pane separation,
+  write leases, previews, and persistence contracts.
+- [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
+- [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 
-## Repository layout
+## Platform support
 
-```
-Cargo.toml                     workspace root; all shared dependency versions live here
-rust-toolchain.toml            pinned channel + rustfmt/clippy
-.github/workflows/ci.yml       macOS and Linux matrix from the first milestone; one cargo job, no node
+| Platform | Status |
+| --- | --- |
+| macOS | Primary development and native snapshot platform |
+| Linux | Built and tested in CI; runtime needs a display and Vulkan driver |
+| Windows | Not currently supported |
 
-crates/
-  turn-core/                   domain layer — no I/O, no clock reads inside logic
-    src/ids.rs                 prefixed typed-id newtypes
-    src/state.rs               Lifecycle × Turn, and the derived DisplayState
-    src/event.rs               TurnEvent, EventKind, Confidence, EventSource
-    src/model/                 Workspace, Session, ProcessNode/SessionTree, Layout/Pane, Template
-    src/attention/             policy, queue, focus governor, manager (emits Effects)
-
-  turn-pty/                    ptys and terminals
-    src/process.rs             PtyProcess: spawn, write, resize, subscribe, replay, exit reporting
-    src/buffer.rs              bounded byte ring + bounded vt100 screen; OSC 52 refusal; title sanitising
-    src/supervisor.rs          on-demand process-table scans; conservative classification
-
-  turn-agents/                 the only tool-specific code in the workspace
-    src/adapter.rs             the AgentAdapter trait, IntegrationLevel, Capabilities, HookEndpoint
-    src/claude.rs              Claude Code — Structured, HTTP hooks via --settings
-    src/codex.rs               Codex CLI — inline TOML hooks + notify, degrading to Wrapper
-    src/heuristic.rs           output inference, capped at InferredHigh, stands down in a TUI
-    src/registry.rs            adapter selection that always answers and always explains
-    src/server.rs              the loopback hook receiver: 127.0.0.1, per-node tokens
-    src/risk.rs                permission risk rating — display and ordering only
-    tests/fixtures/            payloads captured from a live Claude Code 2.1.221 run
-
-  turn-hook/                   zero-dependency helper; exits 0 whatever happens
-  turn-store/                  SQLite: migrations, codec, redact, location, repo/*
-  turn-proto/                  envelope, request, response, events, framing, bytes, view/*
-  turnd/                       the daemon — built, never yet run against a real agent
-    src/core/                  the single owner of state: spawn, supervise, restore, events, requests
-    src/server/                the unix-socket accept loop and per-connection tasks
-
-  turn-gui/                    the window: native Rust drawn on the GPU (eframe/egui over wgpu)
-    src/cells.rs               a pane's screen as cells; converted from the daemon's parsed screen
-    src/theme.rs               the palette, and state_marker(): a colour and a glyph, never one alone
-    src/view.rs                status bar, permission banner, sidebar, terminal pane, attention queue
-    tests/snapshots.rs         the widget tree rendered through wgpu with no display, diffed against PNGs
-    tests/snapshots/           the committed baselines — recorded on macOS/Metal
-
-docs/PROTOCOL.md               the wire protocol, kept honest by turn-proto's catalogue tests
-```
-
----
-
-## The one rule to know before reading the code
-
-**A heuristic can never move the user's focus.** Terminal-output inference is capped at
-`Confidence::InferredHigh` by its `EventSource`, and any focus action arising from a confidence below
-`Integrated` degrades to a badge. It is enforced twice, independently, and tested at each point. A missed
-notification costs a glance; a false focus change costs the thought you were holding, and teaches you not
-to trust the tool.
-
-Everything else follows from that asymmetry. See `CONTRIBUTING.md`.
-
-## Licence
+## License
 
 MIT.
