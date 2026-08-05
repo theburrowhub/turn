@@ -3937,6 +3937,7 @@ dependencies = [
  "tracing-subscriber",
  "turn-core",
  "turn-proto",
+ "turnd",
 ]
 
 [[package]]

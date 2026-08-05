@@ -37,4 +37,8 @@ egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
 # `start_paused` lets the reconnect backoff be tested in microseconds rather than by
 # waiting out a real thirty seconds.
 tokio = { workspace = true, features = ["test-util"] }
+# The onboarding contract is exercised across the actual GUI transport and an
+# in-process daemon. Its socket and durable store both live in a TempDir, so the test
+# can prove restart persistence without reading or writing the developer's Turn state.
+turnd = { path = "../turnd" }
 tempfile = "3"
