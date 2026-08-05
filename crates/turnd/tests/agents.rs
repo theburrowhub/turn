@@ -12,7 +12,7 @@ use turn_core::attention::Effect;
 use turn_core::event::Confidence;
 use turn_core::model::PaneKind;
 use turn_core::state::{AwaitingReason, DisplayState, Turn};
-use turn_proto::{NewPane, Request, ServerEvent};
+use turn_proto::{CloseDisposition, HierarchyKey, NewPane, Request, Response, ServerEvent};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notification_that_the_agent_needs_input_puts_the_session_in_the_queue() {
@@ -162,14 +162,35 @@ async fn a_permission_request_is_carried_in_full_and_never_answered_by_turn() {
     daemon.shutdown().await;
 }
 
-/// Case D from the brief: a subagent appearing is information, not an interruption.
+/// The upgraded first vertical over the real hook transport. A declared Reviewer is a
+/// background AgentNode first; its preview, relationship and tree interaction survive a
+/// UI reconnect, while its temporary Pane never mutates the saved Layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_subagent_joins_the_tree_with_a_confirmed_link_and_does_not_move_the_user() {
+async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
     let agent = agent_session(&daemon, &mut ui, "spawning subagents").await;
+    let layout_before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    )
+    .layout;
 
-    post_hook(&agent.hook, &subagent_start("Explore", "sub-1")).await;
+    post_hook(
+        &agent.hook,
+        &serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "agent_name": "Reviewer",
+            "agent_type": "Explore",
+            "agent_id": "sub-reviewer",
+            "task": "Review the climbing logic changes",
+            "session_id": fixture_session_id(),
+            "cwd": "/private/tmp"
+        }),
+    )
+    .await;
 
     let nodes = ui
         .wait_for("the tree to gain a subagent", |event| match event {
@@ -195,7 +216,22 @@ async fn a_subagent_joins_the_tree_with_a_confirmed_link_and_does_not_move_the_u
     assert_eq!(subagent.relationship.confidence, Confidence::Explicit);
     assert!(!subagent.relationship_is_provisional);
     assert_eq!(subagent.depth, 1);
-    assert_eq!(subagent.title, "Explore");
+    assert_eq!(subagent.title, "Reviewer");
+    assert_eq!(
+        subagent
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.name.declared_name.as_deref()),
+        Some("Reviewer")
+    );
+    assert_eq!(
+        subagent
+            .activity_preview
+            .as_ref()
+            .map(|preview| preview.normalized_text.as_str()),
+        Some("Review the climbing logic changes")
+    );
+    assert!(subagent.pane_bindings.is_empty());
     assert_eq!(
         subagent.pid, None,
         "a subagent runs inside its parent, so inventing a pid would name nothing"
@@ -224,12 +260,119 @@ async fn a_subagent_joins_the_tree_with_a_confirmed_link_and_does_not_move_the_u
         "a subagent appearing must never move the user: {effects:#?}"
     );
 
+    let surface = "reviewer-window".to_string();
+    let reviewer_key = HierarchyKey::process(subagent.node_id.clone());
+    let root_key = HierarchyKey::process(agent.node.clone());
+    ui.ask(Request::SetTreeExpanded {
+        surface_id: surface.clone(),
+        key: root_key.clone(),
+        expanded: true,
+    })
+    .await;
+    ui.ask(Request::SelectTreeNode {
+        surface_id: surface.clone(),
+        selected: Some(reviewer_key.clone()),
+    })
+    .await;
+
+    let history = ui
+        .ask(Request::GetPreviewHistory {
+            session_id: agent.session.clone(),
+            node_id: subagent.node_id.clone(),
+            limit: Some(5),
+        })
+        .await;
+    assert!(matches!(
+        history,
+        Response::PreviewHistory { ref entries, .. }
+            if entries.iter().any(|entry| entry.normalized_text == "Review the climbing logic changes")
+    ));
+
+    let temporary = match ui
+        .ask(Request::OpenNodeAsTemporaryPane {
+            surface_id: surface.clone(),
+            session_id: agent.session.clone(),
+            node_id: subagent.node_id.clone(),
+        })
+        .await
+    {
+        Response::NodePane { pane } => pane,
+        other => panic!("expected a temporary Reviewer pane, got {other:?}"),
+    };
+    assert!(temporary.binding.temporary);
+    assert!(matches!(
+        temporary.capability,
+        turn_proto::NodePaneCapability::PreviewDetails
+    ));
+    let layout_while_open = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    )
+    .layout;
+    assert_eq!(layout_while_open, layout_before, "Cmd+Enter must not split");
+
+    ui.ask(Request::ClosePane {
+        session_id: agent.session.clone(),
+        pane_id: temporary.binding.pane_id.clone(),
+        disposition: CloseDisposition::KeepProcesses,
+    })
+    .await;
+    let after_close = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let reviewer = after_close
+        .tree
+        .iter()
+        .find(|node| node.node_id == subagent.node_id)
+        .expect("Reviewer remains in the tree");
+    assert!(
+        reviewer.lifecycle.is_running(),
+        "closing a view cannot stop it"
+    );
+    assert_eq!(after_close.layout, layout_before);
+
+    // Dropping and reconnecting this client is the UI-restart boundary: turnd and its
+    // Processes stay alive, while the next window restores only persisted tree state.
+    drop(ui);
+    let mut ui = daemon.connect().await;
+    let restored = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: surface,
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the restored hierarchy, got {other:?}"),
+    };
+    assert_eq!(restored.tree_state.selected, Some(reviewer_key));
+    assert!(restored.tree_state.expanded.contains(&root_key));
+    let restored_reviewer = restored
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.node_id == subagent.node_id)
+        .expect("Reviewer survives the UI restart");
+    assert_eq!(restored_reviewer.parent.as_ref(), Some(&agent.node));
+    assert_eq!(
+        restored_reviewer.relationship.confidence,
+        Confidence::Explicit
+    );
+    assert!(restored_reviewer.activity_preview.is_some());
+    assert!(restored_reviewer.pane_bindings.is_empty());
+
     // And it leaves again when the tool says so.
     post_hook(
         &agent.hook,
         &serde_json::json!({
             "hook_event_name": "SubagentStop",
-            "agent_id": "sub-1",
+            "agent_id": "sub-reviewer",
             "session_id": fixture_session_id(),
         }),
     )
