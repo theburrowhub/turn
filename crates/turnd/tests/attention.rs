@@ -22,7 +22,7 @@ async fn two_sessions_blocking_at_once_are_ordered_and_walking_the_queue_visits_
     // The idle prompt lands first, so age cannot be what decides the order.
     post_hook(
         &first.hook,
-        &notification("agent_needs_input", "Which approach do you want?"),
+        &notification("idle_prompt", "Which approach do you want?"),
     )
     .await;
     wait_for_state(&mut ui, &first.session, DisplayState::WaitingForUser).await;
@@ -135,11 +135,7 @@ async fn a_muted_session_still_badges_and_a_snooze_takes_a_demand_out_of_the_way
         until_ms: None,
     })
     .await;
-    post_hook(
-        &agent.hook,
-        &notification("agent_needs_input", "Still waiting"),
-    )
-    .await;
+    post_hook(&agent.hook, &notification("idle_prompt", "Still waiting")).await;
     wait_for_state(&mut ui, &agent.session, DisplayState::WaitingForUser).await;
 
     let entries = attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await);

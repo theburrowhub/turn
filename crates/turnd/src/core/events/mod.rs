@@ -24,7 +24,7 @@ mod tree;
 use super::Core;
 use turn_core::event::{Confidence, EventKind, TurnEvent};
 use turn_core::ids::NodeId;
-use turn_core::model::PendingPermission;
+use turn_core::model::{NodeKind, PendingPermission};
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::ServerEvent;
 
@@ -66,6 +66,7 @@ impl Core {
                 event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
             }
         }
+        self.correlate_unbound_agent_event(&mut event);
         let policy = session.attention.clone();
 
         let changed = self.apply(&event, now_ms);
@@ -110,6 +111,80 @@ impl Core {
                 confidence = event.confidence.label(),
                 "kept the existing state: the event was less trustworthy than what set it"
             );
+        }
+    }
+
+    /// Resolves callbacks delivered through a parent's hook endpoint but lacking
+    /// a worker id.
+    ///
+    /// Claude explicitly reported the event, but not its subject. A single live
+    /// child is a high-confidence correlation; several children remain node-less
+    /// and provisional. That distinction prevents both failure modes: silently
+    /// marking the parent `YOUR TURN`, and confidently blaming an arbitrary
+    /// sibling.
+    fn correlate_unbound_agent_event(&self, event: &mut TurnEvent) {
+        if event.node_id.is_some() {
+            return;
+        }
+        let Some(parent) = event.parent_node_id.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(&event.session_id) else {
+            return;
+        };
+
+        match &event.kind {
+            EventKind::AgentPermissionRequired { .. } | EventKind::AgentWaitingForUser { .. } => {
+                let candidates: Vec<_> = session
+                    .tree
+                    .descendants(&parent)
+                    .into_iter()
+                    .filter(|node| node.kind == NodeKind::Subagent && node.is_running())
+                    .map(|node| node.id.clone())
+                    .collect();
+                match candidates.as_slice() {
+                    [subject] => bind_inferred_subject(event, subject),
+                    _ => preserve_unresolved_subject(event, &parent),
+                }
+            }
+            EventKind::AgentTurnStarted { .. } => {
+                // An earlier ambiguous worker demand is itself the best available
+                // correlation target. Resolve that provisional flow, not a known
+                // sibling which may still be waiting for an unrelated answer.
+                let has_unassigned =
+                    self.attention.queue().iter().any(|entry| {
+                        entry.session_id == event.session_id && entry.node_id.is_none()
+                    });
+                if has_unassigned {
+                    preserve_unresolved_subject(event, &parent);
+                    return;
+                }
+
+                let waiting: Vec<_> = std::iter::once(session.tree.get(&parent))
+                    .flatten()
+                    .chain(session.tree.descendants(&parent))
+                    .filter(|node| {
+                        node.kind.is_agentic()
+                            && node.is_running()
+                            && (node.interaction_pending
+                                || node.turn.as_ref().is_some_and(|turn| turn.needs_user()))
+                    })
+                    .map(|node| node.id.clone())
+                    .collect();
+
+                match waiting.as_slice() {
+                    [subject] if subject == &parent => bind_explicit_subject(event, subject),
+                    [subject] => bind_inferred_subject(event, subject),
+                    [] => {
+                        // With no outstanding child flow, UserPromptSubmit belongs
+                        // to the runtime whose authenticated hook endpoint received
+                        // it: the parent node itself.
+                        bind_explicit_subject(event, &parent);
+                    }
+                    _ => preserve_unresolved_subject(event, &parent),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -164,7 +239,7 @@ impl Core {
         }
 
         let touches_turn = turn_axis_change(&event.kind).is_some();
-        if touches_turn && !self.may_set_turn(&node_id, event.confidence) {
+        if touches_turn && !self.may_set_turn_for_event(event, &node_id) {
             return Changed {
                 node: None,
                 structure: false,
@@ -394,6 +469,40 @@ impl Core {
             None => true,
         }
     }
+
+    /// A uniquely correlated prompt submission may close the one child flow that
+    /// was waiting even when the original demand carried an explicit worker id.
+    /// The resulting state retains `inferred_high` authority: the callback was a
+    /// fact, while choosing this child was still a correlation.
+    fn may_set_turn_for_event(&self, event: &TurnEvent, node: &NodeId) -> bool {
+        if self.may_set_turn(node, event.confidence) {
+            return true;
+        }
+        matches!(&event.kind, EventKind::AgentTurnStarted { .. })
+            && event.confidence == Confidence::InferredHigh
+            && event.parent_node_id.is_some()
+            && self
+                .sessions
+                .get(&event.session_id)
+                .and_then(|session| session.tree.get(node))
+                .is_some_and(|subject| subject.interaction_pending)
+    }
+}
+
+fn bind_explicit_subject(event: &mut TurnEvent, subject: &NodeId) {
+    event.node_id = Some(subject.clone());
+    event.dedup_key = format!("{}|subject:{subject}", event.dedup_key);
+}
+
+fn bind_inferred_subject(event: &mut TurnEvent, subject: &NodeId) {
+    event.node_id = Some(subject.clone());
+    event.confidence = event.confidence.min(Confidence::InferredHigh);
+    event.dedup_key = format!("{}|subject:{subject}", event.dedup_key);
+}
+
+fn preserve_unresolved_subject(event: &mut TurnEvent, parent: &NodeId) {
+    event.confidence = Confidence::Unknown;
+    event.dedup_key = format!("{}|subject:unresolved-under:{parent}", event.dedup_key);
 }
 
 /// Whether an event kind moves the agent turn axis, and to what.

@@ -458,4 +458,233 @@ mod tests {
         ));
         assert_eq!(tree.get(&parent_id).unwrap().turn, Some(Turn::Active));
     }
+
+    #[tokio::test]
+    async fn one_child_correlates_an_idless_worker_demand_and_resume_without_lying() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_idless_worker");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_idless_worker"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.turn = Some(Turn::Active);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-reviewer".into()),
+            None,
+            NOW + 1,
+        );
+        let reviewer_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-reviewer")
+            .unwrap()
+            .id
+            .clone();
+
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_parent(parent_id.clone());
+        harness.core.ingest(permission, NOW + 2);
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert!(matches!(
+            tree.get(&reviewer_id).unwrap().turn,
+            Some(Turn::AwaitingUser {
+                reason: turn_core::state::AwaitingReason::Permission
+            })
+        ));
+        assert_eq!(tree.get(&parent_id).unwrap().turn, Some(Turn::Active));
+        let queued = harness.core.attention.queue().iter().next().unwrap();
+        assert_eq!(queued.node_id.as_ref(), Some(&reviewer_id));
+        assert_eq!(queued.confidence, Confidence::InferredHigh);
+
+        let resumed = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentTurnStarted {
+                prompt_excerpt: Some("allow".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "UserPromptSubmit".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_parent(parent_id.clone());
+        harness.core.ingest(resumed, NOW + 3);
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert_eq!(tree.get(&reviewer_id).unwrap().turn, Some(Turn::Active));
+        assert_eq!(tree.get(&parent_id).unwrap().turn, Some(Turn::Active));
+        assert!(harness.core.attention.queue().is_empty());
+        assert_eq!(
+            harness.core.turn_authority.get(&reviewer_id),
+            Some(&Confidence::InferredHigh),
+            "the hook fact is explicit, but the child attribution remains inferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_children_keep_idless_attention_unassigned_and_preserve_sibling_demands() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_ambiguous_workers");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_ambiguous_workers"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.turn = Some(Turn::Active);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        for (name, id) in [("Reviewer", "worker-reviewer"), ("Tests", "worker-tests")] {
+            harness.core.insert_subagent(
+                &session_id,
+                &parent_id,
+                Some(name.into()),
+                Some("Explore".into()),
+                Some(id.into()),
+                None,
+                NOW + 1,
+            );
+        }
+        let reviewer_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-reviewer")
+            .unwrap()
+            .id
+            .clone();
+        let tests_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-tests")
+            .unwrap()
+            .id
+            .clone();
+
+        let ambiguous = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentWaitingForUser {
+                reason: turn_core::state::AwaitingReason::Input,
+                summary: Some("A worker needs input".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_parent(parent_id.clone());
+        harness.core.ingest(ambiguous, NOW + 2);
+
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&parent_id)
+                .unwrap()
+                .turn,
+            Some(Turn::Active)
+        );
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&reviewer_id)
+                .unwrap()
+                .turn,
+            Some(Turn::Active)
+        );
+        let unassigned = harness.core.attention.queue().iter().next().unwrap();
+        assert_eq!(unassigned.node_id, None);
+        assert_eq!(unassigned.confidence, Confidence::Unknown);
+
+        let reviewer_permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer needs permission".into(),
+                command: None,
+                tool_name: Some("Bash".into()),
+                risk: Risk::Medium,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_node(reviewer_id.clone());
+        harness.core.ingest(reviewer_permission, NOW + 3);
+        assert_eq!(harness.core.attention.queue().len(), 2);
+
+        let resumed = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentTurnStarted {
+                prompt_excerpt: Some("continue".into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "UserPromptSubmit".into(),
+            },
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_parent(parent_id.clone());
+        harness.core.ingest(resumed, NOW + 4);
+
+        let remaining: Vec<_> = harness.core.attention.queue().iter().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].node_id.as_ref(), Some(&reviewer_id));
+        assert!(matches!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&reviewer_id)
+                .unwrap()
+                .turn,
+            Some(Turn::AwaitingUser {
+                reason: turn_core::state::AwaitingReason::Permission
+            })
+        ));
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&tests_id)
+                .unwrap()
+                .turn,
+            Some(Turn::Active)
+        );
+    }
 }

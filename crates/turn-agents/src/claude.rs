@@ -357,6 +357,24 @@ impl AgentAdapter for ClaudeCodeAdapter {
             .with_agent(agent.clone())
         };
 
+        // Some callbacks arrive on the parent's hook connection while describing
+        // a worker. Keep the known parent as a correlation anchor, but leave the
+        // subject empty: the daemon owns the live tree and is the only layer that
+        // can honestly decide whether there is one possible child, several, or
+        // none. Assigning `ctx.node_id` here would silently turn a worker demand
+        // into a main-agent demand.
+        let make_descendant = |kind: EventKind| -> TurnEvent {
+            TurnEvent::new(
+                ctx.session_id.clone(),
+                kind,
+                source.clone(),
+                Confidence::Explicit,
+                ctx.timestamp_ms,
+            )
+            .with_parent(ctx.node_id.clone())
+            .with_agent(agent.clone())
+        };
+
         // Validated, not merely copied: this id is handed back to the tool as an
         // argument when the user resumes the session.
         let external_id = payload
@@ -377,7 +395,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             // The field is `prompt`; `user_prompt` is accepted as well because
             // the published documentation names it that way and the two may yet
             // diverge between releases.
-            "UserPromptSubmit" => vec![make(EventKind::AgentTurnStarted {
+            "UserPromptSubmit" => vec![make_descendant(EventKind::AgentTurnStarted {
                 prompt_excerpt: payload
                     .get("prompt")
                     .or_else(|| payload.get("user_prompt"))
@@ -419,11 +437,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
                     .and_then(Value::as_str)
                     .map(|message| excerpt(message, 240));
                 match notification_type {
-                    // `worker_permission_prompt` is the same demand raised by a
-                    // background worker session. Told apart from the interactive
-                    // one only by who is blocked, which the user does not care
-                    // about while deciding whether to approve.
-                    "permission_prompt" | "worker_permission_prompt" => {
+                    "permission_prompt" => {
                         vec![make(EventKind::AgentPermissionRequired {
                             summary: message
                                 .clone()
@@ -440,8 +454,36 @@ impl AgentAdapter for ClaudeCodeAdapter {
                             ),
                         })]
                     }
-                    "idle_prompt" | "agent_needs_input" => {
+                    // Worker callbacks use the parent's hook endpoint and do not
+                    // consistently carry `agent_id`. Preserve that uncertainty for
+                    // tree-aware correlation instead of blaming the parent.
+                    "worker_permission_prompt" => {
+                        vec![make_descendant(EventKind::AgentPermissionRequired {
+                            summary: message
+                                .clone()
+                                .filter(|message| !message.is_empty())
+                                .unwrap_or_else(|| {
+                                    "A Claude worker is waiting for permission".to_string()
+                                }),
+                            command: None,
+                            tool_name: payload
+                                .get("tool_name")
+                                .and_then(Value::as_str)
+                                .and_then(text::field),
+                            risk: risk::assess(
+                                payload.get("tool_name").and_then(Value::as_str),
+                                None,
+                            ),
+                        })]
+                    }
+                    "idle_prompt" => {
                         vec![make(EventKind::AgentWaitingForUser {
+                            reason: AwaitingReason::Input,
+                            summary: message,
+                        })]
+                    }
+                    "agent_needs_input" => {
+                        vec![make_descendant(EventKind::AgentWaitingForUser {
                             reason: AwaitingReason::Input,
                             summary: message,
                         })]
@@ -985,6 +1027,8 @@ mod tests {
             permission[0].attention_reason(),
             Some(AwaitingReason::Permission)
         );
+        assert_eq!(permission[0].node_id.as_ref(), Some(&ctx().node_id));
+        assert_eq!(permission[0].parent_node_id, None);
 
         let idle = normalise(json!({
             "hook_event_name": "Notification",
@@ -992,6 +1036,7 @@ mod tests {
             "message": "Claude is waiting for your input"
         }));
         assert_eq!(idle[0].attention_reason(), Some(AwaitingReason::Input));
+        assert_eq!(idle[0].node_id.as_ref(), Some(&ctx().node_id));
 
         let needs_input = normalise(json!({
             "hook_event_name": "Notification",
@@ -1001,6 +1046,8 @@ mod tests {
             needs_input[0].attention_reason(),
             Some(AwaitingReason::Input)
         );
+        assert_eq!(needs_input[0].node_id, None);
+        assert_eq!(needs_input[0].parent_node_id.as_ref(), Some(&ctx().node_id));
 
         // A worker's permission prompt blocks work just the same.
         let worker = normalise(json!({
@@ -1012,6 +1059,16 @@ mod tests {
             worker[0].attention_reason(),
             Some(AwaitingReason::Permission)
         );
+        assert_eq!(worker[0].node_id, None);
+        assert_eq!(worker[0].parent_node_id.as_ref(), Some(&ctx().node_id));
+        assert_eq!(worker[0].confidence, Confidence::Explicit);
+        assert!(matches!(
+            worker[0].source,
+            EventSource::Hook {
+                ref tool,
+                ref event_name
+            } if tool == "claude-code" && event_name == "Notification"
+        ));
 
         // Announcements of things that finished are not demands on the user.
         for progress in NON_DEMANDING_NOTIFICATIONS {
@@ -1118,6 +1175,8 @@ mod tests {
             "user_prompt": "yes, go ahead"
         }));
         assert!(matches!(events[0].kind, EventKind::AgentTurnStarted { .. }));
+        assert_eq!(events[0].node_id, None);
+        assert_eq!(events[0].parent_node_id.as_ref(), Some(&ctx().node_id));
     }
 
     #[test]

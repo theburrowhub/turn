@@ -9,7 +9,7 @@ mod common;
 use common::agent::*;
 use common::*;
 use turn_core::attention::Effect;
-use turn_core::event::Confidence;
+use turn_core::event::{Confidence, EventKind, EventSource};
 use turn_core::model::PaneKind;
 use turn_core::state::{AwaitingReason, DisplayState, Turn};
 use turn_proto::{CloseDisposition, HierarchyKey, NewPane, Request, Response, ServerEvent};
@@ -22,7 +22,7 @@ async fn a_notification_that_the_agent_needs_input_puts_the_session_in_the_queue
 
     post_hook(
         &agent.hook,
-        &notification("agent_needs_input", "Waiting for your reply"),
+        &notification("idle_prompt", "Waiting for your reply"),
     )
     .await;
 
@@ -158,6 +158,221 @@ async fn a_permission_request_is_carried_in_full_and_never_answered_by_turn() {
         "Turn must not have approved anything on the user's behalf"
     );
     assert_eq!(details.summary.display_state, DisplayState::NeedsPermission);
+
+    daemon.shutdown().await;
+}
+
+/// P1 regression: Claude delivers worker notifications through the parent's hook
+/// and may omit `agent_id`. With one declared child the tree is enough to correlate
+/// at inferred-high confidence; answering clears that child only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = agent_session(&daemon, &mut ui, "idless worker attention").await;
+
+    post_hook(
+        &agent.hook,
+        &serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "agent_name": "Reviewer",
+            "agent_type": "Explore",
+            "agent_id": "sub-reviewer-idless",
+            "task": "Review the climbing diff",
+            "session_id": fixture_session_id(),
+            "cwd": "/private/tmp"
+        }),
+    )
+    .await;
+    let reviewer = ui
+        .wait_for("Reviewer in the hierarchy", |event| match event {
+            ServerEvent::TreeChanged { session_id, nodes }
+                if session_id == &agent.session && nodes.len() == 2 =>
+            {
+                nodes
+                    .iter()
+                    .find(|node| node.title == "Reviewer")
+                    .map(|node| node.node_id.clone())
+            }
+            _ => None,
+        })
+        .await;
+
+    let payload = notification(
+        "worker_permission_prompt",
+        "Reviewer needs permission to run tests",
+    );
+    assert!(
+        payload.get("agent_id").is_none(),
+        "the regression requires the real id-less hook shape"
+    );
+    post_hook(&agent.hook, &payload).await;
+
+    let permission = ui
+        .wait_for(
+            "the correlated worker permission event",
+            |event| match event {
+                ServerEvent::TurnEventEmitted { turn_event }
+                    if turn_event.session_id == agent.session
+                        && matches!(
+                            &turn_event.kind,
+                            EventKind::AgentPermissionRequired { .. }
+                        ) =>
+                {
+                    Some(turn_event.clone())
+                }
+                _ => None,
+            },
+        )
+        .await;
+    assert_eq!(permission.node_id.as_ref(), Some(&reviewer));
+    assert_eq!(permission.parent_node_id.as_ref(), Some(&agent.node));
+    assert_eq!(permission.confidence, Confidence::InferredHigh);
+    assert!(matches!(
+        permission.source,
+        EventSource::Hook {
+            ref tool,
+            ref event_name
+        } if tool == "claude-code" && event_name == "Notification"
+    ));
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        details
+            .tree
+            .iter()
+            .find(|node| node.node_id == reviewer)
+            .unwrap()
+            .turn,
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission
+        })
+    );
+    let parent = details
+        .tree
+        .iter()
+        .find(|node| node.node_id == agent.node)
+        .unwrap();
+    assert!(
+        parent.turn.as_ref().is_some_and(|turn| !turn.needs_user()),
+        "the parent did not ask for this permission: {:?}",
+        parent.turn
+    );
+    assert!(
+        parent
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.pending_permission.as_ref())
+            .is_none(),
+        "the permission detail belongs only to Reviewer"
+    );
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].entry.node_id.as_ref(), Some(&reviewer));
+    assert!(queued[0].provisional);
+
+    let prompt = fixtures()["UserPromptSubmit"].clone();
+    assert!(prompt.get("agent_id").is_none());
+    post_hook(&agent.hook, &prompt).await;
+    let resumed = ui
+        .wait_for("the correlated worker resume event", |event| match event {
+            ServerEvent::TurnEventEmitted { turn_event }
+                if turn_event.session_id == agent.session
+                    && matches!(&turn_event.kind, EventKind::AgentTurnStarted { .. }) =>
+            {
+                Some(turn_event.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(resumed.node_id.as_ref(), Some(&reviewer));
+    assert_eq!(resumed.parent_node_id.as_ref(), Some(&agent.node));
+    assert_eq!(resumed.confidence, Confidence::InferredHigh);
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        details
+            .tree
+            .iter()
+            .find(|node| node.node_id == reviewer)
+            .unwrap()
+            .turn,
+        Some(Turn::Active)
+    );
+    assert!(attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await
+    )
+    .is_empty());
+
+    // Claude's other id-less worker hand-off follows the same path. This is a
+    // separate hook subtype, so exercise it through the transport as well as the
+    // adapter unit contract.
+    post_hook(
+        &agent.hook,
+        &notification("agent_needs_input", "Reviewer needs a decision"),
+    )
+    .await;
+    let waiting = ui
+        .wait_for("the correlated worker input event", |event| match event {
+            ServerEvent::TurnEventEmitted { turn_event }
+                if turn_event.session_id == agent.session
+                    && matches!(&turn_event.kind, EventKind::AgentWaitingForUser { .. }) =>
+            {
+                Some(turn_event.clone())
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(waiting.node_id.as_ref(), Some(&reviewer));
+    assert_eq!(waiting.parent_node_id.as_ref(), Some(&agent.node));
+    assert_eq!(waiting.confidence, Confidence::InferredHigh);
+    let queued = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await,
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].entry.node_id.as_ref(), Some(&reviewer));
+    assert_eq!(queued[0].entry.reason, AwaitingReason::Input);
+
+    post_hook(&agent.hook, &prompt).await;
+    ui.wait_for("Reviewer to resume a second time", |event| match event {
+        ServerEvent::TurnEventEmitted { turn_event }
+            if turn_event.session_id == agent.session
+                && turn_event.node_id.as_ref() == Some(&reviewer)
+                && matches!(&turn_event.kind, EventKind::AgentTurnStarted { .. }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    })
+    .await;
+    assert!(attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await
+    )
+    .is_empty());
 
     daemon.shutdown().await;
 }
@@ -611,7 +826,7 @@ async fn a_hook_post_without_a_valid_token_is_refused_and_counted() {
     );
     let response = reqwest::Client::new()
         .post(&forged)
-        .json(&notification("agent_needs_input", "let me in"))
+        .json(&notification("idle_prompt", "let me in"))
         .send()
         .await
         .expect("the hook server must answer");
@@ -622,7 +837,7 @@ async fn a_hook_post_without_a_valid_token_is_refused_and_counted() {
     assert!(entries.is_empty(), "a forged post must change nothing");
 
     // The real token still works.
-    post_hook(&agent.hook, &notification("agent_needs_input", "real")).await;
+    post_hook(&agent.hook, &notification("idle_prompt", "real")).await;
     wait_for_state(&mut ui, &agent.session, DisplayState::WaitingForUser).await;
     assert_eq!(daemon.handle().hook_stats().accepted, 1);
 
@@ -635,7 +850,7 @@ async fn an_agents_process_ending_takes_its_demand_out_of_the_queue() {
     let mut ui = daemon.connect().await;
     let agent = agent_session(&daemon, &mut ui, "about to die").await;
 
-    post_hook(&agent.hook, &notification("agent_needs_input", "Answer me")).await;
+    post_hook(&agent.hook, &notification("idle_prompt", "Answer me")).await;
     wait_for_state(&mut ui, &agent.session, DisplayState::WaitingForUser).await;
     assert_eq!(
         attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await).len(),

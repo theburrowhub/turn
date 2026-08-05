@@ -197,6 +197,16 @@ impl AttentionQueue {
         before - self.entries.len()
     }
 
+    /// Drops only demands whose subject could not be identified inside a
+    /// session. A node-less agent event is uncertainty, not permission to erase
+    /// every sibling that is independently waiting.
+    pub fn resolve_unassigned_for_session(&mut self, session: &SessionId) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| &e.session_id != session || e.node_id.is_some());
+        before - self.entries.len()
+    }
+
     /// Drops demands for one node, leaving its siblings alone.
     pub fn resolve_node(&mut self, node: &NodeId) -> usize {
         let before = self.entries.len();
@@ -429,6 +439,30 @@ mod tests {
         assert_eq!(q.resolve_session(&SessionId::from_stored("sess_a")), 2);
         assert_eq!(q.len(), 1);
         assert_eq!(q.next(T0).unwrap().session_id.as_str(), "sess_b");
+    }
+
+    #[test]
+    fn resolving_an_unassigned_flow_keeps_identified_siblings() {
+        let mut q = AttentionQueue::new();
+        q.upsert(entry("sess_a", AwaitingReason::Input, T0));
+        let mut reviewer = entry("sess_a", AwaitingReason::Permission, T0);
+        reviewer.node_id = Some(NodeId::from_stored("reviewer"));
+        q.upsert(reviewer);
+        q.upsert(entry("sess_b", AwaitingReason::Question, T0));
+
+        assert_eq!(
+            q.resolve_unassigned_for_session(&SessionId::from_stored("sess_a")),
+            1
+        );
+        assert_eq!(q.len(), 2);
+        assert!(q.iter().any(|entry| {
+            entry.session_id.as_str() == "sess_a"
+                && entry
+                    .node_id
+                    .as_ref()
+                    .is_some_and(|node| node.as_str() == "reviewer")
+        }));
+        assert!(q.iter().any(|entry| entry.session_id.as_str() == "sess_b"));
     }
 
     #[test]

@@ -497,11 +497,27 @@ impl AttentionManager {
             return None;
         }
 
-        let cleared = match &event.node_id {
-            Some(node) => self.queue.resolve_node(node),
-            None => self.queue.resolve_session(&event.session_id),
+        let clear_entire_session = matches!(&event.kind, EventKind::SessionAttentionResolved);
+        let cleared = if clear_entire_session {
+            self.queue.resolve_session(&event.session_id)
+        } else {
+            match &event.node_id {
+                Some(node) => self.queue.resolve_node(node),
+                None => self.queue.resolve_unassigned_for_session(&event.session_id),
+            }
         };
-        self.deferred.retain(|d| d.session_id != event.session_id);
+        self.deferred.retain(|deferred| {
+            if deferred.session_id != event.session_id {
+                return true;
+            }
+            if clear_entire_session {
+                return false;
+            }
+            match &event.node_id {
+                Some(node) => deferred.node_id.as_ref() != Some(node),
+                None => deferred.node_id.is_some(),
+            }
+        });
         let _ = now_ms;
         Some(if cleared > 0 {
             vec![Effect::Cleared {
@@ -820,6 +836,60 @@ mod tests {
         let effects = m.ingest(&resumed, &AttentionPolicy::default(), &ctx(), T0 + 1_000);
         assert!(effects.iter().any(|e| matches!(e, Effect::Cleared { .. })));
         assert!(m.queue().is_empty());
+    }
+
+    #[test]
+    fn an_unassigned_resume_only_clears_the_unassigned_flow() {
+        let mut m = AttentionManager::new();
+        let reviewer = NodeId::from_stored("reviewer");
+        let tests = NodeId::from_stored("tests");
+
+        m.ingest(
+            &permission("sess_a"),
+            &AttentionPolicy::default(),
+            &ctx(),
+            T0,
+        );
+        m.ingest(
+            &permission("sess_a").with_node(reviewer.clone()),
+            &AttentionPolicy::default(),
+            &ctx(),
+            T0 + 1,
+        );
+        m.ingest(
+            &permission("sess_a").with_node(tests.clone()),
+            &AttentionPolicy::default(),
+            &ctx(),
+            T0 + 2,
+        );
+        assert_eq!(m.queue().len(), 3);
+        assert_eq!(
+            m.deferred_count(),
+            2,
+            "the two sibling focus requests are waiting behind the session cooldown"
+        );
+
+        let resumed = hook_event(
+            "sess_a",
+            EventKind::AgentTurnStarted {
+                prompt_excerpt: Some("continue".into()),
+            },
+        );
+        m.ingest(&resumed, &AttentionPolicy::default(), &ctx(), T0 + 3);
+
+        let remaining: Vec<_> = m
+            .queue()
+            .iter()
+            .map(|entry| entry.node_id.clone())
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&Some(reviewer)));
+        assert!(remaining.contains(&Some(tests)));
+        assert_eq!(
+            m.deferred_count(),
+            2,
+            "an unassigned resume must not cancel sibling focus deferrals"
+        );
     }
 
     #[test]

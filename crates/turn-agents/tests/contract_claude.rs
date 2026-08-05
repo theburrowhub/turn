@@ -387,9 +387,14 @@ fn no_recorded_or_corrupted_payload_can_panic_the_adapter() {
         let events = normalise(payload);
         assert!(!events.is_empty(), "{name} produced nothing");
         for event in events {
-            // Whatever the payload, the event must be attributable.
+            // Whatever the payload, the event must be attributable either to a
+            // concrete node or to the authenticated parent hook that the live
+            // tree will use as its correlation anchor.
             assert_eq!(event.session_id.as_str(), "sess_contract");
-            assert!(event.node_id.is_some());
+            assert!(
+                event.node_id.is_some() || event.parent_node_id.is_some(),
+                "{name} lost both its subject and correlation anchor"
+            );
         }
     }
 
@@ -477,4 +482,13 @@ fn the_documented_notification_types_are_handled_as_intended() {
     });
     let events = normalise(&needs_input);
     assert_eq!(events[0].attention_reason(), Some(AwaitingReason::Input));
+    assert_eq!(events[0].node_id, None);
+    assert_eq!(events[0].parent_node_id.as_ref(), Some(&ctx().node_id));
+    assert!(matches!(
+        events[0].source,
+        turn_core::event::EventSource::Hook {
+            ref tool,
+            ref event_name
+        } if tool == "claude-code" && event_name == "Notification"
+    ));
 }

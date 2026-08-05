@@ -533,7 +533,7 @@ async fn acknowledging_a_demand_keeps_it_in_the_queue_but_ranks_it_below_a_new_o
     let node = details.tree[0].node_id.clone();
     let hook = hook_url(daemon.data_dir(), &session.id, &node);
 
-    post_hook(&hook, &notification("agent_needs_input", "Anything?")).await;
+    post_hook(&hook, &notification("idle_prompt", "Anything?")).await;
     let entry = ui
         .wait_for("the demand", |event| match event {
             ServerEvent::AttentionQueueChanged { entries } if !entries.is_empty() => {
