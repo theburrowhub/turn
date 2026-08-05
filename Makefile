@@ -81,9 +81,19 @@ release: ## Release build of the three binaries
 
 # --- running it ---------------------------------------------------------------
 
-.PHONY: run
-run: release ## Open Turn; the app starts its daemon companion if needed
-	@echo "opening the window (it will reuse or start turnd)…"
+.PHONY: run run-ready
+run: run-ready ## Rebuild, restart the development daemon, and open Turn
+	@echo "opening the window with the freshly built turnd…"
+	TURN_SOCKET=$(TURN_SOCKET) TURN_DATA_DIR=$(TURN_DATA_DIR) ./target/release/turn
+
+# Keep the ordering explicit even under `make -j`: release must finish before the
+# old daemon is stopped, and the GUI must not start until that stop is confirmed.
+run-ready: release
+	@$(MAKE) --no-print-directory daemon-stop TURN_SOCKET="$(TURN_SOCKET)"
+
+.PHONY: run-reuse
+run-reuse: release ## Rebuild binaries and reconnect without restarting the daemon
+	@echo "opening the window and reusing the existing turnd…"
 	TURN_SOCKET=$(TURN_SOCKET) TURN_DATA_DIR=$(TURN_DATA_DIR) ./target/release/turn
 
 .PHONY: daemon
@@ -105,16 +115,30 @@ daemon: ## Start turnd in the background if it is not already up
 
 .PHONY: daemon-stop
 daemon-stop: ## Stop the background daemon
-	@pkill -f "turnd --socket $(TURN_SOCKET)" && echo "turnd: stopped" || echo "turnd: not running"
+	@pattern="[t]urnd --socket $(TURN_SOCKET)"; \
+	pids="$$(pgrep -f "$$pattern" || true)"; \
+	if [ -z "$$pids" ]; then \
+		echo "turnd: not running on $(TURN_SOCKET)"; \
+		exit 0; \
+	fi; \
+	echo "turnd: stopping $$pids (active development sessions will end)"; \
+	kill -TERM $$pids; \
+	for i in $$(seq 1 50); do \
+		pgrep -f "$$pattern" >/dev/null || break; \
+		sleep 0.1; \
+	done; \
+	if pgrep -f "$$pattern" >/dev/null; then \
+		echo "turnd: did not stop cleanly; refusing to launch against an old daemon"; \
+		exit 1; \
+	fi; \
+	echo "turnd: stopped"
 
 .PHONY: daemon-log
 daemon-log: ## Follow the daemon's log
 	@tail -f "$(TURN_DATA_DIR)/turnd.log"
 
 .PHONY: gui
-gui: ## Build the packaged sibling set and open the window
-	$(CARGO) build --release --bin turn --bin turnd --bin turn-hook
-	TURN_SOCKET=$(TURN_SOCKET) TURN_DATA_DIR=$(TURN_DATA_DIR) ./target/release/turn
+gui: run ## Alias for the fresh development run
 
 # --- looking at the interface -------------------------------------------------
 
