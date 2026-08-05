@@ -53,16 +53,16 @@ because the whole point of the daemon is that the UI can go away.
 ```
                      ┌──────────────────────────────────────────────────┐
                      │  turn-gui  (eframe/egui on wgpu — native, no     │
-                     │  webview)                      IN PROGRESS       │
+                     │  webview)              BUILT: FIRST VERTICAL    │
                      │  unified hierarchy · user-chosen panes ·         │
                      │  contextual inspector · permission banner        │
                      └───────────────────┬──────────────────────────────┘
-                                         │ turn-proto  v2 BUILT / v3 IN PROGRESS
+                                         │ turn-proto  v3 BUILT
                                          │ newline-delimited JSON over a unix socket
                                          │ ── Request  → Response
                                          │ ── ServerMessage pushes (state, cells/output, effects)
                      ┌───────────────────┴──────────────────────────────┐
-                     │  turnd — the daemon           IN PROGRESS        │
+                     │  turnd — the daemon     BUILT: FIRST VERTICAL    │
                      │                                                  │
                      │  owns: pty handles · session/checkout registry · │
                      │  one AttentionManager · the hook server ·        │
@@ -74,7 +74,7 @@ because the whole point of the daemon is that the UI can go away.
                         │           │              │              │
         ┌───────────────▼──┐ ┌──────▼───────────┐ ┌▼───────────┐ ┌▼──────────────────┐
         │ turn-pty  BUILT  │ │ turn-agents      │ │ turn-core  │ │ turn-store        │
-        │                  │ │ BUILT            │ │ IN PROGRESS│ │ IN PROGRESS       │
+        │                  │ │ BUILT            │ │ BUILT      │ │ BUILT             │
         │ PtyProcess       │ │                  │ │            │ │                   │
         │ TerminalBuffer   │ │ AgentAdapter     │ │ ids        │ │ Store facade      │
         │ ProcessSupervisor│ │ claude · codex   │ │ event      │ │ migrations        │

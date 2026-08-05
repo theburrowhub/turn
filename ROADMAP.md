@@ -36,7 +36,7 @@ payloads may provide a role/external id without a parent-declared display name.
 | M2 — Agent integration | `turn-agents` + `turn-hook`: adapters, hook server, heuristics, registry | **Done** |
 | M3 — Persistence | `turn-store`: SQLite, migrations, redaction, seven repositories | **Done** |
 | M4 — Protocol | `turn-proto`: framing, requests, responses, pushes, view models | **Done** |
-| M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Code complete**, exit criterion unverified |
+| M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Built for automated vertical**; live CLI acceptance pending |
 | M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented for the first vertical**; release audit/hardening remains |
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
@@ -183,27 +183,22 @@ newer daemon's added fields; a change that would make an older client *misread* 
 
 ---
 
-## M5 — The daemon · **Code complete, exit criterion unverified**
+## M5 — The daemon · **Built for the automated vertical**
 
 `main.rs` parses options, initialises logging, resolves a `Config` and calls `turnd::start`; the library
 declares `config`, `paths`, `instance`, `logging`, `options`, `error`, `server` and `core`, the last split
 into `spawn`, `supervise`, `restore`, `events`, `requests`, `views`, `attention`, `clients`, `command` and
-`output`. 85 tests pass, including the integration tests in
-`tests/{desk,agents,surface,restart,attention,binary}.rs`.
-
-**The exit criterion below is still unmet:** no scripted client has created a Session whose hook POST changed
-what the client was told, and nothing here has been driven by a real agent. The deliverables are therefore
-still listed as deliverables — passing tests are not the same as the milestone being met.
+`output`. The release command reproduces the current count rather than freezing one here; integration tests
+live in `tests/{desk,agents,surface,restart,attention,binary,cells}.rs`.
 
 **Delivers.**
 
-1. **The reducer** — the piece nothing else can supply. One place that takes a `TurnEvent` from the hook
+1. **The reducer.** One place takes a `TurnEvent` from the hook
    server, an `ExitInfo` from a `PtyProcess`, an `ObservedProcess` from the supervisor and an `Inference`
-   from `OutputHeuristic`, and folds all four into one authoritative `SessionTree`. This includes the
-   correlation Turn does not have yet: hook `session_id` → `NodeId` via `find_by_external_id`, observed pid
-   → node via `find_by_pid`, and the `Relation` ladder applied on every link.
-2. **Pty facts as events.** `EventKind::ProcessStarted`, `ProcessExited`, `ProcessFailed` and
-   `ProcessSpawnedChild` are defined and have never been emitted. This is where they come from.
+   from `OutputHeuristic`, and folds all four into one authoritative `SessionTree`. Hook external ids,
+   observed pids and declared parent/child relationships are correlated here rather than in the GUI.
+2. **Pty facts as events.** `ProcessStarted`, `ProcessExited`, `ProcessFailed` and
+   `ProcessSpawnedChild` are emitted through the same reducer as adapter events.
 3. **The unix socket server**, speaking `turn-proto` — accept, handshake, per-connection request loop,
    push fan-out, and the lagged-subscriber replay path.
 4. **The session lifecycle** — create from a Template, materialise Panes into `PtyProcess`es via
@@ -211,27 +206,18 @@ still listed as deliverables — passing tests are not the same as the milestone
    delete the scratch directory.
 5. **Store integration** off the reactor. `rusqlite` is synchronous; every call goes through a blocking
    boundary or a dedicated writer, with the daemon owning ordering.
-6. **Restore.** Load with `load_for_restore`, try to re-attach each `Orphaned` node against the process
-   table, set `Reconnected` or `Lost`, compute the Session's `RestoreState`, and **offer** relaunches for
-   Panes marked `Relaunch` without performing any.
+6. **Restore.** Load with `load_for_restore`, corroborate orphaned pids against the process table, compute
+   `RestoreState`, and **offer** relaunches for Panes marked `Relaunch` without performing any. A UI restart
+   over the still-running daemon instead reuses the live PTY and replay stream.
 7. **Daemon lifecycle** — socket path, single-instance guard, log location, graceful shutdown, and a clear
    answer to "the daemon is not running".
 
-**Verified by** (to be written):
-
-- A test that spawns a real `claude` (or a scripted stand-in) through the real adapter, receives a real
-  hook POST, and asserts the resulting `SessionTree` state — the first test that exercises the join.
-- A test that a supervisor-inferred child and a hook-confirmed subagent land in the same tree with the
-  right `Relation` on each, and that the confirmed one is not downgraded on a later scan.
-- A test that a pty exit clears that node's attention demands.
-- A protocol-level test over a real socket: connect, handshake, create a Session, write to a pty, receive
-  output pushes, disconnect, reconnect, and get a replay that matches.
-- A restore test: write a Session with a live process, kill the daemon, restart, and assert `Reconnected`
-  for what is still there and `Lost` for what is not — with **nothing relaunched**.
-- A test that the daemon survives an unwritable store: it keeps serving and reports degraded persistence.
-
-**Exit criterion.** `turnd` starts, a scripted client over `socat` can create a Session that runs `claude`,
-and a hook POST from that Agent changes what the client is told.
+**Verified by.** `tests/agents.rs::the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart`
+crosses the real loopback hook server and production Claude normaliser; `tests/desk.rs` covers PTY input,
+output and reconnect replay; `tests/restart.rs` proves a daemon restart relaunches nothing; the child-process,
+exit/attention and socket lifecycle cases have dedicated integration tests. The one missing class of evidence
+is an authenticated external Claude Code binary driven from the native packaged window. That remains M8/M9
+live acceptance, not something the deterministic stand-in proves.
 
 ---
 

@@ -169,7 +169,7 @@ that misses a revision asks for resync rather than applying a partial guess. Tre
 stable `surface_id`; selection/expansion from two windows is never broadcast between them. Mutations remain
 daemon-authoritative; the GUI never fabricates a relationship, state, lease or preview confidence.
 
-## SQLite v3 migration
+## SQLite migration policy
 
 Migration 003 is append-only and transactional. It adds:
 
@@ -182,11 +182,12 @@ Migration 003 is append-only and transactional. It adds:
 saved Layout wins over the legacy reverse `ProcessNode.pane_id`; a legacy reverse pointer is imported only
 when no Layout pane contradicts it, and disagreements produce a reconciliation audit record.
 
-Existing Sessions migrate conservatively. A Workspace with no live legacy process may assign its most
-recent active Session `main_checkout` and acquire a lease during daemon reconciliation. If two or more
-legacy Sessions may still be writing, none is silently declared safe: they retain `read_only_enforced =
-false`, the Workspace enters `needs_lease_reconciliation`, and the UI asks the user to focus/stop/isolate
-before granting a lease. Other inactive Sessions become read-only; no worktree is invented. Existing
+Existing Sessions migrate conservatively. Migration 003 creates no lease and chooses no writer. Migration
+005 removes historical raw hook callback bodies. Migration 006 re-resolves filesystem identity and marks
+every pre-existing Workspace and every non-released legacy claim as requiring explicit reconciliation;
+neither database open nor daemon launch may clear that gate or acquire authority as a side effect. Until
+the audited reconciliation action is implemented, those upgraded Workspaces remain deliberately
+fail-closed rather than being assigned to the “most recent” Session. No worktree is invented. Existing
 `pane_id` values become rows in `pane_node_bindings`. Existing `Relation::Confirmed` maps to
 `spawned_by/explicit`; `Inferred` maps to `spawned_by/inferred_high`; `Unknown` remains unknown. Existing
 agent titles become display names, with no fabricated declared name. No process is launched, killed,
