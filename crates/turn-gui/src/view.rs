@@ -337,6 +337,11 @@ pub enum ViewAction {
         session_id: SessionId,
         until_ms: Option<i64>,
     },
+    /// Stopping an Agent is independent from closing any of its views.
+    TerminateNode {
+        session_id: SessionId,
+        node_id: NodeId,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -1334,6 +1339,83 @@ impl<'a> TurnView<'a> {
                     if response.double_clicked() && !caret_clicked {
                         actions.extend(open_or_focus_hierarchy_row(state, snapshot, *row));
                     }
+                    if let HierarchyRow::Process { node, .. } = row {
+                        response.context_menu(|ui| {
+                            if ui.button("Quick Preview").clicked() {
+                                state.quick_preview =
+                                    Some(HierarchyKey::process(node.node_id.clone()));
+                                state.push_hierarchy_action(HierarchyAction::QuickPreview {
+                                    surface_id: snapshot.tree_state.surface_id.clone(),
+                                    session_id: node.session_id.clone(),
+                                    node_id: node.node_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Open temporary pane").clicked() {
+                                state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                                    surface_id: snapshot.tree_state.surface_id.clone(),
+                                    session_id: node.session_id.clone(),
+                                    node_id: node.node_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            if !node.pane_bindings.is_empty()
+                                && ui.button("Focus open pane").clicked()
+                            {
+                                state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
+                                    surface_id: snapshot.tree_state.surface_id.clone(),
+                                    session_id: node.session_id.clone(),
+                                    node_id: node.node_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Show details").clicked() {
+                                state.inspector_open = true;
+                                ui.close();
+                            }
+                            let previews_hidden =
+                                node.preview_visibility == PreviewVisibility::Hide;
+                            if ui
+                                .button(if previews_hidden {
+                                    "Show activity preview"
+                                } else {
+                                    "Hide activity preview"
+                                })
+                                .clicked()
+                            {
+                                state.push_hierarchy_action(
+                                    HierarchyAction::SetPreviewVisibility {
+                                        session_id: node.session_id.clone(),
+                                        node_id: node.node_id.clone(),
+                                        visibility: if previews_hidden {
+                                            PreviewVisibility::Show
+                                        } else {
+                                            PreviewVisibility::Hide
+                                        },
+                                    },
+                                );
+                                ui.close();
+                            }
+                            if !node.lifecycle.is_terminal() {
+                                ui.separator();
+                                let label = if node.is_agentic {
+                                    "Stop Agent"
+                                } else {
+                                    "Stop Process"
+                                };
+                                if ui
+                                    .button(RichText::new(label).color(theme.failure))
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::TerminateNode {
+                                        session_id: node.session_id.clone(),
+                                        node_id: node.node_id.clone(),
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     if response.secondary_clicked() {
                         state.tree_has_focus = true;
                         response.request_focus();
@@ -1455,14 +1537,19 @@ impl<'a> TurnView<'a> {
                 Vec2::new(146.0, 24.0),
             );
             let response = ui
-                .put(
-                    button_rect,
-                    egui::Button::new(if summary.running_count == 0 {
-                        "Release write lease"
-                    } else {
-                        "Stop work to release"
-                    }),
-                )
+                .scope_builder(region(button_rect, "release-write-lease"), |ui| {
+                    ui.set_min_size(button_rect.size());
+                    ui.add_enabled(
+                        summary.running_count == 0,
+                        egui::Button::new(if summary.running_count == 0 {
+                            "Release write lease"
+                        } else {
+                            "Lease held · busy"
+                        })
+                        .min_size(button_rect.size()),
+                    )
+                })
+                .inner
                 .on_hover_text(if summary.running_count == 0 {
                     "Give up exclusive write access to the primary checkout"
                 } else {

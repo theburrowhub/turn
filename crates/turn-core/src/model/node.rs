@@ -187,8 +187,10 @@ impl ProcessNode {
     ) -> Self {
         let mut node = Self::process(session_id, NodeKind::Agent, command, cwd, started_ms);
         node.turn = Some(Turn::Idle);
-        let mut info = AgentInfo::default();
-        info.name = AgentName::fallback(node.title.clone());
+        let info = AgentInfo {
+            name: AgentName::fallback(node.title.clone()),
+            ..AgentInfo::default()
+        };
         node.agent = Some(info);
         node
     }

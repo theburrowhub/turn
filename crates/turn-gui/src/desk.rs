@@ -586,7 +586,7 @@ impl Desk {
             self.selected = None;
             return Vec::new();
         };
-        let needs_details = self.layouts.get(&active).is_none();
+        let needs_details = !self.layouts.contains_key(&active);
         self.selected = Some(active.clone());
         if needs_details {
             vec![Reaction::Send {
@@ -1646,6 +1646,16 @@ impl Desk {
                     until_ms,
                 },
             }],
+            ViewAction::TerminateNode {
+                session_id,
+                node_id,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("stopping an Agent or Process"),
+                request: Request::TerminateNode {
+                    session_id,
+                    node_id,
+                },
+            }],
             ViewAction::CreateWorkspace { name, root } => vec![Reaction::Send {
                 ask: Ask::Action("creating a workspace"),
                 request: Request::CreateWorkspace { name, root },
@@ -2578,6 +2588,26 @@ mod tests {
             }] => {
                 assert_eq!(sent_session, &session_id);
                 assert_eq!(*sent_until, until_ms);
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let node_id = NodeId::from_stored("agent_reviewer_triage");
+        match sent(&desk.apply_view_action(
+            ViewAction::TerminateNode {
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::TerminateNode {
+                session_id: sent_session,
+                node_id: sent_node,
+            }] => {
+                assert_eq!(sent_session, &session_id);
+                assert_eq!(sent_node, &node_id);
             }
             other => panic!("got {other:?}"),
         }
