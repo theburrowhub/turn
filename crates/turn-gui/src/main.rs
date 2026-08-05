@@ -11,6 +11,9 @@ use turn_gui::companion::{self, EnsureOutcome};
 use turn_gui::keymap::{Keymap, KeymapProblem, Overrides, Platform};
 use turn_gui::transport::socket;
 
+const APP_ID: &str = "io.github.theburrowhub.turn";
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/turn-icon.png");
+
 fn main() -> eframe::Result {
     turn_gui::logging::install();
 
@@ -60,13 +63,7 @@ fn main() -> eframe::Result {
     let keymap = Keymap::build(&overrides, Platform::detect());
     tracing::info!(socket = %socket.display(), "starting Turn");
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Turn")
-            .with_inner_size([1440.0, 900.0])
-            .with_min_inner_size([900.0, 560.0]),
-        ..Default::default()
-    };
+    let options = native_options();
     eframe::run_native(
         "Turn",
         options,
@@ -80,6 +77,25 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+fn native_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_title("Turn")
+            .with_app_id(APP_ID)
+            .with_icon(embedded_app_icon())
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([900.0, 560.0]),
+        ..Default::default()
+    }
+}
+
+/// Decode the checked-in master once during startup. `eframe` uses this for the
+/// macOS Dock application icon as well as the platform window/task-switcher icon.
+fn embedded_app_icon() -> eframe::egui::IconData {
+    eframe::icon_data::from_png_bytes(APP_ICON_PNG)
+        .expect("the embedded Turn app icon must be a valid PNG")
 }
 
 /// Keeps the window diagnostic-capable when the platform has no data directory. An
@@ -134,4 +150,30 @@ fn load_overrides() -> (Overrides, Vec<KeymapProblem>) {
 fn keymap_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "turn", "turn")
         .map(|dirs| dirs.config_dir().join("keymap.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_app_icon_is_a_square_rgba_master() {
+        let options = native_options();
+        let icon = options
+            .viewport
+            .icon
+            .expect("the native window must receive the Turn app icon");
+
+        assert_eq!((icon.width, icon.height), (1024, 1024));
+        assert_eq!(icon.rgba.len(), 1024 * 1024 * 4);
+        assert_eq!(options.viewport.app_id.as_deref(), Some(APP_ID));
+        assert!(
+            icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            "the icon must keep transparent corners instead of an opaque black canvas"
+        );
+        assert!(
+            icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255),
+            "the icon artwork must contain fully opaque pixels"
+        );
+    }
 }
