@@ -11,6 +11,7 @@
 
 use crate::codec::{from_json, json};
 use crate::error::Result;
+use crate::redact::redact_json;
 use rusqlite::{params, Connection};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -29,7 +30,7 @@ impl<'a> SettingsRepo<'a> {
             "INSERT INTO settings (key, value_json, updated_ms) VALUES (?1, ?2, ?3) \
              ON CONFLICT(key) DO UPDATE SET \
                  value_json = excluded.value_json, updated_ms = excluded.updated_ms",
-            params![key, json("setting", value)?, now_ms],
+            params![key, redact_json(&json("setting", value)?), now_ms],
         )?;
         Ok(())
     }

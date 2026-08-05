@@ -146,22 +146,24 @@ pub(crate) fn replace_all_in(conn: &Connection, queue: &AttentionQueue) -> Resul
 
 /// Writes one demand without opening a transaction, so a caller can batch.
 fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId> {
-    let key = entry.dedup_key();
+    let mut safe = entry.clone();
+    safe.subject_external_id = safe.subject_external_id.as_deref().map(redact_secrets);
+    safe.summary = safe.summary.as_deref().map(redact_secrets);
+    let key = safe.dedup_key();
 
     // The same demand may have been re-keyed (its reason changed, say). Drop the
     // stale row first so the id can be reused under the new key instead of
     // colliding with it.
     conn.execute(
         "DELETE FROM attention_entries WHERE id = ?1 AND dedup_key <> ?2",
-        params![entry.id.as_str(), key],
+        params![safe.id.as_str(), key],
     )?;
 
     // The summary is agent-supplied text — the command line a permission request
     // is about, the question an agent asked — so it carries credentials for
     // exactly the reasons the event log's payloads do, and gets exactly the same
     // scan before it reaches a column.
-    let summary = entry.summary.as_deref().map(redact_secrets);
-    let confidence = confidence_to_store(conn, &key, entry.confidence)?;
+    let confidence = confidence_to_store(conn, &key, safe.confidence)?;
 
     conn.execute(
         "INSERT INTO attention_entries (id, session_id, node_id, parent_node_id, \
@@ -179,24 +181,24 @@ fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId
              END, \
              demand_kind = excluded.demand_kind",
         params![
-            entry.id.as_str(),
-            entry.session_id.as_str(),
-            entry.node_id.as_ref().map(|n| n.as_str()),
-            entry.parent_node_id.as_ref().map(|n| n.as_str()),
-            entry.subject_external_id.as_deref(),
-            tag("attention reason", &entry.reason)?,
-            summary,
+            safe.id.as_str(),
+            safe.session_id.as_str(),
+            safe.node_id.as_ref().map(|n| n.as_str()),
+            safe.parent_node_id.as_ref().map(|n| n.as_str()),
+            safe.subject_external_id.as_deref(),
+            tag("attention reason", &safe.reason)?,
+            safe.summary,
             tag("confidence", &confidence)?,
-            entry.created_ms,
-            entry.updated_ms,
-            json("attention state", &entry.state)?,
-            entry.priority_boost,
-            entry.survives_owner_exit,
-            tag("attention demand kind", &entry.demand_kind)?,
+            safe.created_ms,
+            safe.updated_ms,
+            json("attention state", &safe.state)?,
+            safe.priority_boost,
+            safe.survives_owner_exit,
+            tag("attention demand kind", &safe.demand_kind)?,
             key,
         ],
     )
-    .map_err(|error| StoreError::from_write("attention entry", entry.session_id.as_str(), error))?;
+    .map_err(|error| StoreError::from_write("attention entry", safe.session_id.as_str(), error))?;
 
     let stored: String = conn.query_row(
         "SELECT id FROM attention_entries WHERE dedup_key = ?1",

@@ -8,14 +8,16 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use turn_core::attention::{AttentionEntry, EntryState};
-use turn_core::ids::{AttentionId, WorkspaceId};
+use turn_core::attention::{AttentionEntry, AttentionPolicy, EntryState};
+use turn_core::event::{AgentRef, Risk};
+use turn_core::ids::{AttentionId, CheckoutId, WorkspaceId};
 use turn_core::model::layout::{Direction, Pane, PaneKind};
-use turn_core::model::node::NodeKind;
+use turn_core::model::node::{NodeKind, PendingPermission};
 use turn_core::model::{
-    ActivityPreview, Layout, PreviewSource, ProcessNode, Session, Template, Workspace,
+    ActivityPreview, AgentName, Layout, PreviewSource, ProcessNode, Session, SessionMode, Template,
+    Workspace, WorkspaceCheckout,
 };
-use turn_core::state::AwaitingReason;
+use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_core::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_store::{Store, REDACTED};
 
@@ -23,7 +25,11 @@ const T0: i64 = 1_700_000_000_000;
 
 /// Values that must never appear on disk, one per write path that touches an
 /// environment or a captured payload.
-const SECRETS: [&str; 8] = [
+/// A correctly-shaped classic GitHub token. The same value is deliberately planted
+/// in every durable free-text field so a single missed field fails the byte scan.
+const DURABLE_SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+
+const SECRETS: [&str; 9] = [
     "ghp_workspace_level_secret",
     "sk-ant-session-level-secret",
     "npm_pane_level_secret",
@@ -36,6 +42,7 @@ const SECRETS: [&str; 8] = [
     "sk-ant-api03-attention-summary-secret",
     "ghp_QUEUEDSUMMARYSECRET0123456789ABCDEF",
     "sk-ant-api03-preview-secret-ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    DURABLE_SECRET,
 ];
 
 /// Tables `write_everything` puts a row in, because each of them can hold text an
@@ -47,31 +54,32 @@ const SECRETS: [&str; 8] = [
 /// existence. A table added to a migration lands in neither list and fails
 /// [`every_table_in_the_schema_is_accounted_for`] until someone decides which side
 /// it belongs on.
-const TABLES_THIS_TEST_WRITES: [&str; 8] = [
+const TABLES_THIS_TEST_WRITES: [&str; 10] = [
     "activity_previews",
     "attention_entries",
     "events",
     "process_nodes",
     "session_layouts",
     "sessions",
+    "settings",
     "templates",
     "workspaces",
+    "workspace_checkouts",
 ];
 
 /// Tables holding nothing an agent or an environment ever supplied, so there is
 /// nothing here for a secret to hide in.
 ///
-/// `settings` and `tree_ui_state` are UI preferences. Checkout/lease tables hold
-/// filesystem identity, typed ids, states and timestamps. Pane bindings are ids.
-/// Workspace audit events are restricted to structured lease/tree facts. The
-/// `events` table stores typed facts and provenance, never raw hook callbacks.
-const TABLES_WITH_NOTHING_TO_LEAK: [&str; 7] = [
+/// `tree_ui_state` holds structural UI identity. Checkout/lease tables hold
+/// filesystem identity, typed ids, states and timestamps; free checkout labels are
+/// nevertheless planted above. Pane bindings are ids. Workspace audit events are
+/// restricted to structured lease/tree facts. The `events` table stores typed facts
+/// and provenance, never raw hook callbacks.
+const TABLES_WITH_NOTHING_TO_LEAK: [&str; 5] = [
     "checkout_write_fences",
     "pane_node_bindings",
-    "settings",
     "tree_ui_state",
     "workspace_audit_events",
-    "workspace_checkouts",
     "workspace_write_leases",
 ];
 
@@ -86,6 +94,10 @@ fn tables_in_the_schema() -> Vec<String> {
         .collect()
 }
 
+fn tainted(label: &str) -> String {
+    format!("{label} {DURABLE_SECRET}")
+}
+
 fn write_everything(store: &Store) -> (WorkspaceId, Session) {
     let root = store
         .path()
@@ -94,28 +106,95 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         .unwrap()
         .join("workspace-root");
     std::fs::create_dir_all(&root).unwrap();
-    let mut workspace = Workspace::new("turn", root.to_string_lossy(), T0);
+    let mut workspace = Workspace::new(tainted("turn"), root.to_string_lossy(), T0);
+    workspace.git_remote = Some(tainted("https://github.com/example/turn.git?credential="));
     workspace.env = vec![
         ("PATH".into(), "/usr/bin".into()),
         ("GITHUB_TOKEN".into(), SECRETS[0].into()),
+        ("INNOCENT_WORKSPACE_VALUE".into(), tainted("workspace env")),
     ];
+    workspace.default_shell = Some(tainted("zsh"));
+    workspace.default_agent = Some(tainted("claude"));
+    workspace.init_commands = vec![tainted("mise install")];
+    workspace.attention.custom_command = Some(tainted("notify-send"));
+    workspace.colour = Some(tainted("violet"));
+    workspace.icon = Some(tainted("terminal"));
     store.workspaces().save(&workspace).unwrap();
 
     // A pane whose environment carries a token: the layout is stored as one JSON
     // document, which is the easiest place for a secret to hide.
-    let mut agent_pane = Pane::new(PaneKind::Agent).with_command("claude");
-    agent_pane.env = vec![("NPM_TOKEN".into(), SECRETS[2].into())];
+    let mut agent_pane = Pane::new(PaneKind::Agent)
+        .with_title(tainted("Claude Code"))
+        .with_command(tainted("claude"))
+        .with_cwd(tainted("pane cwd"));
+    agent_pane.args = vec![tainted("--resume")];
+    agent_pane.env = vec![
+        ("NPM_TOKEN".into(), SECRETS[2].into()),
+        ("PANE_INNOCENT".into(), tainted("pane env")),
+    ];
     let mut layout = Layout::single(agent_pane);
     let first = layout.panes()[0].id.clone();
     layout.split(&first, Direction::Horizontal, Pane::new(PaneKind::Shell));
 
-    let mut session = Session::new(workspace.id.clone(), "Fix bugs", "/repos/turn", layout, T0);
-    session.env = vec![("ANTHROPIC_API_KEY".into(), SECRETS[1].into())];
+    let mut session = Session::new(
+        workspace.id.clone(),
+        tainted("Fix bugs"),
+        tainted("/repos/turn"),
+        layout,
+        T0,
+    );
+    session.note = Some(tainted("Investigate the failing test"));
+    session.env = vec![
+        ("ANTHROPIC_API_KEY".into(), SECRETS[1].into()),
+        ("SESSION_INNOCENT".into(), tainted("session env")),
+    ];
+    session.attention.custom_command = Some(tainted("osascript"));
+    session.tags = vec![tainted("urgent")];
+    session.git_branch = Some(tainted("fix/redaction"));
+    session.linked_ref = Some(tainted("https://github.com/example/turn/pull/1"));
 
-    let mut node = ProcessNode::agent(session.id.clone(), "claude", "/repos/turn", T0);
+    let mut node = ProcessNode::agent(
+        session.id.clone(),
+        tainted("claude"),
+        tainted("/repos/turn"),
+        T0,
+    );
+    node.title = tainted("Claude Code");
+    node.args = vec![tainted("--resume")];
+    node.lifecycle = Lifecycle::Signaled {
+        signal: tainted("SIGTERM"),
+    };
+    node.turn = Some(Turn::Failed {
+        reason: tainted("adapter failure"),
+    });
+    let agent = node.agent.as_mut().expect("agent metadata");
+    agent.agent = AgentRef {
+        provider: Some(tainted("anthropic")),
+        tool: Some(tainted("claude-code")),
+        model: Some(tainted("claude-sonnet")),
+        external_id: Some(tainted("event-agent-external")),
+    };
+    agent.name = AgentName::declared(tainted("Reviewer"));
+    agent.name.rename(tainted("Review specialist"));
+    agent.external_id = Some(tainted("agent-external"));
+    agent.agent_type = Some(tainted("code-reviewer"));
+    agent.current_task = Some(tainted("Review current diff"));
+    agent.last_message = Some(tainted("Found an issue"));
+    agent.pending_permission = Some(PendingPermission {
+        summary: tainted("Run release command"),
+        command: Some(tainted("git push")),
+        tool_name: Some(tainted("Bash")),
+        risk: Risk::High,
+        requested_ms: T0,
+        cwd: Some(tainted("/repos/turn")),
+    });
+    agent.pending_question = Some(tainted("Should I continue?"));
+    agent.permission_mode = Some(tainted("default"));
+    agent.git_branch = Some(tainted("fix/redaction"));
     let mut highlights = HashMap::new();
     highlights.insert("AWS_SESSION_TOKEN".to_string(), SECRETS[3].to_string());
     highlights.insert("NODE_ENV".to_string(), "development".to_string());
+    highlights.insert("NODE_LABEL".to_string(), tainted("node env"));
     node.env_highlights = highlights;
     node.activity_preview = Some(ActivityPreview {
         node_id: node.id.clone(),
@@ -133,29 +212,89 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
     store.sessions().save(&session).unwrap();
 
     // A template captured from the same shape, with its own environment.
-    let mut template = Template::from_layout("Captured", &session.layout, T0);
-    template.env = vec![("CI_JOB_TOKEN".into(), SECRETS[0].into())];
+    let mut template = Template::from_layout(tainted("Captured"), &session.layout, T0);
+    template.description = Some(tainted("Reusable coding layout"));
+    template.icon = Some(tainted("template icon"));
+    template.attention = Some(AttentionPolicy {
+        custom_command: Some(tainted("template notification")),
+        ..AttentionPolicy::default()
+    });
+    template.init_commands = vec![tainted("cargo fetch")];
+    template.name_pattern = Some(tainted("Review {branch}"));
+    template.hotkey = Some(tainted("cmd+shift+1"));
+    template.env = vec![
+        ("CI_JOB_TOKEN".into(), SECRETS[0].into()),
+        ("TEMPLATE_INNOCENT".into(), tainted("template env")),
+    ];
     store.templates().save(&template).unwrap();
+
+    // Generic settings are another durable default/configuration route. The key
+    // is structural and remains stable; its arbitrary JSON string value is not.
+    store
+        .settings()
+        .set("test.durable-secret", &tainted("global default"), T0)
+        .unwrap();
+
+    // Isolated checkout labels are Workspace metadata too. Paths are operational
+    // fencing identities and stay clean; branch/resource labels cross the same
+    // redaction boundary as the Workspace itself.
+    let worktree_root = root.parent().unwrap().join("isolated-worktree");
+    std::fs::create_dir_all(&worktree_root).unwrap();
+    let worktree_root = std::fs::canonicalize(worktree_root).unwrap();
+    let checkout_id = CheckoutId::new();
+    let branch = tainted("turn/durable-redaction");
+    let checkout = WorkspaceCheckout {
+        id: checkout_id.clone(),
+        workspace_id: workspace.id.clone(),
+        path: worktree_root.to_string_lossy().into_owned(),
+        canonical_path: worktree_root.to_string_lossy().into_owned(),
+        branch: Some(branch.clone()),
+        primary: false,
+        shared_resources: vec![tainted("docker")],
+        created_ms: T0,
+    };
+    let mut isolated = Session::new(
+        workspace.id.clone(),
+        "Isolated",
+        worktree_root.to_string_lossy(),
+        Layout::single(Pane::new(PaneKind::Shell)),
+        T0,
+    );
+    isolated.mode = SessionMode::IsolatedWorktree;
+    isolated.checkout_id = checkout_id;
+    isolated.worktree_path = Some(checkout.path.clone());
+    isolated.git_branch = Some(branch);
+    store
+        .hierarchy()
+        .create_worktree_session(&isolated, &checkout)
+        .unwrap();
 
     // A raw Claude hook payload with arbitrary free text under an innocent key.
     // It is intentionally not recognisable by the redactor: only the durable
     // boundary (drop the callback, keep the typed fact) can make this safe.
-    let event = TurnEvent::new(
+    let mut event = TurnEvent::new(
         session.id.clone(),
         EventKind::AgentTurnStarted {
-            prompt_excerpt: Some("fix the failing test".into()),
+            prompt_excerpt: Some(tainted("fix the failing test")),
         },
         EventSource::Hook {
-            tool: "claude-code".into(),
-            event_name: "UserPromptSubmit".into(),
+            tool: tainted("claude-code"),
+            event_name: tainted("UserPromptSubmit"),
         },
         Confidence::Explicit,
         T0 + 10,
     )
+    .with_agent(AgentRef {
+        provider: Some(tainted("anthropic")),
+        tool: Some(tainted("claude-code")),
+        model: Some(tainted("claude-sonnet")),
+        external_id: Some(tainted("event external")),
+    })
     .with_raw(format!(
         r#"{{"cwd":"/repos/turn","diagnostic_note":"{}","prompt":"fix the failing test"}}"#,
         SECRETS[4]
     ));
+    event.dedup_key = tainted("hook-submit");
     store.events().append(&event).unwrap();
 
     // A blocked agent, waiting for the user. Its summary is the command line the
@@ -168,10 +307,10 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         parent_node_id: None,
         subject_external_id: None,
         reason: AwaitingReason::Permission,
-        summary: Some(format!(
+        summary: Some(tainted(&format!(
             "Run `curl -H 'Authorization: Bearer {}'`",
             SECRETS[5]
-        )),
+        ))),
         confidence: Confidence::Explicit,
         created_ms: T0 + 20,
         updated_ms: T0 + 20,
@@ -189,9 +328,9 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         session_id: session.id.clone(),
         node_id: None,
         parent_node_id: None,
-        subject_external_id: None,
+        subject_external_id: Some(tainted("queued-worker")),
         reason: AwaitingReason::Question,
-        summary: Some(format!("Should I push with {}?", SECRETS[6])),
+        summary: Some(tainted(&format!("Should I push with {}?", SECRETS[6]))),
         confidence: Confidence::Explicit,
         created_ms: T0 + 30,
         updated_ms: T0 + 30,
@@ -237,6 +376,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn assert_scrubbed(label: &str, value: &str) {
+    assert!(
+        !value.contains(DURABLE_SECRET),
+        "{label} returned the credential: {value}"
+    );
+    assert!(
+        value.contains(REDACTED),
+        "{label} was not visibly redacted: {value}"
+    );
+}
+
 #[test]
 fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
     let temp = tempfile::tempdir().unwrap();
@@ -279,10 +429,266 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
         "the variable names are supposed to survive; only the values are dropped"
     );
 
-    // And what the store hands back names the variable and marks it redacted.
+    // What the store hands back is the safe durable projection too. Assert every
+    // free-text family, rather than relying only on the byte scan to tell us which
+    // route lost the credential.
+    let restored_workspace = store
+        .workspaces()
+        .get(&session.workspace_id)
+        .unwrap()
+        .expect("workspace");
+    assert_scrubbed("workspace.name", &restored_workspace.name);
+    assert_scrubbed(
+        "workspace.git_remote",
+        restored_workspace.git_remote.as_deref().unwrap(),
+    );
+    assert_scrubbed(
+        "workspace.default_shell",
+        restored_workspace.default_shell.as_deref().unwrap(),
+    );
+    assert_scrubbed(
+        "workspace.default_agent",
+        restored_workspace.default_agent.as_deref().unwrap(),
+    );
+    assert_scrubbed(
+        "workspace.init_commands",
+        &restored_workspace.init_commands[0],
+    );
+    assert_scrubbed(
+        "workspace.attention.custom_command",
+        restored_workspace
+            .attention
+            .custom_command
+            .as_deref()
+            .unwrap(),
+    );
+    assert_scrubbed(
+        "workspace.colour",
+        restored_workspace.colour.as_deref().unwrap(),
+    );
+    assert_scrubbed(
+        "workspace.icon",
+        restored_workspace.icon.as_deref().unwrap(),
+    );
+    assert_eq!(restored_workspace.env[1].1, REDACTED);
+    assert_scrubbed("workspace.env", &restored_workspace.env[2].1);
+
     let restored = store.sessions().get(&session.id).unwrap().unwrap();
+    assert_eq!(restored.id, session.id, "redaction must not rewrite IDs");
+    assert_eq!(
+        restored.layout.panes()[0].id,
+        session.layout.panes()[0].id,
+        "redaction must not rewrite Pane IDs"
+    );
     assert_eq!(restored.env[0].0, "ANTHROPIC_API_KEY");
     assert_eq!(restored.env[0].1, REDACTED);
+    assert_scrubbed("session.name", &restored.name);
+    assert_scrubbed("session.note", restored.note.as_deref().unwrap());
+    assert_scrubbed("session.cwd", &restored.cwd);
+    assert_eq!(restored.worktree_path, None);
+    assert_scrubbed("session.env", &restored.env[1].1);
+    assert_scrubbed(
+        "session.attention.custom_command",
+        restored.attention.custom_command.as_deref().unwrap(),
+    );
+    assert_scrubbed("session.tags", &restored.tags[0]);
+    assert_scrubbed(
+        "session.git_branch",
+        restored.git_branch.as_deref().unwrap(),
+    );
+    assert_scrubbed(
+        "session.linked_ref",
+        restored.linked_ref.as_deref().unwrap(),
+    );
+
+    let pane = restored.layout.panes()[0];
+    assert_scrubbed("pane.title", pane.title.as_deref().unwrap());
+    assert_scrubbed("pane.command", pane.command.as_deref().unwrap());
+    assert_scrubbed("pane.args", &pane.args[0]);
+    assert_scrubbed("pane.cwd", pane.cwd.as_deref().unwrap());
+    assert_eq!(pane.env[0].1, REDACTED);
+    assert_scrubbed("pane.env", &pane.env[1].1);
+
+    let node = restored.tree.iter().next().expect("process node");
+    assert_eq!(
+        node.id,
+        session.tree.iter().next().unwrap().id,
+        "redaction must not rewrite Node IDs"
+    );
+    assert_scrubbed("node.title", &node.title);
+    assert_scrubbed("node.command", &node.command);
+    assert_scrubbed("node.args", &node.args[0]);
+    assert_scrubbed("node.cwd", &node.cwd);
+    match &node.lifecycle {
+        Lifecycle::Signaled { signal } => assert_scrubbed("node.lifecycle.signal", signal),
+        other => panic!("unexpected lifecycle {other:?}"),
+    }
+    match node.turn.as_ref().unwrap() {
+        Turn::Failed { reason } => assert_scrubbed("node.turn.reason", reason),
+        other => panic!("unexpected turn {other:?}"),
+    }
+    assert_eq!(node.env_highlights["AWS_SESSION_TOKEN"], REDACTED);
+    assert_scrubbed("node.env_highlights", &node.env_highlights["NODE_LABEL"]);
+    assert_scrubbed(
+        "node.preview",
+        &node.activity_preview.as_ref().unwrap().normalized_text,
+    );
+
+    let agent = node.agent.as_ref().expect("agent metadata");
+    for (label, value) in [
+        ("agent.provider", agent.agent.provider.as_deref().unwrap()),
+        ("agent.tool", agent.agent.tool.as_deref().unwrap()),
+        ("agent.model", agent.agent.model.as_deref().unwrap()),
+        (
+            "agent.ref.external_id",
+            agent.agent.external_id.as_deref().unwrap(),
+        ),
+        (
+            "agent.name.declared",
+            agent.name.declared_name.as_deref().unwrap(),
+        ),
+        ("agent.name.display", agent.name.display_name.as_str()),
+        ("agent.external_id", agent.external_id.as_deref().unwrap()),
+        ("agent.agent_type", agent.agent_type.as_deref().unwrap()),
+        ("agent.current_task", agent.current_task.as_deref().unwrap()),
+        ("agent.last_message", agent.last_message.as_deref().unwrap()),
+        (
+            "agent.pending_question",
+            agent.pending_question.as_deref().unwrap(),
+        ),
+        (
+            "agent.permission_mode",
+            agent.permission_mode.as_deref().unwrap(),
+        ),
+        ("agent.git_branch", agent.git_branch.as_deref().unwrap()),
+    ] {
+        assert_scrubbed(label, value);
+    }
+    let permission = agent.pending_permission.as_ref().unwrap();
+    assert_scrubbed("permission.summary", &permission.summary);
+    assert_scrubbed("permission.command", permission.command.as_deref().unwrap());
+    assert_scrubbed(
+        "permission.tool_name",
+        permission.tool_name.as_deref().unwrap(),
+    );
+    assert_scrubbed("permission.cwd", permission.cwd.as_deref().unwrap());
+
+    let template = store.templates().list().unwrap().remove(0);
+    assert_scrubbed("template.name", &template.name);
+    assert_scrubbed(
+        "template.description",
+        template.description.as_deref().unwrap(),
+    );
+    assert_scrubbed("template.icon", template.icon.as_deref().unwrap());
+    assert_scrubbed("template.init_commands", &template.init_commands[0]);
+    assert_scrubbed(
+        "template.name_pattern",
+        template.name_pattern.as_deref().unwrap(),
+    );
+    assert_scrubbed("template.hotkey", template.hotkey.as_deref().unwrap());
+    assert_eq!(template.env[0].1, REDACTED);
+    assert_scrubbed("template.env", &template.env[1].1);
+    assert_scrubbed(
+        "template.attention.custom_command",
+        template
+            .attention
+            .as_ref()
+            .unwrap()
+            .custom_command
+            .as_deref()
+            .unwrap(),
+    );
+    let template_pane = template.layout.panes()[0];
+    assert_scrubbed(
+        "template.layout.pane.command",
+        template_pane.command.as_deref().unwrap(),
+    );
+
+    let checkout = store
+        .hierarchy()
+        .checkouts_for_workspace(&session.workspace_id)
+        .unwrap()
+        .into_iter()
+        .find(|checkout| !checkout.primary)
+        .expect("isolated checkout");
+    assert_scrubbed("checkout.branch", checkout.branch.as_deref().unwrap());
+    assert_scrubbed("checkout.shared_resources", &checkout.shared_resources[0]);
+
+    let setting: String = store
+        .settings()
+        .get("test.durable-secret")
+        .unwrap()
+        .expect("setting");
+    assert_scrubbed("settings.value", &setting);
+
+    let event = store
+        .events()
+        .list_for_session(&session.id, 10)
+        .unwrap()
+        .remove(0);
+    match &event.kind {
+        EventKind::AgentTurnStarted {
+            prompt_excerpt: Some(prompt),
+        } => assert_scrubbed("event.kind", prompt),
+        other => panic!("unexpected event kind {other:?}"),
+    }
+    for (label, value) in [
+        (
+            "event.agent.provider",
+            event.agent.provider.as_deref().unwrap(),
+        ),
+        ("event.agent.tool", event.agent.tool.as_deref().unwrap()),
+        ("event.agent.model", event.agent.model.as_deref().unwrap()),
+        (
+            "event.agent.external_id",
+            event.agent.external_id.as_deref().unwrap(),
+        ),
+        ("event.dedup_key", event.dedup_key.as_str()),
+    ] {
+        assert_scrubbed(label, value);
+    }
+    match &event.source {
+        EventSource::Hook { tool, event_name } => {
+            assert_scrubbed("event.source.tool", tool);
+            assert_scrubbed("event.source.event_name", event_name);
+        }
+        other => panic!("unexpected event source {other:?}"),
+    }
+
+    let entries = store.attention().list_for_session(&session.id).unwrap();
+    assert!(!entries.is_empty());
+    for entry in entries {
+        assert_scrubbed("attention.summary", entry.summary.as_deref().unwrap());
+        if let Some(external_id) = entry.subject_external_id.as_deref() {
+            assert_scrubbed("attention.subject_external_id", external_id);
+        }
+    }
+}
+
+#[test]
+fn a_credential_shaped_workspace_root_is_refused_before_sqlite_sees_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open_in(temp.path()).unwrap();
+    let root = temp.path().join(DURABLE_SECRET);
+    std::fs::create_dir(&root).unwrap();
+    let workspace = Workspace::new("unsafe structural path", root.to_string_lossy(), T0);
+
+    let error = store
+        .workspaces()
+        .save(&workspace)
+        .expect_err("rewriting a checkout identity would be unsafe");
+    assert!(matches!(
+        error,
+        turn_store::StoreError::SecretInStructuralField {
+            what: "workspace root",
+            ..
+        }
+    ));
+    assert_eq!(store.workspaces().count().unwrap(), 0);
+    assert_absent(
+        temp.path(),
+        "after rejecting a credential-shaped structural path",
+    );
 }
 
 #[test]
@@ -394,10 +800,27 @@ fn every_table_this_test_claims_to_cover_actually_has_rows_in_it() {
         "session_layouts"
     );
     assert!(store.sessions().count().unwrap() > 0, "sessions");
+    assert!(
+        store
+            .settings()
+            .keys()
+            .unwrap()
+            .contains(&"test.durable-secret".to_string()),
+        "settings"
+    );
     assert!(store.templates().count().unwrap() > 0, "templates");
     assert!(
         store.workspaces().get(&workspace).unwrap().is_some(),
         "workspaces"
+    );
+    assert!(
+        store
+            .hierarchy()
+            .checkouts_for_workspace(&workspace)
+            .unwrap()
+            .len()
+            > 1,
+        "workspace_checkouts"
     );
 }
 
@@ -439,8 +862,16 @@ fn a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes() {
         .unwrap()
         .expect("the session came back");
     store.sessions().save(&restored).unwrap();
+    let mut layout = restored.layout.clone();
+    let pane_id = layout.panes()[0].id.clone();
+    layout.get_mut(&pane_id).unwrap().command = Some(tainted("direct layout save"));
+    store
+        .sessions()
+        .save_layout(&session_id, &layout, T0 + 1)
+        .unwrap();
     let mut node = restored.tree.iter().next().cloned().expect("an agent node");
-    node.command = "claude --resume".into();
+    node.command = tainted("claude --resume");
+    node.agent.as_mut().unwrap().pending_question = Some(tainted("direct node upsert"));
     store.nodes().upsert(&node).unwrap();
     store
         .events()

@@ -2,7 +2,7 @@
 
 use crate::codec::{from_json, json};
 use crate::error::{Result, StoreError};
-use crate::redact::redact_pairs;
+use crate::redact::{redact_secrets, workspace_for_persistence};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,13 +29,26 @@ impl<'a> WorkspaceRepo<'a> {
     /// [`get`](Self::get) is what was safe to keep — not necessarily what was
     /// passed in.
     pub fn save(&self, workspace: &Workspace) -> Result<()> {
-        let env = redact_pairs(&workspace.env);
+        let mut safe = workspace_for_persistence(workspace);
+        if redact_secrets(&workspace.root) != workspace.root {
+            return Err(StoreError::SecretInStructuralField {
+                what: "workspace root",
+                owner_id: workspace.id.to_string(),
+            });
+        }
         // Take the database writer lock before resolving filesystem identity. A
         // concurrent Store must not register the canonical spelling while this
         // one is still comparing a legacy symlink spelling.
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
         let canonical = canonical_workspace_root(&workspace.root)?;
         let canonical = canonical.to_string_lossy().into_owned();
+        if redact_secrets(&canonical) != canonical {
+            return Err(StoreError::SecretInStructuralField {
+                what: "workspace root",
+                owner_id: workspace.id.to_string(),
+            });
+        }
+        safe.root = canonical.clone();
         let existing: Option<(String, bool)> = tx
             .query_row(
                 "SELECT root, lease_reconciliation_required FROM workspaces WHERE id = ?1",
@@ -44,7 +57,7 @@ impl<'a> WorkspaceRepo<'a> {
             )
             .optional()?;
         if existing.as_ref().is_some_and(|(root, required)| {
-            root != &canonical || (*required && !workspace.lease_reconciliation_required)
+            root != &canonical || (*required && !safe.lease_reconciliation_required)
         }) {
             return Err(StoreError::LeaseReconciliationRequired {
                 workspace_id: workspace.id.to_string(),
@@ -116,22 +129,22 @@ impl<'a> WorkspaceRepo<'a> {
                  lease_reconciliation_required = excluded.lease_reconciliation_required",
             params![
                 workspace.id.as_str(),
-                workspace.name,
-                canonical,
-                workspace.git_remote,
-                json("workspace env", &env)?,
-                workspace.default_shell,
-                workspace.default_agent,
-                json("workspace init commands", &workspace.init_commands)?,
-                workspace.default_template.as_ref().map(|t| t.as_str()),
-                json("attention policy", &workspace.attention)?,
-                workspace.colour,
-                workspace.icon,
-                workspace.created_ms,
-                workspace.last_used_ms,
-                workspace.tmux_enabled,
-                workspace.archived,
-                workspace.lease_reconciliation_required,
+                safe.name,
+                safe.root,
+                safe.git_remote,
+                json("workspace env", &safe.env)?,
+                safe.default_shell,
+                safe.default_agent,
+                json("workspace init commands", &safe.init_commands)?,
+                safe.default_template.as_ref().map(|t| t.as_str()),
+                json("attention policy", &safe.attention)?,
+                safe.colour,
+                safe.icon,
+                safe.created_ms,
+                safe.last_used_ms,
+                safe.tmux_enabled,
+                safe.archived,
+                safe.lease_reconciliation_required,
             ],
         )?;
         // The fence is global and deliberately outlives a Workspace. A second
@@ -154,7 +167,7 @@ impl<'a> WorkspaceRepo<'a> {
                 workspace.id.as_str(),
                 canonical,
                 canonical,
-                workspace.created_ms
+                safe.created_ms
             ],
         )?;
         tx.commit()?;

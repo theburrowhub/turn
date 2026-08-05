@@ -145,6 +145,16 @@ pub enum StoreError {
         existing_checkout_id: String,
     },
 
+    /// A filesystem identity or other structural key cannot be rewritten without
+    /// changing its meaning. If it contains something shaped like a credential,
+    /// fail before SQLite sees it instead of storing the credential or inventing
+    /// a redacted identity that aliases a different checkout.
+    #[error("{what} for {owner_id} contains credential-shaped text; refusing to persist it")]
+    SecretInStructuralField {
+        what: &'static str,
+        owner_id: String,
+    },
+
     #[error("could not create the data directory {path}: {cause}")]
     DataDir {
         path: String,

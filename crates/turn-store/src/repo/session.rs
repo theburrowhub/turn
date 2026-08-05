@@ -6,7 +6,7 @@
 
 use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
-use crate::redact::{redact_layout, redact_pairs};
+use crate::redact::{redact_layout, session_for_persistence};
 use crate::repo::node::{build_tree, from_row as node_from_row, upsert_node};
 use rusqlite::{params, Connection, Row};
 use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
@@ -229,6 +229,7 @@ impl<'a> SessionRepo<'a> {
 }
 
 pub(crate) fn save_in(conn: &Connection, session: &Session) -> Result<()> {
+    let safe = session_for_persistence(session);
     conn.execute(
         "INSERT INTO sessions (id, workspace_id, name, note, cwd, env_json, attention_json, \
              mode, checkout_id, worktree_path, read_only_enforced, template_id, status, \
@@ -250,44 +251,44 @@ pub(crate) fn save_in(conn: &Connection, session: &Session) -> Result<()> {
              parent_session = excluded.parent_session, created_ms = excluded.created_ms, \
              last_activity_ms = excluded.last_activity_ms, tmux = excluded.tmux",
         params![
-            session.id.as_str(),
-            session.workspace_id.as_str(),
-            session.name,
-            session.note,
-            session.cwd,
-            json("session env", &redact_pairs(&session.env))?,
-            json("attention policy", &session.attention)?,
-            tag("session mode", &session.mode)?,
-            session.checkout_id.as_str(),
-            session.worktree_path,
-            session.read_only_enforced,
-            session.template_id.as_ref().map(|t| t.as_str()),
-            tag("session status", &session.status)?,
-            tag("restore state", &session.restore_state)?,
-            json("session tags", &session.tags)?,
-            session.git_branch,
-            session.linked_ref,
-            session.favourite,
-            session.pinned,
-            session.sort_key,
-            session.parent_session.as_ref().map(|s| s.as_str()),
-            session.created_ms,
-            session.last_activity_ms,
-            session.tmux,
+            safe.id.as_str(),
+            safe.workspace_id.as_str(),
+            safe.name,
+            safe.note,
+            safe.cwd,
+            json("session env", &safe.env)?,
+            json("attention policy", &safe.attention)?,
+            tag("session mode", &safe.mode)?,
+            safe.checkout_id.as_str(),
+            safe.worktree_path,
+            safe.read_only_enforced,
+            safe.template_id.as_ref().map(|t| t.as_str()),
+            tag("session status", &safe.status)?,
+            tag("restore state", &safe.restore_state)?,
+            json("session tags", &safe.tags)?,
+            safe.git_branch,
+            safe.linked_ref,
+            safe.favourite,
+            safe.pinned,
+            safe.sort_key,
+            safe.parent_session.as_ref().map(|s| s.as_str()),
+            safe.created_ms,
+            safe.last_activity_ms,
+            safe.tmux,
         ],
     )
-    .map_err(|error| StoreError::from_write("session", session.workspace_id.as_str(), error))?;
+    .map_err(|error| StoreError::from_write("session", safe.workspace_id.as_str(), error))?;
 
-    write_layout(conn, &session.id, &session.layout, session.last_activity_ms)?;
+    write_layout(conn, &safe.id, &safe.layout, safe.last_activity_ms)?;
 
     // Replace the node set wholesale: the tree in memory is authoritative.
     let mut keep: Vec<String> = Vec::new();
-    for (index, node) in session.tree.iter().enumerate() {
+    for (index, node) in safe.tree.iter().enumerate() {
         upsert_node(conn, node, index as i64)?;
         keep.push(node.id.to_string());
     }
-    prune_nodes(conn, &session.id, &keep)?;
-    sync_layout_bindings(conn, session)?;
+    prune_nodes(conn, &safe.id, &keep)?;
+    sync_layout_bindings(conn, &safe)?;
     Ok(())
 }
 

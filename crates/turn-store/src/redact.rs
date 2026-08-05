@@ -34,7 +34,14 @@
 //! shape; it is a net under the key rule, not a replacement for it.
 
 use std::collections::HashMap;
+use turn_core::attention::AttentionPolicy;
+use turn_core::event::AgentRef;
 use turn_core::model::layout::{Layout, LayoutNode};
+use turn_core::model::node::{AgentInfo, PendingPermission, ProcessNode};
+use turn_core::model::{
+    ActivityPreview, AgentName, Session, SessionTree, Template, Workspace, WorkspaceCheckout,
+};
+use turn_core::state::{Lifecycle, Turn};
 
 /// Written in place of a secret value.
 pub const REDACTED: &str = "[redacted]";
@@ -438,7 +445,191 @@ pub fn redact_map(env: &HashMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
-/// Redacts every pane environment in a layout.
+fn redact_optional(text: &Option<String>) -> Option<String> {
+    text.as_deref().map(redact_secrets)
+}
+
+fn redact_strings(values: &[String]) -> Vec<String> {
+    values.iter().map(|value| redact_secrets(value)).collect()
+}
+
+/// Returns the Workspace document that is allowed to cross the durable boundary.
+///
+/// Filesystem identity is validated and written separately by `WorkspaceRepo`; every
+/// other user- or tool-supplied string is scanned here. Identifiers remain byte-for-byte
+/// stable so redaction can never break foreign keys.
+pub(crate) fn workspace_for_persistence(workspace: &Workspace) -> Workspace {
+    let mut safe = workspace.clone();
+    safe.name = redact_secrets(&safe.name);
+    safe.git_remote = redact_optional(&safe.git_remote);
+    safe.env = redact_pairs(&safe.env);
+    safe.default_shell = redact_optional(&safe.default_shell);
+    safe.default_agent = redact_optional(&safe.default_agent);
+    safe.init_commands = redact_strings(&safe.init_commands);
+    safe.attention = attention_policy_for_persistence(&safe.attention);
+    safe.colour = redact_optional(&safe.colour);
+    safe.icon = redact_optional(&safe.icon);
+    safe
+}
+
+/// Returns the Session document that is allowed to cross the durable boundary.
+pub(crate) fn session_for_persistence(session: &Session) -> Session {
+    let mut safe = session.clone();
+    safe.name = redact_secrets(&safe.name);
+    safe.note = redact_optional(&safe.note);
+    safe.cwd = redact_secrets(&safe.cwd);
+    safe.worktree_path = redact_optional(&safe.worktree_path);
+    safe.env = redact_pairs(&safe.env);
+    safe.layout = redact_layout(&safe.layout);
+    safe.attention = attention_policy_for_persistence(&safe.attention);
+    safe.tags = redact_strings(&safe.tags);
+    safe.git_branch = redact_optional(&safe.git_branch);
+    safe.linked_ref = redact_optional(&safe.linked_ref);
+    let mut tree = SessionTree::new();
+    for node in safe.tree.iter() {
+        tree.insert(node_for_persistence(node));
+    }
+    safe.tree = tree;
+    safe
+}
+
+/// Returns the Template document that is allowed to cross the durable boundary.
+pub(crate) fn template_for_persistence(template: &Template) -> Template {
+    let mut safe = template.clone();
+    safe.name = redact_secrets(&safe.name);
+    safe.description = redact_optional(&safe.description);
+    safe.icon = redact_optional(&safe.icon);
+    safe.layout = redact_layout(&safe.layout);
+    safe.attention = safe
+        .attention
+        .as_ref()
+        .map(attention_policy_for_persistence);
+    safe.init_commands = redact_strings(&safe.init_commands);
+    safe.name_pattern = redact_optional(&safe.name_pattern);
+    safe.hotkey = redact_optional(&safe.hotkey);
+    safe.env = redact_pairs(&safe.env);
+    safe
+}
+
+/// Returns checkout metadata with labels redacted while preserving filesystem
+/// identity. Checkout paths are structural fencing keys and are rejected by the
+/// repository if they contain credential-shaped material rather than rewritten.
+pub(crate) fn checkout_for_persistence(checkout: &WorkspaceCheckout) -> WorkspaceCheckout {
+    let mut safe = checkout.clone();
+    safe.branch = redact_optional(&safe.branch);
+    safe.shared_resources = redact_strings(&safe.shared_resources);
+    safe
+}
+
+/// Returns a ProcessNode whose structural identity is intact and whose durable free
+/// text has been scanned for credentials.
+pub(crate) fn node_for_persistence(node: &ProcessNode) -> ProcessNode {
+    let mut safe = node.clone();
+    safe.title = redact_secrets(&safe.title);
+    safe.command = redact_secrets(&safe.command);
+    safe.args = redact_strings(&safe.args);
+    safe.cwd = redact_secrets(&safe.cwd);
+    safe.lifecycle = lifecycle_for_persistence(&safe.lifecycle);
+    safe.turn = safe.turn.as_ref().map(turn_for_persistence);
+    safe.agent = safe.agent.as_ref().map(agent_info_for_persistence);
+    safe.activity_preview = safe
+        .activity_preview
+        .as_ref()
+        .map(activity_preview_for_persistence);
+    safe.env_highlights = redact_map(&safe.env_highlights);
+    safe
+}
+
+fn lifecycle_for_persistence(lifecycle: &Lifecycle) -> Lifecycle {
+    match lifecycle {
+        Lifecycle::Signaled { signal } => Lifecycle::Signaled {
+            signal: redact_secrets(signal),
+        },
+        Lifecycle::Stopped { signal } => Lifecycle::Stopped {
+            signal: redact_secrets(signal),
+        },
+        other => other.clone(),
+    }
+}
+
+fn turn_for_persistence(turn: &Turn) -> Turn {
+    match turn {
+        Turn::Failed { reason } => Turn::Failed {
+            reason: redact_secrets(reason),
+        },
+        other => other.clone(),
+    }
+}
+
+fn attention_policy_for_persistence(policy: &AttentionPolicy) -> AttentionPolicy {
+    let mut safe = policy.clone();
+    safe.custom_command = redact_optional(&safe.custom_command);
+    safe
+}
+
+fn activity_preview_for_persistence(preview: &ActivityPreview) -> ActivityPreview {
+    let mut safe = preview.clone();
+    let text = redact_secrets(&safe.normalized_text);
+    if text != safe.normalized_text {
+        safe.normalized_text = text;
+        safe.contains_sensitive_data = true;
+        safe.redacted = true;
+    }
+    safe
+}
+
+fn agent_ref_for_persistence(agent: &AgentRef) -> AgentRef {
+    AgentRef {
+        provider: redact_optional(&agent.provider),
+        tool: redact_optional(&agent.tool),
+        model: redact_optional(&agent.model),
+        external_id: redact_optional(&agent.external_id),
+    }
+}
+
+fn agent_name_for_persistence(name: &AgentName) -> AgentName {
+    AgentName {
+        declared_name: redact_optional(&name.declared_name),
+        display_name: redact_secrets(&name.display_name),
+        source: name.source,
+        confidence: name.confidence,
+        user_renamed: name.user_renamed,
+    }
+}
+
+fn pending_permission_for_persistence(permission: &PendingPermission) -> PendingPermission {
+    PendingPermission {
+        summary: redact_secrets(&permission.summary),
+        command: redact_optional(&permission.command),
+        tool_name: redact_optional(&permission.tool_name),
+        risk: permission.risk,
+        requested_ms: permission.requested_ms,
+        cwd: redact_optional(&permission.cwd),
+    }
+}
+
+fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
+    AgentInfo {
+        agent: agent_ref_for_persistence(&agent.agent),
+        name: agent_name_for_persistence(&agent.name),
+        external_id: redact_optional(&agent.external_id),
+        agent_type: redact_optional(&agent.agent_type),
+        current_task: redact_optional(&agent.current_task),
+        last_message: redact_optional(&agent.last_message),
+        pending_permission: agent
+            .pending_permission
+            .as_ref()
+            .map(pending_permission_for_persistence),
+        pending_question: redact_optional(&agent.pending_question),
+        tokens_used: agent.tokens_used,
+        cost_usd: agent.cost_usd,
+        permission_mode: redact_optional(&agent.permission_mode),
+        git_branch: redact_optional(&agent.git_branch),
+        resumable: agent.resumable,
+    }
+}
+
+/// Redacts every free-text field in every pane of a layout.
 ///
 /// Layouts are stored as one JSON blob, so a token pasted into a pane's env
 /// would otherwise ride into the file inside the tree — the one place it is easy
@@ -451,7 +642,13 @@ pub fn redact_layout(layout: &Layout) -> Layout {
 
 fn scrub(node: &mut LayoutNode) {
     match node {
-        LayoutNode::Leaf(pane) => pane.env = redact_pairs(&pane.env),
+        LayoutNode::Leaf(pane) => {
+            pane.title = redact_optional(&pane.title);
+            pane.command = redact_optional(&pane.command);
+            pane.args = redact_strings(&pane.args);
+            pane.cwd = redact_optional(&pane.cwd);
+            pane.env = redact_pairs(&pane.env);
+        }
         LayoutNode::Split(split) => {
             for child in split.children.iter_mut() {
                 scrub(&mut child.node);

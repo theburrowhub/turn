@@ -2,6 +2,7 @@
 
 use crate::codec::{from_tag, json, tag};
 use crate::error::{Result, StoreError};
+use crate::redact::{checkout_for_persistence, redact_secrets};
 use crate::repo::session::SessionRepo;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -259,7 +260,22 @@ impl<'a> HierarchyRepo<'a> {
         session: &Session,
         checkout: &WorkspaceCheckout,
     ) -> Result<()> {
+        if redact_secrets(&checkout.path) != checkout.path
+            || redact_secrets(&checkout.canonical_path) != checkout.canonical_path
+        {
+            return Err(StoreError::SecretInStructuralField {
+                what: "checkout path",
+                owner_id: checkout.id.to_string(),
+            });
+        }
         let canonical = Self::validate_worktree_shape(session, checkout)?;
+        if redact_secrets(&canonical) != canonical {
+            return Err(StoreError::SecretInStructuralField {
+                what: "checkout path",
+                owner_id: checkout.id.to_string(),
+            });
+        }
+        let safe_checkout = checkout_for_persistence(checkout);
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
         Self::ensure_new_session(&tx, session)?;
 
@@ -325,13 +341,13 @@ impl<'a> HierarchyRepo<'a> {
                   shared_resources_json, created_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)",
             params![
-                checkout.id.as_str(),
-                checkout.workspace_id.as_str(),
-                checkout.path,
+                safe_checkout.id.as_str(),
+                safe_checkout.workspace_id.as_str(),
+                safe_checkout.path,
                 canonical,
-                checkout.branch,
-                json("checkout shared resources", &checkout.shared_resources)?,
-                checkout.created_ms,
+                safe_checkout.branch,
+                json("checkout shared resources", &safe_checkout.shared_resources)?,
+                safe_checkout.created_ms,
             ],
         )
         .map_err(|error| {

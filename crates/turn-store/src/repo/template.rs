@@ -2,7 +2,7 @@
 
 use crate::codec::{from_json, from_json_opt, json};
 use crate::error::Result;
-use crate::redact::{redact_layout, redact_pairs};
+use crate::redact::template_for_persistence;
 use rusqlite::{params, Connection, Row};
 use turn_core::ids::TemplateId;
 use turn_core::model::{Layout, PaneKind, Template};
@@ -21,6 +21,7 @@ impl<'a> TemplateRepo<'a> {
     }
 
     pub fn save(&self, template: &Template) -> Result<()> {
+        let safe = template_for_persistence(template);
         self.conn.execute(
             "INSERT INTO templates (id, name, description, icon, layout_json, attention_json, \
                  init_commands_json, name_pattern, hotkey, env_json, tmux, built_in, created_ms) \
@@ -34,23 +35,22 @@ impl<'a> TemplateRepo<'a> {
                  env_json = excluded.env_json, tmux = excluded.tmux, \
                  built_in = excluded.built_in, created_ms = excluded.created_ms",
             params![
-                template.id.as_str(),
-                template.name,
-                template.description,
-                template.icon,
-                json("layout", &redact_layout(&template.layout))?,
-                template
-                    .attention
+                safe.id.as_str(),
+                safe.name,
+                safe.description,
+                safe.icon,
+                json("layout", &safe.layout)?,
+                safe.attention
                     .as_ref()
                     .map(|p| json("attention policy", p))
                     .transpose()?,
-                json("template init commands", &template.init_commands)?,
-                template.name_pattern,
-                template.hotkey,
-                json("template env", &redact_pairs(&template.env))?,
-                template.tmux,
-                template.built_in,
-                template.created_ms,
+                json("template init commands", &safe.init_commands)?,
+                safe.name_pattern,
+                safe.hotkey,
+                json("template env", &safe.env)?,
+                safe.tmux,
+                safe.built_in,
+                safe.created_ms,
             ],
         )?;
         Ok(())

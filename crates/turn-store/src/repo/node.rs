@@ -12,7 +12,7 @@
 
 use crate::codec::{from_json, from_json_opt, from_tag, json, tag};
 use crate::error::{Result, StoreError};
-use crate::redact::{redact_map, redact_secrets};
+use crate::redact::node_for_persistence;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::collections::HashSet;
 use turn_core::ids::{NodeId, SessionId};
@@ -163,22 +163,14 @@ impl<'a> NodeRepo<'a> {
 ///
 /// [`SessionRepo`]: crate::repo::SessionRepo
 pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Result<()> {
+    let node = node_for_persistence(node);
     let external_id = node
         .agent
         .as_ref()
         .and_then(|agent| agent.external_id.clone());
-    let env = redact_map(&node.env_highlights);
+    let env = node.env_highlights.clone();
     let name = node.agent.as_ref().map(|agent| &agent.name);
-    let safe_preview = node.activity_preview.as_ref().map(|preview| {
-        let mut safe = preview.clone();
-        let redacted = redact_secrets(&safe.normalized_text);
-        if redacted != safe.normalized_text {
-            safe.normalized_text = redacted;
-            safe.contains_sensitive_data = true;
-            safe.redacted = true;
-        }
-        safe
-    });
+    let safe_preview = node.activity_preview.clone();
     let preview_json = safe_preview
         .as_ref()
         .map(|preview| json("activity preview", preview))
