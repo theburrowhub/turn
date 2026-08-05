@@ -15,7 +15,9 @@ pub use hierarchy::{
     PaneNodeBinding, PreviewSource, PreviewVisibility, Relationship, RelationshipKind, SessionMode,
     TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
 };
-pub use layout::{Child, Direction, Layout, LayoutNode, Pane, PaneKind, RestoreBehaviour, Split};
+pub use layout::{
+    Child, Direction, Layout, LayoutNode, LayoutPreset, Pane, PaneKind, RestoreBehaviour, Split,
+};
 pub use node::{AgentInfo, NodeKind, PendingPermission, ProcessNode, Relation, SessionTree};
 pub use session::{RestoreState, Session, SessionStatus};
 pub use template::Template;

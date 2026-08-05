@@ -27,7 +27,7 @@ use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
 use crate::theme::Theme;
 use crate::transport::{Ask, DaemonLink};
-use crate::view::{ViewAction, ViewState};
+use crate::view::{LayoutEditorOrigin, LayoutTemplateDraft, ViewAction, ViewState};
 
 #[derive(Debug)]
 struct FolderDialogResult {
@@ -226,6 +226,21 @@ impl TurnApp {
                     draft.error = Some(message);
                 }
             }
+            Reaction::TemplateCreated { template_id } => {
+                let origin = self.state.layout_draft.as_ref().map(|draft| draft.origin);
+                self.state.layout_draft = None;
+                if origin == Some(LayoutEditorOrigin::NewSession) {
+                    if let Some(session) = self.state.session_draft.as_mut() {
+                        session.template_id = Some(template_id);
+                    }
+                }
+            }
+            Reaction::TemplateCreationFailed(message) => {
+                if let Some(draft) = self.state.layout_draft.as_mut() {
+                    draft.submitting = false;
+                    draft.error = Some(message);
+                }
+            }
         }
     }
 
@@ -347,6 +362,11 @@ impl TurnApp {
                     .state
                     .session_draft
                     .as_ref()
+                    .is_some_and(|draft| !draft.submitting)
+                || self
+                    .state
+                    .layout_draft
+                    .as_ref()
                     .is_some_and(|draft| !draft.submitting);
             if self.state.shortcuts_open
                 || self.state.settings_open
@@ -356,6 +376,10 @@ impl TurnApp {
                 let escape = ctx
                     .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 if escape {
+                    if self.state.layout_draft.is_some() {
+                        self.state.layout_draft = None;
+                        return Vec::new();
+                    }
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
                     self.state.attention_panel_open = false;
@@ -545,14 +569,22 @@ impl eframe::App for TurnApp {
                     self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
+                    self.state.layout_draft = None;
                     self.pending_folder_request = None;
                     self.state.workspace_picker_pending = false;
                 }
                 ViewAction::ChooseWorkspaceDirectory => {
                     self.open_workspace_directory_chooser(&ctx, frame);
                 }
+                ViewAction::OpenLayoutEditor(origin) => {
+                    self.state.layout_draft = Some(LayoutTemplateDraft::two_shells(origin));
+                }
+                ViewAction::CloseLayoutEditor => {
+                    self.state.layout_draft = None;
+                }
                 action @ (ViewAction::CreateWorkspace { .. }
-                | ViewAction::CreateSessionFromTemplate { .. }) => {
+                | ViewAction::CreateSessionFromTemplate { .. }
+                | ViewAction::CreateLayoutTemplate { .. }) => {
                     for reaction in self.desk.apply_view_action(action, now_ms) {
                         self.perform(&ctx, reaction);
                     }

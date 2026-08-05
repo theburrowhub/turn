@@ -27,7 +27,10 @@ use egui::{
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
 use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
-use turn_core::model::{ActivityPreview, Layout, NodeKind, PreviewVisibility, RelationshipKind};
+use turn_core::model::{
+    ActivityPreview, Direction, Layout, LayoutPreset, NodeKind, Pane, PaneKind, PreviewVisibility,
+    RelationshipKind, RestoreBehaviour,
+};
 use turn_core::state::{AwaitingReason, DisplayState};
 use turn_proto::cells::Grid;
 use turn_proto::{
@@ -205,6 +208,9 @@ pub struct ViewState {
     pub workspace_picker_pending: bool,
     /// The explicit New Session sheet. `Cmd+N` opens this; only Quick New may bypass it.
     pub session_draft: Option<SessionDraft>,
+    /// Reusable visual editor shared by New Session and Settings. It contains only
+    /// a local draft; no process starts until a Session is explicitly created.
+    pub layout_draft: Option<LayoutTemplateDraft>,
     /// The daemon-owned navigation projection for this window. `None` is kept as a
     /// narrow compatibility path while the first hierarchy snapshot is in flight.
     pub hierarchy: Option<HierarchySnapshot>,
@@ -247,6 +253,7 @@ impl ViewState {
             || self.write_conflict_open
             || self.workspace_draft.is_some()
             || self.session_draft.is_some()
+            || self.layout_draft.is_some()
             || self.quick_preview.is_some()
     }
 
@@ -346,6 +353,139 @@ pub struct SessionDraft {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutEditorOrigin {
+    NewSession,
+    Settings,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CellCommandDraft {
+    /// Empty means the Workspace's configured shell. It is never passed to a shell
+    /// for interpretation; a non-empty value is an executable program.
+    pub program: String,
+    /// Shell-style quoting is parsed into argv, but operators are not evaluated.
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutTemplateDraft {
+    pub name: String,
+    pub layout: Layout,
+    pub selected: PaneId,
+    pub cells: HashMap<PaneId, CellCommandDraft>,
+    pub dragged_pane: Option<PaneId>,
+    pub origin: LayoutEditorOrigin,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl LayoutTemplateDraft {
+    pub fn two_shells(origin: LayoutEditorOrigin) -> Self {
+        let left = Pane::new(PaneKind::Shell)
+            .with_title("shell")
+            .with_restore(RestoreBehaviour::Relaunch);
+        let selected = left.id.clone();
+        let right = Pane::new(PaneKind::Shell)
+            .with_title("shell")
+            .with_restore(RestoreBehaviour::Relaunch);
+        let mut layout = Layout::single(left);
+        layout.split(&selected, Direction::Horizontal, right);
+        layout.active = Some(selected.clone());
+        let cells = layout
+            .panes()
+            .into_iter()
+            .map(|pane| (pane.id.clone(), CellCommandDraft::default()))
+            .collect();
+        Self {
+            name: String::new(),
+            layout,
+            selected,
+            cells,
+            dragged_pane: None,
+            origin,
+            submitting: false,
+            error: None,
+        }
+    }
+
+    fn split_selected(&mut self, direction: Direction) {
+        if self.layout.pane_count() >= 16 {
+            self.error = Some("A layout can contain at most 16 cells.".into());
+            return;
+        }
+        let pane = Pane::new(PaneKind::Shell)
+            .with_title("shell")
+            .with_restore(RestoreBehaviour::Relaunch);
+        let id = pane.id.clone();
+        if self.layout.split(&self.selected, direction, pane) {
+            self.cells.insert(id.clone(), CellCommandDraft::default());
+            self.selected = id;
+            self.error = None;
+        }
+    }
+
+    fn remove_selected(&mut self) {
+        let removed = self.selected.clone();
+        if self.layout.close(&removed) {
+            self.cells.remove(&removed);
+            if let Some(next) = self.layout.active.clone() {
+                self.selected = next;
+            }
+            self.error = None;
+        } else {
+            self.error = Some("A layout needs at least one cell.".into());
+        }
+    }
+
+    fn materialized_layout(&self) -> Result<Layout, String> {
+        let mut layout = self.layout.clone();
+        let ids: Vec<_> = layout
+            .panes()
+            .into_iter()
+            .map(|pane| pane.id.clone())
+            .collect();
+        for id in ids {
+            let command = self.cells.get(&id).cloned().unwrap_or_default();
+            let pane = layout
+                .get_mut(&id)
+                .ok_or_else(|| "A layout cell disappeared while saving.".to_string())?;
+            let program = command.program.trim();
+            if program.is_empty() {
+                pane.kind = PaneKind::Shell;
+                pane.command = None;
+                pane.args.clear();
+                pane.title = Some("shell".into());
+            } else {
+                let args = shell_words::split(command.arguments.trim())
+                    .map_err(|error| format!("Invalid arguments for {program}: {error}"))?;
+                pane.kind = if matches!(program, "claude" | "codex" | "gemini" | "opencode") {
+                    PaneKind::Agent
+                } else {
+                    PaneKind::Terminal
+                };
+                pane.command = Some(program.to_string());
+                pane.args = args;
+                pane.title = Some(program.rsplit('/').next().unwrap_or(program).to_string());
+            }
+            pane.node_id = None;
+            pane.restore = RestoreBehaviour::Relaunch;
+        }
+        layout.zoomed = None;
+        layout.normalise();
+        Ok(layout)
+    }
+
+    fn cell_label(&self, pane_id: &PaneId) -> String {
+        self.cells
+            .get(pane_id)
+            .map(|cell| cell.program.trim())
+            .filter(|program| !program.is_empty())
+            .unwrap_or("Shell")
+            .to_string()
+    }
+}
+
 impl SessionDraft {
     pub fn new(workspace_id: WorkspaceId, template_id: Option<TemplateId>) -> Self {
         Self {
@@ -409,9 +549,15 @@ pub enum ViewAction {
     /// A divider was dragged. The fraction is of the parent split, which is what
     /// `resize_pane` wants.
     ResizeDivider {
-        pane_id: PaneId,
+        before: PaneId,
+        after: PaneId,
         fraction: f32,
     },
+    EqualizeDivider {
+        before: PaneId,
+        after: PaneId,
+    },
+    ApplyLayoutPreset(LayoutPreset),
     /// Go to a specific demand — the one the banner or the row is showing, never an
     /// arbitrary one.
     GotoAttention(AttentionId),
@@ -442,6 +588,12 @@ pub enum ViewAction {
         template_id: TemplateId,
         name: String,
         task: Option<String>,
+    },
+    OpenLayoutEditor(LayoutEditorOrigin),
+    CloseLayoutEditor,
+    CreateLayoutTemplate {
+        name: String,
+        layout: Layout,
     },
     ReleaseWorkspaceLease {
         workspace_id: WorkspaceId,
@@ -765,11 +917,6 @@ impl<'a> TurnView<'a> {
             .and_then(|workspace| workspace.default_template.as_ref());
         configured
             .and_then(|id| self.templates.iter().find(|template| &template.id == id))
-            .or_else(|| {
-                self.templates
-                    .iter()
-                    .find(|template| template.name == "Coding")
-            })
             .or_else(|| self.templates.first())
             .map(|template| template.id.clone())
     }
@@ -1015,7 +1162,9 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.workspace_draft.is_some() {
+        if state.layout_draft.is_some() {
+            actions.extend(self.layout_editor_overlay(ui, theme, state, full));
+        } else if state.workspace_draft.is_some() {
             actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
         } else if let Some(conflict) = self.write_conflict {
             actions.extend(self.write_conflict_overlay(ui, theme, conflict, full));
@@ -1028,7 +1177,7 @@ impl<'a> TurnView<'a> {
         } else if state.shortcuts_open {
             actions.extend(self.shortcuts_sheet(ui, theme, keymap, full));
         } else if state.settings_open {
-            actions.extend(self.settings_sheet(ui, theme, full));
+            actions.extend(self.settings_sheet(ui, theme, state, full));
         }
         state.hierarchy = hierarchy;
         actions
@@ -1702,7 +1851,7 @@ impl<'a> TurnView<'a> {
             .unwrap_or("no branch");
         let title_clip = Rect::from_min_max(
             area.min,
-            egui::pos2((area.max.x - 155.0).max(area.min.x), area.max.y),
+            egui::pos2((area.max.x - 230.0).max(area.min.x), area.max.y),
         );
         let painter = ui.painter().with_clip_rect(title_clip);
         painter.text(
@@ -1728,64 +1877,79 @@ impl<'a> TurnView<'a> {
             .write_lease
             .as_ref()
             .filter(|lease| lease.session_id == summary.id);
-        if let Some(lease) = owned_lease {
-            let button_rect = Rect::from_min_size(
-                area.right_center() + Vec2::new(-158.0, -12.0),
-                Vec2::new(146.0, 24.0),
-            );
-            let response = ui
-                .scope_builder(region(button_rect, "release-write-lease"), |ui| {
-                    ui.set_min_size(button_rect.size());
-                    ui.add_enabled(
-                        summary.running_count == 0,
-                        egui::Button::new(if summary.running_count == 0 {
-                            "Release write lease"
-                        } else {
-                            "Lease held · busy"
-                        })
-                        .min_size(button_rect.size()),
-                    )
-                })
-                .inner
-                .on_hover_text(if summary.running_count == 0 {
-                    "Give up exclusive write access to the primary checkout"
-                } else {
-                    "Every running process must stop before the fenced lease can be released"
+        let toolbar = Rect::from_min_size(
+            area.right_top() + Vec2::new(-218.0, 7.0),
+            Vec2::new(208.0, 32.0),
+        );
+        ui.scope_builder(region(toolbar, "session-layout-toolbar"), |ui| {
+            ui.horizontal(|ui| {
+                ui.menu_button("+ Pane", |ui| {
+                    if ui.button("Shell · split right").clicked() {
+                        actions.push(ViewAction::Run(Command::SplitHorizontal));
+                        ui.close();
+                    }
+                    if ui.button("Shell · split below").clicked() {
+                        actions.push(ViewAction::Run(Command::SplitVertical));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Agent · split right").clicked() {
+                        actions.push(ViewAction::Run(Command::LaunchAgent));
+                        ui.close();
+                    }
                 });
-            if response.clicked() && summary.running_count == 0 {
-                actions.push(ViewAction::ReleaseWorkspaceLease {
-                    workspace_id: workspace.workspace.id.clone(),
-                    lease_id: lease.id.clone(),
-                    expected_generation: lease.generation,
+                ui.menu_button("Layout", |ui| {
+                    for (label, preset) in [
+                        ("Balance current splits", LayoutPreset::Balanced),
+                        ("Equal columns", LayoutPreset::Columns),
+                        ("Equal rows", LayoutPreset::Rows),
+                        ("Main pane left", LayoutPreset::MainLeft),
+                        ("Grid", LayoutPreset::Grid),
+                    ] {
+                        if ui.button(label).clicked() {
+                            actions.push(ViewAction::ApplyLayoutPreset(preset));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Save current layout as preset").clicked() {
+                        actions.push(ViewAction::Run(Command::SaveLayoutAsTemplate));
+                        ui.close();
+                    }
+                    if let Some(lease) = owned_lease {
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                summary.running_count == 0,
+                                egui::Button::new("Release write lease"),
+                            )
+                            .clicked()
+                        {
+                            actions.push(ViewAction::ReleaseWorkspaceLease {
+                                workspace_id: workspace.workspace.id.clone(),
+                                lease_id: lease.id.clone(),
+                                expected_generation: lease.generation,
+                            });
+                            ui.close();
+                        }
+                    }
                 });
-            }
-        } else {
-            ui.painter().text(
-                area.right_center() + Vec2::new(-12.0, -8.0),
-                Align2::RIGHT_CENTER,
-                if session_needs_attention {
-                    "YOUR TURN"
-                } else {
-                    summary.mode.label()
-                },
-                FontId::new(10.0, egui::FontFamily::Monospace),
-                if session_needs_attention {
-                    theme.attention
-                } else {
-                    theme.text_dim
-                },
-            );
-            ui.painter().text(
-                area.right_center() + Vec2::new(-12.0, 9.0),
-                Align2::RIGHT_CENTER,
-                format!(
-                    "{} panes · {} processes",
-                    summary.pane_count, summary.node_count
-                ),
-                FontId::new(10.0, egui::FontFamily::Monospace),
-                theme.text_faint,
-            );
-        }
+                ui.label(
+                    RichText::new(if session_needs_attention {
+                        "◆ YOUR TURN"
+                    } else {
+                        summary.mode.label()
+                    })
+                    .monospace()
+                    .size(10.0)
+                    .color(if session_needs_attention {
+                        theme.attention
+                    } else {
+                        theme.text_dim
+                    }),
+                );
+            });
+        });
 
         let context_id = ui.id().with("active-session-context");
         ui.ctx().accesskit_node_builder(context_id, |node| {
@@ -1981,33 +2145,36 @@ impl<'a> TurnView<'a> {
             full.center(),
             Vec2::new(
                 620.0_f32.min((full.width() - 32.0).max(280.0)),
-                430.0_f32.min((full.height() - 32.0).max(300.0)),
+                410.0_f32.min((full.height() - 32.0).max(300.0)),
             ),
         );
         ui.painter()
             .rect_filled(full, 0.0, Color32::from_black_alpha(150));
-        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
         ui.painter().rect_stroke(
             panel,
-            0.0,
+            10.0,
             Stroke::new(1.0, theme.border),
             egui::StrokeKind::Outside,
         );
-        ui.scope_builder(region(panel.shrink(16.0), "session-creator"), |ui| {
+        ui.scope_builder(region(panel.shrink(20.0), "session-creator"), |ui| {
             ui.ctx().accesskit_node_builder(ui.id(), |node| {
                 node.set_role(egui::accesskit::Role::Dialog);
                 node.set_label("New Session");
                 node.set_modal();
             });
-            ui.label(RichText::new("NEW SESSION").color(theme.text).strong());
             ui.label(
-                RichText::new(
-                    "A Session is one task. Creating it may launch the selected template's commands.",
-                )
+                RichText::new("New session")
+                    .size(21.0)
+                    .color(theme.text)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new("Choose a workspace and a reusable layout. The name is optional.")
                 .color(theme.text_dim)
                 .small(),
             );
-            ui.add_space(10.0);
+            ui.add_space(14.0);
             let Some(draft) = state.session_draft.as_mut() else {
                 return;
             };
@@ -2049,30 +2216,41 @@ impl<'a> TurnView<'a> {
                 });
             workspace_combo.response.labelled_by(workspace_label.id);
 
-            let template_label =
-                ui.label(RichText::new("Template").color(theme.text_dim).small());
+            let template_label = ui.label(
+                RichText::new("Layout preset")
+                    .color(theme.text_dim)
+                    .small(),
+            );
             let template_name = draft
                 .template_id
                 .as_ref()
                 .and_then(|id| self.templates.iter().find(|template| &template.id == id))
                 .map(|template| template.name.as_str())
                 .unwrap_or("Templates are loading…");
-            let template_combo = egui::ComboBox::from_id_salt("new-session-template")
-                .selected_text(template_name)
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    for template in self.templates {
-                        ui.selectable_value(
-                            &mut draft.template_id,
-                            Some(template.id.clone()),
-                            format!("{}  ·  {} panes", template.name, template.pane_count),
-                        );
-                    }
-                });
-            template_combo.response.labelled_by(template_label.id);
+            ui.horizontal(|ui| {
+                let combo_width = (ui.available_width() - 128.0).max(140.0);
+                let template_combo = egui::ComboBox::from_id_salt("new-session-template")
+                    .selected_text(template_name)
+                    .width(combo_width)
+                    .show_ui(ui, |ui| {
+                        for template in self.templates {
+                            ui.selectable_value(
+                                &mut draft.template_id,
+                                Some(template.id.clone()),
+                                format!("{}  ·  {} cells", template.name, template.pane_count),
+                            );
+                        }
+                    });
+                template_combo.response.labelled_by(template_label.id);
+                if ui.button("New layout…").clicked() {
+                    actions.push(ViewAction::OpenLayoutEditor(
+                        LayoutEditorOrigin::NewSession,
+                    ));
+                }
+            });
 
             let name_label = ui.label(
-                RichText::new("Task / session name")
+                RichText::new("Session name (optional)")
                     .color(theme.text_dim)
                     .small(),
             );
@@ -2080,7 +2258,7 @@ impl<'a> TurnView<'a> {
                 .add(
                     egui::TextEdit::singleline(&mut draft.name)
                         .desired_width(f32::INFINITY)
-                        .hint_text("Fix climbing bugs"),
+                        .hint_text("Turn will choose a name if left blank"),
                 )
                 .labelled_by(name_label.id);
             if draft.request_name_focus {
@@ -2107,7 +2285,7 @@ impl<'a> TurnView<'a> {
                 .and_then(|id| self.templates.iter().find(|template| &template.id == id))
             {
                 let commands = if template.commands.is_empty() {
-                    "no commands".to_string()
+                    format!("{} default shell cell(s)", template.pane_count)
                 } else {
                     template.commands.join(" · ")
                 };
@@ -2139,7 +2317,6 @@ impl<'a> TurnView<'a> {
             }
             let valid = connected
                 && !draft.submitting
-                && !draft.name.trim().is_empty()
                 && draft.template_id.is_some()
                 && self
                     .workspaces
@@ -2161,7 +2338,9 @@ impl<'a> TurnView<'a> {
                                 "Creating…"
                             } else {
                                 "Create session"
-                            }),
+                            })
+                            .fill(theme.running)
+                            .stroke(Stroke::NONE),
                         )
                         .clicked();
                 });
@@ -2177,6 +2356,304 @@ impl<'a> TurnView<'a> {
                     task: (!draft.task.trim().is_empty())
                         .then(|| draft.task.trim().to_string()),
                 });
+            }
+        });
+        actions
+    }
+
+    fn layout_editor_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                860.0_f32.min((full.width() - 32.0).max(320.0)),
+                650.0_f32.min((full.height() - 32.0).max(420.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+
+        ui.scope_builder(region(panel.shrink(20.0), "layout-editor"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_label("Layout editor");
+                node.set_modal();
+            });
+            let Some(draft) = state.layout_draft.as_mut() else {
+                return;
+            };
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Create layout preset")
+                            .size(21.0)
+                            .color(theme.text)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "Add rows or columns, choose a program per cell, drag cells to swap, and drag dividers to resize.",
+                        )
+                        .color(theme.text_dim)
+                        .small(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                    if ui
+                        .add_enabled(!draft.submitting, egui::Button::new("Back"))
+                        .clicked()
+                    {
+                        actions.push(ViewAction::CloseLayoutEditor);
+                    }
+                });
+            });
+            ui.add_space(12.0);
+
+            ui.horizontal(|ui| {
+                if ui.button("+ Column").clicked() {
+                    draft.split_selected(Direction::Horizontal);
+                }
+                if ui.button("+ Row").clicked() {
+                    draft.split_selected(Direction::Vertical);
+                }
+                if ui.button("Balance").clicked() {
+                    draft.layout.apply_preset(LayoutPreset::Balanced);
+                }
+                if ui
+                    .add_enabled(draft.layout.pane_count() > 1, egui::Button::new("Remove cell"))
+                    .clicked()
+                {
+                    draft.remove_selected();
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("{} cells", draft.layout.pane_count()))
+                        .color(theme.text_faint)
+                        .small(),
+                );
+            });
+            ui.add_space(8.0);
+
+            let canvas_height = (panel.height() * 0.42).clamp(210.0, 290.0);
+            let (canvas, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), canvas_height),
+                Sense::hover(),
+            );
+            ui.painter().rect_filled(canvas, 8.0, theme.background);
+            ui.painter().rect_stroke(
+                canvas,
+                8.0,
+                Stroke::new(1.0, theme.border),
+                egui::StrokeKind::Inside,
+            );
+            let arrangement = panes::arrange(&draft.layout, canvas.shrink(8.0));
+            for placed in &arrangement.panes {
+                let selected = draft.selected == placed.pane_id;
+                let response = ui.interact(
+                    placed.rect,
+                    ui.id().with(("layout-cell", placed.pane_id.as_str())),
+                    Sense::click_and_drag(),
+                );
+                ui.painter().rect_filled(
+                    placed.rect,
+                    6.0,
+                    if selected {
+                        theme.selection
+                    } else if response.hovered() {
+                        theme.raised
+                    } else {
+                        theme.panel
+                    },
+                );
+                ui.painter().rect_stroke(
+                    placed.rect,
+                    6.0,
+                    Stroke::new(
+                        if selected { 2.0 } else { 1.0 },
+                        if selected { theme.running } else { theme.border },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    placed.rect.center() - Vec2::new(0.0, 8.0),
+                    Align2::CENTER_CENTER,
+                    draft.cell_label(&placed.pane_id),
+                    theme.ui_font.clone(),
+                    theme.text,
+                );
+                ui.painter().text(
+                    placed.rect.center() + Vec2::new(0.0, 11.0),
+                    Align2::CENTER_CENTER,
+                    "drag to move · select to configure",
+                    FontId::new(10.0, egui::FontFamily::Proportional),
+                    theme.text_faint,
+                );
+                if response.clicked() {
+                    draft.selected = placed.pane_id.clone();
+                    draft.layout.active = Some(placed.pane_id.clone());
+                }
+                if response.drag_started() {
+                    draft.dragged_pane = Some(placed.pane_id.clone());
+                }
+            }
+
+            let released = ui.input(|input| input.pointer.any_released());
+            if released {
+                let target = ui
+                    .input(|input| input.pointer.interact_pos())
+                    .and_then(|position| arrangement.pane_at(position))
+                    .map(|pane| pane.pane_id.clone());
+                if let (Some(source), Some(target)) = (draft.dragged_pane.take(), target) {
+                    if source != target && draft.layout.swap(&source, &target) {
+                        draft.selected = source;
+                    }
+                }
+            }
+
+            for divider in &arrangement.dividers {
+                let id = ui.id().with((
+                    "layout-editor-divider",
+                    divider.before.as_str(),
+                    divider.after.as_str(),
+                ));
+                let response = ui.interact(divider.grab_rect(), id, Sense::click_and_drag());
+                let active = response.hovered() || response.dragged();
+                ui.painter().rect_filled(
+                    divider.rect,
+                    1.0,
+                    if active { theme.running } else { theme.border },
+                );
+                if active {
+                    ui.ctx().set_cursor_icon(match divider.direction {
+                        Direction::Horizontal => egui::CursorIcon::ResizeHorizontal,
+                        Direction::Vertical => egui::CursorIcon::ResizeVertical,
+                    });
+                }
+                if response.double_clicked() {
+                    draft
+                        .layout
+                        .equalize_divider(&divider.before, &divider.after);
+                } else if response.dragged() {
+                    if let Some(delta) = divider.fraction_for_drag(response.drag_delta()) {
+                        draft
+                            .layout
+                            .resize_divider(&divider.before, &divider.after, delta);
+                    }
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!(
+                    "Selected cell · {}",
+                    draft.cell_label(&draft.selected)
+                ))
+                .color(theme.text)
+                .strong(),
+            );
+            if let Some(command) = draft.cells.get_mut(&draft.selected) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Quick choice").color(theme.text_dim).small());
+                    for (label, program) in [
+                        ("Shell", ""),
+                        ("Claude", "claude"),
+                        ("Codex", "codex"),
+                        ("Gemini", "gemini"),
+                    ] {
+                        if ui.selectable_label(command.program == program, label).clicked() {
+                            command.program = program.to_string();
+                            command.arguments.clear();
+                        }
+                    }
+                });
+                ui.columns(2, |columns| {
+                    columns[0].label(
+                        RichText::new("Program (blank = workspace shell)")
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    columns[0].add(
+                        egui::TextEdit::singleline(&mut command.program)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("npm"),
+                    );
+                    columns[1].label(
+                        RichText::new("Arguments")
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    columns[1].add(
+                        egui::TextEdit::singleline(&mut command.arguments)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("run dev -- --watch"),
+                    );
+                });
+                ui.label(
+                    RichText::new(
+                        "Arguments support quotes and become argv. Turn never evaluates them as an implicit shell script.",
+                    )
+                    .color(theme.text_faint)
+                    .small(),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut draft.name)
+                        .desired_width((ui.available_width() - 150.0).max(160.0))
+                        .hint_text("Layout name"),
+                );
+                let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
+                let valid = connected && !draft.submitting && !draft.name.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        valid,
+                        egui::Button::new(if draft.submitting {
+                            "Saving…"
+                        } else {
+                            "Save layout"
+                        })
+                        .fill(theme.running)
+                        .stroke(Stroke::NONE),
+                    )
+                    .clicked()
+                {
+                    match draft.materialized_layout() {
+                        Ok(layout) => {
+                            draft.submitting = true;
+                            draft.error = None;
+                            actions.push(ViewAction::CreateLayoutTemplate {
+                                name: draft.name.trim().to_string(),
+                                layout,
+                            });
+                        }
+                        Err(error) => draft.error = Some(error),
+                    }
+                }
+            });
+            if let Some(error) = &draft.error {
+                ui.label(RichText::new(error).color(theme.failure).small());
+            } else if !matches!(self.connection, Some(ConnectionState::Connected { .. })) {
+                ui.label(
+                    RichText::new("Waiting for the Turn daemon before this layout can be saved.")
+                        .color(theme.failure)
+                        .small(),
+                );
             }
         });
         actions
@@ -3129,22 +3606,143 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    fn settings_sheet(&self, ui: &mut Ui, theme: &Theme, full: Rect) -> Vec<ViewAction> {
+    fn settings_sheet(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        _state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
-        let panel = full.shrink2(Vec2::new(full.width() * 0.2, full.height() * 0.15));
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                760.0_f32.min((full.width() - 40.0).max(320.0)),
+                560.0_f32.min((full.height() - 40.0).max(360.0)),
+            ),
+        );
         ui.painter()
             .rect_filled(full, 0.0, Color32::from_black_alpha(150));
-        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
 
-        ui.scope_builder(region(panel.shrink(14.0), "settings"), |ui| {
+        ui.scope_builder(region(panel.shrink(20.0), "settings"), |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("SETTINGS").color(theme.text).strong());
+                ui.label(
+                    RichText::new("Settings")
+                        .size(21.0)
+                        .color(theme.text)
+                        .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Close").clicked() {
                         actions.push(ViewAction::CloseOverlay);
                     }
                 });
             });
+            ui.add_space(14.0);
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new("Layout presets")
+                                    .size(17.0)
+                                    .color(theme.text)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Reusable rows, columns and commands offered when a Session is created.",
+                                )
+                                .color(theme.text_dim)
+                                .small(),
+                            );
+                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::TOP),
+                            |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new("New layout…")
+                                            .fill(theme.running)
+                                            .stroke(Stroke::NONE),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::OpenLayoutEditor(
+                                        LayoutEditorOrigin::Settings,
+                                    ));
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings-layout-presets")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for template in self.templates {
+                                egui::Frame::new()
+                                    .fill(theme.raised)
+                                    .stroke(Stroke::new(1.0, theme.border))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 9))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    RichText::new(&template.name)
+                                                        .color(theme.text)
+                                                        .strong(),
+                                                );
+                                                let command_summary = if template.commands.is_empty()
+                                                {
+                                                    format!(
+                                                        "{} default shell cell(s)",
+                                                        template.pane_count
+                                                    )
+                                                } else {
+                                                    template.commands.join(" · ")
+                                                };
+                                                ui.label(
+                                                    RichText::new(command_summary)
+                                                        .monospace()
+                                                        .color(theme.text_dim)
+                                                        .small(),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(if template.built_in {
+                                                            "Built in"
+                                                        } else {
+                                                            "Custom"
+                                                        })
+                                                        .color(theme.text_faint)
+                                                        .small(),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    });
+                                ui.add_space(6.0);
+                            }
+                        });
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Current Session attention")
+                            .color(theme.text)
+                            .strong(),
+                    );
             match &self.policy {
                 Some(policy) => {
                     // Shown, not edited here: the policy belongs to the session and the
@@ -3180,6 +3778,7 @@ impl<'a> TurnView<'a> {
                     );
                 }
             }
+            });
         });
         actions
     }
@@ -3862,13 +4461,14 @@ fn palette_row(ui: &mut Ui, theme: &Theme, row: &palette::Row, selected: bool) -
 ///
 /// The drag is turned into a fraction of the parent split, which is what `resize_pane`
 /// takes, and it is sent as it happens rather than on release: a divider that only moved
-/// when let go would feel broken.
+/// when let go would feel broken. In egui 0.35 `drag_delta()` is already the movement
+/// since the previous frame; `total_drag_delta()` is the cumulative alternative.
 fn draggable_divider(ui: &mut Ui, theme: &Theme, divider: &Divider) -> Vec<ViewAction> {
     let mut actions = Vec::new();
     let id = ui
         .id()
         .with(("divider", divider.before.as_str(), divider.after.as_str()));
-    let response = ui.interact(divider.grab_rect(), id, Sense::drag());
+    let response = ui.interact(divider.grab_rect(), id, Sense::click_and_drag());
     let hovered = response.hovered() || response.dragged();
     ui.painter().rect_filled(
         divider.rect,
@@ -3881,10 +4481,16 @@ fn draggable_divider(ui: &mut Ui, theme: &Theme, divider: &Divider) -> Vec<ViewA
             turn_core::model::Direction::Vertical => egui::CursorIcon::ResizeVertical,
         });
     }
-    if response.dragged() {
+    if response.double_clicked() {
+        actions.push(ViewAction::EqualizeDivider {
+            before: divider.before.clone(),
+            after: divider.after.clone(),
+        });
+    } else if response.dragged() {
         if let Some(fraction) = divider.fraction_for_drag(response.drag_delta()) {
             actions.push(ViewAction::ResizeDivider {
-                pane_id: divider.before.clone(),
+                before: divider.before.clone(),
+                after: divider.after.clone(),
                 fraction,
             });
         }
@@ -4312,5 +4918,45 @@ mod tests {
             state.pane(&second).selection.is_none(),
             "two panes must hold separate selections"
         );
+    }
+
+    #[test]
+    fn the_layout_editor_starts_as_two_portable_shell_columns() {
+        let draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::NewSession);
+        assert_eq!(draft.layout.pane_count(), 2);
+        assert!(draft.layout.sizes_are_normalised());
+        assert!(draft.layout.panes().iter().all(|pane| {
+            pane.kind == PaneKind::Shell && pane.command.is_none() && pane.args.is_empty()
+        }));
+        let turn_core::model::LayoutNode::Split(split) = &draft.layout.root else {
+            panic!("the starter must be a split");
+        };
+        assert_eq!(split.direction, Direction::Horizontal);
+        assert!(split
+            .children
+            .iter()
+            .all(|child| (child.size - 0.5).abs() < 0.001));
+    }
+
+    #[test]
+    fn the_layout_editor_separates_program_and_quoted_arguments_without_a_shell() {
+        let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
+        let selected = draft.selected.clone();
+        draft.cells.insert(
+            selected.clone(),
+            CellCommandDraft {
+                program: "npm".into(),
+                arguments: "run test -- --name 'wall to ceiling'".into(),
+            },
+        );
+
+        let layout = draft.materialized_layout().unwrap();
+        let pane = layout.get(&selected).unwrap();
+        assert_eq!(pane.command.as_deref(), Some("npm"));
+        assert_eq!(
+            pane.args,
+            ["run", "test", "--", "--name", "wall to ceiling"]
+        );
+        assert_ne!(pane.command.as_deref(), Some("/bin/sh"));
     }
 }

@@ -6,13 +6,54 @@ use common::*;
 use turn_core::attention::{AttentionEntry, EntryState};
 use turn_core::event::EventKind;
 use turn_core::ids::{AttentionId, CheckoutId};
-use turn_core::model::{LeaseState, PaneKind, RestoreState};
+use turn_core::model::{LeaseState, PaneKind, RestoreState, Template};
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_core::Confidence;
 use turn_proto::{ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent};
 
-/// Creates a workspace and a session from the Coding template.
-async fn seed(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionDetails {
+/// Verifies the portable shipped preset, then persists Coding as a user-owned fixture.
+async fn save_custom_coding_template(ui: &mut Client) -> turn_proto::TemplateSummary {
+    let shipped = match ui.ask(Request::ListTemplates).await {
+        Response::Templates { templates } => templates,
+        other => panic!("expected the shipped templates, got {other:?}"),
+    };
+    let built_ins: Vec<_> = shipped
+        .iter()
+        .filter(|template| template.built_in)
+        .collect();
+    assert_eq!(built_ins.len(), 1, "Turn ships one portable preset");
+    assert_eq!(built_ins[0].name, "Two Shells");
+    assert_eq!(built_ins[0].pane_count, 2);
+    assert!(
+        built_ins[0].commands.is_empty(),
+        "the shipped preset must not assume optional executables"
+    );
+
+    let mut coding = Template::coding(0);
+    coding.built_in = false;
+    let template = match ui
+        .ask(Request::CreateLayoutTemplate {
+            name: coding.name,
+            layout: Box::new(coding.layout),
+            description: coding.description,
+        })
+        .await
+    {
+        Response::Template { template } => template,
+        other => panic!("expected the custom Coding template, got {other:?}"),
+    };
+    assert!(
+        !template.built_in,
+        "test fixtures must never become built-ins"
+    );
+    template
+}
+
+/// Creates a workspace and a session from an explicit custom Coding fixture.
+async fn seed_custom_coding_session(
+    daemon: &TestDaemon,
+    ui: &mut Client,
+) -> turn_proto::SessionDetails {
     let workspace = workspace_of(
         ui.ask(Request::CreateWorkspace {
             name: "restarted".to_string(),
@@ -20,14 +61,7 @@ async fn seed(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionDetail
         })
         .await,
     );
-    let templates = match ui.ask(Request::ListTemplates).await {
-        Response::Templates { templates } => templates,
-        other => panic!("expected templates, got {other:?}"),
-    };
-    let coding = templates
-        .iter()
-        .find(|template| template.name == "Coding")
-        .expect("the Coding template");
+    let coding = save_custom_coding_template(ui).await;
     let session = session_of(
         ui.ask(Request::CreateSessionFromTemplate {
             workspace_id: workspace.id,
@@ -51,7 +85,7 @@ async fn seed(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionDetail
 async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let before = seed(&daemon, &mut ui).await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
 
     let session_id = before.summary.id.clone();
     let workspace_id = before.summary.workspace_id.clone();
@@ -523,7 +557,7 @@ async fn a_stop_before_start_tombstone_survives_a_daemon_restart() {
 async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let before = seed(&daemon, &mut ui).await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
     let session_id = before.summary.id.clone();
     drop(ui);
 
@@ -951,7 +985,7 @@ async fn a_daemon_told_not_to_persist_leaves_nothing_on_disk() {
 async fn a_session_that_had_nothing_to_lose_does_not_claim_turn_lost_something() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let working = seed(&daemon, &mut ui).await;
+    let working = seed_custom_coding_session(&daemon, &mut ui).await;
 
     // A copy, which is a session set up for another run of the same task: same shape,
     // no processes. Nothing about a restart can take anything away from it.
@@ -1011,10 +1045,10 @@ async fn a_session_that_had_nothing_to_lose_does_not_claim_turn_lost_something()
 async fn a_restart_relaunches_nothing_even_for_a_pane_that_says_it_is_safe_to() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let before = seed(&daemon, &mut ui).await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
     let session_id = before.summary.id.clone();
 
-    // The Coding template's shell pane asks to be relaunched on restore; the agent pane
+    // The custom Coding fixture's shell pane asks to be relaunched on restore; the agent pane
     // does not. Both must be left alone.
     let eager: Vec<_> = before
         .layout

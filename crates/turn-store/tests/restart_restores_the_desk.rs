@@ -18,7 +18,11 @@ const T0: i64 = 1_700_000_000_000;
 /// agent with a subagent and a test runner, an event log and a pending demand.
 fn seed(store: &Store) -> SessionId {
     store.templates().install_built_ins(T0).unwrap();
-    let coding = store.templates().find_by_name("Coding").unwrap().unwrap();
+    // A working desk may have richer user presets, but the application itself
+    // ships only the portable Two Shells starter.
+    let mut coding = Template::coding(T0);
+    coding.built_in = false;
+    store.templates().save(&coding).unwrap();
     let roots = store
         .path()
         .unwrap()
@@ -387,11 +391,17 @@ fn settings_templates_and_preferences_come_back_too() {
     );
 
     let templates = store.templates().list().unwrap();
-    assert_eq!(templates.len(), 4);
+    assert_eq!(templates.len(), 2);
     // Installing again on this launch adds nothing.
     assert_eq!(store.templates().install_built_ins(T0 + 1).unwrap(), 0);
-    assert_eq!(store.templates().count().unwrap(), 4);
-    assert!(templates.iter().all(|t| t.built_in));
+    assert_eq!(store.templates().count().unwrap(), 2);
+    assert_eq!(templates.iter().filter(|t| t.built_in).count(), 1);
+    assert!(templates
+        .iter()
+        .any(|template| template.built_in && template.name == "Two Shells"));
+    assert!(templates
+        .iter()
+        .any(|template| !template.built_in && template.name == "Coding"));
 }
 
 #[test]

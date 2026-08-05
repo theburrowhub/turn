@@ -113,7 +113,7 @@ fn created_session(gui: &GuiHarness) -> Option<SessionId> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn workspace_then_blank_session_is_selected_leased_and_restored_from_disk() {
+async fn workspace_then_two_shell_session_is_selected_leased_and_restored_from_disk() {
     let state = tempfile::tempdir().expect("an isolated daemon data directory");
     let project = state.path().join("project");
     std::fs::create_dir(&project).expect("an isolated workspace root");
@@ -154,23 +154,23 @@ async fn workspace_then_blank_session_is_selected_leased_and_restored_from_disk(
     })
     .await;
 
-    let blank = gui
+    let starter = gui
         .view()
         .templates
         .iter()
-        .find(|template| template.name == "Blank")
+        .find(|template| template.name == "Two Shells")
         .cloned()
-        .expect("turnd installs the Blank template");
+        .expect("turnd installs the portable starter template");
     assert!(
-        blank.commands.is_empty(),
-        "Blank must not hide an agent command: {:?}",
-        blank.commands
+        starter.commands.is_empty(),
+        "Two Shells must not hide an optional command: {:?}",
+        starter.commands
     );
 
     // This is the exact typed action emitted by the New Session sheet after Cmd+N.
     gui.act(ViewAction::CreateSessionFromTemplate {
         workspace_id: workspace_id.clone(),
-        template_id: blank.id,
+        template_id: starter.id,
         name: "Investigate safely".into(),
         task: Some("Prove first-run onboarding".into()),
     });
@@ -206,8 +206,11 @@ async fn workspace_then_blank_session_is_selected_leased_and_restored_from_disk(
 
     let view = gui.view();
     let layout = view.layout.expect("session details reached the Desk");
-    assert_eq!(layout.pane_count(), 1);
-    assert_eq!(layout.panes()[0].kind, PaneKind::Shell);
+    assert_eq!(layout.pane_count(), 2);
+    assert!(layout
+        .panes()
+        .iter()
+        .all(|pane| pane.kind == PaneKind::Shell));
     let hierarchy = gui.desk.hierarchy().expect("the unified tree");
     let created = hierarchy.workspaces[0]
         .sessions
@@ -216,7 +219,7 @@ async fn workspace_then_blank_session_is_selected_leased_and_restored_from_disk(
         .expect("the created Session is in its Workspace");
     assert!(
         created.nodes.iter().all(|node| !node.is_agentic),
-        "the Blank flow must never execute Claude or any other agent"
+        "the starter flow must never execute Claude or any other agent"
     );
 
     // A second daemon over the same temporary SQLite database is the persistence

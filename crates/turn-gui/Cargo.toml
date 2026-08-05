@@ -21,6 +21,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
+shell-words = { workspace = true }
 # The window must be able to tell the user something finished while they are looking
 # at another application, which is the entire product. Reaching the OS notification
 # centre needs a platform binding; everything that *decides* whether to notify lives

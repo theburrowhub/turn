@@ -10,6 +10,7 @@ use turn_core::AttentionPolicy;
 
 const COLUMNS: &str = "id, name, description, icon, layout_json, attention_json, \
      init_commands_json, name_pattern, hotkey, env_json, tmux, built_in, created_ms";
+const LEGACY_BUILT_IN_NAMES: &[&str] = &["Blank", "Coding", "PR Review", "Pair of Agents"];
 
 pub struct TemplateRepo<'a> {
     conn: &'a Connection,
@@ -88,62 +89,74 @@ impl<'a> TemplateRepo<'a> {
         }
     }
 
-    /// Writes missing built-ins and upgrades an obsolete navigation Pane in a
-    /// shipped built-in, returning how many rows changed.
+    /// Reconciles the shipped preset set and upgrades obsolete navigation Panes,
+    /// returning how many Template rows changed.
     ///
-    /// Matching is by name, not by id: `Template::built_ins` mints fresh ids on
-    /// every call, so an id comparison would install four duplicates on every
-    /// launch. Existing rows are normally left alone so user overrides survive.
-    /// `AgentTree` is the exception: the unified hierarchy makes a second
-    /// persistent navigator a product invariant violation, not a visual choice.
-    /// Only each obsolete Pane is replaced in place; ids, split geometry and
-    /// user-owned panes/policy/commands/environment remain stable.
+    /// The original four presets launched optional third-party tools, so rows
+    /// carrying those names are retired only when they are still marked built-in.
+    /// A user-owned Template with the same name is preserved. Workspace defaults
+    /// pointing at a retired row are moved to the portable starter preset.
+    ///
+    /// `AgentTree` cannot coexist with the unified hierarchy. Retained Templates
+    /// keep their identity, geometry and other Panes, but that obsolete Pane is
+    /// replaced by an ordinary Shell with no declared command.
     pub fn install_built_ins(&self, now_ms: i64) -> Result<usize> {
-        let mut installed = 0;
-        for shipped in Template::built_ins(now_ms) {
-            match self.find_by_name(&shipped.name)? {
-                None => {
-                    self.save(&shipped)?;
-                    installed += 1;
-                }
-                Some(existing)
-                    if existing.built_in
-                        && existing
-                            .layout
-                            .panes()
-                            .iter()
-                            .any(|pane| pane.kind == PaneKind::AgentTree) =>
-                {
-                    let mut upgraded = existing;
-                    let obsolete: Vec<_> = upgraded
-                        .layout
-                        .panes()
-                        .iter()
-                        .filter(|pane| pane.kind == PaneKind::AgentTree)
-                        .map(|pane| pane.id.clone())
-                        .collect();
-                    for pane_id in obsolete {
-                        let pane = upgraded
-                            .layout
-                            .get_mut(&pane_id)
-                            .expect("the Pane id came from this Layout");
-                        pane.kind = PaneKind::Tui;
-                        pane.title = Some("fang (files)".into());
-                        pane.command = Some("fang".into());
-                        pane.args.clear();
-                        pane.cwd = None;
-                        pane.env.clear();
-                        pane.node_id = None;
-                        pane.restore = turn_core::model::RestoreBehaviour::Relaunch;
-                    }
-                    upgraded.description = shipped.description;
-                    self.save(&upgraded)?;
-                    installed += 1;
-                }
-                Some(_) => {}
+        let mut changed = 0;
+
+        for mut template in self.list()? {
+            if replace_obsolete_navigation_panes(&mut template) {
+                self.save(&template)?;
+                changed += 1;
             }
         }
-        Ok(installed)
+
+        let mut starter_id = None;
+        for shipped in Template::built_ins(now_ms) {
+            match self.find_built_in_by_name(&shipped.name)? {
+                None => {
+                    self.save(&shipped)?;
+                    starter_id = Some(shipped.id.clone());
+                    changed += 1;
+                }
+                Some(existing) => starter_id = Some(existing.id),
+            }
+        }
+
+        let legacy: Vec<TemplateId> = self
+            .list()?
+            .into_iter()
+            .filter(|template| {
+                template.built_in && LEGACY_BUILT_IN_NAMES.contains(&template.name.as_str())
+            })
+            .map(|template| template.id)
+            .collect();
+        for id in &legacy {
+            if self.delete(id)? {
+                changed += 1;
+            }
+        }
+
+        if let Some(starter_id) = starter_id {
+            for retired_id in legacy {
+                self.conn.execute(
+                    "UPDATE workspaces SET default_template = ?1 WHERE default_template = ?2",
+                    params![starter_id.as_str(), retired_id.as_str()],
+                )?;
+            }
+        }
+
+        Ok(changed)
+    }
+
+    fn find_built_in_by_name(&self, name: &str) -> Result<Option<Template>> {
+        let sql =
+            format!("SELECT {COLUMNS} FROM templates WHERE name = ?1 AND built_in = 1 LIMIT 1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(from_row(row)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn delete(&self, id: &TemplateId) -> Result<bool> {
@@ -159,6 +172,31 @@ impl<'a> TemplateRepo<'a> {
             .query_row("SELECT COUNT(*) FROM templates", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+}
+
+fn replace_obsolete_navigation_panes(template: &mut Template) -> bool {
+    let obsolete: Vec<_> = template
+        .layout
+        .panes()
+        .iter()
+        .filter(|pane| pane.kind == PaneKind::AgentTree)
+        .map(|pane| pane.id.clone())
+        .collect();
+    for pane_id in &obsolete {
+        let pane = template
+            .layout
+            .get_mut(pane_id)
+            .expect("the Pane id came from this Layout");
+        pane.kind = PaneKind::Shell;
+        pane.title = Some("shell".into());
+        pane.command = None;
+        pane.args.clear();
+        pane.cwd = None;
+        pane.env.clear();
+        pane.node_id = None;
+        pane.restore = turn_core::model::RestoreBehaviour::Relaunch;
+    }
+    !obsolete.is_empty()
 }
 
 fn from_row(row: &Row<'_>) -> Result<Template> {
@@ -242,39 +280,55 @@ mod tests {
     #[test]
     fn installing_the_built_ins_twice_does_not_duplicate_them() {
         let store = testing::store();
-        assert_eq!(store.templates().install_built_ins(T0).unwrap(), 4);
+        assert_eq!(store.templates().install_built_ins(T0).unwrap(), 1);
         assert_eq!(store.templates().install_built_ins(T0 + 60_000).unwrap(), 0);
-        assert_eq!(store.templates().count().unwrap(), 4);
+        assert_eq!(store.templates().count().unwrap(), 1);
 
-        let names: Vec<String> = store
+        let templates = store.templates().list().unwrap();
+        assert_eq!(templates[0].name, "Two Shells");
+        assert!(templates[0].built_in);
+        assert!(templates[0]
+            .layout
+            .panes()
+            .iter()
+            .all(|pane| { pane.kind == PaneKind::Shell && pane.command.is_none() }));
+    }
+
+    #[test]
+    fn legacy_built_ins_are_retired_but_user_templates_with_those_names_survive() {
+        let store = testing::store();
+        for legacy in [
+            Template::blank(T0),
+            Template::coding(T0),
+            Template::pr_review(T0),
+            Template::pair_of_agents(T0),
+        ] {
+            store.templates().save(&legacy).unwrap();
+        }
+        let mut own_coding = Template::coding(T0);
+        own_coding.id = TemplateId::from_stored("tpl_user_coding");
+        own_coding.built_in = false;
+        own_coding.init_commands = vec!["nvm use".into()];
+        store.templates().save(&own_coding).unwrap();
+
+        assert_eq!(store.templates().install_built_ins(T0 + 1).unwrap(), 5);
+
+        let back = store.templates().get(&own_coding.id).unwrap().unwrap();
+        assert!(!back.built_in);
+        assert_eq!(back.init_commands, vec!["nvm use".to_string()]);
+        let built_ins: Vec<_> = store
             .templates()
             .list()
             .unwrap()
             .into_iter()
-            .map(|t| t.name)
+            .filter(|template| template.built_in)
+            .map(|template| template.name)
             .collect();
-        assert_eq!(
-            names,
-            vec!["Blank", "Coding", "PR Review", "Pair of Agents"]
-        );
+        assert_eq!(built_ins, vec!["Two Shells"]);
     }
 
     #[test]
-    fn an_edited_built_in_is_not_overwritten_by_a_later_launch() {
-        let store = testing::store();
-        store.templates().install_built_ins(T0).unwrap();
-        let mut coding = store.templates().find_by_name("Coding").unwrap().unwrap();
-        coding.init_commands = vec!["nvm use".into()];
-        store.templates().save(&coding).unwrap();
-
-        store.templates().install_built_ins(T0 + 1).unwrap();
-
-        let back = store.templates().get(&coding.id).unwrap().unwrap();
-        assert_eq!(back.init_commands, vec!["nvm use".to_string()]);
-    }
-
-    #[test]
-    fn the_legacy_coding_tree_is_replaced_without_changing_identity_or_user_settings() {
+    fn an_obsolete_tree_becomes_a_commandless_shell_without_changing_user_template_identity() {
         use turn_core::model::{Direction, Pane};
 
         let store = testing::store();
@@ -294,31 +348,52 @@ mod tests {
                 .with_command("cargo run")
                 .with_title("custom server"),
         );
-        let mut legacy = Template::from_layout("Coding", &layout, T0);
-        legacy.built_in = true;
+        let mut legacy = Template::from_layout("My layout", &layout, T0);
         legacy.init_commands = vec!["nvm use".into()];
         let original_id = legacy.id.clone();
         store.templates().save(&legacy).unwrap();
 
-        assert_eq!(store.templates().install_built_ins(T0 + 1).unwrap(), 4);
-        let coding = store.templates().find_by_name("Coding").unwrap().unwrap();
-        assert_eq!(coding.id, original_id);
-        assert_eq!(coding.created_ms, T0);
-        assert_eq!(coding.init_commands, vec!["nvm use"]);
-        assert!(coding
+        assert_eq!(store.templates().install_built_ins(T0 + 1).unwrap(), 2);
+        let restored = store.templates().get(&original_id).unwrap().unwrap();
+        assert_eq!(restored.id, original_id);
+        assert!(!restored.built_in);
+        assert_eq!(restored.created_ms, T0);
+        assert_eq!(restored.init_commands, vec!["nvm use"]);
+        assert!(restored
             .layout
             .panes()
             .iter()
             .all(|pane| pane.kind != PaneKind::AgentTree));
-        assert!(coding
+        assert!(restored
             .layout
             .panes()
             .iter()
-            .any(|pane| { pane.kind == PaneKind::Tui && pane.command.as_deref() == Some("fang") }));
-        assert!(coding.layout.panes().iter().any(|pane| {
+            .any(|pane| pane.kind == PaneKind::Shell && pane.command.is_none()));
+        assert!(restored.layout.panes().iter().any(|pane| {
             pane.kind == PaneKind::Server && pane.command.as_deref() == Some("cargo run")
         }));
         assert_eq!(store.templates().install_built_ins(T0 + 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_workspace_default_is_repointed_from_a_retired_builtin_to_two_shells() {
+        let store = testing::store();
+        let coding = Template::coding(T0);
+        store.templates().save(&coding).unwrap();
+        let mut workspace = testing::saved_workspace(&store, "turn");
+        workspace.default_template = Some(coding.id.clone());
+        store.workspaces().save(&workspace).unwrap();
+
+        store.templates().install_built_ins(T0 + 1).unwrap();
+
+        let starter = store
+            .templates()
+            .find_by_name("Two Shells")
+            .unwrap()
+            .unwrap();
+        let restored = store.workspaces().get(&workspace.id).unwrap().unwrap();
+        assert_eq!(restored.default_template, Some(starter.id));
+        assert!(store.templates().get(&coding.id).unwrap().is_none());
     }
 
     #[test]

@@ -42,6 +42,7 @@ sysinfo = "0.39"
 axum = "0.8"
 directories = "6.0"
 regex = "1.11"
+shell-words = "1.1"
 
 [profile.release]
 lto = "thin"

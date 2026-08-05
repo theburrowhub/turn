@@ -146,16 +146,26 @@ UPDATE_SNAPSHOTS=1 cargo test -p turn-gui   # re-record after an intended change
 
 1. In an empty window, click **+ Workspace** in the left hierarchy. **⌘N** is the keyboard route to the
    same first-run flow when no Workspace exists.
-2. Enter a name and an existing absolute project directory, then choose **Create and continue**. Turn
-   persists the Workspace and opens the Session form; this is not a launcher-only placeholder.
-3. Choose the Workspace and Template, name the task, optionally add a note, and choose **Create session**.
-   The new Session is selected in the hierarchy and owns the main-checkout write lease.
+2. Choose **Browse…** and select an existing project directory. Turn derives the Workspace name from the
+   folder; the name remains editable. **Create and continue** persists it and opens the Session form.
+3. Choose a Layout preset and select **Create session**. The Session name and task note are optional. A
+   fresh installation contains one portable preset, **Two Shells**, with two equal default-shell columns;
+   it never assumes Claude, Fang or any other optional executable is installed.
+
+**New layout…** in the Session form opens the visual preset editor. **+ Column** and **+ Row** split the
+selected cell, each cell has an explicit program and argv, cells can be dragged to swap them, and dividers
+can be dragged to resize them. Double-clicking a divider equalises that split. The same editor is available
+under **Settings → Layout presets**.
+
+Inside a Session, **+ Pane** adds shells or agents to the current Layout. The **Layout** menu balances or
+reflows existing panes into columns, rows, a main-left arrangement or a grid, and can save the result as a
+reusable preset. Those operations preserve the running processes.
 
 After first run, **+ Workspace** always creates another Workspace. Select a Workspace and use **+ Session**
-or **⌘N** to open the full Session form. **⌘⇧N** is **Quick New**: it creates `Session N` immediately in
-the visibly selected Workspace using that Workspace's default Template, then `Coding`, then the first
-available Template. It never silently chooses a different Workspace, and a second create is refused while
-the first is still awaiting its daemon response.
+or **⌘N** to open the full Session form. **⌘⇧N** is **Quick New**: it creates a Session immediately in
+the visibly selected Workspace using that Workspace's default Layout preset, then the first available
+preset. It never silently chooses a different Workspace, and a second create is refused while the first is
+still awaiting its daemon response.
 
 `turn` reuses a daemon already listening on its socket. When none is listening it starts `turnd` as a
 detached companion, so closing the window does not stop the daemon, its PTYs or its agents. Packaged builds

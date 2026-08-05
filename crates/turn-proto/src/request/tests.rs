@@ -478,6 +478,13 @@ pub(crate) fn all_requests() -> Vec<Request> {
             visibility: turn_core::model::PreviewVisibility::Hide,
         },
         Request::ListTemplates,
+        Request::CreateLayoutTemplate {
+            name: "Two tools".into(),
+            layout: Box::new(turn_core::model::Layout::single(
+                turn_core::model::Pane::new(PaneKind::Shell),
+            )),
+            description: Some("A reusable draft".into()),
+        },
         Request::SaveLayoutAsTemplate {
             session_id: session_id.clone(),
             name: "My shape".into(),
@@ -499,6 +506,21 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
             delta: 0.15,
+        },
+        Request::ResizeDivider {
+            session_id: session_id.clone(),
+            before: pane_id.clone(),
+            after: PaneId::from_stored("pane_req0002"),
+            delta: 0.15,
+        },
+        Request::EqualizeDivider {
+            session_id: session_id.clone(),
+            before: pane_id.clone(),
+            after: PaneId::from_stored("pane_req0002"),
+        },
+        Request::ApplyLayoutPreset {
+            session_id: session_id.clone(),
+            preset: turn_core::model::LayoutPreset::Grid,
         },
         Request::FocusPane {
             session_id: session_id.clone(),
@@ -618,7 +640,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 56 operations. This number is asserted so that adding one without
+    // 60 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 56, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 60, "the catalogue changed size: {names:?}");
 }

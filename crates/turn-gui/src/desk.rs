@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turn_core::attention::{AttentionPolicy, Effect};
-use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::ids::{NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind, PreviewVisibility};
 use turn_proto::cells::Grid;
 use turn_proto::{
@@ -69,6 +69,10 @@ pub enum Reaction {
     WorkspaceCreationFailed(String),
     SessionCreationFailed(String),
     SessionCreationCancelled,
+    TemplateCreated {
+        template_id: TemplateId,
+    },
+    TemplateCreationFailed(String),
 }
 
 /// The default geometry a pane is attached at, before it has been laid out.
@@ -307,11 +311,6 @@ impl Desk {
             .and_then(|workspace| workspace.default_template.as_ref());
         configured
             .and_then(|id| self.templates.iter().find(|template| &template.id == id))
-            .or_else(|| {
-                self.templates
-                    .iter()
-                    .find(|template| template.name == "Coding")
-            })
             .or_else(|| self.templates.first())
     }
 
@@ -395,6 +394,9 @@ impl Desk {
                             }
                             Ask::CreateSession { .. } => {
                                 reactions.push(Reaction::SessionCreationFailed(message));
+                            }
+                            Ask::CreateTemplate => {
+                                reactions.push(Reaction::TemplateCreationFailed(message));
                             }
                             _ => {}
                         }
@@ -550,6 +552,23 @@ impl Desk {
             }
             (_, Response::Templates { templates }) => {
                 self.templates = templates;
+                Vec::new()
+            }
+            (Ask::CreateTemplate, Response::Template { template }) => {
+                let template_id = template.id.clone();
+                self.templates.retain(|known| known.id != template_id);
+                self.templates.push(template);
+                self.templates.sort_by(|left, right| {
+                    right
+                        .built_in
+                        .cmp(&left.built_in)
+                        .then_with(|| left.name.cmp(&right.name))
+                });
+                vec![Reaction::TemplateCreated { template_id }]
+            }
+            (_, Response::Template { template }) => {
+                self.templates.retain(|known| known.id != template.id);
+                self.templates.push(template);
                 Vec::new()
             }
             (_, Response::Sessions { sessions }) => {
@@ -1901,10 +1920,11 @@ impl Desk {
                     return vec![Reaction::Notice(message)];
                 }
                 self.notice = None;
+                let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
                 let draft = PendingSessionDraft {
                     workspace_id: workspace_id.clone(),
                     template_id: template_id.clone(),
-                    name: Some(name.clone()),
+                    name: name.clone(),
                     cwd: None,
                     branch: None,
                     task: task.clone(),
@@ -1917,13 +1937,21 @@ impl Desk {
                     request: Request::CreateSessionFromTemplate {
                         workspace_id,
                         template_id,
-                        name: Some(name),
+                        name,
                         cwd: None,
                         branch: None,
                         task,
                     },
                 }]
             }
+            ViewAction::CreateLayoutTemplate { name, layout } => vec![Reaction::Send {
+                ask: Ask::CreateTemplate,
+                request: Request::CreateLayoutTemplate {
+                    name,
+                    layout: Box::new(layout),
+                    description: Some("Created in Turn's visual layout editor".into()),
+                },
+            }],
             ViewAction::ReleaseWorkspaceLease {
                 workspace_id,
                 lease_id,
@@ -1961,18 +1989,44 @@ impl Desk {
                     },
                 }]
             }
-            ViewAction::ResizeDivider { pane_id, fraction } => match self.selected.clone() {
+            ViewAction::ResizeDivider {
+                before,
+                after,
+                fraction,
+            } => match self.selected.clone() {
                 Some(session_id) => vec![Reaction::Send {
                     ask: Ask::Action("resizing the pane"),
-                    request: Request::ResizePane {
+                    request: Request::ResizeDivider {
                         session_id,
-                        pane_id,
+                        before,
+                        after,
                         delta: fraction,
                     },
                 }],
                 None => Vec::new(),
             },
-            ViewAction::ChooseWorkspaceDirectory | ViewAction::CloseOverlay => Vec::new(),
+            ViewAction::EqualizeDivider { before, after } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("balancing the panes"),
+                    request: Request::EqualizeDivider {
+                        session_id,
+                        before,
+                        after,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::ApplyLayoutPreset(preset) => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("rearranging the layout"),
+                    request: Request::ApplyLayoutPreset { session_id, preset },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::ChooseWorkspaceDirectory
+            | ViewAction::OpenLayoutEditor(_)
+            | ViewAction::CloseLayoutEditor
+            | ViewAction::CloseOverlay => Vec::new(),
             ViewAction::Pane { pane_id, action } => self.apply_pane_action(pane_id, action),
         }
     }
@@ -3369,6 +3423,7 @@ mod tests {
     #[test]
     fn a_dragged_divider_becomes_a_fraction_of_the_parent_split() {
         let (session, pane_id, _) = session_with_agent("Resizable");
+        let after = PaneId::from_stored("pane_resize_after");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -3378,19 +3433,22 @@ mod tests {
         );
         match sent(&desk.apply_view_action(
             ViewAction::ResizeDivider {
-                pane_id: pane_id.clone(),
+                before: pane_id.clone(),
+                after: after.clone(),
                 fraction: 0.125,
             },
             T0,
         ))
         .as_slice()
         {
-            [Request::ResizePane {
-                pane_id: named,
+            [Request::ResizeDivider {
+                before: named,
+                after: named_after,
                 delta,
                 ..
             }] => {
                 assert_eq!(named, &pane_id);
+                assert_eq!(named_after, &after);
                 assert!((delta - 0.125).abs() < f32::EPSILON);
             }
             other => panic!("got {other:?}"),
@@ -4041,15 +4099,15 @@ mod tests {
     }
 
     #[test]
-    fn quick_new_prefers_coding_over_alphabetical_blank() {
+    fn quick_new_uses_the_first_available_preset_without_a_hidden_coding_fallback() {
         let workspace = Workspace::new("turn", "/repo/turn", T0);
         let workspace_id = workspace.id.clone();
-        let blank = TemplateSummary::from_template(&Template::blank(T0));
+        let starter = TemplateSummary::from_template(&Template::two_shells(T0));
+        let starter_id = starter.id.clone();
         let coding = TemplateSummary::from_template(&Template::coding(T0));
-        let coding_id = coding.id.clone();
         let mut desk = Desk::new();
         desk.workspaces = vec![WorkspaceSummary::from_workspace(&workspace, &[])];
-        desk.templates = vec![blank, coding];
+        desk.templates = vec![starter, coding];
 
         assert!(matches!(
             sent(&desk.dispatch(Command::QuickNewSession, T0)).as_slice(),
@@ -4057,7 +4115,7 @@ mod tests {
                 workspace_id: requested_workspace,
                 template_id,
                 ..
-            }] if requested_workspace == &workspace_id && template_id == &coding_id
+            }] if requested_workspace == &workspace_id && template_id == &starter_id
         ));
     }
 

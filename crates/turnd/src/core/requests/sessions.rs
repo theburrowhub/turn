@@ -4,6 +4,7 @@ use super::workspaces::store;
 use super::{check_name, Answer};
 use crate::core::Core;
 use crate::paths;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as SystemCommand;
 use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
@@ -666,6 +667,35 @@ impl Core {
     }
 
     /// Captures a session's current arrangement as a template.
+    pub(super) fn create_layout_template(
+        &mut self,
+        name: String,
+        mut layout: Layout,
+        description: Option<String>,
+        now_ms: i64,
+    ) -> Answer {
+        let name = check_name(&name)?;
+        validate_template_layout(&layout)?;
+        if self
+            .templates
+            .values()
+            .any(|template| template.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "A layout with that name already exists",
+            ));
+        }
+        layout.normalise();
+        let mut template = Template::from_layout(name, &layout, now_ms);
+        template.description = description;
+        self.store.templates().save(&template).map_err(store)?;
+        let summary = TemplateSummary::from_template(&template);
+        self.templates.insert(template.id.clone(), template);
+        Ok(Response::Template { template: summary })
+    }
+
+    /// Captures a session's current arrangement as a template.
     pub(super) fn save_layout_as_template(
         &mut self,
         id: &SessionId,
@@ -767,7 +797,77 @@ fn instantiate_template_session(
     session.tmux = template.tmux;
     session.git_branch = git_branch;
     session.mode = mode;
+    session.note = task.map(str::to_owned);
     Ok(session)
+}
+
+fn validate_template_layout(layout: &Layout) -> Result<(), ProtoError> {
+    const MAX_PANES: usize = 16;
+    const MAX_DEPTH: usize = 8;
+    const MAX_PROGRAM_BYTES: usize = 1_024;
+    const MAX_ARGUMENTS: usize = 128;
+
+    fn visit(
+        node: &turn_core::model::LayoutNode,
+        depth: usize,
+        pane_ids: &mut HashSet<String>,
+    ) -> Result<usize, ProtoError> {
+        if depth > MAX_DEPTH {
+            return Err(ProtoError::invalid("A layout may be at most 8 splits deep"));
+        }
+        match node {
+            turn_core::model::LayoutNode::Leaf(pane) => {
+                if !pane_ids.insert(pane.id.as_str().to_string()) {
+                    return Err(ProtoError::invalid("A layout contains a duplicate Pane id"));
+                }
+                if pane
+                    .command
+                    .as_ref()
+                    .is_some_and(|program| program.trim().is_empty())
+                {
+                    return Err(ProtoError::invalid(
+                        "A Pane program must be omitted or contain an executable name",
+                    ));
+                }
+                if pane
+                    .command
+                    .as_ref()
+                    .is_some_and(|program| program.len() > MAX_PROGRAM_BYTES)
+                {
+                    return Err(ProtoError::invalid("A Pane program is too long"));
+                }
+                if pane.args.len() > MAX_ARGUMENTS {
+                    return Err(ProtoError::invalid("A Pane has too many arguments"));
+                }
+                Ok(1)
+            }
+            turn_core::model::LayoutNode::Split(split) => {
+                if split.children.len() < 2 {
+                    return Err(ProtoError::invalid(
+                        "Every layout split must contain at least two cells",
+                    ));
+                }
+                let mut panes = 0;
+                for child in &split.children {
+                    if !child.size.is_finite() || child.size < 0.0 {
+                        return Err(ProtoError::invalid(
+                            "Every layout cell size must be a finite positive fraction",
+                        ));
+                    }
+                    panes += visit(&child.node, depth + 1, pane_ids)?;
+                }
+                Ok(panes)
+            }
+        }
+    }
+
+    let panes = visit(&layout.root, 0, &mut HashSet::new())?;
+    if panes == 0 || panes > MAX_PANES {
+        return Err(ProtoError::invalid(format!(
+            "A layout must contain between 1 and {MAX_PANES} cells"
+        )));
+    }
+    Ok(())
 }
 
 fn render_template_session_name(
@@ -1063,6 +1163,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_visual_layout_draft_becomes_a_persisted_reusable_template() {
+        let mut harness = Harness::new().await;
+        let mut layout = Template::two_shells(1).layout;
+        let first = layout.panes()[0].id.clone();
+        layout.get_mut(&first).unwrap().node_id =
+            Some(turn_core::ids::NodeId::from_stored("proc_draft_must_drop"));
+
+        let summary = match harness
+            .core
+            .create_layout_template(
+                "Dev and tests".into(),
+                layout,
+                Some("Two commands".into()),
+                2,
+            )
+            .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(summary.pane_count, 2);
+        let stored = harness
+            .core
+            .store
+            .templates()
+            .get(&summary.id)
+            .unwrap()
+            .expect("persisted Template");
+        assert!(stored
+            .layout
+            .panes()
+            .iter()
+            .all(|pane| pane.node_id.is_none()));
+        let a = stored.instantiate();
+        let b = stored.instantiate();
+        assert!(
+            a.panes().iter().all(|pane| b.get(&pane.id).is_none()),
+            "each Session needs fresh Pane ids"
+        );
+    }
+
+    #[tokio::test]
     async fn archiving_a_session_advances_and_publishes_the_unified_hierarchy() {
         let mut harness = Harness::new().await;
         let root = harness._dir.path().join("session-archive-workspace");
@@ -1294,6 +1436,7 @@ mod tests {
         let session = &harness.core.sessions[&id];
         let canonical_project = std::fs::canonicalize(&project).unwrap();
         assert_eq!(session.name, "Review feat/layout: preserve everything");
+        assert_eq!(session.note.as_deref(), Some("preserve everything"));
         assert_eq!(session.mode, SessionMode::ReadOnly);
         assert_eq!(session.template_id.as_ref(), Some(&template_id));
         assert_eq!(Path::new(&session.cwd), canonical_project);

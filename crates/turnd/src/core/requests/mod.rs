@@ -240,6 +240,11 @@ impl Core {
             Request::ListTemplates => Ok(Response::Templates {
                 templates: self.template_summaries(),
             }),
+            Request::CreateLayoutTemplate {
+                name,
+                layout,
+                description,
+            } => self.create_layout_template(name, *layout, description, now_ms),
             Request::SaveLayoutAsTemplate {
                 session_id,
                 name,
@@ -264,6 +269,20 @@ impl Core {
                 pane_id,
                 delta,
             } => self.resize_pane(client, &session_id, &pane_id, delta),
+            Request::ResizeDivider {
+                session_id,
+                before,
+                after,
+                delta,
+            } => self.resize_divider(client, &session_id, &before, &after, delta),
+            Request::EqualizeDivider {
+                session_id,
+                before,
+                after,
+            } => self.equalize_divider(client, &session_id, &before, &after),
+            Request::ApplyLayoutPreset { session_id, preset } => {
+                self.apply_layout_preset(client, &session_id, preset)
+            }
             Request::FocusPane { session_id, target } => {
                 self.focus_pane(client, &session_id, target)
             }

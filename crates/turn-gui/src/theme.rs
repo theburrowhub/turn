@@ -12,7 +12,7 @@
 //! * **Exactly one thing on screen is allowed to be loud.** `YOUR TURN` is the
 //!   product's whole message; if three other things also shout, it stops working.
 
-use egui::{Color32, FontFamily, FontId, Stroke, TextStyle};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 
 /// Colours and metrics, resolved once.
 #[derive(Debug, Clone)]
@@ -73,19 +73,75 @@ impl Theme {
     pub fn install(&self, ctx: &egui::Context) {
         let theme = egui::Theme::Dark;
         let mut style = (*ctx.style_of(theme)).clone();
+        let radius = CornerRadius::same(6);
+        let input = Color32::from_rgb(0x0a, 0x0d, 0x11);
+        let inactive = Color32::from_rgb(0x17, 0x1b, 0x21);
+        let hovered = Color32::from_rgb(0x20, 0x27, 0x30);
+        let active = Color32::from_rgb(0x18, 0x22, 0x2e);
+        let open = Color32::from_rgb(0x1c, 0x21, 0x29);
+        let inactive_border = Color32::from_rgb(0x34, 0x3b, 0x46);
+        let hovered_border = Color32::from_rgb(0x4a, 0x56, 0x65);
+        let active_border = Color32::from_rgb(0x74, 0x86, 0x9c);
+        let open_border = Color32::from_rgb(0x56, 0x64, 0x77);
+
         style.visuals.dark_mode = true;
         style.visuals.panel_fill = self.background;
         style.visuals.window_fill = self.panel;
-        style.visuals.extreme_bg_color = self.background;
-        style.visuals.override_text_color = Some(self.text);
-        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.border);
-        style.visuals.widgets.inactive.bg_fill = self.raised;
-        style.visuals.widgets.hovered.bg_fill = self.selection;
+        style.visuals.window_stroke = Stroke::new(1.0, self.border);
+        style.visuals.extreme_bg_color = input;
+        style.visuals.text_edit_bg_color = Some(input);
+        style.visuals.faint_bg_color = self.raised;
+        style.visuals.code_bg_color = input;
+        // Let each interaction state own its foreground. A global override made a
+        // focused field and a disabled button read exactly like an idle control.
+        style.visuals.override_text_color = None;
+        style.visuals.weak_text_color = Some(self.text_dim);
+
+        let widgets = &mut style.visuals.widgets;
+        widgets.noninteractive.bg_fill = self.panel;
+        widgets.noninteractive.weak_bg_fill = self.panel;
+        widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.border);
+        widgets.noninteractive.fg_stroke = Stroke::new(1.0, self.text);
+        widgets.noninteractive.corner_radius = radius;
+
+        widgets.inactive.bg_fill = inactive;
+        widgets.inactive.weak_bg_fill = inactive;
+        widgets.inactive.bg_stroke = Stroke::new(1.0, inactive_border);
+        widgets.inactive.fg_stroke = Stroke::new(1.0, self.text);
+        widgets.inactive.corner_radius = radius;
+
+        widgets.hovered.bg_fill = hovered;
+        widgets.hovered.weak_bg_fill = hovered;
+        widgets.hovered.bg_stroke = Stroke::new(1.0, hovered_border);
+        widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xee, 0xf2, 0xf6));
+        widgets.hovered.corner_radius = radius;
+
+        widgets.active.bg_fill = active;
+        widgets.active.weak_bg_fill = active;
+        widgets.active.bg_stroke = Stroke::new(1.0, active_border);
+        widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        widgets.active.corner_radius = radius;
+
+        widgets.open.bg_fill = open;
+        widgets.open.weak_bg_fill = open;
+        widgets.open.bg_stroke = Stroke::new(1.0, open_border);
+        widgets.open.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe4, 0xe9, 0xef));
+        widgets.open.corner_radius = radius;
+
         style.visuals.selection.bg_fill = self.selection;
-        // Square corners: this is an instrument panel, not a card layout.
-        style.visuals.window_corner_radius = egui::CornerRadius::ZERO;
-        style.visuals.menu_corner_radius = egui::CornerRadius::ZERO;
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+        style.visuals.selection.stroke = Stroke::new(1.0, self.text);
+        style.visuals.window_corner_radius = radius;
+        style.visuals.menu_corner_radius = radius;
+
+        // macOS-sized targets without turning a dense terminal workspace into a touch UI.
+        style.spacing.interact_size = egui::vec2(44.0, 28.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.menu_margin = egui::Margin::same(8);
+        style.spacing.icon_width = 16.0;
+        style.spacing.icon_width_inner = 10.0;
+        style.spacing.icon_spacing = 6.0;
+        style.spacing.indent = 22.0;
         style.spacing.window_margin = egui::Margin::same(0);
         style
             .text_styles
@@ -190,5 +246,54 @@ mod tests {
             theme.state_marker(DisplayState::NeedsPermission).0,
             theme.state_marker(DisplayState::Failed).0
         );
+    }
+
+    #[test]
+    fn installed_controls_have_native_sized_geometry_and_a_legible_input_surface() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        theme.install(&context);
+        let style = context.style_of(egui::Theme::Dark);
+
+        assert_eq!(style.spacing.interact_size, egui::vec2(44.0, 28.0));
+        assert_eq!(style.spacing.button_padding, egui::vec2(10.0, 5.0));
+        assert_eq!(style.visuals.window_corner_radius, CornerRadius::same(6));
+        assert_eq!(style.visuals.menu_corner_radius, CornerRadius::same(6));
+        assert_eq!(
+            style.visuals.text_edit_bg_color(),
+            Color32::from_rgb(0x0a, 0x0d, 0x11)
+        );
+        assert_ne!(style.visuals.text_edit_bg_color(), theme.text);
+    }
+
+    #[test]
+    fn every_interaction_state_has_its_own_fill_and_outline() {
+        let theme = Theme::dark();
+        let context = egui::Context::default();
+        theme.install(&context);
+        let style = context.style_of(egui::Theme::Dark);
+        let widgets = &style.visuals.widgets;
+        let states = [
+            widgets.inactive,
+            widgets.hovered,
+            widgets.active,
+            widgets.open,
+        ];
+
+        for state in states {
+            assert_eq!(state.corner_radius, CornerRadius::same(6));
+        }
+        for left in 0..states.len() {
+            for right in left + 1..states.len() {
+                assert_ne!(
+                    states[left].weak_bg_fill, states[right].weak_bg_fill,
+                    "interaction states {left} and {right} share a button fill"
+                );
+                assert_ne!(
+                    states[left].bg_stroke, states[right].bg_stroke,
+                    "interaction states {left} and {right} share an outline"
+                );
+            }
+        }
     }
 }

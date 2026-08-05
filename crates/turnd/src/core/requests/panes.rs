@@ -6,7 +6,7 @@ use super::Answer;
 use crate::core::clients::Attachment;
 use crate::core::{ClientId, Core};
 use turn_core::ids::{PaneId, SessionId};
-use turn_core::model::Direction;
+use turn_core::model::{Direction, LayoutPreset};
 use turn_proto::{
     CloseDisposition, ErrorCode, FocusTarget, NewPane, PaneAttachment, PaneStream, ProtoError,
     PtySize, Response, ServerEvent,
@@ -180,6 +180,74 @@ impl Core {
         // A single-pane layout has nothing to take space from; the clamp inside
         // `resize` reports that by returning false, and it is not an error.
         session.layout.resize(pane_id, delta);
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn resize_divider(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        before: &PaneId,
+        after: &PaneId,
+        delta: f32,
+    ) -> Answer {
+        validate_resize_delta(delta)?;
+        let session = self.session_mut(session_id)?;
+        for pane in [before, after] {
+            if session.layout.get(pane).is_none() {
+                return Err(ProtoError::not_found("pane", pane.as_str()));
+            }
+        }
+        if !session.layout.resize_divider(before, after, delta) {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "Those panes do not identify one divider",
+            ));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn equalize_divider(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        before: &PaneId,
+        after: &PaneId,
+    ) -> Answer {
+        let session = self.session_mut(session_id)?;
+        for pane in [before, after] {
+            if session.layout.get(pane).is_none() {
+                return Err(ProtoError::not_found("pane", pane.as_str()));
+            }
+        }
+        if !session.layout.equalize_divider(before, after) {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "Those panes do not identify one divider",
+            ));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn apply_layout_preset(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        preset: LayoutPreset,
+    ) -> Answer {
+        let session = self.session_mut(session_id)?;
+        if !session.layout.apply_preset(preset) {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "The current panes cannot use that layout",
+            ));
+        }
         self.save_layout(session_id)?;
         self.push_layout(session_id, Some(client));
         self.answer_layout(session_id)
@@ -531,4 +599,18 @@ impl Core {
             .save_layout(session_id, &session.layout, session.last_activity_ms)
             .map_err(store)
     }
+}
+
+fn validate_resize_delta(delta: f32) -> Result<(), ProtoError> {
+    if !delta.is_finite() {
+        return Err(ProtoError::invalid(
+            "A resize delta must be a finite number",
+        ));
+    }
+    if delta.abs() > 1.0 {
+        return Err(ProtoError::invalid(
+            "A resize delta is a fraction of the split, so it cannot exceed 1",
+        ));
+    }
+    Ok(())
 }

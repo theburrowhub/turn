@@ -3959,6 +3959,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

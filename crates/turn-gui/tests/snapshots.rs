@@ -43,8 +43,9 @@ use turn_gui::terminal::PaneAction;
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRow, TemporaryPaneContent,
-    TurnView, ViewAction, ViewState, WorkspaceDraft,
+    LayoutEditorOrigin, LayoutTemplateDraft, PaneContent, PendingPermission, QueueItem,
+    SessionDraft, SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState,
+    WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -185,11 +186,11 @@ fn connected() -> ConnectionState {
 }
 
 fn workspace_without_sessions() -> Fixture {
-    let coding = Template::coding(T0);
-    let template = TemplateSummary::from_template(&coding);
+    let starter = Template::two_shells(T0);
+    let template = TemplateSummary::from_template(&starter);
     let mut workspace = Workspace::new("turn", "/Users/x/personal-workspace/turn", T0);
     workspace.id = WorkspaceId::from_stored("ws_onboarding_turn");
-    workspace.default_template = Some(coding.id.clone());
+    workspace.default_template = Some(starter.id.clone());
     let summary = WorkspaceSummary::from_workspace(&workspace, &[]);
     Fixture {
         hierarchy: Some(HierarchySnapshot {
@@ -833,17 +834,35 @@ fn cmd_n_has_a_real_session_form_with_workspace_template_and_task() {
     h.snapshot("new_session");
 }
 
-/// `Cmd+N` can beat the daemon's template response. When the choices arrive on a later
-/// frame, the sheet must apply the same Workspace default -> Coding -> first policy as
-/// an immediately populated draft, rather than silently choosing alphabetic Blank.
 #[test]
-fn templates_arriving_after_the_session_sheet_prefer_coding_over_blank() {
+fn a_layout_preset_is_created_in_the_visual_row_and_column_editor() {
+    let mut h = harness(workspace_without_sessions());
+    h.state_mut().state.layout_draft = Some(LayoutTemplateDraft::two_shells(
+        LayoutEditorOrigin::NewSession,
+    ));
+    h.run();
+    h.snapshot("layout_editor");
+}
+
+#[test]
+fn settings_exposes_layout_presets_as_a_first_class_section() {
+    let mut h = harness(workspace_without_sessions());
+    h.state_mut().state.settings_open = true;
+    h.run();
+    h.snapshot("settings_layout_presets");
+}
+
+/// `Cmd+N` can beat the daemon's template response. When the choices arrive on a later
+/// frame, the sheet must apply the same Workspace default -> first preset policy as an
+/// immediately populated draft. There is no hidden preference for a legacy Coding preset.
+#[test]
+fn templates_arriving_after_the_session_sheet_select_the_first_available_preset() {
     let mut fixture = workspace_without_sessions();
     fixture.workspaces[0].default_template = None;
-    let blank = TemplateSummary::from_template(&Template::blank(T0));
+    let starter = TemplateSummary::from_template(&Template::two_shells(T0));
     let coding = TemplateSummary::from_template(&Template::coding(T0));
-    let coding_id = coding.id.clone();
-    fixture.templates = vec![blank, coding];
+    let starter_id = starter.id.clone();
+    fixture.templates = vec![starter, coding];
     let workspace_id = fixture.workspaces[0].id.clone();
 
     let mut h = harness(fixture);
@@ -856,7 +875,7 @@ fn templates_arriving_after_the_session_sheet_prefer_coding_over_blank() {
             .session_draft
             .as_ref()
             .and_then(|draft| draft.template_id.as_ref()),
-        Some(&coding_id)
+        Some(&starter_id)
     );
 }
 
@@ -997,7 +1016,7 @@ fn session_onboarding_captures_input_and_enter_submits_without_writing_to_the_pt
     assert_eq!(
         h.query_by_role(egui::accesskit::Role::TextInput)
             .and_then(|node| node.accesskit_node().label()),
-        Some("Task / session name".into())
+        Some("Session name (optional)".into())
     );
     assert_eq!(
         h.query_by_role(egui::accesskit::Role::MultilineTextInput)
@@ -1009,7 +1028,7 @@ fn session_onboarding_captures_input_and_enter_submits_without_writing_to_the_pt
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(combo_labels.iter().any(|label| label == "Workspace"));
-    assert!(combo_labels.iter().any(|label| label == "Template"));
+    assert!(combo_labels.iter().any(|label| label == "Layout preset"));
     h.state_mut().actions.clear();
     h.event(egui::Event::Text(" safely".into()));
     h.event(egui::Event::Paste(" now".into()));

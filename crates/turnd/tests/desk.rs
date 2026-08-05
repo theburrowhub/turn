@@ -5,14 +5,56 @@ mod common;
 use common::*;
 use std::path::Path;
 use std::process::Command as SystemCommand;
-use turn_core::model::{PaneKind, RestoreBehaviour, SessionMode};
+use turn_core::model::{PaneKind, RestoreBehaviour, SessionMode, Template};
 use turn_proto::{
     CloseDisposition, ErrorCode, FocusTarget, NewPane, ProtoErrorContext, PtySize, Request,
     Response, ServerEvent,
 };
 
-/// Creates a workspace and a session from the built-in Coding template.
-async fn coding_session(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionSummary {
+/// Persists the richer Coding shape as an explicitly user-owned test fixture.
+///
+/// Turn ships only the portable Two Shells preset. Tests that exercise agents,
+/// optional TUIs or a three-Pane shape must opt into those commands instead of
+/// quietly depending on Coding being a built-in.
+async fn save_custom_coding_template(ui: &mut Client) -> turn_proto::TemplateSummary {
+    let shipped = match ui.ask(Request::ListTemplates).await {
+        Response::Templates { templates } => templates,
+        other => panic!("expected the shipped templates, got {other:?}"),
+    };
+    let built_ins: Vec<_> = shipped
+        .iter()
+        .filter(|template| template.built_in)
+        .collect();
+    assert_eq!(built_ins.len(), 1, "Turn ships one portable preset");
+    assert_eq!(built_ins[0].name, "Two Shells");
+    assert_eq!(built_ins[0].pane_count, 2);
+    assert!(
+        built_ins[0].commands.is_empty(),
+        "the shipped preset must not assume optional executables"
+    );
+
+    let mut coding = Template::coding(0);
+    coding.built_in = false;
+    let template = match ui
+        .ask(Request::CreateLayoutTemplate {
+            name: coding.name,
+            layout: Box::new(coding.layout),
+            description: coding.description,
+        })
+        .await
+    {
+        Response::Template { template } => template,
+        other => panic!("expected the custom Coding template, got {other:?}"),
+    };
+    assert!(
+        !template.built_in,
+        "test fixtures must never become built-ins"
+    );
+    template
+}
+
+/// Creates a workspace and a session from an explicit custom Coding fixture.
+async fn custom_coding_session(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionSummary {
     let workspace = workspace_of(
         ui.ask(Request::CreateWorkspace {
             name: "turn".to_string(),
@@ -20,14 +62,7 @@ async fn coding_session(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::Ses
         })
         .await,
     );
-    let templates = match ui.ask(Request::ListTemplates).await {
-        Response::Templates { templates } => templates,
-        other => panic!("expected templates, got {other:?}"),
-    };
-    let coding = templates
-        .iter()
-        .find(|template| template.name == "Coding")
-        .expect("the built-in Coding template must be installed");
+    let coding = save_custom_coding_template(ui).await;
 
     session_of(
         ui.ask(Request::CreateSessionFromTemplate {
@@ -43,10 +78,10 @@ async fn coding_session(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::Ses
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_session_from_the_coding_template_has_its_panes_and_real_processes_behind_them() {
+async fn a_session_from_a_custom_coding_template_has_real_processes_behind_its_panes() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
 
     assert_eq!(session.name, "Fix the flaky test");
     assert_eq!(
@@ -111,7 +146,7 @@ async fn a_session_from_the_coding_template_has_its_panes_and_real_processes_beh
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn template_lease_conflict_alternatives_keep_coding_authoritative_and_isolated() {
+async fn template_lease_conflict_alternatives_keep_a_custom_layout_authoritative_and_isolated() {
     let daemon = TestDaemon::start().await;
     let repository = daemon.data_dir().join("template-conflict-repository");
     std::fs::create_dir_all(repository.join("project")).unwrap();
@@ -144,13 +179,7 @@ async fn template_lease_conflict_alternatives_keep_coding_authoritative_and_isol
         })
         .await,
     );
-    let coding = match ui.ask(Request::ListTemplates).await {
-        Response::Templates { templates } => templates
-            .into_iter()
-            .find(|template| template.name == "Coding")
-            .expect("Coding is installed"),
-        other => panic!("expected templates, got {other:?}"),
-    };
+    let coding = save_custom_coding_template(&mut ui).await;
     let writer = session_of(
         ui.ask(Request::CreateSession {
             workspace_id: workspace.id.clone(),
@@ -327,7 +356,7 @@ async fn template_lease_conflict_alternatives_keep_coding_authoritative_and_isol
 async fn writing_to_an_attached_pane_produces_the_processs_output() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
 
     let details = details_of(
         ui.ask(Request::GetSession {
@@ -377,7 +406,7 @@ async fn writing_to_an_attached_pane_produces_the_processs_output() {
 async fn a_new_client_rebuilds_a_terminal_the_previous_one_was_watching() {
     let daemon = TestDaemon::start().await;
     let mut first = daemon.connect().await;
-    let session = coding_session(&daemon, &mut first).await;
+    let session = custom_coding_session(&daemon, &mut first).await;
 
     let details = details_of(
         first
@@ -448,7 +477,7 @@ async fn a_new_client_rebuilds_a_terminal_the_previous_one_was_watching() {
 async fn a_saved_layout_makes_a_second_session_of_the_same_shape_with_its_own_panes() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
 
     let original = details_of(
         ui.ask(Request::GetSession {
@@ -556,7 +585,7 @@ async fn pane_operations_answer_with_the_layout_and_tell_the_other_client() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
     let mut observer = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
 
     let first_pane = details_of(
         ui.ask(Request::GetSession {
@@ -640,7 +669,7 @@ async fn pane_operations_answer_with_the_layout_and_tell_the_other_client() {
 async fn closing_a_session_does_exactly_what_the_disposition_says() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
     let details = details_of(
         ui.ask(Request::GetSession {
             session_id: session.id.clone(),
@@ -714,7 +743,7 @@ async fn closing_a_session_does_exactly_what_the_disposition_says() {
 async fn the_daemon_refuses_the_things_it_should_and_says_why() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
-    let session = coding_session(&daemon, &mut ui).await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
     let details = details_of(
         ui.ask(Request::GetSession {
             session_id: session.id.clone(),

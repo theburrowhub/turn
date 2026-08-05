@@ -56,6 +56,22 @@ pub enum Direction {
     Vertical,
 }
 
+/// A closed set of safe rearrangements for panes that already exist.
+///
+/// Applying one changes geometry only: pane ids, process bindings and the focused
+/// pane survive. That makes these suitable for a visible Layout menu without
+/// turning a layout choice into implicit process control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutPreset {
+    /// Keep the current split tree and give siblings equal shares recursively.
+    Balanced,
+    Columns,
+    Rows,
+    MainLeft,
+    Grid,
+}
+
 /// One visual pane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
@@ -379,6 +395,108 @@ impl Layout {
             .any(|c| Self::resize_in(&mut c.node, target, delta))
     }
 
+    /// Moves one exact divider, identified by panes on its two sides.
+    ///
+    /// A divider can separate two whole subtrees rather than two direct Pane
+    /// children. Addressing it by only one Pane is therefore ambiguous: recursively
+    /// looking up that Pane may resize a nested split instead of the divider the user
+    /// actually dragged. The ordered pair disambiguates the boundary by locating the
+    /// split whose adjacent children contain `before` and `after` respectively.
+    ///
+    /// `delta` is a fraction of that split. A positive value grows the child before
+    /// the divider and shrinks the child after it. As with [`Self::resize`], both
+    /// children retain a minimum visible share.
+    pub fn resize_divider(&mut self, before: &PaneId, after: &PaneId, delta: f32) -> bool {
+        Self::resize_divider_in(&mut self.root, before, after, delta)
+    }
+
+    fn resize_divider_in(
+        node: &mut LayoutNode,
+        before: &PaneId,
+        after: &PaneId,
+        delta: f32,
+    ) -> bool {
+        const MIN_SIZE: f32 = 0.05;
+        let LayoutNode::Split(split) = node else {
+            return false;
+        };
+
+        if let Some(index) = divider_index(split, before, after) {
+            let current = split.children[index].size;
+            let other = split.children[index + 1].size;
+            let applied = delta.min(other - MIN_SIZE).max(MIN_SIZE - current);
+            split.children[index].size = current + applied;
+            split.children[index + 1].size = other - applied;
+            return true;
+        }
+
+        split
+            .children
+            .iter_mut()
+            .any(|child| Self::resize_divider_in(&mut child.node, before, after, delta))
+    }
+
+    /// Gives every child of the split containing one exact divider an equal share.
+    ///
+    /// Equalising all siblings, rather than only the two panes named by the caller,
+    /// makes a double-click predictable for a row or column with three or more panes.
+    /// Nested layouts inside those siblings retain their own proportions.
+    pub fn equalize_divider(&mut self, before: &PaneId, after: &PaneId) -> bool {
+        Self::equalize_divider_in(&mut self.root, before, after)
+    }
+
+    fn equalize_divider_in(node: &mut LayoutNode, before: &PaneId, after: &PaneId) -> bool {
+        let LayoutNode::Split(split) = node else {
+            return false;
+        };
+
+        if divider_index(split, before, after).is_some() {
+            let share = 1.0 / split.children.len() as f32;
+            for child in &mut split.children {
+                child.size = share;
+            }
+            return true;
+        }
+
+        split
+            .children
+            .iter_mut()
+            .any(|child| Self::equalize_divider_in(&mut child.node, before, after))
+    }
+
+    /// Rearranges the panes that already exist into a predictable shape.
+    ///
+    /// No Pane is created or removed and every live `node_id` is carried over.
+    /// The operation is therefore purely visual even for a Session with running
+    /// Agents. `Balanced` is the one variant that retains the current tree.
+    pub fn apply_preset(&mut self, preset: LayoutPreset) -> bool {
+        if preset == LayoutPreset::Balanced {
+            equalize_all(&mut self.root);
+            self.zoomed = None;
+            return true;
+        }
+
+        let panes: Vec<Pane> = self.panes().into_iter().cloned().collect();
+        if panes.is_empty() {
+            return false;
+        }
+        let active = self.active.clone();
+        self.root = match preset {
+            LayoutPreset::Balanced => unreachable!("handled above"),
+            LayoutPreset::Columns => split_from_panes(Direction::Horizontal, panes),
+            LayoutPreset::Rows => split_from_panes(Direction::Vertical, panes),
+            LayoutPreset::MainLeft => main_left_from_panes(panes),
+            LayoutPreset::Grid => grid_from_panes(panes),
+        };
+        self.active = active.filter(|id| self.get(id).is_some());
+        if self.active.is_none() {
+            self.active = self.panes().first().map(|pane| pane.id.clone());
+        }
+        self.zoomed = None;
+        self.normalise();
+        true
+    }
+
     /// Exchanges two panes' positions, leaving the geometry alone.
     pub fn swap(&mut self, a: &PaneId, b: &PaneId) -> bool {
         if a == b || self.get(a).is_none() || self.get(b).is_none() {
@@ -512,6 +630,93 @@ impl Layout {
             }
         }
         fix(&mut self.root);
+    }
+}
+
+fn equalize_all(node: &mut LayoutNode) {
+    if let LayoutNode::Split(split) = node {
+        let share = 1.0 / split.children.len().max(1) as f32;
+        for child in &mut split.children {
+            child.size = share;
+            equalize_all(&mut child.node);
+        }
+    }
+}
+
+fn split_from_panes(direction: Direction, panes: Vec<Pane>) -> LayoutNode {
+    if panes.len() == 1 {
+        return LayoutNode::Leaf(panes.into_iter().next().expect("one Pane"));
+    }
+    let share = 1.0 / panes.len() as f32;
+    LayoutNode::Split(Split {
+        direction,
+        children: panes
+            .into_iter()
+            .map(|pane| Child {
+                size: share,
+                node: LayoutNode::Leaf(pane),
+            })
+            .collect(),
+    })
+}
+
+fn main_left_from_panes(mut panes: Vec<Pane>) -> LayoutNode {
+    if panes.len() == 1 {
+        return LayoutNode::Leaf(panes.remove(0));
+    }
+    let main = panes.remove(0);
+    LayoutNode::Split(Split {
+        direction: Direction::Horizontal,
+        children: vec![
+            Child {
+                size: 0.62,
+                node: LayoutNode::Leaf(main),
+            },
+            Child {
+                size: 0.38,
+                node: split_from_panes(Direction::Vertical, panes),
+            },
+        ],
+    })
+}
+
+fn grid_from_panes(panes: Vec<Pane>) -> LayoutNode {
+    if panes.len() <= 2 {
+        return split_from_panes(Direction::Horizontal, panes);
+    }
+    let row_count = panes.len().div_ceil(2);
+    let share = 1.0 / row_count as f32;
+    let rows = panes
+        .chunks(2)
+        .map(|row| Child {
+            size: share,
+            node: split_from_panes(Direction::Horizontal, row.to_vec()),
+        })
+        .collect();
+    LayoutNode::Split(Split {
+        direction: Direction::Vertical,
+        children: rows,
+    })
+}
+
+/// Finds the ordered boundary between two adjacent children of one split.
+///
+/// Pane ids are unique within a Layout. Testing containment rather than requiring
+/// direct leaves is what lets an outer divider address a child that is itself a
+/// nested row or column.
+fn divider_index(split: &Split, before: &PaneId, after: &PaneId) -> Option<usize> {
+    split.children.windows(2).position(|pair| {
+        contains_pane(&pair[0].node, before) && contains_pane(&pair[1].node, after)
+    })
+}
+
+fn contains_pane(node: &LayoutNode, pane_id: &PaneId) -> bool {
+    match node {
+        LayoutNode::Leaf(pane) => &pane.id == pane_id,
+        LayoutNode::Split(split) => split
+            .children
+            .iter()
+            .any(|child| contains_pane(&child.node, pane_id)),
     }
 }
 
@@ -692,6 +897,133 @@ mod tests {
                 }
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resizing_an_outer_divider_does_not_resize_its_nested_child() {
+        let mut l = layout();
+        let upper_left = l.panes()[0].id.clone();
+        let right = Pane::new(PaneKind::Shell);
+        let right_id = right.id.clone();
+        l.split(&upper_left, Direction::Horizontal, right);
+
+        let lower_left = Pane::new(PaneKind::Logs);
+        let lower_left_id = lower_left.id.clone();
+        l.split(&upper_left, Direction::Vertical, lower_left);
+
+        assert!(l.resize_divider(&lower_left_id, &right_id, 0.15));
+        let LayoutNode::Split(root) = &l.root else {
+            panic!("expected the outer horizontal split");
+        };
+        assert!((root.children[0].size - 0.65).abs() < 0.001);
+        assert!((root.children[1].size - 0.35).abs() < 0.001);
+
+        let LayoutNode::Split(nested) = &root.children[0].node else {
+            panic!("expected the left child to remain a vertical split");
+        };
+        assert!(
+            nested
+                .children
+                .iter()
+                .all(|child| (child.size - 0.5).abs() < 0.001),
+            "moving the outer divider must not disturb its nested row"
+        );
+        assert!(l.sizes_are_normalised());
+    }
+
+    #[test]
+    fn equalizing_a_two_child_divider_restores_halves() {
+        let mut l = layout();
+        let left = l.panes()[0].id.clone();
+        let right = Pane::new(PaneKind::Shell);
+        let right_id = right.id.clone();
+        l.split(&left, Direction::Horizontal, right);
+        assert!(l.resize_divider(&left, &right_id, 0.2));
+
+        assert!(l.equalize_divider(&left, &right_id));
+        let LayoutNode::Split(split) = &l.root else {
+            panic!("expected a split");
+        };
+        assert!(split
+            .children
+            .iter()
+            .all(|child| (child.size - 0.5).abs() < 0.001));
+        assert!(l.sizes_are_normalised());
+    }
+
+    #[test]
+    fn equalizing_one_divider_gives_all_three_siblings_equal_shares() {
+        let mut l = layout();
+        let first = l.panes()[0].id.clone();
+        let second = Pane::new(PaneKind::Shell);
+        let second_id = second.id.clone();
+        l.split(&first, Direction::Horizontal, second);
+        let third = Pane::new(PaneKind::Logs);
+        let third_id = third.id.clone();
+        l.split(&second_id, Direction::Horizontal, third);
+        assert!(l.resize_divider(&first, &second_id, 0.1));
+
+        assert!(l.equalize_divider(&second_id, &third_id));
+        let LayoutNode::Split(split) = &l.root else {
+            panic!("expected one flat split");
+        };
+        assert_eq!(split.children.len(), 3);
+        assert!(split
+            .children
+            .iter()
+            .all(|child| { (child.size - 1.0 / 3.0).abs() < 0.001 }));
+        assert!(l.sizes_are_normalised());
+    }
+
+    #[test]
+    fn divider_operations_reject_non_adjacent_and_reversed_pairs_without_mutation() {
+        let mut l = layout();
+        let first = l.panes()[0].id.clone();
+        let second = Pane::new(PaneKind::Shell);
+        let second_id = second.id.clone();
+        l.split(&first, Direction::Horizontal, second);
+        let third = Pane::new(PaneKind::Logs);
+        let third_id = third.id.clone();
+        l.split(&second_id, Direction::Horizontal, third);
+        let before = l.clone();
+
+        assert!(!l.resize_divider(&first, &third_id, 0.1));
+        assert!(!l.equalize_divider(&second_id, &first));
+        assert_eq!(l, before);
+    }
+
+    #[test]
+    fn layout_presets_rearrange_only_geometry_and_preserve_live_panes() {
+        let mut l = layout();
+        let first = l.panes()[0].id.clone();
+        l.get_mut(&first).unwrap().node_id = Some(NodeId::from_stored("proc_layout_main"));
+        l.split(&first, Direction::Horizontal, Pane::new(PaneKind::Shell));
+        let second = l.active.clone().unwrap();
+        l.split(&second, Direction::Vertical, Pane::new(PaneKind::Logs));
+        let before: Vec<_> = l
+            .panes()
+            .into_iter()
+            .map(|pane| (pane.id.clone(), pane.node_id.clone()))
+            .collect();
+
+        for preset in [
+            LayoutPreset::Columns,
+            LayoutPreset::Rows,
+            LayoutPreset::MainLeft,
+            LayoutPreset::Grid,
+            LayoutPreset::Balanced,
+        ] {
+            assert!(l.apply_preset(preset));
+            let after: Vec<_> = l
+                .panes()
+                .into_iter()
+                .map(|pane| (pane.id.clone(), pane.node_id.clone()))
+                .collect();
+            assert_eq!(after, before, "{preset:?} changed Pane or Process identity");
+            assert_eq!(l.pane_count(), 3);
+            assert!(l.sizes_are_normalised());
+            assert_eq!(l.zoomed, None);
         }
     }
 

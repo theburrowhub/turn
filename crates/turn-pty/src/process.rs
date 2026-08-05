@@ -425,6 +425,17 @@ fn build_command(spec: &ProcessSpec, node_id: &NodeId) -> CommandBuilder {
     if !spec.env.iter().any(|(k, _)| k == "TERM") {
         builder.env("TERM", "xterm-256color");
     }
+    if !spec.env.iter().any(|(k, _)| k == "COLORTERM") {
+        builder.env("COLORTERM", "truecolor");
+    }
+    // `turnd` may itself have been started from a shell or supervisor that exports
+    // NO_COLOR. That is a preference for the launcher, not for every interactive
+    // terminal it goes on to create: forwarding it makes otherwise capable CLIs render
+    // monochrome despite the real pty and TERM above. A Pane/profile can still opt out
+    // explicitly by putting NO_COLOR in ProcessSpec::env.
+    if !spec.env.iter().any(|(k, _)| k == "NO_COLOR") {
+        builder.env_remove("NO_COLOR");
+    }
     // Marks the process as ours, so the supervisor can attribute strays and
     // adapters can tell they are running under Turn.
     builder.env("TURN_NODE_ID", node_id.as_str());
@@ -700,6 +711,46 @@ mod tests {
                 .map(|s| s.text().contains("[injected][xterm-256color]"))
                 .unwrap_or(false)
         });
+    }
+
+    #[test]
+    fn interactive_terminal_defaults_enable_true_colour() {
+        let process = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("printf '[%s][%s][%s]\\n' \"${NO_COLOR-unset}\" \"$TERM\" \"$COLORTERM\""),
+        );
+        wait_until("the terminal colour defaults to be reported", || {
+            process
+                .snapshot()
+                .map(|snapshot| {
+                    snapshot
+                        .text()
+                        .contains("[unset][xterm-256color][truecolor]")
+                })
+                .unwrap_or(false)
+        });
+    }
+
+    #[test]
+    fn explicit_terminal_colour_environment_overrides_are_respected() {
+        let process = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("printf '[%s][%s][%s]\\n' \"$NO_COLOR\" \"$TERM\" \"$COLORTERM\"")
+                .env("NO_COLOR", "1")
+                .env("TERM", "screen-256color")
+                .env("COLORTERM", "24bit"),
+        );
+        wait_until(
+            "the explicit terminal colour environment to be reported",
+            || {
+                process
+                    .snapshot()
+                    .map(|snapshot| snapshot.text().contains("[1][screen-256color][24bit]"))
+                    .unwrap_or(false)
+            },
+        );
     }
 
     #[test]

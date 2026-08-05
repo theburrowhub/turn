@@ -77,6 +77,7 @@ pub enum Ask {
     CreateSession {
         workspace_id: WorkspaceId,
     },
+    CreateTemplate,
     Attach {
         session_id: SessionId,
         pane_id: PaneId,
@@ -110,6 +111,7 @@ impl Ask {
             Ask::NodePane => "opening a node as a pane",
             Ask::CreateWorkspace { .. } => "creating a workspace",
             Ask::CreateSession { .. } => "creating a session",
+            Ask::CreateTemplate => "saving the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",

@@ -65,7 +65,7 @@ impl Core {
                 if migrate_obsolete_navigation_panes(&mut session) {
                     // The old central AgentTree cannot coexist with the unified
                     // sidebar. Persist the structural migration immediately, but
-                    // never materialise Fang during restore.
+                    // never materialise the replacement Shell during restore.
                     self.store.sessions().save(&session)?;
                 }
                 self.sessions.insert(session.id.clone(), session);
@@ -346,9 +346,9 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
             .layout
             .get_mut(pane_id)
             .expect("the Pane id came from this Layout");
-        pane.kind = PaneKind::Tui;
-        pane.title = Some("fang (files)".into());
-        pane.command = Some("fang".into());
+        pane.kind = PaneKind::Shell;
+        pane.title = Some("shell".into());
+        pane.command = None;
         pane.args.clear();
         pane.cwd = None;
         pane.env.clear();
@@ -408,6 +408,11 @@ mod migration_tests {
             .panes()
             .iter()
             .all(|pane| pane.kind != PaneKind::AgentTree));
+        assert!(session
+            .layout
+            .panes()
+            .iter()
+            .any(|pane| pane.kind == PaneKind::Shell && pane.command.is_none()));
         assert!(!migrate_obsolete_navigation_panes(&mut session));
     }
 

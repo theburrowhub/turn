@@ -24,7 +24,9 @@ use turn_core::attention::UserContext;
 use turn_core::ids::{
     AttentionId, CheckoutId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
-use turn_core::model::{Direction, PaneKind, PreviewVisibility, RestoreBehaviour};
+use turn_core::model::{
+    Direction, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
+};
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
@@ -354,6 +356,14 @@ pub enum Request {
 
     // ----------------------------------------------------------------- templates
     ListTemplates,
+    /// Creates a reusable layout before any Session exists. The daemon strips
+    /// runtime bindings, validates the bounded tree and stores its own Template.
+    CreateLayoutTemplate {
+        name: String,
+        layout: Box<Layout>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
     /// Captures a session's current pane arrangement as a reusable template.
     /// Process bindings are stripped; a template describes what to start.
     SaveLayoutAsTemplate {
@@ -383,6 +393,25 @@ pub enum Request {
         session_id: SessionId,
         pane_id: PaneId,
         delta: f32,
+    },
+    /// Moves one exact divider. Both adjacent Pane ids are required because a
+    /// divider may separate nested subtrees rather than direct leaf siblings.
+    ResizeDivider {
+        session_id: SessionId,
+        before: PaneId,
+        after: PaneId,
+        delta: f32,
+    },
+    /// Double-click behaviour: equal shares for the split owning this divider.
+    EqualizeDivider {
+        session_id: SessionId,
+        before: PaneId,
+        after: PaneId,
+    },
+    /// Applies a closed, geometry-only shape to the existing Panes.
+    ApplyLayoutPreset {
+        session_id: SessionId,
+        preset: LayoutPreset,
     },
     FocusPane {
         session_id: SessionId,
@@ -604,10 +633,14 @@ impl Request {
             Request::GetPreviewHistory { .. } => "get_preview_history",
             Request::SetPreviewVisibility { .. } => "set_preview_visibility",
             Request::ListTemplates => "list_templates",
+            Request::CreateLayoutTemplate { .. } => "create_layout_template",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
             Request::SplitPane { .. } => "split_pane",
             Request::ClosePane { .. } => "close_pane",
             Request::ResizePane { .. } => "resize_pane",
+            Request::ResizeDivider { .. } => "resize_divider",
+            Request::EqualizeDivider { .. } => "equalize_divider",
+            Request::ApplyLayoutPreset { .. } => "apply_layout_preset",
             Request::FocusPane { .. } => "focus_pane",
             Request::SwapPanes { .. } => "swap_panes",
             Request::ZoomPane { .. } => "zoom_pane",
@@ -672,7 +705,9 @@ impl Request {
             Request::SetPreviewVisibility { .. } => "ack",
 
             Request::ListTemplates => "templates",
-            Request::SaveLayoutAsTemplate { .. } => "template",
+            Request::CreateLayoutTemplate { .. } | Request::SaveLayoutAsTemplate { .. } => {
+                "template"
+            }
 
             // Every pane operation answers with the layout it produced, so the UI
             // re-renders from the daemon's version rather than its own optimistic
@@ -680,6 +715,9 @@ impl Request {
             Request::SplitPane { .. }
             | Request::ClosePane { .. }
             | Request::ResizePane { .. }
+            | Request::ResizeDivider { .. }
+            | Request::EqualizeDivider { .. }
+            | Request::ApplyLayoutPreset { .. }
             | Request::FocusPane { .. }
             | Request::SwapPanes { .. }
             | Request::ZoomPane { .. } => "layout",
@@ -754,6 +792,9 @@ impl Request {
             | Request::SplitPane { session_id, .. }
             | Request::ClosePane { session_id, .. }
             | Request::ResizePane { session_id, .. }
+            | Request::ResizeDivider { session_id, .. }
+            | Request::EqualizeDivider { session_id, .. }
+            | Request::ApplyLayoutPreset { session_id, .. }
             | Request::FocusPane { session_id, .. }
             | Request::SwapPanes { session_id, .. }
             | Request::ZoomPane { session_id, .. }

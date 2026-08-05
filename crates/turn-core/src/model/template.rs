@@ -63,12 +63,32 @@ impl Template {
 
     /// The built-in set the app ships with.
     pub fn built_ins(now_ms: i64) -> Vec<Template> {
-        vec![
-            Self::blank(now_ms),
-            Self::coding(now_ms),
-            Self::pr_review(now_ms),
-            Self::pair_of_agents(now_ms),
-        ]
+        vec![Self::two_shells(now_ms)]
+    }
+
+    /// The safe first-run preset: two equal shells and no optional executable.
+    ///
+    /// An empty command is deliberate. Materialisation resolves each Shell Pane
+    /// through the Workspace default, then `$SHELL`, then `/bin/sh`, so a fresh
+    /// install never assumes Claude, Codex, Fang or another third-party tool is
+    /// present.
+    pub fn two_shells(now_ms: i64) -> Template {
+        let left = Pane::new(PaneKind::Shell)
+            .with_title("shell 1")
+            .with_restore(crate::model::layout::RestoreBehaviour::Relaunch);
+        let right = Pane::new(PaneKind::Shell)
+            .with_title("shell 2")
+            .with_restore(crate::model::layout::RestoreBehaviour::Relaunch);
+
+        let mut layout = Layout::single(left);
+        let left_id = layout.panes()[0].id.clone();
+        layout.split(&left_id, Direction::Horizontal, right);
+        layout.active = Some(left_id);
+
+        let mut template = Self::from_layout("Two Shells", &layout, now_ms);
+        template.built_in = true;
+        template.description = Some("Two equal shells side by side.".into());
+        template
     }
 
     /// One shell. The escape hatch when no template fits.
@@ -190,10 +210,7 @@ mod tests {
     fn the_built_in_set_is_present_and_valid() {
         let templates = Template::built_ins(0);
         let names: Vec<_> = templates.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["Blank", "Coding", "PR Review", "Pair of Agents"]
-        );
+        assert_eq!(names, vec!["Two Shells"]);
         for t in &templates {
             assert!(t.built_in);
             assert!(
@@ -202,6 +219,29 @@ mod tests {
                 t.name
             );
             assert!(t.layout.pane_count() >= 1);
+        }
+    }
+
+    #[test]
+    fn the_first_run_preset_is_two_equal_portable_shells() {
+        let template = Template::two_shells(0);
+        assert_eq!(template.layout.pane_count(), 2);
+        assert!(template.layout.panes().iter().all(|pane| {
+            pane.kind == PaneKind::Shell
+                && pane.command.is_none()
+                && pane.restore == crate::model::layout::RestoreBehaviour::Relaunch
+        }));
+
+        match &template.layout.root {
+            LayoutNode::Split(split) => {
+                assert_eq!(split.direction, Direction::Horizontal);
+                assert_eq!(split.children.len(), 2);
+                assert!(split
+                    .children
+                    .iter()
+                    .all(|child| (child.size - 0.5).abs() < f32::EPSILON));
+            }
+            other => panic!("expected two side-by-side shells, got {other:?}"),
         }
     }
 

@@ -496,10 +496,13 @@ remain the explicit blank/shell path.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `list_templates` | — | `templates` |
+| `create_layout_template` | `name`, `layout`, `description?` | `template` |
 | `save_layout_as_template` | `session_id`, `name`, `description?`, `hotkey?` | `template` |
 
-Saving strips process bindings: a template describes what to start, never which
-instance it was captured from.
+Both creation paths strip process bindings: a template describes what to start, never which
+instance it was captured from. `create_layout_template` is the visual editor path. Its bounded
+Layout is validated and normalised by the daemon before persistence; the client-side Pane ids are
+draft identity only, and every Session instantiation mints a fresh set.
 
 ### Panes
 
@@ -508,6 +511,9 @@ instance it was captured from.
 | `split_pane` | `session_id`, `pane_id`, `direction`, `pane` | `layout` |
 | `close_pane` | `session_id`, `pane_id`, `disposition` | `layout` |
 | `resize_pane` | `session_id`, `pane_id`, `delta` | `layout` |
+| `resize_divider` | `session_id`, `before`, `after`, `delta` | `layout` |
+| `equalize_divider` | `session_id`, `before`, `after` | `layout` |
+| `apply_layout_preset` | `session_id`, `preset` | `layout` |
 | `focus_pane` | `session_id`, `target` | `layout` |
 | `swap_panes` | `session_id`, `a`, `b` | `layout` |
 | `zoom_pane` | `session_id`, `pane_id` — **toggles** | `layout` |
@@ -530,6 +536,11 @@ dispositions apply only where process-control rules allow them, and an Agent req
 - `target`: `{"kind":"pane","pane_id":…}` \| `{"kind":"next"}` \| `{"kind":"previous"}`
 - `delta`: fraction of the parent split, positive to grow. Clamped so no pane can
   be resized out of existence.
+- `resize_divider` supersedes the ambiguous leaf-only resize for interactive dividers. The ordered
+  `before`/`after` pair identifies the exact boundary even when it separates nested subtrees.
+- `equalize_divider` is the double-click operation and gives every sibling in that split an equal
+  share. `preset` is one of `balanced`, `columns`, `rows`, `main_left`, `grid`; presets preserve Pane
+  and Process identity and change geometry only.
 - `zoom_pane` leaves the layout tree untouched, so un-zooming restores the exact
   previous geometry.
 - `pane` (a `NewPane`): `kind` plus optional `title`, `command`, `args`, `cwd`,
