@@ -2,15 +2,13 @@
 
 **Run agents in parallel. Step in when it's your turn.**
 
-Status of this document: it describes the product Turn is being built to be, and it distinguishes
-throughout between what exists in the repository today and what does not. Every claim marked as met is
-backed by a named test that runs and passes in this workspace, in one of the six library crates. The
-daemon (`turnd`) is being written concurrently; nothing in this document treats its behaviour as verified,
-and no acceptance item is checked on the strength of a test in it. Treat the test counts in §7 as a
-snapshot and reproduce them per crate rather than trusting them:
+Status of this document: it describes the accepted product and distinguishes automated evidence from
+manual release acceptance. Every claim marked as met is backed by a named test in this workspace,
+including daemon and native-GUI integration suites. Counts are deliberately not frozen in prose; reproduce
+the current evidence rather than trusting an old survey:
 
 ```sh
-for c in turn-core turn-pty turn-agents turn-proto turn-store turn-hook; do cargo test -p $c; done
+cargo test --workspace --all-targets -- --test-threads=1
 ```
 
 See `ROADMAP.md` for sequencing and `ARCHITECTURE.md` for how the pieces fit — its §0 holds the
@@ -171,8 +169,9 @@ background and does not mutate Layout, selection, focus or Attention.
 
 The tree may show a compact Activity Preview so background work is legible without rendering every
 terminal. A preview is normalised, provenance-labelled, redacted and bounded status — never transcript,
-scrollback or restored conversational memory. A recovered preview is visibly stale until fresh activity
-arrives. Opening Quick Preview changes no Layout or process state.
+scrollback or restored conversational memory. A recovered preview retains its original timestamp; the
+distinct recovered/stale visual marker is still open and must not be claimed as delivered. Opening Quick
+Preview changes no Layout or process state.
 
 ---
 
@@ -220,9 +219,10 @@ fill in the branch, and Session duplication that copies the shape without the pr
    three in priority order.
 4. **Understand a failure inside a big tree.** A Session with an Agent, two subagents, a dev server
    and a test runner reads as failed because one child failed, and the tree says which.
-5. **Come back after closing the window.** Reattach to Sessions whose processes are still alive; be
-   told honestly about the ones that are not, and be offered — never forced — a relaunch.
-   *(Not yet implemented; see §6 and §7.)*
+5. **Come back after closing the window.** A replacement UI reattaches to the same live daemon without
+   disturbing its processes. After a daemon restart, durable state returns but runtimes are reported
+   `Orphaned`/`Lost` and relaunch is only offered. Proven PTY reattachment across daemon death remains
+   unimplemented; see §6 and §7.
 
 ---
 
@@ -232,9 +232,10 @@ The MVP is a desktop application that does the following, on macOS and Linux, wi
 requirement rather than an aspiration.
 
 **Terminal and process substrate**
-- Real ptys per Pane. Interactive programs, full-screen TUIs (`vim`, `lazygit`, `btop`), correct
-  resize, correct working directory and environment.
-- Bounded buffers per Pane: a raw byte ring for replay and a parsed vt100 screen for snapshots.
+- Real ptys per PTY-backed runtime node, with zero-to-many Panes as views. Interactive programs,
+  full-screen TUIs (`vim`, `lazygit`, `btop`), correct resize, working directory and environment.
+- Bounded buffers per PTY-backed runtime: a raw byte ring for replay and a parsed vt100 screen for
+  rendering and stable-preview extraction.
 - Backpressure that degrades cleanly: a slow consumer is told it lost data and resynchronises from a
   replay rather than growing an unbounded queue.
 - Process supervision: discovery of what the processes Turn started went on to start, scanned on
@@ -300,30 +301,11 @@ the first release.
 
 ## 7. MVP acceptance criteria
 
-Checked items are demonstrated by named tests that **run and pass** in this workspace. Counts observed
-during this survey, per crate:
-
-| Crate | Tests | Note |
-| --- | --- | --- |
-| `turn-core` | 116 | |
-| `turn-proto` | 127 | |
-| `turn-store` | 119 | |
-| `turn-pty` | 46 | grew from 38 during the survey |
-| `turn-hook` | 15 | |
-| `turn-agents` | 110 | when last green; mid-refactor and not compiling at the final check |
-
-The five settled crates total **423 passing, re-verified together**. `turn-agents` is being refactored as
-this is read, so its 110 is the last figure observed rather than a current one. Every `turn-agents` test
-cited below was passing when checked; if one is failing when you read this, that crate is mid-edit, and the
-crate — not this list — is the thing to look at.
-
-These counts exclude `turnd` entirely. The daemon has 71 test functions written and is being written now;
-**no item below is checked on the basis of any of them.** An item that depends on the daemon is unchecked
-here even where daemon code for it exists, because "written" and "demonstrated" are different claims and
-this checklist only makes the second one.
-
-Reproduce the counts per crate rather than trusting them (see the command at the head of this document).
-Unchecked items say what is missing, not when it will arrive.
+Checked items are demonstrated by named unit, integration, protocol or native snapshot tests that **run and
+pass** in this workspace. The automated Reviewer vertical crosses the production daemon, store, protocol,
+GUI state and real loopback Claude hook transport; it does not claim an authenticated external CLI or a
+signed application bundle was exercised. Reproduce the current suite with the command at the head of this
+document. Unchecked items say what evidence or implementation is still missing, not when it will arrive.
 
 ### Terminal substrate
 
@@ -534,29 +516,46 @@ Unchecked items say what is missing, not when it will arrive.
 - [x] **A Session's aggregate state is the most severe, not the most recent.** One failure among nine
   healthy processes reads as failed: `node::tests::the_aggregate_state_is_the_most_severe_not_the_
   most_recent`.
-- [ ] **One revisioned hierarchy snapshot contains Workspace → Session → Agent/Tool → Child in draw
+- [x] **One revisioned hierarchy snapshot contains Workspace → Session → Agent/Tool → Child in draw
   order.** The GUI bootstraps from it rather than joining independent Workspace, Session and process lists.
-- [ ] **A reported subagent appears with its true declared name and no Pane binding.** Discovery does not
+  `a_full_snapshot_round_trips_checkout_name_relationship_preview_and_binding_facts`,
+  `a_delayed_full_hierarchy_snapshot_cannot_rewind_navigation`.
+- [x] **A reported subagent appears with its true declared name and no Pane binding.** Discovery does not
   change Layout, selection, pane focus, OS focus or the Attention Queue.
-- [ ] **Relationship kind and relationship confidence survive persistence and protocol separately from
+  `reviewer_is_a_named_background_child_and_never_opens_a_pane`,
+  `the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart`.
+- [x] **Relationship kind and relationship confidence survive persistence and protocol separately from
   event confidence.** A process-table edge remains visibly provisional even when the observation event is
-  explicit.
-- [ ] **Tree selection, active Session, focused Pane and pending Attention are independent.** Expansion and
+  explicit. `hierarchy_rows_project_preview_bindings_and_runtime_capability_without_coupling_lifetimes`,
+  `an_inferred_permission_and_an_inferred_relationship_are_drawn_as_guesses`.
+- [x] **Tree selection, active Session, focused Pane and pending Attention are independent.** Expansion and
   selection restore per stable UI surface and one window never adopts another window's selection.
-- [ ] **Quick Preview and a temporary Pane are explicit view actions.** Closing either leaves the Agent
-  alive; a node without a PTY opens Preview/Process Details rather than a fake terminal.
+  `tree_selection_is_private_to_a_surface`,
+  `selection_expansion_and_focus_are_different_typed_actions`.
+- [x] **Quick Preview and a temporary Pane are explicit view actions.** Closing either leaves the Agent
+  alive; a node without a PTY opens Preview/Process Details rather than a fake terminal. Temporary
+  bindings belong to one live UI surface and expire on replacement/disconnect/restart without changing
+  the saved Layout or another surface.
+  `quick_preview_is_semantic_and_does_not_replace_the_layout`,
+  `a_temporary_reviewer_pane_is_visually_distinct_from_the_saved_layout`.
 
 ### Checkout safety
 
-- [ ] **Creating a `main_checkout` Session stores its assignment and acquires the exclusive lease in one
+- [x] **Creating a `main_checkout` Session stores its assignment and acquires the exclusive lease in one
   atomic transaction before any init command, process or Pane is materialised.** Failure rolls back the
-  Session and performs no external side effect.
-- [ ] **A conflicting writer returns structured data naming the owner and the allowed alternatives:** focus
+  Session and performs no external side effect. `creating_a_main_session_and_lease_is_atomic_on_conflict`,
+  `a_second_main_checkout_session_is_rejected_before_any_runtime_state_exists`.
+- [x] **A conflicting writer returns structured data naming the owner and the allowed alternatives:** focus
   owner, read-only, isolated worktree or cancel. No client parses a human error string to construct them.
-- [ ] **A heartbeat timeout never steals a lease.** Restart reconciliation verifies the owner/processes or
+  `a_write_conflict_carries_owner_and_alternatives_as_typed_context`,
+  `a_write_lease_conflict_offers_only_explicit_safe_alternatives`.
+- [x] **A heartbeat timeout never steals a lease.** Restart reconciliation verifies the owner/processes or
   asks the user; closing the UI, archiving a live Session or `keep_processes` does not release ownership.
-- [ ] **Read-only truth is visible.** Turn distinguishes enforced read-only from unenforced legacy metadata;
-  agent instructions alone never count as enforcement.
+  `daemon_restart_fences_every_unreleased_lease_without_forging_a_heartbeat`,
+  `a_recovery_lease_cannot_authorise_add_pane_or_relaunch`.
+- [x] **Read-only truth is visible.** Turn distinguishes enforced read-only from unenforced legacy metadata;
+  agent instructions alone never count as enforcement. `read_only_creation_uses_the_primary_without_claiming_its_lease`,
+  `a_read_only_alternative_never_launches_without_a_technical_guard`.
 
 ### Layouts and Templates
 
@@ -573,6 +572,12 @@ Unchecked items say what is missing, not when it will arrive.
   `layout::tests::a_hand_edited_layout_with_bad_sizes_is_normalised_on_load`.
 - [x] **The four built-in Templates are present and structurally valid.**
   `template::tests::the_built_in_set_is_present_and_valid`.
+- [x] **Choosing a safe alternative after a Template lease conflict preserves the complete Template.**
+  The client retains only Template id/name/cwd/branch/task intent; the daemon authoritatively reapplies
+  Layout, commands, env, Attention, tmux and naming. An unenforced read-only alternative launches nothing;
+  a worktree remaps absolute
+  cwd values into the isolated checkout without modifying the primary tree.
+  `template_lease_conflict_alternatives_keep_coding_authoritative_and_isolated`.
 
 ### Security
 
@@ -595,14 +600,24 @@ Unchecked items say what is missing, not when it will arrive.
   `buffer::tests::a_title_cannot_reverse_its_own_rendering_with_a_direction_override`,
   `a_title_cannot_smuggle_invisible_tag_characters_into_a_label`. The same rule holds for screen content
   the UI renders: `screen_rows_never_carry_invisible_or_direction_changing_characters`.
+- [x] **Every hierarchy label is safe at the daemon boundary, even when an adapter or OS source is not.**
+  Workspace, Session and Template names reject C0/C1/ANSI/bidi/zero-width input rather than silently
+  rewriting identity. Discovered Agent and process metadata is sanitised and bounded before reducer, push,
+  inspector and SQLite; argv is capped by argument count, per-argument length and aggregate length.
+  `navigation_names_reject_adversarial_text_instead_of_rewriting_it`,
+  `an_agent_declaration_is_safe_and_bounded_in_event_tree_and_inspector` and
+  `enormous_hostile_supervisor_argv_is_only_projected_as_bounded_safe_text`.
 - [x] **One enormous line cannot grow the screen model without bound.** It is bounded by the terminal
   geometry: `buffer::tests::one_enormous_line_is_bounded_by_the_terminal_geometry`.
-- [ ] **Activity Preview cannot become a transcript or secret side channel.** ANSI, control sequences,
+- [x] **Activity Preview cannot become a transcript or secret side channel.** ANSI, control sequences,
   bidi controls and unstable prompt/spinner text are removed; known secrets are redacted before SQLite;
   raw PTY bytes and raw hook payloads never enter preview storage; retention is capped at 20 per node and
-  2,000 globally.
-- [ ] **Checkout identity resists path aliases.** Lease arbitration uses canonical filesystem identity,
+  2,000 globally. `redacts_credentials_before_the_preview_can_reach_disk_or_ui`,
+  `an_unredacted_sensitive_preview_never_reaches_navigation` and the on-disk secret suite.
+- [x] **Checkout identity resists path aliases.** Lease arbitration uses canonical filesystem identity,
   rejects cross-Workspace/checkpoint mismatches, and reports worktree resources that remain shared.
+  `lease_ownership_rejects_cross_workspace_session_and_checkout_ids`,
+  `a_second_workspace_alias_is_refused_before_it_can_mint_a_checkout`.
 
 ### Persistence
 
@@ -628,19 +643,26 @@ Unchecked items say what is missing, not when it will arrive.
   `turn_store::tests::a_database_from_a_newer_build_is_refused_at_open_time`.
 - [x] **A long-running install prunes its history without losing the recent past.**
   `restart_restores_the_desk::a_long_running_install_prunes_its_history_without_losing_the_recent_past`.
-- [x] **No secret value is present anywhere in the files on disk** — asserted by writing real SQLite files
-  and searching them, not by unit-testing the redactor.
+- [x] **No recognisable secret in current durable free text reaches SQLite or its WAL** — every repository
+  redacts Workspace, Session, Layout/Pane, Template, process/Agent, Attention, Preview, settings and event
+  fields before rows are built; filesystem fencing identities are rejected rather than rewritten. This is
+  asserted by writing and scanning real files, not by unit-testing the redactor.
   `secrets_never_reach_the_disk::no_secret_value_is_present_anywhere_in_the_files_on_disk`,
   `a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes`,
   `a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent`.
 - [x] **A restored Pane is never given a scrollback the Agent no longer remembers.** Only process metadata
   is persisted — pid, command, cwd, lifecycle, relation, exit code, external id — never the pty, the
   terminal grid or the parser state. `repo::node::tests` (12 tests).
-- [ ] **Migration 003 grants no write lease.** It creates primary checkout assignments, imports compatible
+- [x] **Migration 003 grants no write lease.** It creates primary checkout assignments, imports compatible
   legacy pane bindings and marks ambiguous Workspaces for reconciliation. It launches, kills and moves no
   process and never claims a legacy Session is technically read-only merely by changing metadata.
-- [ ] **Restoration preserves hierarchy edges, names, previews, bindings and per-surface expansion without
-  opening a new Pane.** A persisted preview is labelled stale until replaced.
+  `v3_orphaned_worktree_claims_become_honest_primary_readers`, migration and legacy-reconciliation suites.
+- [x] **Durable restoration preserves hierarchy edges, names, previews and permanent bindings without
+  opening a new Pane; a replacement UI also recovers its per-surface expansion against the live daemon.**
+  A persisted preview keeps its original timestamp; a distinct recovered/stale visual marker is still an
+  acceptance gate and is not claimed complete. A daemon restart restores metadata, not a live PTY.
+  `the_reviewer_vertical_survives_a_ui_restart_without_changing_layout` and
+  `the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart`.
 
 ### The daemon↔UI boundary
 
@@ -672,66 +694,30 @@ Unchecked items say what is missing, not when it will arrive.
   type definition. `request::tests`.
 - [x] **A subagent appearing pushes a tree the client can draw without guessing.**
   `conversation::a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing`.
-- [ ] **Protocol v3 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
+- [x] **Protocol v3 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
   revision triggers full resync; the client never applies a hierarchy diff to stale state.
-- [ ] **Lease conflicts are typed.** The wire payload carries owner Workspace/Session/checkout and recovery
-  choices independently from the human-readable message.
-- [ ] **Preview and pane-binding pushes are coalesced current state, not append-only `TurnEvent`s.** Tree
+  `a_delayed_full_hierarchy_snapshot_cannot_rewind_navigation` and protocol conversation tests.
+- [x] **Lease conflicts are typed.** The wire payload carries owner Workspace/Session/checkout and recovery
+  choices independently from the human-readable message. `a_write_conflict_carries_owner_and_alternatives_as_typed_context`.
+- [x] **Preview and pane-binding pushes are coalesced current state, not append-only `TurnEvent`s.** Tree
   expansion and selection are scoped requests/acks, not broadcast domain events.
+  `tree_selection_is_private_to_a_surface` and hierarchy push/coalescing tests.
 
-### Not demonstrated
+### Manual and release acceptance still pending
 
-Two different things appear below, and the distinction is the point. Some items have **no code at all**.
-Others have code on every side of the boundary and tests that pass on each side separately, which is not the
-same as demonstrated: the pieces have never been run together against a real agent, so nothing in this
-section may be checked off. Each item says which case it is.
+The deterministic vertical is demonstrated; these are deliberately narrower claims that automated tests
+do not settle:
 
-- [ ] **Anything runs end to end.** *Code exists, unverified.* `turnd` is no longer a stub: `main.rs`
-  parses options and starts a daemon, and the crate carries 71 test functions. Whether a Session actually
-  runs an Agent end to end has not been observed here, and the exit criterion in `ROADMAP.md` M5 — a
-  scripted client creating a Session whose hook POST changes what the client is told — remains unmet as far
-  as this document can attest.
-- [ ] **Process and pty facts become events.** *Code exists, unverified.* `turn-pty` still constructs no
-  `TurnEvent`s, by design. The conversion now lives in `turnd`: `core/spawn.rs` and `core/events/exit.rs`
-  build `process.started` / `process.exited` / `process.failed`, and `core/supervise.rs` builds
-  `process.spawned_child`. The join of a supervisor observation, a pty exit and a hook payload into one
-  `SessionTree` is `core/events/mod.rs`. **This remains the riskiest code in the system** — see
-  `ROADMAP.md` §Risks 4 — and its adversarial cases (out-of-order arrival, a hook for a dead node, a reused
-  pid) are exactly what has not been shown to work.
-- [ ] **Attention effects reach a user.** *Daemon side exists; client side regressed.* `turnd` owns an
-  `AttentionManager` and forwards `Effect`s over the protocol. **The client side regressed:** all four
-  channels — badge, highlight in words as well as colour, sound, OS notification — were built and tested in
-  the frontend that has since been deleted (ADR-039), and none of them exists in `turn-gui` yet. The daemon's
-  half is unchanged and still tested; the perceptible half has to be written again. What has not happened,
-  and is now further away, is a real notification arriving from a real agent on a real desktop.
-- [ ] **`UserContext` is real.** *Daemon side exists; client side regressed.* `turnd` holds a `UserContext`
-  and accepts `update_user_activity`. The reporter that fed it — every keystroke, every window focus change,
-  every open modal, with the burst coalescing tested — was in the deleted frontend and does not exist in
-  `turn-gui`. Until it does, `is_typing()` is always false in a running system, which makes the focus
-  governor's typing guard inert. That is the most consequential single thing lost with the old client, and it
-  is not optional polish: ADR-039's carry-over list names it.
-- [ ] **The heuristic layer is actually driven.** *Code exists, unverified.* `turnd` constructs an
-  `OutputHeuristic` for panes selected at `IntegrationLevel::Heuristic` and calls `observe` against a
-  snapshot. Whether a `PtyHeuristic` event has ever been produced by a running system is not established
-  here.
-- [ ] **Re-attaching to a live process.** *Code exists, unverified, and incomplete by its own admission.*
-  `turn-store` still produces `Lifecycle::Orphaned` on restore. `turnd/src/core/restore.rs` assigns
-  `Lifecycle::Lost` where a pid cannot be found and reads `RestoreBehaviour` when deciding what may be
-  offered, so neither is dead code any more. Its own module documentation records that
-  `Lifecycle::Reconnected` is deliberately never produced there. Pid-reuse defence is still an open
-  decision (`ROADMAP.md` Open decision 5).
-- [ ] **The window shows a real agent.** *Started over.* The first window — a Tauri shell around a
-  TypeScript/`xterm.js` frontend — was built with sidebar, draggable dividers, attention queue, agent tree,
-  event log, overview, palette, keymap sheet and permission banner, and was **rejected by the product owner
-  on sight and deleted** (ADR-039). What exists now is `crates/turn-gui`: a native `eframe`/`egui` window on
-  `wgpu` that paints the status bar, the permission banner, the session sidebar, a terminal pane cell by cell
-  and the attention queue, verified by 11 unit tests and 2 snapshot tests rendered through `wgpu` with no
-  display. That flat sidebar/permanent queue is an incompatible spike, not the accepted ADR-040 navigation
-  model. It has no daemon connection, so it has never shown any agent, real or otherwise.
-- [ ] **tmux-backed Sessions.** *No code.* Flags and node kinds exist; nothing reads them. Deliberate
-  (see §6).
-- [x] **Clean `cargo fmt --check` and clippy.** Both pass across the workspace as of 2026-08-04:
-  `cargo fmt --all -- --check` reports no diff and `cargo clippy --workspace --all-targets -- -D warnings`
-  is silent. The 30 unformatted files and four clippy findings this list used to name are fixed, as is one
-  further clippy finding that appeared in `turn-gui` while the old frontend was being retired. Details in
-  `ROADMAP.md` §Technical debt.
+- [ ] **Authenticated Claude Code in the packaged native app.** Complete Workspace creation, leased main
+  Session, PTY interaction, named Reviewer spawn, Quick Preview, temporary Pane, close-without-stop and UI
+  restart using the currently installed external binary and a real user account.
+- [ ] **Successful live-process reattachment after daemon death.** UI restart over a still-running daemon is
+  covered. A PTY master cannot survive its owning daemon today, and `Lifecycle::Reconnected` is not forged.
+- [ ] **Manual desktop acceptance.** Verify sound and OS notification delivery, VoiceOver/Orca, terminal
+  IME/dead keys, clipboard and alternate-screen TUIs on packaged macOS/Linux builds.
+- [ ] **Measured performance envelope.** Record CPU, memory, output latency and preview cadence with 30
+  Sessions and more than 100 relevant processes; budgets remain targets until measured.
+- [ ] **tmux-backed Sessions.** Flags and node kinds exist; no backend exists in the MVP. This is deliberate
+  optional persistence work, not a substitute for Turn's hierarchy.
+- [x] **Clean format and lint gates.** Reproduce with `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings`; the audit report records the observed run.

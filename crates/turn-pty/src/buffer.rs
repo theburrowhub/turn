@@ -6,8 +6,8 @@
 //!   a pane is re-attached. Bytes, not text, because escape sequences carry the
 //!   colours, cursor position and alternate-screen state.
 //! * A **parsed screen** ([`vt100`]) so the daemon can answer "what does this
-//!   look like right now" without a UI attached. Thumbnails of sessions nobody
-//!   has open, and the output heuristics, both depend on this.
+//!   look like right now" without a UI attached. Attached cell renderers,
+//!   on-demand previews and output heuristics all depend on this.
 //!
 //! Both are bounded. An unbounded scrollback is a memory leak with a nice name.
 
@@ -44,12 +44,12 @@ impl ScreenSize {
     }
 }
 
-/// A point-in-time view of a terminal, cheap enough to send to the UI for
-/// thumbnails and small enough not to matter if it is dropped.
+/// A point-in-time view of a terminal, cheap enough for an on-demand preview and
+/// small enough not to matter if it is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenSnapshot {
     /// Visible rows, top to bottom, trailing blanks trimmed, and filtered through
-    /// [`is_display_safe`] so a row cannot misrepresent itself in a thumbnail.
+    /// [`is_display_safe`] so a row cannot misrepresent itself in product chrome.
     pub lines: Vec<String>,
     pub cursor: (u16, u16),
     pub size: ScreenSize,
@@ -62,7 +62,7 @@ pub struct ScreenSnapshot {
 }
 
 impl ScreenSnapshot {
-    /// The last `n` non-empty lines, which is what a thumbnail actually shows.
+    /// The last `n` non-empty lines, used by bounded previews and heuristics.
     pub fn tail(&self, n: usize) -> Vec<String> {
         let non_empty: Vec<&String> = self.lines.iter().filter(|l| !l.trim().is_empty()).collect();
         non_empty
@@ -243,7 +243,7 @@ impl TerminalBuffer {
     ///
     /// Exposed for the one caller that needs more than [`Self::snapshot`] gives: the
     /// daemon builds the cell grid a client renders, which needs every cell's colours
-    /// and attributes rather than the trimmed text a thumbnail wants. Borrowed rather
+    /// and attributes rather than the trimmed text a preview wants. Borrowed rather
     /// than converted here on purpose — this crate knows nothing about the protocol's
     /// grid types, and the conversion lives with them
     /// (`turn_proto::cells::from_screen`) so the daemon and the client cannot end up
@@ -264,7 +264,7 @@ impl TerminalBuffer {
         self.bytes.len()
     }
 
-    /// A snapshot for thumbnails, heuristics and the store.
+    /// A snapshot for on-demand previews and heuristics.
     pub fn snapshot(&self) -> ScreenSnapshot {
         let screen = self.parser.screen();
         let lines: Vec<String> = screen
@@ -446,7 +446,7 @@ fn sanitise_title(raw: &str) -> Option<String> {
 
 /// A rendered screen row, with anything that could misrepresent it removed.
 ///
-/// Screen rows are process output too. They reach the UI as thumbnails and tree
+/// Screen rows are process output too. They can reach product chrome through
 /// previews, so they get the same treatment as a title — the parser has already
 /// consumed the escape sequences, but nothing stops a program printing a bidi
 /// override or a run of tag characters as ordinary text.
@@ -546,7 +546,7 @@ mod tests {
         );
     }
 
-    /// A thumbnail wants trimmed text; a rendered pane wants every cell's colours.
+    /// A preview wants trimmed text; a rendered pane wants every cell's colours.
     /// Both come off the same parsed screen, which is what stops the daemon from
     /// needing a second terminal emulator to answer the second question.
     #[test]
@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn thumbnails_show_the_last_meaningful_lines() {
+    fn snapshot_tail_returns_the_last_meaningful_lines() {
         let mut buffer = TerminalBuffer::new(ScreenSize::new(10, 30));
         buffer.write(b"first\r\nsecond\r\nthird\r\n\r\n\r\n");
 
@@ -755,8 +755,8 @@ mod tests {
         assert_eq!(buffer.snapshot().lines.len(), 24);
     }
 
-    /// Screen rows reach the UI as thumbnails, so they get the same treatment as
-    /// a title: an agent cannot print a direction override and have the preview
+    /// Screen rows can reach product chrome through previews, so they get the same
+    /// treatment as a title: an agent cannot print a direction override and have the preview
     /// render its output backwards.
     #[test]
     fn screen_rows_never_carry_invisible_or_direction_changing_characters() {

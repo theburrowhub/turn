@@ -1,15 +1,16 @@
 # The Turn daemon protocol
 
-Normative contract for `turn-proto` version **3**. Implementation is in progress; version 2 is historical
-context for the retained terminal-cell transport, not a supported navigation mode.
+Normative contract for the implemented `turn-proto` version **3**. Version 2 is historical context for the
+retained terminal-cell transport, not a supported navigation mode. Operations explicitly labelled planned
+below are product commitments, not wire operations in this build.
 
 This is the contract between `turnd` — which owns every pty, all state and the
 attention manager — and a UI client, which renders and forwards keystrokes.
 
 Fields shown without an ellipsis are normative. Examples containing `…` deliberately omit unrelated view
-fields. The implementation source of truth is `crates/turn-proto/src/`; catalogue and conversation tests
-must fail if operation names, request-to-response pairing, protocol version or revision semantics drift from
-this contract.
+fields. The exact wire source of truth is `crates/turn-proto/src/`; catalogue and conversation tests guard
+operation names, request-to-response pairing and protocol version. Revision semantics and the prose contract
+also have integration/audit coverage, but no test can prove that prose is current merely by existing.
 
 ---
 
@@ -71,6 +72,12 @@ Specifics:
 - `pane_screen` and `pane_output` pushes for one pane arrive in `seq` order. A gap
   means an update was lost: for cells the recovery is `resync_pane`, for bytes it is
   admitted by `pane_output_gap` and recovered by re-attaching (§8.2).
+- No runtime-event push or Attention effect is emitted until the daemon has committed
+  the event's Session → event-log → Attention checkpoint. A failed checkpoint is
+  retried behind a FIFO barrier. Before dispatching any request the daemon retries the
+  oldest checkpoint; while it remains blocked the response is `unavailable`. Reads
+  therefore cannot observe its partial projections and rejected writes cannot be
+  persisted accidentally by a later retry.
 - Nothing else is ordered relative to anything else.
 
 ---
@@ -86,7 +93,7 @@ A pane can be carried two ways, and the client chooses at `attach_pane` with
 | `bytes` | The escape stream: `replay` on attach, `pane_output` frames after | Anything that needs the stream itself — capturing a log, a client with its own VT emulator. |
 
 **Cells are the default because the daemon has already parsed the screen.** It has to:
-thumbnails and the output heuristics work with no client attached, so a `vt100` screen
+on-demand previews and the output heuristics work with no client attached, so a `vt100` screen
 per pane exists whether or not anybody is looking. Sending that screen means there is
 exactly one terminal emulator in the system, which removes the whole class of bug where
 the daemon's idea of a pane and the client's disagree — and it means a client does not
@@ -175,7 +182,7 @@ can hold a grapheme cluster, and it is paid only for panes somebody is actually 
 ### 2.3 What is *not* sanitised
 
 Screen cells are the terminal's own contents, passed through as the program wrote them.
-That is the opposite of the rule for **labels** — a pane title or a thumbnail line is
+That is the opposite of the rule for **labels** — a pane title or Activity Preview line is
 stripped of control, bidirectional and invisible characters, because those end up in
 Turn's chrome where text could lie about itself. Inside a pane the client paints cell by
 cell, so no cell can reorder its neighbours, and filtering would mean a terminal that
@@ -228,8 +235,8 @@ lease conflict choices, assume one Pane per node, and never resynchronise the un
 
 Version 3 adds:
 
-- `get_hierarchy` and `HierarchySnapshot { revision, surface_id, tree_state, workspaces }` as the only
-  navigation bootstrap;
+- `get_hierarchy` and `HierarchySnapshot { revision, tree_state, workspaces }` as the only navigation
+  bootstrap; the stable `surface_id` lives inside `tree_state`;
 - per-surface `set_tree_expanded` and `select_tree_node`, which are acknowledged but not broadcast;
 - closed `SessionMode` values `main_checkout`, `read_only`, `isolated_worktree` and checkout/lease operations;
 - typed `workspace_write_lease_conflict` and `stale_lease_generation` error context;
@@ -351,7 +358,14 @@ shown to the user verbatim and is never parsed. `detail` is for logs.
   "code":"conflict","message":"The primary checkout already has a writer",
   "context":{"kind":"workspace_write_lease_conflict",
     "workspace_id":"ws_9f2a1c","checkout_id":"checkout_a4c9",
-    "owner_session_id":"sess_owner","lease_id":"lease_72ce","generation":4,
+    "requesting_session_id":"sess_requester",
+    "lease":{"id":"lease_72ce","workspace_id":"ws_9f2a1c",
+      "session_id":"sess_owner","checkout_id":"checkout_a4c9",
+      "mode":"exclusive_write","state":"active","acquired_ms":1700000000000,
+      "heartbeat_ms":1700000004000,"released_ms":null,"generation":4},
+    "owner":{"session_id":"sess_owner","session_name":"Fix climbing bugs",
+      "mode":"main_checkout","cwd":"/repo","branch":"fix/climbing",
+      "last_activity_ms":1700000004000},
     "alternatives":["focus_owner","create_read_only","create_isolated_worktree","cancel"]}}}
 ```
 
@@ -377,7 +391,7 @@ kind matters.
 | --- | --- | --- |
 | `get_hierarchy` | `surface_id`, `include_archived?` | `hierarchy` |
 | `set_tree_expanded` | `surface_id`, `key: HierarchyKey`, `expanded` | `tree_state` |
-| `select_tree_node` | `surface_id`, `key: HierarchyKey?` | `tree_state` |
+| `select_tree_node` | `surface_id`, `selected: HierarchyKey?` | `tree_state` |
 | `get_preview_history` | `session_id`, `node_id`, `limit?` (clamped to 20) | `preview_history` |
 | `set_preview_visibility` | `session_id`, `node_id`, `visibility` | `ack` |
 | `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `node_pane` |
@@ -390,6 +404,12 @@ revision gap or daemon identity change, request a full snapshot.
 
 Expansion/selection writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active
 Session or Pane focus, and do not produce a broadcast. There is deliberately no unconstrained `move_node`.
+
+`surface_id` is immutable for one connected client. The first `get_hierarchy` on a replacement connection
+claims that surface, retires any older connection's surface ownership and removes its temporary Pane before
+the snapshot is built. Permanent Layout bindings and tree expansion/selection remain. Temporary bindings
+are also removed when their last client disconnects and when the daemon restarts; they are ephemeral view
+state, not restorable process state.
 
 `rename_node`, audited `correct_relationship` and tree visibility/filter mutations are accepted product
 APIs but are **not protocol-v3 operations in this build**. A client must not send those operation names or
@@ -417,7 +437,7 @@ highlights as current.
 | `close_workspace` | `workspace_id`, `disposition` | `ack` |
 | `get_workspace_write_lease` | `workspace_id` | `workspace_write_lease` |
 | `acquire_workspace_write_lease` | `workspace_id`, `session_id`, `checkout_id` | `workspace_write_lease` |
-| `release_workspace_write_lease` | `lease_id`, `expected_generation` | `workspace_write_lease` |
+| `release_workspace_write_lease` | `workspace_id`, `lease_id`, `expected_generation` | `workspace_write_lease` |
 
 `archive_*` takes a flag rather than existing as two operations, so undo is the
 same code path as do.
@@ -427,10 +447,12 @@ same code path as do.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `list_sessions` | `workspace_id?` (absent = all), `include_archived?` | `sessions` |
-| `create_session` | `workspace_id`, `name`, `mode`, `checkout_id?`, `cwd?`, `panes?`, `note?`, `tags?` | `session` |
-| `create_session_from_template` | `workspace_id`, `template_id`, `mode`, `checkout_id?`, `name?`, `cwd?`, `branch?`, `task?` | `session` |
-| `create_read_only_session` | `workspace_id`, `name`, `checkout_id?`, `template_id?` | `session` |
-| `create_worktree_session` | `workspace_id`, `name`, `branch`, `template_id?` | `session` |
+| `create_session` | `workspace_id`, `name`, `cwd?`, `panes?`, `note?`, `tags?` | `session` |
+| `create_session_from_template` | `workspace_id`, `template_id`, `name?`, `cwd?`, `branch?`, `task?` | `session` |
+| `create_read_only_session` | `workspace_id`, `name`, `cwd?`, `panes?`, `note?`, `tags?` | `session` |
+| `create_read_only_session_from_template` | `workspace_id`, `template_id`, `name?`, `cwd?`, `branch?`, `task?` | `session` |
+| `create_worktree_session` | `workspace_id`, `name`, `branch`, `worktree_path?`, `panes?`, `note?`, `tags?` | `session` |
+| `create_worktree_session_from_template` | `workspace_id`, `template_id`, `name?`, `cwd?`, `template_branch?`, `task?`, `branch`, `worktree_path?` | `session` |
 | `rename_session` | `session_id`, `name` | `session` |
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
@@ -441,11 +463,22 @@ same code path as do.
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
 
-Creating `main_checkout` persists the Session assignment and acquires the lease in one atomic store
+`create_session` and `create_session_from_template` always request the primary checkout; callers cannot
+smuggle a generic mode or checkout through either shape. Creating `main_checkout` persists the Session
+assignment and acquires the lease in one atomic store
 transaction, before init commands, processes or Panes exist. A conflict rolls the transaction back, returns
 the typed context in §5 and leaves no partial Session. Duplicate never inherits an active lease; it must
 choose/reconcile a mode. Read-only replies include `read_only_enforced`, because metadata and agent guidance
 are not enforcement. Worktree replies include the new checkout and declared shared resources.
+
+When the failed request was `create_session_from_template`, the client retains only its original Template
+identity and interpolation inputs, then uses the matching `*_from_template` alternative. The daemon reloads
+the authoritative Template and applies the same Layout, commands, relative cwd, environment, Attention,
+tmux and name-pattern rules inside the selected safe checkout. A read-only alternative preserves that
+configuration but launches no process while enforcement is unavailable; a worktree alternative remaps
+absolute primary-checkout Session/Pane cwd values to the same repository-relative location in the isolated
+checkout. Clients must not reconstruct a Template from `TemplateSummary`. The non-Template alternatives
+remain the explicit blank/shell path.
 
 ### Templates
 
@@ -471,9 +504,10 @@ instance it was captured from.
 | `resync_pane` | `session_id`, `pane_id` | `screen` |
 | `detach_pane` | `session_id`, `pane_id` | `ack` |
 
-Every pane operation answers with the resulting `layout` rather than an ack, so
+Every Layout-mutating pane operation above answers with the resulting `layout` rather than an ack, so
 the UI renders the daemon's arrangement instead of its own optimistic guess at what
-a split, a collapse or a clamped resize did.
+a split, a collapse or a clamped resize did. Attach/detach and process-control operations acknowledge or
+return their own runtime result without pretending they changed Layout.
 
 Pane identity and runtime identity are many-to-one through `PaneNodeBinding`: one Pane binds at most one
 node, one node may have zero or many Panes. `ProcessNode.pane_id` is not a v3 authority. Opening a semantic
@@ -567,8 +601,11 @@ A muted session still badges. Muting silences the interruption, not the evidence
 This is `turn_core::attention::UserContext`, sent as itself. It is what the focus
 governor needs to decide whether it may move the user.
 
-- Send on a **change**, not on a timer. The interesting transitions are the first
-  keystroke of a burst, the window losing focus, and a modal opening.
+- Send state transitions immediately: the first keystroke of a burst, window focus,
+  active Session and sensitive-operation changes. During a continuing burst, coalesce
+  a bounded heartbeat carrying the latest timestamp before `TYPING_GRACE_MS` can
+  expire at the daemon. Do not send one request per character, and do not send idle
+  periodic traffic.
 - The daemon derives "is typing" from `last_keystroke_ms` rather than trusting a
   boolean a client might forget to clear.
 - Set `sensitive_operation` while something must not be interrupted: a permission
@@ -633,6 +670,9 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `ack` | — |
 | `workspaces` | `workspaces: [WorkspaceSummary]` |
 | `workspace` | `workspace: WorkspaceSummary` |
+| `hierarchy` | `snapshot: HierarchySnapshot` |
+| `tree_state` | `state: TreeSurfaceState` |
+| `workspace_write_lease` | `workspace_id`, `lease?: WorkspaceWriteLease` |
 | `sessions` | `sessions: [SessionSummary]` |
 | `session` | `session: SessionSummary` |
 | `session_details` | `details: SessionDetails` |
@@ -643,13 +683,12 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `screen` | `session_id`, `pane_id`, `node_id?`, `next_seq`, `grid: Grid` |
 | `tree` | `session_id`, `nodes: [TreeNodeView]` |
 | `node` | `node: TreeNodeView` |
+| `node_pane` | `pane: NodePaneView` |
+| `pane_focus` | `focus?: PaneFocusView` |
 | `attention` | `entry?: AttentionView` — absent when the queue is empty |
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
-| `hierarchy` | `snapshot: HierarchySnapshot` |
 | `preview_history` | `session_id`, `node_id`, `entries: [ActivityPreview]` (newest first) |
-| `pane_binding` | `binding: PaneBindingView`, `capability` |
-| `workspace_write_lease` | `workspace_id`, `lease?: WorkspaceWriteLeaseView` |
 
 ```jsonc
 {"v":3,"type":"response","id":"r-3","response":{"result":"ack"}}
@@ -745,10 +784,11 @@ request id because no request caused them.
 | `turn_event_emitted` | `turn_event: TurnEvent` |
 | `attention_effect` | `effect: Effect` |
 | `attention_queue_changed` | `entries: [AttentionView]` |
+| `tree_changed` | `session_id`, `nodes: [TreeNodeView]` |
 | `hierarchy_changed` | `snapshot: HierarchySnapshot` — full replacement with monotonic revision |
-| `activity_preview_changed` | `session_id`, `node_id`, `preview?: ActivityPreview` |
-| `pane_bindings_changed` | `session_id`, `node_id`, `bindings: [PaneBindingView]` |
-| `workspace_write_lease_changed` | `workspace_id`, `lease?: WorkspaceWriteLeaseView` |
+| `activity_preview_changed` | `hierarchy_revision`, `session_id`, `node_id`, `preview?: ActivityPreview` |
+| `pane_bindings_changed` | `hierarchy_revision`, `session_id`, `node_id`, `bindings: [PaneNodeBinding]` |
+| `workspace_write_lease_changed` | `hierarchy_revision`, `workspace_id`, `lease?: WorkspaceWriteLease` |
 | `layout_changed` | `session_id`, `layout` |
 | `pty_resized` | `session_id`, `node_id`, `size` |
 | `restore_result` | `session_id`, `state`, `needs_explanation`, `panes` |
@@ -901,7 +941,7 @@ supervisor sweep) rather than being filled in with a fabricated cause.
 
 ```jsonc
 {"v":3,"type":"event","event":{"event":"hierarchy_changed","snapshot":{
-  "revision":18,"surface_id":"main-window","tree_state":{"selected":null,"expanded":[]},
+  "revision":18,"tree_state":{"surface_id":"main-window","selected":null,"expanded":[]},
   "workspaces":[{"workspace":{"id":"ws_9f2a1c","name":"turn",
       "lease_reconciliation_required":false},"sessions":[{"session":{
       "id":"sess_4b71e0","name":"Fix restore","mode":"main_checkout"},"nodes":[
@@ -938,8 +978,8 @@ never recomputes it.
   "session_id":"sess_4b71e0","state":"partially_restored","needs_explanation":true,
   "panes":[
     {"pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
-     "lifecycle":{"kind":"reconnected"},"can_relaunch":false},
-    {"pane_id":"pane_66ba04","lifecycle":{"kind":"lost"},
+     "lifecycle":{"kind":"orphaned"},"can_relaunch":false},
+    {"pane_id":"pane_66ba04","node_id":"proc_910bc2","lifecycle":{"kind":"lost"},
      "can_relaunch":true,"command":"cargo watch -x test"}]}}
 ```
 
@@ -950,12 +990,14 @@ anything yet.
 - `state`: `live` \| `reattached` \| `partially_restored` \| `layout_only`
 - `needs_explanation` is true when the user must be told, rather than left to
   notice a dead pane.
-- `lifecycle`: `reconnected` (the pty survived and Turn owns it again), `orphaned`
-  (alive but out of reach), `lost` (was running, cannot be found).
-- **Nothing here has been relaunched.** `can_relaunch: true` with `node_id` absent
-  is an *offer*: there is no process to point at. `command` is shown verbatim so
-  accepting is an informed choice. The user answers with `relaunch_node` or does
-  not, and nothing happens until they do.
+- `lifecycle`: current daemon restart reports `orphaned` (the stored PID may still be alive but the PTY is
+  out of reach) or `lost` (the former runtime cannot be found). `reconnected` is reserved for a future
+  backend that can prove it reattached the original PTY; this build does not emit that claim on restore.
+- **Nothing here has been relaunched.** Every outcome retains its durable `node_id`; `can_relaunch: true` is
+  an offer to relaunch that exact node, not a newly invented process. `command` is descriptive so accepting
+  is informed. The user answers with `relaunch_node` or does not, and nothing happens until they do.
+- A UI reconnect to the same still-running daemon is a different path: it reattaches to the daemon-owned
+  live screen and bindings. It must not be described as PTY survival across a daemon restart.
 
 ---
 
@@ -972,7 +1014,7 @@ otherwise need a copy of the rules to compute.
 
 ### `HierarchySnapshot` — the one navigation projection
 
-`revision`, `surface_id`, `tree_state`, `workspaces`.
+`revision`, `tree_state`, `workspaces`. There is no duplicate top-level `surface_id`.
 
 `tree_state` is `TreeSurfaceState { surface_id, selected?, expanded }`. Keys are tagged
 `workspace`/`session`/`process`; expansion and selection from another surface are never merged into it.
@@ -997,9 +1039,9 @@ Derived state — **the client renders these, it never computes them**:
 | Field | From |
 | --- | --- |
 | `display_state` | `DisplayState::derive` over the session's process tree |
-| `state_label` | `"YOUR TURN"`, `"PERMISSION"`, `"QUESTION"`, `"running"`, `"failed"`, … |
+| `state_label` | the display-state label, except outstanding Attention promotes the Session row to `"YOUR TURN"` |
 | `severity` | Ranking weight, so a client sorting locally sorts as the daemon would |
-| `needs_user` | Whether anything here is blocked on the human |
+| `needs_user` | Whether the runtime tree itself is blocked on the human; `badge_count` independently exposes exact or scoped Attention |
 
 Counts: `subagent_count`, `running_count`, `node_count`, `pane_count`. Subagents
 and running processes are counted separately because "the agent finished its turn"
@@ -1038,7 +1080,8 @@ list is cheaper and less error-prone than diffing a recursive structure. Rows
 arrive in draw order — each root followed by its subtree, depth-first, siblings in
 insertion order.
 
-Placement: `node_id`, `session_id`, `parent`, `relationship { kind, confidence }`, `depth`, `child_count`.
+Placement: `node_id`, `session_id`, `parent`, `relationship { kind, confidence }`,
+`relationship_is_provisional`, `depth`, `child_count`.
 Event confidence does not substitute for `relationship.confidence`.
 
 Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`.
@@ -1046,7 +1089,7 @@ Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`
 State: `lifecycle`, `turn` (absent for a non-agent), `display_state`,
 `state_label`, `severity`, `needs_user`, `interaction_pending`.
 
-Views and timing: `pane_bindings: [PaneBindingView]`, `pane_capability`, `started_ms`, `ended_ms`,
+Views and timing: `pane_bindings: [PaneNodeBinding]`, `pane_capability`, `started_ms`, `ended_ms`,
 `runtime_ms` (freezes at exit), `exit_code`. There is no privileged single `pane_id`.
 
 `agent`: an `AgentSummary`, for agentic nodes, including lossless `name` (`declared_name?`, `display_name`,
@@ -1082,6 +1125,7 @@ them as "no history offered" rather than as "no history exists".
 ### `AttentionView`
 
 `entry` is the whole `turn_core::attention::AttentionEntry` — id, session, node,
+optional `parent_node_id` and `subject_external_id` correlation scope,
 `reason` (`permission`\|`credentials`\|`question`\|`input`), `summary`,
 `confidence`, timestamps, `state` (`pending`\|`snoozed`\|`acknowledged`),
 `priority_boost`. Plus:
@@ -1093,6 +1137,17 @@ them as "no history offered" rather than as "no history exists".
   locally. Not stable across time: the age bonus grows.
 - `actionable` — a snoozed entry is still **listed**, so the snooze does not feel
   like a deletion, and marked unactionable.
+
+`node_id` is the exact subject when known. The parent/external fields are not a substitute node to focus:
+they preserve an unresolved callback's authenticated boundary so deduplication, restart and resolution do
+not broaden it to every worker in the Session. They are additive optional fields; older persisted/protocol
+entries decode with no provisional scope.
+
+A client applies the same rule to permission detail. It may join `pending_permission` only to the exact
+`node_id`; a matching `SessionSummary.primary_agent.node_id` is an exact join when the Session projection
+arrives before the tree. A scoped node-less entry or a stale exact id must never borrow the primary Agent's
+command, cwd or risk. Only a legacy entry with all three subject fields absent may use that compatibility
+fallback.
 
 ### `WorkspaceSummary`
 
@@ -1106,12 +1161,12 @@ badge and its session badges can never disagree.
 
 ### Lease, binding and preview views
 
-`WorkspaceWriteLeaseView` carries Workspace/Session/checkout identity, `exclusive_write`, state,
-acquisition/heartbeat timestamps and fencing generation. `recovery_required` and `stale` still block a new
-owner; only fenced release/reconciliation makes the claim non-blocking. A `canonical_path` may be included
-for diagnosis but clients never use it to perform filesystem work.
+`WorkspaceWriteLease` carries Workspace/Session/checkout identity, `mode: exclusive_write`, state,
+acquisition/heartbeat/release timestamps and fencing generation. `recovery_required` and `stale` still block
+a new owner; only fenced release/reconciliation makes the claim non-blocking. Canonical checkout paths live
+on `WorkspaceCheckout`, not on the lease.
 
-`PaneBindingView` carries Pane, Session and node identity, temporary/durable ownership, optional
+`PaneNodeBinding` carries Pane, Session and node identity, temporary/durable ownership, optional
 `surface_id` and open time. `pane_capability` is the closed
 `NodePaneCapability::{Terminal, PreviewDetails}`, so a semantic-only subagent cannot be opened as a fake
 terminal.
@@ -1151,8 +1206,8 @@ descriptions has to argue with a test first.
    goes through daemon lease arbitration, and conflict recovery is one of the typed alternatives. There is
    no force/steal flag; generation mismatch is a conflict, not a retry loop.
 6. **Navigation cannot fabricate ownership.** There is no unconstrained `move_node`, no client-supplied
-   confidence promotion and no `tree.node_selected` domain event. Relationship correction is scoped,
-   audited and cycle-checked.
+   confidence promotion and no `tree.node_selected` domain event. Audited, cycle-checked relationship
+   correction is planned; protocol v3 refuses to approximate it with a local-only mutation.
 
 One more, on the transport, which this crate does not implement but assumes:
 `$SOCKET` is owner-only, and the hook server binds `127.0.0.1` with a per-node
@@ -1177,7 +1232,9 @@ token. Never `0.0.0.0`.
    `pane_output_gap`.
 6. Forward keystrokes as `write_pty` and window resizes as `resize_pty`. Pipeline
    freely.
-7. Send `update_user_activity` on activity transitions, not on a timer.
+7. Send `update_user_activity` immediately on activity transitions. During continuous typing, send only a
+   coalesced bounded heartbeat before the typing grace can expire; never one request per character or idle
+   periodic traffic.
 8. Handle every push in §8. Apply terminal sequence rules independently from hierarchy revision rules.
    On an invalid hierarchy revision, request `get_hierarchy`; do not patch stale ownership.
 9. On a decode error, reply with an `error` frame built from

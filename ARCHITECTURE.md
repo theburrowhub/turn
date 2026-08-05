@@ -21,8 +21,8 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | `turn-core` | Built | reproduce | Domain, state, attention and ADR-040 hierarchy/lease/preview values. |
 | `turn-proto` | Built | reproduce | Framing, terminal cells and implemented protocol-v3 hierarchy operations. |
 | `turn-store` | Built | reproduce | Append-only migrations, global fences, hierarchy and secure hook cleanup. |
-| `turn-pty` | Built | 47 | Ptys, buffers, supervision. |
-| `turn-hook` | Built | 21 | The `turn-hook` helper binary and its library. |
+| `turn-pty` | Built | reproduce | Ptys, buffers, supervision. |
+| `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
 | `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
 | `turnd` | Built | reproduce | Atomic Session/lease lifecycle, PTYs, hierarchy projection and restore vertical. |
 | `turn-gui` | Built for first vertical | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
@@ -65,6 +65,7 @@ because the whole point of the daemon is that the UI can go away.
                      │  turnd — the daemon     BUILT: FIRST VERTICAL    │
                      │                                                  │
                      │  owns: pty handles · session/checkout registry · │
+                     │  canonical data-dir process lock ·               │
                      │  one AttentionManager · the hook server ·        │
                      │  write leases · hierarchy projection ·           │
                      │  supervisor timing · all store writes ·          │
@@ -165,8 +166,8 @@ user's screen.
 
 ```
 Lifecycle: Spawning → Alive → { Exited{code} | Signaled{signal} }
-                    ↘ Orphaned      (still running after a UI restart, handle lost)
-                    ↘ Reconnected   (running and re-attached)
+                    ↘ Orphaned      (stored PID may live after daemon restart; PTY handle lost)
+                    ↘ Reconnected   (reserved for a backend that proves reattachment; not emitted today)
                     ↘ Lost          (was running, cannot be found — an honest "we don't know")
 
 Turn:      Idle → Active → { AwaitingUser{reason} | Done | TaskDone | Failed{reason} }
@@ -184,7 +185,9 @@ it is why a crashed Agent cannot keep rendering as `NeedsPermission`: the deriva
 `lifecycle.is_failure()` first, so a dead process outranks any stale turn state.
 
 `DisplayState` also carries the presentation logic the UI needs and the queue reuses: `label()`
-(`"YOUR TURN"`, `"PERMISSION"`, `"turn done"`), `demands_user()`, and `severity()` for ranking.
+(`"WAITING"`, `"PERMISSION"`, `"turn done"`), `demands_user()`, and `severity()` for ranking. `YOUR TURN`
+belongs to the Session/Attention projection: an exact Agent remains `WAITING` or `PERMISSION`, and a scoped
+unresolved child demand may badge the Session while its parent remains `RUNNING`.
 
 Note the deliberate asymmetry between `is_terminal()` and `is_failure()`: `Lost` is terminal but not a
 failure, because failing to re-attach is not the same as the work having gone wrong.
@@ -274,6 +277,12 @@ stores meaning (`spawned_by`, `owns_process`, related or unknown) and confidence
 node also carries lossless naming: declared name when the source supplied one, user-facing display name,
 source, confidence and whether the user renamed it.
 
+Navigation text is a separate trust boundary from typed event decoding. User-authored Workspace, Session
+and Template names with C0/C1/ANSI/bidi/invisible formatting are rejected. Agent and OS process metadata is
+sanitised and bounded before it reaches reducer, inspector, protocol or SQLite; discovered argv is capped
+by count, per-argument characters and aggregate characters. Raw supervisor values remain transient inputs
+to PID traversal/classification, not an alternate durable label source.
+
 `SessionTree::relink` enforces the `Relation` ladder — a `Confirmed` link is never downgraded by an
 `Inferred` one — and refuses to create a cycle, with a 1,000-hop defensive bound in case the store ever
 hands it a corrupt tree. `remove` promotes children to roots with `Relation::Unknown` rather than
@@ -294,6 +303,9 @@ A binding belongs to a Session and connects one Pane to one node; a node may hav
 bindings. The binding table is authoritative after migration. Process identity never points back to one
 privileged Pane, and closing a binding never stops the node. A node with semantic events but no independent
 PTY can be shown as Preview or Process Details, not as a fabricated terminal.
+A temporary binding additionally belongs to one live `surface_id`; it is hidden from other surfaces and
+expires when that surface connection is replaced, its last client disconnects, or the daemon restarts.
+Permanent Layout bindings and the Agent remain unchanged.
 
 **`ActivityPreview` / `TreeUiState`** — bounded navigation state. Preview is sanitised, redacted,
 provenance-labelled text derived from semantic status or one stable screen line; it is not terminal history.
@@ -303,6 +315,8 @@ changes process ownership, Layout, focus or Attention.
 **`Template`** — a reusable Session shape. `from_layout` strips `node_id` bindings (a Template must not
 remember which process it was cloned from); `instantiate` reassigns every `PaneId` so two Sessions from
 one Template share no identity. Four built-ins: `Blank`, `Coding`, `PR Review`, `Pair of Agents`.
+If main-checkout creation conflicts, typed read-only/worktree Template requests preserve the id and naming
+inputs; only the daemon instantiates the authoritative Layout/env/Attention/tmux/init-command definition.
 
 ### 2.6 Attention
 
@@ -319,8 +333,10 @@ burning wall-clock waiting on the human; badge only for a new subagent.
 action fired by a confidence that fails `may_steal_focus()` degrades to `Badge`, and the result is
 deduplicated so `[Badge, Focus, FocusIfIdle]` collapses to `[Badge]`.
 
-**`queue`** — ordering. `AttentionEntry` is keyed for dedup on `session|node|reason`. `score(now_ms)`
-is `base_priority + state_penalty + confidence_penalty + age_bonus + priority_boost`, where the age
+**`queue`** — ordering. `AttentionEntry` is keyed for dedup on Session, reason and an exact subject: a
+known `node`, or an unresolved authenticated `parent + external id?` scope. A completely unanchored legacy
+entry stays explicitly unassigned. `score(now_ms)` is
+`base_priority + state_penalty + confidence_penalty + age_bonus + priority_boost`, where the age
 bonus is capped at 15 minutes — enough to prevent starvation, deliberately far below one priority class
 so it can never let an idle prompt outrank a blocked permission. `upsert` refreshes an existing entry,
 upgrades its confidence, un-acknowledges it (the Agent asked again) and **keeps the original
@@ -363,6 +379,14 @@ Details that are easy to get wrong and are pinned by tests:
   reset the rate limiter so automatic focus does not immediately fight manual navigation.
 - A muted Session yields exactly one `Badge` and nothing else, so the sidebar still shows something
   happened.
+- Response resolution and lifecycle cleanup are different operations. A response closes only its exact
+  node or parent/external-id flow. A terminal runtime additionally owns node-less flows anchored on itself;
+  its exit removes those and their deferred focus without erasing exact live children. `ProcessFailed`
+  performs that cleanup and still proceeds through the failure policy to create the new failure demand.
+- A deferred focus retains the same exact node or parent/external-id subject as its queue entry. `tick`
+  requires that subject—not merely some demand in the same Session—to remain actionable. Snooze, dismiss,
+  mute and terminal lifecycle cancel the matching deferred jump. Muting suppresses interruption while
+  preserving the policy's durable queue evidence.
 
 ### 2.7 Failure modes
 
@@ -381,7 +405,7 @@ Details that are easy to get wrong and are pinned by tests:
 
 ## 3. turn-pty — ptys, buffers, supervision
 
-**Status: Built. 46 tests (buffer 20, process 18, supervisor 8).** Depends on `turn-core` (ids, state,
+**Status: Built.** Depends on `turn-core` (ids, state,
 `NodeKind`), `portable-pty`, `vt100`, `sysinfo`, `tokio` (sync only), and `libc` on unix.
 
 ### 3.1 `PtyProcess` — one process on one pty
@@ -430,8 +454,8 @@ tolerate that ordering.
 Turn keeps a raw **byte ring** (default 2 MiB) for exact replay and a **parsed vt100 screen** (default
 5,000 scrollback rows) so the daemon can answer "what does this look like right now" with no UI
 attached. Both earn their keep: bytes carry the colours, cursor position and alternate-screen state
-that text cannot; the parsed screen is what makes thumbnails of unopened Sessions and output heuristics
-possible.
+that text cannot; the parsed screen makes attached cell rendering, on-demand previews and output
+heuristics possible without a hidden Session-overview consumer.
 
 `replay()` returns the **parser's** `contents_formatted()`, not the raw ring. It is far smaller and
 always self-consistent, where a truncated ring can start mid-escape-sequence and corrupt the receiving
@@ -481,19 +505,18 @@ It produces no `TurnEvent`s. It reports `Lifecycle`, `ExitInfo` and `ObservedPro
 into `process.started` / `process.exited` / `process.failed` / `process.spawned_child` and attaching them
 to a `SessionTree` is the daemon's job, and it is deliberately not this crate's.
 
-That conversion is now written in `turnd` — `core/spawn.rs` and `core/events/exit.rs` construct the
-process events, `core/supervise.rs` the `process.spawned_child` ones — but it is being written as this is
-read and none of it is verified here. Until it is, treat the join as the riskiest unproven code in the
-system rather than as a solved problem (`ROADMAP.md` §Risks 4).
+That conversion lives in `turnd`: `core/spawn.rs` and `core/events/exit.rs` construct the process events,
+and `core/supervise.rs` constructs `process.spawned_child`. Unit tests cover exit/supervisor joins and the
+daemon integration suites cover spawn, child adoption, Attention cleanup and process termination. The join
+remains the riskiest reducer in the system, so the out-of-order and ambiguous-agent regressions stay
+load-bearing (`ROADMAP.md` §Risks 4); it is no longer unverified code.
 
 ---
 
 ## 4. turn-agents — the adapter layer and the hook server
 
-**Status: Being refactored. 92 unit tests plus 18 contract tests (6 Claude Code, 12 Codex) when last
-green; the crate did not compile at the final check of this survey, mid-extraction of a `text` module and
-a signature change to `notify_config`. The behaviour described below is what the crate did when last
-verified — check it before relying on an API shape.** Modules: `adapter`,
+**Status: built and green in the serial workspace audit; reproduce with `cargo test -p turn-agents`.**
+Modules: `adapter`,
 `claude`, `codex`, `heuristic`, `registry`, `risk`, `server`.
 
 ### 4.1 The adapter contract
@@ -754,7 +777,7 @@ that always fires is a warning nobody reads. The command outweighs a reassuring 
 
 ### 5.1 `turn-hook` — the helper that must never break a session
 
-**Status: Built. 15 tests. Zero dependencies.**
+**Status: Built. Zero dependencies.**
 
 Agents that cannot POST over HTTP themselves run a command instead. Codex's hook handlers and its
 `notify` mechanism are both command-based, so this is the only way Turn hears from Codex at all.
@@ -777,26 +800,28 @@ start in microseconds and cannot afford an async runtime. The HTTP request is bu
 
 ### 5.2 `turnd` — the daemon
 
-**Status: In progress, and being written as this is read.** `main.rs` is a real entry point that parses
+**Status: built for the automated first vertical.** `main.rs` is a real entry point that parses
 options, initialises logging, resolves a `Config` and calls `turnd::start`. The library declares `config`,
 `paths`, `instance`, `logging`, `options`, `error`, `server` and `core`, with `core` split into `spawn`,
 `supervise`, `restore`, `events`, `requests`, `views`, `attention`, `clients`, `command` and `output`.
-There are 71 test functions across the crate, including integration tests (`desk.rs`, `agents.rs`,
-`surface.rs`, `restart.rs`, `attention.rs`, `binary.rs`).
+Unit and integration coverage lives beside those modules and in `tests/{desk,agents,surface,restart,
+attention,binary,cells}.rs`; counts are intentionally reproduced rather than frozen here.
 
-**None of that is verified in this document.** The counts above are of code and test functions that exist,
-not of tests observed to pass. Everything in this section describes the daemon's intended responsibility
-and the design it is being built to; read it as specification, and check the crate before relying on any
-of it.
+The release audit runs `cargo test -p turnd -- --test-threads=1` and the full workspace serially. The exact
+Reviewer tests cross both the production reducer and the real loopback Claude hook transport. An
+authenticated external Claude Code session in the packaged native window remains a separate acceptance
+gate; deterministic coverage is not evidence that credentials, signing or the installed release work.
 
-#### Intended responsibility
+#### Responsibility
 
 The daemon is the only process that holds a pty handle. It owns:
 
 - the Session registry and the authoritative `SessionTree` per Session;
+- an exclusive process lock on the canonical data directory, acquired before SQLite, migrations or
+  restore, independently of the chosen control socket;
 - checkout identity and the write-lease arbiter for every Workspace;
 - the revisioned `HierarchySnapshot` projection and reconciliation of legacy checkout ownership;
-- one `PtyProcess` per terminal Pane;
+- one `PtyProcess` per PTY-backed runtime node; zero-to-many Panes may view that node;
 - zero-to-many Pane bindings per runtime node and bounded/coalesced Activity Preview state;
 - one `AttentionManager` for the whole application — the queue is global by design, being the ordered
   list of everything wanting the user across every Workspace;
@@ -808,7 +833,14 @@ The daemon is the only process that holds a pty handle. It owns:
 It is also the **only** place where a pty fact and an Agent fact are joined: mapping a hook payload's
 `session_id` to a `NodeId` via `SessionTree::find_by_external_id`, or a supervisor `ObservedProcess` to
 an existing node via `find_by_pid`. Concentrating that join is deliberate; it is where a wrong
-correlation would silently corrupt state.
+correlation would silently corrupt state. When Claude delivers a worker callback through the parent's hook
+endpoint without `agent_id`, the reducer binds it to a child only when exactly one live candidate exists,
+and downgrades that attribution to `inferred_high`. With zero or several candidates the event stays
+node-less/`unknown`; it never borrows the parent or an arbitrary sibling. An explicit but not-yet-declared
+worker id is stronger evidence than the current tree shape and also remains unresolved instead of falling
+through to a different unique child. Node-less Attention is durably scoped by authenticated hook parent and
+optional external worker id, so a prompt submission resolves only that exact provisional flow and cannot
+clear a sibling or another parent in the same Session.
 
 Creating a `main_checkout` Session is one daemon transaction boundary: canonicalise and validate the
 checkout plus the effective Session/Pane working directories, persist the Session/assignment and acquire its
@@ -817,15 +849,16 @@ validation is repeated immediately before every PTY launch because symlinks and 
 after creation. The canonical cwd must be contained by the Session's registered primary or worktree checkout;
 this constrains where a process starts, not which files same-user code can later access. A conflict rolls the
 store transaction back and returns the current owner and allowed alternatives before any external side
-effect. Duplicating a Session never copies an active lease. Release is fenced and occurs only after
-the writer has really stopped or explicitly changed mode; UI close, archive and `KeepProcesses` are not
-release signals.
+effect. Duplicating a Session never copies an active lease. Release is fenced and occurs only after no
+runtime node owned by the Session remains running; that same atomic operation demotes the Session to
+`ReadOnly`. UI close, archive and `KeepProcesses` are not release signals.
 
 #### Why the daemon exists from day one, and exactly what it buys
 
 **It buys:** the UI can crash, be quit, be hot-reloaded during development, or be updated, and the
-Agents keep running. Reconnecting re-attaches — the UI takes `PtyProcess::replay()` per Pane to rebuild
-the screen exactly, then subscribes to the live stream.
+Agents keep running. Reconnecting re-attaches — for each visible Pane, the UI attaches to its bound live
+runtime node, receives the daemon-owned screen/replay and subscribes to the live stream. The Pane is a view;
+the runtime node, not that view, owns the PTY buffer.
 
 **It does not buy:** survival of the daemon exiting. The pty master lives in the daemon's file table,
 and `PtyProcess::drop` deliberately terminates the process it owns — `terminate()` then `kill()` —
@@ -833,18 +866,29 @@ because closing a Session must not leave strays holding ptys, which are a finite
 the daemon goes, the ptys close and the children get SIGHUP.
 
 This is stated plainly rather than papered over, because the honest boundary is what `Lifecycle` is
-shaped around. `Orphaned` (still running, handle lost), `Reconnected` (running and re-attached) and
-`Lost` (was running, cannot be found) exist precisely so Turn can report the truth after a restart
-instead of inventing an exit code. Making work survive the *daemon* is a different problem with a known
+shaped around. `Orphaned` (stored runtime may still exist, handle lost) and `Lost` (the recorded runtime
+cannot be found) report the current restart truth instead of inventing an exit code. `Reconnected` is
+reserved for a future backend that can prove PTY reattachment; the current daemon does not emit it on
+restore. Making work survive the *daemon* is a different problem with a known
 solution — tmux, which the model already has flags for — and it is deliberately out of the MVP
 (ADR-007).
 
 **Turn never relaunches a process automatically on restore.** It offers; the user decides.
-`RestoreBehaviour::ReattachOnly` is the default, and `Relaunch` is opt-in per Pane for things safe to
-re-run unprompted, like a shell. `turn-proto` enforces this structurally: `Request::RelaunchNode` is
+`RestoreBehaviour::ReattachOnly` is the default, and `Relaunch` marks Panes whose command may be offered
+again, such as a shell; it is not authority to run them unprompted. `turn-proto` enforces this structurally: `Request::RelaunchNode` is
 the only request that starts anything, and it is user-initiated.
 
-#### Intended event flow
+Before opening SQLite, running migrations or restoring state, `turnd` must own the non-blocking OS lock on
+the canonical data directory. A different socket path is not a second ownership domain. Only after that
+process boundary is established does a new daemon atomically change every unreleased checkout lease to
+`recovery_required` while preserving its identity, generation and last heartbeat. Restore never adopts the
+former daemon's authority, and heartbeat/launch paths require an `active` lease. The durable Attention
+queue is loaded without replay: id, age, confidence, priority, snooze and acknowledgement survive exactly;
+its exact node or unresolved parent/external-id correlation scope survives as well. Interaction demands
+whose exact node/parent no longer runs are removed; postmortem evidence explicitly marked
+`survives_owner_exit` (for example failure/completion facts) remains.
+
+#### Event flow
 
 ```
 hook POST ──▶ HookServer ──▶ adapter.normalise ──▶ TurnEvent (confidence clamped)
@@ -854,22 +898,26 @@ pty exit  ──▶ ExitInfo ──▶ (daemon) ──────────�
 supervisor scan ──▶ ObservedProcess ───────────────────┤
 OutputHeuristic::observe(snapshot) ────────────────────┤
                                                        ▼
-                                           reduce into SessionTree
+reduce into SessionTree
                                            (Lifecycle, Turn, Relation)
                                                        │
-                                    ┌──────────────────┼──────────────────┐
-                                    ▼                  ▼                  ▼
-                          AttentionManager      turn-store          turn-proto
-                             ::ingest        (append event, redact)  (push view models)
-                                    │
-                                 Vec<Effect> ──▶ turn-proto ──▶ UI performs them
+                                               ▼
+                                  one SQLite checkpoint
+                             Session → Event → Attention → COMMIT
+                                               │
+                                    ┌──────────┴───────────────┐
+                                    ▼                          ▼
+                              turn-proto                  Vec<Effect>
+                           (push view models) ───────────▶ UI performs them
                                                             (and acknowledges Focus, so
                                                              UserContext stays true)
 ```
 
 `UserContext` — last keystroke, whether the window is frontmost, the active Session, whether a sensitive
-operation is in flight — flows the other way, from UI to daemon, and must be kept fresh or the typing
-guard degrades to nothing.
+operation is in flight — flows the other way, from UI to daemon. State transitions are sent immediately;
+while a typing burst continues, the client coalesces a bounded heartbeat and schedules a repaint before
+the daemon's 1,500 ms grace can expire. Sending only the first key makes a long burst look idle; sending
+every key turns protection state into socket pressure. Neither is acceptable.
 
 #### Failure modes to design for
 
@@ -877,8 +925,12 @@ guard degrades to nothing.
   be dropped or coalesced, not queued indefinitely.
 - **A hook arrives for an unknown `session_id`.** Drop it and log; never create a Session from a hook.
   The hook server already refuses an unknown *token*, which is the stronger check.
-- **The store is unwritable** (disk full, permissions). The daemon must keep running with persistence
-  degraded and say so, rather than exiting and taking the Agents with it.
+- **The store is unwritable** (disk full, permissions). The daemon keeps PTYs running, suppresses the
+  uncommitted event's projections/effects and places later runtime events behind a FIFO retry barrier.
+  Session/Attention standalone writes cannot leak the partial projection. Every protocol request first
+  retries the oldest checkpoint and returns `unavailable` if it is still blocked, so neither a read nor a
+  rejected mutation can cross the barrier. A prolonged outage still needs a surfaced degraded-state
+  indicator and bounded/coalesced deferred-event hardening.
 - **A schema written by a newer build.** `turn-store` refuses a downgrade loudly, and the daemon must
   stop cold rather than write to it.
 - **`rusqlite` is synchronous.** Every store call must be off the reactor or the event loop stalls, and
@@ -948,8 +1000,8 @@ over-long line yields an error for that line and the decoder carries on. `MAX_LI
 `MAX_OUTPUT_CHUNK_BYTES` is 256 KiB.
 
 **A terminal is cells, not bytes (protocol 2).** The daemon already keeps an authoritative `vt100` screen
-per pane — it must, because thumbnails and the output heuristics work with no client attached — so a pane's
-screen crosses the boundary already parsed: `cells::Grid`, with palette indices resolved to concrete `Rgb`
+per PTY-backed runtime node — it must, because on-demand previews and output heuristics work with no client
+attached — so a bound Pane's screen crosses the boundary already parsed: `cells::Grid`, with palette indices resolved to concrete `Rgb`
 and reversed video applied. One VT emulator in the system, and with it the whole class of "the two screens
 disagree" bug is gone. `screen::ScreenUpdate` carries the **rows that changed** with a per-attachment `seq`;
 a client that misses one asks `resync_pane`, and the daemon independently makes the next update a whole
@@ -992,11 +1044,11 @@ the whole point of the product is that thirty processes are getting on with thin
 at one. Pushes are addressed but **not correlated** — no request id, because no request caused them.
 Terminal attachments keep their per-attachment sequence. Hierarchy pushes carry a monotonic projection
 revision; a client that observes a gap discards the stale hierarchy and requests a full replacement.
-`PreviewChanged`, `PaneBindingChanged` and `LeaseChanged` carry current bounded state and do not enter the
-append-only `TurnEvent` log.
+`ActivityPreviewChanged`, `PaneBindingsChanged` and `WorkspaceWriteLeaseChanged` carry current bounded
+state and do not enter the append-only `TurnEvent` log.
 
 **View models (`view/*`): derive, never duplicate.** `HierarchySnapshot` is the navigation model:
-`revision`, stable `surface_id`, `TreeSurfaceState` and ordered `WorkspaceTreeView` roots containing
+`revision`, `TreeSurfaceState { surface_id, … }` and ordered `WorkspaceTreeView` roots containing
 checkout/lease state and `SessionTreeView` children. Runtime node rows retain parent/depth and draw order,
 derived state/badges, relationship meaning/confidence, zero-to-many `pane_bindings` and safe Activity
 Preview.
@@ -1008,20 +1060,25 @@ Provisional state remains explicit on the wire.
 **Protocol v3 navigation operations.** Bootstrap is `GetHierarchy`; `ListWorkspaces`, `ListSessions` and
 `GetSession` remain administrative/detail endpoints, not a navigation recipe. `SetTreeExpanded` and
 `SelectTreeNode` are scoped by stable `surface_id` and acknowledged without broadcasting another surface's
-selection. Node actions include rename, relationship correction with old/new parent audit,
-`GetPreviewHistory`, `OpenNodeAsTemporaryPane` and `FocusPaneForNode`. Lease acquire/release carry expected
-fencing generation; Session creation includes `SessionMode` and returns no partial Session on conflict.
+selection. Implemented node actions include `GetPreviewHistory`, `SetPreviewVisibility`,
+`OpenNodeAsTemporaryPane` and `FocusPaneForNode`; rename and audited relationship correction remain planned.
+Lease release carries expected fencing generation; `CreateSession` implicitly requests the main checkout,
+while dedicated read-only/worktree operations express the safe alternatives. No creation path returns a
+partial Session on conflict.
+`CreateReadOnlySessionFromTemplate` and `CreateWorktreeSessionFromTemplate` keep a failed Template request
+authoritative instead of asking the GUI to reconstruct panes from `TemplateSummary`; absolute primary cwd
+values are mapped repository-relatively for the isolated checkout.
 
 **Two catalogue-level tests hold the contract together**, and they are the reason
 `Request::expected_result` exists at all: `contract::every_request_names_a_response_variant_that_exists`
 and `contract::every_response_variant_is_produced_by_at_least_one_request`. Between them a client can
-treat the request→response pairing as load-bearing rather than as documentation that might be stale, and
-`docs/PROTOCOL.md` cannot drift silently.
+treat the request→response pairing as load-bearing rather than as documentation that might be stale. These
+tests do not validate prose or example field lists; the release audit checks those against the Rust types.
 
 ### 6.2 turn-store — SQLite persistence
 
-**Status: Built baseline; migration 003 and hierarchy repository in progress.** Modules: `migrations`,
-`codec`, `redact`, `location`, `error`,
+**Status: built, including the hierarchy repository and append-only migrations through 009.** Modules: `migrations`,
+`codec`, `redact`, `maintenance`, `location`, `error`,
 `repo/{workspace, session, node, event, attention, template, settings, hierarchy}`, behind a `Store` facade
 (`open_default`, `open_in`, `open_at`, `open_in_memory`, plus `schema_version`, `journal_mode`,
 `foreign_keys_enforced` and `compact`). WAL and enforced foreign keys are set at open.
@@ -1034,6 +1091,9 @@ convincing lie. Persisted: Workspaces/checkouts, Session assignment and mode, La
 policies/queue, event log, process metadata/relationships/names, Pane bindings, bounded redacted previews,
 leases and per-surface tree state. Never persisted: the pty master, raw terminal bytes, grid or scrollback,
 the output broadcast channel, parser state, live subscriptions or unredacted preview source.
+Every repository builds those rows from a redacted durable copy. Known credential shapes are scanned in
+all free-text fields and sensitive-key values are replaced; ids/FKs stay stable. Authority-bearing
+Workspace/checkout paths are rejected rather than rewritten when scanning would alter them.
 
 And the line that makes restore honest: **`SessionRepo::load_for_restore` downgrades anything stored as
 running to `Lifecycle::Orphaned`**, because a stored `Alive` only ever meant "alive when we last wrote".
@@ -1053,6 +1113,19 @@ Pane bindings and marks the Workspace for lease reconciliation. It creates **no 
 does not launch, kill, move, chmod or relaunch a process. DDL cannot prove that a recent Session is the sole
 writer; daemon reconciliation or an explicit user decision must do that later. Conflicting legacy binding
 sources are surfaced for reconciliation rather than silently choosing two authorities.
+
+Migration 005 removes historical raw hook callback bodies from both SQLite and WAL. Migration 006
+re-resolves legacy checkout identity, preserves global fence monotonicity and marks every ambiguous legacy
+claim for explicit reconciliation rather than granting authority. Migration 007 adds the authenticated
+parent and optional external-worker correlation scope to node-less Attention entries; old rows remain valid
+and acquire null scope rather than being broadened by a guessed parent. Migration 008 distinguishes
+interaction demands from postmortem turn-complete/task-complete/failure evidence and records whether each
+demand truthfully survives its runtime owner exiting; legacy rows remain non-surviving interactions.
+Migration 009 marks every pre-v9 store for a retryable credential purge. Open then classifies every current
+`TEXT` column, redacts legacy free text transactionally, refuses to rewrite structural identities, rebuilds
+the database with `secure_delete`/`VACUUM`, verifies WAL truncation and clears the marker only at the end.
+A busy WAL, SQLite failure, structural credential or correlation-key collision leaves the marker intact and
+fails the open rather than claiming a partial cleanup succeeded.
 
 The schema additions are Session mode/checkout/enforcement fields and
 `workspace_checkouts`, `checkout_write_fences`, `workspace_write_leases`, `activity_previews`,
@@ -1095,7 +1168,15 @@ Per-repository notes worth knowing:
   `PruneOutcome` keep the log from eating the disk.
 - **`attention`** — the queue is persisted, because it is the one piece of live state that must not
   evaporate on a restart: an Agent that blocked on a permission at 17:58 is still blocked at 18:02, and
-  a queue rebuilt from nothing would quietly drop it until the Agent happened to say so again.
+  a queue rebuilt from nothing would quietly drop it until the Agent happened to say so again. A known
+  Agent is keyed by node; an out-of-order or id-less worker demand is keyed by authenticated parent plus
+  optional external worker id, preserving ambiguity without turning it into session-wide authority.
+- **cross-repository runtime checkpoint** — an accepted `TurnEvent` persists its complete Session
+  projection, the idempotent event row and the resulting Attention Queue inside one transaction, in that
+  order. Client pushes and perceptible effects happen only after commit. A rollback therefore cannot leave
+  a permission without its Agent, a tombstone without its Stop event or a stale demand beside a stopped
+  owner. While its FIFO retry barrier is blocked, protocol reads and writes fail `unavailable` before their
+  handlers instead of observing or adopting the uncommitted projection (ADR-041).
 - **`settings`** — key/value with JSON values, not a column per preference, because a wide table needs a
   migration per preference and a migration is a thing that can fail on a user's machine. A value this
   build cannot parse is reported as a decode error naming the key, never silently defaulted.
@@ -1226,20 +1307,22 @@ Turn launches processes with the user's environment, which on a developer machin
 restarts also survives being copied into a bug report, synced to a backup, or read by anything else
 running as the user — so none of that may be written down.
 
-The rule is narrow and mechanical: **the value of any key that looks like a credential is replaced
-before the row is built.** The key itself is kept, because "GITHUB_TOKEN was set" is exactly what Turn
-needs in order to explain why an Agent could not authenticate after a restore, while its value is only a
-liability. Matching is deliberately greedy — substring, case-insensitive — because redacting a variable
-called `MONKEY_MODE` costs the user nothing while missing one called `deploy_key` costs them a
-repository.
+The rule is mechanical at the durable boundary: **the value of any key that looks like a credential is
+replaced before the row is built, and every other free-text field is scanned for recognised credential,
+JWT and private-key shapes.** The key itself is kept, because "GITHUB_TOKEN was set" explains why an Agent
+could not authenticate after restore, while its value is only a liability. Matching keys is deliberately
+greedy — substring, case-insensitive — because redacting `MONKEY_MODE` costs little while missing
+`deploy_key` costs a repository. Workspace/Session/Layout/Template, process/Agent, settings, Attention,
+Preview and event/provenance writes all pass through this projection. Typed ids/FKs are untouched;
+authority-bearing filesystem paths fail rather than being silently rewritten.
 
 `ProcessNode::env_highlights` is the domain-side half of the same decision: selected entries, never the
 whole environment.
 
-Three integration tests assert the property rather than the mechanism, by writing real SQLite files and
-searching them: `secrets_never_reach_the_disk::no_secret_value_is_present_anywhere_in_the_files_on_disk`,
-`a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes`, and
-`a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent`.
+Byte-level integration tests assert the property rather than the mechanism by planting one token in every
+durable free-text route and scanning real SQLite/WAL files after direct writes, the atomic runtime
+checkpoint, restart and pruning. A redacted command/cwd/external id is no longer an operational resume
+credential; relaunch/resume/correlation needs a fresh value.
 
 ADR-040 closes the persistence side of the former `TurnEvent::raw` question: a Claude callback exists only
 as transient adapter ingress and is reduced to typed facts without being attached to its `TurnEvent`.
@@ -1310,7 +1393,10 @@ a security boundary.
 
 Lease acquisition happens before any init command or process spawn. Heartbeats and fencing generations
 prevent a stale daemon/client from releasing a newer owner's lease, but time alone never proves the old
-writer is dead. Migration 003 grants no lease and changes no filesystem permissions.
+writer is dead. Separately, the daemon acquires an advisory exclusive lock on the canonical data directory
+before SQLite, migrations or restore; socket aliases therefore cannot create two cooperating store owners.
+The lock file is never removed, uses a stable inode and is released by the kernel on process death. Unsupported
+or unsafe filesystems fail closed. Migration 003 grants no lease and changes no filesystem permissions.
 
 Activity Preview and agent names cross an untrusted-text boundary before entering navigation chrome. They
 use the same control/bidi sanitisation as titles, known-secret redaction, strict character/history limits

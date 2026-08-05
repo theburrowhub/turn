@@ -30,7 +30,7 @@ Status values:
 | [014](#adr-014) | `background_tasks` makes "turn done, work continuing" a reported fact | Accepted, implemented |
 | [015](#adr-015) | Time is always a parameter, never read inside logic | Accepted, implemented |
 | [016](#adr-016) | The attention manager emits `Effect`s; it never performs them | Accepted, implemented |
-| [017](#adr-017) | Flat process tree with parent pointers and an evidence ladder | Flat ownership implemented; relationship extension in progress |
+| [017](#adr-017) | Flat process tree with parent pointers and an evidence ladder | Accepted, implemented and extended by ADR-040 |
 | [018](#adr-018) | Focus guards live in the governor, not in the policy | Accepted, implemented |
 | [019](#adr-019) | Scan the process table on demand, never on a timer | Accepted, implemented |
 | [020](#adr-020) | Prefixed typed-id newtypes | Accepted, implemented and extended by ADR-040 |
@@ -48,12 +48,13 @@ Status values:
 | [032](#adr-032) | View models derive; they never duplicate a rule | Accepted, implemented |
 | [033](#adr-033) | Schema version in SQLite's `user_version`, append-only migrations, no downgrades | Accepted, implemented |
 | [034](#adr-034) | `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE` | Accepted, implemented |
-| [035](#adr-035) | Redact the value, keep the key | Accepted, implemented |
+| [035](#adr-035) | Redact durable secrets, preserve structural identity | Accepted, implemented |
 | [036](#adr-036) | Persist node metadata, never terminal history | Implemented; narrowly amended by ADR-040 |
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
 | [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implemented for the first vertical; narrowly amends ADR-036 |
+| [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 
 ---
 
@@ -239,7 +240,7 @@ so consumers never learn which tool produced an event — only how much to trust
 <a id="adr-004"></a>
 ## ADR-004 — Two-axis state model with a derived `DisplayState`
 
-**Status:** Accepted, implemented. `crates/turn-core/src/state.rs`, 9 tests.
+**Status:** Accepted, implemented. `crates/turn-core/src/state.rs`; reproduce the current crate suite.
 
 ### Context
 
@@ -351,7 +352,7 @@ consults them on Turn's schedule.
 <a id="adr-006"></a>
 ## ADR-006 — SQLite for persistence
 
-**Status:** Accepted, implemented. `crates/turn-store`, 119 tests, behind a `Store` facade with WAL and
+**Status:** Accepted, implemented. `crates/turn-store`, behind a `Store` facade with WAL and
 enforced foreign keys. See also ADR-033, ADR-034, ADR-035, ADR-036.
 
 ### Context
@@ -673,8 +674,7 @@ the recorded payload still has `prompt`.
 ## ADR-013 — Codex hooks are an inline TOML struct, not a file path
 
 **Status:** Accepted, implemented. Schema established empirically against codex-cli 0.146.0 using
-`--strict-config`; `crates/turn-agents/src/codex.rs` implements it, with 21 unit tests and 12 contract
-tests.
+`--strict-config`; `crates/turn-agents/src/codex.rs` implements it with unit and captured-contract tests.
 
 ### Context
 
@@ -1124,8 +1124,13 @@ Two changes, both necessary:
 2. `tick` passes `None` for `session_last_effect_ms`, because a deferred jump is the tail of one
    already-approved effect, not a new one. The governor's own guards — typing, rate limit, ping-pong —
    still apply.
+3. `DeferredFocus` carries the exact node or unresolved parent/external-id subject. Re-evaluation requires
+   that same subject to remain actionable; another demand in the Session is not authority to focus it.
+   Snooze, dismiss, mute and lifecycle resolution cancel their matching deferred requests.
+4. The UI reports a bounded latest-keystroke heartbeat during a long burst. The daemon derives typing from
+   time, so a transition-only client would otherwise let the grace expire while the user still types.
 
-A third rule fell out of the same investigation: only a **perceptible** effect starts the Session
+A separate cooldown rule fell out of the same investigation: only a **perceptible** effect starts the Session
 cooldown (`is_perceptible`). Bookkeeping effects — enqueued, deferred, denied, cleared — are invisible
 and must not silence a Session.
 
@@ -1187,7 +1192,7 @@ dropped data.
 <a id="adr-024"></a>
 ## ADR-024 — Risk assessment is display and ordering only; it never authorises
 
-**Status:** Accepted, implemented. `crates/turn-agents/src/risk.rs`, 7 tests.
+**Status:** Accepted, implemented. `crates/turn-agents/src/risk.rs`; reproduce the current crate suite.
 
 ### Context
 
@@ -1240,7 +1245,7 @@ warning that always fires is a warning nobody reads. The command outweighs a rea
 <a id="adr-025"></a>
 ## ADR-025 — The hook server never answers with a decision, and drops rather than stalls
 
-**Status:** Accepted, implemented. `crates/turn-agents/src/server.rs`, 13 tests.
+**Status:** Accepted, implemented. `crates/turn-agents/src/server.rs`; reproduce the current crate suite.
 
 ### Context
 
@@ -1286,7 +1291,7 @@ answering agents and discards what it normalises.
 <a id="adr-026"></a>
 ## ADR-026 — `turn-hook` has no dependencies and exits 0 unconditionally
 
-**Status:** Accepted, implemented. `crates/turn-hook`, 15 tests, an empty `[dependencies]` section.
+**Status:** Accepted, implemented. `crates/turn-hook`, with an empty `[dependencies]` section.
 
 ### Context
 
@@ -1400,7 +1405,7 @@ rule positively: **a per-node token never appears in any process's argv.**
 <a id="adr-028"></a>
 ## ADR-028 — Heuristics run only against a closed list of conversational CLIs
 
-**Status:** Accepted, implemented. `HEURISTIC_EXECUTABLES`, 19 tests.
+**Status:** Accepted, implemented. `HEURISTIC_EXECUTABLES`; reproduce the current crate suite.
 
 ### Context
 
@@ -1451,7 +1456,7 @@ rather than diffing text, and only the last 12 lines matched so a resolved permi
 <a id="adr-029"></a>
 ## ADR-029 — Adapter selection always answers
 
-**Status:** Accepted, implemented. `registry`, 12 tests.
+**Status:** Accepted, implemented. `registry`; reproduce the current crate suite.
 
 ### Context
 
@@ -1495,7 +1500,7 @@ fails. The result is **reported, not just used**: `Selection` carries `level`, `
 <a id="adr-030"></a>
 ## ADR-030 — Newline-delimited JSON over a unix socket, with base64 for bytes
 
-**Status:** Accepted, implemented. `turn-proto::framing`, `turn-proto::bytes`, 127 tests in the crate.
+**Status:** Accepted, implemented. `turn-proto::framing`, `turn-proto::bytes`; reproduce the current crate suite.
 
 ### Context
 
@@ -1602,7 +1607,7 @@ check them:
 <a id="adr-032"></a>
 ## ADR-032 — View models derive; they never duplicate a rule
 
-**Status:** Accepted, implemented. `turn-proto::view`, 32 tests across the four projections.
+**Status:** Accepted, implemented. `turn-proto::view`; reproduce the current crate suite.
 
 ### Context
 
@@ -1650,7 +1655,8 @@ Purpose-built view models — `SessionSummary`, `SessionDetails`, `AgentSummary`
 <a id="adr-033"></a>
 ## ADR-033 — Schema version in SQLite's `user_version`, append-only migrations, no downgrades
 
-**Status:** Accepted, implemented. `turn-store::migrations`, 9 tests.
+**Status:** Accepted, implemented. `turn-store::migrations`; reproduce the current migration suite rather
+than freezing a test count here.
 
 ### Context
 
@@ -1692,7 +1698,7 @@ stop cold rather than write to it.
 <a id="adr-034"></a>
 ## ADR-034 — `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE`
 
-**Status:** Accepted, implemented. `turn-store::repo`, seven repositories.
+**Status:** Accepted, implemented. `turn-store::repo`, eight repositories.
 
 ### Context
 
@@ -1730,9 +1736,10 @@ A Session save is **one transaction over three tables** — the session row, its
 ---
 
 <a id="adr-035"></a>
-## ADR-035 — Redact the value, keep the key
+## ADR-035 — Redact durable secrets, preserve structural identity
 
-**Status:** Accepted, implemented. `turn-store::redact` (8 tests) plus three integration tests that write real SQLite files and search them for secrets.
+**Status:** Accepted, implemented. `turn-store::redact` plus integration tests that write real SQLite files
+and search them for secrets.
 
 ### Context
 
@@ -1758,18 +1765,38 @@ identical, and a short token looks like a word.
 
 ### Decision
 
-**The value of any key that looks like a credential is replaced before the row is built. The key is kept.**
-Matching is deliberately greedy — substring, case-insensitive — because redacting a variable called
-`MONKEY_MODE` because it contains `KEY` costs the user nothing, while missing one called `deploy_key` costs
-them a repository.
+**Every repository constructs its row from a safe durable projection.** The value of any key that looks
+like a credential is replaced and the key is kept. Every other free-text field is scanned for issuer-shaped
+credentials, JWTs and private-key blocks, including Workspace/Session/Layout/Template metadata,
+process/Agent fields, settings, Attention, Activity Preview and typed event/provenance JSON. Matching keys
+is deliberately greedy — substring, case-insensitive — because redacting a variable called `MONKEY_MODE`
+costs little, while missing one called `deploy_key` costs a repository.
+
+Redaction never changes typed ids or foreign keys. Filesystem roots and canonical checkout paths are
+authority-bearing structural identities: if scanning would change one, the repository rejects the write
+instead of silently fencing a different path. Raw hook bodies remain excluded entirely under ADR-040;
+pattern redaction is not permission to persist arbitrary source/prompt content.
 
 ### Consequences
 
 - The asymmetry is the design: over-redaction is free, under-redaction is a leaked credential.
 - Redaction happens **before the row is built**, not as a filter on the way out, so there is no code path
   that writes the value and hopes nothing reads it.
+- A redacted command, cwd or external conversation id remains useful as an explanation but cannot safely
+  relaunch, resume or correlate. The user/tool must provide a fresh operational value.
+- Byte-level tests plant the same recognisable token in every durable free-text field and scan SQLite plus
+  WAL after direct writes, the atomic runtime checkpoint, restart and pruning.
+- Migration 009 covers historical stores rather than only current writes. Its open-time maintenance
+  transaction classifies every schema `TEXT` column, redacts free text, refuses to mutate identities, then
+  uses `secure_delete`, checked WAL truncation and `VACUUM` before clearing its retry marker. A busy WAL,
+  structural credential or deduplication collision fails closed for explicit reconciliation.
+- **Downside:** the first open of a populated pre-v9 store performs an O(durable text) scan and a database
+  rebuild. It can therefore be noticeably slower and needs free disk space proportional to SQLite's
+  `VACUUM` requirements.
 - **Downside:** greedy substring matching will redact things users wanted to see, with no way to opt out per
   variable. `MONKEY_MODE=on` showing as redacted is confusing.
+- **Downside:** shape matching deliberately avoids entropy guesses. A credential with no recognised prefix
+  under an innocent key can still evade it; minimisation and raw-hook exclusion remain necessary.
 - **Resolved by ADR-040:** key/shape redaction cannot make arbitrary callback free text safe. Claude's
   adapter therefore emits only typed facts and provenance, never the callback body in `TurnEvent::raw`;
   `EventRepo` additionally refuses raw data from every `EventSource::Hook`, and migration 005 removes hook
@@ -1781,7 +1808,7 @@ them a repository.
 ## ADR-036 — Persist node metadata, never terminal history
 
 **Status:** Accepted, implemented for terminal persistence; narrowly amended by ADR-040 for bounded
-Activity Preview. `turn-store::repo::node`, 12 tests.
+Activity Preview. `turn-store::repo::node`; reproduce the current store suite.
 
 ### Context
 
@@ -1812,7 +1839,8 @@ process that holds it, and the rest is ephemeral by nature.
 
 ADR-040's exception is deliberately narrow. A preview contains normalised semantic status or one stable,
 sanitised line; it is redacted before persistence, bounded to 20 snapshots per node and 2,000 globally,
-and marked stale after restore until fresh activity arrives. Raw PTY bytes, the grid, prompts, spinners and
+and retains its original timestamp after restore. A distinct recovered/stale marker remains planned and
+must not be claimed by clients that only show the timestamp. Raw PTY bytes, the grid, prompts, spinners and
 unredacted hook payloads remain outside this exception.
 
 ### Consequences
@@ -1820,8 +1848,9 @@ unredacted hook payloads remain outside this exception.
 - Persistence stays small and cheap: a Session save is a few rows, not megabytes.
 - `external_id` is what makes resuming meaningful — the right answer to "bring my Agent back" is to resume
   the Agent's own conversation via its `--resume`-equivalent, not to redraw a picture of the old one.
-- The honest states have somewhere to come from: `Lifecycle::Reconnected` when re-attachment worked,
-  `Lifecycle::Lost` when it did not.
+- The honest states have somewhere to come from: the current daemon restore emits `Lifecycle::Orphaned`
+  when the stored runtime may remain but its PTY is unreachable, and `Lifecycle::Lost` when it cannot be
+  found. `Reconnected` remains reserved until a backend can prove reattachment; it is not emitted today.
 - **Downside:** a re-attached Pane starts with no history above the fold, compounding the same limitation
   replay already has (ADR-023). Users who expected tmux-like fidelity will notice.
 - **Downside:** re-attaching to a live process from metadata is not implemented anywhere yet, and matching a
@@ -2101,7 +2130,7 @@ committed PNGs, which makes the visual layer reviewable in CI — something the 
 ### Cells, not bytes — and the second VT emulator is gone
 
 The window does not receive an escape stream. The daemon already keeps an authoritative `vt100`-parsed
-screen per pane (ADR-009) — it must, because thumbnails and the output heuristics work with no client
+screen per pane (ADR-009) — it must, because on-demand previews and output heuristics work with no client
 attached — so the client consumes that directly and paints a grid of cells with their colours and
 attributes. `crates/turn-gui/src/cells.rs` holds `Grid`/`Cell`/`CellAttrs`/`Rgb` and the conversion from a
 parsed screen, asserted by `a_parsed_screen_becomes_the_grid_the_client_paints`,
@@ -2110,8 +2139,8 @@ parsed screen, asserted by `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_wide_glyph_from_a_real_stream_is_not_painted_twice`.
 
 The consequence is the one worth having: **there is no longer a second terminal emulator.** The webview
-frontend had two independent parsers of the same bytes — `vt100` in the daemon for heuristics and
-thumbnails, `xterm.js` in the window for the user — and every disagreement between them was a bug whose
+frontend had two independent parsers of the same bytes — `vt100` in the daemon for heuristics and its
+then-current thumbnail view, `xterm.js` in the window for the user — and every disagreement was a bug whose
 symptom was "the sidebar says one thing and the terminal shows another". That class of bug is now
 unrepresentable, because there is one parse and the client paints its result.
 
@@ -2231,14 +2260,23 @@ independent. Tree expansion and selection persist per stable UI `surface_id`; th
 are never broadcast as another window's selection.
 
 `SessionMode` is a closed enum with wire values `main_checkout`, `read_only` and `isolated_worktree`.
-Every primary checkout has at most one active `exclusive_write` lease, owned and arbitrated by the daemon.
+Every primary checkout has at most one unreleased blocking `exclusive_write` claim, owned and arbitrated by the daemon.
 Its semantic record is `workspace_id`, `session_id`, `checkout_id`, `mode`, `state`, `acquired_at` and
 `heartbeat_at`; implementation identifiers, fencing generations and release timestamps may support that
 contract but do not change it. The fencing generation is monotonic per canonical checkout path even if a
 Workspace or lease row is deleted and recreated; every non-released state remains blocking. A heartbeat
 timeout alone never transfers ownership. A second Session must
 focus the owner, use technically enforced read-only mode where available, create an isolated worktree, or
-cancel. Worktrees declare the shared resources they do not isolate.
+cancel. When the failed request came from a Template, the safe alternative carries only the original
+Template id and interpolation inputs: the daemon reloads the authoritative definition and preserves its
+Layout, commands, environment, Attention policy, tmux flag and naming. The client never flattens a
+`TemplateSummary` into guessed panes. Worktrees declare the shared resources they do not isolate.
+
+The checkout lease is not the daemon-instance boundary. Before SQLite, migrations or restore can run,
+`turnd` acquires a non-blocking operating-system lock on the canonical data directory. Socket ownership is
+checked separately, so configuring another socket cannot create a second cooperating owner of the same
+store and fence live leases while the first daemon still owns PTYs. The stable lock file is retained and the
+kernel releases the lock on process death; unsupported locking fails closed.
 
 The lease does not authorise an arbitrary launch directory. Session creation validates the Session cwd and
 all configured Pane cwds against the assigned canonical checkout before acquiring the lease or running init
@@ -2253,6 +2291,28 @@ carry relationship kind and confidence separately from the confidence that an ev
 starts in the background, never opens a Pane, changes Layout, steals focus or resolves attention. `Space`
 opens a cheap Quick Preview; `Cmd+Enter` explicitly creates a temporary pane. Closing a pane never stops
 the agent. A node without its own PTY opens Preview or Process Details, never a fabricated terminal.
+A temporary binding belongs to one live `surface_id`; another surface never sees it, and replacement
+connection, final disconnect or daemon restart expires it without changing the saved Layout or Agent.
+
+Typed input is not trusted display input. User-authored Workspace/Session/Template names containing
+control, C1, ANSI, bidi or invisible formatting are rejected so identity is never silently rewritten.
+Agent/process declarations from adapters or the OS are normalised and bounded before reducer, push,
+inspector and persistence; process argv has count, per-argument and aggregate caps. The raw supervisor
+snapshot remains available only for PID traversal/classification and never becomes navigation text.
+
+A worker callback that cannot yet be bound to a node retains its authenticated hook parent and optional
+tool-owned external id as a correlation scope. That parent is not presented as the subject. An explicit
+unknown id never falls through to the one different child currently visible, and an id-less resume only
+resolves the provisional flow under the same parent. Migration 007 persists this scope so restart does not
+broaden it to the Session.
+
+The same subject boundary governs lifecycle and focus. A runtime exit clears its exact demand and unresolved
+child scopes owned by that runtime, but not exact children that may still be alive; a declared child stop also
+retires its earlier parent/external-id scope. Every such mutation reaches SQLite and the queue projection.
+Deferred focus is valid only while that exact subject remains actionable, and mute/snooze/dismiss cancel the
+matching jump. Permission UI may show command, cwd and risk only after an exact node join; it never substitutes
+the primary Agent for a modern unresolved or stale worker identity. A node-less but Session-scoped demand
+raises that Session and its Workspace aggregate/queue without falsifying the parent Agent's primary state.
 
 The full normative model, migration, events, API and wireframe are in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`.
@@ -2290,6 +2350,8 @@ attention all need an identity that survives with no view.
 - Navigation reflects the domain directly at 3 or 30 Sessions; previews make background work legible
   without rendering every terminal.
 - Session creation becomes a conflict-capable operation and clients must present explicit alternatives.
+- A Template conflict retry is a separate typed operation so safe mode selection cannot silently collapse a
+  Coding Layout into the blank/shell fallback.
 - `ProcessNode.pane_id` migrates to a binding table; legacy single bindings remain readable through the
   migration only.
 - UI selection, pane focus and attention are separate persisted concepts and require explicit tests.
@@ -2302,3 +2364,72 @@ attention all need an identity that survives with no view.
   **grants no lease automatically**. Legacy Sessions start conservatively as unenforced read-only metadata
   until the daemon proves a sole viable writer or the user reconciles them. No process is launched, killed,
   moved or retroactively made safe by DDL.
+- Migration 007 adds optional parent/external-id columns to durable Attention. Existing rows retain null
+  scope, while new ambiguous worker demands deduplicate and resolve within their authenticated boundary.
+- Migration 008 records whether a demand truthfully survives owner exit and its demand kind; legacy entries
+  remain non-surviving instead of receiving guessed postmortem authority.
+
+---
+
+<a id="adr-041"></a>
+## ADR-041 — Runtime events checkpoint Session, event log and Attention in one transaction
+
+**Status:** Accepted, implemented for `Core::ingest`, with rollback and real-restart tests.
+
+### Context
+
+One normalised runtime event can change three durable projections at once: the Session tree/state (including
+a newly declared node, tombstone or preview), the append-only event log, and the Attention Queue. Writing
+those through three repository transactions allowed restart states that had never existed in memory: a
+permission event without its Agent, `YOUR TURN` without the event that caused it, or a stopped node whose
+old permission resurrected from the queue.
+
+Publishing UI pushes between those writes made the split externally visible as well as crash-visible. A
+client could be told an event was accepted even though the final queue write failed.
+
+### Alternatives considered
+
+**Keep independent repository writes and repair on restore.** Rejected. Restore cannot prove which of three
+partial records was intended, and heuristics must not invent authority after a crash.
+
+**Make the event log the only source of truth and replay every event.** Rejected for the MVP. It would turn
+all current Session/layout migrations into event migrations, replay high-volume history at startup and make
+per-surface UI state an awkward exception. The existing state-plus-audit model remains appropriate.
+
+**Checkpoint the complete affected projections in one SQLite transaction.** Chosen.
+
+### Decision
+
+After the reducer and Attention Manager accept a runtime event in memory, `turnd` calls one store boundary:
+
+```text
+save Session (row → layout/bindings → nodes/previews)
+→ append idempotent TurnEvent
+→ replace durable Attention Queue
+→ COMMIT
+→ publish event/tree/node/session/effects/queue to clients
+```
+
+The ordering is contractual: a Stop-before-Start event may create a node tombstone, so the referenced node
+must exist before the event foreign key is written; Attention is the projection produced by that same event
+and comes last. Any failure rolls back all three.
+
+No client push or focus/sound/notification effect is emitted before commit. A failed checkpoint creates a
+FIFO barrier: the unapplied later events wait behind it, the failed event is retried before periodic semantic
+work, and standalone Session/Attention flushes that could leak its in-memory state are refused until the
+barrier clears. Protocol requests retry the oldest checkpoint before dispatch and return `unavailable` while
+it remains blocked: reads cannot observe the uncommitted projection, and mutations cannot hitch a rejected
+change onto a later retry. Effects published after a successful checkpoint do not write the queue twice.
+
+### Consequences
+
+- Restart sees a possible complete state, never a cross-product of independent writes.
+- A referenced child declaration, its event and its demand can be proved with one rollback injection test.
+- Permission, process failure, postmortem Attention and Stop-before-Start tombstones are exercised through
+  a real daemon restart, not only repository mocks.
+- **Downside:** every semantic runtime event currently rewrites the small durable Attention Queue. This is
+  simple and correct at MVP scale; measured write amplification may justify a transactional delta later,
+  but not separate commits.
+- **Downside:** while SQLite remains unavailable the in-memory reducer is ahead of durable state and later
+  runtime events wait in memory. The hook ingress remains bounded and may drop rather than stall Agents;
+  explicit queue bounds/coalescing for a prolonged disk outage remain hardening work.

@@ -33,8 +33,11 @@ defence fails a test that says what was lost.
 
 ## 2. Trust boundaries
 
-**Trusted.** The user. The daemon process itself. The SQLite store's contents (it
-is Turn's own file, written by Turn). Anything the user typed into Turn's UI.
+**Trusted for authority.** The user's explicit intent and the daemon process itself. SQLite is Turn-owned,
+but rows still pass schema, identity and redaction validation on load: legacy builds, partial external
+tampering and copied hostile text are not trusted display or launch input. Text the user pastes is trusted
+as intent only where the UI makes that action explicit; it is still sanitised/redacted before chrome or
+durable storage.
 
 **Untrusted — this is the important list.**
 
@@ -82,7 +85,7 @@ decision, not a patch. §7 says what follows from this.
 ### 3.2 Agent output rendered as UI (`turn-pty/src/buffer.rs`)
 
 An agent controls its own stdout, and parts of that reach native chrome: session
-titles, tree labels, thumbnails, notifications, log lines.
+titles, tree labels, Activity/Quick Previews, notifications and log lines.
 
 - `is_display_safe` is the single policy for what may appear in text a human
   reads. It removes control characters (C0 **and** C1, so both `ESC` and the
@@ -97,8 +100,8 @@ titles, tree labels, thumbnails, notifications, log lines.
 - Titles are sanitised and capped to 200 characters **at the callback**, not on
   the way out: the parser buffers an OSC payload without a bound of its own, so a
   megabyte-long title would otherwise be retained per pane.
-- Screen rows get the same filter in `snapshot()`, so a thumbnail cannot render an
-  agent's output backwards.
+- Screen rows get the same filter in `snapshot()`, so an on-demand preview cannot
+  render an agent's output backwards.
 - OSC 52 is refused in **both** directions and counted: writes
   (`blocked_clipboard_writes`) and reads (`blocked_clipboard_reads`), the second
   being the exfiltration direction — answering it would put whatever the user last
@@ -122,7 +125,8 @@ together — before it can reach an event, a notification or a log line.
 
 Two special cases:
 
-- **Commands are filtered but never shortened** (`MAX_COMMAND_CHARS`, 4 KiB).
+- **Commands are filtered but never silently shortened** (`MAX_COMMAND_CHARS`, 4 KiB): an over-limit
+  permission command is refused as an unsafe semantic event rather than turned into an approvable excerpt.
   Truncating a command for display would hide its own tail, and the tail is where
   `&& rm -rf /` lives. The one-line `summary` *is* an excerpt; the approval UI is
   responsible for showing the full `command` field before the user decides.
@@ -169,12 +173,21 @@ Two rules, because either alone leaks:
    UUIDs and make the log useless. It will miss a credential with no distinctive
    shape, so it is a net under rule 1, not a replacement.
 
-Both rules run on the structured event kind before persistence. A Claude callback exists only as transient
-ingress while the adapter extracts typed facts; the resulting `TurnEvent` does not carry its body.
-`EventRepo` independently drops `raw` for every hook source, and migration 005 deletes callback bodies from
-databases written by older builds. Key/shape redaction cannot prove arbitrary free text safe, and a `Write`
-payload can contain an entire source file. Diagnostic persistence would require an explicit opt-in, a separate
-short-lived store and its own threat review; it is not part of the event log.
+The durable boundary applies these rules to every free-text projection, not only events: Workspace and
+Session metadata, Layout/Pane definitions, Templates, process/Agent metadata, settings, Attention,
+Activity Preview and event provenance. Repository writers create a redacted copy before constructing any
+row; ids and foreign keys remain byte-for-byte stable. A structural filesystem identity (`root`, checkout
+path or canonical path) is never silently rewritten: if it looks credential-shaped the write fails before
+SQLite, because redacting a fencing key would assign authority to a different path. Consequently a command,
+cwd or external conversation id restored as `[redacted]` is diagnostic only and may not be used to relaunch,
+resume or correlate without fresh user/tool input.
+
+A Claude callback exists only as transient ingress while the adapter extracts typed facts; the resulting
+`TurnEvent` does not carry its body. `EventRepo` independently drops `raw` for every hook source, and
+migration 005 physically deletes callback bodies from databases written by older builds. Key/shape
+redaction cannot prove arbitrary free text safe, and a `Write` payload can contain an entire source file.
+Diagnostic persistence would require an explicit opt-in, a separate short-lived store and its own threat
+review; it is not part of the event log.
 
 Adapters still minimise before any transient diagnostic rendering: members that carry bulk content rather
 than state — `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`, … — are dropped, the remainder
@@ -196,6 +209,16 @@ durable product state.
 - Reads are capped at 256 KiB from stdin and 64 bytes from the response.
 
 ### 3.7 Checkouts and write leases
+
+Before the store can enforce any checkout lease, the daemon must be the only process allowed to mutate that
+store. `turnd` canonicalises `data_dir` and acquires a non-blocking exclusive lock on its stable
+`.turnd.lock` inode before opening SQLite, applying migrations or running restore. Socket ownership remains
+an independent boundary: choosing another socket cannot create another store owner. The lock file is opened
+without following symlinks, retained across clean shutdowns, and its device/inode identity is verified while
+acquiring; the kernel releases the lock if the process dies. Failure or an unsupported filesystem is fatal,
+because best-effort exclusion would let a second restore fence a live daemon's leases while it still owns
+PTYs. This is an advisory local-filesystem boundary between cooperating Turn daemons, not protection against
+the same account deliberately unlinking or replacing the lock inode.
 
 The protected resource is a **canonical checkout path**, not a Workspace name, UI window or the spelling of
 `cwd`. The store maintains a global monotonic fence per canonical path, so deleting/recreating a Workspace
@@ -244,14 +267,16 @@ only display state and never destroys provenance.
 
 Relationship meaning and relationship confidence are stored separately from event confidence. An explicit
 process-table observation can still produce only an inferred edge. The GUI never promotes confidence or
-accepts an unconstrained move; user correction is same-Session, cycle-checked and audited with old/new edge.
+accepts an unconstrained move. Domain relinking is same-Session/cycle-checked; the daemon-authoritative,
+old/new-edge audited correction API remains planned and must not be simulated locally.
 
 Activity Preview is an especially tempting exfiltration channel because it persists in navigation chrome.
 The pipeline accepts semantic status first and at most one stable rendered line as fallback; strips ANSI,
 control/bidi/invisible characters and carriage-return rewrites; rejects prompts, spinners and repeated noise;
 redacts known secrets; caps text; and records provenance. Raw PTY bytes, terminal grid, prompt bodies and raw
 hook payloads never enter the preview table. Retention is 20 snapshots per node and 2,000 globally, and a
-restored preview is marked stale until fresh activity arrives.
+restored preview keeps its original timestamp. The current UI still lacks a distinct recovered/stale marker,
+so clients must not reinterpret that timestamp as fresh activity.
 
 ### 3.9 Per-surface state and Pane bindings
 
@@ -263,6 +288,12 @@ A `PaneNodeBinding` must name a Pane and node in the same Session. One Pane bind
 have many views. Opening a Pane is an explicit UI action. A semantic-only subagent with no independent PTY
 can expose Preview/Process Details but never a terminal/write capability. Closing a binding is not process
 termination, and no binding operation changes checkout ownership.
+
+A temporary binding is ephemeral ownership of one live `surface_id`, not restored Layout. Hierarchy
+snapshots expose it only to that surface. The first client that bootstraps a surface replaces any older
+connection and clears the old temporary binding before receiving its snapshot; disconnect and daemon
+restart clear it as well. Tree expansion/selection still persist. This prevents a reconnected UI from
+showing a `TEMP PANE` marker it cannot focus, while leaving the Agent and saved Layout untouched.
 
 ## 4. Product invariants, defended as security properties
 
@@ -285,6 +316,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 
 | Required invariant | Required proof |
 | --- | --- |
+| One canonical data directory has one daemon owner | different sockets and symlink aliases are rejected before Store/restore; a real `SIGKILL` releases the kernel lock and stale socket recovery succeeds |
 | One canonical checkout has one blocking write claim globally | concurrent acquisition through path aliases and recreated Workspaces yields exactly one owner |
 | Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
@@ -292,11 +324,21 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | A launch cwd stays in its assigned checkout | adversarial daemon tests cover Workspace A→B absolute paths, `../../`, symlink escapes, worktree Pane→primary and a stored Layout rechecked at the final PTY boundary |
 | Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
 | Preview/event stores no source/secret | `turn-store/tests/secrets_never_reach_the_disk.rs::no_secret_value_is_present_anywhere_in_the_files_on_disk` scans the database and WAL for seeded preview credentials and non-redactable Claude-hook free text; `upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal` proves migration 005 scrubs older files too |
+| Ambiguous worker Attention never broadens on restart | an unknown explicit worker id remains node-less under its authenticated parent; two parent runtimes resolve only their own durable parent/external-id scope |
+| Permission detail never crosses subjects | scoped node-less and stale exact queue entries cannot borrow the primary Agent's command/cwd/risk; Sessions-before-tree resolves the primary only by matching node id |
+| Deferred focus cannot borrow a sibling demand | snooze, dismiss, mute and lifecycle resolution cancel the matching subject's deferred jump; `tick` requires that exact subject to remain actionable |
+| Continuous typing never looks idle to the daemon | a bounded client heartbeat refreshes `last_keystroke_ms` before typing grace expires without sending per-character traffic |
 | UI state is surface-isolated | selection from surface A is neither returned nor pushed as selection for surface B |
 | A Pane cannot acquire runtime authority | closing/duplicating a binding neither stops the node nor changes its lease |
+| A temporary Pane cannot become a phantom after reconnect | another surface never sees its binding; replacement connection, disconnect and daemon restart remove only the temporary binding while the node keeps running |
+| Runtime projection is crash-consistent | an injected Attention write failure rolls back Session, referenced node, event and queue; permission/failure/tombstone restart tests observe only committed combinations |
+| Untrusted hierarchy text cannot forge or exhaust navigation | Workspace/Session/Template APIs reject C0/C1/ANSI/bidi/zero-width names; discovered Agent/process fields are sanitised and character/argv bounded before state, push and SQLite; restore and inspector tests assert the same projection |
+| Durable free text cannot retain a recognisable credential | the byte-level DB/WAL suite plants one token in every durable free-text field and verifies redaction across direct saves, the atomic runtime checkpoint, restart and pruning; structural filesystem identities fail rather than mutate |
+| Legacy durable bytes receive the same boundary | a v8 fixture seeds every classified `TEXT` route, migration 009 redacts it transactionally, `secure_delete`/`VACUUM` plus checked WAL truncation remove physical remnants, and real busy-WAL/reopen tests prove the marker retries; structural credentials and correlation collisions fail closed |
 
-Turn never relaunches anything: `SessionRepo::load_for_restore` downgrades every
-stored `Alive` to `Orphaned`, and the UI offers rather than acts.
+Turn never relaunches automatically during restore: `SessionRepo::load_for_restore` downgrades every
+stored `Alive` to `Orphaned`, and the UI offers rather than acts. Only the user's explicit node-addressed
+`RelaunchNode` request may cross that boundary.
 
 ## 5. Fixed in this audit
 
@@ -429,47 +471,36 @@ Workspace declares them and the conflict choice shows them. Calling the mode “
 process or credential isolation.
 
 **Read-only enforcement varies by platform/tool.** When Turn cannot install a technical guard, the Session
-may still be useful for review, but it is explicitly `read_only_enforced=false`, cannot acquire the primary
-write lease and must ask before any write-capable relaunch. Hiding that limitation is not accepted.
+remains explicit `read_only_enforced=false`, cannot acquire the primary write lease and cannot launch a
+process; a future write-capable escalation must be explicit. Hiding that limitation is not accepted.
 
-## 8. Reported, not fixed
+## 8. Remaining audit follow-ups
 
-Outside the files this audit was scoped to change. Each has a specific fix.
+The earlier database-permission and daemon-label findings are closed. The data directory is restricted to
+`0700`, SQLite and its sidecars to `0600`, and
+`the_database_and_its_sidecars_are_readable_only_by_their_owner` covers it. Typed ingress is not assumed
+safe: navigation names are rejected at the API boundary, while process/Agent metadata is normalised and
+bounded before reducer, protocol or store. The remaining boundaries are:
 
-1. **The database file is world-readable.** `turn-store/src/location.rs` —
-   measured on macOS with `umask 022`: `turn.db` at `0644` inside a data directory
-   at `0755`. It contains commands, working directories, prompt excerpts and
-   assistant-message excerpts. `~/Library` is `0700` on macOS so the exposure is
-   currently indirect there, but `~/.local/share` is commonly `0755` on Linux.
-   *Fix:* `ensure_dir` should create with mode `0700`, and `Store::open_at` should
-   `set_permissions(0o600)` on the file after opening. Worth a test asserting both,
-   next to the existing `secrets_never_reach_the_disk.rs`.
-2. **`turnd` renders payload-authored strings as labels.** `core/events/tree.rs`
-   assigns `node.title = agent_type` and `agent.external_id = agent_id` straight
-   from the event. Those are now filtered and validated in the adapters, so the
-   daemon is safe today — but the daemon should not depend on that. Any *other*
-   process-derived string it puts in a label (a `ProcessSpawnedChild.command` read
-   from the process table, for instance) should go through
-   `turn_pty::sanitise_label`, which is exported for exactly this.
-3. **`turnd` runs the workspace start-up command through a shell.**
+1. **`turnd` runs the workspace start-up command through a shell.**
    `core/spawn.rs` builds `$SHELL -c <command>`, which is correct for a
    user-authored init command and a command-injection vector for anything that is
    not. *Requirement:* templates and workspaces must only ever come from the user
    or the store — never auto-loaded from a file inside a repository — and the UI
    must show the command before it runs. If repository-provided templates are ever
    wanted, that decision needs its own review.
-4. **The UI must show the full command before an approval.** `AgentPermissionRequired`
+2. **The UI must show the full command before an approval.** `AgentPermissionRequired`
    carries both a one-line `summary` (an excerpt) and the full `command`. An
    approval banner that shows only the summary can be made to hide the dangerous
    half of a long command.
-5. **Codex's hook `command` value is run through a shell** — confirmed live and
+3. **Codex's hook `command` value is run through a shell** — confirmed live and
    documented in `codex.rs`, which POSIX single-quotes the helper path and *then*
    TOML-escapes it. That order is load-bearing and easy to lose: the TOML parser
    unwraps its layer first, and the shell sees what is left. Any future value
    interpolated into that config needs both layers, in that order. Reviewed and
    correct as written; noted here because it is the one place in the launch path
    where a shell is genuinely involved.
-6. **`HookStats::overloaded` and `timed_out` deserve to be surfaced.** A non-zero
+4. **`HookStats::overloaded` and `timed_out` deserve to be surfaced.** A non-zero
    `refused` or `overloaded` means something on this machine is posting to Turn
    without a valid token or opening sockets it does not use. That is exactly the
    kind of thing a user should be able to see.

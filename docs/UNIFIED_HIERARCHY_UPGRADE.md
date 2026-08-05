@@ -1,6 +1,6 @@
 # Turn — Unified hierarchy upgrade
 
-**Status:** normative, accepted, implementation target for the first vertical.  
+**Status:** normative, accepted, implemented and audited for the first vertical.
 **Precedence:** this document supersedes earlier navigation, simultaneous-session and automatic-subagent-pane decisions wherever they conflict. See ADR-040.
 
 ## Product invariant
@@ -30,7 +30,7 @@ pane does not start or stop its AgentNode.
 ```text
 Workspace 1 ── * Checkout
     │             └── Primary or Worktree; declares shared resources
-    ├── 0..1 active WorkspaceWriteLease for the primary checkout
+    ├── 0..1 unreleased blocking WorkspaceWriteLease claim for the primary checkout
     └── * Session
           ├── mode: MainCheckout | ReadOnly | IsolatedWorktree
           ├── checkout_id / cwd / branch / layout
@@ -50,21 +50,40 @@ Normalised ownership stays explicit: `Session.workspace_id`, `ProcessNode.sessio
 - `read_only`: review/research against the primary checkout. Turn must use a technical guard when viable and must require explicit escalation before a write-capable relaunch.
 - `isolated_worktree`: independent path and branch. It may write concurrently, but Turn warns about declared shared ports, containers, databases, caches, credentials and services.
 
-An active second main-checkout session is a conflict, never a silent success. Creation must return the current owner and the alternatives: focus it, create read-only, create an isolated worktree, or cancel.
+An active second main-checkout session is a conflict, never a silent success. Creation must return the
+current owner and the alternatives: focus it, create read-only, create an isolated worktree, or cancel. If
+the failed creation came from a Template, the safe retry retains only its Template id and interpolation
+inputs; the daemon re-instantiates authoritative Layout, commands, environment, Attention, tmux, name and
+cwd rules. Read-only launches no process without enforcement, while worktree cwd values are mapped to the
+equivalent repository-relative directory in the isolated checkout.
 
 ```text
 WorkspaceWriteLease
   id, workspace_id, session_id, checkout_id
   mode = exclusive_write
-  state = active | released | stale
-  acquired_ms, heartbeat_ms, released_ms?
+  state = active | recovery_required | stale | released
+  acquired_ms, heartbeat_ms, released_ms?, generation
 ```
 
-SQLite enforces at most one active `exclusive_write` lease per workspace/checkout with a partial unique index. The daemon owns acquisition, heartbeat and release. A stale lease is never stolen solely because a timer elapsed: Turn first proves that its owning session cannot still be live, or asks the user.
+SQLite and the daemon transaction enforce one canonical writer namespace per checkout. Every non-released
+lease blocks acquisition; the fencing generation remains monotonic even if a Workspace is deleted and
+recreated. The daemon owns acquisition, heartbeat and release. A new daemon first changes every unreleased
+lease to `recovery_required`; loading the former Session never adopts it. A stale or recovery lease is never
+stolen solely because a timer elapsed: release and reacquisition remain explicit and fenced.
+
+Checkout leases assume one store owner. Before opening SQLite, applying migrations or restoring Sessions,
+the daemon acquires an exclusive process lock on the canonical data directory. Socket paths are only control
+endpoints and do not define store ownership: a second daemon using another socket or a symlink alias is
+refused before it can fence live leases. Process death releases the kernel lock; the stable lock file itself
+is never removed.
 
 ### AgentNode independent of Pane
 
-`ProcessNode` remains the persisted runtime identity; an agentic node gains the complete AgentNode fields. It exists without a pane, owns its event stream and retained terminal buffer, and may have zero, one or several pane bindings. Panes are views. `ClosePane(KeepProcesses)` removes only a binding; terminating an agent remains a separate explicit request.
+`ProcessNode` remains the persisted runtime identity; an agentic node gains the complete AgentNode fields.
+It exists without a Pane and may have zero, one or several Pane bindings. Events and daemon runtime state
+are correlated by its `NodeId`; only a PTY-backed node has a daemon-owned `PtyProcess` and terminal buffer,
+while a semantic subagent normally has neither. Panes are views. `ClosePane(KeepProcesses)` removes only a
+binding; terminating an Agent remains a separate explicit request.
 
 Agent naming is lossless:
 
@@ -79,7 +98,28 @@ user_renamed: bool
 
 Priority is explicit parent name, hook/integration name, structured task, process title, high-confidence inference, then `Subagent N`. A user rename changes only `display_name` and `user_renamed`.
 
+Typed input is not trusted display input. Workspace, Session and Template names containing C0/C1, ANSI,
+bidi or invisible formatting are rejected so identity is never repaired silently. Discovered Agent/process
+names, task, command, cwd, title and structured argv are sanitised and bounded before state, protocol,
+inspector and persistence. Raw OS metadata remains transient for PID traversal/classification only.
+
 Parent edges carry both meaning and confidence. `spawned_by` is not synonymous with certainty; inferred edges remain visibly provisional and can be corrected.
+
+When a worker callback arrives through an authenticated parent endpoint without a resolvable node, Turn
+persists the Attention subject as `(session_id, parent_node_id, external_worker_id?)`. The parent is a
+correlation boundary, not a claim that the parent itself asked. An explicit unknown worker id never falls
+through to a different unique child, and an id-less response under one parent cannot clear an unresolved
+demand under another parent in the same Session. A later declaration may bind the same external id; a
+subsequent callback for that id then correlates to the exact node and resolves the provisional scope.
+Declaration alone does not silently acknowledge a pending demand. Terminal lifecycle uses a separate ownership rule: the exact child
+and its matching pre-declaration scope are retired together, while a dead parent clears unresolved scopes
+anchored on that runtime without erasing exact children that may still be alive. Every live cleanup is
+persisted and projected before restart can resurrect stale Attention.
+
+Permission detail follows identity, never Session proximity. A client may show command, cwd and risk only
+for the exact `node_id` (including an exact primary-Agent summary received before the tree). A scoped
+node-less demand or stale exact id remains provisional in the queue and never borrows the primary Agent's
+pending permission.
 
 ## Activity preview
 
@@ -95,17 +135,30 @@ ActivityPreview
 
 Source priority is semantic event, adapter state, detected relevant action, stable rendered line, process fallback. Normalisation strips ANSI/control sequences, resolves carriage-return rewrites, rejects spinners/prompts/repeated noise, preserves Unicode, applies known-secret redaction and caps the result at a safe character boundary.
 
-Updates are coalesced rather than byte-driven: visible active nodes at most every 250–500 ms, visible background nodes every 1–2 s, collapsed nodes only on semantic changes, archived nodes never. The persisted last preview lets the tree return immediately after a UI restart. Preview history is bounded to 20 entries per node and 2,000 globally, pruned on write; no raw PTY bytes, terminal grid or scrollback are stored. Visibility may be disabled globally, per Session or per Agent.
+Updates are coalesced rather than byte-driven. The current daemon samples watched PTY-backed nodes at a
+500 ms interval and unwatched ones at 1.5 s, suppresses archived Sessions, and emits semantic changes
+immediately; byte traffic never maps one-for-one to UI updates. Expansion-aware suppression for collapsed
+nodes and the wider semantic source ladder remain planned. The persisted last preview lets the tree return
+immediately after a UI restart. Preview history is bounded to 20 entries per node and 2,000 globally,
+pruned on write; no raw PTY bytes, terminal grid or scrollback are stored. The product requires global,
+per-Session and per-Agent visibility controls; protocol v3 currently enforces the per-node Agent control,
+while the broader scopes remain planned rather than client-local guesses.
 
 Quick Preview is an overlay driven by the selected node. `Space` opens it without changing layout, session, pane focus, process state or OS focus. It contains stable preview history and can promote the node to an explicit pane action. `Esc` closes it.
+
+A temporary Pane is scoped to one live UI `surface_id`. Another surface never sees its binding. A
+replacement connection, the last disconnect and a daemon restart remove that temporary binding before a
+new hierarchy snapshot is built; expansion/selection, permanent Layout bindings and the Agent survive. This
+is intentionally different from restoring a user-saved Pane: an ephemeral view without its owning UI would
+be an unfocusable phantom.
 
 ## State machines
 
 Agent runtime state remains the existing two-dimensional model:
 
 ```text
-Lifecycle: Spawning → Alive ↔ Reconnected
-                 ├──────→ Orphaned → Reconnected | Lost
+Lifecycle: Spawning → Alive
+                 ├──────→ Orphaned → Lost
                  └──────→ Exited(code) | Signaled(signal) | Stopped(signal)
 Turn:      Idle → Active ↔ AwaitingUser(reason)
                   ├────→ Done → Active
@@ -114,7 +167,18 @@ Turn:      Idle → Active ↔ AwaitingUser(reason)
             any state may degrade to Unknown when no adapter can vouch for it
 ```
 
-The visible state is a daemon-derived projection with this precedence: `FAILED`, `PERMISSION`, `YOUR TURN`, `WAITING`, `RUNNING`, `DONE`, `STOPPED`, `IDLE`, `UNKNOWN`. Completing a turn does not imply process exit. Process exit clears pending permissions/questions and resolves attention for that node.
+`Reconnected` remains a reserved lifecycle value for a backend that can prove PTY reattachment; the current
+daemon-restart path deliberately emits only `Orphaned` or `Lost`. Reconnecting a UI to the same live daemon
+reattaches a view and does not change the runtime lifecycle.
+
+Node state is a daemon-derived projection whose actual labels include `starting`, `RUNNING`, `WAITING`,
+`PERMISSION`, `QUESTION`, `turn done`, `DONE`, `FAILED`, `STOPPED`, `IDLE` and `UNKNOWN`. `YOUR TURN` is the
+Session/Attention label, not a replacement for an Agent's exact
+`WAITING` or `PERMISSION` state. A Session may therefore say `YOUR TURN` while its exact child still says
+`WAITING`, and a scoped unresolved demand may badge the Session while the parent Agent remains `RUNNING`.
+Completing a turn does not imply process exit. Process exit clears pending permissions/questions, the exact
+node's Attention and unresolved child scopes owned by that runtime; it does not clear exact live siblings or
+children.
 
 Session aggregate state is derived from every node plus pending attention. Session lifecycle/mode is independent:
 
@@ -126,13 +190,19 @@ Active ↔ Paused → Archived
 
 ## Events
 
-All events retain timestamp, workspace/session/node/parent identity, source, confidence, severity, payload, deduplication key and optional redacted raw source. Add these stable names:
+The accepted event model reserves these stable names:
 
 - `workspace.write_lease_requested`, `.acquired`, `.denied`, `.released`
 - `session.read_only_created`, `session.worktree_created`
 - `agent.declared`, `.renamed`, `.spawned`, `.relationship_discovered`, `.relationship_corrected`
 - `agent.preview_updated`, `.preview_redacted`, `.pane_opened`, `.pane_closed`
 - Client audit records `tree.node_expanded`, `.node_collapsed`, `.node_selected`
+
+This list is not a claim that every name is an `EventKind` in the current build. Runtime `agent.spawned` is
+implemented as a `TurnEvent`; previews, Pane bindings, leases and per-surface tree state currently use their
+dedicated typed records/pushes. The `workspace_audit_events` schema reserves pre-Session audit storage, but
+its complete repository/emission path and the remaining rename/correction audit names are planned. A client
+must not fabricate them locally.
 
 `agent.spawned` creates or updates an AgentNode under its reported parent, preserves a name only when the
 parent/integration actually declared one, starts preview tracking and pushes a tree change. Claude/Codex
@@ -143,6 +213,21 @@ Runtime `TurnEvent` keeps its required Session identity. Lease request/denial be
 tree expansion/selection are persisted in dedicated audit/UI-state records rather than forged into a
 session-scoped agent event. Lease acquisition/release may emit a `TurnEvent` only once an owning Session
 exists; the canonical lease record remains the lease table.
+
+Every durable free-text field is scanned before SQL, including typed event/provenance JSON, Session tree,
+Layout/Template, Attention and preview state. Typed ids/FKs are immutable. Workspace/checkout filesystem
+identities fail instead of being rewritten when scanning would alter them; a redacted operational value is
+not eligible for silent relaunch, resume or correlation.
+
+An accepted runtime event crosses one durable boundary before any client sees it:
+
+```text
+Session tree/layout/preview → event log → Attention Queue → COMMIT → UI pushes/effects
+```
+
+A failure rolls the complete checkpoint back and places later runtime events behind a FIFO retry barrier.
+This prevents restart from combining a permission with a missing Agent, a tombstone with no Stop event or a
+resolved runtime with stale Attention.
 
 ## Internal APIs
 
@@ -161,7 +246,8 @@ Preview: SubscribeActivityPreviews, GetActivityPreview, GetPreviewHistory,
 Pane:    OpenNodeAsPane, OpenNodeAsTemporaryPane, FocusPaneForNode,
          ClosePane, ListPanesForNode
 Lease:   AcquireWorkspaceWriteLease, ReleaseWorkspaceWriteLease,
-         GetWorkspaceWriteLease, CreateReadOnlySession, CreateWorktreeSession
+         GetWorkspaceWriteLease, CreateReadOnlySession, CreateWorktreeSession,
+         CreateReadOnlySessionFromTemplate, CreateWorktreeSessionFromTemplate
 ```
 
 Implemented members are exposed as request/response pairs and revisioned full-snapshot pushes. A client
@@ -187,7 +273,13 @@ Existing Sessions migrate conservatively. Migration 003 creates no lease and cho
 every pre-existing Workspace and every non-released legacy claim as requiring explicit reconciliation;
 neither database open nor daemon launch may clear that gate or acquire authority as a side effect. Until
 the audited reconciliation action is implemented, those upgraded Workspaces remain deliberately
-fail-closed rather than being assigned to the “most recent” Session. No worktree is invented. Existing
+fail-closed rather than being assigned to the “most recent” Session. Migration 007 adds optional
+`parent_node_id` and `subject_external_id` columns to durable Attention entries so restart preserves an
+unresolved callback's narrow scope; legacy rows receive nulls and no inferred owner. Migration 008 adds
+`survives_owner_exit` and `demand_kind`, keeping legacy rows as non-surviving interactions while allowing
+turn/task completion and failure evidence to remain actionable after the runtime exits. Migration 009 marks
+legacy durable text for a retryable physical credential purge; structural ids and fencing paths are validated
+and never rewritten, while SQLite/WAL are rebuilt before the marker is cleared. No worktree is invented. Existing
 `pane_id` values become rows in `pane_node_bindings`. Existing `Relation::Confirmed` maps to
 `spawned_by/explicit`; `Inferred` maps to `spawned_by/inferred_high`; `Unknown` remains unknown. Existing
 agent titles become display names, with no fabricated declared name. No process is launched, killed,
@@ -227,7 +319,8 @@ the list remains so a future refactor does not reintroduce them:
 
 1. `turn-gui::view` renders only a flat Session sidebar; Workspaces and process nodes are absent.
 2. The Attention Queue is a second persistent right navigation panel, while the right side must become an optional contextual inspector. Queue ordering remains a logical service and `Next Attention` command, with non-navigation UI on demand.
-3. `ToggleSessionOverview` and the thumbnail grid duplicate Sessions outside the tree. They are removed from persistent navigation.
+3. `ToggleSessionOverview` and its hidden thumbnail feed duplicate Sessions outside the tree and consume
+   background rendering work. The command, shortcut, feed, repaint cadence and module are removed, not hidden.
 4. `ToggleAgentTree` assumes an optional second tree. The unified tree is always the navigation source.
 5. `ProcessNode.pane_id: Option<PaneId>` cannot express zero-to-many views and couples node lifetime to one view.
 6. Session creation and duplication do not arbitrate checkout ownership.
@@ -247,8 +340,11 @@ test in step 9 remains pending.
 4. Add naming/relationship/preview ingestion. Preserve background AgentNodes independently of panes.
 5. Add unified hierarchy protocol/view and full-replacement pushes; keep old list endpoints only as non-navigation compatibility until protocol v3 is adopted.
 6. Replace the GUI sidebar/queue/overview/second-tree assumptions with the unified tree, contextual inspector and keyboard model.
-7. Add Quick Preview and temporary pane binding. Closing it removes the binding only.
-8. Restore tree UI state, relations, preview, bindings and live processes without opening a new pane.
+7. Add Quick Preview and a surface-scoped temporary pane binding. Closing it removes the binding only.
+8. Reconnect a replacement UI to the live daemon with tree UI state, relations, previews, permanent
+   bindings and live processes intact, without opening a new Pane; expire temporary bindings before a new
+   surface bootstrap. On daemon restart, restore the same durable metadata but report runtimes as
+   `Orphaned`/`Lost`; do not claim PTY reattachment.
 9. Demonstrate the vertical with a deterministic fixture adapter, then run a manual Claude Code smoke test when the CLI and credentials are available.
 
 ## Reproducible vertical acceptance
@@ -264,16 +360,20 @@ create workspace
 → ingest noisy ANSI/CR preview bytes and assert one stable redacted preview
 → request Quick Preview and temporary Preview/Details pane explicitly
 → close temporary pane and assert Reviewer remains alive
-→ restart Store/daemon/client model
-→ assert tree edge, name, preview, lease and process metadata remain
+→ restart the UI client while the same daemon remains alive
+→ assert tree edge, name, preview, lease and live runtime remain
 → assert no new pane was opened during restore
+→ separately restart the daemon and assert durable metadata remains, runtimes are Orphaned/Lost,
+  and nothing is relaunched automatically
 ```
 
 The deterministic Reviewer fixture has a semantic stream but no independent PTY, matching Claude Code's
 current subagent hook contract. Its temporary pane therefore renders Preview/Details; a terminal pane is
 only offered when an integration supplies a real attachable stream.
 
-Separate GUI tests verify tree keyboard semantics, selection/focus/attention independence and snapshots at ordinary and dense (30-agent) sizes.
+Twenty native GUI tests verify tree keyboard semantics and selection/focus/attention independence; twelve
+of them maintain committed PNG baselines, including an ordinary desk and a dense 30-Session tree. This is
+not a measured 30-Agent performance claim.
 
 Reproduce the vertical and the native UI evidence with:
 
@@ -281,6 +381,15 @@ Reproduce the vertical and the native UI evidence with:
 cargo test -p turnd --test agents \
   the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart \
   -- --exact --test-threads=1 --nocapture
+cargo test -p turnd --test agents \
+  an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer \
+  -- --exact --test-threads=1 --nocapture
+cargo test -p turnd \
+  two_hook_parents_keep_out_of_order_and_idless_attention_in_their_own_scopes \
+  -- --test-threads=1 --nocapture
+cargo test -p turnd \
+  a_data_directory_rejects_another_socket_and_recovers_after_sigkill \
+  -- --test-threads=1 --nocapture
 cargo test -p turnd --lib \
   core::requests::hierarchy::tests::the_reviewer_vertical_survives_a_ui_restart_without_changing_layout \
   -- --exact --test-threads=1

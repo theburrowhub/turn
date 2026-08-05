@@ -1,7 +1,7 @@
 //! The terminal grid: a pane's screen as cells, and the form it travels in.
 //!
 //! A pane's screen crosses this boundary as cells rather than as an escape-code
-//! stream, because the daemon has already parsed it — it must, since thumbnails and
+//! stream, because the daemon has already parsed it — it must, since previews and
 //! the output heuristics work with no client attached. The types are deliberately
 //! dumb: they store what to draw and answer questions about geometry, and they decide
 //! nothing.
@@ -51,7 +51,7 @@
 //!
 //! Screen cells are the terminal's own contents and are passed through as the program
 //! wrote them. That is deliberate and it is the opposite of the rule for labels: a
-//! title or a thumbnail line goes through `turn_pty::sanitise_label`, because those
+//! title or an Activity Preview line goes through `turn_pty::sanitise_label`, because those
 //! end up in Turn's chrome where a direction override could make text lie about
 //! itself. Inside a pane the client paints cell by cell, so no cell can reorder its
 //! neighbours, and stripping characters would mean a terminal that does not show what

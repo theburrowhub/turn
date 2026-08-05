@@ -82,7 +82,8 @@ pub enum RestoreBehaviour {
     /// offer a button. The safe default: never re-runs anything by itself.
     #[default]
     ReattachOnly,
-    /// Safe to re-run unprompted (a shell, a file browser).
+    /// Eligible to offer for an explicit relaunch (a shell, a file browser).
+    /// The restore path never treats this metadata as launch authority.
     Relaunch,
     /// Do not restore at all.
     Skip,

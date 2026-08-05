@@ -24,32 +24,45 @@ Turn is not an agent, not a model client and not a chat interface. It supervises
 
 ## Current state, honestly
 
-**The daemon and the library crates exist and their tests pass. The window is being rebuilt from scratch,
-and Turn has still not been shown to run end to end against a real agent.** That is the honest summary: the
-first frontend was finished and rejected (ADR-039), the second one currently draws chrome and nothing else,
-and the moment where one real Claude Code session drives one real pane in a running window has not been
-reached — see `ROADMAP.md` §M6 and §M7.
+**The upgraded first vertical is implemented and covered end to end by deterministic tests.** The native
+window consumes the production daemon protocol and presents one Workspace → Session → Agent/Tool →
+Child hierarchy, user-chosen panes, background subagents, activity previews, temporary panes, a contextual
+inspector and the Attention Queue. The Reviewer scenario crosses the real loopback Claude hook transport,
+the production daemon/store boundary and a UI reconnect to that same live daemon without opening a Pane or
+changing the saved Layout. Separate daemon-restart tests restore durable metadata as `Orphaned`/`Lost` and
+prove that nothing is relaunched; they do not claim PTY reattachment.
+Primary-checkout conflicts are typed: a Template-origin request can focus the owner or create read-only /
+worktree variants without flattening the Template in the client. The daemon preserves its complete Layout,
+environment, Attention policy, tmux and naming intent; worktree cwd values are remapped into the isolated
+checkout. A read-only Session launches only behind a technical guard; when Turn cannot apply one, launch
+remains blocked and model instructions alone never count as enforcement.
+
+That is not the same claim as a released product. Nobody has yet accepted the complete scenario with an
+authenticated, currently installed Claude Code binary inside the packaged native app. Packaging,
+performance measurement, manual VoiceOver/Orca acceptance, terminal IME sign-off and broader integration
+coverage remain open — see `ROADMAP.md` §M8 and §M9.
 
 | Crate | What it is | Status |
 | --- | --- | --- |
-| `turn-core` | Domain, two-axis state model, event vocabulary, attention subsystem | Built, 120 tests |
-| `turn-proto` | The daemon↔client protocol: envelope, framing, requests, pushes, cells, view models | Built, 172 tests |
-| `turn-store` | SQLite persistence, migrations, secret redaction, seven repositories | Built, 140 tests |
-| `turn-pty` | Ptys, bounded terminal buffers, process supervision | Built, 47 tests |
-| `turn-hook` | Zero-dependency helper for tools that shell out instead of POSTing | Built, 21 tests |
-| `turn-agents` | Adapter layer (Claude Code, Codex, heuristics), registry, loopback hook server | Built, 169 tests |
-| `turnd` | The daemon that assembles all of the above | Built, 88 tests |
-| `turn-gui` | The window: native Rust drawn on the GPU, no webview | In progress, 80 tests |
+| `turn-core` | Domain, two-axis state model, event vocabulary, attention subsystem | Built; reproduce its suite |
+| `turn-proto` | The daemon↔client protocol: envelope, framing, requests, pushes, cells, view models | Built; protocol v3 |
+| `turn-store` | SQLite persistence, migrations, secret redaction and hierarchy repositories | Built; append-only migrations |
+| `turn-pty` | Ptys, bounded terminal buffers, process supervision | Built |
+| `turn-hook` | Zero-dependency helper for tools that shell out instead of POSTing | Built |
+| `turn-agents` | Adapter layer (Claude Code, Codex, heuristics), registry, loopback hook server | Built |
+| `turnd` | The daemon that owns PTYs, Sessions, hierarchy, leases and Attention | Built for the automated vertical |
+| `turn-gui` | Native GPU window with the unified hierarchy and terminal panes | Built for the automated vertical |
 
-**`cargo test --workspace` ran and passed 730 tests in one green run on 2026-08-04**, immediately after the
-webview frontend was retired. One command and one test runner: the frontend is Rust, so there is no `pnpm`,
-no `vitest` and no second lockfile. Several crates are modified daily and two of them are being extended as
-this is written, so the number is higher than 730 by now — reproduce it with the commands below rather than
-trusting it. The tests are real: `turn-pty` spawns
+The release audit runs the whole workspace serially, then format, Clippy and the native snapshot suite.
+Counts are deliberately not frozen here because this repository changes quickly: reproduce the evidence
+with the commands below. There is one test runner; the frontend is Rust, so there is no `pnpm`, no `vitest`
+and no second lockfile. The tests are real: `turn-pty` spawns
 actual processes on actual ptys and asks the tty itself via `stty size`; `turn-agents` asserts against hook
 payloads recorded from a live Claude Code run; `turn-store` writes real SQLite files and searches them for
 secrets; `turn-gui`'s snapshot tests render the real widget tree through `wgpu` with no display attached and
-diff it against committed PNGs. See `ROADMAP.md` for what each milestone delivered and how it was verified.
+diff it against committed PNGs. The native suite contains 20 tests, 12 of which maintain PNG baselines;
+the dense fixture contains 30 Sessions, not a measured 30-Agent performance result. See `ROADMAP.md` for
+what each milestone delivered and how it was verified.
 
 **The frontend was replaced.** A Tauri shell around a TypeScript/`xterm.js` frontend was built, rejected by
 the product owner on sight, and deleted — `ui/` and `crates/turn-ui` are gone. The window is now native Rust
@@ -58,14 +71,14 @@ rather than the product, and what it costs from here.
 
 What is still missing, and worth knowing before you build:
 
-- **No end-to-end run.** Nothing below has been observed working together with a real agent, so treat
-  "Built" as "compiles, and its own contract is tested", not as "works".
-- **`turn-gui` is a spike, not a window.** It settles the stack — cells, theme, chrome, snapshot testing —
-  and has no daemon connection, keymap, palette, tree panel or effect channels yet. M6 is reopened in
-  `ROADMAP.md`, and M7 is blocked behind it again.
-- **This window cannot be used with a screen reader yet, and has no IME work.** Both were free with a
-  webview and neither is now. `every_session_row_is_reachable_by_its_accessible_name` is committed failing
-  and `#[ignore]`d rather than deleted, because it is a real gap. `ROADMAP.md` §Risks 2b.
+- **No authenticated live-CLI acceptance.** The production reducer, protocol, hook transport, persistence
+  and UI are joined by tests, but the packaged app has not completed the scenario against a user's live
+  Claude account. Treat “Built” as automated evidence, not release acceptance.
+- **Accessibility and input need human sign-off.** The hierarchy and terminal panes expose AccessKit
+  semantics and the input path preserves composed text, but VoiceOver/Orca and terminal IME behaviour still
+  require manual acceptance on supported platforms.
+- **Advanced product hardening remains.** Complete context menus, permanent Pane placement choices,
+  performance budgets at 30 Sessions, packaging and recovery UX are M9 work.
 - **The snapshot baselines are macOS-only.** They were recorded through Metal, and `egui_kittest` allows no
   differing pixels by default, so CI runs the comparison on macOS and says why in the workflow instead of
   skipping it silently. Linux still compiles the snapshot target every push.
@@ -97,7 +110,7 @@ What is still missing, and worth knowing before you build:
 
 ```sh
 # Everything. This is what CI runs.
-cargo test --workspace -- --test-threads=4
+cargo test --workspace --all-targets -- --test-threads=4
 
 # One crate
 cargo test -p turn-core

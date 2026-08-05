@@ -239,7 +239,7 @@ impl PtyProcess {
     /// Tells both the kernel and our own screen model about a new size.
     ///
     /// Both halves are required: without the ioctl the process keeps drawing at
-    /// the old width, and without the buffer update our thumbnails and
+    /// the old width, and without the buffer update our previews and
     /// heuristics read a screen that no longer matches what the user sees.
     pub fn resize(&self, size: ScreenSize) -> Result<(), PtyError> {
         self.master
@@ -267,7 +267,7 @@ impl PtyProcess {
         self.buffer.lock().map(|b| b.replay()).unwrap_or_default()
     }
 
-    /// A snapshot for thumbnails and heuristics.
+    /// A snapshot for on-demand previews and heuristics.
     pub fn snapshot(&self) -> Option<ScreenSnapshot> {
         self.buffer.lock().ok().map(|b| b.snapshot())
     }

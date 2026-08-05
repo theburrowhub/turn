@@ -39,7 +39,7 @@
 //! ## A terminal is cells, not bytes
 //!
 //! The daemon keeps an authoritative `vt100`-parsed screen for every pane — it has
-//! to, because thumbnails and the output heuristics work with no client attached. So
+//! to, because on-demand previews and output heuristics work with no client attached. So
 //! a pane's screen crosses this boundary already parsed: [`Grid`] of [`Cell`], with
 //! palette indices already resolved to concrete [`Rgb`]. There is one VT emulator in
 //! the system, which removes the entire class of bug where the daemon's screen and

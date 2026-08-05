@@ -17,35 +17,42 @@ the workspace. The window is now native Rust drawn on the GPU (`crates/turn-gui`
 **reopened** as M7 below, and the tests it used to count are gone rather than renamed.
 
 There is one Rust test runner and one lockfile. The reproducible source of truth is
-`cargo test --workspace -- --test-threads=1`; this roadmap no longer hard-codes a total that becomes false
+`cargo test --workspace --all-targets -- --test-threads=1`; this roadmap no longer hard-codes a total that becomes false
 whenever a regression test lands. PTY and loopback hook tests use real operating-system resources and are
 run serially for the release audit.
 
 The upgraded first vertical now runs through the production daemon, store, protocol projection and GUI
 model: Workspace and fenced main Session, explicit Reviewer spawn, stable preview, Quick Preview,
-temporary Pane close without process termination, and UI restart/restore. A separate integration test sends
+temporary Pane close without process termination, and UI reconnect to the same live daemon. Separate
+daemon-restart coverage restores durable state as `Orphaned`/`Lost` and proves no relaunch. Another integration test sends
 the event through the real loopback Claude hook transport and production normaliser. This is reproducible
 without a paid external service. A manual smoke test against an authenticated, currently installed Claude
 Code CLI is still pending and must not be conflated with the deterministic proof; current Claude hook
 payloads may provide a role/external id without a parent-declared display name.
+
+The hardening pass also proves two authority boundaries that the happy-path vertical did not: only one
+daemon may own a canonical data directory even when configured with another socket, and ambiguous or
+out-of-order worker Attention remains scoped to its authenticated hook parent and external id across
+restart instead of being attributed or resolved session-wide.
 
 | Milestone | Delivers | Status |
 | --- | --- | --- |
 | M0 — Domain | `turn-core`: entities, two-axis state, event vocabulary, attention | **Done** |
 | M1 — Terminal substrate | `turn-pty`: ptys, bounded buffers, supervision | **Done** |
 | M2 — Agent integration | `turn-agents` + `turn-hook`: adapters, hook server, heuristics, registry | **Done** |
-| M3 — Persistence | `turn-store`: SQLite, migrations, redaction, seven repositories | **Done** |
+| M3 — Persistence | `turn-store`: SQLite, migrations, redaction, eight repositories | **Done** |
 | M4 — Protocol | `turn-proto`: framing, requests, responses, pushes, view models | **Done** |
 | M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Built for automated vertical**; live CLI acceptance pending |
-| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented for the first vertical**; release audit/hardening remains |
+| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented and audited for the first vertical**; broader hardening remains |
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
-| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **Not started**; two CI boxes already green |
+| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing and durable projections are built, measurement/packaging remain |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
 Preview → temporary Pane → close without stop → restart and reattach` sequence in
-`docs/UNIFIED_HIERARCHY_UPGRADE.md`.
+`docs/UNIFIED_HIERARCHY_UPGRADE.md`: the live-runtime part restarts only the UI; a separate daemon restart
+proves metadata recovery and honest loss without claiming PTY reattachment.
 
 ---
 
@@ -56,7 +63,8 @@ Preview → temporary Pane → close without stop → restart and reattach` sequ
 vocabulary with the `Confidence` ladder; and the attention subsystem — policy, queue, focus governor,
 manager. No I/O, no clock reads inside logic.
 
-**Verified by.** 116 tests. The ones that pin the product's guarantees rather than its mechanics:
+**Verified by.** Reproduce with `cargo test -p turn-core -- --test-threads=1`. The tests that pin the
+product's guarantees rather than its mechanics include:
 
 - `state::tests::finishing_a_turn_is_not_the_same_as_exiting`
 - `state::tests::a_crashed_process_never_keeps_claiming_it_awaits_you`
@@ -77,9 +85,8 @@ kill, exit reporting), `TerminalBuffer` (bounded byte ring plus bounded vt100 sc
 sanitisation), `ProcessSupervisor` (on-demand process-table scans, transitive descendants, conservative
 classification).
 
-**Verified by.** 46 tests against real ptys and real processes, not mocks (38 at the start of this survey;
-eight terminal-hardening tests were added during it, covering clipboard reads, self-resize requests and
-Unicode tricks in titles and rows):
+**Verified by.** Reproduce with `cargo test -p turn-pty -- --test-threads=1`; the suite uses real ptys and
+real processes rather than mocks. Load-bearing cases include:
 
 - `process::tests::a_process_sees_the_size_we_gave_it` — asks the tty itself via `stty size`
 - `process::tests::resize_reaches_both_the_kernel_and_our_screen_model`
@@ -104,9 +111,9 @@ down in the alternate screen); the registry (selection that always answers and a
 loopback hook server (127.0.0.1, per-node 256-bit tokens, immediate empty-200 responses, bounded event
 channel). Plus `turn-hook`: a zero-dependency helper that cannot break an agent session.
 
-**Verified by.** 161 tests in `turn-agents` (118 unit, 15 Claude Code contract, 19 Codex contract, 9
-invariants) and 19 in `turn-hook`, all green on 2026-08-04. The contract tests are the load-bearing ones,
-because hook payloads are a contract Turn does not own, and both fixtures are now recorded off the wire:
+**Verified by.** Reproduce with `cargo test -p turn-agents -- --test-threads=1` and
+`cargo test -p turn-hook -- --test-threads=1`. The contract tests are the load-bearing ones, because hook
+payloads are a contract Turn does not own, and both fixtures are now recorded off the wire:
 
 - `contract_claude::the_recorded_hook_payloads_still_carry_the_fields_the_adapter_reads` — against
   `tests/fixtures/claude-code-2.1.221.json`, recorded from live runs against Claude Code 2.1.221
@@ -118,7 +125,7 @@ because hook payloads are a contract Turn does not own, and both fixtures are no
 - `contract_codex::subscribed_event_keys_are_pascal_case_and_from_the_known_set`
 - `contract_codex::without_hook_trust_the_adapter_reports_wrapper_and_says_what_is_missing`
 - `contract_codex::a_tool_call_payload_is_never_turned_into_an_approval_or_a_command_to_run`
-- `invariants::*` — nine tests, one per product rule: a heuristic cannot steal focus, no payload can claim a
+- `invariants::*` — product-rule tests: a heuristic cannot steal focus, no payload can claim a
   permission was allowed, no payload becomes something to run, hierarchy only ever comes from a tool's own
   report, and an agent cannot name its session after a command-line flag
 - `server::tests` — including a real HTTP client over a real socket, an unknown token refused and counted,
@@ -131,13 +138,18 @@ because hook payloads are a contract Turn does not own, and both fixtures are no
 **Delivers.** `turn-store`: the `Store` facade (`open_default`, `open_in`, `open_at`, `open_in_memory`),
 schema versioned in SQLite's own `user_version` with append-only migrations and a loud refusal of any
 database from a newer build, WAL and enforced foreign keys, `codec` for tag-vs-JSON columns, `redact` for
-secret hygiene, `location` for platform paths, and seven repositories (workspace, session, node, event,
-attention, template, settings) using `ON CONFLICT DO UPDATE` rather than `REPLACE`.
+secret hygiene, `location` for platform paths, and eight repositories (workspace, session, node, event,
+attention, template, settings, hierarchy) using `ON CONFLICT DO UPDATE` rather than `REPLACE`.
+Every free-text repository route now builds a redacted copy before SQL; structural ids/FKs remain stable
+and credential-shaped Workspace/checkout paths are rejected rather than rewritten. Byte-level coverage
+plants one token across Workspace, Session, Layout/Pane, Template, process/Agent, settings, Attention,
+Preview and event fields and scans both database and WAL.
 
 The line that matters most: `SessionRepo::load_for_restore` **downgrades anything stored as running to
 `Lifecycle::Orphaned`**, because a stored `Alive` only ever meant "alive when we last wrote".
 
-**Verified by.** 119 tests, one of them a doctest. The integration tests are named after the promises:
+**Verified by.** Reproduce with `cargo test -p turn-store -- --test-threads=1`. The integration tests are
+named after the promises:
 
 - `restart_restores_the_desk::a_whole_desk_survives_a_restart_and_reports_what_it_cannot_vouch_for`
 - `restart_restores_the_desk::a_pending_demand_for_the_user_outlives_the_daemon_that_recorded_it`
@@ -167,7 +179,8 @@ an `Effect` the governor already cleared. Nothing uses `deny_unknown_fields`, so
 newer daemon's added fields; a change that would make an older client *misread* a message bumps
 `PROTOCOL_VERSION` and the handshake refuses the connection rather than letting it half work.
 
-**Verified by.** 127 tests. The catalogue-level and conversation-level ones matter most:
+**Verified by.** Reproduce with `cargo test -p turn-proto -- --test-threads=1`. The catalogue-level and
+conversation-level tests matter most:
 
 - `contract::every_request_names_a_response_variant_that_exists`
 - `contract::every_response_variant_is_produced_by_at_least_one_request`
@@ -209,8 +222,9 @@ live in `tests/{desk,agents,surface,restart,attention,binary,cells}.rs`.
 6. **Restore.** Load with `load_for_restore`, corroborate orphaned pids against the process table, compute
    `RestoreState`, and **offer** relaunches for Panes marked `Relaunch` without performing any. A UI restart
    over the still-running daemon instead reuses the live PTY and replay stream.
-7. **Daemon lifecycle** — socket path, single-instance guard, log location, graceful shutdown, and a clear
-   answer to "the daemon is not running".
+7. **Daemon lifecycle** — socket path, a canonical-data-directory process lock acquired before SQLite,
+   independent socket ownership checks, log location, graceful shutdown, crash recovery, and a clear answer
+   to "the daemon is not running".
 
 **Verified by.** `tests/agents.rs::the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart`
 crosses the real loopback hook server and production Claude normaliser; `tests/desk.rs` covers PTY input,
@@ -236,6 +250,13 @@ It creates no lease, starts/kills/moves no process, changes no filesystem permis
 “most recent” Session as writer. Daemon reconciliation or explicit user action is the first place authority
 can be granted.
 
+Later append-only corrections keep the same fail-closed rule: migration 005 erases historical raw hook
+bodies, migration 006 re-resolves legacy checkout identity without adopting a writer, and migration 007
+persists parent/external-id correlation for node-less Attention without inventing a node. Migration 008
+records demand kind and whether postmortem Attention truthfully survives its runtime owner exiting.
+Migration 009 performs the one-time, retryable physical purge that applies the current durable-redaction
+boundary to legacy free text and rebuilds/truncates SQLite only after structural identities pass validation.
+
 **Verified by.** All of these must be automated before the milestone closes:
 
 1. Two concurrent acquisitions, symlink/path aliases and Workspace delete/recreate yield one canonical
@@ -248,15 +269,23 @@ can be granted.
 6. A fixture-declared `Reviewer` appears under its parent with no Pane; a role such as `Explore` is not
    fabricated as its declared name.
 7. ANSI/carriage-return/noisy output produces one bounded redacted preview, stores no raw source/secret and
-   is stale after restart until fresh activity.
+   retains its original timestamp after restart; a distinct recovered/stale UI marker remains open.
 8. Quick Preview/temporary Pane close removes only a binding; the Agent and lease remain.
 
 **Status detail.** Domain, append-only migrations, canonical checkout ownership, lease fencing/conflict
 transactions, hierarchy projection, per-surface state, pane bindings, preview redaction/history and the
 reproducible Reviewer vertical are implemented and tested. Legacy lease reconciliation is conservative:
-ambiguous live owners enter `recovery_required` instead of receiving authority. The remaining work is
-advanced management API surface (rename/correct/filter/manual order), performance measurement and the live
-CLI smoke test; “types exist” is still not an exit criterion.
+ambiguous live owners enter `recovery_required` instead of receiving authority, and a daemon restart fences
+every unreleased lease before loading Sessions. Durable Attention entries keep their identity, age, snooze,
+acknowledgement, ordering and exact node-or-parent/external-id correlation scope, while Preview history is
+returned newest-first. A canonical data-directory process lock also prevents a differently configured
+daemon from reaching SQLite and fencing the live owner. The remaining work is the
+explicit migration-reconciliation flow, advanced management API surface (rename/correct/filter/manual
+order), performance measurement and the live CLI smoke test; “types exist” is still not an exit criterion.
+Template-origin conflicts now retain the Template id and inputs through typed read-only/worktree requests;
+the daemon, not `TemplateSummary`, re-instantiates the complete Layout/env/Attention/tmux/naming contract.
+Read-only keeps commands stopped whenever no technical guard is available; worktree maps primary absolute
+cwd values repository-relatively.
 
 ---
 
@@ -296,9 +325,9 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_full_screen_program_reports_its_alternate_screen_and_its_input_modes`,
 `the_indexed_palette_matches_the_xterm_cube_and_greys` — plus
 `every_state_has_a_glyph_as_well_as_a_colour` and
-`the_attention_colour_is_reserved_for_states_that_block_the_user`, and the two snapshots
-`a_busy_desk_with_a_pending_permission` and `an_empty_window_says_so_rather_than_looking_broken`. The
-snapshots are the new capability, not a formality: the first one caught two labels drawn on top of each
+`the_attention_colour_is_reserved_for_states_that_block_the_user`. The native suite has 20 tests, including
+12 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
+`an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
 **What is not.** Tree search/filter modes, manual ordering, user rename and audited relationship correction,
@@ -311,11 +340,12 @@ GPU output and still need platform CI coverage. No manual authenticated Claude s
 
 ## M8 — First vertical · **Automated vertical complete; live smoke pending**
 
-The deterministic vertical is implemented twice at the boundary that matters: a daemon/store restart test
-and an integration test through the real loopback Claude hook server and production normaliser. Both assert
-that Reviewer is a named child with no automatic Pane, its preview is stable/redacted, a temporary Pane can
-close without stopping it, the Layout stays unchanged, and the relationship/preview/process metadata
-survive UI restart.
+The deterministic vertical crosses the production daemon/store model and, separately, the real loopback
+Claude hook server and production normaliser. The live-runtime proof reconnects a replacement UI to the
+same daemon and asserts that Reviewer is a named child with no automatic Pane, its preview is
+stable/redacted, a temporary Pane can close without stopping it and Layout stays unchanged. Daemon-restart
+tests make the narrower claim that relationship/preview/process metadata survives as `Orphaned`/`Lost` and
+nothing is relaunched.
 
 **The true remaining gap.** Nobody has yet completed the same scenario by launching an authenticated
 external Claude Code binary from the packaged native window. That smoke test may expose installed-version,
@@ -328,7 +358,8 @@ product. M9 holds the unmeasured performance budget, the unfinished restore sema
 packaging, and none of that is optional for something a person installs. M8 is the milestone that turns
 "built" into "seen to work once".
 
-**Delivers.** Seven scenarios, working, on both platforms:
+**Acceptance target.** Seven scenarios define completion. Their deterministic core is automated; the
+external-CLI and both-platform manual runs below remain open:
 
 1. **One Agent.** New Workspace, new Session from the `Coding` Template, `claude` runs, output renders,
    input works, state is correct throughout — `Running` → `NeedsPermission` → `Running` → `CompletedTurn`.
@@ -352,11 +383,11 @@ run on macOS and Linux before the milestone closes.
 
 ---
 
-## M9 — Hardening · **Not started, and partly overtaken**
+## M9 — Hardening · **In progress**
 
-Nothing in this milestone has been done as a milestone, but two of its boxes have been ticked in passing:
-`cargo clippy --workspace --all-targets` and `cargo fmt --all -- --check` are both clean as of 2026-08-04
-(§Technical debt). Everything that needs measuring is still unmeasured, and Linux is still unrun.
+Authority fencing, atomic event checkpoints, restore diagnostics, durable redaction and local quality gates
+have landed. Everything that needs measuring is still unmeasured; Linux visual/manual acceptance and
+packaging are still open.
 
 **Delivers.**
 
@@ -364,16 +395,15 @@ Nothing in this milestone has been done as a milestone, but two of its boxes hav
   latency; output-to-glass at the 95th percentile; idle daemon CPU; and the base64 protocol overhead under a
   build firehose. Then tune `TerminalBuffer::with_capacity` per `PaneKind` if the numbers say so — a build
   log does not need an Agent conversation's scrollback.
-- **Restore semantics finished.** Pid-reuse defence when re-attaching (corroborate with the stored command
-  line), `RestoreBehaviour` honoured, and the relaunch offer flow.
+- **Restore semantics finished.** Current PID/command corroboration must remain conservative, the relaunch
+  offer flow must stay explicit, and a real persistent backend must prove PTY reattachment before
+  `Reconnected` can be emitted.
 - **Linux parity signed off** — one GPU stack checked on both backends deliberately rather than hoped for:
   the window opened and used under Vulkan, and the snapshot baselines recorded on Linux so CI compares them
   there too instead of only on macOS/Metal.
-- **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, the full
-  test suite and the `ui` job, all green on both runners. See §Technical debt: `fmt`, clippy and both test
-  suites now pass locally on macOS; what is left is the `ui` job's Node version, which needs raising to 22,
-  and the fact that no runner has yet reported any of it. It should all be fixed long before M9 rather than
-  saved up for it.
+- **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and the
+  full Rust suite, all green on both runners. There is no Node/UI job in the current native-Rust frontend;
+  Linux still needs reviewed visual baselines rather than a silently skipped comparison.
 - **Packaging**: a signed macOS bundle, a Linux artefact, `turn-hook` installed and locatable, and a
   first-run experience that works with no configuration.
 - **Contract-drift monitoring**: re-record the Claude Code fixture against the current release, add a Codex
@@ -426,7 +456,7 @@ global or per-Workspace navigator.
 | 3 | ~~Does installing hooks into Codex require interactive trust on first launch?~~ **Settled live: yes.** See Risk 5 — `codex exec` silently runs nothing, the TUI blocks on a review dialog, `notify` is ungated. `HooksAndNotify` therefore cannot claim `Structured` by default; what remains is a product decision, not a question about Codex. | Done; the two product decisions moved to Risk 5. |
 | 4 | **What are the `execution_mode` semantics** (`blocking` / `await`)? Left unset deliberately, because guessing risks configuring Codex to wait on Turn. | Reading Codex's source or a controlled experiment. |
 | 5 | **How does the daemon defend against pid reuse when re-attaching?** The stored command line is the only corroboration and it is weak. | M9 restore hardening, tested adversarially. |
-| 6 | **Where does the daemon's socket live, and what is the single-instance rule?** `turnd` now answers both in code, unverified here: `paths::resolve_socket_path` takes flag, then `TURN_SOCKET`, then `<runtime-or-data-dir>/turnd.sock`, refusing a path over 100 bytes because `sun_path` is 104 on macOS; `instance` probes for an answering daemon via the real handshake rather than trusting the socket file's existence. The window's side was settled and then deleted with it (ADR-039): the retired shell never started `turnd` — the daemon's lifetime is deliberately longer than the window's — and showed `reconnecting` with the socket path while it retried, with a backoff a connection had to survive ten seconds to spend. Those two rules are the ones to reproduce in `turn-gui`, and until they are, nothing on this side is settled. Whether *something else* should start the daemon on first run is still open. | M9 packaging for the remaining half. |
+| 6 | **Where does the daemon live, and what is the single-instance rule?** Settled in the daemon: `paths::resolve_socket_path` takes flag, then `TURN_SOCKET`, then `<runtime-or-data-dir>/turnd.sock`, and refuses a path too long for macOS `sun_path`. Socket occupancy is probed through the real handshake, while store ownership is separately enforced by a non-blocking OS lock on the canonical `data_dir` before SQLite/migrations/restore. Different sockets do not permit two store owners; stale socket files and process locks recover after process death. The remaining question is only which packaged component starts the daemon on first run. | M9 packaging. |
 | 8 | **Per-`PaneKind` buffer bounds.** `with_capacity` takes both bounds; nothing uses them non-default yet. | M9 measurement. |
 | 9 | **Does `TerminalBuffer::replay()` need scrollback, or is the visible screen enough?** Today a re-attached Pane starts with no history above the fold (ADR-023). | M8 scenario 5, with real users. |
 | 10 | **How is `turn-hook` located at runtime,** and what happens on version skew with the daemon? | M9 packaging. |
@@ -458,7 +488,7 @@ breaks already shipped in this repo, none of which any test or build could see:
 (`claude-code-2.1.221.json`, `codex-cli-0.146.0.json` — session ids, transcript paths and UUIDv7 timestamps
 all cross-check against artefacts still on the recording machine); contract tests labelled CAPTURED vs
 DERIVED per assertion so a documented guess can never be mistaken for an observation; unknown events dropped;
-adapters that never panic on malformed input (161 tests in `turn-agents`).
+adapters that never panic on malformed input (covered by the reproducible `turn-agents` suite).
 *Still missing:* **a CI oracle for "parsed but fires nothing".** The only real oracle found is a JSON-RPC
 `hooks/list` call over `codex app-server`, which is not automated — the in-repo stand-in asserts literal
 spellings, which protects against our typos and not against upstream drift. Also missing: a re-record routine
@@ -473,36 +503,43 @@ client can release a newer claim; deleting/recreating a Workspace can reset loca
 
 *Mitigated by:* canonical-path uniqueness across Workspaces, one global monotonic fence per canonical path,
 `BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release,
-blocking `recovery_required`, and canonical Session/Pane cwd containment repeated at the final PTY boundary.
-Adversarial tests cover concurrent aliases, delete/recreate generations, stale release, transaction rollback,
-absolute/`..`/symlink cwd escapes and worktree→primary launches. Migration 003 grants no lease; migration 006
-trusts no pre-existing one.
+blocking `recovery_required`, a canonical-data-directory process lock established before SQLite/restore, and
+canonical Session/Pane cwd containment repeated at the final PTY boundary. Adversarial tests cover concurrent
+aliases, delete/recreate generations, stale release, transaction rollback, same-data/different-socket daemons,
+symlink data-dir aliases, crash recovery, absolute/`..`/symlink cwd escapes and worktree→primary launches.
+Migration 003 grants no lease; migration 006 trusts no pre-existing one.
 *Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
 old writer stopped. Cwd containment is not an OS sandbox: same-user code can still open another path after
-launch, so stronger isolation remains a separate security feature.
+launch, so stronger isolation remains a separate security feature. The local-filesystem `flock` is an
+advisory boundary between cooperating Turn daemons, not protection from the same user deliberately replacing
+the lock inode.
 
-### 1b. Activity Preview can become a durable exfiltration/lying channel — **M6 blocker**
+### 1b. Activity Preview can become a durable exfiltration/lying channel — **hardened; recovered-state UX open**
 
 A terminal line may contain secrets, prompt injection, bidi/invisible text or a transient spinner that looks
 like stable progress. Persisting “last lines” also recreates the misleading restored-conversation problem
 ADR-036 rejected.
 
 *Mitigated by:* semantic-source priority, control/bidi/ANSI and carriage-return normalisation, stability/noise
-filtering, known-secret redaction, 20-per-node/2,000-global retention, no raw PTY/hook source and a stale-on-
-restore label. High-frequency changes are snapshot state, not append-only events.
-*Still missing:* adversarial SQLite/restart tests seeded with secrets and noisy TUI output, plus UI proof that
-stale/provisional provenance is spoken as well as coloured.
+filtering, known-secret redaction, 20-per-node/2,000-global retention, no raw PTY/hook source, newest-first
+history and bounded snapshot updates rather than append-only byte events. Adversarial store/restart tests
+prove hook bodies and seeded secrets do not survive SQLite/WAL migration; GUI tests and snapshots prove
+provisional confidence is expressed in words as well as colour.
+*Still missing:* a distinct recovered/stale marker for a persisted Preview whose original timestamp predates
+the current daemon, plus manual assistive-technology acceptance of that wording.
 
-### 1c. Protocol v3 projection drift — **M6/M7 blocker**
+### 1c. Protocol v3 projection drift — **hardened; documentation oracle open**
 
 If hierarchy bootstrap, bounded pushes and per-surface state use different ownership/order rules, the GUI can
 show the right terminal under the wrong Agent or apply one window's selection to another. Shared Rust types
 do not prevent two derivations.
 
 *Mitigated by:* one daemon-derived `HierarchySnapshot`, monotonic revision and full replacement, typed
-`HierarchyKey`, structured lease conflict and server-provided relationship/preview confidence.
-*Still missing:* catalogue/conversation tests for revision gaps, daemon restart, surface isolation and every
-request→response/push variant; `docs/PROTOCOL.md` still has no mechanical prose-to-code check.
+`HierarchyKey`, structured lease conflict and server-provided relationship/preview confidence. Catalogue,
+conversation, restart, delayed-snapshot and per-surface tests now cover request/response/push variants,
+revision recovery and private selection state.
+*Still missing:* a mechanical prose-to-code check for `docs/PROTOCOL.md`, plus long-running multi-window soak
+coverage beyond the deterministic revision-gap cases.
 
 ### 2. ~~Webview divergence between macOS and Linux~~ — **struck: the webview is gone**
 
@@ -568,7 +605,7 @@ cells** rather than with bytes received, and thirty panes of dense colour cost s
 nothing changed. Nothing here is measured either, and "we replaced a measured-nothing with a different
 measured-nothing" is the accurate summary.
 
-### 4. The join is the riskiest code in the system and it is unproven
+### 4. The join is the riskiest code in the system — **implemented and adversarially covered**
 
 One reducer must fold four independent signal sources — hook payloads, pty exits, supervisor observations,
 heuristic inferences — into one authoritative `SessionTree`. A wrong correlation there does not crash; it
@@ -576,15 +613,18 @@ silently attributes a permission request to the wrong Agent, or marks the wrong 
 told something confidently false. Correlation keys are weak by nature: a tool's own `session_id`, an OS pid
 that can be reused, a command line that can be ambiguous.
 
-*Mitigated by:* concentrating the join in exactly one place in the daemon (a decision, not an accident); the
-`Relation` ladder refusing to downgrade a confirmed link; `SessionTree::relink` refusing cycles; nodes with
-no attributable parent rendering at the root rather than under a guess; and `find_by_external_id` /
-`find_by_pid` already existing as the only two lookup paths.
-*Still missing:* confidence in the reducer. It is now written — `turnd/src/core/events/mod.rs`, with
-`events/tree.rs` and `events/exit.rs` beside it — and none of it is verified here, so this risk has moved
-from "unwritten" to "unproven", which is a smaller step than it sounds. What is definitely absent is the
-adversarial coverage that would retire it: out-of-order arrival, a hook for a node that died, a reused pid,
-and two Sessions running the same tool in the same directory.
+*Mitigated by:* concentrating the join in exactly one place in the daemon; the `Relation` ladder refusing to
+downgrade a confirmed link; `SessionTree::relink` refusing cycles; nodes with no attributable parent staying
+unassigned; and external-id/PID lookup remaining daemon-owned. Recorded-id routing, a real hook-transport
+Reviewer vertical, id-less single-child correlation, ambiguous multi-child attribution, sibling Attention
+preservation, out-of-order explicit worker ids, two independent parents in one Session, restart durability,
+dead-process cleanup and recycled-PID store queries all have regression tests. An id-less worker event is
+`inferred_high` only with one live candidate; otherwise it remains node-less/`unknown`. An unknown explicit
+id never falls through to a different unique child; its queue identity is the authenticated parent plus
+external id, and a resume cannot clear another parent's demand.
+*Still missing:* broader adversarial sequences for a hook arriving after its node died, PID reuse across two
+live Sessions and prolonged same-tool/same-directory workloads. These are hardening gaps, not permission to
+invent a relationship today.
 
 ### 5. Codex's hook trust model — **confirmed; now a product decision, not an unknown**
 
@@ -654,33 +694,25 @@ been decided on.
   another migration.
 - **`Request::WritePty` is a very wide capability.** The protocol's refusal to model approval is a good rule;
   `WritePty` is the hole it leaves, and the daemon cannot tell an approval keystroke from any other.
-- **`DECISIONS.md` ADR-037 and ADR-038 assert the disproven Codex facts, inverted.** ADR-037's "what the spike
-  established" says Codex wants `handlers=` and snake_case event keys and that the contract test asserts the
-  config does *not* contain `,hooks=[` — the exact opposite of what the live spike found and of what the
-  passing test asserts. ADR-038's title claims Codex has no turn-completion hook event; it has `Stop`, which
-  fired live before `notify` with the same turn id. An engineer following either ADR would reintroduce the
-  dead-integration bug. Same disproven claims in `ARCHITECTURE.md` §4.5 (:584, :589) and `PRODUCT.md` 442-456.
-  These are documents, so they should be **superseded rather than edited**.
-- **Six test-name citations across the docs no longer resolve** (checked mechanically against every `fn` in
-  the workspace): `the_handler_list_key_is_hooks_because_handlers_fires_nothing`,
-  `subscribed_event_keys_are_pascal_case_and_from_the_known_set`,
-  `without_hook_trust_the_adapter_reports_wrapper_and_says_what_is_missing`,
-  `notify_names_the_program_only_and_the_url_travels_in_the_environment`,
-  `a_first_launch_configures_both_mechanisms_but_claims_only_what_it_can_prove`,
-  `the_recorded_hook_payloads_still_carry_the_fields_the_adapter_reads`. Three of them assert the *inverted* fact,
-  which is worse than a dangling link. A CI check that resolves every backticked test name in the docs would
-  make this class of drift impossible; there is none.
-- **`turn-store`'s database file is `0644` in a `0755` directory.** `location.rs:57` calls `create_dir_all`
-  and nothing calls `set_permissions` anywhere in the crate. The store keeps every command line, cwd and
-  structured event excerpt, lease and Activity Preview by design. ADR-040 removes untouched hook payloads,
-  but the remaining metadata is still private and file mode remains an exposure.
+- **Codex contract drift remains an upstream risk, not a known local inversion.** ADR-037 and ADR-038 now
+  record the live facts: the handler list key is `hooks`, event keys are PascalCase, `Stop` exists but is
+  trust-gated, and `notify` carries the first-run turn boundary. Their cited contract tests resolve and pin
+  the literal spellings. Re-capturing fixtures on a Codex upgrade is still manual, so a future upstream
+  rename can make a Session quiet while the current local suite stays green.
+- **Documentation-test citation drift has no automated guard.** The six citations that triggered this
+  finding resolve again, but a CI job does not yet parse backticked test names and compare them with
+  `cargo test -- --list`. A renamed test can therefore leave prose stale without breaking CI.
+- **Store file permissions are closed on supported Unix platforms.** The data directory is forced to
+  `0700`, SQLite and sidecars to `0600`, and the on-disk security suite checks the real files. Keep the test:
+  a relaxed mode would expose commands, cwd, lease metadata and Activity Previews even though raw hooks are
+  excluded.
 - **The pty tests are load-sensitive, and more of them than was thought.**
   `turn_pty::process::a_process_sees_the_size_we_gave_it` failed once with `OpenPty(Os { code: -6 })` while
   other cargo builds saturated the machine, then passed on rerun — a third test beyond the two already known
   to flake this way. They spawn real ptys; CI parallelism will find this.
-- **"Turn never relaunches" is documented and structurally true, but not test-proven.** No suite that can be
-  run today asserts it: `invariants.rs` proves no *adapter* can be made to produce a relaunch, and the daemon's
-  own guarantee rests on `RelaunchNode` being the only path, which lives in unverified `turnd` code.
+- **Automatic relaunch remains forbidden and is now test-proven.** Restart may offer recovery metadata but
+  never launches by itself; only the explicit `RelaunchNode` request crosses the launch boundary. Keep the
+  daemon restart and protocol conversation regressions because this is a safety invariant, not a UI choice.
 
 ---
 
@@ -725,21 +757,20 @@ Concrete, verified items. Each is real today.
 
 ### Design debt
 
-9. **Process events are emitted only by unverified daemon code.** `EventKind::ProcessStarted`,
-   `ProcessExited`, `ProcessFailed` and `ProcessSpawnedChild` are defined, serialised and tested in
-   isolation in `turn-core`. They are now constructed in `turnd` (`core/spawn.rs`,
-   `core/events/exit.rs`, `core/supervise.rs`), which has not been verified here — so the debt is no longer
-   "nothing emits them" but "nothing has been shown to emit them correctly". `AgentQuestionAsked` is still
-   generated by **no adapter**; `AgentTaskCompleted` likewise, though `turnd` derives one from a user
-   correction.
+9. **Process-event emission is verified; two semantic events still lack an adapter source.**
+   `ProcessStarted`, `ProcessExited`, `ProcessFailed` and `ProcessSpawnedChild` are constructed in `turnd`
+   (`core/spawn.rs`, `core/events/exit.rs`, `core/supervise.rs`) and exercised by unit plus daemon integration
+   suites. `AgentQuestionAsked` is still generated by **no adapter**; `AgentTaskCompleted` likewise, though
+   `turnd` derives one from a user correction.
 10. **`Lifecycle::Reconnected` is assigned by nothing.** `load_for_restore` produces `Orphaned`.
     `turnd/src/core/restore.rs` assigns `Lost`, and its own module documentation says `Reconnected` is
     deliberately never produced there — so the state exists in the model, is reachable in the protocol, and
     is set by no code at all. That is a real gap, not an oversight to be tidied: something must eventually
     claim a successful re-attach.
-11. **`RestoreBehaviour` is now read, in unverified code.** `turnd/src/core/restore.rs` branches on
-    `Skip` and `Relaunch` when deciding what may be offered. The default is still `ReattachOnly`, and no
-    test observed here exercises any branch.
+11. **`RestoreBehaviour` is read and tested.** `turnd/src/core/restore.rs` branches on `Skip` and `Relaunch`
+    only to decide what may be offered; `a_restart_relaunches_nothing_even_for_a_pane_that_says_it_is_safe_to`
+    proves restart performs no launch, and the protocol conversation proves only the user can accept an
+    offered relaunch. The default remains `ReattachOnly`.
 12. **`AttentionPolicy` is cloned per deferred focus request** (seven `Vec`s). Cheap at these volumes, and
     it is a clone in a hot-ish path, kept deliberately (ADR-022).
 13. **Typed ids are 12 hex characters — 48 bits, not a UUID.** Fine at this scale; they should not be
