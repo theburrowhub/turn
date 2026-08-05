@@ -125,6 +125,10 @@ pub enum EventKind {
         #[serde(default)]
         ppid: Option<u32>,
         command: String,
+        /// OS-reported argv, retained separately from the compact command-line
+        /// projection so the inspector need not guess argument boundaries.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
         #[serde(default)]
         cwd: Option<String>,
         /// False when the parent link was inferred from the process table
@@ -489,6 +493,25 @@ mod tests {
         );
         assert_eq!(a.dedup_key, b.dedup_key);
         assert_ne!(a.id, b.id, "each occurrence still gets its own id");
+    }
+
+    #[test]
+    fn a_legacy_child_process_event_without_structured_argv_still_decodes() {
+        let kind: EventKind = serde_json::from_value(serde_json::json!({
+            "event": "process.spawned_child",
+            "child": "proc_legacy_child",
+            "pid": 42,
+            "ppid": 41,
+            "command": "cargo test",
+            "cwd": "/repo",
+            "confirmed_parent": false
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            kind,
+            EventKind::ProcessSpawnedChild { args, .. } if args.is_empty()
+        ));
     }
 
     #[test]

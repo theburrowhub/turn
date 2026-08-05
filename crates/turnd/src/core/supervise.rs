@@ -151,6 +151,7 @@ impl Core {
                     pid: process.pid,
                     ppid: process.ppid,
                     command,
+                    args: process.args,
                     cwd: process.cwd,
                     // Never confirmed here. Only a tool reporting what it started
                     // earns that, and the process table is not a tool.

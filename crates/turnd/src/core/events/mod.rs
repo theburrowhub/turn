@@ -39,6 +39,78 @@ pub(super) struct Changed {
     pub(super) refused: bool,
 }
 
+/// Durable/display bounds for facts discovered from agents or the OS process
+/// table. The raw process-table snapshot remains available to the supervisor for
+/// classification and PID traversal; only this safe projection crosses into an
+/// event, Session tree, inspector, or SQLite.
+pub(super) const MAX_DISCOVERED_COMMAND_CHARS: usize = turn_agents::text::MAX_COMMAND_CHARS;
+pub(super) const MAX_DISCOVERED_CWD_CHARS: usize = 4_096;
+pub(super) const MAX_DISCOVERED_ARGS: usize = 128;
+pub(super) const MAX_DISCOVERED_ARG_CHARS: usize = 1_024;
+pub(super) const MAX_DISCOVERED_ARGV_CHARS: usize = 4_096;
+pub(super) const MAX_AGENT_TASK_CHARS: usize = 512;
+pub(super) const UNPRINTABLE_LABEL: &str = "[unprintable]";
+
+pub(super) fn safe_untrusted_label(raw: &str, max_chars: usize) -> Option<String> {
+    turn_pty::sanitise_label(raw, max_chars)
+}
+
+pub(super) fn safe_untrusted_args(args: Vec<String>) -> Vec<String> {
+    let mut remaining = MAX_DISCOVERED_ARGV_CHARS;
+    let mut safe = Vec::with_capacity(args.len().min(MAX_DISCOVERED_ARGS));
+    for argument in args.into_iter().take(MAX_DISCOVERED_ARGS) {
+        if remaining == 0 {
+            break;
+        }
+        if argument.is_empty() {
+            safe.push(String::new());
+            continue;
+        }
+        let limit = remaining.min(MAX_DISCOVERED_ARG_CHARS);
+        let projected = match safe_untrusted_label(&argument, limit) {
+            Some(projected) => projected,
+            None if remaining >= UNPRINTABLE_LABEL.chars().count() => UNPRINTABLE_LABEL.into(),
+            None => break,
+        };
+        remaining = remaining.saturating_sub(projected.chars().count());
+        safe.push(projected);
+    }
+    safe
+}
+
+fn normalise_untrusted_tree_fields(event: &mut TurnEvent) {
+    match &mut event.kind {
+        EventKind::AgentSpawned {
+            declared_name,
+            agent_type,
+            task,
+            ..
+        } => {
+            *declared_name = declared_name
+                .take()
+                .and_then(|name| safe_untrusted_label(&name, turn_pty::MAX_TITLE_CHARS));
+            *agent_type = agent_type
+                .take()
+                .and_then(|kind| safe_untrusted_label(&kind, turn_pty::MAX_TITLE_CHARS));
+            *task = task
+                .take()
+                .and_then(|task| safe_untrusted_label(&task, MAX_AGENT_TASK_CHARS));
+        }
+        EventKind::ProcessSpawnedChild {
+            command, args, cwd, ..
+        } => {
+            *command = safe_untrusted_label(command, MAX_DISCOVERED_COMMAND_CHARS)
+                .unwrap_or_else(|| "process".into());
+            *args = safe_untrusted_args(std::mem::take(args));
+            *cwd = cwd.take().map(|cwd| {
+                safe_untrusted_label(&cwd, MAX_DISCOVERED_CWD_CHARS)
+                    .unwrap_or_else(|| UNPRINTABLE_LABEL.into())
+            });
+        }
+        _ => {}
+    }
+}
+
 impl Core {
     /// Applies one event: state, store, attention, pushes.
     pub(crate) fn ingest(&mut self, event: TurnEvent, now_ms: i64) {
@@ -75,6 +147,11 @@ impl Core {
     }
 
     fn ingest_after_checkpoint_barrier(&mut self, mut event: TurnEvent, now_ms: i64) {
+        // Typed does not mean trusted. Future adapters and supervisor backends can
+        // construct these events without going through today's payload filters.
+        // Normalise once before state, pushes, and persistence so every consumer
+        // observes the same bounded single-line projection.
+        normalise_untrusted_tree_fields(&mut event);
         let session_id = event.session_id.clone();
         let Some(session) = self.sessions.get(&session_id) else {
             // A hook from a session that has since gone. Recording it against nothing
@@ -582,6 +659,7 @@ impl Core {
             pid,
             ppid,
             command,
+            args,
             cwd,
             confirmed_parent,
         } = &event.kind
@@ -593,6 +671,7 @@ impl Core {
                 *pid,
                 *ppid,
                 command.clone(),
+                args.clone(),
                 cwd.clone(),
                 *confirmed_parent,
                 now_ms,

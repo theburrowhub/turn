@@ -691,6 +691,72 @@ fn rollback_git_worktree(root: &Path, target: &Path) {
 mod tests {
     use super::*;
     use crate::core::testing::Harness;
+    use turn_core::ids::PaneId;
+
+    #[tokio::test]
+    async fn workspace_session_and_template_apis_reject_unsafe_navigation_names() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_safe_name_boundary");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_safe_name_boundary"),
+            10,
+        );
+        let workspace_id = harness.core.sessions[&session_id].workspace_id.clone();
+        let workspace_root = harness._dir.path().to_string_lossy().into_owned();
+        let before = (
+            harness.core.workspaces.len(),
+            harness.core.sessions.len(),
+            harness.core.templates.len(),
+        );
+
+        for (offset, hostile) in [
+            "forged\nrow",
+            "clear\x1b[2Jscreen",
+            "reverse\u{202e}name",
+            "zero\u{200b}width",
+            "join\u{200d}me",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let now = 20 + offset as i64;
+            let workspace_error = harness
+                .core
+                .create_workspace(hostile.into(), workspace_root.clone(), now)
+                .expect_err("an unsafe Workspace name must be rejected first");
+            let session_error = harness
+                .core
+                .create_session(
+                    &workspace_id,
+                    hostile.into(),
+                    None,
+                    Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                    None,
+                    Vec::new(),
+                    now,
+                )
+                .expect_err("an unsafe Session name must be rejected first");
+            let template_error = harness
+                .core
+                .save_layout_as_template(&session_id, hostile.into(), None, None, now)
+                .expect_err("an unsafe Template name must be rejected first");
+
+            for error in [workspace_error, session_error, template_error] {
+                assert_eq!(error.code, turn_proto::ErrorCode::InvalidArgument);
+            }
+        }
+
+        assert_eq!(
+            (
+                harness.core.workspaces.len(),
+                harness.core.sessions.len(),
+                harness.core.templates.len(),
+            ),
+            before,
+            "refused labels must not create partial navigation state"
+        );
+    }
 
     #[test]
     fn a_list_of_panes_becomes_one_split_in_the_order_it_was_given() {

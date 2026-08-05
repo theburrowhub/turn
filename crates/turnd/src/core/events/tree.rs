@@ -5,7 +5,10 @@
 //! [`Relation::Confirmed`]; a pid whose parent happens to match is
 //! [`Relation::Inferred`]; nothing else is allowed to become an edge at all.
 
-use super::Changed;
+use super::{
+    safe_untrusted_args, safe_untrusted_label, Changed, MAX_AGENT_TASK_CHARS,
+    MAX_DISCOVERED_COMMAND_CHARS, MAX_DISCOVERED_CWD_CHARS, UNPRINTABLE_LABEL,
+};
 use crate::core::Core;
 use turn_core::event::Confidence;
 use turn_core::ids::{NodeId, SessionId};
@@ -30,6 +33,16 @@ impl Core {
         task: Option<String>,
         now_ms: i64,
     ) -> Changed {
+        // A declared name is authored by an agent which may itself be processing
+        // adversarial repository content. Preserve its semantic value, but never
+        // its ability to inject terminal controls, bidi state or unbounded text
+        // into the persistent tree. `ingest` performs the same projection on the
+        // event; this is defence for direct/internal callers.
+        let declared_name =
+            declared_name.and_then(|name| safe_untrusted_label(&name, turn_pty::MAX_TITLE_CHARS));
+        let agent_type =
+            agent_type.and_then(|kind| safe_untrusted_label(&kind, turn_pty::MAX_TITLE_CHARS));
+        let task = task.and_then(|task| safe_untrusted_label(&task, MAX_AGENT_TASK_CHARS));
         let Some(session) = self.sessions.get_mut(session_id) else {
             return Changed::default();
         };
@@ -254,10 +267,22 @@ impl Core {
         pid: u32,
         ppid: Option<u32>,
         command: String,
+        args: Vec<String>,
         observed_cwd: Option<String>,
         confirmed_parent: bool,
         now_ms: i64,
     ) -> Changed {
+        // ProcessSupervisor keeps the raw OS values long enough to classify and
+        // traverse them. A child node is the human-facing, durable projection and
+        // therefore must not retain hostile argv/path text. Repeat the ingress
+        // normalisation here so no internal caller can bypass it.
+        let command = safe_untrusted_label(&command, MAX_DISCOVERED_COMMAND_CHARS)
+            .unwrap_or_else(|| "process".into());
+        let args = safe_untrusted_args(args);
+        let observed_cwd = observed_cwd.map(|cwd| {
+            safe_untrusted_label(&cwd, MAX_DISCOVERED_CWD_CHARS)
+                .unwrap_or_else(|| UNPRINTABLE_LABEL.into())
+        });
         let Some(session) = self.sessions.get_mut(session_id) else {
             return Changed::default();
         };
@@ -276,16 +301,18 @@ impl Core {
         node.id = child;
         node.pid = Some(pid);
         node.ppid = ppid;
+        node.args = args;
         node.lifecycle = Lifecycle::Alive;
-        node.title = node
+        let executable = node
             .command
             .split_whitespace()
             .next()
             .unwrap_or(&node.command)
             .rsplit('/')
             .next()
-            .unwrap_or("process")
-            .to_string();
+            .unwrap_or("process");
+        node.title = safe_untrusted_label(executable, turn_pty::MAX_TITLE_CHARS)
+            .unwrap_or_else(|| "process".into());
         // Inferred unless a tool said so. The UI draws the difference.
         let relation = if confirmed_parent {
             Relation::Confirmed
@@ -304,12 +331,25 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{MAX_DISCOVERED_ARGS, MAX_DISCOVERED_ARGV_CHARS, MAX_DISCOVERED_ARG_CHARS};
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::PaneId;
 
     const NOW: i64 = 1_775_000_000_000;
+
+    fn assert_safe_and_bounded(value: &str, max_chars: usize) {
+        assert!(
+            value.chars().all(turn_pty::is_display_safe),
+            "unsafe display character survived in {value:?}"
+        );
+        assert!(
+            value.chars().count() <= max_chars,
+            "{} characters exceeded the {max_chars}-character bound",
+            value.chars().count()
+        );
+    }
 
     #[tokio::test]
     async fn reviewer_is_a_named_background_child_and_never_opens_a_pane() {
@@ -400,6 +440,258 @@ mod tests {
             Some("Reviewer")
         );
         assert!(restored_reviewer.activity_preview.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_agent_declaration_is_safe_and_bounded_in_event_tree_and_inspector() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_hostile_declaration");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_hostile_declaration"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+
+        let declared_name = format!(
+            "Rev\x1b[31miew\u{009b}2Jer\u{202e}\u{200b}\u{200d}\n{}",
+            "n".repeat(turn_pty::MAX_TITLE_CHARS * 8)
+        );
+        let agent_type = "Expl\u{202e}ore\u{200b}".to_string();
+        let task = format!(
+            "Review\ncurrent\u{200d} diff\x1b]0;forged\x07 {}",
+            "t".repeat(MAX_AGENT_TASK_CHARS * 8)
+        );
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentSpawned {
+                    declared_name: Some(declared_name),
+                    agent_type: Some(agent_type),
+                    agent_id: Some("hostile-reviewer-1".into()),
+                    task: Some(task),
+                },
+                EventSource::Hook {
+                    tool: "claude-code".into(),
+                    event_name: "SubagentStart".into(),
+                },
+                Confidence::Explicit,
+                NOW + 1,
+            )
+            .with_node(parent_id.clone()),
+            NOW + 1,
+        );
+
+        let worker = harness.core.sessions[&session_id]
+            .tree
+            .children(&parent_id)
+            .into_iter()
+            .next()
+            .expect("the declaration still creates its AgentNode");
+        let info = worker.agent.as_ref().unwrap();
+        let declared = info.name.declared_name.as_deref().unwrap();
+        assert_safe_and_bounded(declared, turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(&info.name.display_name, turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(&worker.title, turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(
+            info.agent_type.as_deref().unwrap(),
+            turn_pty::MAX_TITLE_CHARS,
+        );
+        assert_safe_and_bounded(info.current_task.as_deref().unwrap(), MAX_AGENT_TASK_CHARS);
+
+        let inspector = harness
+            .core
+            .tree_views(&session_id, NOW + 2)
+            .into_iter()
+            .find(|view| view.node_id == worker.id)
+            .expect("the inspector projection contains the worker");
+        assert_safe_and_bounded(&inspector.title, turn_pty::MAX_TITLE_CHARS);
+        let inspector_agent = inspector.agent.unwrap();
+        assert_safe_and_bounded(
+            inspector_agent.name.declared_name.as_deref().unwrap(),
+            turn_pty::MAX_TITLE_CHARS,
+        );
+        assert_safe_and_bounded(
+            inspector_agent.current_task.as_deref().unwrap(),
+            MAX_AGENT_TASK_CHARS,
+        );
+
+        let persisted = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .expect("the normalised event is durable");
+        let EventKind::AgentSpawned {
+            declared_name,
+            agent_type,
+            task,
+            ..
+        } = persisted.kind
+        else {
+            panic!("unexpected event kind")
+        };
+        assert_safe_and_bounded(declared_name.as_deref().unwrap(), turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(agent_type.as_deref().unwrap(), turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(task.as_deref().unwrap(), MAX_AGENT_TASK_CHARS);
+
+        let restored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let restored_worker = restored.tree.get(&worker.id).unwrap();
+        assert_safe_and_bounded(&restored_worker.title, turn_pty::MAX_TITLE_CHARS);
+        assert_safe_and_bounded(
+            restored_worker
+                .agent
+                .as_ref()
+                .unwrap()
+                .name
+                .declared_name
+                .as_deref()
+                .unwrap(),
+            turn_pty::MAX_TITLE_CHARS,
+        );
+    }
+
+    #[tokio::test]
+    async fn enormous_hostile_supervisor_argv_is_only_projected_as_bounded_safe_text() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_hostile_process");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_hostile_process"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+
+        let child_id = NodeId::from_stored("proc_hostile_discovered");
+        let huge_argv = format!(
+            "/opt/ru\u{202e}n\u{200b}ner\x1b[31m --payload={}\n--forged-row",
+            "A".repeat(MAX_DISCOVERED_COMMAND_CHARS * 64)
+        );
+        let hostile_cwd = format!(
+            "/tmp/work\u{200d}space\u{009b}2J/{}",
+            "B".repeat(MAX_DISCOVERED_CWD_CHARS * 8)
+        );
+        let mut hostile_args = vec![
+            "/opt/runner".to_string(),
+            "--normal".to_string(),
+            format!(
+                "evil\n\x1b[31m\u{202e}\u{200b}\u{200d}{}",
+                "C".repeat(MAX_DISCOVERED_ARG_CHARS * 8)
+            ),
+        ];
+        hostile_args.extend((0..MAX_DISCOVERED_ARGS * 2).map(|index| format!("--extra-{index}")));
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::ProcessSpawnedChild {
+                    child: child_id.clone(),
+                    pid: 42_424,
+                    ppid: Some(42_000),
+                    command: huge_argv,
+                    args: hostile_args,
+                    cwd: Some(hostile_cwd),
+                    confirmed_parent: false,
+                },
+                EventSource::Supervisor,
+                Confidence::InferredHigh,
+                NOW + 1,
+            )
+            .with_node(parent_id),
+            NOW + 1,
+        );
+
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&child_id)
+            .expect("the discovered process is represented");
+        assert_safe_and_bounded(&node.command, MAX_DISCOVERED_COMMAND_CHARS);
+        assert_safe_and_bounded(&node.cwd, MAX_DISCOVERED_CWD_CHARS);
+        assert_safe_and_bounded(&node.title, turn_pty::MAX_TITLE_CHARS);
+        assert!(node.args.len() <= MAX_DISCOVERED_ARGS);
+        assert!(
+            node.args
+                .iter()
+                .map(|arg| arg.chars().count())
+                .sum::<usize>()
+                <= MAX_DISCOVERED_ARGV_CHARS
+        );
+        for arg in &node.args {
+            assert_safe_and_bounded(arg, MAX_DISCOVERED_ARG_CHARS);
+        }
+
+        let inspector = harness
+            .core
+            .tree_views(&session_id, NOW + 2)
+            .into_iter()
+            .find(|view| view.node_id == child_id)
+            .expect("the inspector receives the process projection");
+        assert_safe_and_bounded(&inspector.command, MAX_DISCOVERED_COMMAND_CHARS);
+        assert_safe_and_bounded(&inspector.cwd, MAX_DISCOVERED_CWD_CHARS);
+        assert_safe_and_bounded(&inspector.title, turn_pty::MAX_TITLE_CHARS);
+        assert_eq!(inspector.args, node.args);
+
+        let persisted_event = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 1)
+            .unwrap()
+            .pop()
+            .expect("the discovery event is durable");
+        let EventKind::ProcessSpawnedChild {
+            command, args, cwd, ..
+        } = persisted_event.kind
+        else {
+            panic!("unexpected event kind")
+        };
+        assert_safe_and_bounded(&command, MAX_DISCOVERED_COMMAND_CHARS);
+        assert_safe_and_bounded(cwd.as_deref().unwrap(), MAX_DISCOVERED_CWD_CHARS);
+        assert!(args.len() <= MAX_DISCOVERED_ARGS);
+        assert!(
+            args.iter().map(|arg| arg.chars().count()).sum::<usize>() <= MAX_DISCOVERED_ARGV_CHARS
+        );
+        for arg in &args {
+            assert_safe_and_bounded(arg, MAX_DISCOVERED_ARG_CHARS);
+        }
+
+        let restored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let restored_node = restored.tree.get(&child_id).unwrap();
+        assert_safe_and_bounded(&restored_node.command, MAX_DISCOVERED_COMMAND_CHARS);
+        assert_safe_and_bounded(&restored_node.cwd, MAX_DISCOVERED_CWD_CHARS);
+        assert_safe_and_bounded(&restored_node.title, turn_pty::MAX_TITLE_CHARS);
+        assert_eq!(restored_node.args, args);
     }
 
     #[tokio::test]

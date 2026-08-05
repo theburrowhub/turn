@@ -12,6 +12,8 @@
 //! Both are bounded. An unbounded scrollback is a memory leak with a nice name.
 
 use std::collections::VecDeque;
+use std::iter::Peekable;
+use std::str::Chars;
 
 /// Default cap on retained raw bytes per pane, ~2 MiB.
 pub const DEFAULT_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
@@ -353,7 +355,7 @@ pub fn is_display_safe(c: char) -> bool {
 /// Returns `None` when nothing legible is left, so a caller cannot end up
 /// rendering an empty label where it expected a name.
 pub fn sanitise_label(raw: &str, max_chars: usize) -> Option<String> {
-    if raw.is_empty() {
+    if raw.is_empty() || max_chars == 0 {
         return None;
     }
 
@@ -367,25 +369,12 @@ pub fn sanitise_label(raw: &str, max_chars: usize) -> Option<String> {
                 // CSI: parameters and intermediates, then a final byte in @..~
                 Some('[') => {
                     chars.next();
-                    while let Some(&next) = chars.peek() {
-                        chars.next();
-                        if ('\x40'..='\x7e').contains(&next) {
-                            break;
-                        }
-                    }
+                    consume_csi(&mut chars);
                 }
                 // OSC and other string sequences: run to BEL or ESC \.
                 Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
                     chars.next();
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' {
-                            break;
-                        }
-                        if next == '\x1b' {
-                            chars.next();
-                            break;
-                        }
-                    }
+                    consume_control_string(&mut chars);
                 }
                 // A lone two-character sequence.
                 Some(_) => {
@@ -393,6 +382,20 @@ pub fn sanitise_label(raw: &str, max_chars: usize) -> Option<String> {
                 }
                 None => {}
             }
+            continue;
+        }
+        // ECMA-48 also defines single-character C1 introducers. Treating U+009B
+        // as just another control would drop it but leave `31m` behind, letting a
+        // hostile process forge visible text out of the tail of a CSI sequence.
+        if c == '\u{009b}' {
+            consume_csi(&mut chars);
+            continue;
+        }
+        if matches!(
+            c,
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}'
+        ) {
+            consume_control_string(&mut chars);
             continue;
         }
         if is_display_safe(c) {
@@ -411,6 +414,28 @@ pub fn sanitise_label(raw: &str, max_chars: usize) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Consumes a CSI body after either `ESC [` or the single-character C1 CSI.
+fn consume_csi(chars: &mut Peekable<Chars<'_>>) {
+    for next in chars.by_ref() {
+        if ('\x40'..='\x7e').contains(&next) {
+            break;
+        }
+    }
+}
+
+/// Consumes an OSC/DCS/SOS/PM/APC body through BEL or either spelling of ST.
+fn consume_control_string(chars: &mut Peekable<Chars<'_>>) {
+    while let Some(next) = chars.next() {
+        if matches!(next, '\x07' | '\u{009c}') {
+            break;
+        }
+        if next == '\x1b' && chars.peek() == Some(&'\\') {
+            chars.next();
+            break;
+        }
     }
 }
 
@@ -605,6 +630,20 @@ mod tests {
         assert_eq!(sanitise_title(&"x".repeat(500)).unwrap().len(), 200);
     }
 
+    #[test]
+    fn c1_control_sequences_are_consumed_with_their_payload_syntax() {
+        assert_eq!(
+            sanitise_label("safe\u{009b}31mred\u{009b}0m text", 200),
+            Some("safered text".into()),
+            "a single-character CSI must not leave `31m` in the label"
+        );
+        assert_eq!(
+            sanitise_label("before\u{009d}forged title\u{009c}after", 200),
+            Some("beforeafter".into()),
+            "a C1 OSC must be consumed through its ST terminator"
+        );
+    }
+
     /// A title is the one piece of process-controlled text Turn puts in native
     /// chrome, so it must not be able to render as something other than itself.
     /// `RLO` reverses everything after it: the payload below reads as
@@ -622,6 +661,7 @@ mod tests {
         for hostile in [
             "\u{2066}isolated\u{2069}",
             "left\u{200b}\u{200b}right",
+            "emoji\u{200d}joiner",
             "line\u{2028}second line",
             "para\u{2029}second para",
             "bom\u{feff}here",

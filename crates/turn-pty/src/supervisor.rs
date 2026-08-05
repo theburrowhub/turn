@@ -23,6 +23,9 @@ pub struct ObservedProcess {
     pub name: String,
     /// Full command line, when the OS lets us read it.
     pub command_line: String,
+    /// Argument boundaries as reported by the OS. This remains raw supervisor
+    /// data; the daemon creates a bounded safe projection before persistence.
+    pub args: Vec<String>,
     pub cwd: Option<String>,
     /// Our guess at what this process is for.
     pub kind: NodeKind,
@@ -125,12 +128,12 @@ impl ProcessSupervisor {
     pub fn observe(&self, pid: u32) -> Option<ObservedProcess> {
         let process = self.system.process(Pid::from_u32(pid))?;
         let name = process.name().to_string_lossy().to_string();
-        let command_line = process
+        let args = process
             .cmd()
             .iter()
             .map(|part| part.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+            .collect::<Vec<_>>();
+        let command_line = args.join(" ");
         let effective = if command_line.is_empty() {
             name.clone()
         } else {
@@ -142,6 +145,7 @@ impl ProcessSupervisor {
             ppid: process.parent().map(|p| p.as_u32()),
             name,
             command_line,
+            args,
             cwd: process.cwd().map(|path| path.to_string_lossy().to_string()),
             kind: classify(&effective),
         })

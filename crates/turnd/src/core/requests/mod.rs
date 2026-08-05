@@ -320,17 +320,63 @@ impl Core {
 
 /// Rejects a name that would leave the user with an unidentifiable row.
 pub(super) fn check_name(name: &str) -> std::result::Result<String, ProtoError> {
+    // Do not repair user-authored navigation identity. A Workspace called
+    // `release\nFAILED`, or one containing a bidi override, is a different and
+    // misleading label rather than a harmless spelling mistake. Agent/process
+    // metadata is projected safely elsewhere; API names are rejected so the
+    // caller can correct what it submitted.
+    if name
+        .chars()
+        .any(|character| !turn_pty::is_display_safe(character))
+    {
+        return Err(ProtoError::invalid(
+            "A name cannot contain control, direction-changing, or invisible characters",
+        ));
+    }
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(ProtoError::invalid("A name cannot be empty"));
     }
     // A name is a label in a sidebar, not a payload. The cap is generous enough that
     // no real task description hits it.
-    const MAX: usize = 200;
+    const MAX: usize = turn_pty::MAX_TITLE_CHARS;
     if trimmed.chars().count() > MAX {
         return Err(ProtoError::invalid(format!(
             "A name cannot be longer than {MAX} characters"
         )));
     }
+    if turn_pty::sanitise_label(trimmed, MAX).as_deref() != Some(trimmed) {
+        return Err(ProtoError::invalid(
+            "A name must be a single safe display label",
+        ));
+    }
     Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_name;
+
+    #[test]
+    fn navigation_names_reject_adversarial_text_instead_of_rewriting_it() {
+        for hostile in [
+            "release\nFAILED",
+            "release\rFAILED",
+            "release\x1b[2JFAILED",
+            "release\u{009b}2JFAILED",
+            "safe\u{202e}gpj.elif",
+            "zero\u{200b}width",
+            "joined\u{200d}label",
+        ] {
+            let error = check_name(hostile).expect_err(hostile);
+            assert_eq!(error.code, turn_proto::ErrorCode::InvalidArgument);
+        }
+
+        assert_eq!(
+            check_name("  Review current diff  ").unwrap(),
+            "Review current diff",
+            "ordinary surrounding spaces retain the established API behaviour"
+        );
+        assert!(check_name(&"x".repeat(turn_pty::MAX_TITLE_CHARS + 1)).is_err());
+    }
 }
