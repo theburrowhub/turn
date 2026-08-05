@@ -11,10 +11,7 @@ use turn_core::model::{
     Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template,
     WorkspaceCheckout,
 };
-use turn_proto::{
-    CloseDisposition, NewPane, ProtoError, ProtoErrorContext, Response, ServerEvent,
-    TemplateSummary,
-};
+use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
 
 impl Core {
     /// Creates a session and starts the processes its panes describe.
@@ -815,7 +812,7 @@ mod tests {
             .expect_err("the canonical checkout fence must span Workspace aliases");
         assert!(matches!(
             error.context.as_deref(),
-            Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+            Some(turn_proto::ProtoErrorContext::WorkspaceWriteLeaseConflict {
                 workspace_id,
                 owner: conflicting_owner,
                 lease,
