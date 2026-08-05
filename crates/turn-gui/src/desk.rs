@@ -1626,6 +1626,26 @@ impl Desk {
                 ask: Ask::Action("dismissing a demand"),
                 request: Request::DismissAttention { attention_id },
             }],
+            ViewAction::SnoozeAttention {
+                attention_id,
+                until_ms,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("snoozing a demand"),
+                request: Request::SnoozeAttention {
+                    attention_id,
+                    until_ms,
+                },
+            }],
+            ViewAction::MuteAttentionSession {
+                session_id,
+                until_ms,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("muting a session"),
+                request: Request::MuteSession {
+                    session_id,
+                    until_ms,
+                },
+            }],
             ViewAction::CreateWorkspace { name, root } => vec![Reaction::Send {
                 ask: Ask::Action("creating a workspace"),
                 request: Request::CreateWorkspace { name, root },
@@ -1891,7 +1911,29 @@ impl Desk {
             .sessions
             .iter()
             .find(|session| session.id == entry.entry.session_id)?;
-        let agent = summary.primary_agent.as_ref()?;
+        // An attention entry belongs to a Process, not merely to a Session. Prefer
+        // that exact node so a Reviewer's permission never displays Claude's pending
+        // command or cwd. The primary Agent is only a compatibility fallback for old
+        // daemon projections that did not carry node ids.
+        let targeted_node = entry.entry.node_id.as_ref().and_then(|node_id| {
+            self.hierarchy
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot.workspaces.iter().find_map(|workspace| {
+                        workspace.sessions.iter().find_map(|session| {
+                            session.nodes.iter().find(|node| &node.node_id == node_id)
+                        })
+                    })
+                })
+                .or_else(|| {
+                    self.trees
+                        .get(&entry.entry.session_id)
+                        .and_then(|tree| tree.iter().find(|node| &node.node_id == node_id))
+                })
+        });
+        let agent = targeted_node
+            .and_then(|node| node.agent.as_ref())
+            .or(summary.primary_agent.as_ref())?;
         let pending = agent.pending_permission.as_ref()?;
         Some(PendingPermission {
             attention_id: Some(entry.entry.id.clone()),
@@ -2010,7 +2052,8 @@ mod tests {
     use turn_core::event::{Confidence, Risk};
     use turn_core::ids::{AttentionId, WorkspaceId};
     use turn_core::model::{
-        Pane, PendingPermission as CorePermission, ProcessNode, Session, Template, Workspace,
+        NodeKind, Pane, PendingPermission as CorePermission, ProcessNode, Relation, Session,
+        Template, Workspace,
     };
     use turn_core::state::{AwaitingReason, Lifecycle, Turn};
     use turn_core::Effect;
@@ -2494,6 +2537,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn queue_triage_actions_keep_the_exact_demand_session_and_deadline() {
+        let mut desk = Desk::new();
+        let attention_id = AttentionId::new();
+        let session_id = SessionId::from_stored("sess_queue_triage");
+        let until_ms = T0 + 10 * 60 * 1_000;
+
+        match sent(&desk.apply_view_action(
+            ViewAction::SnoozeAttention {
+                attention_id: attention_id.clone(),
+                until_ms,
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::SnoozeAttention {
+                attention_id: sent_id,
+                until_ms: sent_until,
+            }] => {
+                assert_eq!(sent_id, &attention_id);
+                assert_eq!(*sent_until, until_ms);
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        match sent(&desk.apply_view_action(
+            ViewAction::MuteAttentionSession {
+                session_id: session_id.clone(),
+                until_ms: Some(until_ms),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::MuteSession {
+                session_id: sent_session,
+                until_ms: Some(sent_until),
+            }] => {
+                assert_eq!(sent_session, &session_id);
+                assert_eq!(*sent_until, until_ms);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
     /// The banner is built from the daemon's queue order and the daemon's own permission
     /// detail — including the directory, which is the field that stops somebody
     /// approving a command in the wrong repository.
@@ -2559,6 +2648,73 @@ mod tests {
             "the banner must carry the id of what it is showing"
         );
         assert!(!banner.provisional);
+    }
+
+    #[test]
+    fn a_subagent_permission_banner_never_borrows_the_primary_agents_command() {
+        let (mut session, _, primary_id) = session_with_agent("Review in background");
+        let primary = session.tree.get_mut(&primary_id).expect("primary agent");
+        primary.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        });
+        primary.agent.as_mut().unwrap().pending_permission = Some(CorePermission {
+            summary: "primary command".into(),
+            command: Some("make deploy".into()),
+            tool_name: Some("Bash".into()),
+            risk: Risk::High,
+            requested_ms: T0,
+            cwd: Some("/repo/main".into()),
+        });
+
+        let mut reviewer = ProcessNode::agent(
+            session.id.clone(),
+            "claude reviewer",
+            "/repo/review",
+            T0 + 1,
+        );
+        reviewer.kind = NodeKind::Subagent;
+        reviewer.title = "Reviewer".into();
+        reviewer.lifecycle = Lifecycle::Alive;
+        reviewer.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        });
+        reviewer.link_to(primary_id, Relation::Confirmed);
+        reviewer.agent.as_mut().unwrap().pending_permission = Some(CorePermission {
+            summary: "reviewer command".into(),
+            command: Some("git diff --check".into()),
+            tool_name: Some("Bash".into()),
+            risk: Risk::Low,
+            requested_ms: T0 + 1,
+            cwd: Some("/repo/review".into()),
+        });
+        let reviewer_id = session.tree.insert(reviewer);
+
+        let entry = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session.id.clone(),
+            node_id: Some(reviewer_id),
+            reason: AwaitingReason::Permission,
+            summary: Some("reviewer command".into()),
+            confidence: Confidence::Explicit,
+            created_ms: T0 + 1,
+            updated_ms: T0 + 1,
+            state: EntryState::Pending,
+            priority_boost: 0,
+        };
+        let mut desk = Desk::new();
+        desk.sessions.push(summary(&session, 1));
+        desk.trees.insert(
+            session.id.clone(),
+            TreeNodeView::for_session(&session, T0 + 2),
+        );
+        desk.queue
+            .push(AttentionView::from_entry(&entry, &session.name, T0 + 2));
+
+        let banner = desk.view(T0 + 2).permission.expect("permission banner");
+        assert_eq!(banner.summary, "reviewer command");
+        assert_eq!(banner.command.as_deref(), Some("git diff --check"));
+        assert_eq!(banner.cwd, "/repo/review");
+        assert_eq!(banner.risk, Risk::Low);
     }
 
     /// A demand that came from a heuristic has to be drawn as a guess.

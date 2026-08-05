@@ -158,12 +158,16 @@ impl TurnApp {
     /// Returns true when the key was for the sheet, so it is not also treated as input.
     fn steer_overlays(&mut self, ctx: &egui::Context) -> Vec<Command> {
         if !self.state.palette.open {
-            if self.state.shortcuts_open || self.state.settings_open {
+            if self.state.shortcuts_open
+                || self.state.settings_open
+                || self.state.attention_panel_open
+            {
                 let escape = ctx
                     .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
                 if escape {
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
+                    self.state.attention_panel_open = false;
                 }
             }
             return Vec::new();
@@ -212,6 +216,10 @@ impl TurnApp {
             }
             Command::OpenSettings => {
                 self.state.settings_open = !self.state.settings_open;
+                true
+            }
+            Command::ToggleAttentionPanel => {
+                self.state.attention_panel_open = !self.state.attention_panel_open;
                 true
             }
             // This legacy command now focuses the sole, always-present hierarchy. It
@@ -275,6 +283,7 @@ impl eframe::App for TurnApp {
                 ViewAction::CloseOverlay => {
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
+                    self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
                 }
                 action @ ViewAction::CreateWorkspace { .. } => {

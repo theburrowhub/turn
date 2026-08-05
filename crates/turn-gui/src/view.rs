@@ -202,6 +202,9 @@ pub struct ViewState {
     /// Which command sheet is open, if any.
     pub shortcuts_open: bool,
     pub settings_open: bool,
+    /// Explicit, temporary view of the daemon-owned Attention Queue. It is an
+    /// overlay, never a second persistent navigator beside the hierarchy.
+    pub attention_panel_open: bool,
     pub write_conflict_open: bool,
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
@@ -244,6 +247,7 @@ impl ViewState {
         self.palette.open
             || self.shortcuts_open
             || self.settings_open
+            || self.attention_panel_open
             || self.write_conflict_open
             || self.workspace_draft.is_some()
             || self.quick_preview.is_some()
@@ -325,6 +329,14 @@ pub enum ViewAction {
     /// arbitrary one.
     GotoAttention(AttentionId),
     DismissAttention(AttentionId),
+    SnoozeAttention {
+        attention_id: AttentionId,
+        until_ms: i64,
+    },
+    MuteAttentionSession {
+        session_id: SessionId,
+        until_ms: Option<i64>,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -821,6 +833,8 @@ impl<'a> TurnView<'a> {
             actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
         } else if let Some(conflict) = self.write_conflict {
             actions.extend(self.write_conflict_overlay(ui, theme, conflict, full));
+        } else if state.attention_panel_open {
+            actions.extend(self.attention_queue_overlay(ui, theme, full));
         } else if state.palette.open {
             actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
         } else if state.shortcuts_open {
@@ -914,6 +928,15 @@ impl<'a> TurnView<'a> {
                             .clicked()
                         {
                             actions.push(ViewAction::Run(Command::NextAttention));
+                        }
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new("Queue").color(theme.text_dim).small(),
+                            ))
+                            .on_hover_text("Open the Attention Queue")
+                            .clicked()
+                        {
+                            actions.push(ViewAction::Run(Command::ToggleAttentionPanel));
                         }
                     } else {
                         ui.label(
@@ -1309,7 +1332,7 @@ impl<'a> TurnView<'a> {
                         }
                     }
                     if response.double_clicked() && !caret_clicked {
-                        actions.extend(activate_hierarchy_row(state, snapshot, *row));
+                        actions.extend(open_or_focus_hierarchy_row(state, snapshot, *row));
                     }
                     if response.secondary_clicked() {
                         state.tree_has_focus = true;
@@ -1561,6 +1584,150 @@ impl<'a> TurnView<'a> {
                     }
                 });
             });
+        });
+        actions
+    }
+
+    /// A bounded, explicit queue overlay. The hierarchy remains the sole persistent
+    /// navigator; this view exists only while the user is triaging demands.
+    fn attention_queue_overlay(&self, ui: &mut Ui, theme: &Theme, full: Rect) -> Vec<ViewAction> {
+        const SNOOZE_MS: i64 = 10 * 60 * 1_000;
+        const MUTE_MS: i64 = 60 * 60 * 1_000;
+
+        let mut actions = Vec::new();
+        let width = 680.0_f32.min((full.width() - 40.0).max(240.0));
+        let content_height = 128.0 + self.queue.len().min(4) as f32 * 88.0;
+        let height = content_height
+            .clamp(220.0, 520.0)
+            .min((full.height() - 80.0).max(220.0));
+        let panel = Rect::from_center_size(full.center(), Vec2::new(width, height));
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(150));
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+
+        ui.scope_builder(region(panel.shrink(14.0), "attention-queue"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ATTENTION QUEUE").color(theme.text).strong());
+                ui.label(
+                    RichText::new(format!("{} pending", self.queue.len()))
+                        .color(theme.attention)
+                        .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        actions.push(ViewAction::CloseOverlay);
+                    }
+                });
+            });
+            ui.label(
+                RichText::new(
+                    "Demands stay unresolved until the agent resumes or you dismiss them explicitly.",
+                )
+                .color(theme.text_faint)
+                .small(),
+            );
+            ui.add_space(8.0);
+
+            if self.queue.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(36.0);
+                    ui.label(RichText::new("Nothing needs you").color(theme.text_dim));
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("attention-queue-rows")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for item in &self.queue {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if item.actionable { "◆" } else { "○" })
+                                        .monospace()
+                                        .color(if item.actionable {
+                                            theme.attention
+                                        } else {
+                                            theme.text_faint
+                                        }),
+                                );
+                                ui.label(
+                                    RichText::new(&item.session_name)
+                                        .color(theme.text)
+                                        .strong(),
+                                );
+                                ui.label(
+                                    RichText::new(item.reason_label().to_uppercase())
+                                        .color(if item.actionable {
+                                            theme.attention
+                                        } else {
+                                            theme.text_faint
+                                        })
+                                        .small(),
+                                );
+                                if item.provisional {
+                                    ui.label(
+                                        RichText::new("inferred")
+                                            .color(theme.provisional)
+                                            .small(),
+                                    );
+                                }
+                                if !item.actionable {
+                                    ui.label(
+                                        RichText::new("snoozed")
+                                            .color(theme.text_faint)
+                                            .small(),
+                                    );
+                                }
+                            });
+                            if let Some(summary) = &item.summary {
+                                ui.label(RichText::new(summary).color(theme.text_dim));
+                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(item.actionable, egui::Button::new("Open"))
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::GotoAttention(
+                                        item.attention_id.clone(),
+                                    ));
+                                }
+                                if ui
+                                    .add_enabled(
+                                        item.actionable,
+                                        egui::Button::new("Snooze 10 min"),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::SnoozeAttention {
+                                        attention_id: item.attention_id.clone(),
+                                        until_ms: self.now_ms.saturating_add(SNOOZE_MS),
+                                    });
+                                }
+                                if ui.button("Mute session 1h").clicked() {
+                                    actions.push(ViewAction::MuteAttentionSession {
+                                        session_id: item.session_id.clone(),
+                                        until_ms: Some(self.now_ms.saturating_add(MUTE_MS)),
+                                    });
+                                }
+                                if ui.button("Dismiss").clicked() {
+                                    actions.push(ViewAction::DismissAttention(
+                                        item.attention_id.clone(),
+                                    ));
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
         });
         actions
     }
@@ -2676,6 +2843,34 @@ fn activate_hierarchy_row(
     }
 }
 
+/// Double-click is the explicit mouse equivalent of "open or focus". A background
+/// Agent with no Pane gets a temporary one; an Agent already represented in the
+/// layout keeps that stable layout and merely focuses its existing Pane.
+fn open_or_focus_hierarchy_row(
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    row: HierarchyRow<'_>,
+) -> Vec<ViewAction> {
+    let HierarchyRow::Process { node, .. } = row else {
+        return activate_hierarchy_row(state, snapshot, row);
+    };
+    let action = if node.pane_bindings.is_empty() {
+        HierarchyAction::OpenTemporaryPane {
+            surface_id: snapshot.tree_state.surface_id.clone(),
+            session_id: node.session_id.clone(),
+            node_id: node.node_id.clone(),
+        }
+    } else {
+        HierarchyAction::FocusPaneForNode {
+            surface_id: snapshot.tree_state.surface_id.clone(),
+            session_id: node.session_id.clone(),
+            node_id: node.node_id.clone(),
+        }
+    };
+    state.push_hierarchy_action(action);
+    Vec::new()
+}
+
 #[derive(Clone, Copy)]
 enum HierarchyKeypress {
     Up,
@@ -3234,6 +3429,41 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn double_click_opens_a_background_subagent_without_changing_the_saved_layout() {
+        let (snapshot, root_id, child_id, session_id) = hierarchy_fixture();
+        let session = &snapshot.workspaces[0].sessions[0];
+        let child = session
+            .nodes
+            .iter()
+            .find(|node| node.node_id == child_id)
+            .expect("Reviewer");
+        assert!(child.pane_bindings.is_empty());
+
+        let mut state = ViewState::default();
+        open_or_focus_hierarchy_row(
+            &mut state,
+            &snapshot,
+            HierarchyRow::Process {
+                session,
+                node: child,
+            },
+        );
+        let actions = state.take_hierarchy_actions();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::OpenTemporaryPane {
+                session_id: opened_session,
+                node_id,
+                ..
+            } if opened_session == &session_id && node_id == &child_id
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
+        )));
+    }
+
     fn process_session(row: HierarchyRow<'_>) -> SessionId {
         match row {
             HierarchyRow::Process { node, .. } => node.session_id.clone(),
@@ -3338,6 +3568,9 @@ mod tests {
         assert!(state.is_sensitive());
         state.shortcuts_open = false;
         state.settings_open = true;
+        assert!(state.is_sensitive());
+        state.settings_open = false;
+        state.attention_panel_open = true;
         assert!(state.is_sensitive());
     }
 

@@ -362,6 +362,7 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         provider: Some("anthropic".into()),
         tool: Some("claude-code".into()),
         model: Some("claude-3.5-sonnet".into()),
+        external_id: Some("claude-main".into()),
     };
     claude_info.current_task = Some("Fix the climbing transition and verify it".into());
     add_preview(
@@ -389,6 +390,7 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         provider: Some("anthropic".into()),
         tool: Some("claude-code".into()),
         model: Some("claude-3.5-sonnet".into()),
+        external_id: Some("reviewer".into()),
     };
     reviewer_info.current_task = Some("Review the climbing logic changes".into());
     add_preview(
@@ -689,6 +691,14 @@ fn a_busy_desk_with_a_pending_permission() {
     let mut h = harness(busy_desk());
     h.run();
     h.snapshot("busy_desk");
+}
+
+#[test]
+fn the_attention_queue_is_an_explicit_overlay_not_a_second_navigator() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.attention_panel_open = true;
+    h.run();
+    h.snapshot("attention_queue");
 }
 
 #[test]
