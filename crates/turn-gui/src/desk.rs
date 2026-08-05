@@ -5409,6 +5409,309 @@ mod tests {
     }
 
     #[test]
+    fn preparing_context_handoff_sends_only_the_typed_prepare_request() {
+        let session_id = SessionId::from_stored("sess_handoff001");
+        let source_node_id = NodeId::from_stored("proc_source001");
+        let target_node_id = NodeId::from_stored("proc_target001");
+        let mut desk = Desk::new();
+
+        let reactions = desk.apply_view_action(
+            ViewAction::PrepareContextHandoff {
+                session_id: session_id.clone(),
+                source_node_id: source_node_id.clone(),
+                target_node_id: target_node_id.clone(),
+                instruction: Some("Concentrate on the failing invariant".into()),
+            },
+            T0,
+        );
+
+        match reactions.as_slice() {
+            [Reaction::Send {
+                ask:
+                    Ask::PrepareContextHandoff {
+                        session_id: asked_session_id,
+                        source_node_id: asked_source_node_id,
+                        target_node_id: asked_target_node_id,
+                    },
+                request:
+                    Request::PrepareContextHandoff {
+                        session_id: requested_session_id,
+                        source_node_id: requested_source_node_id,
+                        target_node_id: requested_target_node_id,
+                        instruction,
+                    },
+            }] => {
+                assert_eq!(asked_session_id, &session_id);
+                assert_eq!(asked_source_node_id, &source_node_id);
+                assert_eq!(asked_target_node_id, &target_node_id);
+                assert_eq!(requested_session_id, &session_id);
+                assert_eq!(requested_source_node_id, &source_node_id);
+                assert_eq!(requested_target_node_id, &target_node_id);
+                assert_eq!(
+                    instruction.as_ref().map(ContextHandoffText::as_str),
+                    Some("Concentrate on the failing invariant")
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(!sent(&reactions)
+            .iter()
+            .any(|request| matches!(request, Request::WritePty { .. })));
+    }
+
+    #[test]
+    fn a_correlated_context_handoff_answer_produces_the_typed_reaction() {
+        let session_id = SessionId::from_stored("sess_handoff002");
+        let source_node_id = NodeId::from_stored("proc_source002");
+        let target_node_id = NodeId::from_stored("proc_target002");
+        let handoff = ContextHandoffView {
+            handoff_id: HandoffId::from_stored("handoff_draft002"),
+            session_id: session_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            source_label: "Reviewer".into(),
+            target_label: "Implementer".into(),
+            body: ContextHandoffText::new("[Turn context handoff]\nSafe fact"),
+            preview_count: 1,
+            redacted: true,
+        };
+        let mut desk = Desk::new();
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::PrepareContextHandoff {
+                    session_id,
+                    source_node_id,
+                    target_node_id,
+                },
+                response: Box::new(Response::ContextHandoff {
+                    handoff: Box::new(handoff.clone()),
+                }),
+            },
+            T0,
+        );
+
+        match reactions.as_slice() {
+            [Reaction::ContextHandoffPrepared(answered)] => assert_eq!(answered, &handoff),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_context_handoff_answer_with_different_entity_ids_is_rejected() {
+        let session_id = SessionId::from_stored("sess_handoff003");
+        let source_node_id = NodeId::from_stored("proc_source003");
+        let target_node_id = NodeId::from_stored("proc_target003");
+        let expected = ContextHandoffView {
+            handoff_id: HandoffId::from_stored("handoff_draft003"),
+            session_id: session_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            source_label: "Source".into(),
+            target_label: "Target".into(),
+            body: ContextHandoffText::new("bounded context"),
+            preview_count: 1,
+            redacted: false,
+        };
+        let mismatched = [
+            ContextHandoffView {
+                session_id: SessionId::from_stored("sess_wrong0001"),
+                ..expected.clone()
+            },
+            ContextHandoffView {
+                source_node_id: NodeId::from_stored("proc_wrong0001"),
+                ..expected.clone()
+            },
+            ContextHandoffView {
+                target_node_id: NodeId::from_stored("proc_wrong0002"),
+                ..expected
+            },
+        ];
+
+        for handoff in mismatched {
+            let mut desk = Desk::new();
+            let reactions = desk.apply_inbound(
+                Inbound::Answer {
+                    ask: Ask::PrepareContextHandoff {
+                        session_id: session_id.clone(),
+                        source_node_id: source_node_id.clone(),
+                        target_node_id: target_node_id.clone(),
+                    },
+                    response: Box::new(Response::ContextHandoff {
+                        handoff: Box::new(handoff),
+                    }),
+                },
+                T0,
+            );
+
+            match reactions.as_slice() {
+                [Reaction::ContextHandoffPrepareFailed {
+                    session_id: failed_session_id,
+                    source_node_id: failed_source_node_id,
+                    target_node_id: failed_target_node_id,
+                    message,
+                }] => {
+                    assert_eq!(failed_session_id, &session_id);
+                    assert_eq!(failed_source_node_id, &source_node_id);
+                    assert_eq!(failed_target_node_id, &target_node_id);
+                    assert!(message.contains("different Agents"), "got {message}");
+                }
+                other => panic!("got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn delivering_context_handoff_never_writes_directly_to_the_pty() {
+        let session_id = SessionId::from_stored("sess_handoff004");
+        let handoff_id = HandoffId::from_stored("handoff_draft004");
+        let mut desk = Desk::new();
+
+        let reactions = desk.apply_view_action(
+            ViewAction::DeliverContextHandoff {
+                session_id: session_id.clone(),
+                handoff_id: handoff_id.clone(),
+            },
+            T0,
+        );
+
+        match reactions.as_slice() {
+            [Reaction::Send {
+                ask:
+                    Ask::DeliverContextHandoff {
+                        session_id: asked_session_id,
+                        handoff_id: asked_handoff_id,
+                    },
+                request:
+                    Request::DeliverContextHandoff {
+                        session_id: requested_session_id,
+                        handoff_id: requested_handoff_id,
+                    },
+            }] => {
+                assert_eq!(asked_session_id, &session_id);
+                assert_eq!(asked_handoff_id, &handoff_id);
+                assert_eq!(requested_session_id, &session_id);
+                assert_eq!(requested_handoff_id, &handoff_id);
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(!sent(&reactions)
+            .iter()
+            .any(|request| matches!(request, Request::WritePty { .. })));
+
+        let acknowledgement = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::DeliverContextHandoff {
+                    session_id,
+                    handoff_id: handoff_id.clone(),
+                },
+                response: Box::new(Response::Ack),
+            },
+            T0 + 1,
+        );
+        assert!(matches!(
+            acknowledgement.as_slice(),
+            [Reaction::ContextHandoffDelivered { handoff_id: delivered }]
+                if delivered == &handoff_id
+        ));
+    }
+
+    #[test]
+    fn context_handoff_failures_remain_typed_and_inline() {
+        let session_id = SessionId::from_stored("sess_handoff005");
+        let source_node_id = NodeId::from_stored("proc_source005");
+        let target_node_id = NodeId::from_stored("proc_target005");
+        let handoff_id = HandoffId::from_stored("handoff_draft005");
+        let mut desk = Desk::new();
+
+        let prepare_failure = desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::PrepareContextHandoff {
+                    session_id: session_id.clone(),
+                    source_node_id: source_node_id.clone(),
+                    target_node_id: target_node_id.clone(),
+                },
+                error: turn_proto::ProtoError::new(
+                    turn_proto::ErrorCode::Conflict,
+                    "the source changed",
+                ),
+            },
+            T0,
+        );
+        assert!(matches!(
+            prepare_failure.as_slice(),
+            [Reaction::ContextHandoffPrepareFailed {
+                session_id: failed_session_id,
+                source_node_id: failed_source_node_id,
+                target_node_id: failed_target_node_id,
+                message,
+            }] if failed_session_id == &session_id
+                && failed_source_node_id == &source_node_id
+                && failed_target_node_id == &target_node_id
+                && message == "the source changed"
+        ));
+
+        let delivery_failure = desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::DeliverContextHandoff {
+                    session_id,
+                    handoff_id: handoff_id.clone(),
+                },
+                error: turn_proto::ProtoError::new(
+                    turn_proto::ErrorCode::Conflict,
+                    "the destination is busy",
+                ),
+            },
+            T0 + 1,
+        );
+        assert!(matches!(
+            delivery_failure.as_slice(),
+            [Reaction::ContextHandoffDeliveryFailed {
+                handoff_id: failed_handoff_id,
+                message,
+            }] if failed_handoff_id == &handoff_id && message == "the destination is busy"
+        ));
+        assert!(desk.view(T0 + 1).notice.is_none());
+    }
+
+    #[test]
+    fn reconnecting_invalidates_any_context_handoff_draft() {
+        let mut desk = Desk::new();
+        desk.apply_view_action(
+            ViewAction::PrepareContextHandoff {
+                session_id: SessionId::from_stored("sess_handoff006"),
+                source_node_id: NodeId::from_stored("proc_source006"),
+                target_node_id: NodeId::from_stored("proc_target006"),
+                instruction: None,
+            },
+            T0,
+        );
+
+        let reconnecting = desk.apply_inbound(
+            Inbound::Status(ConnectionState::Connecting { attempt: 2 }),
+            T0 + 1,
+        );
+        assert!(matches!(
+            reconnecting.as_slice(),
+            [Reaction::ContextHandoffInvalidated]
+        ));
+
+        let reconnected = desk.apply_inbound(connected(), T0 + 2);
+        assert_eq!(
+            reconnected
+                .iter()
+                .filter(|reaction| matches!(reaction, Reaction::ContextHandoffInvalidated))
+                .count(),
+            1
+        );
+        let requests = sent(&reconnected);
+        assert_eq!(
+            requests.iter().map(Request::op).collect::<Vec<_>>(),
+            vec!["get_hierarchy", "list_templates", "list_attention"]
+        );
+    }
+
+    #[test]
     fn scrolling_a_pane_moves_its_viewport_and_typing_brings_it_back() {
         let (session, pane_id, node_id) = session_with_agent("Scrollable");
         let mut desk = Desk::new();
