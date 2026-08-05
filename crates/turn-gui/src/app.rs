@@ -13,6 +13,7 @@
 //! 5. Work out when to draw next, which for an idle desk is "never, until something
 //!    happens".
 
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 use eframe::egui;
@@ -28,6 +29,73 @@ use crate::theme::Theme;
 use crate::transport::{Ask, DaemonLink};
 use crate::view::{ViewAction, ViewState};
 
+#[derive(Debug)]
+struct FolderDialogResult {
+    request_id: u64,
+    path: Option<PathBuf>,
+}
+
+/// Owns the native chooser boundary without making the pure `TurnView` platform-aware.
+///
+/// `rfd` needs the dialog future to be created on the application thread on macOS. The
+/// future itself is then awaited off-thread and wakes egui exactly once on completion,
+/// so an open chooser causes neither a blocked renderer nor an idle repaint loop.
+struct FolderDialog {
+    next_request_id: u64,
+    sender: mpsc::Sender<FolderDialogResult>,
+    results: mpsc::Receiver<FolderDialogResult>,
+}
+
+impl Default for FolderDialog {
+    fn default() -> Self {
+        let (sender, results) = mpsc::channel();
+        Self {
+            next_request_id: 1,
+            sender,
+            results,
+        }
+    }
+}
+
+impl FolderDialog {
+    fn open(
+        &mut self,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        current_root: &str,
+    ) -> Result<u64, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Choose project folder")
+            .set_parent(frame)
+            .set_can_create_directories(true);
+        let current_root = Path::new(current_root.trim());
+        if current_root.is_dir() {
+            dialog = dialog.set_directory(current_root);
+        }
+        // Constructing the future here is intentional: rfd schedules NSOpenPanel from
+        // the application's main thread, while the worker below only awaits completion.
+        let future = dialog.pick_folder();
+        let sender = self.sender.clone();
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name(format!("turn-folder-picker-{request_id}"))
+            .spawn(move || {
+                let path = pollster::block_on(future).map(|handle| handle.path().to_path_buf());
+                let _ = sender.send(FolderDialogResult { request_id, path });
+                repaint.request_repaint();
+            })
+            .map_err(|error| format!("Could not open the project folder chooser: {error}"))?;
+        Ok(request_id)
+    }
+
+    fn drain(&self) -> Vec<FolderDialogResult> {
+        self.results.try_iter().collect()
+    }
+}
+
 /// The application.
 pub struct TurnApp {
     theme: Theme,
@@ -38,6 +106,8 @@ pub struct TurnApp {
     activity: ActivityTracker,
     announcer: Box<dyn Announcer>,
     companion_events: Option<mpsc::Receiver<CompanionEvent>>,
+    folder_dialog: FolderDialog,
+    pending_folder_request: Option<u64>,
 }
 
 impl TurnApp {
@@ -98,6 +168,8 @@ impl TurnApp {
             activity: ActivityTracker::new(),
             announcer: Box::new(DesktopAnnouncer),
             companion_events,
+            folder_dialog: FolderDialog::default(),
+            pending_folder_request: None,
         }
     }
 
@@ -132,6 +204,8 @@ impl TurnApp {
                 workspace_id,
                 continue_to_session,
             } => {
+                self.pending_folder_request = None;
+                self.state.workspace_picker_pending = false;
                 self.state.workspace_draft = None;
                 if continue_to_session {
                     self.state.session_draft = Some(self.desk.new_session_draft_for(workspace_id));
@@ -152,6 +226,48 @@ impl TurnApp {
                     draft.error = Some(message);
                 }
             }
+        }
+    }
+
+    fn open_workspace_directory_chooser(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.pending_folder_request.is_some() {
+            return;
+        }
+        let Some(current_root) = self
+            .state
+            .workspace_draft
+            .as_ref()
+            .map(|draft| draft.root.clone())
+        else {
+            return;
+        };
+        match self.folder_dialog.open(frame, ctx, &current_root) {
+            Ok(request_id) => {
+                self.pending_folder_request = Some(request_id);
+                self.state.workspace_picker_pending = true;
+                if let Some(draft) = self.state.workspace_draft.as_mut() {
+                    draft.error = None;
+                }
+            }
+            Err(error) => {
+                if let Some(draft) = self.state.workspace_draft.as_mut() {
+                    draft.error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn apply_folder_dialog_result(&mut self, result: FolderDialogResult) {
+        if self.pending_folder_request != Some(result.request_id) {
+            return;
+        }
+        self.pending_folder_request = None;
+        self.state.workspace_picker_pending = false;
+        let (Some(path), Some(draft)) = (result.path, self.state.workspace_draft.as_mut()) else {
+            return;
+        };
+        if let Err(error) = draft.select_directory(&path) {
+            draft.error = Some(error);
         }
     }
 
@@ -355,9 +471,13 @@ impl TurnApp {
 }
 
 impl eframe::App for TurnApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now_ms = turn_core::now_ms();
+
+        for result in self.folder_dialog.drain() {
+            self.apply_folder_dialog_result(result);
+        }
 
         if let Some(events) = &self.companion_events {
             for event in events.try_iter() {
@@ -425,6 +545,11 @@ impl eframe::App for TurnApp {
                     self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
+                    self.pending_folder_request = None;
+                    self.state.workspace_picker_pending = false;
+                }
+                ViewAction::ChooseWorkspaceDirectory => {
+                    self.open_workspace_directory_chooser(&ctx, frame);
                 }
                 action @ (ViewAction::CreateWorkspace { .. }
                 | ViewAction::CreateSessionFromTemplate { .. }) => {
@@ -660,6 +785,58 @@ mod tests {
                 .map(|draft| &draft.workspace_id),
             Some(&workspace_id)
         );
+    }
+
+    #[test]
+    fn cancelling_the_native_folder_chooser_preserves_the_workspace_draft() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-folder-cancel.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let mut draft = crate::view::WorkspaceDraft::new(true);
+        draft.root = "/Users/x/original".into();
+        draft.name = "Original name".into();
+        draft.name_is_derived = false;
+        let before = draft.clone();
+        app.state.workspace_draft = Some(draft);
+        app.state.workspace_picker_pending = true;
+        app.pending_folder_request = Some(41);
+
+        app.apply_folder_dialog_result(FolderDialogResult {
+            request_id: 41,
+            path: None,
+        });
+
+        assert_eq!(app.state.workspace_draft.as_ref(), Some(&before));
+        assert!(!app.state.workspace_picker_pending);
+        assert!(app.pending_folder_request.is_none());
+    }
+
+    #[test]
+    fn a_late_folder_result_cannot_mutate_a_reopened_workspace_form() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-stale-folder.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let mut draft = crate::view::WorkspaceDraft::new(false);
+        draft.root = "/Users/x/current".into();
+        draft.name = "Current".into();
+        app.state.workspace_draft = Some(draft.clone());
+        app.state.workspace_picker_pending = true;
+        app.pending_folder_request = Some(52);
+
+        app.apply_folder_dialog_result(FolderDialogResult {
+            request_id: 51,
+            path: Some(std::path::PathBuf::from("/Users/x/stale")),
+        });
+
+        assert_eq!(app.state.workspace_draft.as_ref(), Some(&draft));
+        assert_eq!(app.pending_folder_request, Some(52));
+        assert!(app.state.workspace_picker_pending);
     }
 
     #[test]

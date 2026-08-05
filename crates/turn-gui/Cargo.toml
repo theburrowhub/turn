@@ -26,6 +26,10 @@ directories = { workspace = true }
 # centre needs a platform binding; everything that *decides* whether to notify lives
 # in `announce.rs` and is tested without it.
 notify-rust = { version = "4.11", default-features = false }
+# Native project-folder selection. The dialog is created on the UI thread, then its
+# async result is awaited by a short-lived worker so the egui event loop stays idle.
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
+pollster = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

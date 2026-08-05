@@ -779,6 +779,7 @@ fn the_workspace_form_is_a_visible_first_step_not_a_log_message() {
     h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
         name: "turn".into(),
         root: "/Users/x/personal-workspace/turn".into(),
+        name_is_derived: true,
         continue_to_session: true,
         request_name_focus: true,
         submitting: false,
@@ -786,6 +787,36 @@ fn the_workspace_form_is_a_visible_first_step_not_a_log_message() {
     });
     h.run();
     h.snapshot("new_workspace");
+}
+
+#[test]
+fn browsing_for_a_workspace_is_an_explicit_accessible_view_action() {
+    let mut h = harness(Fixture {
+        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
+        connection: Some(connected()),
+        ..Fixture::default()
+    });
+    h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
+        name: "turn".into(),
+        root: "/Users/x/personal-workspace/turn".into(),
+        name_is_derived: true,
+        continue_to_session: true,
+        request_name_focus: false,
+        submitting: false,
+        error: None,
+    });
+    h.run_steps(2);
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Browse…")
+        .expect("the folder chooser is a visible accessible button")
+        .click();
+    h.run_steps(1);
+
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::ChooseWorkspaceDirectory]
+    );
 }
 
 #[test]
@@ -851,6 +882,7 @@ fn workspace_onboarding_owns_keyboard_events_even_while_a_pane_remains_focused()
     h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
         name: "turn".into(),
         root: "/Users/x/personal-workspace/turn".into(),
+        name_is_derived: true,
         continue_to_session: false,
         request_name_focus: true,
         submitting: false,
@@ -876,9 +908,8 @@ fn workspace_onboarding_owns_keyboard_events_even_while_a_pane_remains_focused()
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(field_labels.iter().any(|label| label == "Name"));
-    assert!(field_labels
-        .iter()
-        .any(|label| label == "Absolute project directory"));
+    assert!(field_labels.iter().any(|label| label == "Project folder"));
+    assert!(h.query_by_label("Browse…").is_some());
     h.state_mut().actions.clear();
     h.event(egui::Event::Text("-typed".into()));
     h.event(egui::Event::Paste("-pasted".into()));
@@ -914,6 +945,7 @@ fn onboarding_blocks_clicks_through_to_background_controls() {
     h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
         name: "turn".into(),
         root: "/Users/x/personal-workspace/turn".into(),
+        name_is_derived: true,
         continue_to_session: false,
         request_name_focus: true,
         submitting: false,

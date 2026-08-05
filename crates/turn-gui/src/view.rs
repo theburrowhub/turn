@@ -200,6 +200,9 @@ pub struct ViewState {
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
     pub workspace_draft: Option<WorkspaceDraft>,
+    /// A native folder sheet is outstanding. It disables duplicate Browse/Create
+    /// actions but causes no polling or continuous repaint.
+    pub workspace_picker_pending: bool,
     /// The explicit New Session sheet. `Cmd+N` opens this; only Quick New may bypass it.
     pub session_draft: Option<SessionDraft>,
     /// The daemon-owned navigation projection for this window. `None` is kept as a
@@ -265,6 +268,9 @@ impl ViewState {
 pub struct WorkspaceDraft {
     pub name: String,
     pub root: String,
+    /// True while `name` is the suggestion derived from `root`. Typing a custom name
+    /// makes it false; choosing another folder intentionally starts a new suggestion.
+    pub name_is_derived: bool,
     /// `Cmd+N` with an empty desk is a two-step onboarding flow. An explicit New
     /// Workspace command stops after the Workspace is created.
     pub continue_to_session: bool,
@@ -289,10 +295,41 @@ impl WorkspaceDraft {
         Self {
             name,
             root,
+            name_is_derived: true,
             continue_to_session,
             request_name_focus: true,
             submitting: false,
             error: None,
+        }
+    }
+
+    /// Applies an explicit native-folder selection and derives its editable default name.
+    pub fn select_directory(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let root = path
+            .to_str()
+            .ok_or_else(|| "The selected folder name is not valid Unicode.".to_string())?;
+        let name = path
+            .file_name()
+            .and_then(|part| part.to_str())
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| turn_core::model::Workspace::name_from_path(root));
+        self.root = root.to_string();
+        self.name = name;
+        self.name_is_derived = true;
+        self.request_name_focus = true;
+        self.error = None;
+        Ok(())
+    }
+
+    /// Keeps a still-unedited suggestion in sync when a power user types a path.
+    fn refresh_derived_name(&mut self) {
+        if self.name_is_derived {
+            self.name = if self.root.trim().is_empty() {
+                String::new()
+            } else {
+                turn_core::model::Workspace::name_from_path(self.root.trim())
+            };
         }
     }
 }
@@ -397,6 +434,9 @@ pub enum ViewAction {
         root: String,
         continue_to_session: bool,
     },
+    /// Opens the native project-folder chooser. The view only reports the intent;
+    /// platform UI is owned by `TurnApp` outside this pure renderer.
+    ChooseWorkspaceDirectory,
     CreateSessionFromTemplate {
         workspace_id: WorkspaceId,
         template_id: TemplateId,
@@ -1340,7 +1380,10 @@ impl<'a> TurnView<'a> {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.panel);
 
-        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 44.0));
+        // Buttons occupy the first row; keyboard help gets a separate baseline below
+        // them. Keeping both inside the old 44px header made them overlap at the normal
+        // 344px sidebar width on Retina displays.
+        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 50.0));
         ui.painter().text(
             header.min + Vec2::new(10.0, 6.0),
             Align2::LEFT_TOP,
@@ -1349,14 +1392,7 @@ impl<'a> TurnView<'a> {
             theme.text_dim,
         );
         ui.painter().text(
-            header.right_top() + Vec2::new(-218.0, 8.0),
-            Align2::RIGHT_TOP,
-            format!("rev {}", snapshot.revision),
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme.text_faint,
-        );
-        ui.painter().text(
-            header.min + Vec2::new(10.0, 23.0),
+            header.min + Vec2::new(10.0, 34.0),
             Align2::LEFT_TOP,
             "Space preview · Enter focus · ⌘Enter temporary",
             FontId::new(10.0, egui::FontFamily::Monospace),
@@ -1803,6 +1839,52 @@ impl<'a> TurnView<'a> {
             let Some(draft) = state.workspace_draft.as_mut() else {
                 return;
             };
+            let root_label = ui.label(
+                RichText::new("Project folder")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            let mut browse_clicked = false;
+            let root_field = ui
+                .horizontal(|ui| {
+                    let button_width = if state.workspace_picker_pending {
+                        92.0
+                    } else {
+                        76.0
+                    };
+                    let field_width = (ui.available_width()
+                        - button_width
+                        - ui.spacing().item_spacing.x)
+                        .max(80.0);
+                    let field = ui
+                        .add_sized(
+                            [field_width, 24.0],
+                            egui::TextEdit::singleline(&mut draft.root)
+                                .hint_text("/Users/you/projects/my-project"),
+                        )
+                        .labelled_by(root_label.id);
+                    browse_clicked = ui
+                        .add_enabled(
+                            !state.workspace_picker_pending && !draft.submitting,
+                            egui::Button::new(if state.workspace_picker_pending {
+                                "Choosing…"
+                            } else {
+                                "Browse…"
+                            }),
+                        )
+                        .on_hover_text("Choose an existing project folder")
+                        .clicked();
+                    field
+                })
+                .inner;
+            if root_field.changed() {
+                draft.refresh_derived_name();
+            }
+            let submit_from_root =
+                root_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            if browse_clicked {
+                actions.push(ViewAction::ChooseWorkspaceDirectory);
+            }
             let name_label = ui.label(RichText::new("Name").color(theme.text_dim).small());
             let name_field = ui
                 .add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY))
@@ -1811,31 +1893,22 @@ impl<'a> TurnView<'a> {
                 name_field.request_focus();
                 draft.request_name_focus = false;
             }
+            if name_field.changed() {
+                draft.name_is_derived = false;
+            }
             let submit_from_name =
                 name_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-            let root_label = ui.label(
-                RichText::new("Absolute project directory")
-                    .color(theme.text_dim)
-                    .small(),
-            );
-            let root_field = ui
-                .add(
-                    egui::TextEdit::singleline(&mut draft.root)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("/Users/you/projects/my-project"),
-                )
-                .labelled_by(root_label.id);
-            let submit_from_root =
-                root_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
             let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
+            let root_is_absolute = std::path::Path::new(draft.root.trim()).is_absolute();
             let valid = connected
                 && !draft.submitting
+                && !state.workspace_picker_pending
                 && !draft.name.trim().is_empty()
-                && draft.root.starts_with('/');
-            if !draft.root.starts_with('/') {
+                && root_is_absolute;
+            if !root_is_absolute {
                 ui.label(
                     RichText::new(
-                        "Use an absolute path so every process resolves the same checkout.",
+                        "Choose an absolute project folder so every process resolves the same checkout.",
                     )
                     .color(theme.attention)
                     .small(),
@@ -3928,6 +4001,40 @@ mod tests {
             }],
         };
         (snapshot, root_id, child_id, session_id)
+    }
+
+    #[test]
+    fn selecting_a_project_folder_derives_an_editable_workspace_name() {
+        let mut draft = WorkspaceDraft::new(true);
+        draft
+            .select_directory(std::path::Path::new("/Users/x/projects/space-troopers"))
+            .unwrap();
+
+        assert_eq!(draft.root, "/Users/x/projects/space-troopers");
+        assert_eq!(draft.name, "space-troopers");
+        assert!(draft.name_is_derived);
+
+        draft.name = "Space Troopers".into();
+        draft.name_is_derived = false;
+        draft.root = "/Users/x/projects/space-troopers-v2".into();
+        draft.refresh_derived_name();
+        assert_eq!(draft.name, "Space Troopers");
+    }
+
+    #[test]
+    fn choosing_another_folder_replaces_the_suggestion_but_not_the_ability_to_edit_it() {
+        let mut draft = WorkspaceDraft::new(true);
+        draft.name = "A custom label".into();
+        draft.name_is_derived = false;
+
+        draft
+            .select_directory(std::path::Path::new("/Users/x/projects/alternative"))
+            .unwrap();
+
+        assert_eq!(draft.root, "/Users/x/projects/alternative");
+        assert_eq!(draft.name, "alternative");
+        assert!(draft.name_is_derived);
+        assert!(draft.request_name_focus);
     }
 
     #[test]

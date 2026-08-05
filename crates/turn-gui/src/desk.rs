@@ -1972,7 +1972,7 @@ impl Desk {
                 }],
                 None => Vec::new(),
             },
-            ViewAction::CloseOverlay => Vec::new(),
+            ViewAction::ChooseWorkspaceDirectory | ViewAction::CloseOverlay => Vec::new(),
             ViewAction::Pane { pane_id, action } => self.apply_pane_action(pane_id, action),
         }
     }
