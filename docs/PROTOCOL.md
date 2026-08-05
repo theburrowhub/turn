@@ -378,8 +378,6 @@ kind matters.
 | `get_hierarchy` | `surface_id`, `include_archived?` | `hierarchy` |
 | `set_tree_expanded` | `surface_id`, `key: HierarchyKey`, `expanded` | `tree_state` |
 | `select_tree_node` | `surface_id`, `key: HierarchyKey?` | `tree_state` |
-| `rename_node` | `session_id`, `node_id`, `display_name` | `node` |
-| `correct_relationship` | `session_id`, `node_id`, `old_parent?`, `new_parent?`, `kind`, `note?` | `node` |
 | `get_preview_history` | `session_id`, `node_id`, `limit?` (clamped to 20) | `preview_history` |
 | `set_preview_visibility` | `session_id`, `node_id`, `visibility` | `ack` |
 | `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `node_pane` |
@@ -391,9 +389,13 @@ navigation tree is a client bug. `HierarchySnapshot.revision` is monotonic for t
 revision gap or daemon identity change, request a full snapshot.
 
 Expansion/selection writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active
-Session or Pane focus, and do not produce a broadcast. `correct_relationship` is an audited user correction:
-the daemon verifies the old edge, refuses cycles/cross-Session moves and records explicit confidence. There
-is deliberately no unconstrained `move_node`.
+Session or Pane focus, and do not produce a broadcast. There is deliberately no unconstrained `move_node`.
+
+`rename_node`, audited `correct_relationship` and tree visibility/filter mutations are accepted product
+APIs but are **not protocol-v3 operations in this build**. A client must not send those operation names or
+pretend a local rename changed daemon state. Their eventual contracts must verify the old edge, refuse
+cycles and cross-Session moves, and record the user's correction at explicit confidence before this table
+can list them as implemented.
 
 `set_preview_visibility: hide` is enforced at the daemon projection and history boundaries: hierarchy
 snapshots omit the current activity preview and `get_preview_history` returns no entries. It does not erase

@@ -16,24 +16,18 @@ the workspace. The window is now native Rust drawn on the GPU (`crates/turn-gui`
 `wgpu`). ADR-039 records the decision, its cost and its downsides. The window milestone is therefore
 **reopened** as M7 below, and the tests it used to count are gone rather than renamed.
 
-Every remaining crate was built and green **together in one run** the moment the old frontend came out:
-**730 tests pass** — `turn-agents` 169, `turn-store` 140, `turn-proto` 133, `turn-core` 120, `turnd` 88,
-`turn-pty` 46, `turn-hook` 21, `turn-gui` 13 (measured 2026-08-04,
-`cargo test --workspace -- --test-threads=4`, 0 failed, 1 ignored — the accessibility snapshot named in M7).
-There is now one test runner and one command: no `pnpm`, no `vitest`, no second lockfile.
+There is one Rust test runner and one lockfile. The reproducible source of truth is
+`cargo test --workspace -- --test-threads=1`; this roadmap no longer hard-codes a total that becomes false
+whenever a regression test lands. PTY and loopback hook tests use real operating-system resources and are
+run serially for the release audit.
 
-That total has already moved. `turn-proto` and `turn-gui` are being extended right now — a cell
-representation on the wire, and a keymap, pane arranger and daemon transport in the window — so the number is
-higher and `ARCHITECTURE.md` §0 carries the per-crate breakdown with the same caveat. Reproduce it. One
-further caveat that is not about churn: `turn_pty::process::a_process_sees_the_size_we_gave_it` failed once
-with `OpenPty(Os { code: -6 })` under concurrent cargo load and passed on rerun — the pty tests spawn real
-ptys and want `--test-threads=4` on a busy machine.
-
-**Nothing has yet been shown to run end to end.** Every piece is tested against its own contract and against
-a fake counterpart — the adapters against payloads recorded from a live Claude Code run, the window against
-committed snapshot images — and no one has yet started `turnd`, opened the window, and watched a real
-`claude` session answer a real permission. That is M8, and until it closes "Built" means "compiles and keeps
-its own promises", not "works".
+The upgraded first vertical now runs through the production daemon, store, protocol projection and GUI
+model: Workspace and fenced main Session, explicit Reviewer spawn, stable preview, Quick Preview,
+temporary Pane close without process termination, and UI restart/restore. A separate integration test sends
+the event through the real loopback Claude hook transport and production normaliser. This is reproducible
+without a paid external service. A manual smoke test against an authenticated, currently installed Claude
+Code CLI is still pending and must not be conflated with the deterministic proof; current Claude hook
+payloads may provide a role/external id without a parent-declared display name.
 
 | Milestone | Delivers | Status |
 | --- | --- | --- |
@@ -43,9 +37,9 @@ its own promises", not "works".
 | M3 — Persistence | `turn-store`: SQLite, migrations, redaction, seven repositories | **Done** |
 | M4 — Protocol | `turn-proto`: framing, requests, responses, pushes, view models | **Done** |
 | M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Code complete**, exit criterion unverified |
-| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **In progress**; domain/schema checkpoint landed, runtime/protocol proof pending |
-| M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Reopened.** First version deleted; current flat-sidebar/queue spike is transitional |
-| M8 — First vertical | One real Session and background Reviewer, end to end | **Not started.** Blocked on M6 contract and M7 client |
+| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented for the first vertical**; release audit/hardening remains |
+| M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
+| M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
 | M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **Not started**; two CI boxes already green |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
@@ -241,7 +235,7 @@ and a hook POST from that Agent changes what the client is told.
 
 ---
 
-## M6 — Unified hierarchy foundation · **In progress**
+## M6 — Unified hierarchy foundation · **Implemented for the first vertical**
 
 This milestone makes ADR-040 true below the UI before M7 builds on it.
 
@@ -271,13 +265,16 @@ can be granted.
    is stale after restart until fresh activity.
 8. Quick Preview/temporary Pane close removes only a binding; the Agent and lease remain.
 
-**Status detail.** Domain/schema groundwork exists at the checkpoint. Lease lifecycle hardening, daemon
-transaction boundaries, complete protocol-v3 catalogue/conversations and the reproducible vertical are not
-yet accepted. “Types exist” is not the exit criterion.
+**Status detail.** Domain, append-only migrations, canonical checkout ownership, lease fencing/conflict
+transactions, hierarchy projection, per-surface state, pane bindings, preview redaction/history and the
+reproducible Reviewer vertical are implemented and tested. Legacy lease reconciliation is conservative:
+ambiguous live owners enter `recovery_required` instead of receiving authority. The remaining work is
+advanced management API surface (rename/correct/filter/manual order), performance measurement and the live
+CLI smoke test; “types exist” is still not an exit criterion.
 
 ---
 
-## M7 — The window · **Reopened: the first version was built and deleted**
+## M7 — The window · **Implemented for the first vertical**
 
 The first window implementation shipped as a Tauri shell plus a TypeScript/`xterm.js` frontend, reached code-complete with its
 own suites green, and was **rejected by the product owner on sight**. It has been deleted — `ui/`, 51
@@ -295,17 +292,15 @@ Also the other half of attention: performing `Effect`s (badge, highlight, sound,
 **reporting `UserContext` back** — last keystroke, foreground state, active Session, sensitive operation.
 Without that report the typing guard is inert, so it is not optional polish.
 
-**What exists now.** `crates/turn-gui`: an `eframe`/`egui` window over `wgpu`, 1440×900, with `cells.rs` (a
-pane's screen as cells, converted from the daemon's parsed screen — so there is no second VT emulator),
-`theme.rs` (whose `state_marker` returns a colour **and** a glyph together, making "never colour alone"
-structural) and `view.rs` (status bar, non-modal permission banner, flat Session sidebar, terminal painter
-and permanent queue). The painter/banner survive; the two navigation surfaces are explicitly transitional.
-13 tests: 11 unit plus 2 snapshot tests that render the real widget
-tree through `wgpu` **with no display attached** and diff against committed PNGs.
-
-That is a spike that settles the stack. It is not the accepted window: there is no complete v3 hierarchy,
-checkout-conflict chooser, contextual inspector/Quick Preview, accessible Tree/TreeItem navigation,
-splitting, effect channels or restore flow. The flat sidebar/permanent queue are removed, not promoted.
+**What exists now.** `crates/turn-gui` renders one accessible
+Workspace → Session → Agent/Tool → Child tree; there are no persistent Session tabs, thumbnail strip or
+second Agent tree. The centre is the saved user Layout, subagents stay in the background, Space opens a
+semantic Quick Preview and Cmd+Enter/double-click can open a temporary Pane. Selection, pane focus and
+Attention are separate. The right inspector is contextual and collapsible. Typed checkout conflicts offer
+focus/read-only/worktree/cancel, first run can create a Workspace, Quick New chooses the Coding Template,
+and the Attention Queue is an explicit overlay with open/snooze/mute/dismiss actions. GPU snapshots render
+the real widget tree and AccessKit tests require `Tree`/`TreeItem` semantics with no duplicate `ListItem`
+navigator.
 
 **What is verified.** The cell model against a real `vt100` stream, including the cases that are easy to get
 silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
@@ -320,38 +315,27 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 snapshots are the new capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
-**What is not.** Everything in "Delivers" above beyond the paint layer. Specifically and awkwardly:
-`every_session_row_is_reachable_by_its_accessible_name` is committed **failing and `#[ignore]`d**, because
-the session rows are painted rather than composed from widgets and `kittest` cannot find them in the
-accessibility tree — so this window is currently unusable with a screen reader, which the webview was not.
-IME is entirely unaddressed. The snapshot baselines exist only for macOS/Metal, so CI runs the comparison on
-macOS only and says so in the workflow. And no manual acceptance has happened on either platform.
+**What is not.** Tree search/filter modes, manual ordering, user rename and audited relationship correction,
+full context menus, permanent open-placement choices and IME sign-off remain. Snapshot baselines are native
+GPU output and still need platform CI coverage. No manual authenticated Claude session has been accepted.
 
-**Exit criterion.** A user can create a Session from a Template, watch an Agent work, answer a permission
-by typing in the terminal, and be taken to the right Pane by the Attention Queue shortcut. **Not met**, and
-further from met than it was a week ago — that is the honest accounting of a frontend swap.
+**Exit criterion.** The automated first-vertical form is met. Human live-CLI acceptance remains open.
 
 ---
 
-## M8 — First vertical · **Not started, and blocked**
+## M8 — First vertical · **Automated vertical complete; live smoke pending**
 
-The point of this milestone is that nothing counts until a person can do it.
+The deterministic vertical is implemented twice at the boundary that matters: a daemon/store restart test
+and an integration test through the real loopback Claude hook server and production normaliser. Both assert
+that Reviewer is a named child with no automatic Pane, its preview is stable/redacted, a temporary Pane can
+close without stopping it, the Layout stays unchanged, and the relationship/preview/process metadata
+survive UI restart.
 
-**What has changed, and it is a step backwards.** The vertical was once unblocked: both halves existed as
-code. Deleting the
-frontend (ADR-039) re-blocks it, because there is no longer a client that can open a socket. The daemon (M5)
-still assembles everything and owns the ptys; the window (M7) is now a paint-layer spike. M8 waits on both
-the M6 hierarchy contract and M7 client, and pretending otherwise would be the kind of accounting this document
-exists to avoid.
-
-**What the true remaining gap is.** Every suite in the workspace tests a piece against a *stand-in*: the
-adapters against hook payloads recorded from a live Claude Code run rather than against a live one, the
-window against committed images rather than against a daemon. Nobody has started `turnd`, opened the window,
-and watched a real `claude` answer a real permission — so the integration between the two halves, which is
-where the interesting failures live, is untested by construction. Nothing has run on Linux beyond CI's
-compile-and-test, either; what has changed there is that the risk is no longer two rendering engines
-diverging but one GPU stack behaving differently on Metal and Vulkan, which is at least a risk CI can be
-made to see (§Risks 2a).
+**The true remaining gap.** Nobody has yet completed the same scenario by launching an authenticated
+external Claude Code binary from the packaged native window. That smoke test may expose installed-version,
+credentials, signing, notification or Metal/Vulkan behaviour the deterministic proof cannot. It also must
+record exactly which current hook fields Claude supplies; the test fixture's explicit `Reviewer` name/task
+is a supported payload shape, not evidence that every installed Claude release emits those fields.
 
 To be clear about the other direction too: this is not the *only* thing between the code and a working
 product. M9 holds the unmeasured performance budget, the unfinished restore semantics, Linux sign-off and

@@ -146,6 +146,13 @@ exists; the canonical lease record remains the lease table.
 
 ## Internal APIs
 
+The list below is the accepted product boundary, not a claim that every operation is already exposed by
+protocol v3. The current vertical implements hierarchy list/subscription via revisioned snapshots,
+expand/collapse/select, preview history/visibility, temporary Pane open/focus/close, and lease
+acquire/release plus read-only/worktree creation. Rename, relationship correction, visibility modes,
+explicit redaction, permanent `OpenNodeAsPane`, `ListPanesForNode` and direct preview subscriptions remain
+planned and must not be simulated only in the GUI.
+
 ```text
 Tree:    ListWorkspaceTree, SubscribeTreeChanges, ExpandNode, CollapseNode,
          SelectNode, CorrectRelationship, RenameNode, SetVisibilityMode
@@ -157,9 +164,9 @@ Lease:   AcquireWorkspaceWriteLease, ReleaseWorkspaceWriteLease,
          GetWorkspaceWriteLease, CreateReadOnlySession, CreateWorktreeSession
 ```
 
-The protocol exposes these as request/response pairs and revisioned full-snapshot pushes. A client that
-misses a revision asks for resync rather than applying a partial guess. Tree UI state is keyed by a stable
-`surface_id`; selection/expansion from two windows is never broadcast between them. Mutations remain
+Implemented members are exposed as request/response pairs and revisioned full-snapshot pushes. A client
+that misses a revision asks for resync rather than applying a partial guess. Tree UI state is keyed by a
+stable `surface_id`; selection/expansion from two windows is never broadcast between them. Mutations remain
 daemon-authoritative; the GUI never fabricates a relationship, state, lease or preview confidence.
 
 ## SQLite v3 migration
@@ -262,3 +269,21 @@ current subagent hook contract. Its temporary pane therefore renders Preview/Det
 only offered when an integration supplies a real attachable stream.
 
 Separate GUI tests verify tree keyboard semantics, selection/focus/attention independence and snapshots at ordinary and dense (30-agent) sizes.
+
+Reproduce the vertical and the native UI evidence with:
+
+```sh
+cargo test -p turnd --test agents \
+  the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart \
+  -- --exact --test-threads=1 --nocapture
+cargo test -p turnd --lib \
+  core::requests::hierarchy::tests::the_reviewer_vertical_survives_a_ui_restart_without_changing_layout \
+  -- --exact --test-threads=1
+cargo test -p turn-gui --test snapshots -- --test-threads=1
+```
+
+The loopback-hook test exercises the real transport and production normaliser, but deliberately supplies
+the supported explicit `agent_name: Reviewer` and task fields. Claude Code 2.1.221's recorded payload in
+this repository supplied an external worker id and role (`Explore`) but not that parent-declared display
+name. Until a live installed version emits an explicit name, Turn must display the role/fallback honestly
+and enrich the same node later if a declaration arrives; it must never invent `Reviewer` from `Explore`.
