@@ -1771,9 +1771,10 @@ them a repository.
   that writes the value and hopes nothing reads it.
 - **Downside:** greedy substring matching will redact things users wanted to see, with no way to opt out per
   variable. `MONKEY_MODE=on` showing as redacted is confusing.
-- **Downside, and this one is open:** `TurnEvent::raw` holds the untouched hook payload, which can carry a
-  `transcript_path`, a `cwd` and a prompt excerpt. Key-based redaction does not touch free text. Whether
-  `raw` is persisted at all is an open decision (`ROADMAP.md` §Open decisions).
+- **Resolved by ADR-040:** key/shape redaction cannot make arbitrary callback free text safe. Claude's
+  adapter therefore emits only typed facts and provenance, never the callback body in `TurnEvent::raw`;
+  `EventRepo` additionally refuses raw data from every `EventSource::Hook`, and migration 005 removes hook
+  bodies written by older builds. Non-hook diagnostic notes keep the redacted persistence described here.
 
 ---
 
@@ -2259,6 +2260,13 @@ navigation status. Turn persists no raw PTY bytes or grid, normalises and redact
 most 20 snapshots per node and 2,000 globally, and displays a recovered preview only as stale until fresh
 activity arrives. High-frequency preview updates are snapshot state and coalesced pushes, not append-only
 domain events. ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
+
+Hook callbacks are hostile ingress, not event-log content. The Claude adapter reduces a callback directly
+to typed `EventKind`, `EventSource`, confidence and node/session identity; it does not attach the callback
+body to `TurnEvent::raw`. `EventRepo` enforces the boundary again for every hook source, preserving only the
+typed fact and its non-sensitive tool/event-name provenance. Migration 005 nulls historical hook `raw`
+columns so an upgrade does not leave the previous exposure behind. Adapter fixture files remain test source
+artefacts in the repository, not runtime product data.
 
 ### Alternatives considered
 

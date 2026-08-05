@@ -1,4 +1,5 @@
-//! Proof, at the level of raw bytes, that credentials do not end up in the file.
+//! Proof, at the level of raw bytes, that credentials and opaque hook free text
+//! do not end up in the file.
 //!
 //! Every other secret-hygiene test checks what comes back out of the store, which
 //! only proves redaction happened somewhere in the read path. This one reads the
@@ -27,7 +28,9 @@ const SECRETS: [&str; 8] = [
     "sk-ant-session-level-secret",
     "npm_pane_level_secret",
     "aws-node-level-secret",
-    "bearer-raw-payload-secret",
+    // Deliberately has no recognisable credential prefix and lives under an
+    // innocent key. A scanner cannot save us here; the hook body must be absent.
+    "free-text-hook-secret-with-no-recognisable-shape-8675309",
     // A shape the scanner has to recognise on its own: an attention summary has
     // no key beside it to give the game away.
     "sk-ant-api03-attention-summary-secret",
@@ -60,8 +63,8 @@ const TABLES_THIS_TEST_WRITES: [&str; 8] = [
 ///
 /// `settings` and `tree_ui_state` are UI preferences. Checkout/lease tables hold
 /// filesystem identity, typed ids, states and timestamps. Pane bindings are ids.
-/// Workspace audit events are restricted to structured lease/tree facts; raw
-/// agent payloads remain in the separately redacted `events` table.
+/// Workspace audit events are restricted to structured lease/tree facts. The
+/// `events` table stores typed facts and provenance, never raw hook callbacks.
 const TABLES_WITH_NOTHING_TO_LEAK: [&str; 7] = [
     "checkout_write_fences",
     "pane_node_bindings",
@@ -127,7 +130,9 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
     template.env = vec![("CI_JOB_TOKEN".into(), SECRETS[0].into())];
     store.templates().save(&template).unwrap();
 
-    // A raw hook payload that echoes an environment back at us.
+    // A raw Claude hook payload with arbitrary free text under an innocent key.
+    // It is intentionally not recognisable by the redactor: only the durable
+    // boundary (drop the callback, keep the typed fact) can make this safe.
     let event = TurnEvent::new(
         session.id.clone(),
         EventKind::AgentTurnStarted {
@@ -141,7 +146,7 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         T0 + 10,
     )
     .with_raw(format!(
-        r#"{{"cwd":"/repos/turn","headers":{{"authorization":"{}"}},"prompt":"fix the failing test"}}"#,
+        r#"{{"cwd":"/repos/turn","diagnostic_note":"{}","prompt":"fix the failing test"}}"#,
         SECRETS[4]
     ));
     store.events().append(&event).unwrap();
@@ -238,8 +243,18 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
         .any(|(_, bytes)| contains(bytes, b"fix the failing test"));
     assert!(
         found_marker,
-        "the payload never reached the file, so the absence of secrets proves nothing"
+        "the typed event fact never reached the file, so the absence of callback text proves nothing"
     );
+
+    let sqlite = rusqlite::Connection::open(temp.path().join(turn_store::DATABASE_FILE)).unwrap();
+    let raw: Option<String> = sqlite
+        .query_row(
+            "SELECT raw FROM events WHERE source_json LIKE '{\"hook\":%' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, None, "a hook callback must not occupy the raw column");
 
     let keys_kept = bytes
         .iter()
@@ -253,6 +268,82 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
     let restored = store.sessions().get(&session.id).unwrap().unwrap();
     assert_eq!(restored.env[0].0, "ANTHROPIC_API_KEY");
     assert_eq!(restored.env[0].1, REDACTED);
+}
+
+#[test]
+fn upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join(turn_store::DATABASE_FILE);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    turn_store::migrations::apply_to(&conn, 1).unwrap();
+    conn.execute(
+        "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+         attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+         VALUES ('ws_old', 'legacy', '/repo', '[]', '[]', '{}', 1, 1, 0, 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sessions \
+             (id, workspace_id, name, cwd, env_json, attention_json, status, \
+              restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+              last_activity_ms, tmux) \
+         VALUES ('sess_old', 'ws_old', 'work', '/repo', '[]', '{}', 'active', \
+                 'live', '[]', 0, 0, 0, 1, 1, 0)",
+        [],
+    )
+    .unwrap();
+    let secret = "historical-hook-free-text-with-no-secret-shape-8675309";
+    conn.execute(
+        "INSERT INTO events \
+             (id, timestamp_ms, session_id, kind_slug, kind_json, agent_json, \
+              confidence, source_json, severity, dedup_key, raw) \
+         VALUES ('evt_hook', 1, 'sess_old', 'agent.idle', '{}', '{}', 'explicit', \
+                 '{\"hook\":{\"tool\":\"claude-code\",\"event_name\":\"Stop\"}}', \
+                 'debug', 'hook', ?1)",
+        [secret],
+    )
+    .unwrap();
+    turn_store::migrations::apply_to(&conn, 4).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    assert!(
+        all_bytes(temp.path())
+            .iter()
+            .any(|(_, bytes)| contains(bytes, secret.as_bytes())),
+        "the v4 fixture never contained the historical callback"
+    );
+    drop(conn);
+
+    let store = Store::open_at(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), turn_store::LATEST_VERSION);
+    for (name, bytes) in all_bytes(temp.path()) {
+        assert!(
+            !contains(&bytes, secret.as_bytes()),
+            "the historical callback survived the security migration in {name}"
+        );
+    }
+
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let raw: Option<String> = sqlite
+        .query_row("SELECT raw FROM events WHERE id = 'evt_hook'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(raw, None);
+    let pending: bool = sqlite
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key = 'security.hook_raw_purge_pending')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !pending,
+        "a successful physical purge must clear its retry marker"
+    );
 }
 
 /// The control for the control: absence of a secret from a table proves nothing

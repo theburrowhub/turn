@@ -1063,10 +1063,9 @@ mod tests {
         let event = rx.recv().await.expect("an event must arrive");
         let rendered = serde_json::to_string(&event).expect("events serialise");
 
-        // Nothing anywhere in the event — fields or retained payload — can
-        // misrepresent itself. The payload keeps its control characters, but JSON
-        // encoding has turned them into six readable characters rather than a live
-        // escape sequence, which is why this holds for the whole document.
+        // Nothing anywhere in the typed event can misrepresent itself. Claude's
+        // callback body is ingress-only and therefore is not present to render or
+        // persist at all.
         let offenders: Vec<char> = rendered
             .chars()
             .filter(|c| !turn_pty::is_display_safe(*c))
@@ -1076,14 +1075,7 @@ mod tests {
             "characters that lie about themselves reached a stored event: \
              {offenders:?} in {rendered}"
         );
-        assert!(
-            event
-                .raw
-                .as_deref()
-                .expect("the payload is kept")
-                .contains("\\u001b"),
-            "and the payload still records that an escape byte was sent"
-        );
+        assert_eq!(event.raw, None, "the hostile callback body must be dropped");
         assert_eq!(
             event.agent.model.as_deref(),
             Some("claude"),

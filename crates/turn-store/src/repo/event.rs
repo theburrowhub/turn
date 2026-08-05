@@ -7,6 +7,13 @@
 //! Every row keeps its [`turn_core::Confidence`] and its source, so weeks later
 //! Turn can still say "the session read as waiting for you because a pty rule
 //! matched, not because the tool said so".
+//!
+//! A hook callback is deliberately *not* part of that durable account. It is
+//! hostile ingress that adapters reduce to typed [`turn_core::EventKind`] facts.
+//! The source still records which tool and hook supplied those facts, while the
+//! callback body is discarded even if a caller accidentally leaves it in
+//! [`turn_core::TurnEvent::raw`]. Arbitrary free text cannot be proven safe by a
+//! credential scanner.
 
 use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
@@ -281,11 +288,25 @@ fn insert(conn: &Connection, event: &TurnEvent) -> Result<()> {
             json("event source", &event.source)?,
             tag("severity", &event.severity)?,
             event.dedup_key,
-            event.raw.as_deref().map(redact_json),
+            raw_for_persistence(event),
         ],
     )
     .map_err(|error| StoreError::from_write("event", event.session_id.as_str(), error))?;
     Ok(())
+}
+
+/// Returns the diagnostic note that may cross the durable boundary.
+///
+/// Hook payloads never do. This repository-level check is intentional defence in
+/// depth: adapters should avoid attaching raw callbacks in the first place, but
+/// persistence must remain safe if a future adapter or test constructs a
+/// [`TurnEvent`] incorrectly. Non-hook notes (for example an OS exit description)
+/// retain their existing redacted persistence semantics.
+fn raw_for_persistence(event: &TurnEvent) -> Option<String> {
+    match &event.source {
+        EventSource::Hook { .. } => None,
+        _ => event.raw.as_deref().map(redact_json),
+    }
 }
 
 fn from_row(row: &Row<'_>) -> Result<TurnEvent> {
@@ -378,8 +399,7 @@ mod tests {
                 tool: Some("claude-code".into()),
                 model: Some("opus".into()),
                 external_id: None,
-            })
-            .with_raw(r#"{"hook_event_name":"PermissionRequest"}"#);
+            });
 
         store.events().append(&event).unwrap();
         let back = store.events().get(&event.id).unwrap().expect("stored");
@@ -489,21 +509,50 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_inside_a_raw_hook_payload_is_redacted_before_it_is_stored() {
+    fn a_raw_hook_payload_is_never_persisted_even_when_free_text_is_not_redactable() {
         let store = testing::store();
         let session = testing::saved_session_anywhere(&store, "raw");
-        let event = hook_event(&session.id, T0).with_raw(
-            r#"{"cwd":"/repo","env":{"GITHUB_TOKEN":"ghp_leaked"},"prompt":"fix the tests"}"#,
+        let secret = "free-text-secret-with-no-recognisable-shape-8675309";
+        let event = hook_event(&session.id, T0).with_raw(format!(
+            r#"{{"cwd":"/repo","diagnostic_note":"{secret}","prompt":"fix the tests"}}"#
+        ));
+        store.events().append(&event).unwrap();
+
+        let stored = store.events().get(&event.id).unwrap().unwrap();
+        assert_eq!(stored.raw, None);
+        let raw_column: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT raw FROM events WHERE id = ?1",
+                [event.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_column, None);
+        assert!(
+            !format!("{stored:?}").contains(secret),
+            "the ignored free text survived elsewhere in the event"
         );
+    }
+
+    #[test]
+    fn a_non_hook_diagnostic_note_is_still_redacted_and_persisted() {
+        let store = testing::store();
+        let session = testing::saved_session_anywhere(&store, "diagnostic");
+        let event = TurnEvent::new(
+            session.id.clone(),
+            EventKind::AgentIdle,
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            T0,
+        )
+        .with_raw(r#"{"GITHUB_TOKEN":"ghp_leaked","note":"process disappeared"}"#);
         store.events().append(&event).unwrap();
 
         let raw = store.events().get(&event.id).unwrap().unwrap().raw.unwrap();
         assert!(!raw.contains("ghp_leaked"), "got {raw}");
         assert!(raw.contains(REDACTED), "got {raw}");
-        assert!(
-            raw.contains("fix the tests"),
-            "the payload is still useful: {raw}"
-        );
+        assert!(raw.contains("process disappeared"), "got {raw}");
     }
 
     /// The raw payload was not the only copy. A permission request stores the

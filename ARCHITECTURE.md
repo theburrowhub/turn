@@ -1254,10 +1254,10 @@ searching them: `secrets_never_reach_the_disk::no_secret_value_is_present_anywhe
 `a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes`, and
 `a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent`.
 
-ADR-040 closes the persistence side of the former `TurnEvent::raw` question: an untouched hook payload may
-exist transiently in memory for adapter diagnostics, but it is not written to SQLite by default and it is
-never a preview source without normalisation/redaction. Free text cannot be made safe by environment-key
-matching alone.
+ADR-040 closes the persistence side of the former `TurnEvent::raw` question: a Claude callback exists only
+as transient adapter ingress and is reduced to typed facts without being attached to its `TurnEvent`.
+`EventRepo` drops `raw` for every hook source, migration 005 deletes historical callback bodies, and a raw
+callback is never a preview source. Free text cannot be made safe by environment-key matching alone.
 
 ### 7.6 No auto-approval, no auto-relaunch, no inferred execution — **implemented at every layer**
 

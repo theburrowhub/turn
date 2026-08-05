@@ -445,9 +445,10 @@ and what must not be foreclosed.
 
 Live questions. Each names what would settle it.
 
-ADR-040 closed two former questions: untouched `TurnEvent::raw` is memory-only by default, and Attention is
-one global logical queue reached through hierarchy badges/commands rather than a permanent global or
-per-Workspace navigator.
+ADR-040 closed two former questions: raw hook callbacks are ingress-only (Claude never attaches them to a
+`TurnEvent`, `EventRepo` rejects them for every hook source, and migration 005 removes historical rows), and
+Attention is one global logical queue reached through hierarchy badges/commands rather than a permanent
+global or per-Workspace navigator.
 
 | # | Question | Settled by |
 | --- | --- | --- |
@@ -772,8 +773,10 @@ Concrete, verified items. Each is real today.
 13. **Typed ids are 12 hex characters — 48 bits, not a UUID.** Fine at this scale; they should not be
     treated as globally unique. Relatedly, `Default` on an id **mints a fresh identity**, so a stray
     `..Default::default()` silently creates a new one.
-14. **`TurnEvent::raw` is unredacted and memory-only by ADR-040.** The decision is closed; the missing work
-    is an integration test proving EventRepo/PreviewRepo never serialise it, including after restart/prune.
+14. **Resolved: raw hook callbacks never cross the durable boundary.** Claude emits only typed facts;
+    `EventRepo` discards raw data from every hook source; migration 005 clears older rows; and
+    `turn-store/tests/secrets_never_reach_the_disk.rs` scans SQLite plus its WAL for free text deliberately
+    chosen not to match any credential redactor. Non-hook diagnostic notes remain redacted and persistent.
 15. **The heuristic marker lists are English** and taken from the shapes today's CLIs render. A localised or
     restyled CLI stops being detected with nothing failing — the Session just goes quiet.
 16. **`Session::duplicate` names the copy `"{name} (copy)"`** in English, in the domain layer, and the UI

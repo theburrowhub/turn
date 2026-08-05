@@ -355,7 +355,6 @@ impl AgentAdapter for ClaudeCodeAdapter {
             )
             .with_node(ctx.node_id.clone())
             .with_agent(agent.clone())
-            .with_raw(text::raw_for_storage(payload))
         };
 
         // Validated, not merely copied: this id is handed back to the tool as an
@@ -1205,14 +1204,34 @@ mod tests {
     }
 
     #[test]
-    fn every_event_is_attributed_to_its_node_and_keeps_the_raw_payload() {
-        let events = normalise(json!({ "hook_event_name": "Stop" }));
+    fn every_event_is_attributed_to_its_node_without_carrying_the_hook_payload() {
+        let secret = "free-text-secret-with-no-recognisable-shape-8675309";
+        let events = normalise(json!({
+            "hook_event_name": "Stop",
+            "last_assistant_message": "finished",
+            // Not a field the adapter reads, and deliberately not shaped like a
+            // credential a redactor could recognise. The confidentiality boundary
+            // is dropping the callback, not hoping every possible secret matches a
+            // scanner rule.
+            "diagnostic_note": secret
+        }));
         assert_eq!(events[0].node_id.as_ref().unwrap().as_str(), "proc_test01");
         assert_eq!(events[0].session_id.as_str(), "sess_test01");
         assert!(
-            events[0].raw.is_some(),
-            "keep the raw payload for debugging"
+            events[0].raw.is_none(),
+            "a Claude callback is ingress data, not a TurnEvent field"
         );
+        assert!(
+            !format!("{:?}", events[0]).contains(secret),
+            "an ignored callback member must not survive in another event field"
+        );
+        assert!(matches!(
+            events[0].kind,
+            EventKind::AgentTurnCompleted {
+                last_message: Some(ref message),
+                ..
+            } if message == "finished"
+        ));
         assert_eq!(events[0].agent.tool.as_deref(), Some("claude-code"));
     }
 }

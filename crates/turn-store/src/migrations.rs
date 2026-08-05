@@ -48,6 +48,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "safe_session_checkout_modes",
         statements: MIGRATION_004_SAFE_SESSION_CHECKOUT_MODES,
     },
+    Migration {
+        version: 5,
+        name: "drop_persisted_hook_payloads",
+        statements: MIGRATION_005_DROP_PERSISTED_HOOK_PAYLOADS,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -598,6 +603,29 @@ BEGIN
 END;
 "#;
 
+/// Removes callback bodies written by builds predating ADR-040's durable
+/// boundary. The typed event, provenance and confidence remain intact; only the
+/// opaque hook body is destroyed.
+///
+/// `EventSource` uses serde's externally tagged representation, so every hook
+/// source starts with `{"hook":`. Keeping this independent of JSON1 makes the
+/// migration work with every SQLite build Turn supports.
+const MIGRATION_005_DROP_PERSISTED_HOOK_PAYLOADS: &str = r#"
+UPDATE events
+SET raw = NULL
+WHERE raw IS NOT NULL
+  AND source_json LIKE '{"hook":%';
+
+-- An UPDATE removes the value logically but can leave its old bytes in free
+-- pages or the WAL. The Store sees this durable marker after the migration
+-- commits, rebuilds/checkpoints the file, and deletes the marker only after that
+-- succeeds. A failed cleanup is therefore retried on the next open.
+INSERT INTO settings (key, value_json, updated_ms)
+SELECT 'security.hook_raw_purge_pending', 'true', 0
+WHERE changes() > 0
+ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_ms = 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,7 +675,8 @@ mod tests {
                 "core_entities",
                 "attention_queue",
                 "unified_hierarchy_and_leases",
-                "safe_session_checkout_modes"
+                "safe_session_checkout_modes",
+                "drop_persisted_hook_payloads"
             ]
         );
 
@@ -716,7 +745,8 @@ mod tests {
             vec![
                 "attention_queue",
                 "unified_hierarchy_and_leases",
-                "safe_session_checkout_modes"
+                "safe_session_checkout_modes",
+                "drop_persisted_hook_payloads"
             ]
         );
 
@@ -755,7 +785,13 @@ mod tests {
         .unwrap();
 
         let applied = apply(&conn).unwrap();
-        assert_eq!(applied.names, vec!["safe_session_checkout_modes"]);
+        assert_eq!(
+            applied.names,
+            vec![
+                "safe_session_checkout_modes",
+                "drop_persisted_hook_payloads"
+            ]
+        );
         let repaired: (String, String, Option<String>, bool) = conn
             .query_row(
                 "SELECT mode, checkout_id, worktree_path, read_only_enforced \
@@ -773,6 +809,79 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn v5_deletes_historical_hook_bodies_without_losing_typed_events_or_other_notes() {
+        let conn = fresh();
+        apply_to(&conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+             attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+             VALUES ('ws_old', 'legacy', '/repo', '[]', '[]', '{}', 1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions \
+                 (id, workspace_id, name, cwd, env_json, attention_json, status, \
+                  restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+                  last_activity_ms, tmux) \
+             VALUES ('sess_old', 'ws_old', 'work', '/repo', '[]', '{}', 'active', \
+                     'live', '[]', 0, 0, 0, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+        let secret = "historical-free-text-secret-8675309";
+        conn.execute(
+            "INSERT INTO events \
+                 (id, timestamp_ms, session_id, kind_slug, kind_json, agent_json, \
+                  confidence, source_json, severity, dedup_key, raw) \
+             VALUES ('evt_hook', 1, 'sess_old', 'agent.idle', '{}', '{}', 'explicit', \
+                     '{\"hook\":{\"tool\":\"claude-code\",\"event_name\":\"Stop\"}}', \
+                     'debug', 'hook', ?1)",
+            [secret],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events \
+                 (id, timestamp_ms, session_id, kind_slug, kind_json, agent_json, \
+                  confidence, source_json, severity, dedup_key, raw) \
+             VALUES ('evt_supervisor', 2, 'sess_old', 'agent.idle', '{}', '{}', \
+                     'explicit', '\"supervisor\"', 'debug', 'supervisor', \
+                     'process disappeared')",
+            [],
+        )
+        .unwrap();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names.last(), Some(&"drop_persisted_hook_payloads"));
+
+        let hook: (String, Option<String>) = conn
+            .query_row(
+                "SELECT kind_slug, raw FROM events WHERE id = 'evt_hook'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(hook, ("agent.idle".into(), None));
+        let supervisor: Option<String> = conn
+            .query_row(
+                "SELECT raw FROM events WHERE id = 'evt_supervisor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(supervisor.as_deref(), Some("process disappeared"));
+        let pending: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings \
+                 WHERE key = 'security.hook_raw_purge_pending')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pending, "the physical purge must be retried by Store::open");
     }
 
     #[test]

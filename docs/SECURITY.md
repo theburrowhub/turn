@@ -169,16 +169,17 @@ Two rules, because either alone leaks:
    UUIDs and make the log useless. It will miss a credential with no distinctive
    shape, so it is a net under rule 1, not a replacement.
 
-Both rules run on the structured event kind before persistence. The untouched hook payload may be retained
-transiently in memory for adapter diagnosis, but ADR-040 closes the former open question: it is not persisted
-by default. Key/shape redaction cannot prove arbitrary free text safe, and a `Write` payload can contain an
-entire source file. Diagnostic persistence would require an explicit opt-in, a separate short-lived store and
-its own threat review; it is not part of the event log.
+Both rules run on the structured event kind before persistence. A Claude callback exists only as transient
+ingress while the adapter extracts typed facts; the resulting `TurnEvent` does not carry its body.
+`EventRepo` independently drops `raw` for every hook source, and migration 005 deletes callback bodies from
+databases written by older builds. Key/shape redaction cannot prove arbitrary free text safe, and a `Write`
+payload can contain an entire source file. Diagnostic persistence would require an explicit opt-in, a separate
+short-lived store and its own threat review; it is not part of the event log.
 
-Adapters still minimise before any diagnostic rendering: members that carry bulk content rather than state
-— `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`, … — are dropped, the remainder is capped,
-and misleading Unicode/control content is stripped. That transform does not turn the result into durable
-product state.
+Adapters still minimise before any transient diagnostic rendering: members that carry bulk content rather
+than state — `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`, … — are dropped, the remainder
+is capped, and misleading Unicode/control content is stripped. That transform does not turn the result into
+durable product state.
 
 ### 3.6 `turn-hook`
 
@@ -264,8 +265,8 @@ if a later change is careless.
 | An agent cannot choose a command-line flag | `an_agent_cannot_choose_a_command_line_flag_by_naming_its_own_session` |
 | No shell in the launch path | `no_adapter_wraps_the_users_command_in_a_shell` |
 
-ADR-040 adds security properties that are **accepted but not yet demonstrated**. They stay unverified until
-the named adversarial behaviour has an automated test:
+ADR-040 adds security properties that require adversarial tests. The table records the required proof; raw
+callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 
 | Required invariant | Required proof |
 | --- | --- |
@@ -274,7 +275,7 @@ the named adversarial behaviour has an automated test:
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
 | Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
-| Preview stores no source/secret | real SQLite bytes contain neither raw PTY/hook content nor seeded credentials after pruning/restart |
+| Preview/event stores no source/secret | `turn-store/tests/secrets_never_reach_the_disk.rs::no_secret_value_is_present_anywhere_in_the_files_on_disk` scans the database and WAL for seeded preview credentials and non-redactable Claude-hook free text; `upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal` proves migration 005 scrubs older files too |
 | UI state is surface-isolated | selection from surface A is neither returned nor pushed as selection for surface B |
 | A Pane cannot acquire runtime authority | closing/duplicating a binding neither stops the node nor changes its lease |
 

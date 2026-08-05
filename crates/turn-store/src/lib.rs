@@ -15,6 +15,11 @@
 //! cwd, lifecycle, parent and relation, exit code, and the agent's own external
 //! session id.
 //!
+//! The event log contains typed facts and provenance, not callback bodies.
+//! [`EventRepo`] refuses to persist `TurnEvent::raw` for every hook source even
+//! if an adapter accidentally supplies it; arbitrary hook free text cannot be
+//! made safe by credential-pattern redaction.
+//!
 //! **Never persisted here** — the things that only mean something while a process
 //! is alive: the pty master, the terminal grid and its scrollback, the output
 //! broadcast channel, the vt100 parser state, live subscriptions. Those belong to
@@ -181,6 +186,28 @@ impl Store {
             }
         }
         let applied = migrations::apply(&self.conn)?;
+        // v5 removes callback bodies from rows, but an UPDATE alone is not a
+        // physical erasure: the old bytes can remain in free database pages or
+        // in the WAL. Its durable marker makes this rebuild retryable if a busy
+        // database or full disk interrupts the first upgraded open.
+        let hook_raw_purge_pending: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings \
+             WHERE key = 'security.hook_raw_purge_pending')",
+            [],
+            |row| row.get(0),
+        )?;
+        if hook_raw_purge_pending {
+            self.conn.execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE); \
+                 PRAGMA secure_delete = ON; \
+                 VACUUM; \
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )?;
+            self.conn.execute(
+                "DELETE FROM settings WHERE key = 'security.hook_raw_purge_pending'",
+                [],
+            )?;
+        }
         if applied.changed() {
             tracing::info!(
                 from = applied.from,
