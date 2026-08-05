@@ -1,10 +1,12 @@
-//! The window: status bar, sidebar, panes, attention queue, palette.
+//! The window: status, unified hierarchy, session context, panes and contextual overlays.
 //!
 //! Everything here is a function of display data the daemon supplied. [`TurnView`] is
 //! deliberately a plain description of what is on screen rather than a handle on the
 //! application, for two reasons: a snapshot test can construct any state it likes
 //! without a socket, and nothing in the drawing code can compute a product rule,
-//! because it has nothing to compute one from.
+//! because it has nothing to compute one from. Protocol v3 supplies one
+//! Workspace -> Session -> Process projection; the legacy flat rows exist only while
+//! that first snapshot is in flight.
 //!
 //! What the user does comes back as [`ViewAction`]s. The window therefore cannot move
 //! focus, approve a permission or start a process on its own — it can only report that
@@ -14,25 +16,31 @@
 //! ## Accessibility is not a layer on top
 //!
 //! A GPU-drawn window has no DOM. If the rows are only pixels then a screen-reader user
-//! has no window at all, and no snapshot test can catch that — which is why the session
-//! list is composed of real, sensed widgets that put a `ListItem` node with a name and a
-//! selected state into the AccessKit tree, and why `tests/snapshots.rs` drives that tree
-//! rather than a parallel description of it.
+//! has no window at all. The unified navigation is therefore a real AccessKit `Tree`
+//! whose sensed `TreeItem` rows state their type, state and confidence in words.
 
-use egui::{Align2, Color32, FontId, Rect, Response, RichText, Sense, Stroke, Ui, Vec2};
+use std::collections::HashMap;
+
+use egui::{
+    Align2, Color32, FontId, Key, Modifiers, Rect, Response, RichText, Sense, Stroke, Ui, Vec2,
+};
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
-use turn_core::ids::{AttentionId, PaneId, SessionId};
-use turn_core::model::Layout;
+use turn_core::ids::{AttentionId, NodeId, PaneId, SessionId};
+use turn_core::model::{Layout, NodeKind, PreviewVisibility, RelationshipKind};
 use turn_core::state::{AwaitingReason, DisplayState};
 use turn_proto::cells::Grid;
+use turn_proto::{
+    HierarchyKey, HierarchySnapshot, NodePaneCapability, SessionTreeView, TreeNodeView,
+    TreeSurfaceState, WorkspaceTreeView,
+};
 
 use crate::keymap::{Command, Keymap};
 use crate::palette::{self, Palette};
 use crate::panes::{self, Arrangement, Divider, Side};
 use crate::terminal::{self, PaneAction, PaneInteraction, PaneOptions};
 use crate::theme::Theme;
-use crate::thumbnails::{Thumbnail, Thumbnails};
+use crate::thumbnails::Thumbnails;
 use crate::transport::ConnectionState;
 
 /// One row in the session list. The daemon supplies these already derived; the client
@@ -138,7 +146,8 @@ pub struct PaneContent<'a> {
     pub history_complete: bool,
 }
 
-/// The session overview: a thumbnail per session.
+/// Legacy toggle retained while callers move to the unified hierarchy. It no longer
+/// replaces the explicit Pane layout in the centre.
 #[derive(Debug, Clone, Default)]
 pub struct Overview {
     pub open: bool,
@@ -153,13 +162,12 @@ pub struct TurnView<'a> {
     /// geometry. `None` before the first `get_session` answers.
     pub layout: Option<Layout>,
     pub panes: Vec<PaneContent<'a>>,
-    /// One live screen per session, for the overview's thumbnails.
-    ///
-    /// Separate from `panes` because they answer different questions: `panes` is what is
-    /// on screen in the session being worked on, and this is one picture per session
-    /// across the whole desk.
+    /// Legacy overview data retained for source compatibility; hierarchy previews are
+    /// structured [`turn_core::model::ActivityPreview`] values, never terminal captures.
     pub overview_screens: Vec<(SessionId, &'a Grid)>,
     pub permission: Option<PendingPermission>,
+    /// The daemon's ordered queue still backs the global Next Attention action, but is
+    /// not rendered as a second permanent navigation panel.
     pub queue: Vec<QueueItem>,
     pub connection: Option<ConnectionState>,
     /// A failure worth showing, from a request that did not work.
@@ -175,11 +183,27 @@ pub struct TurnView<'a> {
 #[derive(Debug, Default)]
 pub struct ViewState {
     pub palette: Palette,
-    pub panes: std::collections::HashMap<PaneId, PaneInteraction>,
+    pub panes: HashMap<PaneId, PaneInteraction>,
     pub thumbnails: Thumbnails,
     /// Which command sheet is open, if any.
     pub shortcuts_open: bool,
     pub settings_open: bool,
+    /// The daemon-owned navigation projection for this window. `None` is kept as a
+    /// narrow compatibility path while the first hierarchy snapshot is in flight.
+    pub hierarchy: Option<HierarchySnapshot>,
+    /// An optimistic selection for immediate keyboard and pointer feedback. The daemon
+    /// remains authoritative and replaces it when a later snapshot selects a new row.
+    pub selected_tree: Option<HierarchyKey>,
+    /// Per-row expansion overrides awaiting acknowledgement from the daemon.
+    pub tree_expansion: HashMap<HierarchyKey, bool>,
+    /// Whether navigation keys belong to the hierarchy rather than the terminal.
+    pub tree_has_focus: bool,
+    /// A read-only overlay. Opening it never changes the pane layout or terminal focus.
+    pub quick_preview: Option<HierarchyKey>,
+    /// The inspector is contextual and only occupies space for a selected Process.
+    pub inspector_open: bool,
+    hierarchy_actions: Vec<HierarchyAction>,
+    observed_tree_state: Option<TreeSurfaceState>,
 }
 
 impl ViewState {
@@ -194,8 +218,54 @@ impl ViewState {
     /// moving somebody who is halfway through reading a permission prompt or choosing a
     /// command.
     pub fn is_sensitive(&self) -> bool {
-        self.palette.open || self.shortcuts_open || self.settings_open
+        self.palette.open
+            || self.shortcuts_open
+            || self.settings_open
+            || self.quick_preview.is_some()
     }
+
+    /// Drains typed hierarchy intents after drawing.
+    ///
+    /// This side channel keeps [`ViewAction`] source-compatible with the current Desk
+    /// while protocol-v3 hierarchy routing is wired in. It can be removed once every
+    /// caller consumes hierarchy actions directly.
+    pub fn take_hierarchy_actions(&mut self) -> Vec<HierarchyAction> {
+        std::mem::take(&mut self.hierarchy_actions)
+    }
+
+    fn push_hierarchy_action(&mut self, action: HierarchyAction) {
+        self.hierarchy_actions.push(action);
+    }
+}
+
+/// A hierarchy interaction, kept separate from terminal and legacy session actions.
+/// Selection, opening and focus are intentionally different operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HierarchyAction {
+    Select {
+        surface_id: String,
+        key: HierarchyKey,
+    },
+    SetExpanded {
+        surface_id: String,
+        key: HierarchyKey,
+        expanded: bool,
+    },
+    QuickPreview {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    OpenTemporaryPane {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    FocusPaneForNode {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+    },
 }
 
 /// What the user did.
@@ -228,17 +298,261 @@ pub enum ViewAction {
 /// The salt is not decoration. `egui` derives a widget's id from its parent plus a
 /// counter, so two sibling regions that lay out the same number of widgets produce the
 /// same ids — and two widgets sharing an id share their interaction state, which shows up
-/// as the command palette scrolling the session list. Naming each region makes that
+/// as the command palette scrolling the hierarchy. Naming each region makes that
 /// impossible rather than unlikely.
 fn region(rect: Rect, name: &'static str) -> egui::UiBuilder {
     egui::UiBuilder::new().max_rect(rect).id_salt(name)
 }
 
-const SIDEBAR_WIDTH: f32 = 264.0;
-const QUEUE_WIDTH: f32 = 240.0;
+const SIDEBAR_WIDTH: f32 = 344.0;
+const INSPECTOR_WIDTH: f32 = 264.0;
 const STATUS_HEIGHT: f32 = 26.0;
 const ROW_HEIGHT: f32 = 40.0;
 const PANE_HEADER: f32 = 22.0;
+
+#[derive(Clone, Copy)]
+enum HierarchyRow<'a> {
+    Workspace(&'a WorkspaceTreeView),
+    Session {
+        workspace: &'a WorkspaceTreeView,
+        session: &'a SessionTreeView,
+    },
+    Process {
+        session: &'a SessionTreeView,
+        node: &'a TreeNodeView,
+    },
+}
+
+impl HierarchyRow<'_> {
+    fn key(self) -> HierarchyKey {
+        match self {
+            Self::Workspace(workspace) => HierarchyKey::workspace(workspace.workspace.id.clone()),
+            Self::Session { session, .. } => HierarchyKey::session(session.session.id.clone()),
+            Self::Process { node, .. } => HierarchyKey::process(node.node_id.clone()),
+        }
+    }
+
+    fn depth(self) -> usize {
+        match self {
+            Self::Workspace(_) => 0,
+            Self::Session { .. } => 1,
+            Self::Process { node, .. } => node.depth.saturating_add(2),
+        }
+    }
+
+    fn child_count(self) -> usize {
+        match self {
+            Self::Workspace(workspace) => workspace.sessions.len(),
+            Self::Session { session, .. } => {
+                session.nodes.iter().filter(|node| node.depth == 0).count()
+            }
+            Self::Process { node, .. } => node.child_count,
+        }
+    }
+
+    fn parent_key(self) -> Option<HierarchyKey> {
+        match self {
+            Self::Workspace(_) => None,
+            Self::Session { workspace, .. } => {
+                Some(HierarchyKey::workspace(workspace.workspace.id.clone()))
+            }
+            Self::Process { session, node } => Some(match &node.parent {
+                Some(parent) => HierarchyKey::process(parent.clone()),
+                None => HierarchyKey::session(session.session.id.clone()),
+            }),
+        }
+    }
+
+    fn height(self) -> f32 {
+        match self {
+            Self::Workspace(_) => 34.0,
+            Self::Session { .. } => 46.0,
+            Self::Process { .. } => 56.0,
+        }
+    }
+
+    fn accessible_name(self, focused_pane: bool) -> String {
+        match self {
+            Self::Workspace(workspace) => {
+                let summary = &workspace.workspace;
+                let mut name = format!(
+                    "Workspace {} — {} sessions",
+                    summary.name, summary.session_count
+                );
+                if summary.sessions_needing_user > 0 {
+                    name.push_str(&format!(
+                        " — {} sessions need attention",
+                        summary.sessions_needing_user
+                    ));
+                }
+                if summary.lease_reconciliation_required {
+                    name.push_str(" — write lease needs reconciliation");
+                }
+                name
+            }
+            Self::Session { session, .. } => {
+                let summary = &session.session;
+                let mut name = format!(
+                    "Session {} — mode {} — {}",
+                    summary.name,
+                    summary.mode.label(),
+                    summary.state_label
+                );
+                if summary.badge_count > 0 {
+                    name.push_str(&format!(" — {} waiting", summary.badge_count));
+                }
+                if summary.muted {
+                    name.push_str(" — muted");
+                }
+                name
+            }
+            Self::Process { node, .. } => {
+                let mut name = format!(
+                    "{} {} — {}",
+                    node_kind_label(node.kind),
+                    process_title(node),
+                    node.state_label
+                );
+                if node.relationship_is_provisional {
+                    name.push_str(" — relationship inferred");
+                }
+                if let Some(preview) = visible_preview(node) {
+                    name.push_str(&format!(" — {}", preview.normalized_text));
+                }
+                if focused_pane {
+                    name.push_str(" — focused pane");
+                } else if !node.pane_bindings.is_empty() {
+                    name.push_str(" — pane open");
+                }
+                name
+            }
+        }
+    }
+}
+
+fn node_kind_label(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Agent => "AGENT",
+        NodeKind::Subagent => "SUBAGENT",
+        NodeKind::Shell => "SHELL",
+        NodeKind::Terminal => "TERMINAL",
+        NodeKind::Tui => "TUI",
+        NodeKind::Server => "SERVER",
+        NodeKind::Watcher => "WATCHER",
+        NodeKind::TestRunner => "TESTS",
+        NodeKind::Build => "BUILD",
+        NodeKind::Background => "BACKGROUND",
+        NodeKind::TmuxSession => "TMUX SESSION",
+        NodeKind::TmuxPane => "TMUX PANE",
+        NodeKind::Unknown => "PROCESS",
+    }
+}
+
+fn process_title(node: &TreeNodeView) -> &str {
+    node.agent
+        .as_ref()
+        .map(|agent| agent.name.display_name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&node.title)
+}
+
+fn visible_preview(node: &TreeNodeView) -> Option<&turn_core::model::ActivityPreview> {
+    if matches!(node.preview_visibility, PreviewVisibility::Hide)
+        || node
+            .activity_preview
+            .as_ref()
+            .is_some_and(|preview| preview.contains_sensitive_data && !preview.redacted)
+    {
+        None
+    } else {
+        node.activity_preview.as_ref()
+    }
+}
+
+fn effective_selection(snapshot: &HierarchySnapshot, state: &ViewState) -> Option<HierarchyKey> {
+    state
+        .selected_tree
+        .clone()
+        .or_else(|| snapshot.tree_state.selected.clone())
+}
+
+fn row_is_expanded(snapshot: &HierarchySnapshot, state: &ViewState, key: &HierarchyKey) -> bool {
+    state
+        .tree_expansion
+        .get(key)
+        .copied()
+        .unwrap_or_else(|| snapshot.tree_state.expanded.contains(key))
+}
+
+fn visible_hierarchy_rows<'a>(
+    snapshot: &'a HierarchySnapshot,
+    state: &ViewState,
+) -> Vec<HierarchyRow<'a>> {
+    let mut rows = Vec::new();
+    for workspace in &snapshot.workspaces {
+        let workspace_row = HierarchyRow::Workspace(workspace);
+        let workspace_key = workspace_row.key();
+        rows.push(workspace_row);
+        if !row_is_expanded(snapshot, state, &workspace_key) {
+            continue;
+        }
+
+        for session in &workspace.sessions {
+            let session_row = HierarchyRow::Session { workspace, session };
+            let session_key = session_row.key();
+            rows.push(session_row);
+            if !row_is_expanded(snapshot, state, &session_key) {
+                continue;
+            }
+
+            let mut collapsed_depth = None;
+            for node in &session.nodes {
+                if let Some(depth) = collapsed_depth {
+                    if node.depth > depth {
+                        continue;
+                    }
+                    collapsed_depth = None;
+                }
+                let process_row = HierarchyRow::Process { session, node };
+                let process_key = process_row.key();
+                rows.push(process_row);
+                if node.child_count > 0 && !row_is_expanded(snapshot, state, &process_key) {
+                    collapsed_depth = Some(node.depth);
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn selected_process<'a>(
+    snapshot: &'a HierarchySnapshot,
+    selected: Option<&HierarchyKey>,
+) -> Option<&'a TreeNodeView> {
+    let HierarchyKey::Process { node_id } = selected? else {
+        return None;
+    };
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| &node.node_id == node_id)
+}
+
+fn active_session_context<'a>(
+    snapshot: &'a HierarchySnapshot,
+    active: Option<&SessionId>,
+) -> Option<(&'a WorkspaceTreeView, &'a SessionTreeView)> {
+    let active = active?;
+    snapshot.workspaces.iter().find_map(|workspace| {
+        workspace
+            .sessions
+            .iter()
+            .find(|session| &session.session.id == active)
+            .map(|session| (workspace, session))
+    })
+}
 
 impl<'a> TurnView<'a> {
     /// Draws the whole window and returns what the user did.
@@ -253,7 +567,19 @@ impl<'a> TurnView<'a> {
         let full = ui.available_rect_before_wrap();
         ui.painter().rect_filled(full, 0.0, theme.background);
 
-        self.status_bar(ui, theme);
+        // Temporarily take the snapshot so the UI may update its local interaction
+        // state without cloning the complete process tree every frame.
+        let hierarchy = state.hierarchy.take();
+        let incoming_tree_state = hierarchy
+            .as_ref()
+            .map(|snapshot| snapshot.tree_state.clone());
+        if incoming_tree_state != state.observed_tree_state {
+            state.selected_tree = None;
+            state.tree_expansion.clear();
+            state.observed_tree_state = incoming_tree_state;
+        }
+
+        actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref()));
         if let Some(permission) = &self.permission {
             actions.extend(self.permission_banner(ui, theme, permission));
         }
@@ -261,45 +587,127 @@ impl<'a> TurnView<'a> {
             self.notice_bar(ui, theme, notice);
         }
 
+        if state.quick_preview.is_some()
+            && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            state.quick_preview = None;
+        }
+
         let body = ui.available_rect_before_wrap();
-        let queue_width = if self.queue.is_empty() {
-            0.0
-        } else {
-            QUEUE_WIDTH
-        };
-        let sidebar = Rect::from_min_size(body.min, Vec2::new(SIDEBAR_WIDTH, body.height()));
+        let sidebar_width = SIDEBAR_WIDTH
+            .min((body.width() * 0.42).max(80.0))
+            .min(body.width());
+        let current_tree_selection = hierarchy
+            .as_ref()
+            .and_then(|snapshot| effective_selection(snapshot, state));
+        let selected_node = hierarchy
+            .as_ref()
+            .and_then(|snapshot| selected_process(snapshot, current_tree_selection.as_ref()));
+        let active_context = hierarchy
+            .as_ref()
+            .and_then(|snapshot| active_session_context(snapshot, self.selected.as_ref()));
+        let inspector_is_overlay = body.width() < 960.0;
+        let inspector_width =
+            if state.inspector_open && selected_node.is_some() && !inspector_is_overlay {
+                INSPECTOR_WIDTH.min((body.width() - sidebar_width).max(0.0) * 0.4)
+            } else {
+                0.0
+            };
+        let sidebar = Rect::from_min_size(body.min, Vec2::new(sidebar_width, body.height()));
         let centre = Rect::from_min_size(
-            body.min + Vec2::new(SIDEBAR_WIDTH, 0.0),
+            body.min + Vec2::new(sidebar_width, 0.0),
             Vec2::new(
-                (body.width() - SIDEBAR_WIDTH - queue_width).max(0.0),
+                (body.width() - sidebar_width - inspector_width).max(0.0),
                 body.height(),
             ),
         );
 
         ui.scope_builder(region(sidebar, "sidebar"), |ui| {
-            actions.extend(self.sidebar(ui, theme));
+            match hierarchy.as_ref() {
+                Some(snapshot) => {
+                    actions.extend(self.hierarchy_sidebar(ui, theme, snapshot, state));
+                }
+                // Startup and legacy fixtures get one fallback list, never a second
+                // navigation surface beside the hierarchy.
+                None => actions.extend(self.sidebar(ui, theme)),
+            }
         });
         ui.painter()
             .vline(centre.min.x, body.y_range(), Stroke::new(1.0, theme.border));
 
-        ui.scope_builder(region(centre.shrink(1.0), "panes"), |ui| {
-            if self.overview.open {
-                actions.extend(self.overview_grid(ui, theme, state));
-            } else {
-                actions.extend(self.pane_area(ui, theme, keymap, state));
-            }
-        });
-
-        if queue_width > 0.0 {
-            let queue = Rect::from_min_size(
-                body.min + Vec2::new(body.width() - queue_width, 0.0),
-                Vec2::new(queue_width, body.height()),
-            );
-            ui.painter()
-                .vline(queue.min.x, body.y_range(), Stroke::new(1.0, theme.border));
-            ui.scope_builder(region(queue.shrink(1.0), "queue"), |ui| {
-                actions.extend(self.queue_panel(ui, theme));
+        let context_height = if active_context.is_some() {
+            46.0_f32.min(centre.height())
+        } else {
+            0.0
+        };
+        let footer_height = if self.layout.is_some() {
+            23.0_f32.min((centre.height() - context_height).max(0.0))
+        } else {
+            0.0
+        };
+        let context_rect =
+            Rect::from_min_size(centre.min, Vec2::new(centre.width(), context_height));
+        let pane_rect = Rect::from_min_max(
+            centre.min + Vec2::new(0.0, context_height),
+            centre.max - Vec2::new(0.0, footer_height),
+        );
+        let footer_rect = Rect::from_min_size(
+            pane_rect.left_bottom(),
+            Vec2::new(centre.width(), footer_height),
+        );
+        if let Some((workspace, session)) = active_context {
+            ui.scope_builder(region(context_rect, "session-context"), |ui| {
+                self.session_context_bar(ui, theme, workspace, session);
             });
+        }
+        ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
+            let pane_actions = self.pane_area(ui, theme, keymap, state);
+            if pane_actions.iter().any(|action| {
+                matches!(
+                    action,
+                    ViewAction::Pane {
+                        action: PaneAction::Focus | PaneAction::Write(_),
+                        ..
+                    }
+                )
+            }) {
+                state.tree_has_focus = false;
+            }
+            actions.extend(pane_actions);
+        });
+        if footer_height > 0.0 {
+            ui.scope_builder(region(footer_rect, "pane-status"), |ui| {
+                self.pane_status_bar(ui, theme, active_context.map(|(_, session)| session));
+            });
+        }
+
+        if inspector_width > 0.0 {
+            let inspector = Rect::from_min_size(
+                centre.right_top(),
+                Vec2::new(inspector_width, body.height()),
+            );
+            ui.painter().vline(
+                inspector.min.x,
+                body.y_range(),
+                Stroke::new(1.0, theme.border),
+            );
+            ui.scope_builder(region(inspector.shrink(1.0), "inspector"), |ui| {
+                if let Some(node) = selected_node {
+                    self.process_inspector(ui, theme, node, state);
+                }
+            });
+        } else if state.inspector_open && inspector_is_overlay {
+            if let Some(node) = selected_node {
+                self.inspector_overlay(ui, theme, node, state, body);
+            }
+        }
+
+        if let (Some(snapshot), Some(key)) = (hierarchy.as_ref(), state.quick_preview.clone()) {
+            if let Some(node) = selected_process(snapshot, Some(&key)) {
+                self.quick_preview_overlay(ui, theme, snapshot, node, state, full);
+            } else {
+                state.quick_preview = None;
+            }
         }
 
         if state.palette.open {
@@ -309,10 +717,18 @@ impl<'a> TurnView<'a> {
         } else if state.settings_open {
             actions.extend(self.settings_sheet(ui, theme, full));
         }
+        state.hierarchy = hierarchy;
         actions
     }
 
-    fn status_bar(&self, ui: &mut Ui, theme: &Theme) {
+    fn status_bar(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        keymap: &Keymap,
+        hierarchy: Option<&HierarchySnapshot>,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
         let rect = Rect::from_min_size(
             ui.available_rect_before_wrap().min,
             Vec2::new(ui.available_width(), STATUS_HEIGHT),
@@ -353,19 +769,41 @@ impl<'a> TurnView<'a> {
                         .small(),
                 );
 
-                let waiting = self
-                    .sessions
-                    .iter()
-                    .filter(|row| row.state.demands_user())
-                    .count();
+                let waiting = hierarchy.map_or_else(
+                    || {
+                        self.sessions
+                            .iter()
+                            .filter(|row| row.state.demands_user())
+                            .count()
+                    },
+                    |snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .map(|workspace| workspace.workspace.sessions_needing_user)
+                            .sum()
+                    },
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if waiting > 0 {
-                        // The one loud thing on screen.
-                        ui.label(
-                            RichText::new(format!("needs you · {waiting}"))
-                                .color(theme.attention)
-                                .small(),
-                        );
+                        let shortcut = keymap
+                            .chord_for(Command::NextAttention)
+                            .map(|chord| chord.describe(keymap.platform()))
+                            .unwrap_or_default();
+                        let label = if shortcut.is_empty() {
+                            format!("Next attention · {waiting}")
+                        } else {
+                            format!("Next attention · {waiting} · {shortcut}")
+                        };
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new(label).color(theme.attention).small(),
+                            ))
+                            .on_hover_text("Go to the next actionable item in the attention queue")
+                            .clicked()
+                        {
+                            actions.push(ViewAction::Run(Command::NextAttention));
+                        }
                     } else {
                         ui.label(
                             RichText::new("nothing waiting")
@@ -377,6 +815,7 @@ impl<'a> TurnView<'a> {
             });
         });
         ui.advance_cursor_after_rect(rect);
+        actions
     }
 
     fn notice_bar(&self, ui: &mut Ui, theme: &Theme, notice: &str) {
@@ -489,6 +928,164 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    /// The only navigation surface once protocol v3 has supplied a hierarchy.
+    fn hierarchy_sidebar(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        snapshot: &HierarchySnapshot,
+        state: &mut ViewState,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, theme.panel);
+
+        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 44.0));
+        ui.painter().text(
+            header.min + Vec2::new(10.0, 6.0),
+            Align2::LEFT_TOP,
+            "WORKSPACES",
+            FontId::new(11.0, egui::FontFamily::Monospace),
+            theme.text_dim,
+        );
+        ui.painter().text(
+            header.right_top() + Vec2::new(-10.0, 6.0),
+            Align2::RIGHT_TOP,
+            format!("rev {}", snapshot.revision),
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            theme.text_faint,
+        );
+        ui.painter().text(
+            header.min + Vec2::new(10.0, 23.0),
+            Align2::LEFT_TOP,
+            "Space preview · Enter focus · ⌘Enter temporary",
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            theme.text_faint,
+        );
+        ui.painter().hline(
+            header.x_range(),
+            header.max.y,
+            Stroke::new(1.0, theme.border),
+        );
+        ui.advance_cursor_after_rect(header);
+
+        let rows = visible_hierarchy_rows(snapshot, state);
+        let tree_id = ui.id().with("workspace-session-process-tree");
+        ui.ctx().accesskit_node_builder(tree_id, |node| {
+            node.set_role(egui::accesskit::Role::Tree);
+            node.set_label(format!(
+                "Workspaces, sessions and processes, {} rows",
+                rows.len()
+            ));
+        });
+
+        if snapshot.workspaces.is_empty() {
+            ui.painter().text(
+                ui.available_rect_before_wrap().center_top() + Vec2::new(0.0, 28.0),
+                Align2::CENTER_TOP,
+                "no workspaces",
+                theme.ui_font.clone(),
+                theme.text_faint,
+            );
+            return actions;
+        }
+
+        let selected = effective_selection(snapshot, state);
+        egui::ScrollArea::vertical()
+            .id_salt("hierarchy-rows")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                for row in &rows {
+                    let key = row.key();
+                    let is_selected = selected.as_ref() == Some(&key);
+                    let expanded = row_is_expanded(snapshot, state, &key);
+                    let focused_pane = match row {
+                        HierarchyRow::Process { node, .. } => {
+                            node.pane_bindings.iter().any(|binding| {
+                                self.panes
+                                    .iter()
+                                    .any(|pane| pane.focused && pane.pane_id == binding.pane_id)
+                            })
+                        }
+                        _ => false,
+                    };
+                    let active_session = match row {
+                        HierarchyRow::Session { session, .. } => {
+                            self.selected.as_ref() == Some(&session.session.id)
+                        }
+                        _ => false,
+                    };
+                    let response = hierarchy_row(
+                        ui,
+                        theme,
+                        *row,
+                        is_selected,
+                        expanded,
+                        focused_pane,
+                        active_session,
+                    );
+                    let mut accessible_expansion = None;
+                    ui.input_mut(|input| {
+                        input.consume_accesskit_action_requests(
+                            response.id,
+                            |request| match request.action {
+                                egui::accesskit::Action::Expand => {
+                                    accessible_expansion = Some(true);
+                                    true
+                                }
+                                egui::accesskit::Action::Collapse => {
+                                    accessible_expansion = Some(false);
+                                    true
+                                }
+                                _ => false,
+                            },
+                        );
+                    });
+                    if let Some(expanded) = accessible_expansion {
+                        state.tree_has_focus = true;
+                        set_hierarchy_expanded(state, snapshot, key.clone(), expanded);
+                    }
+                    let caret_clicked = response.clicked()
+                        && response.interact_pointer_pos().is_some_and(|pointer| {
+                            pointer.x
+                                <= response.rect.min.x + 10.0 + row.depth() as f32 * 14.0 + 15.0
+                        })
+                        && row.child_count() > 0;
+
+                    if response.clicked() {
+                        state.tree_has_focus = true;
+                        response.request_focus();
+                        if caret_clicked {
+                            set_hierarchy_expanded(state, snapshot, key.clone(), !expanded);
+                        } else {
+                            set_hierarchy_selection(state, snapshot, key.clone());
+                        }
+                    }
+                    if response.double_clicked() && !caret_clicked {
+                        actions.extend(activate_hierarchy_row(state, snapshot, *row));
+                    }
+                    if response.secondary_clicked() {
+                        state.tree_has_focus = true;
+                        response.request_focus();
+                        set_hierarchy_selection(state, snapshot, key);
+                        state.inspector_open = matches!(row, HierarchyRow::Process { .. });
+                    }
+                }
+            });
+
+        if state.tree_has_focus {
+            let updated_rows = visible_hierarchy_rows(snapshot, state);
+            actions.extend(handle_hierarchy_keyboard(
+                ui,
+                snapshot,
+                state,
+                &updated_rows,
+            ));
+        }
+        actions
+    }
+
     fn sidebar(&self, ui: &mut Ui, theme: &Theme) -> Vec<ViewAction> {
         let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
@@ -526,6 +1123,134 @@ impl<'a> TurnView<'a> {
                 }
             });
         actions
+    }
+
+    /// Context for the active Session, deliberately a header rather than a tab strip.
+    fn session_context_bar(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        workspace: &WorkspaceTreeView,
+        session: &SessionTreeView,
+    ) {
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, theme.raised);
+        ui.painter()
+            .hline(area.x_range(), area.max.y, Stroke::new(1.0, theme.border));
+
+        let summary = &session.session;
+        let (state_colour, glyph) = theme.state_marker(summary.display_state);
+        let branch = summary
+            .git_branch
+            .as_deref()
+            .or_else(|| {
+                workspace
+                    .checkouts
+                    .iter()
+                    .find(|checkout| checkout.id == summary.checkout_id)
+                    .and_then(|checkout| checkout.branch.as_deref())
+            })
+            .unwrap_or("no branch");
+        let title_clip = Rect::from_min_max(
+            area.min,
+            egui::pos2((area.max.x - 155.0).max(area.min.x), area.max.y),
+        );
+        let painter = ui.painter().with_clip_rect(title_clip);
+        painter.text(
+            area.min + Vec2::new(12.0, 5.0),
+            Align2::LEFT_TOP,
+            format!("{}  ›  {}", workspace.workspace.name, summary.name),
+            theme.ui_font.clone(),
+            theme.text,
+        );
+        painter.text(
+            area.min + Vec2::new(12.0, 25.0),
+            Align2::LEFT_TOP,
+            format!(
+                "{} · {branch} · {glyph} {} · {}",
+                summary.mode.label(),
+                summary.state_label,
+                summary.cwd
+            ),
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            state_colour,
+        );
+        ui.painter().text(
+            area.right_center() + Vec2::new(-12.0, -8.0),
+            Align2::RIGHT_CENTER,
+            if summary.needs_user {
+                "YOUR TURN"
+            } else {
+                summary.mode.label()
+            },
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            if summary.needs_user {
+                theme.attention
+            } else {
+                theme.text_dim
+            },
+        );
+        ui.painter().text(
+            area.right_center() + Vec2::new(-12.0, 9.0),
+            Align2::RIGHT_CENTER,
+            format!(
+                "{} panes · {} processes",
+                summary.pane_count, summary.node_count
+            ),
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            theme.text_faint,
+        );
+
+        let context_id = ui.id().with("active-session-context");
+        ui.ctx().accesskit_node_builder(context_id, |node| {
+            node.set_role(egui::accesskit::Role::Group);
+            node.set_label(format!(
+                "Active session, workspace {}, session {}, mode {}, {}, branch {}",
+                workspace.workspace.name,
+                summary.name,
+                summary.mode.label(),
+                summary.state_label,
+                branch
+            ));
+        });
+    }
+
+    fn pane_status_bar(&self, ui: &mut Ui, theme: &Theme, session: Option<&SessionTreeView>) {
+        let area = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(area, 0.0, theme.panel);
+        ui.painter()
+            .hline(area.x_range(), area.min.y, Stroke::new(1.0, theme.border));
+        let focused = self
+            .panes
+            .iter()
+            .find(|pane| pane.focused)
+            .map(|pane| pane.title.as_str())
+            .unwrap_or("no pane focused");
+        ui.painter().text(
+            area.left_center() + Vec2::new(9.0, 0.0),
+            Align2::LEFT_CENTER,
+            format!("FOCUS · {focused}"),
+            FontId::new(10.0, egui::FontFamily::Monospace),
+            if self.panes.iter().any(|pane| pane.focused) {
+                theme.running
+            } else {
+                theme.text_faint
+            },
+        );
+        if let Some(session) = session {
+            ui.painter().text(
+                area.right_center() + Vec2::new(-9.0, 0.0),
+                Align2::RIGHT_CENTER,
+                format!(
+                    "{} · {} running · {} panes",
+                    session.session.mode.label(),
+                    session.session.running_count,
+                    session.session.pane_count
+                ),
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                theme.text_faint,
+            );
+        }
     }
 
     /// The panes of the selected session, with their dividers.
@@ -648,77 +1373,289 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    /// The session overview: one thumbnail per session, on a slow cadence.
-    fn overview_grid(&self, ui: &mut Ui, theme: &Theme, state: &mut ViewState) -> Vec<ViewAction> {
-        let mut actions = Vec::new();
-        let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, theme.background);
-
-        // Refresh only what is on screen, and only when the cadence allows: `refresh`
-        // answers false for a thumbnail taken less than its interval ago, so a draw
-        // function calling this sixty times a second rebuilds nothing fifty-nine of them.
-        for (session_id, grid) in &self.overview_screens {
-            state.thumbnails.refresh(session_id, grid, self.now_ms);
-        }
-
-        let columns = ((area.width() / 260.0).floor() as usize).max(1);
-        let cell_size = Vec2::new((area.width() - 12.0) / columns as f32 - 12.0, 140.0);
-        for (index, row) in self.sessions.iter().enumerate() {
-            let column = index % columns;
-            let line = index / columns;
-            let at = area.min
-                + Vec2::new(
-                    12.0 + column as f32 * (cell_size.x + 12.0),
-                    12.0 + line as f32 * (cell_size.y + 12.0),
-                );
-            let tile = Rect::from_min_size(at, cell_size);
-            if tile.min.y > area.max.y {
-                break;
-            }
-            actions.extend(overview_tile(
-                ui,
-                theme,
-                row,
-                state.thumbnails.get(&row.id),
-                tile,
-                self.selected.as_ref() == Some(&row.id),
-            ));
-        }
-        actions
-    }
-
-    /// The attention queue, in the daemon's order, with the next item unmistakable.
-    fn queue_panel(&self, ui: &mut Ui, theme: &Theme) -> Vec<ViewAction> {
-        let mut actions = Vec::new();
+    fn process_inspector(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        node: &TreeNodeView,
+        state: &mut ViewState,
+    ) {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.panel);
-
-        ui.add_space(6.0);
+        ui.add_space(7.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(RichText::new("NEEDS YOU").color(theme.attention).small());
             ui.label(
-                RichText::new(self.queue.len().to_string())
+                RichText::new("PROCESS DETAILS")
                     .color(theme.text_dim)
                     .small(),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Close").clicked() {
+                    state.inspector_open = false;
+                }
+            });
         });
-        ui.add_space(4.0);
+        ui.separator();
 
-        for (index, item) in self.queue.iter().enumerate() {
-            // The first actionable item is the one a shortcut would jump to, and it is
-            // the one marked NEXT — not simply the first row, which may be snoozed.
-            let is_next = index
-                == self
-                    .queue
-                    .iter()
-                    .position(|candidate| candidate.actionable)
-                    .unwrap_or(usize::MAX);
-            if queue_row(ui, theme, item, is_next).clicked() {
-                actions.push(ViewAction::GotoAttention(item.attention_id.clone()));
+        egui::ScrollArea::vertical()
+            .id_salt("process-inspector-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(process_title(node))
+                        .color(theme.text)
+                        .strong(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(node_kind_label(node.kind))
+                            .monospace()
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    let (state_colour, glyph) = theme.state_marker(node.display_state);
+                    ui.label(
+                        RichText::new(format!("{glyph} {}", node.state_label))
+                            .monospace()
+                            .color(state_colour)
+                            .small(),
+                    );
+                    if node.relationship_is_provisional {
+                        ui.label(
+                            RichText::new("inferred")
+                                .monospace()
+                                .color(theme.provisional)
+                                .small(),
+                        );
+                    }
+                });
+
+                inspector_section(ui, theme, "ACTIVITY");
+                match visible_preview(node) {
+                    Some(preview) => {
+                        ui.label(RichText::new(&preview.normalized_text).color(theme.text));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {} · {}",
+                                preview_source_label(preview.source),
+                                preview.confidence.label(),
+                                if preview.stable { "stable" } else { "updating" }
+                            ))
+                            .monospace()
+                            .color(theme.text_faint)
+                            .small(),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("No safe activity preview")
+                                .color(theme.text_faint)
+                                .small(),
+                        );
+                    }
+                }
+
+                inspector_section(ui, theme, "RELATIONSHIP");
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {}",
+                        relationship_label(node.relationship.kind),
+                        node.relationship.confidence.label()
+                    ))
+                    .monospace()
+                    .color(if node.relationship_is_provisional {
+                        theme.provisional
+                    } else {
+                        theme.text_dim
+                    }),
+                );
+                if let Some(parent) = &node.parent {
+                    ui.label(
+                        RichText::new(format!("parent {}", parent.as_str()))
+                            .monospace()
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                }
+
+                inspector_section(ui, theme, "PROCESS");
+                inspector_value(ui, theme, "command", &node.command);
+                inspector_value(ui, theme, "cwd", &node.cwd);
+                inspector_value(ui, theme, "lifecycle", lifecycle_label(&node.lifecycle));
+                if let Some(pid) = node.pid {
+                    inspector_value(ui, theme, "pid", &pid.to_string());
+                }
+                if let Some(ppid) = node.ppid {
+                    inspector_value(ui, theme, "ppid", &ppid.to_string());
+                }
+                inspector_value(ui, theme, "runtime", &format_duration(node.runtime_ms));
+                if let Some(code) = node.exit_code {
+                    inspector_value(ui, theme, "exit", &code.to_string());
+                }
+
+                if let Some(agent) = &node.agent {
+                    inspector_section(ui, theme, "AGENT");
+                    if let Some(declared) = &agent.name.declared_name {
+                        inspector_value(ui, theme, "declared", declared);
+                    }
+                    if let Some(tool) = &agent.agent.tool {
+                        inspector_value(ui, theme, "tool", tool);
+                    }
+                    if let Some(model) = &agent.agent.model {
+                        inspector_value(ui, theme, "model", model);
+                    }
+                    if let Some(branch) = &agent.git_branch {
+                        inspector_value(ui, theme, "branch", branch);
+                    }
+                    if let Some(task) = &agent.current_task {
+                        inspector_value(ui, theme, "task", task);
+                    }
+                }
+
+                inspector_section(ui, theme, "PANE");
+                if node.pane_bindings.is_empty() {
+                    ui.label(
+                        RichText::new("Not open in a pane")
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                } else {
+                    for binding in &node.pane_bindings {
+                        inspector_value(
+                            ui,
+                            theme,
+                            if binding.temporary {
+                                "temporary"
+                            } else {
+                                "layout"
+                            },
+                            binding.pane_id.as_str(),
+                        );
+                    }
+                }
+                ui.label(
+                    RichText::new(pane_capability_label(&node.pane_capability))
+                        .color(theme.text_dim)
+                        .small(),
+                );
+            });
+    }
+
+    fn inspector_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        node: &TreeNodeView,
+        state: &mut ViewState,
+        body: Rect,
+    ) {
+        let width = INSPECTOR_WIDTH.min((body.width() - 20.0).max(0.0));
+        let panel = Rect::from_min_size(
+            body.right_top() + Vec2::new(-width - 10.0, 10.0),
+            Vec2::new(width, (body.height() - 20.0).max(0.0)),
+        );
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(1.0), "inspector-overlay"), |ui| {
+            self.process_inspector(ui, theme, node, state);
+        });
+    }
+
+    fn quick_preview_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        snapshot: &HierarchySnapshot,
+        node: &TreeNodeView,
+        state: &mut ViewState,
+        full: Rect,
+    ) {
+        let width = 600.0_f32.min((full.width() - 36.0).max(0.0));
+        let height = 260.0_f32.min((full.height() - 36.0).max(0.0));
+        let panel = Rect::from_center_size(full.center(), Vec2::new(width, height));
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(115));
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+
+        ui.scope_builder(region(panel.shrink(14.0), "quick-preview"), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("QUICK PREVIEW").color(theme.text_dim).small());
+                ui.label(
+                    RichText::new(process_title(node))
+                        .color(theme.text)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        state.quick_preview = None;
+                    }
+                });
+            });
+            ui.separator();
+
+            match visible_preview(node) {
+                Some(preview) => {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(&preview.normalized_text)
+                            .color(theme.text)
+                            .size(16.0),
+                    );
+                    ui.add_space(8.0);
+                    let mut facts = format!(
+                        "{} · {} · {}",
+                        preview_source_label(preview.source),
+                        preview.confidence.label(),
+                        if preview.stable { "stable" } else { "updating" }
+                    );
+                    if preview.redacted {
+                        facts.push_str(" · redacted");
+                    }
+                    ui.label(RichText::new(facts).monospace().color(theme.text_faint));
+                }
+                None => {
+                    ui.add_space(18.0);
+                    ui.label(
+                        RichText::new("No stable, safe activity preview is available yet.")
+                            .color(theme.text_faint),
+                    );
+                }
             }
-        }
-        actions
+
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Open temporary pane  ⌘⏎").clicked() {
+                        state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                            surface_id: snapshot.tree_state.surface_id.clone(),
+                            session_id: node.session_id.clone(),
+                            node_id: node.node_id.clone(),
+                        });
+                    }
+                    if ui.button("Show details").clicked() {
+                        state.inspector_open = true;
+                        state.quick_preview = None;
+                    }
+                    ui.label(
+                        RichText::new("Esc closes · layout and pane focus stay unchanged")
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                });
+            });
+        });
     }
 
     fn palette_overlay(
@@ -900,6 +1837,474 @@ impl<'a> TurnView<'a> {
     }
 }
 
+fn hierarchy_row(
+    ui: &mut Ui,
+    theme: &Theme,
+    row: HierarchyRow<'_>,
+    selected: bool,
+    expanded: bool,
+    focused_pane: bool,
+    active_session: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), row.height()),
+        Sense::click(),
+    );
+    if selected {
+        ui.painter().rect_filled(rect, 0.0, theme.selection);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 0.0, theme.raised);
+    }
+
+    let needs_user = match row {
+        HierarchyRow::Workspace(workspace) => workspace.workspace.sessions_needing_user > 0,
+        HierarchyRow::Session { session, .. } => session.session.needs_user,
+        HierarchyRow::Process { node, .. } => node.needs_user,
+    };
+    if focused_pane || active_session {
+        ui.painter().rect_filled(
+            Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+            0.0,
+            theme.running,
+        );
+    }
+    if needs_user {
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                rect.right_top() - Vec2::new(3.0, 0.0),
+                Vec2::new(3.0, rect.height()),
+            ),
+            0.0,
+            theme.attention,
+        );
+    }
+
+    let indent = 9.0 + row.depth() as f32 * 14.0;
+    let caret = if row.child_count() == 0 {
+        "·"
+    } else if expanded {
+        "▾"
+    } else {
+        "▸"
+    };
+    ui.painter().text(
+        rect.min + Vec2::new(indent, 7.0),
+        Align2::LEFT_TOP,
+        caret,
+        FontId::new(11.0, egui::FontFamily::Monospace),
+        if row.child_count() == 0 {
+            theme.text_faint
+        } else {
+            theme.text_dim
+        },
+    );
+
+    let text_x = rect.min.x + indent + 15.0;
+    let right_tag = match row {
+        HierarchyRow::Workspace(workspace) if workspace.workspace.sessions_needing_user > 0 => {
+            Some(format!(
+                "{} NEED YOU",
+                workspace.workspace.sessions_needing_user
+            ))
+        }
+        HierarchyRow::Session { .. } if active_session => Some("ACTIVE".into()),
+        HierarchyRow::Session { session, .. } if session.session.badge_count > 0 => {
+            Some(format!("{} WAITING", session.session.badge_count))
+        }
+        HierarchyRow::Process { .. } if focused_pane => Some("FOCUSED".into()),
+        HierarchyRow::Process { node, .. } if !node.pane_bindings.is_empty() => Some(
+            if node.pane_bindings.iter().any(|binding| binding.temporary) {
+                "TEMP PANE".into()
+            } else {
+                "PANE OPEN".into()
+            },
+        ),
+        _ => None,
+    };
+    let right_width = if right_tag.is_some() { 94.0 } else { 10.0 };
+    let clip = Rect::from_min_max(
+        egui::pos2(text_x, rect.min.y),
+        egui::pos2((rect.max.x - right_width).max(text_x), rect.max.y),
+    );
+    let painter = ui.painter().with_clip_rect(clip);
+
+    match row {
+        HierarchyRow::Workspace(workspace) => {
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 4.0),
+                Align2::LEFT_TOP,
+                &workspace.workspace.name,
+                theme.ui_font.clone(),
+                theme.text,
+            );
+            let mut detail = format!("WORKSPACE · {} sessions", workspace.workspace.session_count);
+            if workspace.workspace.lease_reconciliation_required {
+                detail.push_str(" · LEASE CHECK");
+            }
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 22.0),
+                Align2::LEFT_TOP,
+                detail,
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                if workspace.workspace.lease_reconciliation_required {
+                    theme.attention
+                } else {
+                    theme.text_faint
+                },
+            );
+        }
+        HierarchyRow::Session { session, .. } => {
+            let summary = &session.session;
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 4.0),
+                Align2::LEFT_TOP,
+                &summary.name,
+                theme.ui_font.clone(),
+                theme.text,
+            );
+            let (colour, glyph) = theme.state_marker(summary.display_state);
+            let mut detail = format!(
+                "{} · {glyph} {} · {} running",
+                summary.mode.label(),
+                summary.state_label,
+                summary.running_count
+            );
+            if summary.read_only_enforced {
+                detail.push_str(" · enforced");
+            }
+            if summary.muted {
+                detail.push_str(" · muted");
+            }
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 23.0),
+                Align2::LEFT_TOP,
+                detail,
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                colour,
+            );
+        }
+        HierarchyRow::Process { node, .. } => {
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 3.0),
+                Align2::LEFT_TOP,
+                process_title(node),
+                theme.ui_font.clone(),
+                theme.text,
+            );
+            let (colour, glyph) = theme.state_marker(node.display_state);
+            let relation = if node.relationship_is_provisional {
+                " · inferred"
+            } else {
+                ""
+            };
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 21.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{} · {glyph} {}{relation}",
+                    node_kind_label(node.kind),
+                    node.state_label
+                ),
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                if node.relationship_is_provisional {
+                    theme.provisional
+                } else {
+                    colour
+                },
+            );
+            painter.text(
+                egui::pos2(text_x, rect.min.y + 39.0),
+                Align2::LEFT_TOP,
+                visible_preview(node)
+                    .map(|preview| preview.normalized_text.as_str())
+                    .unwrap_or("no activity preview"),
+                FontId::new(10.0, egui::FontFamily::Proportional),
+                theme.text_faint,
+            );
+        }
+    }
+
+    if let Some(tag) = right_tag {
+        ui.painter().text(
+            rect.right_top() + Vec2::new(-9.0, 6.0),
+            Align2::RIGHT_TOP,
+            tag,
+            FontId::new(9.0, egui::FontFamily::Monospace),
+            if needs_user {
+                theme.attention
+            } else {
+                theme.running
+            },
+        );
+    }
+
+    let accessible_name = row.accessible_name(focused_pane);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &accessible_name)
+    });
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(egui::accesskit::Role::TreeItem);
+        node.set_label(accessible_name);
+        node.set_level(row.depth().saturating_add(1));
+        node.set_selected(selected);
+        if row.child_count() > 0 {
+            node.set_expanded(expanded);
+            node.add_action(if expanded {
+                egui::accesskit::Action::Collapse
+            } else {
+                egui::accesskit::Action::Expand
+            });
+        }
+        node.add_action(egui::accesskit::Action::Click);
+        node.add_action(egui::accesskit::Action::Focus);
+    });
+    response
+}
+
+fn set_hierarchy_selection(state: &mut ViewState, snapshot: &HierarchySnapshot, key: HierarchyKey) {
+    if state.selected_tree.as_ref() == Some(&key)
+        || (state.selected_tree.is_none() && snapshot.tree_state.selected.as_ref() == Some(&key))
+    {
+        return;
+    }
+    state.selected_tree = Some(key.clone());
+    state.push_hierarchy_action(HierarchyAction::Select {
+        surface_id: snapshot.tree_state.surface_id.clone(),
+        key,
+    });
+}
+
+fn set_hierarchy_expanded(
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    key: HierarchyKey,
+    expanded: bool,
+) {
+    if row_is_expanded(snapshot, state, &key) == expanded {
+        return;
+    }
+    state.tree_expansion.insert(key.clone(), expanded);
+    state.push_hierarchy_action(HierarchyAction::SetExpanded {
+        surface_id: snapshot.tree_state.surface_id.clone(),
+        key,
+        expanded,
+    });
+}
+
+fn activate_hierarchy_row(
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    row: HierarchyRow<'_>,
+) -> Vec<ViewAction> {
+    match row {
+        HierarchyRow::Workspace(_) => {
+            let key = row.key();
+            let expanded = row_is_expanded(snapshot, state, &key);
+            set_hierarchy_expanded(state, snapshot, key, !expanded);
+            Vec::new()
+        }
+        HierarchyRow::Session { session, .. } => {
+            vec![ViewAction::SelectSession(session.session.id.clone())]
+        }
+        HierarchyRow::Process { node, .. } => {
+            state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
+                surface_id: snapshot.tree_state.surface_id.clone(),
+                session_id: node.session_id.clone(),
+                node_id: node.node_id.clone(),
+            });
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HierarchyKeypress {
+    Up,
+    Down,
+    Left,
+    Right,
+    Preview,
+    TemporaryPane,
+    Activate,
+    Blur,
+}
+
+fn handle_hierarchy_keyboard(
+    ui: &mut Ui,
+    snapshot: &HierarchySnapshot,
+    state: &mut ViewState,
+    rows: &[HierarchyRow<'_>],
+) -> Vec<ViewAction> {
+    let keypress = ui.input_mut(|input| {
+        if input.consume_key(Modifiers::COMMAND, Key::Enter) {
+            Some(HierarchyKeypress::TemporaryPane)
+        } else if input.consume_key(Modifiers::NONE, Key::Escape) {
+            Some(HierarchyKeypress::Blur)
+        } else if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
+            Some(HierarchyKeypress::Up)
+        } else if input.consume_key(Modifiers::NONE, Key::ArrowDown) {
+            Some(HierarchyKeypress::Down)
+        } else if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
+            Some(HierarchyKeypress::Left)
+        } else if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
+            Some(HierarchyKeypress::Right)
+        } else if input.consume_key(Modifiers::NONE, Key::Space) {
+            Some(HierarchyKeypress::Preview)
+        } else if input.consume_key(Modifiers::NONE, Key::Enter) {
+            Some(HierarchyKeypress::Activate)
+        } else {
+            None
+        }
+    });
+    let Some(keypress) = keypress else {
+        return Vec::new();
+    };
+    if matches!(keypress, HierarchyKeypress::Blur) {
+        state.tree_has_focus = false;
+        return Vec::new();
+    }
+    let Some(first) = rows.first() else {
+        return Vec::new();
+    };
+    let selection = effective_selection(snapshot, state);
+    let Some(index) = selection
+        .as_ref()
+        .and_then(|selected| rows.iter().position(|row| row.key() == *selected))
+    else {
+        set_hierarchy_selection(state, snapshot, first.key());
+        return Vec::new();
+    };
+    let row = rows[index];
+    match keypress {
+        HierarchyKeypress::Up => {
+            let target = index.saturating_sub(1);
+            set_hierarchy_selection(state, snapshot, rows[target].key());
+        }
+        HierarchyKeypress::Down => {
+            let target = (index + 1).min(rows.len() - 1);
+            set_hierarchy_selection(state, snapshot, rows[target].key());
+        }
+        HierarchyKeypress::Left => {
+            let key = row.key();
+            if row.child_count() > 0 && row_is_expanded(snapshot, state, &key) {
+                set_hierarchy_expanded(state, snapshot, key, false);
+            } else if let Some(parent) = row.parent_key() {
+                set_hierarchy_selection(state, snapshot, parent);
+            }
+        }
+        HierarchyKeypress::Right => {
+            let key = row.key();
+            if row.child_count() > 0 && !row_is_expanded(snapshot, state, &key) {
+                set_hierarchy_expanded(state, snapshot, key, true);
+            } else if rows
+                .get(index + 1)
+                .is_some_and(|next| next.depth() > row.depth())
+            {
+                set_hierarchy_selection(state, snapshot, rows[index + 1].key());
+            }
+        }
+        HierarchyKeypress::Preview => {
+            if let HierarchyRow::Process { node, .. } = row {
+                let key = row.key();
+                state.quick_preview = Some(key);
+                state.push_hierarchy_action(HierarchyAction::QuickPreview {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+        }
+        HierarchyKeypress::TemporaryPane => {
+            if let HierarchyRow::Process { node, .. } = row {
+                state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+        }
+        HierarchyKeypress::Activate => return activate_hierarchy_row(state, snapshot, row),
+        HierarchyKeypress::Blur => {}
+    }
+    Vec::new()
+}
+
+fn relationship_label(kind: RelationshipKind) -> &'static str {
+    match kind {
+        RelationshipKind::SpawnedBy => "spawned by parent",
+        RelationshipKind::OwnsProcess => "owned by parent",
+        RelationshipKind::Related => "related to parent",
+        RelationshipKind::Unknown => "relationship unknown",
+    }
+}
+
+fn lifecycle_label(lifecycle: &turn_core::state::Lifecycle) -> &'static str {
+    use turn_core::state::Lifecycle;
+    match lifecycle {
+        Lifecycle::Spawning => "starting",
+        Lifecycle::Alive => "alive",
+        Lifecycle::Exited { .. } => "exited",
+        Lifecycle::Signaled { .. } => "signaled",
+        Lifecycle::Stopped { .. } => "stopped by user",
+        Lifecycle::Orphaned => "orphaned",
+        Lifecycle::Reconnected => "reconnected",
+        Lifecycle::Lost => "lost",
+    }
+}
+
+fn preview_source_label(source: turn_core::model::PreviewSource) -> &'static str {
+    use turn_core::model::PreviewSource;
+    match source {
+        PreviewSource::SemanticEvent => "semantic event",
+        PreviewSource::AdapterState => "adapter state",
+        PreviewSource::RelevantAction => "relevant action",
+        PreviewSource::StableScreenLine => "stable screen line",
+        PreviewSource::ProcessFallback => "process fallback",
+    }
+}
+
+fn pane_capability_label(capability: &NodePaneCapability) -> String {
+    match capability {
+        NodePaneCapability::PreviewDetails => "Preview/details only".into(),
+        NodePaneCapability::Terminal { streams } => {
+            format!("Attachable terminal · {} stream(s)", streams.len())
+        }
+    }
+}
+
+fn format_duration(milliseconds: i64) -> String {
+    let seconds = milliseconds.max(0) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+fn inspector_section(ui: &mut Ui, theme: &Theme, title: &str) {
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(title)
+            .monospace()
+            .color(theme.text_faint)
+            .small(),
+    );
+}
+
+fn inspector_value(ui: &mut Ui, theme: &Theme, label: &str, value: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("{label}:"))
+                .monospace()
+                .color(theme.text_faint)
+                .small(),
+        );
+        ui.label(RichText::new(value).color(theme.text_dim).small());
+    });
+}
+
 /// One session row, as a real widget with a place in the accessibility tree.
 ///
 /// This is what makes the window usable with a screen reader. `allocate_exact_size`
@@ -1028,76 +2433,6 @@ fn describe_row(response: &Response, name: &str, selected: bool) {
     });
 }
 
-/// One row of the attention queue.
-fn queue_row(ui: &mut Ui, theme: &Theme, item: &QueueItem, is_next: bool) -> Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
-    if is_next {
-        // The next item is unmistakable: a filled left rule and the word NEXT, not
-        // merely being at the top of a list.
-        ui.painter().rect_filled(
-            Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
-            0.0,
-            theme.attention,
-        );
-    }
-    if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, theme.raised);
-    }
-    let dim = !item.actionable;
-    let text_colour = if dim { theme.text_faint } else { theme.text };
-    let painter = ui.painter();
-    let mut x = 10.0;
-    if is_next {
-        let next = painter.text(
-            rect.min + Vec2::new(x, 4.0),
-            Align2::LEFT_TOP,
-            "NEXT",
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme.attention,
-        );
-        x = next.max.x - rect.min.x + 6.0;
-    }
-    painter.text(
-        rect.min + Vec2::new(x, 3.0),
-        Align2::LEFT_TOP,
-        &item.session_name,
-        theme.ui_font.clone(),
-        text_colour,
-    );
-    let mut second = format!("{} ", item.reason_label());
-    if item.provisional {
-        second.push_str("(inferred) ");
-    }
-    if !item.actionable {
-        second.push_str("· snoozed ");
-    }
-    if let Some(summary) = &item.summary {
-        second.push_str(summary);
-    }
-    painter.with_clip_rect(rect).text(
-        rect.min + Vec2::new(10.0, 21.0),
-        Align2::LEFT_TOP,
-        second.trim(),
-        FontId::new(11.0, egui::FontFamily::Proportional),
-        if item.provisional {
-            theme.provisional
-        } else {
-            theme.text_dim
-        },
-    );
-
-    let name = format!(
-        "{}{} — {}{}",
-        if is_next { "next: " } else { "" },
-        item.session_name,
-        item.reason_label(),
-        if item.actionable { "" } else { ", snoozed" }
-    );
-    describe_row(&response, &name, is_next);
-    response
-}
-
 /// One row of the command palette.
 fn palette_row(ui: &mut Ui, theme: &Theme, row: &palette::Row, selected: bool) -> Response {
     let (rect, response) =
@@ -1134,112 +2469,6 @@ fn palette_row(ui: &mut Ui, theme: &Theme, row: &palette::Row, selected: bool) -
     };
     describe_row(&response, &name, selected);
     response
-}
-
-/// One tile of the session overview.
-fn overview_tile(
-    ui: &mut Ui,
-    theme: &Theme,
-    row: &SessionRow,
-    thumbnail: Option<&Thumbnail>,
-    rect: Rect,
-    selected: bool,
-) -> Vec<ViewAction> {
-    let mut actions = Vec::new();
-    let response = ui.interact(
-        rect,
-        ui.id().with(("overview", row.id.as_str())),
-        Sense::click(),
-    );
-    ui.painter().rect_filled(rect, 0.0, theme.panel);
-    ui.painter().rect_stroke(
-        rect,
-        0.0,
-        Stroke::new(
-            if selected { 2.0 } else { 1.0 },
-            if selected {
-                theme.running
-            } else {
-                theme.border
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-
-    let (colour, glyph) = theme.state_marker(row.state);
-    let header = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 20.0));
-    ui.painter().text(
-        header.min + Vec2::new(6.0, 3.0),
-        Align2::LEFT_TOP,
-        format!("{glyph} {}", row.name),
-        FontId::new(11.0, egui::FontFamily::Monospace),
-        colour,
-    );
-    if row.badge > 0 {
-        ui.painter().text(
-            header.right_top() + Vec2::new(-6.0, 3.0),
-            Align2::RIGHT_TOP,
-            row.badge.to_string(),
-            FontId::new(11.0, egui::FontFamily::Monospace),
-            theme.attention,
-        );
-    }
-
-    let picture = Rect::from_min_max(header.left_bottom(), rect.max).shrink(6.0);
-    match thumbnail {
-        Some(thumbnail) if !thumbnail.is_blank() => {
-            let block = Vec2::new(
-                picture.width() / thumbnail.cols as f32,
-                picture.height() / thumbnail.rows as f32,
-            );
-            for line in 0..thumbnail.rows {
-                for column in 0..thumbnail.cols {
-                    let Some(cell) = thumbnail.block(line, column) else {
-                        continue;
-                    };
-                    if cell.ink <= 0.0 {
-                        continue;
-                    }
-                    let colour = cell
-                        .colour
-                        .map(|rgb| Color32::from_rgb(rgb.0, rgb.1, rgb.2))
-                        .unwrap_or(theme.text_dim);
-                    ui.painter().rect_filled(
-                        Rect::from_min_size(
-                            picture.min + Vec2::new(column as f32 * block.x, line as f32 * block.y),
-                            block,
-                        ),
-                        0.0,
-                        colour.gamma_multiply(cell.ink.clamp(0.15, 1.0)),
-                    );
-                }
-            }
-            if thumbnail.alternate_screen {
-                ui.painter().text(
-                    picture.right_bottom() + Vec2::new(-4.0, -12.0),
-                    Align2::RIGHT_TOP,
-                    "full screen",
-                    FontId::new(9.0, egui::FontFamily::Monospace),
-                    theme.text_faint,
-                );
-            }
-        }
-        _ => {
-            ui.painter().text(
-                picture.center(),
-                Align2::CENTER_CENTER,
-                "nothing on screen",
-                FontId::new(10.0, egui::FontFamily::Proportional),
-                theme.text_faint,
-            );
-        }
-    }
-
-    describe_row(&response, &row.accessible_name(), selected);
-    if response.clicked() {
-        actions.push(ViewAction::SelectSession(row.id.clone()));
-    }
-    actions
 }
 
 /// A divider the user can drag.
@@ -1295,6 +2524,15 @@ pub fn neighbour_for(arrangement: &Arrangement, from: &PaneId, command: Command)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turn_core::event::Confidence;
+    use turn_core::model::{
+        ActivityPreview, Pane, PaneKind, PreviewSource, ProcessNode, Relation, Session,
+        SessionMode, Workspace,
+    };
+    use turn_core::state::{Lifecycle, Turn};
+    use turn_proto::{SessionSummary, TreeSurfaceState, WorkspaceSummary};
+
+    const T0: i64 = 1_700_000_000_000;
 
     fn row(name: &str, state: DisplayState) -> SessionRow {
         SessionRow {
@@ -1308,6 +2546,154 @@ mod tests {
             depth: 0,
             muted: false,
         }
+    }
+
+    fn hierarchy_fixture() -> (HierarchySnapshot, NodeId, NodeId, SessionId) {
+        let workspace = Workspace::new("turn", "/repo/turn", T0);
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "Unify navigation",
+            "/repo/turn",
+            Layout::single(Pane::new(PaneKind::Agent).with_command("claude")),
+            T0,
+        );
+        session.mode = SessionMode::ReadOnly;
+        session.read_only_enforced = true;
+
+        let mut root = ProcessNode::agent(session.id.clone(), "claude", "/repo/turn", T0);
+        root.lifecycle = Lifecycle::Alive;
+        root.turn = Some(Turn::Active);
+        root.activity_preview = Some(ActivityPreview {
+            node_id: root.id.clone(),
+            raw_source_sequence: Some(4),
+            normalized_text: "Reviewing the navigation projection".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: T0 + 4,
+        });
+        let root_id = session.tree.insert(root);
+
+        let mut child = ProcessNode::agent(
+            session.id.clone(),
+            "claude --subagent",
+            "/repo/turn",
+            T0 + 1,
+        );
+        child.kind = NodeKind::Subagent;
+        child.lifecycle = Lifecycle::Alive;
+        child.turn = Some(Turn::Active);
+        child.link_to(root_id.clone(), Relation::Inferred);
+        let child_id = session.tree.insert(child);
+
+        let session_id = session.id.clone();
+        let summary = SessionSummary::from_session(&session, 1, false, T0 + 10);
+        let workspace_summary =
+            WorkspaceSummary::from_workspace(&workspace, std::slice::from_ref(&summary));
+        let nodes = TreeNodeView::for_session(&session, T0 + 10);
+        let snapshot = HierarchySnapshot {
+            revision: 7,
+            tree_state: TreeSurfaceState {
+                surface_id: "window-test".into(),
+                selected: Some(HierarchyKey::process(root_id.clone())),
+                expanded: vec![
+                    HierarchyKey::workspace(workspace.id.clone()),
+                    HierarchyKey::session(session.id),
+                ],
+            },
+            workspaces: vec![WorkspaceTreeView {
+                workspace: workspace_summary,
+                checkouts: Vec::new(),
+                write_lease: None,
+                sessions: vec![SessionTreeView {
+                    session: summary,
+                    nodes,
+                }],
+            }],
+        };
+        (snapshot, root_id, child_id, session_id)
+    }
+
+    #[test]
+    fn the_unified_tree_respects_each_expansion_level() {
+        let (snapshot, root_id, child_id, _) = hierarchy_fixture();
+        let mut state = ViewState::default();
+        let collapsed = visible_hierarchy_rows(&snapshot, &state);
+        assert_eq!(collapsed.len(), 3, "workspace, session, collapsed agent");
+        assert_eq!(
+            collapsed.iter().map(|row| row.depth()).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(!collapsed
+            .iter()
+            .any(|row| row.key() == HierarchyKey::process(child_id.clone())));
+
+        set_hierarchy_expanded(&mut state, &snapshot, HierarchyKey::process(root_id), true);
+        let expanded = visible_hierarchy_rows(&snapshot, &state);
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded.last().map(|row| row.depth()), Some(3));
+        assert!(expanded
+            .iter()
+            .any(|row| row.key() == HierarchyKey::process(child_id.clone())));
+    }
+
+    #[test]
+    fn selection_expansion_and_focus_are_different_typed_actions() {
+        let (snapshot, root_id, _, _) = hierarchy_fixture();
+        let mut state = ViewState::default();
+        let key = HierarchyKey::process(root_id.clone());
+
+        set_hierarchy_expanded(&mut state, &snapshot, key.clone(), true);
+        let process = visible_hierarchy_rows(&snapshot, &state)
+            .into_iter()
+            .find(|row| row.key() == key)
+            .expect("root agent is visible");
+        set_hierarchy_selection(
+            &mut state,
+            &snapshot,
+            HierarchyKey::session(process_session(process)),
+        );
+        assert!(activate_hierarchy_row(&mut state, &snapshot, process).is_empty());
+
+        let actions = state.take_hierarchy_actions();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::SetExpanded { key: changed, expanded: true, .. } if changed == &key
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::Select {
+                key: HierarchyKey::Session { .. },
+                ..
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
+        )));
+    }
+
+    fn process_session(row: HierarchyRow<'_>) -> SessionId {
+        match row {
+            HierarchyRow::Process { node, .. } => node.session_id.clone(),
+            _ => unreachable!("called only with a process row"),
+        }
+    }
+
+    #[test]
+    fn an_unredacted_sensitive_preview_never_reaches_navigation() {
+        let (mut snapshot, root_id, _, _) = hierarchy_fixture();
+        let node = snapshot.workspaces[0].sessions[0]
+            .nodes
+            .iter_mut()
+            .find(|node| node.node_id == root_id)
+            .unwrap();
+        let preview = node.activity_preview.as_mut().unwrap();
+        preview.contains_sensitive_data = true;
+        preview.redacted = false;
+        assert!(visible_preview(node).is_none());
     }
 
     /// The accessible name has to carry everything the visuals do, because that is all
