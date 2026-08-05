@@ -265,7 +265,7 @@ impl Core {
         node_id: &NodeId,
         now_ms: i64,
     ) {
-        let bindings = self
+        let all_bindings: Vec<_> = self
             .store
             .hierarchy()
             .bindings_for_session(session_id)
@@ -273,12 +273,40 @@ impl Core {
             .into_iter()
             .filter(|binding| binding.node_id == *node_id)
             .collect();
-        self.push_all(ServerEvent::PaneBindingsChanged {
-            hierarchy_revision: self.hierarchy_revision,
-            session_id: session_id.clone(),
-            node_id: node_id.clone(),
-            bindings,
-        });
+
+        // Temporary panes belong to one UI surface. A complete hierarchy snapshot
+        // already applies that rule, so its partial replacement must do the same.
+        // Sending the unfiltered set first cannot be repaired by the snapshot below:
+        // both carry this revision and clients deliberately ignore an equal-revision
+        // full replacement after applying a partial one.
+        let targets: Vec<(ClientId, String)> = self
+            .clients
+            .iter()
+            .filter_map(|(client_id, client)| {
+                client
+                    .surface_id
+                    .clone()
+                    .map(|surface_id| (*client_id, surface_id))
+            })
+            .collect();
+        for (client_id, surface_id) in targets {
+            let bindings = all_bindings
+                .iter()
+                .filter(|binding| {
+                    !binding.temporary || binding.surface_id.as_deref() == Some(surface_id.as_str())
+                })
+                .cloned()
+                .collect();
+            self.push_to(
+                client_id,
+                ServerEvent::PaneBindingsChanged {
+                    hierarchy_revision: self.hierarchy_revision,
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                    bindings,
+                },
+            );
+        }
         self.push_hierarchy_all(now_ms);
     }
 

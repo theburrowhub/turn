@@ -43,6 +43,8 @@ impl Core {
             .ok_or_else(|| ProtoError::internal("the saved Workspace disappeared"))?;
         self.workspaces.insert(id.clone(), workspace);
         tracing::info!(workspace = %id, root, "created a workspace");
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_workspace(&id, now_ms)
     }
 
@@ -60,6 +62,8 @@ impl Core {
         workspace.name = name;
         let workspace = workspace.clone();
         self.store.workspaces().save(&workspace).map_err(store)?;
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_workspace(id, now_ms)
     }
 
@@ -91,6 +95,8 @@ impl Core {
         self.store.workspaces().save(&workspace).map_err(store)?;
         // Archiving is a filing decision, not an instruction to stop work. A live
         // write owner was rejected above so filing cannot hide checkout authority.
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_workspace(id, now_ms)
     }
 
@@ -118,6 +124,8 @@ impl Core {
             .save(&copy)
             .map_err(workspace_store)?;
         self.workspaces.insert(new_id.clone(), copy);
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         self.answer_workspace(&new_id, now_ms)
     }
 
@@ -193,7 +201,81 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::model::PaneKind;
-    use turn_proto::NewPane;
+    use turn_proto::{NewPane, Request, ServerEvent, ServerMessage};
+
+    fn only_hierarchy_push(
+        frames: &mut tokio::sync::mpsc::Receiver<turn_proto::ServerFrame>,
+    ) -> turn_proto::HierarchySnapshot {
+        let pushes: Vec<_> = std::iter::from_fn(|| frames.try_recv().ok())
+            .filter_map(|frame| match frame.message {
+                ServerMessage::Event {
+                    event: ServerEvent::HierarchyChanged { snapshot },
+                } => Some(*snapshot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pushes.len(), 1, "one mutation has one authoritative push");
+        pushes.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn workspace_mutations_advance_and_publish_the_unified_hierarchy() {
+        let mut harness = Harness::new().await;
+        let (client, mut frames) = harness.add_client(16);
+        let initial_revision = match harness
+            .core
+            .dispatch(
+                client,
+                Request::GetHierarchy {
+                    surface_id: "workspace-window".into(),
+                    include_archived: false,
+                },
+                1,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => snapshot.revision,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let root = harness._dir.path().join("published-workspace");
+        std::fs::create_dir(&root).unwrap();
+        let workspace_id = match harness
+            .core
+            .create_workspace("first name".into(), root.to_string_lossy().into_owned(), 2)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let created = only_hierarchy_push(&mut frames);
+        assert_eq!(created.revision, initial_revision + 1);
+        assert_eq!(created.workspaces[0].workspace.id, workspace_id);
+
+        harness
+            .core
+            .rename_workspace(&workspace_id, "published name".into(), 3)
+            .unwrap();
+        let renamed = only_hierarchy_push(&mut frames);
+        assert_eq!(renamed.revision, created.revision + 1);
+        assert_eq!(renamed.workspaces[0].workspace.name, "published name");
+
+        harness
+            .core
+            .archive_workspace(&workspace_id, true, 4)
+            .unwrap();
+        let archived = only_hierarchy_push(&mut frames);
+        assert_eq!(archived.revision, renamed.revision + 1);
+        assert!(archived.workspaces.is_empty());
+
+        harness
+            .core
+            .archive_workspace(&workspace_id, false, 5)
+            .unwrap();
+        let restored = only_hierarchy_push(&mut frames);
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert_eq!(restored.workspaces[0].workspace.id, workspace_id);
+    }
 
     #[tokio::test]
     async fn create_workspace_refuses_a_missing_root_without_persisting_anything() {

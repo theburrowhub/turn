@@ -568,6 +568,8 @@ impl Core {
                 session_id: id.clone(),
                 workspace_id,
             });
+            self.bump_hierarchy();
+            self.push_hierarchy_all(now_ms);
         } else {
             self.push_session_state(id, now_ms);
         }
@@ -1031,6 +1033,104 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::ids::PaneId;
+    use turn_proto::{Request, ServerMessage};
+
+    fn drain_session_events(
+        frames: &mut tokio::sync::mpsc::Receiver<turn_proto::ServerFrame>,
+    ) -> Vec<ServerEvent> {
+        std::iter::from_fn(|| frames.try_recv().ok())
+            .filter_map(|frame| match frame.message {
+                ServerMessage::Event { event } => Some(event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn archiving_a_session_advances_and_publishes_the_unified_hierarchy() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().join("session-archive-workspace");
+        std::fs::create_dir(&root).unwrap();
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "archive projection".into(),
+                root.to_string_lossy().into_owned(),
+                1,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let (client, mut frames) = harness.add_client(16);
+        let initial_revision = match harness
+            .core
+            .dispatch(
+                client,
+                Request::GetHierarchy {
+                    surface_id: "session-window".into(),
+                    include_archived: false,
+                },
+                2,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => snapshot.revision,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_read_only_session(
+                &workspace_id,
+                "review".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                3,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let created = drain_session_events(&mut frames)
+            .into_iter()
+            .find_map(|event| match event {
+                ServerEvent::HierarchyChanged { snapshot } => Some(*snapshot),
+                _ => None,
+            })
+            .expect("Session creation must publish the hierarchy");
+        assert_eq!(created.revision, initial_revision + 1);
+
+        harness.core.archive_session(&session_id, true, 4).unwrap();
+        let archived_events = drain_session_events(&mut frames);
+        assert!(archived_events.iter().any(|event| matches!(
+            event,
+            ServerEvent::SessionRemoved { session_id: removed, .. } if removed == &session_id
+        )));
+        let archived = archived_events
+            .into_iter()
+            .find_map(|event| match event {
+                ServerEvent::HierarchyChanged { snapshot } => Some(*snapshot),
+                _ => None,
+            })
+            .expect("archiving must replace the navigation projection");
+        assert_eq!(archived.revision, created.revision + 1);
+        assert!(archived.workspaces[0].sessions.is_empty());
+
+        harness.core.archive_session(&session_id, false, 5).unwrap();
+        let restored = drain_session_events(&mut frames)
+            .into_iter()
+            .find_map(|event| match event {
+                ServerEvent::HierarchyChanged { snapshot } => Some(*snapshot),
+                _ => None,
+            })
+            .expect("unarchiving must replace the navigation projection");
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert_eq!(restored.workspaces[0].sessions[0].session.id, session_id);
+    }
 
     #[tokio::test]
     async fn workspace_session_and_template_apis_reject_unsafe_navigation_names() {

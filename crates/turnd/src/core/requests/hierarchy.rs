@@ -733,9 +733,187 @@ mod tests {
         Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, Session, WorkspaceCheckout,
     };
     use turn_core::state::Lifecycle;
-    use turn_proto::{CloseDisposition, NewPane, Request};
+    use turn_proto::{CloseDisposition, NewPane, Request, ServerEvent, ServerMessage};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    fn drain_events(
+        frames: &mut tokio::sync::mpsc::Receiver<turn_proto::ServerFrame>,
+    ) -> Vec<ServerEvent> {
+        let mut events = Vec::new();
+        while let Ok(frame) = frames.try_recv() {
+            if let ServerMessage::Event { event } = frame.message {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    fn assert_surface_binding_replacement(
+        events: &[ServerEvent],
+        session_id: &SessionId,
+        node_id: &NodeId,
+        expected: &[PaneId],
+        forbidden: &[PaneId],
+    ) {
+        let (partial_index, revision, bindings) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ServerEvent::PaneBindingsChanged {
+                    hierarchy_revision,
+                    session_id: changed_session,
+                    node_id: changed_node,
+                    bindings,
+                } if changed_session == session_id && changed_node == node_id => {
+                    Some((index, *hierarchy_revision, bindings))
+                }
+                _ => None,
+            })
+            .expect("the surface must receive a binding replacement");
+        let ids: Vec<_> = bindings
+            .iter()
+            .map(|binding| binding.pane_id.clone())
+            .collect();
+        assert_eq!(ids, expected, "the partial replacement leaked a Pane");
+        assert!(bindings
+            .iter()
+            .all(|binding| { forbidden.iter().all(|pane_id| binding.pane_id != *pane_id) }));
+
+        let (snapshot_index, snapshot) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                ServerEvent::HierarchyChanged { snapshot } if snapshot.revision == revision => {
+                    Some((index, snapshot))
+                }
+                _ => None,
+            })
+            .expect("the same revision must also have a full surface projection");
+        assert!(
+            partial_index < snapshot_index,
+            "this order reproduces the equal-revision client path"
+        );
+        let snapshot_bindings: Vec<_> = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .find(|session| session.session.id == *session_id)
+            .and_then(|session| session.nodes.iter().find(|node| node.node_id == *node_id))
+            .expect("the node must remain in the hierarchy")
+            .pane_bindings
+            .iter()
+            .map(|binding| binding.pane_id.clone())
+            .collect();
+        assert_eq!(snapshot_bindings, expected);
+    }
+
+    #[tokio::test]
+    async fn temporary_binding_pushes_are_filtered_before_each_surface_applies_them() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_surface_isolation");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut reviewer = ProcessNode::agent(
+            session_id.clone(),
+            "claude",
+            harness._dir.path().to_string_lossy(),
+            NOW,
+        );
+        reviewer.title = "Reviewer".into();
+        reviewer.lifecycle = Lifecycle::Alive;
+        let reviewer_id = reviewer.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(reviewer);
+        harness.core.persist_session(&session_id).unwrap();
+
+        let (left_client, mut left_frames) = harness.add_client(32);
+        let (right_client, mut right_frames) = harness.add_client(32);
+        for (client, surface_id) in [(left_client, "left-window"), (right_client, "right-window")] {
+            assert!(matches!(
+                harness
+                    .core
+                    .dispatch(
+                        client,
+                        Request::GetHierarchy {
+                            surface_id: surface_id.into(),
+                            include_archived: false,
+                        },
+                        NOW + 1,
+                    )
+                    .unwrap(),
+                Response::Hierarchy { .. }
+            ));
+        }
+        drain_events(&mut left_frames);
+        drain_events(&mut right_frames);
+
+        let left_pane = match harness
+            .core
+            .dispatch(
+                left_client,
+                Request::OpenNodeAsTemporaryPane {
+                    surface_id: "left-window".into(),
+                    session_id: session_id.clone(),
+                    node_id: reviewer_id.clone(),
+                },
+                NOW + 2,
+            )
+            .unwrap()
+        {
+            Response::NodePane { pane } => pane.binding.pane_id,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_surface_binding_replacement(
+            &drain_events(&mut left_frames),
+            &session_id,
+            &reviewer_id,
+            std::slice::from_ref(&left_pane),
+            &[],
+        );
+        assert_surface_binding_replacement(
+            &drain_events(&mut right_frames),
+            &session_id,
+            &reviewer_id,
+            &[],
+            std::slice::from_ref(&left_pane),
+        );
+
+        let right_pane = match harness
+            .core
+            .dispatch(
+                right_client,
+                Request::OpenNodeAsTemporaryPane {
+                    surface_id: "right-window".into(),
+                    session_id: session_id.clone(),
+                    node_id: reviewer_id.clone(),
+                },
+                NOW + 3,
+            )
+            .unwrap()
+        {
+            Response::NodePane { pane } => pane.binding.pane_id,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_surface_binding_replacement(
+            &drain_events(&mut left_frames),
+            &session_id,
+            &reviewer_id,
+            std::slice::from_ref(&left_pane),
+            std::slice::from_ref(&right_pane),
+        );
+        assert_surface_binding_replacement(
+            &drain_events(&mut right_frames),
+            &session_id,
+            &reviewer_id,
+            std::slice::from_ref(&right_pane),
+            std::slice::from_ref(&left_pane),
+        );
+    }
 
     #[tokio::test]
     async fn a_core_missing_the_owner_cannot_release_another_daemons_lease() {
