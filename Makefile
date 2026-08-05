@@ -51,7 +51,7 @@ test: ## Run the whole test suite
 .PHONY: test-headless
 test-headless: ## Run every test that needs no GPU (what Linux CI runs)
 	$(CARGO) test --workspace --exclude turn-gui -- --test-threads=$(TEST_THREADS)
-	$(CARGO) test -p turn-gui --lib
+	$(CARGO) test -p turn-gui --lib --bins --test onboarding
 
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
@@ -84,7 +84,7 @@ release: ## Release build of the three binaries
 .PHONY: run
 run: release ## Open Turn; the app starts its daemon companion if needed
 	@echo "opening the window (it will reuse or start turnd)…"
-	TURN_SOCKET=$(TURN_SOCKET) ./target/release/turn
+	TURN_SOCKET=$(TURN_SOCKET) TURN_DATA_DIR=$(TURN_DATA_DIR) ./target/release/turn
 
 .PHONY: daemon
 daemon: ## Start turnd in the background if it is not already up
@@ -114,7 +114,7 @@ daemon-log: ## Follow the daemon's log
 .PHONY: gui
 gui: ## Build the packaged sibling set and open the window
 	$(CARGO) build --release --bin turn --bin turnd --bin turn-hook
-	TURN_SOCKET=$(TURN_SOCKET) ./target/release/turn
+	TURN_SOCKET=$(TURN_SOCKET) TURN_DATA_DIR=$(TURN_DATA_DIR) ./target/release/turn
 
 # --- looking at the interface -------------------------------------------------
 
@@ -146,7 +146,7 @@ linux-test: ## Run the headless suite in a Linux container
 		$(LINUX_IMAGE) \
 		bash -c 'set -e; uname -srm; \
 			cargo test --workspace --exclude turn-gui -- --test-threads=$(TEST_THREADS); \
-			cargo test -p turn-gui --lib'
+			cargo test -p turn-gui --lib --bins --test onboarding'
 
 .PHONY: linux-build
 linux-build: ## Prove the window links on Linux

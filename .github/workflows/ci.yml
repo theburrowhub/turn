@@ -81,20 +81,20 @@ jobs:
 
       - name: Test (Linux — turn-gui's logic tests, which need no GPU)
         if: runner.os == 'Linux'
-        run: cargo test -p turn-gui --lib --bins
+        run: cargo test -p turn-gui --lib --bins --test onboarding
 
       # The two steps above name what they run, which means they can stop running
       # something without anyone noticing: `--exclude turn-gui` drops *every* integration
       # target in that crate, and only `tests/snapshots.rs` actually needs a GPU. So this
-      # asserts that assumption instead of trusting it. Adding `tests/keymap.rs` to
+      # asserts the explicit headless allowlist instead of trusting it. Adding `tests/keymap.rs` to
       # `turn-gui` fails here with instructions, rather than quietly never running on Linux.
-      - name: Guard — snapshots.rs is turn-gui's only integration test target
+      - name: Guard — every headless turn-gui integration target is named above
         if: runner.os == 'Linux'
         run: |
           found=$(cd crates/turn-gui/tests && ls *.rs | tr '\n' ' ' | sed 's/ $//')
-          if [ "$found" != "snapshots.rs" ]; then
-            echo "::error::turn-gui has integration test targets beyond snapshots.rs: $found"
-            echo "The Linux job runs '--exclude turn-gui' plus '--lib --bins', so a new target"
+          if [ "$found" != "onboarding.rs snapshots.rs" ]; then
+            echo "::error::turn-gui integration targets differ from the explicit Linux allowlist: $found"
+            echo "The Linux job runs '--exclude turn-gui' plus an explicit headless target list, so a new target"
             echo "would not run on Linux at all. Either name it in the Linux test step above,"
             echo "or move its tests into the crate if they need no GPU."
             exit 1
