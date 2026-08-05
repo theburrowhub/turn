@@ -255,6 +255,32 @@ async fn a_saved_layout_makes_a_second_session_of_the_same_shape_with_its_own_pa
     assert_eq!(template.pane_count, 3);
     assert!(!template.built_in);
 
+    // Reusing a Layout does not waive checkout exclusivity. End the owning run
+    // explicitly before asking for another main-checkout Session from the Template.
+    // The original details above remain available for the shape comparison.
+    ui.ask(Request::CloseSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+    let lease = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: session.workspace_id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the stopped Session's lease, got {other:?}"),
+    };
+    ui.ask(Request::ReleaseWorkspaceWriteLease {
+        workspace_id: session.workspace_id.clone(),
+        lease_id: lease.id,
+        expected_generation: lease.generation,
+    })
+    .await;
+
     let second = session_of(
         ui.ask(Request::CreateSessionFromTemplate {
             workspace_id: session.workspace_id.clone(),
@@ -406,7 +432,10 @@ async fn closing_a_session_does_exactly_what_the_disposition_says() {
         .await,
     );
     let pids: Vec<u32> = details.tree.iter().filter_map(|node| node.pid).collect();
-    assert_eq!(pids.len(), 2);
+    assert!(
+        pids.len() >= 2,
+        "Claude and the shell must run; Fang also runs when installed"
+    );
 
     // Keeping the processes is the whole point of the daemon: the window closes, the
     // work does not.
@@ -441,7 +470,7 @@ async fn closing_a_session_does_exactly_what_the_disposition_says() {
 
     // The processes are asked to stop, and the session is parked rather than deleted.
     let mut stopped = false;
-    // Generous: this waits on the operating system reaping two processes, which a loaded
+    // Generous: this waits on the operating system reaping every process, which a loaded
     // machine can take its time over. A test that fails there fails for no reason.
     for _ in 0..200 {
         if pids.iter().all(|pid| !pid_is_alive(*pid)) {
@@ -524,8 +553,10 @@ async fn the_daemon_refuses_the_things_it_should_and_says_why() {
     assert_eq!(error.code, ErrorCode::PaneNotAttached);
 
     // A one-pane session has nowhere to put the cursor if the pane goes.
+    // This check needs another Layout, not another writer. Use the explicit read-only
+    // alternative so the fixture cannot normalize the pre-upgrade multi-writer model.
     let single = session_of(
-        ui.ask(Request::CreateSession {
+        ui.ask(Request::CreateReadOnlySession {
             workspace_id: session.workspace_id.clone(),
             name: "one pane".to_string(),
             cwd: None,

@@ -53,7 +53,10 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
     let workspace_id = before.summary.workspace_id.clone();
     let pane_ids: Vec<_> = before.layout.panes().iter().map(|p| p.id.clone()).collect();
     let pids: Vec<u32> = before.tree.iter().filter_map(|node| node.pid).collect();
-    assert_eq!(pids.len(), 2, "two panes had processes");
+    assert!(
+        pids.len() >= 2,
+        "Claude and the shell must run; Fang also runs when installed"
+    );
     assert!(pids.iter().all(|pid| pid_is_alive(*pid)));
     drop(ui);
 
@@ -138,7 +141,11 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         })
         .await;
     assert_eq!(state, RestoreState::LayoutOnly);
-    assert_eq!(panes.len(), 2, "the two panes that had processes");
+    assert_eq!(
+        panes.len(),
+        pids.len(),
+        "every pane that had a process needs a restore report"
+    );
     for pane in &panes {
         assert_eq!(pane.lifecycle, Lifecycle::Lost);
         assert!(

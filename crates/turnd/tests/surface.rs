@@ -347,9 +347,17 @@ async fn panes_can_be_swapped_focused_by_name_and_detached_without_stopping_anyt
     assert_eq!(error.code, ErrorCode::NotFound);
 
     // Attaching and detaching is about who is watching, not about what is running.
-    let node = details.tree[0].node_id.clone();
-    let pid = details.tree[0].pid.expect("a pid");
-    let pane_of_node = details.tree[0].pane_bindings[0].pane_id.clone();
+    // Background children are intentionally pane-less and may sort before a visible
+    // tool in the unified tree. Pick the view this test actually needs instead of
+    // assuming the first ProcessNode owns a Pane.
+    let bound = details
+        .tree
+        .iter()
+        .find(|node| !node.pane_bindings.is_empty())
+        .unwrap_or_else(|| panic!("the session needs one bound process: {details:#?}"));
+    let node = bound.node_id.clone();
+    let pid = bound.pid.expect("a pid");
+    let pane_of_node = bound.pane_bindings[0].pane_id.clone();
     ui.attach_cells(&session.id, &pane_of_node, PtySize::new(24, 80))
         .await;
     ui.ask(Request::ResizePty {

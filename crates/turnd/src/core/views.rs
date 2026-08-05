@@ -29,7 +29,12 @@ impl Core {
         let session = self.sessions.get(id)?;
         let badge = self.attention.queue().count_for_session(id, now_ms);
         let muted = self.attention.is_muted(id, now_ms);
-        Some(SessionDetails::from_session(session, badge, muted, now_ms))
+        let mut details = SessionDetails::from_session(session, badge, muted, now_ms);
+        // Protocol v3's Pane→Node table is authoritative. The convenience constructor
+        // cannot see the store, so replace its honest-but-unbound legacy projection
+        // with the same normalised view used by hierarchy and tree pushes.
+        details.tree = self.tree_views(id, now_ms);
+        Some(details)
     }
 
     /// Session rows, ordered the way the sidebar shows them: pinned first, then

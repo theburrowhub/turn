@@ -247,7 +247,10 @@ async fn a_client_that_asks_for_bytes_gets_the_escape_stream_and_a_replay() {
     );
 
     type_line(&mut ui, &session, &pane, r"printf '\033[32mgreen\033[0m\n'").await;
-    let output = ui.wait_for_output("green").await;
+    // The interactive shell first echoes the command, which contains the literal word
+    // `green`. Wait for the rendered control sequence so that echo can never satisfy
+    // the byte-stream assertion early on a slower run.
+    let output = ui.wait_for_output("\u{1b}[32mgreen").await;
     assert!(
         output.contains("\u{1b}[32m"),
         "the escape sequences are the point of this stream: {output:?}"
