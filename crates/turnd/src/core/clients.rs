@@ -317,6 +317,28 @@ impl Core {
         let Some(gone) = self.clients.remove(&client) else {
             return;
         };
+        let abandoned_surface = gone.surface_id.as_deref().filter(|surface_id| {
+            !self
+                .clients
+                .values()
+                .any(|remaining| remaining.surface_id.as_deref() == Some(*surface_id))
+        });
+        if let Some(surface_id) = abandoned_surface {
+            match self
+                .store
+                .hierarchy()
+                .clear_temporary_bindings_for_surface(surface_id)
+            {
+                Ok(0) => {}
+                Ok(pruned) => {
+                    self.bump_hierarchy();
+                    tracing::debug!(surface_id, pruned, "pruned abandoned temporary panes");
+                }
+                Err(error) => {
+                    tracing::warn!(surface_id, %error, "could not prune abandoned temporary panes");
+                }
+            }
+        }
         tracing::info!(
             %client,
             panes = gone.attachments.len(),

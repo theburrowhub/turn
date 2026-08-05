@@ -187,7 +187,10 @@ mod tests {
         let session = session_in(&ws, "worker waiting");
         let summary = SessionSummary::from_session(&session, 1, false, T0);
 
-        assert!(!summary.needs_user, "the Session tree itself stays truthful");
+        assert!(
+            !summary.needs_user,
+            "the Session tree itself stays truthful"
+        );
         let view = WorkspaceSummary::from_workspace(&ws, &[summary]);
         assert_eq!(view.sessions_needing_user, 1);
         assert_eq!(view.badge_count, 1);

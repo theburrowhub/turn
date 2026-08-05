@@ -53,11 +53,60 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         let surface_id = validate_surface_id(&surface_id)?;
-        let client = self
+        let previous_surface = self
             .clients
-            .get_mut(&client_id)
-            .ok_or_else(|| ProtoError::internal("this connection is not registered"))?;
-        client.surface_id = Some(surface_id.clone());
+            .get(&client_id)
+            .ok_or_else(|| ProtoError::internal("this connection is not registered"))?
+            .surface_id
+            .clone();
+        if let Some(previous) = previous_surface.as_deref() {
+            if previous != surface_id {
+                return Err(ProtoError::refused(
+                    "A connected client cannot change its UI surface identity",
+                ));
+            }
+        } else {
+            // A first claim is a UI bootstrap, including a reconnect that overlaps
+            // the final moments of the old socket. A temporary Pane cannot be
+            // rehydrated from a binding alone, so retire the old surface owner and
+            // its ephemeral binding before building the new snapshot.
+            let displaced: Vec<_> = self
+                .clients
+                .iter()
+                .filter_map(|(id, client)| {
+                    (*id != client_id && client.surface_id.as_deref() == Some(surface_id.as_str()))
+                        .then_some(*id)
+                })
+                .collect();
+            for id in displaced {
+                let watched_nodes = self
+                    .clients
+                    .get_mut(&id)
+                    .map(|client| {
+                        client.surface_id = None;
+                        std::mem::take(&mut client.attachments)
+                            .into_values()
+                            .filter_map(|attachment| attachment.node_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for node in watched_nodes {
+                    self.stop_pump_if_unwatched(&node);
+                }
+            }
+            let pruned = self
+                .store
+                .hierarchy()
+                .clear_temporary_bindings_for_surface(&surface_id)
+                .map_err(store)?;
+            if pruned > 0 {
+                self.bump_hierarchy();
+            }
+            self.clients
+                .get_mut(&client_id)
+                .expect("the registered client cannot disappear during dispatch")
+                .surface_id = Some(surface_id.clone());
+        }
         Ok(Response::Hierarchy {
             snapshot: Box::new(self.hierarchy_snapshot(&surface_id, include_archived, now_ms)?),
         })
@@ -435,11 +484,16 @@ impl Core {
             });
             let mut session_views = Vec::with_capacity(sessions.len());
             for session in sessions {
-                let bindings = self
+                let bindings: Vec<_> = self
                     .store
                     .hierarchy()
                     .bindings_for_session(&session.id)
-                    .map_err(store)?;
+                    .map_err(store)?
+                    .into_iter()
+                    .filter(|binding| {
+                        !binding.temporary || binding.surface_id.as_deref() == Some(surface_id)
+                    })
+                    .collect();
                 let capabilities: HashMap<NodeId, NodePaneCapability> = session
                     .tree
                     .iter()
@@ -1066,7 +1120,7 @@ mod tests {
             .is_running());
 
         let (other_client, _other_frames) = harness.add_client(64);
-        harness
+        let other_snapshot = match harness
             .core
             .dispatch(
                 other_client,
@@ -1076,7 +1130,20 @@ mod tests {
                 },
                 NOW + 11,
             )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => *snapshot,
+            other => panic!("unexpected {other:?}"),
+        };
+        let other_reviewer = other_snapshot.workspaces[0].sessions[0]
+            .nodes
+            .iter()
+            .find(|node| node.node_id == reviewer_id)
             .unwrap();
+        assert!(
+            other_reviewer.pane_bindings.is_empty(),
+            "one window must not advertise another window's temporary Pane"
+        );
         assert!(harness
             .core
             .close_pane(
@@ -1113,7 +1180,14 @@ mod tests {
             .is_running());
         assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
 
-        harness.core.client_closed(first_client);
+        let abandoned = match harness
+            .core
+            .open_node_as_temporary_pane("main-window".into(), &session_id, &reviewer_id, NOW + 14)
+            .unwrap()
+        {
+            Response::NodePane { pane } => pane,
+            other => panic!("unexpected {other:?}"),
+        };
         let (second_client, _frames) = harness.add_client(64);
         let restored = match harness
             .core
@@ -1123,13 +1197,28 @@ mod tests {
                     surface_id: "main-window".into(),
                     include_archived: false,
                 },
-                NOW + 10,
+                NOW + 15,
             )
             .unwrap()
         {
             Response::Hierarchy { snapshot } => *snapshot,
             other => panic!("unexpected {other:?}"),
         };
+        assert!(!harness
+            .core
+            .store
+            .hierarchy()
+            .bindings_for_session(&session_id)
+            .unwrap()
+            .iter()
+            .any(|binding| binding.pane_id == abandoned.binding.pane_id));
+        harness.core.client_closed(first_client);
+        assert!(harness.core.sessions[&session_id]
+            .tree
+            .get(&reviewer_id)
+            .unwrap()
+            .is_running());
+        assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
         assert_eq!(
             restored.tree_state.selected,
             Some(HierarchyKey::process(reviewer_id.clone()))

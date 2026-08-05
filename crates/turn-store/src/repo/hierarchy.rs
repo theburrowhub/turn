@@ -757,6 +757,26 @@ impl<'a> HierarchyRepo<'a> {
         )? > 0)
     }
 
+    /// Drops the ephemeral Pane owned by one UI surface.
+    ///
+    /// Temporary bindings deliberately survive neither the owning window nor a
+    /// daemon generation. Keeping them would make a reconnected tree advertise a
+    /// Pane the new UI cannot focus because it never created that view.
+    pub fn clear_temporary_bindings_for_surface(&self, surface_id: &str) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM pane_node_bindings WHERE temporary = 1 AND surface_id = ?1",
+            params![surface_id],
+        )?)
+    }
+
+    /// Removes every temporary UI binding after a daemon restart. Saved Layout
+    /// bindings are permanent (`temporary = 0`) and are left untouched.
+    pub fn clear_all_temporary_bindings(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM pane_node_bindings WHERE temporary = 1", [])?)
+    }
+
     pub fn bindings_for_session(&self, session: &SessionId) -> Result<Vec<PaneNodeBinding>> {
         let mut stmt = self.conn.prepare(
             "SELECT pane_id, session_id, node_id, temporary, surface_id, opened_ms \
@@ -1916,6 +1936,51 @@ mod tests {
             .hierarchy()
             .unbind_pane(&session.id, &PaneId::from_stored("pane_b"))
             .unwrap();
+        assert!(store.nodes().get(&node.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn temporary_bindings_are_scoped_and_can_be_purged_without_touching_layout_panes() {
+        let store = testing::store();
+        let session = testing::saved_session_anywhere(&store, "temporary-scope");
+        let node = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
+        store.nodes().upsert(&node).unwrap();
+        for (name, temporary, surface) in [
+            ("saved", false, None),
+            ("temp-a", true, Some("window-a")),
+            ("temp-b", true, Some("window-b")),
+        ] {
+            store
+                .hierarchy()
+                .bind_pane(&PaneNodeBinding {
+                    pane_id: PaneId::from_stored(name),
+                    session_id: session.id.clone(),
+                    node_id: node.id.clone(),
+                    temporary,
+                    surface_id: surface.map(str::to_string),
+                    opened_ms: T0,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .hierarchy()
+                .clear_temporary_bindings_for_surface("window-a")
+                .unwrap(),
+            1
+        );
+        let remaining = store.hierarchy().bindings_for_session(&session.id).unwrap();
+        assert!(remaining
+            .iter()
+            .any(|binding| binding.pane_id.as_str() == "saved"));
+        assert!(remaining
+            .iter()
+            .any(|binding| binding.pane_id.as_str() == "temp-b"));
+        assert_eq!(store.hierarchy().clear_all_temporary_bindings().unwrap(), 1);
+        let remaining = store.hierarchy().bindings_for_session(&session.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(!remaining[0].temporary);
         assert!(store.nodes().get(&node.id).unwrap().is_some());
     }
 

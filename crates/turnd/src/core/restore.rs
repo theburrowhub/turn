@@ -31,6 +31,10 @@ use turn_proto::{PaneRestoreOutcome, ServerEvent};
 impl Core {
     /// Loads everything from the store and decides what became of each process.
     pub(crate) fn restore(&mut self, now_ms: i64) -> Result<()> {
+        // A temporary Pane belongs to a concrete UI surface. No such surface
+        // survives this daemon generation, so carrying its binding forward would
+        // create a phantom "TEMP PANE" marker that cannot be focused.
+        let temporary_bindings_pruned = self.store.hierarchy().clear_all_temporary_bindings()?;
         // This must be the first state transition of a new daemon generation.
         // Loading a Session is not proof that its previous daemon relinquished
         // checkout authority, and no heartbeat or launch may auto-adopt it.
@@ -97,6 +101,7 @@ impl Core {
             built_ins_installed = installed,
             attention = self.attention.queue().len(),
             leases_requiring_recovery,
+            temporary_bindings_pruned,
             scratch_pruned = pruned,
             "restored"
         );
