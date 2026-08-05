@@ -89,7 +89,7 @@ impl Core {
         self.restore_queue()?;
         // Written straight back, so the demands this start-up decided against do not sit
         // on disk waiting to be reconsidered by the next one.
-        self.persist_attention();
+        let _ = self.persist_attention();
 
         let known: HashSet<String> = self.sessions.keys().map(|id| id.to_string()).collect();
         let pruned = paths::prune_scratch(&self.data_dir, &known);

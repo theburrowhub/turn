@@ -75,6 +75,9 @@ pub use repo::{
 
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use turn_core::attention::AttentionQueue;
+use turn_core::model::Session;
+use turn_core::TurnEvent;
 
 /// How long a write waits for another connection to finish before giving up.
 ///
@@ -291,6 +294,27 @@ impl Store {
         SettingsRepo::new(&self.conn)
     }
 
+    /// Atomically records everything one accepted runtime event changed.
+    ///
+    /// Ordering is part of the contract: an out-of-order stop can materialise a
+    /// node tombstone, so the complete Session (including its nodes, layout and
+    /// activity preview) must exist before the event is inserted; the queue then
+    /// records the attention projection produced by that same event. A failure in
+    /// any step rolls all three projections back to their previous state.
+    pub fn checkpoint_event_session_attention(
+        &self,
+        session: &Session,
+        event: &TurnEvent,
+        attention: &AttentionQueue,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        repo::session::save_in(&tx, session)?;
+        repo::event::insert(&tx, event)?;
+        repo::attention::replace_all_in(&tx, attention)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The underlying connection, for tests that need to simulate a database
     /// damaged behind Turn's back.
     #[cfg(test)]
@@ -380,7 +404,34 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turn_core::model::Workspace;
+    use turn_core::attention::{AttentionDemandKind, AttentionEntry, EntryState};
+    use turn_core::ids::{AttentionId, NodeId, SessionId};
+    use turn_core::model::{NodeKind, ProcessNode, Workspace};
+    use turn_core::state::AwaitingReason;
+    use turn_core::{Confidence, EventKind, EventSource};
+
+    fn checkpoint_attention(
+        session_id: &SessionId,
+        node_id: Option<NodeId>,
+        at_ms: i64,
+    ) -> AttentionEntry {
+        AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session_id.clone(),
+            node_id,
+            parent_node_id: None,
+            subject_external_id: None,
+            reason: AwaitingReason::Permission,
+            summary: Some("review the requested command".into()),
+            confidence: Confidence::Explicit,
+            created_ms: at_ms,
+            updated_ms: at_ms,
+            state: EntryState::Pending,
+            priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: AttentionDemandKind::Interaction,
+        }
+    }
 
     #[test]
     fn opening_a_file_enables_write_ahead_logging_and_foreign_keys() {
@@ -409,6 +460,116 @@ mod tests {
         assert_eq!(store.schema_version().unwrap(), LATEST_VERSION);
         assert!(store.foreign_keys_enforced().unwrap());
         assert_eq!(store.workspaces().count().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_event_checkpoints_its_new_session_node_and_attention_together() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "atomic checkpoint");
+        let layout = turn_core::model::Layout::single(
+            turn_core::model::Pane::new(turn_core::model::PaneKind::Agent).with_command("claude"),
+        );
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "new session",
+            "/repo",
+            layout,
+            testing::T0,
+        );
+        let node_id = session.tree.insert(ProcessNode::process(
+            session.id.clone(),
+            NodeKind::Subagent,
+            "Reviewer",
+            "/repo",
+            testing::T0,
+        ));
+        let event = TurnEvent::new(
+            session.id.clone(),
+            EventKind::AgentIdle,
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            testing::T0 + 1,
+        )
+        .with_workspace(workspace.id.clone())
+        .with_node(node_id.clone());
+        let mut attention = AttentionQueue::new();
+        let demand = checkpoint_attention(&session.id, Some(node_id.clone()), testing::T0 + 1);
+        attention.upsert(demand.clone());
+
+        store
+            .checkpoint_event_session_attention(&session, &event, &attention)
+            .unwrap();
+
+        let saved = store.sessions().get(&session.id).unwrap().unwrap();
+        assert!(saved.tree.get(&node_id).is_some());
+        assert_eq!(store.events().get(&event.id).unwrap(), Some(event));
+        assert_eq!(store.attention().load_queue().unwrap(), attention);
+        assert_eq!(store.attention().get(&demand.id).unwrap(), Some(demand));
+    }
+
+    #[test]
+    fn a_failed_attention_write_rolls_back_session_event_and_queue() {
+        let store = testing::store();
+        let mut session = testing::saved_session_anywhere(&store, "before checkpoint");
+        let prior_event = testing::save_event(&store, &session.id, testing::T0);
+        testing::save_attention(&store, &session.id, testing::T0);
+        let prior_queue = store.attention().load_queue().unwrap();
+        let prior_node_count = store.nodes().count_for_session(&session.id).unwrap();
+
+        session.name = "after checkpoint".into();
+        session.touch(testing::T0 + 10);
+        let node_id = session.tree.insert(ProcessNode::process(
+            session.id.clone(),
+            NodeKind::Subagent,
+            "Reviewer",
+            "/repo",
+            testing::T0 + 10,
+        ));
+        let event = TurnEvent::new(
+            session.id.clone(),
+            EventKind::AgentIdle,
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            testing::T0 + 10,
+        )
+        .with_node(node_id.clone());
+        let mut replacement_queue = AttentionQueue::new();
+        replacement_queue.upsert(checkpoint_attention(
+            &session.id,
+            Some(node_id.clone()),
+            testing::T0 + 10,
+        ));
+
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER abort_atomic_attention_insert \
+                 BEFORE INSERT ON attention_entries \
+                 BEGIN \
+                   SELECT RAISE(ABORT, 'injected attention failure'); \
+                 END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .checkpoint_event_session_attention(&session, &event, &replacement_queue)
+            .is_err());
+
+        let durable = store.sessions().get(&session.id).unwrap().unwrap();
+        assert_eq!(durable.name, "before checkpoint");
+        assert_eq!(durable.last_activity_ms, testing::T0);
+        assert_eq!(
+            store.nodes().count_for_session(&session.id).unwrap(),
+            prior_node_count
+        );
+        assert!(store.nodes().get(&node_id).unwrap().is_none());
+        assert_eq!(store.events().get(&event.id).unwrap(), None);
+        assert_eq!(
+            store.events().get(&prior_event.id).unwrap(),
+            Some(prior_event)
+        );
+        assert_eq!(store.events().count_for_session(&session.id).unwrap(), 1);
+        assert_eq!(store.attention().load_queue().unwrap(), prior_queue);
     }
 
     #[test]

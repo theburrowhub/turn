@@ -228,7 +228,7 @@ impl<'a> SessionRepo<'a> {
     }
 }
 
-fn save_in(conn: &Connection, session: &Session) -> Result<()> {
+pub(crate) fn save_in(conn: &Connection, session: &Session) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (id, workspace_id, name, note, cwd, env_json, attention_json, \
              mode, checkout_id, worktree_path, read_only_enforced, template_id, status, \

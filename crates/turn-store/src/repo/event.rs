@@ -262,7 +262,7 @@ impl<'a> EventRepo<'a> {
     }
 }
 
-fn insert(conn: &Connection, event: &TurnEvent) -> Result<()> {
+pub(crate) fn insert(conn: &Connection, event: &TurnEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO events (id, timestamp_ms, workspace_id, session_id, node_id, \
              parent_node_id, kind_slug, kind_json, agent_json, confidence, source_json, \

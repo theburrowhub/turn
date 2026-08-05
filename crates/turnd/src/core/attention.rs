@@ -15,14 +15,30 @@ impl Core {
     /// the shape of the thing Turn promises not to do, even when the command itself
     /// came from the user's own settings.
     pub(crate) fn emit_effects(&mut self, effects: Vec<Effect>, now_ms: i64) {
+        self.emit_effects_with_queue_persistence(effects, now_ms, true);
+    }
+
+    /// Publishes effects whose queue was already committed by an event checkpoint.
+    pub(crate) fn emit_checkpointed_effects(&mut self, effects: Vec<Effect>, now_ms: i64) {
+        self.emit_effects_with_queue_persistence(effects, now_ms, false);
+    }
+
+    fn emit_effects_with_queue_persistence(
+        &mut self,
+        effects: Vec<Effect>,
+        now_ms: i64,
+        persist_queue_changes: bool,
+    ) {
         if effects.is_empty() {
             return;
         }
-        let mut queue_changed = false;
+        let queue_changed = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Enqueued { .. } | Effect::Cleared { .. }));
+        if queue_changed && persist_queue_changes && !self.persist_attention() {
+            return;
+        }
         for effect in effects {
-            if matches!(effect, Effect::Enqueued { .. } | Effect::Cleared { .. }) {
-                queue_changed = true;
-            }
             // A granted focus change is applied to our own idea of where the user is,
             // optimistically. The UI confirms it with `update_user_activity`; until
             // then this is what stops the governor from granting the same jump twice.
@@ -32,7 +48,6 @@ impl Core {
             self.push_all(ServerEvent::AttentionEffect { effect });
         }
         if queue_changed {
-            self.persist_attention();
             self.push_attention_queue(now_ms);
         }
     }
@@ -41,9 +56,20 @@ impl Core {
     ///
     /// The queue is state the user would notice losing: a permission request that
     /// arrived while they were away must still be waiting after a restart.
-    pub(crate) fn persist_attention(&self) {
-        if let Err(error) = self.store.attention().replace_all(self.attention.queue()) {
-            tracing::warn!(%error, "could not save the attention queue");
+    pub(crate) fn persist_attention(&self) -> bool {
+        if !self.failed_ingest_checkpoints.is_empty() {
+            tracing::warn!(
+                pending = self.failed_ingest_checkpoints.len(),
+                "deferred a standalone attention write behind failed atomic checkpoints"
+            );
+            return false;
+        }
+        match self.store.attention().replace_all(self.attention.queue()) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, "could not save the attention queue");
+                false
+            }
         }
     }
 
@@ -77,8 +103,9 @@ impl Core {
                 .iter()
                 .any(|entry| &entry.session_id == session_id)
             {
-                self.persist_attention();
-                self.push_attention_queue(now_ms);
+                if self.persist_attention() {
+                    self.push_attention_queue(now_ms);
+                }
             } else {
                 self.emit_effects(
                     vec![Effect::Cleared {
@@ -107,8 +134,9 @@ impl Core {
                 .iter()
                 .any(|entry| &entry.session_id == session_id)
             {
-                self.persist_attention();
-                self.push_attention_queue(now_ms);
+                if self.persist_attention() {
+                    self.push_attention_queue(now_ms);
+                }
             } else {
                 self.emit_effects(
                     vec![Effect::Cleared {
@@ -141,8 +169,9 @@ impl Core {
                 .iter()
                 .any(|entry| &entry.session_id == session_id)
             {
-                self.persist_attention();
-                self.push_attention_queue(now_ms);
+                if self.persist_attention() {
+                    self.push_attention_queue(now_ms);
+                }
             } else {
                 self.emit_effects(
                     vec![Effect::Cleared {

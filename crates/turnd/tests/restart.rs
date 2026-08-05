@@ -4,9 +4,10 @@ mod common;
 
 use common::*;
 use turn_core::attention::{AttentionEntry, EntryState};
+use turn_core::event::EventKind;
 use turn_core::ids::{AttentionId, CheckoutId};
 use turn_core::model::{LeaseState, PaneKind, RestoreState};
-use turn_core::state::{AwaitingReason, Lifecycle};
+use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_core::Confidence;
 use turn_proto::{ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent};
 
@@ -275,6 +276,244 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         vec![&shell_pane.id]
     );
 
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permission_checkpoint_restores_the_agent_and_queue_when_its_runtime_survives() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = common::agent::agent_session(&daemon, &mut ui, "durable permission").await;
+
+    post_hook(
+        &agent.hook,
+        &notification(
+            "permission_prompt",
+            "Reviewer needs permission to run make verify",
+        ),
+    )
+    .await;
+    common::agent::wait_for_state(&mut ui, &agent.session, DisplayState::NeedsPermission).await;
+    let before = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await,
+    );
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].entry.node_id.as_ref(), Some(&agent.node));
+    let attention_id = before[0].entry.id.clone();
+    drop(ui);
+
+    let dir = daemon.stop().await;
+    let data_dir = dir.path().to_path_buf();
+    let mut survivor = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("a runtime that survives the daemon");
+    {
+        let store = turn_store::Store::open_in(&data_dir).expect("the store must reopen");
+        let mut session = store
+            .sessions()
+            .get(&agent.session)
+            .expect("the session query")
+            .expect("the checkpointed session");
+        let node = session
+            .tree
+            .get_mut(&agent.node)
+            .expect("the checkpointed agent node");
+        // Model a structured runtime detached from its old PTY. Restore must
+        // validate both pid and command before retaining its actionable demand.
+        node.pid = Some(survivor.id());
+        node.command = "sleep 300".into();
+        node.lifecycle = Lifecycle::Alive;
+        store
+            .sessions()
+            .save(&session)
+            .expect("the survivor metadata must save");
+
+        let events = store
+            .events()
+            .list_for_session(&agent.session, 20)
+            .expect("the event log");
+        assert!(events.iter().any(|event| {
+            event.node_id.as_ref() == Some(&agent.node)
+                && matches!(event.kind, EventKind::AgentPermissionRequired { .. })
+        }));
+        let queue = store.attention().load_queue().expect("the durable queue");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.iter().next().unwrap().id, attention_id);
+    }
+
+    let daemon = TestDaemon::adopt(dir).await;
+    let mut ui = daemon.connect().await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let restored = details
+        .tree
+        .iter()
+        .find(|node| node.node_id == agent.node)
+        .expect("the restored agent");
+    assert_eq!(restored.lifecycle, Lifecycle::Orphaned);
+    assert_eq!(
+        restored.turn,
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission
+        })
+    );
+    assert!(restored
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.pending_permission.as_ref())
+        .is_some());
+    let after = attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await,
+    );
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].entry.id, attention_id);
+    assert_eq!(after[0].entry.node_id.as_ref(), Some(&agent.node));
+
+    daemon.shutdown().await;
+    let _ = survivor.kill();
+    let _ = survivor.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpointed_permission_does_not_resurrect_after_its_runtime_is_lost() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = common::agent::agent_session(&daemon, &mut ui, "stale permission").await;
+    post_hook(
+        &agent.hook,
+        &notification("permission_prompt", "Run the now-abandoned command"),
+    )
+    .await;
+    common::agent::wait_for_state(&mut ui, &agent.session, DisplayState::NeedsPermission).await;
+    assert_eq!(
+        attention_list_of(
+            ui.ask(Request::ListAttention {
+                session_id: Some(agent.session.clone()),
+            })
+            .await,
+        )
+        .len(),
+        1
+    );
+    drop(ui);
+
+    // The fake agent owns a PTY and dies with the daemon. Restore must keep the
+    // event history but remove the demand nobody can answer, both in memory and
+    // from SQLite so a second restart cannot bring it back again.
+    let daemon = daemon.restart().await;
+    let mut ui = daemon.connect().await;
+    assert!(attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session.clone()),
+        })
+        .await,
+    )
+    .is_empty());
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let restored = details
+        .tree
+        .iter()
+        .find(|node| node.node_id == agent.node)
+        .expect("the lost agent remains visible");
+    assert_eq!(restored.lifecycle, Lifecycle::Lost);
+    assert!(!restored.turn.as_ref().is_some_and(Turn::needs_user));
+    assert!(restored
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.pending_permission.as_ref())
+        .is_none());
+
+    drop(ui);
+    let daemon = daemon.restart().await;
+    let mut ui = daemon.connect().await;
+    assert!(attention_list_of(
+        ui.ask(Request::ListAttention {
+            session_id: Some(agent.session),
+        })
+        .await,
+    )
+    .is_empty());
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_before_start_tombstone_survives_a_daemon_restart() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = common::agent::agent_session(&daemon, &mut ui, "out of order stop").await;
+    post_hook(
+        &agent.hook,
+        &serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "agent_id": "reviewer-stopped-before-start",
+            "agent_type": "Explore",
+            "session_id": fixture_session_id(),
+        }),
+    )
+    .await;
+    let tombstone = ui
+        .wait_for("the terminal subagent tombstone", |event| match event {
+            ServerEvent::TreeChanged { session_id, nodes } if session_id == &agent.session => nodes
+                .iter()
+                .find(|node| {
+                    node.kind == turn_core::model::NodeKind::Subagent
+                        && node.lifecycle.is_terminal()
+                })
+                .cloned(),
+            _ => None,
+        })
+        .await;
+    assert_eq!(tombstone.parent.as_ref(), Some(&agent.node));
+    assert_eq!(
+        tombstone
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.external_id.as_deref()),
+        Some("reviewer-stopped-before-start")
+    );
+    drop(ui);
+
+    let daemon = daemon.restart().await;
+    let mut ui = daemon.connect().await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session,
+        })
+        .await,
+    );
+    let restored = details
+        .tree
+        .iter()
+        .find(|node| node.node_id == tombstone.node_id)
+        .expect("the tombstone is part of the durable Session tree");
+    assert!(restored.lifecycle.is_terminal());
+    assert_eq!(restored.parent.as_ref(), Some(&agent.node));
+    assert_eq!(
+        restored
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.external_id.as_deref()),
+        Some("reviewer-stopped-before-start")
+    );
+    assert!(
+        attention_list_of(ui.ask(Request::ListAttention { session_id: None }).await).is_empty()
+    );
     daemon.shutdown().await;
 }
 

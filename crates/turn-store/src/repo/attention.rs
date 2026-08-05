@@ -89,10 +89,7 @@ impl<'a> AttentionRepo<'a> {
     /// queue and no idea that three agents are blocked.
     pub fn replace_all(&self, queue: &AttentionQueue) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM attention_entries", [])?;
-        for entry in queue.iter() {
-            upsert_entry(&tx, entry)?;
-        }
+        replace_all_in(&tx, queue)?;
         tx.commit()?;
         Ok(())
     }
@@ -132,6 +129,19 @@ impl<'a> AttentionRepo<'a> {
         }
         Ok(out)
     }
+}
+
+/// Replaces the durable queue without opening a transaction.
+///
+/// Kept at repository scope so the daemon can checkpoint the queue alongside
+/// the Session projection and the event that produced it. Callers must supply a
+/// connection already inside the transaction that owns that wider invariant.
+pub(crate) fn replace_all_in(conn: &Connection, queue: &AttentionQueue) -> Result<()> {
+    conn.execute("DELETE FROM attention_entries", [])?;
+    for entry in queue.iter() {
+        upsert_entry(conn, entry)?;
+    }
+    Ok(())
 }
 
 /// Writes one demand without opening a transaction, so a caller can batch.

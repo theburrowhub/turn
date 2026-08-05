@@ -36,13 +36,14 @@ pub use command::{ClientId, Command};
 use crate::error::Result;
 use crate::instance::DataDirLock;
 use clients::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic};
+use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
 use turn_core::ids::{NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
@@ -117,6 +118,12 @@ pub struct Process {
     pub exited_ms: Option<i64>,
 }
 
+/// An applied event waiting for its durable boundary before publication.
+pub(crate) struct FailedIngestCheckpoint {
+    event: TurnEvent,
+    effects: Vec<Effect>,
+}
+
 /// Everything the daemon owns.
 pub struct Core {
     /// Shared with the public daemon handle so the store cannot lose its process
@@ -148,6 +155,19 @@ pub struct Core {
 
     pub(crate) attention: AttentionManager,
     pub(crate) user: UserContext,
+
+    /// Events and UI effects whose atomic Session + event + attention checkpoint failed.
+    ///
+    /// They are retried in arrival order before periodic semantic work and before
+    /// the next event. Until a retry commits, no client receives a projection for
+    /// that event. The event id makes the retry idempotent if SQLite committed but
+    /// the caller observed an ambiguous error.
+    pub(crate) failed_ingest_checkpoints: VecDeque<FailedIngestCheckpoint>,
+
+    /// Runtime events held behind the failed-checkpoint barrier, still unapplied.
+    /// Applying them early could let a later successful checkpoint persist the
+    /// global attention changes of an older event whose own transaction failed.
+    pub(crate) deferred_ingest_events: VecDeque<(TurnEvent, i64)>,
 
     /// How trustworthy the source of each node's *current turn state* was.
     ///
@@ -227,6 +247,8 @@ impl Core {
             screens: HashMap::new(),
             attention: AttentionManager::new(),
             user: UserContext::default(),
+            failed_ingest_checkpoints: VecDeque::new(),
+            deferred_ingest_events: VecDeque::new(),
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
             preview_probes: HashMap::new(),
@@ -321,6 +343,10 @@ impl Core {
     /// behind, forgetting stop requests nothing answered, reclaiming finished terminals,
     /// and a process sweep only when something has suggested one is worth doing.
     fn tick(&mut self, now_ms: i64) {
+        self.retry_failed_ingest_checkpoints(now_ms);
+        if !self.failed_ingest_checkpoints.is_empty() {
+            return;
+        }
         let effects = self.attention.tick(&self.user.clone(), now_ms);
         self.emit_effects(effects, now_ms);
         self.observe_heuristics(now_ms);
@@ -375,18 +401,38 @@ impl Core {
 
     /// Writes in-memory state through to the store.
     pub(crate) fn flush(&mut self) {
+        self.retry_failed_ingest_checkpoints(turn_core::now_ms());
         for workspace in self.workspaces.values() {
             if let Err(error) = self.store.workspaces().save(workspace) {
                 tracing::error!(%error, workspace = %workspace.id, "could not save a workspace");
             }
         }
         for session in self.sessions.values() {
+            if self
+                .failed_ingest_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.event.session_id == session.id)
+            {
+                tracing::error!(
+                    session = %session.id,
+                    "skipped a standalone Session flush behind a failed atomic checkpoint"
+                );
+                continue;
+            }
             if let Err(error) = self.store.sessions().save(session) {
                 tracing::error!(%error, session = %session.id, "could not save a session");
             }
         }
-        if let Err(error) = self.store.attention().replace_all(self.attention.queue()) {
-            tracing::error!(%error, "could not save the attention queue");
+        if self.failed_ingest_checkpoints.is_empty() {
+            if let Err(error) = self.store.attention().replace_all(self.attention.queue()) {
+                tracing::error!(%error, "could not save the attention queue");
+            }
+        } else {
+            tracing::error!(
+                pending = self.failed_ingest_checkpoints.len(),
+                deferred = self.deferred_ingest_events.len(),
+                "runtime events remain uncheckpointed after the final retry; skipped standalone attention flush"
+            );
         }
     }
 
@@ -422,6 +468,20 @@ impl Core {
     /// the in-memory state is correct, but the user is about to be told their work is
     /// safe when it is not on disk.
     pub(crate) fn persist_session(&self, id: &SessionId) -> std::result::Result<(), ProtoError> {
+        if self
+            .failed_ingest_checkpoints
+            .iter()
+            .any(|checkpoint| &checkpoint.event.session_id == id)
+        {
+            tracing::warn!(
+                session = %id,
+                "deferred a standalone Session write behind a failed atomic checkpoint"
+            );
+            return Err(ProtoError::new(
+                ErrorCode::Unavailable,
+                "The Session has an event checkpoint waiting to be written to disk",
+            ));
+        }
         let Some(session) = self.sessions.get(id) else {
             return Ok(());
         };

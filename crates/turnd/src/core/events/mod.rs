@@ -21,7 +21,7 @@
 mod exit;
 mod tree;
 
-use super::Core;
+use super::{Core, FailedIngestCheckpoint};
 use turn_core::event::{Confidence, EventKind, TurnEvent};
 use turn_core::ids::NodeId;
 use turn_core::model::{NodeKind, PendingPermission, ProcessNode};
@@ -41,7 +41,34 @@ pub(super) struct Changed {
 
 impl Core {
     /// Applies one event: state, store, attention, pushes.
-    pub(crate) fn ingest(&mut self, mut event: TurnEvent, now_ms: i64) {
+    pub(crate) fn ingest(&mut self, event: TurnEvent, now_ms: i64) {
+        // Give older gaps the first chance to recover before this event advances
+        // the durable projection. Retries only publish after their own atomic
+        // checkpoint commits.
+        self.retry_failed_ingest_checkpoints(now_ms);
+        if !self.failed_ingest_checkpoints.is_empty() {
+            let already_held = self
+                .failed_ingest_checkpoints
+                .iter()
+                .any(|pending| pending.event.id == event.id)
+                || self
+                    .deferred_ingest_events
+                    .iter()
+                    .any(|(pending, _)| pending.id == event.id);
+            if !already_held {
+                tracing::warn!(
+                    event = %event.id,
+                    session = %event.session_id,
+                    "deferred a runtime event behind a failed atomic checkpoint"
+                );
+                self.deferred_ingest_events.push_back((event, now_ms));
+            }
+            return;
+        }
+        self.ingest_after_checkpoint_barrier(event, now_ms);
+    }
+
+    fn ingest_after_checkpoint_barrier(&mut self, mut event: TurnEvent, now_ms: i64) {
         let session_id = event.session_id.clone();
         let Some(session) = self.sessions.get(&session_id) else {
             // A hook from a session that has since gone. Recording it against nothing
@@ -133,8 +160,6 @@ impl Core {
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.touch(now_ms);
         }
-        self.persist_event(&event);
-        self.persist_session_quietly(&session_id);
 
         // An event too weak to change the state is also too weak to demand attention.
         // Letting a refused guess into the queue would produce the worst of both: the
@@ -164,6 +189,29 @@ impl Core {
             )
         });
 
+        let checkpoint = self.sessions.get(&session_id).map_or(Ok(()), |session| {
+            self.store
+                .checkpoint_event_session_attention(session, &event, self.attention.queue())
+        });
+        if let Err(error) = checkpoint {
+            tracing::error!(
+                %error,
+                session = %session_id,
+                event = %event.id,
+                kind = turn_core::event::event_name(&event.kind),
+                "atomic runtime-event checkpoint failed; suppressing projections and scheduling retry"
+            );
+            if !self
+                .failed_ingest_checkpoints
+                .iter()
+                .any(|pending| pending.event.id == event.id)
+            {
+                self.failed_ingest_checkpoints
+                    .push_back(FailedIngestCheckpoint { event, effects });
+            }
+            return;
+        }
+
         self.push_all(ServerEvent::TurnEventEmitted {
             turn_event: event.clone(),
         });
@@ -178,9 +226,8 @@ impl Core {
             self.push_node_state(&session_id, node, Some(event.clone()), now_ms);
         }
         self.push_session_state(&session_id, now_ms);
-        self.emit_effects(effects, now_ms);
+        self.emit_checkpointed_effects(effects, now_ms);
         if attention_changed && !attention_change_reported {
-            self.persist_attention();
             self.push_attention_queue(now_ms);
         }
 
@@ -191,6 +238,72 @@ impl Core {
                 confidence = event.confidence.label(),
                 "kept the existing state: the event was less trustworthy than what set it"
             );
+        }
+    }
+
+    /// Retries event checkpoints that failed before any client saw them.
+    ///
+    /// The current Session and attention queue are complete projections, so using
+    /// their newest values is safe even if unrelated output arrived while SQLite
+    /// was unavailable. Events themselves remain FIFO and append idempotently.
+    pub(crate) fn retry_failed_ingest_checkpoints(&mut self, now_ms: i64) {
+        while let Some(pending) = self.failed_ingest_checkpoints.pop_front() {
+            let event = &pending.event;
+            let Some(session) = self.sessions.get(&event.session_id) else {
+                tracing::warn!(
+                    event = %event.id,
+                    session = %event.session_id,
+                    "discarded a failed checkpoint after its Session was removed"
+                );
+                continue;
+            };
+            if let Err(error) = self.store.checkpoint_event_session_attention(
+                session,
+                event,
+                self.attention.queue(),
+            ) {
+                tracing::warn!(
+                    %error,
+                    event = %event.id,
+                    session = %event.session_id,
+                    "runtime-event checkpoint retry is still blocked"
+                );
+                self.failed_ingest_checkpoints.push_front(pending);
+                break;
+            }
+
+            let session_id = event.session_id.clone();
+            tracing::info!(
+                event = %event.id,
+                session = %session_id,
+                "runtime-event checkpoint retry committed"
+            );
+            self.push_all(ServerEvent::TurnEventEmitted {
+                turn_event: event.clone(),
+            });
+            self.push_tree(&session_id, now_ms);
+            if let Some(node) = &event.node_id {
+                self.push_node_state(&session_id, node, Some(event.clone()), now_ms);
+            }
+            self.push_session_state(&session_id, now_ms);
+            let queue_change_reported = pending.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    turn_core::attention::Effect::Enqueued { .. }
+                        | turn_core::attention::Effect::Cleared { .. }
+                )
+            });
+            self.emit_checkpointed_effects(pending.effects, now_ms);
+            if !queue_change_reported {
+                self.push_attention_queue(now_ms);
+            }
+        }
+
+        while self.failed_ingest_checkpoints.is_empty() {
+            let Some((event, event_now_ms)) = self.deferred_ingest_events.pop_front() else {
+                break;
+            };
+            self.ingest_after_checkpoint_barrier(event, event_now_ms);
         }
     }
 

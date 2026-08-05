@@ -60,8 +60,9 @@ impl Core {
                 self.user.active_session = Some(session_id.clone());
             }
         }
-        self.persist_attention();
-        self.push_attention_queue(now_ms);
+        if self.persist_attention() {
+            self.push_attention_queue(now_ms);
+        }
         Ok(Response::Effects { effects })
     }
 
@@ -69,8 +70,9 @@ impl Core {
         if !self.acknowledge(id, now_ms) {
             return Err(ProtoError::not_found("attention entry", id.as_str()));
         }
-        self.persist_attention();
-        self.push_attention_queue(now_ms);
+        if self.persist_attention() {
+            self.push_attention_queue(now_ms);
+        }
         Ok(Response::Ack)
     }
 
@@ -89,8 +91,9 @@ impl Core {
         if !self.attention.snooze(id, until_ms) {
             return Err(ProtoError::not_found("attention entry", id.as_str()));
         }
-        self.persist_attention();
-        self.push_attention_queue(now_ms);
+        if self.persist_attention() {
+            self.push_attention_queue(now_ms);
+        }
         if let Some(session) = session {
             self.push_session_state(&session, now_ms);
         }
@@ -102,8 +105,9 @@ impl Core {
         if !self.attention.dismiss(id) {
             return Err(ProtoError::not_found("attention entry", id.as_str()));
         }
-        self.persist_attention();
-        self.push_attention_queue(now_ms);
+        if self.persist_attention() {
+            self.push_attention_queue(now_ms);
+        }
         if let Some(session) = session {
             self.push_session_state(&session, now_ms);
         }
@@ -286,8 +290,7 @@ impl Core {
                 self.user.active_session = Some(session_id.clone());
             }
         }
-        if effects.iter().any(|e| matches!(e, Effect::Cleared { .. })) {
-            self.persist_attention();
+        if effects.iter().any(|e| matches!(e, Effect::Cleared { .. })) && self.persist_attention() {
             self.push_attention_queue(now_ms);
         }
         Ok(Response::Effects { effects })

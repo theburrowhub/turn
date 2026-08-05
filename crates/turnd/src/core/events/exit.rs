@@ -335,6 +335,7 @@ mod tests {
     use crate::core::clients::Attachment;
     use crate::core::testing::Harness;
     use crate::core::Command;
+    use turn_core::attention::AttentionDemandKind;
     use turn_core::ids::{PaneId, SessionId};
     use turn_core::model::ProcessNode;
 
@@ -683,6 +684,33 @@ mod tests {
             "the log cannot say how it died: {:?}",
             failure.raw
         );
+
+        let durable = harness
+            .core
+            .store
+            .sessions()
+            .get(&session)
+            .expect("the Session projection")
+            .expect("the durable Session");
+        assert_eq!(
+            durable.tree.get(&node).unwrap().lifecycle,
+            Lifecycle::Signaled {
+                signal: "Killed".to_string()
+            },
+            "the failure state and event commit in the same checkpoint"
+        );
+        let queue = harness
+            .core
+            .store
+            .attention()
+            .load_queue()
+            .expect("the durable attention queue");
+        let demand = queue
+            .iter()
+            .find(|entry| entry.node_id.as_ref() == Some(&node))
+            .expect("an unexpected process death remains actionable after restart");
+        assert_eq!(demand.demand_kind, AttentionDemandKind::ProcessFailed);
+        assert!(demand.survives_owner_exit);
     }
 
     #[test]
