@@ -683,7 +683,11 @@ mod tests {
         assert!(matches!(outcome, EnsureOutcome::Started(_)));
         drop(outcome);
         let args = daemon.with_extension("args");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // This test runs alongside more than two hundred GUI tests and the detached
+        // shell deliberately sleeps before proving it survived the handle drop. Give
+        // a loaded CI machine scheduling headroom; the loop still exits immediately
+        // once the proof file appears.
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !args.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }

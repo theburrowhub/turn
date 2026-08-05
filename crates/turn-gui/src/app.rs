@@ -277,6 +277,34 @@ impl TurnApp {
 
     /// The commands the window handles itself rather than sending on.
     fn handle_locally(&mut self, command: Command) -> bool {
+        let visible_selection = self.state.selected_tree.clone().or_else(|| {
+            self.state
+                .hierarchy
+                .as_ref()
+                .and_then(|hierarchy| hierarchy.tree_state.selected.clone())
+        });
+        self.desk.set_navigation_hint(visible_selection);
+
+        let form_submitting = self
+            .state
+            .workspace_draft
+            .as_ref()
+            .is_some_and(|draft| draft.submitting)
+            || self
+                .state
+                .session_draft
+                .as_ref()
+                .is_some_and(|draft| draft.submitting);
+        if matches!(
+            command,
+            Command::NewWorkspace | Command::NewSession | Command::QuickNewSession
+        ) && (form_submitting || self.desk.creation_in_progress())
+        {
+            self.desk
+                .show_notice("finish the Workspace or Session creation already in progress");
+            return true;
+        }
+
         match command {
             Command::OpenPalette => {
                 self.state.palette.open();
@@ -503,6 +531,67 @@ mod tests {
             .expect("Cmd+N must present a useful first step");
         assert!(draft.continue_to_session);
         assert!(app.state.session_draft.is_none());
+    }
+
+    #[test]
+    fn cmd_n_uses_the_workspace_the_tree_already_shows_as_selected() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-selection.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let now = 1_700_000_000_000;
+        let first = turn_core::model::Workspace::new("first", "/repo/first", now);
+        let second = turn_core::model::Workspace::new("second", "/repo/second", now + 1);
+        let second_id = second.id.clone();
+        app.desk.apply_inbound(
+            crate::transport::Inbound::Answer {
+                ask: Ask::Hierarchy,
+                response: Box::new(turn_proto::Response::Hierarchy {
+                    snapshot: Box::new(turn_proto::HierarchySnapshot {
+                        revision: 1,
+                        tree_state: turn_proto::TreeSurfaceState {
+                            surface_id: "main-window".into(),
+                            selected: Some(turn_proto::HierarchyKey::workspace(first.id.clone())),
+                            expanded: Vec::new(),
+                        },
+                        workspaces: vec![
+                            turn_proto::WorkspaceTreeView {
+                                workspace: turn_proto::WorkspaceSummary::from_workspace(
+                                    &first,
+                                    &[],
+                                ),
+                                checkouts: Vec::new(),
+                                write_lease: None,
+                                sessions: Vec::new(),
+                            },
+                            turn_proto::WorkspaceTreeView {
+                                workspace: turn_proto::WorkspaceSummary::from_workspace(
+                                    &second,
+                                    &[],
+                                ),
+                                checkouts: Vec::new(),
+                                write_lease: None,
+                                sessions: Vec::new(),
+                            },
+                        ],
+                    }),
+                }),
+            },
+            now,
+        );
+        app.state.hierarchy = app.desk.hierarchy().cloned();
+        app.state.selected_tree = Some(turn_proto::HierarchyKey::workspace(second_id.clone()));
+
+        assert!(app.handle_locally(Command::NewSession));
+        assert_eq!(
+            app.state
+                .session_draft
+                .as_ref()
+                .map(|draft| &draft.workspace_id),
+            Some(&second_id)
+        );
     }
 
     #[test]

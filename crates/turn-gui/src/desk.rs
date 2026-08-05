@@ -110,9 +110,14 @@ pub struct Desk {
     /// navigation model.
     hierarchy: Option<HierarchySnapshot>,
     surface_id: String,
+    /// Window-local selection that has rendered but may not have been acknowledged by
+    /// the daemon yet. Creation commands must follow what the user can see, not the
+    /// previous persisted row.
+    navigation_hint: Option<HierarchyKey>,
     preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
+    pending_workspace_creation: bool,
     pending_session: Option<PendingSessionDraft>,
     workspaces: Vec<WorkspaceSummary>,
     templates: Vec<TemplateSummary>,
@@ -153,9 +158,11 @@ impl Desk {
             companion_notice: None,
             hierarchy: None,
             surface_id: "main-window".to_string(),
+            navigation_hint: None,
             preview_history: HashMap::new(),
             temporary_pane: None,
             write_conflict: None,
+            pending_workspace_creation: false,
             pending_session: None,
             workspaces: Vec::new(),
             templates: Vec::new(),
@@ -222,6 +229,26 @@ impl Desk {
         !self.workspaces.is_empty()
     }
 
+    /// Serialises the creation lifecycle. Until protocol operations carry durable
+    /// operation ids, allowing two creates in flight would let a late lease conflict
+    /// borrow the other form's Template and task.
+    pub fn creation_in_progress(&self) -> bool {
+        self.pending_workspace_creation
+            || self.pending_session.is_some()
+            || self.write_conflict.is_some()
+    }
+
+    /// Mirrors the tree's immediate-mode optimistic selection for the next command.
+    /// The key is accepted only when it resolves inside the current hierarchy.
+    pub fn set_navigation_hint(&mut self, key: Option<HierarchyKey>) {
+        self.navigation_hint = key.filter(|key| {
+            self.hierarchy
+                .as_ref()
+                .and_then(|hierarchy| workspace_for_key(hierarchy, key))
+                .is_some()
+        });
+    }
+
     /// Makes a command-level failure visible in the window instead of leaving it in
     /// tracing alone. Inbound protocol failures already set this themselves; local
     /// guards (for example Quick New before templates arrive) use this path.
@@ -251,14 +278,20 @@ impl Desk {
     fn current_workspace(&self) -> Option<WorkspaceId> {
         self.hierarchy
             .as_ref()
-            .and_then(|hierarchy| {
-                hierarchy
-                    .tree_state
-                    .selected
-                    .as_ref()
-                    .map(|key| (hierarchy, key))
-            })
+            .zip(self.navigation_hint.as_ref())
             .and_then(|(hierarchy, key)| workspace_for_key(hierarchy, key))
+            .or_else(|| {
+                self.hierarchy
+                    .as_ref()
+                    .and_then(|hierarchy| {
+                        hierarchy
+                            .tree_state
+                            .selected
+                            .as_ref()
+                            .map(|key| (hierarchy, key))
+                    })
+                    .and_then(|(hierarchy, key)| workspace_for_key(hierarchy, key))
+            })
             .or_else(|| {
                 self.selected_summary()
                     .map(|summary| summary.workspace_id.clone())
@@ -318,17 +351,38 @@ impl Desk {
             Inbound::Event(event) => self.apply_event(*event, now_ms),
             Inbound::Answer { ask, response } => self.apply_answer(ask, *response),
             Inbound::Failed { ask, error } => {
-                let lease_conflict = error.context.as_deref().and_then(|context| {
-                    matches!(
-                        context,
-                        ProtoErrorContext::WorkspaceWriteLeaseConflict { .. }
-                    )
-                    .then(|| context.clone())
-                });
+                let lease_conflict = match (
+                    &ask,
+                    error.context.as_deref(),
+                    self.pending_session.as_ref(),
+                ) {
+                    (
+                        Ask::CreateSession { workspace_id },
+                        Some(
+                            context @ ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                                workspace_id: conflicted,
+                                ..
+                            },
+                        ),
+                        Some(draft),
+                    ) if conflicted == workspace_id && &draft.workspace_id == workspace_id => {
+                        Some(context.clone())
+                    }
+                    _ => None,
+                };
                 if let Some(context) = lease_conflict.clone() {
                     self.write_conflict = Some(context);
-                } else if matches!(&ask, Ask::CreateSession { .. }) {
-                    self.pending_session = None;
+                } else {
+                    match &ask {
+                        Ask::CreateWorkspace { .. } => {
+                            self.pending_workspace_creation = false;
+                        }
+                        Ask::CreateSession { .. } => {
+                            self.write_conflict = None;
+                            self.pending_session = None;
+                        }
+                        _ => {}
+                    }
                 }
                 if ask.is_worth_reporting() {
                     let message = format!("{}: {}", ask.describing(), error.message);
@@ -369,6 +423,8 @@ impl Desk {
         if !refetch {
             return Vec::new();
         }
+        let workspace_creation_interrupted = self.pending_workspace_creation;
+        let session_creation_interrupted = self.pending_session.is_some();
         self.companion_notice = None;
         self.feeds.clear();
         self.attaching.clear();
@@ -378,14 +434,16 @@ impl Desk {
         self.policies.clear();
         self.pane_owner.clear();
         self.hierarchy = None;
+        self.navigation_hint = None;
         self.preview_history.clear();
         self.temporary_pane = None;
         self.write_conflict = None;
+        self.pending_workspace_creation = false;
         self.pending_session = None;
         self.workspaces.clear();
         self.sessions.clear();
         self.selected = None;
-        vec![
+        let mut reactions = vec![
             Reaction::Send {
                 ask: Ask::Hierarchy,
                 request: Request::GetHierarchy {
@@ -401,7 +459,24 @@ impl Desk {
                 ask: Ask::AttentionQueue,
                 request: Request::ListAttention { session_id: None },
             },
-        ]
+        ];
+        // The transport fences every request to one socket generation and reports a
+        // failure before reconnecting. Keep this defensive path too: a synthetic or
+        // future transport must never leave a disabled creation sheet behind merely
+        // because its connection changed underneath it.
+        if workspace_creation_interrupted {
+            reactions.push(Reaction::WorkspaceCreationFailed(
+                "the daemon reconnected before the Workspace was created; review and try again"
+                    .into(),
+            ));
+        }
+        if session_creation_interrupted {
+            reactions.push(Reaction::SessionCreationFailed(
+                "the daemon reconnected before the Session was created; review and try again"
+                    .into(),
+            ));
+        }
+        reactions
     }
 
     fn apply_answer(&mut self, ask: Ask, response: Response) -> Vec<Reaction> {
@@ -442,6 +517,7 @@ impl Desk {
             ) => {
                 let workspace_id = workspace.id.clone();
                 self.notice = None;
+                self.pending_workspace_creation = false;
                 self.workspaces.retain(|known| known.id != workspace_id);
                 self.workspaces.push(workspace);
                 vec![
@@ -516,8 +592,6 @@ impl Desk {
                 reactions
             }
             (_, Response::Session { session }) => {
-                self.write_conflict = None;
-                self.pending_session = None;
                 self.upsert_session(*session);
                 vec![self.hierarchy_request()]
             }
@@ -1516,6 +1590,9 @@ impl Desk {
                     None => Vec::new(),
                 }
             }
+            Command::QuickNewSession if self.creation_in_progress() => vec![Reaction::Notice(
+                "finish the Workspace or Session creation already in progress".into(),
+            )],
             Command::QuickNewSession => match self.current_workspace() {
                 Some(workspace_id) => {
                     let Some(template_id) = self
@@ -1798,7 +1875,13 @@ impl Desk {
                 root,
                 continue_to_session,
             } => {
+                if self.creation_in_progress() {
+                    let message =
+                        "finish the Workspace or Session creation already in progress".to_string();
+                    return vec![Reaction::Notice(message)];
+                }
                 self.notice = None;
+                self.pending_workspace_creation = true;
                 vec![Reaction::Send {
                     ask: Ask::CreateWorkspace {
                         continue_to_session,
@@ -1812,6 +1895,11 @@ impl Desk {
                 name,
                 task,
             } => {
+                if self.creation_in_progress() {
+                    let message =
+                        "finish the Workspace or Session creation already in progress".to_string();
+                    return vec![Reaction::Notice(message)];
+                }
                 self.notice = None;
                 let draft = PendingSessionDraft {
                     workspace_id: workspace_id.clone(),
@@ -3685,8 +3773,9 @@ mod tests {
     }
 
     #[test]
-    fn the_selected_workspace_is_the_target_for_new_and_quick_sessions() {
+    fn the_visible_optimistic_workspace_is_the_target_for_new_and_quick_sessions() {
         let first = Workspace::new("first", "/repo/first", T0);
+        let first_id = first.id.clone();
         let second = Workspace::new("second", "/repo/second", T0 + 1);
         let second_id = second.id.clone();
         let mut desk = Desk::new();
@@ -3696,7 +3785,9 @@ mod tests {
                     revision: 1,
                     tree_state: TreeSurfaceState {
                         surface_id: "main-window".into(),
-                        selected: Some(HierarchyKey::workspace(second_id.clone())),
+                        // The daemon still acknowledges A while the immediate-mode tree
+                        // already paints B as selected.
+                        selected: Some(HierarchyKey::workspace(first_id)),
                         expanded: Vec::new(),
                     },
                     workspaces: vec![
@@ -3717,6 +3808,7 @@ mod tests {
             }),
             T0,
         );
+        desk.set_navigation_hint(Some(HierarchyKey::workspace(second_id.clone())));
         let coding = TemplateSummary::from_template(&Template::coding(T0));
         desk.apply_inbound(
             answer(Response::Templates {
@@ -3731,6 +3823,147 @@ mod tests {
             [Request::CreateSessionFromTemplate { workspace_id, .. }]
                 if workspace_id == &second_id
         ));
+    }
+
+    #[test]
+    fn overlapping_creations_cannot_replace_the_pending_session_intent() {
+        let (mut owner, _, _) = session_with_agent("Fix climbing bugs");
+        let checkout = turn_core::ids::CheckoutId::primary_for(&owner.workspace_id);
+        owner.mode = turn_core::model::SessionMode::MainCheckout;
+        owner.checkout_id = checkout.clone();
+        let coding = Template::coding(T0);
+        let coding_id = coding.id.clone();
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&owner, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::Templates {
+                templates: vec![TemplateSummary::from_template(&coding)],
+            }),
+            T0,
+        );
+
+        let first = sent(&desk.apply_view_action(
+            ViewAction::CreateSessionFromTemplate {
+                workspace_id: owner.workspace_id.clone(),
+                template_id: coding_id.clone(),
+                name: "Original task".into(),
+                task: Some("Keep this exact intent".into()),
+            },
+            T0,
+        ));
+        assert!(matches!(
+            first.as_slice(),
+            [Request::CreateSessionFromTemplate { name: Some(name), .. }]
+                if name == "Original task"
+        ));
+
+        let other_workspace = WorkspaceId::from_stored("ws_other00001");
+        let rejected = desk.apply_view_action(
+            ViewAction::CreateSessionFromTemplate {
+                workspace_id: other_workspace,
+                template_id: turn_core::ids::TemplateId::from_stored("tpl_other0001"),
+                name: "Replacement task".into(),
+                task: Some("must not replace the first draft".into()),
+            },
+            T0 + 1,
+        );
+        assert!(sent(&rejected).is_empty());
+        assert!(rejected
+            .iter()
+            .any(|reaction| matches!(reaction, Reaction::Notice(_))));
+
+        let lease = turn_core::model::WorkspaceWriteLease::active(
+            owner.workspace_id.clone(),
+            owner.id.clone(),
+            checkout.clone(),
+            T0,
+        );
+        desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::CreateSession {
+                    workspace_id: owner.workspace_id.clone(),
+                },
+                error: turn_proto::ProtoError::workspace_write_lease_conflict(
+                    ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                        workspace_id: owner.workspace_id.clone(),
+                        checkout_id: checkout,
+                        requesting_session_id: None,
+                        lease: Box::new(lease),
+                        owner: Box::new(turn_proto::WriteLeaseOwnerView {
+                            session_id: owner.id.clone(),
+                            session_name: owner.name.clone(),
+                            mode: owner.mode,
+                            cwd: owner.cwd.clone(),
+                            branch: owner.git_branch.clone(),
+                            last_activity_ms: owner.last_activity_ms,
+                        }),
+                        alternatives: vec![SessionConflictAlternative::CreateIsolatedWorktree],
+                    },
+                ),
+            },
+            T0 + 2,
+        );
+        assert!(desk.write_conflict().is_some());
+
+        // A response to a different Session operation may update the list, but cannot
+        // consume this creation lifecycle.
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::Action("renaming a session"),
+                response: Box::new(Response::Session {
+                    session: Box::new(summary(&owner, 0)),
+                }),
+            },
+            T0 + 3,
+        );
+        assert!(desk.write_conflict().is_some());
+
+        let retry = sent(
+            &desk
+                .resolve_write_conflict(SessionConflictAlternative::CreateIsolatedWorktree, T0 + 4),
+        );
+        assert!(matches!(
+            retry.as_slice(),
+            [Request::CreateWorktreeSessionFromTemplate {
+                workspace_id,
+                template_id,
+                name: Some(name),
+                task: Some(task),
+                ..
+            }] if workspace_id == &owner.workspace_id
+                && template_id == &coding_id
+                && name == "Original task"
+                && task == "Keep this exact intent"
+        ));
+    }
+
+    #[test]
+    fn reconnecting_releases_a_creation_sheet_with_a_retryable_error() {
+        let mut desk = Desk::new();
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::CreateWorkspace {
+                name: "turn".into(),
+                root: "/repo/turn".into(),
+                continue_to_session: true,
+            },
+            T0,
+        ));
+        assert_eq!(requests.len(), 1);
+        assert!(desk.creation_in_progress());
+
+        let reactions = desk.apply_inbound(connected(), T0 + 1);
+        assert!(!desk.creation_in_progress());
+        assert!(reactions.iter().any(|reaction| matches!(
+            reaction,
+            Reaction::WorkspaceCreationFailed(message)
+                if message.contains("reconnected") && message.contains("try again")
+        )));
     }
 
     #[test]
