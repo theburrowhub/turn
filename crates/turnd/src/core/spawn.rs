@@ -19,10 +19,11 @@
 
 use super::{Core, Process};
 use crate::paths;
+use std::path::{Path, PathBuf};
 use turn_agents::{IntegrationLevel, LaunchContext, OutputHeuristic};
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{NodeKind, PaneKind, ProcessNode, SessionMode};
+use turn_core::model::{NodeKind, PaneKind, ProcessNode, Session, SessionMode, WorkspaceCheckout};
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
 use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
@@ -67,6 +68,127 @@ impl Core {
                 }),
             SessionMode::ReadOnly | SessionMode::IsolatedWorktree => Ok(()),
         }
+    }
+
+    /// Resolves a process working directory at the last boundary before launch.
+    ///
+    /// Lease ownership answers *who* may write. This answers *where* the process
+    /// begins: both the Session cwd and a Pane override are resolved through the
+    /// filesystem and must remain below the checkout assigned to the Session.
+    /// Returning the canonical path also means the PTY never receives the caller's
+    /// symlink/`..` spelling after it has passed validation.
+    pub(crate) fn resolve_authorized_launch_cwd(
+        &self,
+        session_id: &SessionId,
+        pane_cwd: Option<&str>,
+    ) -> std::result::Result<String, ProtoError> {
+        self.require_session_launch_allowed(session_id)?;
+        let session = self.session(session_id)?;
+        let checkout = self.checkout_for_session(session)?;
+        let checkout_root = verified_checkout_root(&checkout)?;
+        let session_cwd = resolve_contained_cwd(
+            &checkout_root,
+            &checkout_root,
+            Some(&session.cwd),
+            "Session",
+        )?;
+        resolve_contained_cwd(
+            &checkout_root,
+            Path::new(&session_cwd),
+            pane_cwd,
+            "Pane or command",
+        )
+    }
+
+    /// Validates a Session definition before persistence, lease acquisition or
+    /// configured command execution. This is deliberately repeated at launch:
+    /// directories and symlinks can change after creation.
+    pub(crate) fn validate_session_definition_cwds(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<String, ProtoError> {
+        let checkout = self.checkout_for_session(session)?;
+        self.validate_session_definition_cwds_for_checkout(session, &checkout)
+    }
+
+    /// As [`Self::validate_session_definition_cwds`], for a worktree checkout that
+    /// has been created on disk but is not yet registered in SQLite.
+    pub(crate) fn validate_session_definition_cwds_for_checkout(
+        &self,
+        session: &Session,
+        checkout: &WorkspaceCheckout,
+    ) -> std::result::Result<String, ProtoError> {
+        verify_session_checkout_binding(session, checkout)?;
+        let checkout_root = verified_checkout_root(checkout)?;
+        let session_cwd = resolve_contained_cwd(
+            &checkout_root,
+            &checkout_root,
+            Some(&session.cwd),
+            "Session",
+        )?;
+        for pane in session.layout.panes() {
+            if pane
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| !cwd.trim().is_empty())
+            {
+                resolve_contained_cwd(
+                    &checkout_root,
+                    Path::new(&session_cwd),
+                    pane.cwd.as_deref(),
+                    "Pane",
+                )?;
+            }
+        }
+        Ok(session_cwd)
+    }
+
+    /// Preflights a newly requested Pane before mutating or persisting its Layout.
+    /// It does not acquire or require a lease because a non-terminal Pane is only a
+    /// view; any process it describes is authorised again by
+    /// [`Self::resolve_authorized_launch_cwd`].
+    pub(crate) fn validate_pane_definition_cwd(
+        &self,
+        session_id: &SessionId,
+        pane_cwd: Option<&str>,
+    ) -> std::result::Result<(), ProtoError> {
+        let session = self.session(session_id)?;
+        let checkout = self.checkout_for_session(session)?;
+        let checkout_root = verified_checkout_root(&checkout)?;
+        let session_cwd = resolve_contained_cwd(
+            &checkout_root,
+            &checkout_root,
+            Some(&session.cwd),
+            "Session",
+        )?;
+        resolve_contained_cwd(&checkout_root, Path::new(&session_cwd), pane_cwd, "Pane")?;
+        Ok(())
+    }
+
+    fn checkout_for_session(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<WorkspaceCheckout, ProtoError> {
+        let checkout = self
+            .store
+            .hierarchy()
+            .checkout(&session.workspace_id, &session.checkout_id)
+            .map_err(|error| {
+                ProtoError::new(
+                    ErrorCode::Unavailable,
+                    "Turn could not verify the Session checkout",
+                )
+                .with_detail(error.to_string())
+            })?
+            .ok_or_else(|| {
+                ProtoError::refused("The Session does not reference a registered checkout")
+                    .with_detail(format!(
+                        "workspace={} session={} checkout={}",
+                        session.workspace_id, session.id, session.checkout_id
+                    ))
+            })?;
+        verify_session_checkout_binding(session, &checkout)?;
+        Ok(checkout)
     }
 
     /// Starts a process for every pane of a session that describes one.
@@ -135,9 +257,7 @@ impl Core {
         let Some(command) = pane_command(pane.kind, pane.command.as_deref(), workspace) else {
             return Ok(None);
         };
-        self.require_session_launch_allowed(session_id)?;
-
-        let cwd = resolve_cwd(pane.cwd.as_deref(), &session.cwd);
+        let cwd = self.resolve_authorized_launch_cwd(session_id, pane.cwd.as_deref())?;
         let title = pane
             .title
             .clone()
@@ -344,9 +464,8 @@ impl Core {
         command: &str,
         now_ms: i64,
     ) -> std::result::Result<NodeId, ProtoError> {
-        self.require_session_launch_allowed(session_id)?;
         let session = self.session(session_id)?;
-        let cwd = session.cwd.clone();
+        let cwd = self.resolve_authorized_launch_cwd(session_id, None)?;
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(workspace) = self.workspaces.get(&session.workspace_id) {
             env.extend(workspace.env.iter().cloned());
@@ -492,13 +611,99 @@ pub(crate) fn default_shell(workspace: Option<&turn_core::model::Workspace>) -> 
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
-/// Resolves a pane's working directory against the session's.
-fn resolve_cwd(pane_cwd: Option<&str>, session_cwd: &str) -> String {
-    match pane_cwd.filter(|c| !c.trim().is_empty()) {
-        Some(cwd) if cwd.starts_with('/') => cwd.to_string(),
-        Some(cwd) => format!("{}/{}", session_cwd.trim_end_matches('/'), cwd),
-        None => session_cwd.to_string(),
+fn verify_session_checkout_binding(
+    session: &Session,
+    checkout: &WorkspaceCheckout,
+) -> std::result::Result<(), ProtoError> {
+    let valid = match session.mode {
+        SessionMode::MainCheckout | SessionMode::ReadOnly => {
+            checkout.primary && session.worktree_path.is_none()
+        }
+        SessionMode::IsolatedWorktree => {
+            !checkout.primary && session.worktree_path.as_deref() == Some(checkout.path.as_str())
+        }
+    };
+    if checkout.workspace_id != session.workspace_id || checkout.id != session.checkout_id || !valid
+    {
+        return Err(
+            ProtoError::refused("The Session checkout assignment is inconsistent").with_detail(
+                format!(
+                    "workspace={} session={} checkout={} mode={:?}",
+                    session.workspace_id, session.id, session.checkout_id, session.mode
+                ),
+            ),
+        );
     }
+    Ok(())
+}
+
+fn verified_checkout_root(
+    checkout: &WorkspaceCheckout,
+) -> std::result::Result<PathBuf, ProtoError> {
+    let resolved = std::fs::canonicalize(&checkout.path).map_err(|error| {
+        ProtoError::refused("The Session checkout cannot be resolved safely")
+            .with_detail(format!("{}: {error}", checkout.path))
+    })?;
+    if !resolved.is_dir() {
+        return Err(
+            ProtoError::refused("The Session checkout is not a directory")
+                .with_detail(resolved.display().to_string()),
+        );
+    }
+    let stored = PathBuf::from(&checkout.canonical_path);
+    if resolved != stored {
+        return Err(ProtoError::refused(
+            "The Session checkout identity changed and must be reconciled",
+        )
+        .with_detail(format!(
+            "stored={} resolved={}",
+            checkout.canonical_path,
+            resolved.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resolves one cwd against a canonical base and proves filesystem containment.
+///
+/// This is launch-root containment, not a process sandbox: once started, a program
+/// still has the user's OS authority and may `chdir`, open absolute paths, follow a
+/// newly replaced path component, or access non-filesystem resources.
+fn resolve_contained_cwd(
+    checkout_root: &Path,
+    base: &Path,
+    requested: Option<&str>,
+    subject: &str,
+) -> std::result::Result<String, ProtoError> {
+    let candidate = match requested.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) if Path::new(cwd).is_absolute() => PathBuf::from(cwd),
+        Some(cwd) => base.join(cwd),
+        None => base.to_path_buf(),
+    };
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        ProtoError::refused(format!(
+            "{subject} working directory cannot be resolved safely"
+        ))
+        .with_detail(format!("{}: {error}", candidate.display()))
+    })?;
+    if !resolved.is_dir() {
+        return Err(
+            ProtoError::refused(format!("{subject} working directory is not a directory"))
+                .with_detail(resolved.display().to_string()),
+        );
+    }
+    if !resolved.starts_with(checkout_root) {
+        return Err(ProtoError::refused(format!(
+            "{subject} working directory is outside the Session checkout"
+        ))
+        .with_detail(format!(
+            "checkout={} requested={} resolved={}",
+            checkout_root.display(),
+            candidate.display(),
+            resolved.display()
+        )));
+    }
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 /// What kind of node a pane's process is.
@@ -581,14 +786,27 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_pane_directory_is_resolved_against_the_session() {
+    fn a_relative_pane_directory_is_canonicalised_against_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("repo");
+        let session = checkout.join("packages/app");
+        let pane = session.join("crates/turnd");
+        std::fs::create_dir_all(&pane).unwrap();
+        let checkout = std::fs::canonicalize(checkout).unwrap();
+        let session = std::fs::canonicalize(session).unwrap();
+        let pane = std::fs::canonicalize(pane).unwrap();
         assert_eq!(
-            resolve_cwd(Some("crates/turnd"), "/repo"),
-            "/repo/crates/turnd"
+            resolve_contained_cwd(&checkout, &session, Some("crates/turnd"), "Pane").unwrap(),
+            pane.to_string_lossy()
         );
-        assert_eq!(resolve_cwd(Some("/elsewhere"), "/repo"), "/elsewhere");
-        assert_eq!(resolve_cwd(None, "/repo"), "/repo");
-        assert_eq!(resolve_cwd(Some(" "), "/repo/"), "/repo/");
+        assert_eq!(
+            resolve_contained_cwd(&checkout, &session, None, "Pane").unwrap(),
+            session.to_string_lossy()
+        );
+        assert_eq!(
+            resolve_contained_cwd(&checkout, &session, Some(" "), "Pane").unwrap(),
+            session.to_string_lossy()
+        );
     }
 
     #[test]

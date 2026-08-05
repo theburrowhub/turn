@@ -118,13 +118,13 @@ impl Core {
                 "That process is still running",
             ));
         }
-        let Some(pane_id) = self
+        let Some((pane_id, pane_cwd)) = self
             .session(session_id)?
             .layout
             .panes()
             .into_iter()
             .find(|pane| pane.node_id.as_ref() == Some(node_id))
-            .map(|pane| pane.id.clone())
+            .map(|pane| (pane.id.clone(), pane.cwd.clone()))
         else {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
@@ -135,6 +135,10 @@ impl Core {
                  a tool or seen in the process table",
             ));
         };
+        // Relaunch retires the old node before materialising its replacement. Prove
+        // the cwd is still inside the assigned checkout before that destructive
+        // transition; materialisation repeats the check at the PTY boundary.
+        self.resolve_authorized_launch_cwd(session_id, pane_cwd.as_deref())?;
         let session = self.session(session_id)?;
         if session.layout.get(&pane_id).is_none() {
             return Err(ProtoError::new(

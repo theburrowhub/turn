@@ -45,6 +45,10 @@ impl Core {
         session.attention = workspace.attention.clone();
         session.env = workspace.env.clone();
         session.mode = SessionMode::MainCheckout;
+        // Resolve Session and Pane cwds before the transaction that acquires the
+        // primary checkout lease. A path escape must leave no Session row, lease,
+        // init command, or PTY behind.
+        session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
         // The store arbitrates and persists this Session in one IMMEDIATE
         // transaction. Nothing user-configured is executed before the exclusive
@@ -98,6 +102,7 @@ impl Core {
         session.env = workspace.env.clone();
         session.mode = SessionMode::ReadOnly;
         session.read_only_enforced = false;
+        session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
         self.store
             .hierarchy()
@@ -195,6 +200,14 @@ impl Core {
             shared_resources: inherited_resources,
             created_ms: now_ms,
         };
+        session.cwd = match self.validate_session_definition_cwds_for_checkout(&session, &checkout)
+        {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                rollback_git_worktree(Path::new(&workspace.root), &path);
+                return Err(error);
+            }
+        };
         if let Err(error) = self
             .store
             .hierarchy()
@@ -269,6 +282,9 @@ impl Core {
         session.tmux = template.tmux;
         session.git_branch = branch;
         session.mode = SessionMode::MainCheckout;
+        // Template Pane cwds are untrusted configuration at this boundary. Resolve
+        // every one before a lease or a template init command has side effects.
+        session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
         self.store
             .hierarchy()
@@ -824,6 +840,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_a_cannot_create_a_main_or_template_session_rooted_in_workspace_b() {
+        let mut harness = Harness::new().await;
+        let root_a = harness._dir.path().join("workspace-a");
+        let root_b = harness._dir.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let workspace_a = match harness
+            .core
+            .create_workspace(
+                "workspace A".into(),
+                root_a.to_string_lossy().into_owned(),
+                10,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let _workspace_b = harness
+            .core
+            .create_workspace(
+                "workspace B".into(),
+                root_b.to_string_lossy().into_owned(),
+                11,
+            )
+            .unwrap();
+
+        let error = harness
+            .core
+            .create_session(
+                &workspace_a,
+                "escaped main".into(),
+                Some(root_b.to_string_lossy().into_owned()),
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .expect_err("an absolute cwd in Workspace B must not acquire A's lease");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("outside"));
+        assert!(harness.core.sessions.is_empty());
+        assert_eq!(harness.core.store.sessions().count().unwrap(), 0);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_a)
+            .unwrap()
+            .is_none());
+
+        let marker = harness._dir.path().join("template-init-ran");
+        let layout = Layout::single(
+            Pane::new(PaneKind::Shell)
+                .with_command("/bin/sh")
+                .with_cwd(root_b.to_string_lossy()),
+        );
+        let mut template = Template::from_layout("escaped template", &layout, 13);
+        template.init_commands = vec![format!("touch {}", marker.display())];
+        let template_id = template.id.clone();
+        harness.core.templates.insert(template_id.clone(), template);
+
+        let error = harness
+            .core
+            .create_session_from_template(
+                &workspace_a,
+                &template_id,
+                Some("escaped template session".into()),
+                None,
+                None,
+                None,
+                14,
+            )
+            .expect_err("a template Pane cannot escape before lease acquisition");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("outside"));
+        assert!(!marker.exists(), "template init ran before cwd validation");
+        assert!(harness.core.sessions.is_empty());
+        assert_eq!(harness.core.store.sessions().count().unwrap(), 0);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_a)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dotdot_and_symlink_pane_escapes_are_refused_before_layout_or_pty_side_effects() {
+        use std::os::unix::fs::symlink;
+
+        let mut harness = Harness::new().await;
+        let root_a = harness._dir.path().join("workspace-a");
+        let nested_a = root_a.join("nested");
+        let root_b = harness._dir.path().join("workspace-b");
+        std::fs::create_dir_all(&nested_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        symlink(&root_b, nested_a.join("escape-link")).unwrap();
+        let workspace_a = match harness
+            .core
+            .create_workspace(
+                "workspace A".into(),
+                root_a.to_string_lossy().into_owned(),
+                20,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness
+            .core
+            .create_workspace(
+                "workspace B".into(),
+                root_b.to_string_lossy().into_owned(),
+                21,
+            )
+            .unwrap();
+        let response = harness
+            .core
+            .create_session(
+                &workspace_a,
+                "safe session".into(),
+                Some(nested_a.to_string_lossy().into_owned()),
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                22,
+            )
+            .unwrap();
+        let session_id = match response {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let original_pane = harness.core.sessions[&session_id].layout.panes()[0]
+            .id
+            .clone();
+        let original_count = harness.core.sessions[&session_id].layout.pane_count();
+        let (client, _frames) = harness.add_client(9);
+
+        for cwd in ["../../workspace-b", "escape-link"] {
+            let error = harness
+                .core
+                .split_pane(
+                    client,
+                    &session_id,
+                    &original_pane,
+                    Direction::Horizontal,
+                    NewPane {
+                        kind: PaneKind::Shell,
+                        title: Some("escape".into()),
+                        command: Some("/bin/sh".into()),
+                        args: Vec::new(),
+                        cwd: Some(cwd.into()),
+                        env: Vec::new(),
+                        restore: turn_core::model::RestoreBehaviour::ReattachOnly,
+                    },
+                    23,
+                )
+                .expect_err("the Pane cwd must stay in Workspace A");
+            assert_eq!(error.code, turn_proto::ErrorCode::Refused, "{cwd}");
+            assert!(error.message.contains("outside"), "{cwd}: {error:?}");
+            assert_eq!(
+                harness.core.sessions[&session_id].layout.pane_count(),
+                original_count,
+                "an invalid Pane must not enter the Layout"
+            );
+            assert!(
+                harness.core.processes.is_empty(),
+                "an invalid Pane must not reach PTY spawn"
+            );
+        }
+
+        // Defence in depth: even a restored/corrupted Layout that bypassed the
+        // request preflight is checked again immediately before PTY creation.
+        {
+            let pane = harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .layout
+                .get_mut(&original_pane)
+                .unwrap();
+            pane.kind = PaneKind::Shell;
+            pane.command = Some("/bin/sh".into());
+            pane.cwd = Some("escape-link".into());
+        }
+        let error = harness
+            .core
+            .materialise_pane(&session_id, &original_pane, 24)
+            .expect_err("the final launch boundary must distrust the stored Layout");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("outside"));
+        assert!(harness.core.processes.is_empty());
+
+        let marker = harness._dir.path().join("escaped-init-ran");
+        harness.core.sessions.get_mut(&session_id).unwrap().cwd =
+            root_b.to_string_lossy().into_owned();
+        let error = harness
+            .core
+            .spawn_init_command(&session_id, &format!("touch {}", marker.display()), 25)
+            .expect_err("an init command must recheck the Session cwd at launch");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("outside"));
+        assert!(!marker.exists());
+        assert!(harness.core.processes.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_read_only_alternative_never_launches_without_a_technical_guard() {
         let mut harness = Harness::new().await;
         let root = harness._dir.path().to_string_lossy().to_string();
@@ -982,5 +1210,35 @@ mod tests {
             .active_lease(&workspace)
             .unwrap()
             .is_none());
+
+        let original_pane = harness.core.sessions[&id].layout.panes()[0].id.clone();
+        let original_count = harness.core.sessions[&id].layout.pane_count();
+        let (client, _frames) = harness.add_client(10);
+        let error = harness
+            .core
+            .split_pane(
+                client,
+                &id,
+                &original_pane,
+                Direction::Horizontal,
+                NewPane {
+                    kind: PaneKind::Shell,
+                    title: Some("primary escape".into()),
+                    command: Some("/bin/sh".into()),
+                    args: Vec::new(),
+                    cwd: Some(repository.to_string_lossy().into_owned()),
+                    env: Vec::new(),
+                    restore: turn_core::model::RestoreBehaviour::ReattachOnly,
+                },
+                13,
+            )
+            .expect_err("a worktree Pane cannot start in the primary checkout");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("outside"));
+        assert_eq!(
+            harness.core.sessions[&id].layout.pane_count(),
+            original_count
+        );
+        assert!(harness.core.processes.is_empty());
     }
 }

@@ -811,10 +811,13 @@ an existing node via `find_by_pid`. Concentrating that join is deliberate; it is
 correlation would silently corrupt state.
 
 Creating a `main_checkout` Session is one daemon transaction boundary: canonicalise and validate the
-checkout, persist the Session/assignment and acquire its exclusive lease atomically, then run init commands
-and materialise processes/Panes. A conflict rolls the store transaction back and returns the current owner
-and allowed alternatives before any external side effect. Duplicating a Session never copies an active
-lease. Release is fenced and occurs only after
+checkout plus the effective Session/Pane working directories, persist the Session/assignment and acquire its
+exclusive lease atomically, then run init commands and materialise processes/Panes. Working-directory
+validation is repeated immediately before every PTY launch because symlinks and stored Layouts can change
+after creation. The canonical cwd must be contained by the Session's registered primary or worktree checkout;
+this constrains where a process starts, not which files same-user code can later access. A conflict rolls the
+store transaction back and returns the current owner and allowed alternatives before any external side
+effect. Duplicating a Session never copies an active lease. Release is fenced and occurs only after
 the writer has really stopped or explicitly changed mode; UI close, archive and `KeepProcesses` are not
 release signals.
 

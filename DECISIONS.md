@@ -2240,6 +2240,12 @@ timeout alone never transfers ownership. A second Session must
 focus the owner, use technically enforced read-only mode where available, create an isolated worktree, or
 cancel. Worktrees declare the shared resources they do not isolate.
 
+The lease does not authorise an arbitrary launch directory. Session creation validates the Session cwd and
+all configured Pane cwds against the assigned canonical checkout before acquiring the lease or running init
+commands. Pane creation validates before mutating the Layout, and every Pane, relaunch and init command
+repeats canonical containment at the final PTY boundary. This is only an initial-cwd invariant: it is not an
+OS sandbox and does not stop same-user code from opening other paths or changing directory after launch.
+
 An AgentNode exists independently of any Pane and may have zero or many pane bindings. A subagent reported
 by its parent is inserted under that parent, preserving a declared name only when the source actually
 declared one. Tool roles such as `Explore` or `default` are not silently promoted to names. Parent edges

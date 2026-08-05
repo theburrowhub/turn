@@ -209,6 +209,21 @@ materialisation occur only afterwards. A conflict rolls back all Session records
 alternative data. Release/heartbeat name `lease_id` and `expected_generation`; a stale actor cannot release a
 newer's claim by knowing the Session id.
 
+Lease ownership alone is not cwd containment. Before a `main_checkout` or template Session acquires a lease,
+Turn canonicalises its Session cwd and every declared Pane cwd and requires their resolved filesystem
+identities to remain below the assigned checkout. A split is preflighted before Layout persistence. The same
+check is repeated for Pane launches, relaunches and init commands at the final boundary before hook
+registration, adapter scratch configuration or PTY creation. Relative paths, `..`, absolute paths and symlink
+aliases are all judged by the resolved directory; the PTY receives that canonical path rather than the
+caller's spelling. Isolated-worktree Sessions are checked against their worktree checkout, so a Pane cannot
+silently start in the primary checkout.
+
+This is **launch-directory containment, not a process sandbox**. Once running, same-user code may call
+`chdir`, open arbitrary absolute paths, follow a path component replaced after validation, or access network,
+Docker, credentials and other shared resources. Preventing those actions and eliminating filesystem TOCTOU
+requires an OS sandbox/container or an fd-based launcher; the cwd check must never be presented as that
+guarantee.
+
 A heartbeat timeout is evidence, never proof that the writer died. Daemon restart enters reconciliation,
 checks process ownership and otherwise asks the user. Closing the UI, archiving a live Session and
 `keep_processes` are not release events. Migration 003 creates no lease, changes no permissions and performs
@@ -274,6 +289,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
+| A launch cwd stays in its assigned checkout | adversarial daemon tests cover Workspace A→B absolute paths, `../../`, symlink escapes, worktree Pane→primary and a stored Layout rechecked at the final PTY boundary |
 | Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
 | Preview/event stores no source/secret | `turn-store/tests/secrets_never_reach_the_disk.rs::no_secret_value_is_present_anywhere_in_the_files_on_disk` scans the database and WAL for seeded preview credentials and non-redactable Claude-hook free text; `upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal` proves migration 005 scrubs older files too |
 | UI state is surface-isolated | selection from surface A is neither returned nor pushed as selection for surface B |
@@ -472,6 +488,8 @@ Outside the files this audit was scoped to change. Each has a specific fix.
   counter for what it dropped.
 - Never arbitrate a checkout by raw path spelling. Canonical identity and the global generation fence are
   required, including after Workspace deletion/recreation.
+- Never pass a caller/stored Session or Pane cwd directly to a PTY. Resolve it against the assigned checkout,
+  canonicalise it, enforce component containment and repeat the check at the final launch boundary.
 - Never release a write claim by Session id or timeout alone. Require lease identity plus expected generation
   and verify the owning writer stopped or was explicitly reconciled.
 - Never turn a terminal line into Activity Preview without sanitisation, secret redaction, stability/noise

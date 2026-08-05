@@ -23,6 +23,9 @@ impl Core {
         spec: NewPane,
         now_ms: i64,
     ) -> Answer {
+        // Reject an escaped cwd before the Layout is mutated or persisted. The
+        // process-launch path repeats this check immediately before PTY spawn.
+        self.validate_pane_definition_cwd(session_id, spec.cwd.as_deref())?;
         let pane = pane_from_spec(&spec);
         let new_pane = pane.id.clone();
         let session = self.session_mut(session_id)?;

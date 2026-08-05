@@ -19,6 +19,7 @@ impl Core {
     /// `SubagentStart` hook is the tool saying it started this itself. A subagent has
     /// no pty of its own — it runs inside its parent's process — so it has no pid, and
     /// pretending otherwise would put a number in the UI that matches nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn insert_subagent(
         &mut self,
         session_id: &SessionId,
