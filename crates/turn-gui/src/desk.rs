@@ -1923,8 +1923,12 @@ impl Desk {
             .find(|session| session.id == entry.entry.session_id)?;
         // An attention entry belongs to a Process, not merely to a Session. Prefer
         // that exact node so a Reviewer's permission never displays Claude's pending
-        // command or cwd. The primary Agent is only a compatibility fallback for old
-        // daemon projections that did not carry node ids.
+        // command or cwd. The primary Agent is only a compatibility fallback for old,
+        // completely unscoped daemon projections. A modern unresolved scope must not
+        // borrow another Agent's permission details.
+        let legacy_unscoped = entry.entry.node_id.is_none()
+            && entry.entry.parent_node_id.is_none()
+            && entry.entry.subject_external_id.is_none();
         let targeted_node = entry.entry.node_id.as_ref().and_then(|node_id| {
             self.hierarchy
                 .as_ref()
@@ -1941,9 +1945,22 @@ impl Desk {
                         .and_then(|tree| tree.iter().find(|node| &node.node_id == node_id))
                 })
         });
+        // Sessions can arrive before the hierarchy/tree projection. A matching
+        // primary node id is still an exact resolution, not the legacy fallback.
+        let projected_primary = entry.entry.node_id.as_ref().and_then(|node_id| {
+            summary
+                .primary_agent
+                .as_ref()
+                .filter(|agent| &agent.node_id == node_id)
+        });
         let agent = targeted_node
             .and_then(|node| node.agent.as_ref())
-            .or(summary.primary_agent.as_ref())?;
+            .or(projected_primary)
+            .or_else(|| {
+                legacy_unscoped
+                    .then_some(summary.primary_agent.as_ref())
+                    .flatten()
+            })?;
         let pending = agent.pending_permission.as_ref()?;
         Some(PendingPermission {
             attention_id: Some(entry.entry.id.clone()),
@@ -2097,6 +2114,23 @@ mod tests {
 
     fn summary(session: &Session, badge: usize) -> SessionSummary {
         SessionSummary::from_session(session, badge, false, T0)
+    }
+
+    fn session_with_primary_permission(name: &str) -> (Session, NodeId) {
+        let (mut session, _, primary_id) = session_with_agent(name);
+        let primary = session.tree.get_mut(&primary_id).expect("primary agent");
+        primary.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        });
+        primary.agent.as_mut().unwrap().pending_permission = Some(CorePermission {
+            summary: "primary command".into(),
+            command: Some("make deploy".into()),
+            tool_name: Some("Bash".into()),
+            risk: Risk::High,
+            requested_ms: T0,
+            cwd: Some("/repo/main".into()),
+        });
+        (session, primary_id)
     }
 
     fn details(session: &Session) -> turn_proto::SessionDetails {
@@ -2684,19 +2718,7 @@ mod tests {
 
     #[test]
     fn a_subagent_permission_banner_never_borrows_the_primary_agents_command() {
-        let (mut session, _, primary_id) = session_with_agent("Review in background");
-        let primary = session.tree.get_mut(&primary_id).expect("primary agent");
-        primary.turn = Some(Turn::AwaitingUser {
-            reason: AwaitingReason::Permission,
-        });
-        primary.agent.as_mut().unwrap().pending_permission = Some(CorePermission {
-            summary: "primary command".into(),
-            command: Some("make deploy".into()),
-            tool_name: Some("Bash".into()),
-            risk: Risk::High,
-            requested_ms: T0,
-            cwd: Some("/repo/main".into()),
-        });
+        let (mut session, primary_id) = session_with_primary_permission("Review in background");
 
         let mut reviewer = ProcessNode::agent(
             session.id.clone(),
@@ -2749,6 +2771,99 @@ mod tests {
         assert_eq!(banner.command.as_deref(), Some("git diff --check"));
         assert_eq!(banner.cwd, "/repo/review");
         assert_eq!(banner.risk, Risk::Low);
+    }
+
+    #[test]
+    fn a_scoped_node_less_permission_does_not_borrow_primary_agent_details() {
+        let (session, primary_id) = session_with_primary_permission("Review in background");
+        for (parent_node_id, subject_external_id) in [
+            (Some(primary_id.clone()), None),
+            (None, Some("worker-reviewer".to_owned())),
+        ] {
+            let entry = AttentionEntry {
+                id: AttentionId::new(),
+                session_id: session.id.clone(),
+                node_id: None,
+                parent_node_id,
+                subject_external_id,
+                reason: AwaitingReason::Permission,
+                summary: Some("reviewer permission".into()),
+                confidence: Confidence::Explicit,
+                created_ms: T0 + 1,
+                updated_ms: T0 + 1,
+                state: EntryState::Pending,
+                priority_boost: 0,
+            };
+            let mut desk = Desk::new();
+            desk.sessions.push(summary(&session, 1));
+            desk.queue
+                .push(AttentionView::from_entry(&entry, &session.name, T0 + 2));
+
+            assert!(
+                desk.view(T0 + 2).permission.is_none(),
+                "an unresolved modern scope must not borrow the primary Agent's permission"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_exact_permission_node_does_not_borrow_primary_agent_details() {
+        let (session, _) = session_with_primary_permission("Review in background");
+        let entry = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session.id.clone(),
+            node_id: Some(NodeId::from_stored("agent_missing_permission")),
+            parent_node_id: None,
+            subject_external_id: None,
+            reason: AwaitingReason::Permission,
+            summary: Some("stale worker permission".into()),
+            confidence: Confidence::Explicit,
+            created_ms: T0 + 1,
+            updated_ms: T0 + 1,
+            state: EntryState::Pending,
+            priority_boost: 0,
+        };
+        let mut desk = Desk::new();
+        desk.sessions.push(summary(&session, 1));
+        desk.queue
+            .push(AttentionView::from_entry(&entry, &session.name, T0 + 2));
+
+        assert!(
+            desk.view(T0 + 2).permission.is_none(),
+            "a stale exact identity must not fall back to the primary Agent"
+        );
+    }
+
+    #[test]
+    fn a_fully_unscoped_legacy_permission_still_uses_the_primary_agent() {
+        let (session, _) = session_with_primary_permission("Legacy daemon");
+        let entry = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session.id.clone(),
+            node_id: None,
+            parent_node_id: None,
+            subject_external_id: None,
+            reason: AwaitingReason::Permission,
+            summary: Some("legacy permission".into()),
+            confidence: Confidence::Explicit,
+            created_ms: T0 + 1,
+            updated_ms: T0 + 1,
+            state: EntryState::Pending,
+            priority_boost: 0,
+        };
+        let mut desk = Desk::new();
+        desk.sessions.push(summary(&session, 1));
+        desk.queue
+            .push(AttentionView::from_entry(&entry, &session.name, T0 + 2));
+
+        let banner = desk
+            .view(T0 + 2)
+            .permission
+            .expect("legacy unscoped permission banner");
+        assert_eq!(banner.summary, "primary command");
+        assert_eq!(banner.command.as_deref(), Some("make deploy"));
+        assert_eq!(banner.cwd, "/repo/main");
+        assert_eq!(banner.risk, Risk::High);
     }
 
     /// A demand that came from a heuristic has to be drawn as a guess.
