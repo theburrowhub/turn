@@ -28,19 +28,19 @@ use crate::view::{AttentionView, HierarchySnapshot, SessionSummary, TreeNodeView
 #[serde(rename_all = "snake_case")]
 pub struct PaneRestoreOutcome {
     pub pane_id: PaneId,
-    /// The process behind the pane now, when there is one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<NodeId>,
-    /// What became of it. `Reconnected` means the pty survived and Turn owns it
-    /// again; `Orphaned` means it is alive but out of reach; `Lost` means it was
-    /// running before and cannot be found.
+    /// The durable Process Node whose runtime is being described. Relaunch is
+    /// node-addressed, so an outcome without this identity could not be acted on.
+    pub node_id: NodeId,
+    /// What became of it. Current daemon restart produces `Orphaned` (alive but
+    /// out of reach) or `Lost` (cannot be found). `Reconnected` is reserved for a
+    /// backend that can prove PTY reattachment; the MVP does not claim it.
     pub lifecycle: Lifecycle,
     /// Set when Turn could offer to start this pane again. It is an offer: the
     /// user answers it with [`Request::RelaunchNode`](crate::Request::RelaunchNode)
     /// or does not, and nothing happens until they do.
     pub can_relaunch: bool,
-    /// What the pane would run if the user accepted, shown verbatim so accepting
-    /// is an informed choice.
+    /// What the pane would run if the user accepted. It is descriptive; the
+    /// authoritative relaunch target remains `node_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }

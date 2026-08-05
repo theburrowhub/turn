@@ -224,14 +224,14 @@ fn a_restore_result_offers_a_relaunch_without_having_performed_one() {
         panes: vec![
             PaneRestoreOutcome {
                 pane_id: PaneId::from_stored("pane_alive"),
-                node_id: Some(NodeId::from_stored("proc_alive")),
-                lifecycle: Lifecycle::Reconnected,
+                node_id: NodeId::from_stored("proc_alive"),
+                lifecycle: Lifecycle::Orphaned,
                 can_relaunch: false,
                 command: None,
             },
             PaneRestoreOutcome {
                 pane_id: PaneId::from_stored("pane_gone"),
-                node_id: None,
+                node_id: NodeId::from_stored("proc_gone"),
                 lifecycle: Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("cargo watch -x test".into()),
@@ -252,10 +252,7 @@ fn a_restore_result_offers_a_relaunch_without_having_performed_one() {
                 .find(|p| p.lifecycle == Lifecycle::Lost)
                 .unwrap();
             assert!(lost.can_relaunch, "Turn offers");
-            assert!(
-                lost.node_id.is_none(),
-                "and has not started anything: there is no process yet"
-            );
+            assert_eq!(lost.node_id, NodeId::from_stored("proc_gone"));
             assert_eq!(lost.command.as_deref(), Some("cargo watch -x test"));
         }
         other => panic!("wrong variant: {other:?}"),
@@ -457,7 +454,7 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
             needs_explanation: false,
             panes: vec![PaneRestoreOutcome {
                 pane_id,
-                node_id: Some(NodeId::from_stored("proc_back0001")),
+                node_id: NodeId::from_stored("proc_back0001"),
                 lifecycle: Lifecycle::Reconnected,
                 can_relaunch: false,
                 command: None,

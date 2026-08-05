@@ -270,10 +270,10 @@ impl Core {
                 && (pane.command.is_some() || pane.kind == turn_core::model::PaneKind::Shell);
             panes.push(PaneRestoreOutcome {
                 pane_id: pane.id.clone(),
-                node_id: Some(node_id),
+                node_id,
                 lifecycle: node.lifecycle.clone(),
                 can_relaunch: relaunchable,
-                // Shown verbatim so accepting the offer is an informed choice.
+                // Descriptive only; relaunch authority is the durable node id.
                 command: pane.command.clone(),
             });
         }

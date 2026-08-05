@@ -2475,7 +2475,7 @@ mod tests {
                 needs_explanation: true,
                 panes: vec![turn_proto::PaneRestoreOutcome {
                     pane_id: PaneId::new(),
-                    node_id: None,
+                    node_id: NodeId::from_stored("proc_watch_restore"),
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("cargo watch -x test".into()),

@@ -504,14 +504,14 @@ fn a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept() {
         panes: vec![
             PaneRestoreOutcome {
                 pane_id: PaneId::from_stored("pane_agent001"),
-                node_id: Some(NodeId::from_stored("proc_agent001")),
-                lifecycle: Lifecycle::Reconnected,
+                node_id: NodeId::from_stored("proc_agent001"),
+                lifecycle: Lifecycle::Orphaned,
                 can_relaunch: false,
                 command: None,
             },
             PaneRestoreOutcome {
                 pane_id: lost_pane.clone(),
-                node_id: None,
+                node_id: NodeId::from_stored("proc_watch001"),
                 lifecycle: Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("cargo watch -x test".into()),
@@ -540,10 +540,7 @@ fn a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept() {
         other => panic!("expected a restore result, got {other:?}"),
     };
     assert!(offer.can_relaunch);
-    assert!(
-        offer.node_id.is_none(),
-        "nothing was relaunched: there is no process to point at yet"
-    );
+    assert_eq!(offer.node_id, NodeId::from_stored("proc_watch001"));
     assert_eq!(offer.command.as_deref(), Some("cargo watch -x test"));
 
     // Only if the user accepts does anything start, and it is an explicit request.
@@ -551,7 +548,7 @@ fn a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept() {
         RequestId::new("r-1"),
         Request::RelaunchNode {
             session_id,
-            node_id: NodeId::from_stored("proc_watch0001"),
+            node_id: offer.node_id,
             resume: false,
         },
     ));
