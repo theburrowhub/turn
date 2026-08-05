@@ -465,17 +465,21 @@ spellings, which protects against our typos and not against upstream drift. Also
 on upgrade, and any coverage beyond one version on one machine. A contract test only fires when someone runs
 it, so a release between CI runs still reaches users first.
 
-### 1a. Checkout aliasing and stale lease authority — **M6 blocker**
+### 1a. Checkout aliasing and stale lease authority — **hardened; recovery UX open**
 
 The catastrophic failure is two Sessions believing they exclusively own the same Git index/files. Raw path
 strings alias through symlinks and spelling; a daemon can crash between side effect and commit; a stale
 client can release a newer claim; deleting/recreating a Workspace can reset locally scoped generation.
 
 *Mitigated by:* canonical-path uniqueness across Workspaces, one global monotonic fence per canonical path,
-`BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release
-and blocking `recovery_required` state. Migration 003 grants no lease.
-*Still missing:* the concurrent/path-alias/recreate tests, daemon transaction proof before init/spawn, and a
-manual recovery flow that never interprets timeout as death. M6 cannot close on schema types alone.
+`BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release,
+blocking `recovery_required`, and canonical Session/Pane cwd containment repeated at the final PTY boundary.
+Adversarial tests cover concurrent aliases, delete/recreate generations, stale release, transaction rollback,
+absolute/`..`/symlink cwd escapes and worktree→primary launches. Migration 003 grants no lease; migration 006
+trusts no pre-existing one.
+*Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
+old writer stopped. Cwd containment is not an OS sandbox: same-user code can still open another path after
+launch, so stronger isolation remains a separate security feature.
 
 ### 1b. Activity Preview can become a durable exfiltration/lying channel — **M6 blocker**
 
