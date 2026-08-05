@@ -82,9 +82,8 @@ release: ## Release build of the three binaries
 # --- running it ---------------------------------------------------------------
 
 .PHONY: run
-run: release ## Start the daemon (if needed) and open the window
-	@$(MAKE) --no-print-directory daemon
-	@echo "opening the window…"
+run: release ## Open Turn; the app starts its daemon companion if needed
+	@echo "opening the window (it will reuse or start turnd)…"
 	TURN_SOCKET=$(TURN_SOCKET) ./target/release/turn
 
 .PHONY: daemon
@@ -113,8 +112,9 @@ daemon-log: ## Follow the daemon's log
 	@tail -f "$(TURN_DATA_DIR)/turnd.log"
 
 .PHONY: gui
-gui: ## Open the window against an already-running daemon
-	TURN_SOCKET=$(TURN_SOCKET) $(CARGO) run --release --bin turn
+gui: ## Build the packaged sibling set and open the window
+	$(CARGO) build --release --bin turn --bin turnd --bin turn-hook
+	TURN_SOCKET=$(TURN_SOCKET) ./target/release/turn
 
 # --- looking at the interface -------------------------------------------------
 

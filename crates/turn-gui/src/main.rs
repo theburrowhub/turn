@@ -1,19 +1,56 @@
 //! The Turn desktop application: a native window, drawn on the GPU.
 //!
-//! This binary does two things and no more: it decides where the daemon's socket is, and
-//! it opens a window. It deliberately does **not** start `turnd` — the daemon's lifetime
-//! is longer than the window's, which is the whole reason the daemon exists, so the
-//! window connects to whatever is there and waits when nothing is.
+//! This binary is the product entry point. It resolves the daemon's socket, starts a
+//! separate `turnd` companion when nobody is listening, and opens the window. The
+//! companion is deliberately not owned by the window: closing the UI must leave its PTYs
+//! and agents alive.
 
 use std::path::PathBuf;
 
+use turn_gui::companion::{self, EnsureOutcome};
 use turn_gui::keymap::{Keymap, KeymapProblem, Overrides, Platform};
 use turn_gui::transport::socket;
 
 fn main() -> eframe::Result {
     turn_gui::logging::install();
 
-    let socket = socket_from_arguments().unwrap_or_else(socket::socket_path_from_env);
+    let explicit_socket = socket_from_arguments();
+    let paths = socket::startup_paths(explicit_socket.as_deref());
+    let (socket, startup_error, companion_monitor) = match paths {
+        Ok(paths) => match companion::ensure(&paths.socket, &paths.data_dir) {
+            Ok(EnsureOutcome::EndpointOccupied) => {
+                tracing::debug!(socket = %paths.socket.display(), "using the occupied daemon endpoint");
+                (paths.socket, None, None)
+            }
+            Ok(EnsureOutcome::Started(launch)) => {
+                tracing::info!(
+                    launcher_pid = launch.started.launcher_pid,
+                    source = %launch.started.source,
+                    program = %launch.started.program.display(),
+                    log = %launch.started.log_path.display(),
+                    "started the daemon companion"
+                );
+                (paths.socket, None, Some(launch.monitor))
+            }
+            Err(error) => {
+                tracing::error!(%error, socket = %paths.socket.display(), "could not ensure the daemon companion");
+                (
+                    paths.socket,
+                    Some(format!("Could not start the Turn daemon: {error}")),
+                    None,
+                )
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "could not resolve Turn's startup paths");
+            let socket = fallback_socket(explicit_socket.as_deref());
+            (
+                socket,
+                Some(format!("Could not resolve Turn's storage: {error}")),
+                None,
+            )
+        }
+    };
     let (overrides, problems) = load_overrides();
     for problem in &problems {
         // Reported rather than swallowed: a binding that silently did not load looks
@@ -34,13 +71,33 @@ fn main() -> eframe::Result {
         "Turn",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(turn_gui::app::TurnApp::new(
+            Ok(Box::new(turn_gui::app::TurnApp::new_with_companion(
                 &cc.egui_ctx,
                 socket,
                 keymap,
+                startup_error,
+                companion_monitor,
             )))
         }),
     )
+}
+
+/// Keeps the window diagnostic-capable when the platform has no data directory. An
+/// explicit socket may still name a manually managed daemon; otherwise the unique,
+/// nonexistent endpoint simply lets the normal reconnect state remain visible.
+fn fallback_socket(explicit: Option<&std::path::Path>) -> PathBuf {
+    let raw = socket::resolve_socket_path(
+        explicit,
+        std::env::var_os(socket::SOCKET_ENV).as_deref(),
+        &std::env::temp_dir().join(format!("turn-unresolved-{}", std::process::id())),
+    );
+    if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&raw))
+            .unwrap_or(raw)
+    }
 }
 
 /// `turn --socket /path/to/turnd.sock`, for a second daemon or a test one.

@@ -15,6 +15,7 @@
 pub mod activity;
 pub mod announce;
 pub mod app;
+pub mod companion;
 pub mod desk;
 pub mod keymap;
 pub mod logging;

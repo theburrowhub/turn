@@ -13,13 +13,14 @@
 //! 5. Work out when to draw next, which for an idle desk is "never, until something
 //!    happens".
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 use eframe::egui;
 use egui::Event;
 
 use crate::activity::ActivityTracker;
 use crate::announce::{perform, Announcement, Announcer, DesktopAnnouncer};
+use crate::companion::{CompanionEvent, CompanionMonitor};
 use crate::desk::{Desk, Reaction};
 use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
@@ -36,11 +37,37 @@ pub struct TurnApp {
     state: ViewState,
     activity: ActivityTracker,
     announcer: Box<dyn Announcer>,
+    companion_events: Option<mpsc::Receiver<CompanionEvent>>,
 }
 
 impl TurnApp {
     /// Builds the application and starts its connection.
     pub fn new(ctx: &egui::Context, socket: std::path::PathBuf, keymap: Keymap) -> Self {
+        Self::new_with_companion(ctx, socket, keymap, None, None)
+    }
+
+    /// Builds the application while preserving a companion-launch failure in the
+    /// visible notice area. The socket link still retries: an operator may repair the
+    /// package or start the daemon without restarting the window.
+    pub fn new_with_startup_error(
+        ctx: &egui::Context,
+        socket: std::path::PathBuf,
+        keymap: Keymap,
+        startup_error: Option<String>,
+    ) -> Self {
+        Self::new_with_companion(ctx, socket, keymap, startup_error, None)
+    }
+
+    /// Builds the application and retains a detached companion only long enough to
+    /// reap it and surface a later startup/runtime failure. The monitor never kills the
+    /// process, including when the window is closed.
+    pub fn new_with_companion(
+        ctx: &egui::Context,
+        socket: std::path::PathBuf,
+        keymap: Keymap,
+        startup_error: Option<String>,
+        monitor: Option<CompanionMonitor>,
+    ) -> Self {
         let theme = Theme::dark();
         theme.install(ctx);
 
@@ -53,14 +80,24 @@ impl TurnApp {
             Arc::new(move || waker.request_repaint()),
         );
 
+        let mut desk = Desk::new();
+        if let Some(error) = startup_error {
+            desk.show_companion_notice(error);
+        }
+        let companion_events = monitor.map(|monitor| {
+            let waker = ctx.clone();
+            monitor.watch(Arc::new(move || waker.request_repaint()))
+        });
+
         TurnApp {
             theme,
             keymap,
             link,
-            desk: Desk::new(),
+            desk,
             state: ViewState::default(),
             activity: ActivityTracker::new(),
             announcer: Box::new(DesktopAnnouncer),
+            companion_events,
         }
     }
 
@@ -293,6 +330,24 @@ impl eframe::App for TurnApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now_ms = turn_core::now_ms();
+
+        if let Some(events) = &self.companion_events {
+            for event in events.try_iter() {
+                match event {
+                    CompanionEvent::Contended(message) if self.desk.connection().is_live() => {
+                        tracing::debug!(%message, "the daemon startup race was resolved by the handshake");
+                    }
+                    CompanionEvent::Contended(message) => {
+                        tracing::warn!(%message, "the daemon companion encountered contention");
+                        self.desk.show_companion_notice(message);
+                    }
+                    CompanionEvent::Failed(message) => {
+                        tracing::error!(%message, "the daemon companion exited");
+                        self.desk.show_companion_notice(message);
+                    }
+                }
+            }
+        }
 
         // 1. Whatever arrived from the daemon.
         for message in self.link.drain() {
@@ -532,6 +587,23 @@ mod tests {
         assert_eq!(
             app.desk.view(0).notice.as_deref(),
             Some("No template is available")
+        );
+    }
+
+    #[test]
+    fn a_companion_launch_failure_is_visible_in_the_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let app = TurnApp::new_with_startup_error(
+            &ctx,
+            temp.path().join("missing.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+            Some("Could not start turnd; see /tmp/turnd.log".into()),
+        );
+
+        assert_eq!(
+            app.desk().view(1_700_000_000_000).notice.as_deref(),
+            Some("Could not start turnd; see /tmp/turnd.log")
         );
     }
 

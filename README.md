@@ -133,7 +133,7 @@ cargo build --release --bin turn-hook
 The window:
 
 ```sh
-cargo run -p turn-gui                   # the native window, 1440x900
+cargo run -p turn-gui                   # the native window, 1440x900; starts turnd if needed
 
 # Its visual tests. They render the real widget tree through wgpu with no display
 # attached and diff against the PNGs in crates/turn-gui/tests/snapshots/.
@@ -141,8 +141,19 @@ cargo test -p turn-gui
 UPDATE_SNAPSHOTS=1 cargo test -p turn-gui   # re-record after an intended change
 ```
 
-The window does **not** start `turnd` — the daemon's lifetime is deliberately longer than the window's, so
-start it first:
+On an empty first launch, press **⌘N**, choose **Create Workspace**, complete the
+workspace sheet with **Create and continue**, then create the first task with **New
+Session**. The Workspace action remains visible even when there is no selection; once a
+workspace is selected, **⌘N** and **New Session** both create a Session inside it.
+
+`turn` reuses a daemon already listening on its socket. When none is listening it starts `turnd` as a
+detached companion, so closing the window does not stop the daemon, its PTYs or its agents. Packaged builds
+place `turnd` beside `turn`; a source build falls back to the exact Cargo workspace it was compiled from.
+`TURN_TURND_BIN` can name an explicit companion binary for an unusual development layout. Companion output
+is appended to `turnd.log` under `TURN_DATA_DIR` (or Turn's platform data directory), and a launch failure is
+shown in the window.
+
+Starting the daemon yourself remains useful for debugging, but is not required:
 
 ```sh
 cargo run --bin turnd &

@@ -12,9 +12,26 @@ use std::path::{Path, PathBuf};
 
 /// Overrides the socket location. The same variable `turnd` reads.
 pub const SOCKET_ENV: &str = "TURN_SOCKET";
+/// Persistent-state override. The daemon reads the same variable.
+pub const DATA_DIR_ENV: &str = "TURN_DATA_DIR";
 
 /// The socket file inside the runtime (or data) directory.
 pub const SOCKET_FILE: &str = "turnd.sock";
+
+/// Paths resolved once at process start and then passed explicitly to `turnd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupPaths {
+    pub data_dir: PathBuf,
+    pub socket: PathBuf,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PathResolutionError {
+    #[error("no platform data directory could be resolved; set TURN_DATA_DIR")]
+    NoDataDir,
+    #[error("could not resolve the current directory needed for relative Turn paths: {0}")]
+    CurrentDirectory(#[source] std::io::Error),
+}
 
 /// Resolves the socket path from an explicit override, the environment, and the
 /// directory to fall back to.
@@ -40,22 +57,67 @@ pub fn resolve_socket_path(
 
 /// The directory the socket belongs in: the platform runtime directory where there
 /// is one, otherwise the data directory. Matches `turnd::paths::socket_dir`.
-pub fn socket_dir() -> PathBuf {
-    let dirs = directories::ProjectDirs::from("dev", "turn", "turn");
-    match &dirs {
-        Some(dirs) => dirs
-            .runtime_dir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| dirs.data_dir().to_path_buf()),
-        // No home directory at all — a stripped CI container. `/tmp` keeps the
-        // failure legible ("no daemon at /tmp/turnd.sock") instead of panicking.
-        None => PathBuf::from("/tmp"),
+pub fn socket_dir_for(data_dir: &Path) -> PathBuf {
+    directories::ProjectDirs::from("dev", "turn", "turn")
+        .and_then(|dirs| dirs.runtime_dir().map(Path::to_path_buf))
+        .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
+/// Resolves data and socket paths once. Relative overrides are anchored before a
+/// source fallback can change directory, and the exact absolute values are passed to
+/// the child. Unlike an implicit `/tmp` fallback, failure to find persistent storage is
+/// visible and cannot silently put a user's session database in a shared directory.
+pub fn startup_paths(explicit_socket: Option<&Path>) -> Result<StartupPaths, PathResolutionError> {
+    let configured_data = std::env::var_os(DATA_DIR_ENV);
+    let default_data = directories::ProjectDirs::from("dev", "turn", "turn")
+        .map(|dirs| dirs.data_dir().to_path_buf());
+    let chosen_data = configured_data
+        .as_deref()
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+        .or(default_data)
+        .ok_or(PathResolutionError::NoDataDir)?;
+    let configured_socket = std::env::var_os(SOCKET_ENV);
+    let raw_socket = resolve_socket_path(
+        explicit_socket,
+        configured_socket.as_deref(),
+        &socket_dir_for(&chosen_data),
+    );
+    let needs_cwd = chosen_data.is_relative() || raw_socket.is_relative();
+    let cwd = needs_cwd
+        .then(std::env::current_dir)
+        .transpose()
+        .map_err(PathResolutionError::CurrentDirectory)?;
+    Ok(resolve_startup_paths(
+        chosen_data,
+        raw_socket,
+        cwd.as_deref(),
+    ))
+}
+
+fn resolve_startup_paths(data_dir: PathBuf, socket: PathBuf, cwd: Option<&Path>) -> StartupPaths {
+    let absolute = |path: PathBuf| {
+        if path.is_absolute() {
+            path
+        } else {
+            cwd.expect("relative paths require a current directory")
+                .join(path)
+        }
+    };
+    StartupPaths {
+        data_dir: absolute(data_dir),
+        socket: absolute(socket),
     }
 }
 
+/// The directory this process uses for its default socket.
+pub fn socket_dir() -> Result<PathBuf, PathResolutionError> {
+    startup_paths(None).map(|paths| socket_dir_for(&paths.data_dir))
+}
+
 /// The socket this process will connect to, reading `TURN_SOCKET`.
-pub fn socket_path_from_env() -> PathBuf {
-    resolve_socket_path(None, std::env::var_os(SOCKET_ENV).as_deref(), &socket_dir())
+pub fn socket_path_from_env() -> Result<PathBuf, PathResolutionError> {
+    startup_paths(None).map(|paths| paths.socket)
 }
 
 #[cfg(test)]
@@ -109,7 +171,31 @@ mod tests {
 
     #[test]
     fn the_resolved_directory_is_absolute_so_the_socket_does_not_move_with_the_cwd() {
-        assert!(socket_dir().is_absolute(), "got {:?}", socket_dir());
-        assert!(socket_path_from_env().is_absolute());
+        assert!(socket_dir().unwrap().is_absolute());
+        assert!(socket_path_from_env().unwrap().is_absolute());
+    }
+
+    #[test]
+    fn relative_data_and_socket_paths_are_anchored_once() {
+        assert_eq!(
+            resolve_startup_paths(
+                PathBuf::from("state"),
+                PathBuf::from("run/turnd.sock"),
+                Some(Path::new("/repo")),
+            ),
+            StartupPaths {
+                data_dir: PathBuf::from("/repo/state"),
+                socket: PathBuf::from("/repo/run/turnd.sock"),
+            }
+        );
+    }
+
+    #[test]
+    fn socket_directory_falls_back_to_the_same_data_directory_as_turnd() {
+        let data = Path::new("/private/turn-state");
+        let expected = directories::ProjectDirs::from("dev", "turn", "turn")
+            .and_then(|dirs| dirs.runtime_dir().map(Path::to_path_buf))
+            .unwrap_or_else(|| data.to_path_buf());
+        assert_eq!(socket_dir_for(data), expected);
     }
 }

@@ -102,6 +102,9 @@ enum PartialRevision {
 pub struct Desk {
     connection: ConnectionState,
     notice: Option<String>,
+    /// Launcher-specific diagnostics disappear only after a real protocol handshake.
+    /// Request errors are independent and must not be erased by connecting.
+    companion_notice: Option<String>,
     /// The sole persistent navigation projection. Flat collections below are
     /// compatibility indexes for commands and pane ownership, never a second
     /// navigation model.
@@ -147,6 +150,7 @@ impl Desk {
         Desk {
             connection: ConnectionState::Starting,
             notice: None,
+            companion_notice: None,
             hierarchy: None,
             surface_id: "main-window".to_string(),
             preview_history: HashMap::new(),
@@ -171,6 +175,12 @@ impl Desk {
 
     pub fn connection(&self) -> &ConnectionState {
         &self.connection
+    }
+
+    /// Shows a startup failure before a protocol connection exists. Request failures
+    /// normally arrive through [`Inbound`]; companion launch is necessarily earlier.
+    pub fn show_companion_notice(&mut self, message: impl Into<String>) {
+        self.companion_notice = Some(message.into());
     }
 
     pub fn selected(&self) -> Option<&SessionId> {
@@ -359,6 +369,7 @@ impl Desk {
         if !refetch {
             return Vec::new();
         }
+        self.companion_notice = None;
         self.feeds.clear();
         self.attaching.clear();
         self.pty_sizes.clear();
@@ -2044,7 +2055,10 @@ impl Desk {
             permission: self.permission_banner(now_ms),
             queue: self.queue.iter().map(queue_item).collect(),
             connection: Some(self.connection.clone()),
-            notice: self.notice.clone(),
+            notice: self
+                .companion_notice
+                .clone()
+                .or_else(|| self.notice.clone()),
             write_conflict: self.write_conflict(),
             policy: self
                 .selected
@@ -3392,6 +3406,37 @@ mod tests {
             other => panic!("got {other:?}"),
         }
         assert!(desk.view(T0).notice.is_some());
+    }
+
+    #[test]
+    fn a_real_handshake_clears_only_the_companion_diagnostic() {
+        let mut desk = Desk::new();
+        desk.show_companion_notice("turnd failed while starting");
+        desk.apply_inbound(
+            Inbound::Status(ConnectionState::Connecting { attempt: 2 }),
+            T0,
+        );
+        assert_eq!(
+            desk.view(T0).notice.as_deref(),
+            Some("turnd failed while starting")
+        );
+
+        desk.apply_inbound(connected(), T0);
+        assert!(desk.view(T0).notice.is_none());
+
+        desk.apply_inbound(
+            Inbound::Notice(turn_proto::ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "a request still failed",
+            )),
+            T0,
+        );
+        desk.show_companion_notice("a later companion warning");
+        desk.apply_inbound(connected(), T0);
+        assert_eq!(
+            desk.view(T0).notice.as_deref(),
+            Some("a request still failed")
+        );
     }
 
     #[test]

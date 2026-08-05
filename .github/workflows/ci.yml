@@ -129,8 +129,9 @@ jobs:
       # Tracked in ROADMAP.md under "Technical debt".
       # ---------------------------------------------------------------------------
 
-      # Both binaries on both platforms. Building `turn` here is what proves the
+      # All packaged sibling binaries on both platforms. Building `turn` here proves the
       # window links on Linux, which is the half of "Linux is a first-class target"
-      # that type-checking alone does not cover.
+      # that type-checking alone does not cover; `turn-hook` is part of the companion
+      # contract used by the Claude/Codex adapters.
       - name: Build release binaries
-        run: cargo build --release --bin turnd --bin turn
+        run: cargo build --release --bin turnd --bin turn --bin turn-hook
