@@ -358,6 +358,7 @@ impl OutputHeuristic {
             provider: None,
             tool: Some("terminal".into()),
             model: None,
+            external_id: None,
         })]
     }
 }

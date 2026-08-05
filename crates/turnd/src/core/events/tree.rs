@@ -39,6 +39,26 @@ impl Core {
         if let Some(id) = &agent_id {
             if let Some(existing) = session.tree.find_by_external_id(id) {
                 let existing = existing.id.clone();
+                if let Some(node) = session.tree.get_mut(&existing) {
+                    if let Some(agent) = node.agent.as_mut() {
+                        if let Some(name) = declared_name.filter(|name| !name.trim().is_empty()) {
+                            agent.name.declared_name = Some(name.clone());
+                            agent.name.source = NameSource::ExplicitParentEvent;
+                            agent.name.confidence = Confidence::Explicit;
+                            if !agent.name.user_renamed {
+                                agent.name.display_name = name.clone();
+                                node.title = name;
+                            }
+                        }
+                        if let Some(kind) = agent_type.filter(|kind| !kind.trim().is_empty()) {
+                            agent.agent_type = Some(kind);
+                        }
+                        if let Some(task) = task.filter(|task| !task.trim().is_empty()) {
+                            agent.current_task = Some(task);
+                        }
+                        agent.agent.external_id = Some(id.clone());
+                    }
+                }
                 return Changed {
                     node: Some(existing),
                     structure: false,
@@ -72,7 +92,8 @@ impl Core {
         node.turn = Some(Turn::Active);
         if let Some(agent) = node.agent.as_mut() {
             agent.agent_type = agent_type;
-            agent.external_id = agent_id;
+            agent.external_id = agent_id.clone();
+            agent.agent.external_id = agent_id;
             agent.current_task = task;
             agent.name = match declared_name {
                 Some(name) => AgentName::declared(name),
@@ -152,7 +173,9 @@ impl Core {
         parent: &NodeId,
         child: NodeId,
         pid: u32,
+        ppid: Option<u32>,
         command: String,
+        observed_cwd: Option<String>,
         confirmed_parent: bool,
         now_ms: i64,
     ) -> Changed {
@@ -162,15 +185,18 @@ impl Core {
         if session.tree.get(&child).is_some() || session.tree.find_by_pid(pid).is_some() {
             return Changed::default();
         }
-        let cwd = session
-            .tree
-            .get(parent)
-            .map(|node| node.cwd.clone())
-            .unwrap_or_else(|| session.cwd.clone());
+        let cwd = observed_cwd.unwrap_or_else(|| {
+            session
+                .tree
+                .get(parent)
+                .map(|node| node.cwd.clone())
+                .unwrap_or_else(|| session.cwd.clone())
+        });
         let kind = turn_pty::classify(&command);
         let mut node = ProcessNode::process(session_id.clone(), kind, command, cwd, now_ms);
         node.id = child;
         node.pid = Some(pid);
+        node.ppid = ppid;
         node.lifecycle = Lifecycle::Alive;
         node.title = node
             .command
@@ -201,7 +227,7 @@ impl Core {
 mod tests {
     use super::*;
     use crate::core::testing::Harness;
-    use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
+    use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::PaneId;
 
     const NOW: i64 = 1_775_000_000_000;
@@ -295,5 +321,140 @@ mod tests {
             Some("Reviewer")
         );
         assert!(restored_reviewer.activity_preview.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_later_declaration_enriches_one_worker_without_losing_a_user_rename() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_enrich");
+        harness.add_session(session_id.clone(), PaneId::from_stored("pane_enrich"), NOW);
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            None,
+            Some("Explore".into()),
+            Some("worker-1".into()),
+            None,
+            NOW + 1,
+        );
+        let worker_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-1")
+            .unwrap()
+            .id
+            .clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&worker_id)
+            .unwrap()
+            .agent
+            .as_mut()
+            .unwrap()
+            .name
+            .rename("My reviewer");
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("code-review".into()),
+            Some("worker-1".into()),
+            Some("Review the climbing diff".into()),
+            NOW + 2,
+        );
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert_eq!(tree.subagent_count(), 1);
+        let worker = tree.get(&worker_id).unwrap().agent.as_ref().unwrap();
+        assert_eq!(worker.name.declared_name.as_deref(), Some("Reviewer"));
+        assert_eq!(worker.name.display_name, "My reviewer");
+        assert_eq!(
+            worker.current_task.as_deref(),
+            Some("Review the climbing diff")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_id_routes_permission_and_attention_state_to_the_subagent() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_worker_attention");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_worker_attention"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.turn = Some(Turn::Active);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        harness.core.insert_subagent(
+            &session_id,
+            &parent_id,
+            Some("Reviewer".into()),
+            Some("Explore".into()),
+            Some("worker-permission".into()),
+            None,
+            NOW + 1,
+        );
+        let worker_id = harness.core.sessions[&session_id]
+            .tree
+            .find_by_external_id("worker-permission")
+            .unwrap()
+            .id
+            .clone();
+
+        let permission = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentPermissionRequired {
+                summary: "Reviewer wants to run tests".into(),
+                command: Some("cargo test".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::Low,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Notification".into(),
+            },
+            Confidence::Explicit,
+            NOW + 2,
+        )
+        .with_node(parent_id.clone())
+        .with_agent(AgentRef {
+            provider: Some("anthropic".into()),
+            tool: Some("claude-code".into()),
+            model: None,
+            external_id: Some("worker-permission".into()),
+        });
+        harness.core.ingest(permission, NOW + 2);
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert!(matches!(
+            tree.get(&worker_id).unwrap().turn,
+            Some(Turn::AwaitingUser {
+                reason: turn_core::state::AwaitingReason::Permission
+            })
+        ));
+        assert_eq!(tree.get(&parent_id).unwrap().turn, Some(Turn::Active));
     }
 }

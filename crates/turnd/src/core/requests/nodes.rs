@@ -466,6 +466,7 @@ mod tests {
         let mut harness = Harness::new().await;
         let session = SessionId::from_stored("sess_ignores_term");
         harness.add_session(session.clone(), PaneId::new(), NOW);
+        harness.allow_test_processes(&session);
 
         // A shell that refuses `SIGTERM`, which is the ordinary case rather than an
         // exotic one: `kill` will report success and the process will still be there.
@@ -522,6 +523,7 @@ mod tests {
         let mut harness = Harness::new().await;
         let session = SessionId::from_stored("sess_outlived");
         harness.add_session(session.clone(), PaneId::new(), NOW);
+        harness.allow_test_processes(&session);
 
         let node_id = harness
             .core

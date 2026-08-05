@@ -216,6 +216,22 @@ impl Desk {
             .or_else(|| self.workspaces.first().map(|w| w.id.clone()))
     }
 
+    fn preferred_template(&self, workspace_id: &WorkspaceId) -> Option<&TemplateSummary> {
+        let configured = self
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.id == workspace_id)
+            .and_then(|workspace| workspace.default_template.as_ref());
+        configured
+            .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            .or_else(|| {
+                self.templates
+                    .iter()
+                    .find(|template| template.name == "Coding")
+            })
+            .or_else(|| self.templates.first())
+    }
+
     fn selected_summary(&self) -> Option<&SessionSummary> {
         let id = self.selected.as_ref()?;
         self.sessions.iter().find(|summary| &summary.id == id)
@@ -331,7 +347,7 @@ impl Desk {
 
     fn apply_answer(&mut self, ask: Ask, response: Response) -> Vec<Reaction> {
         match (ask, response) {
-            (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot),
+            (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot, true),
             (_, Response::TreeState { state }) => {
                 if let Some(hierarchy) = self.hierarchy.as_mut() {
                     hierarchy.tree_state = state;
@@ -358,6 +374,11 @@ impl Desk {
             (_, Response::Workspaces { workspaces }) => {
                 self.workspaces = workspaces;
                 Vec::new()
+            }
+            (_, Response::Workspace { workspace }) => {
+                self.workspaces.retain(|known| known.id != workspace.id);
+                self.workspaces.push(workspace);
+                vec![self.hierarchy_request()]
             }
             (_, Response::Templates { templates }) => {
                 self.templates = templates;
@@ -512,7 +533,18 @@ impl Desk {
         }
     }
 
-    fn replace_hierarchy(&mut self, snapshot: HierarchySnapshot) -> Vec<Reaction> {
+    fn replace_hierarchy(
+        &mut self,
+        snapshot: HierarchySnapshot,
+        allow_equal_revision: bool,
+    ) -> Vec<Reaction> {
+        if let Some(current) = &self.hierarchy {
+            if snapshot.revision < current.revision
+                || (!allow_equal_revision && snapshot.revision == current.revision)
+            {
+                return Vec::new();
+            }
+        }
         let previous_active = self.selected.clone();
         self.workspaces = snapshot
             .workspaces
@@ -668,7 +700,7 @@ impl Desk {
                 }
                 Vec::new()
             }
-            E::HierarchyChanged { snapshot } => self.replace_hierarchy(*snapshot),
+            E::HierarchyChanged { snapshot } => self.replace_hierarchy(*snapshot, false),
             E::ActivityPreviewChanged {
                 hierarchy_revision,
                 session_id,
@@ -1326,8 +1358,14 @@ impl Desk {
             }
             Command::QuickNewSession => match self.current_workspace() {
                 Some(workspace_id) => {
+                    let Some(template_id) = self
+                        .preferred_template(&workspace_id)
+                        .map(|template| template.id.clone())
+                    else {
+                        return vec![Reaction::Notice("no template to start from yet".into())];
+                    };
                     let draft = PendingSessionDraft {
-                        workspace_id,
+                        workspace_id: workspace_id.clone(),
                         name: format!("Session {}", self.sessions.len() + 1),
                         cwd: None,
                         panes: None,
@@ -1337,15 +1375,28 @@ impl Desk {
                     self.pending_session = Some(draft.clone());
                     vec![Reaction::Send {
                         ask: Ask::Action("starting a session"),
-                        request: create_main_session_request(draft),
+                        request: Request::CreateSessionFromTemplate {
+                            workspace_id,
+                            template_id,
+                            name: Some(draft.name),
+                            cwd: None,
+                            branch: None,
+                            task: None,
+                        },
                     }]
                 }
                 None => vec![Reaction::Notice(
                     "no workspace yet — the daemon has not answered".into(),
                 )],
             },
-            Command::NewSession => match (self.current_workspace(), self.templates.first()) {
-                (Some(workspace_id), Some(template)) => {
+            Command::NewSession => match self.current_workspace() {
+                Some(workspace_id) => {
+                    let Some(template_id) = self
+                        .preferred_template(&workspace_id)
+                        .map(|template| template.id.clone())
+                    else {
+                        return vec![Reaction::Notice("no template to start from yet".into())];
+                    };
                     // A typed lease conflict may require creating a safe alternative.
                     // The template response is daemon-owned, so the fallback keeps the
                     // requested name but starts with no inferred commands.
@@ -1361,7 +1412,7 @@ impl Desk {
                         ask: Ask::Action("starting a session from a template"),
                         request: Request::CreateSessionFromTemplate {
                             workspace_id,
-                            template_id: template.id.clone(),
+                            template_id,
                             name: None,
                             cwd: None,
                             branch: None,
@@ -1369,7 +1420,7 @@ impl Desk {
                         },
                     }]
                 }
-                _ => vec![Reaction::Notice("no template to start from yet".into())],
+                None => vec![Reaction::Notice("create a workspace first".into())],
             },
             Command::SaveLayoutAsTemplate => match session {
                 Some(session_id) => vec![Reaction::Send {
@@ -1574,6 +1625,22 @@ impl Desk {
             ViewAction::DismissAttention(attention_id) => vec![Reaction::Send {
                 ask: Ask::Action("dismissing a demand"),
                 request: Request::DismissAttention { attention_id },
+            }],
+            ViewAction::CreateWorkspace { name, root } => vec![Reaction::Send {
+                ask: Ask::Action("creating a workspace"),
+                request: Request::CreateWorkspace { name, root },
+            }],
+            ViewAction::ReleaseWorkspaceLease {
+                workspace_id,
+                lease_id,
+                expected_generation,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("releasing the workspace write lease"),
+                request: Request::ReleaseWorkspaceWriteLease {
+                    workspace_id,
+                    lease_id,
+                    expected_generation,
+                },
             }],
             ViewAction::ResolveWriteConflict(alternative) => {
                 self.resolve_write_conflict(alternative, now_ms)
@@ -1849,17 +1916,6 @@ impl Desk {
     }
 }
 
-fn create_main_session_request(draft: PendingSessionDraft) -> Request {
-    Request::CreateSession {
-        workspace_id: draft.workspace_id,
-        name: draft.name,
-        cwd: draft.cwd,
-        panes: draft.panes,
-        note: draft.note,
-        tags: draft.tags,
-    }
-}
-
 /// A deterministic, Git-valid default for the explicit worktree alternative.
 /// The daemon still validates it and owns the filesystem path.
 fn isolated_branch_name(name: &str, now_ms: i64) -> String {
@@ -1953,7 +2009,9 @@ mod tests {
     use turn_core::attention::{AttentionEntry, EntryState};
     use turn_core::event::{Confidence, Risk};
     use turn_core::ids::{AttentionId, WorkspaceId};
-    use turn_core::model::{Pane, PendingPermission as CorePermission, ProcessNode, Session};
+    use turn_core::model::{
+        Pane, PendingPermission as CorePermission, ProcessNode, Session, Template, Workspace,
+    };
     use turn_core::state::{AwaitingReason, Lifecycle, Turn};
     use turn_core::Effect;
     use turn_proto::{
@@ -2684,10 +2742,16 @@ mod tests {
             }),
             T0,
         );
+        desk.apply_inbound(
+            answer(Response::Templates {
+                templates: vec![TemplateSummary::from_template(&Template::coding(T0))],
+            }),
+            T0,
+        );
         let requested = sent(&desk.dispatch(Command::QuickNewSession, T0));
         assert!(matches!(
             requested.as_slice(),
-            [Request::CreateSession { .. }]
+            [Request::CreateSessionFromTemplate { .. }]
         ));
 
         let lease = turn_core::model::WorkspaceWriteLease::active(
@@ -2733,6 +2797,99 @@ mod tests {
             "the failed main Session is not retried; the chosen read-only API is used"
         );
         assert!(desk.write_conflict().is_none());
+    }
+
+    #[test]
+    fn first_run_workspace_creation_is_a_typed_user_action() {
+        let mut desk = Desk::new();
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::CreateWorkspace {
+                name: "turn".into(),
+                root: "/repo/turn".into(),
+            },
+            T0,
+        ));
+        assert_eq!(
+            requests,
+            vec![Request::CreateWorkspace {
+                name: "turn".into(),
+                root: "/repo/turn".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_delayed_full_hierarchy_snapshot_cannot_rewind_navigation() {
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot::empty("main-window", 8)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::HierarchyChanged {
+                snapshot: Box::new(HierarchySnapshot::empty("main-window", 7)),
+            })),
+            T0 + 1,
+        );
+        assert_eq!(desk.hierarchy().unwrap().revision, 8);
+
+        // A response at the same revision may carry this surface's newer persisted
+        // selection/expansion state, so resync answers are still accepted.
+        let mut same = HierarchySnapshot::empty("main-window", 8);
+        same.tree_state.selected = Some(HierarchyKey::workspace(workspace()));
+        desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(same),
+            }),
+            T0 + 2,
+        );
+        assert!(desk.hierarchy().unwrap().tree_state.selected.is_some());
+    }
+
+    #[test]
+    fn quick_new_prefers_coding_over_alphabetical_blank() {
+        let workspace = Workspace::new("turn", "/repo/turn", T0);
+        let workspace_id = workspace.id.clone();
+        let blank = TemplateSummary::from_template(&Template::blank(T0));
+        let coding = TemplateSummary::from_template(&Template::coding(T0));
+        let coding_id = coding.id.clone();
+        let mut desk = Desk::new();
+        desk.workspaces = vec![WorkspaceSummary::from_workspace(&workspace, &[])];
+        desk.templates = vec![blank, coding];
+
+        assert!(matches!(
+            sent(&desk.dispatch(Command::QuickNewSession, T0)).as_slice(),
+            [Request::CreateSessionFromTemplate {
+                workspace_id: requested_workspace,
+                template_id,
+                ..
+            }] if requested_workspace == &workspace_id && template_id == &coding_id
+        ));
+    }
+
+    #[test]
+    fn releasing_a_write_lease_keeps_its_fencing_generation() {
+        let mut desk = Desk::new();
+        let workspace_id = workspace();
+        let lease_id = turn_core::ids::LeaseId::from_stored("lease_desk");
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::ReleaseWorkspaceLease {
+                workspace_id: workspace_id.clone(),
+                lease_id: lease_id.clone(),
+                expected_generation: 7,
+            },
+            T0,
+        ));
+        assert_eq!(
+            requests,
+            vec![Request::ReleaseWorkspaceWriteLease {
+                workspace_id,
+                lease_id,
+                expected_generation: 7,
+            }]
+        );
     }
 
     #[test]

@@ -122,7 +122,11 @@ pub enum EventKind {
     ProcessSpawnedChild {
         child: NodeId,
         pid: u32,
+        #[serde(default)]
+        ppid: Option<u32>,
         command: String,
+        #[serde(default)]
+        cwd: Option<String>,
         /// False when the parent link was inferred from the process table
         /// rather than reported to us.
         confirmed_parent: bool,
@@ -209,6 +213,9 @@ pub struct AgentRef {
     pub provider: Option<String>,
     pub tool: Option<String>,
     pub model: Option<String>,
+    /// Tool-owned identity of the specific worker this event concerns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
 }
 
 /// A normalised event, ready for the state machine and the store.

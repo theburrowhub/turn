@@ -93,6 +93,13 @@ impl Core {
             .processes
             .iter()
             .filter_map(|(node_id, process)| {
+                if self
+                    .sessions
+                    .get(&process.session_id)
+                    .is_none_or(|session| session.is_archived())
+                {
+                    return None;
+                }
                 let watched = self.is_watched(node_id);
                 let probe = self.preview_probes.get(node_id);
                 if probe.is_some_and(|probe| !probe.due(now_ms)) || !process.pty.is_running() {

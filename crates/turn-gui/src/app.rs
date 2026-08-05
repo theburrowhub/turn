@@ -275,6 +275,13 @@ impl eframe::App for TurnApp {
                 ViewAction::CloseOverlay => {
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
+                    self.state.workspace_draft = None;
+                }
+                action @ ViewAction::CreateWorkspace { .. } => {
+                    self.state.workspace_draft = None;
+                    for reaction in self.desk.apply_view_action(action, now_ms) {
+                        self.perform(&ctx, reaction);
+                    }
                 }
                 ViewAction::Run(command) if self.handle_locally(command) => {}
                 other => {

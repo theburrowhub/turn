@@ -433,6 +433,7 @@ mod tests {
                 provider: Some("anthropic".into()),
                 tool: Some("claude-code".into()),
                 model: Some("opus".into()),
+                external_id: None,
             },
             name: AgentName::fallback("Claude Code"),
             external_id: Some("claude-abc123".into()),

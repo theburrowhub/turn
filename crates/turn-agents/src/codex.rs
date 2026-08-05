@@ -343,6 +343,8 @@ impl AgentAdapter for CodexAdapter {
             provider: Some("openai".into()),
             tool: Some("codex".into()),
             model: pick(payload, &["model"]).and_then(text::field),
+            external_id: pick(payload, &["agent_id", "agent-id", "subagent_id"])
+                .and_then(text::identifier),
         };
 
         let make = |kind: EventKind| -> TurnEvent {

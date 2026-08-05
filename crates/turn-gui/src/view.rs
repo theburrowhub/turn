@@ -26,7 +26,7 @@ use egui::{
 };
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
-use turn_core::ids::{AttentionId, NodeId, PaneId, SessionId};
+use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Layout, NodeKind, PreviewVisibility, RelationshipKind};
 use turn_core::state::{AwaitingReason, DisplayState};
 use turn_proto::cells::Grid;
@@ -203,6 +203,9 @@ pub struct ViewState {
     pub shortcuts_open: bool,
     pub settings_open: bool,
     pub write_conflict_open: bool,
+    /// First-run workspace form. It is window-local until the user submits it;
+    /// no half-written path enters daemon state.
+    pub workspace_draft: Option<WorkspaceDraft>,
     /// The daemon-owned navigation projection for this window. `None` is kept as a
     /// narrow compatibility path while the first hierarchy snapshot is in flight.
     pub hierarchy: Option<HierarchySnapshot>,
@@ -242,6 +245,7 @@ impl ViewState {
             || self.shortcuts_open
             || self.settings_open
             || self.write_conflict_open
+            || self.workspace_draft.is_some()
             || self.quick_preview.is_some()
     }
 
@@ -257,6 +261,12 @@ impl ViewState {
     fn push_hierarchy_action(&mut self, action: HierarchyAction) {
         self.hierarchy_actions.push(action);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDraft {
+    pub name: String,
+    pub root: String,
 }
 
 /// A hierarchy interaction, kept separate from terminal and legacy session actions.
@@ -315,6 +325,15 @@ pub enum ViewAction {
     /// arbitrary one.
     GotoAttention(AttentionId),
     DismissAttention(AttentionId),
+    CreateWorkspace {
+        name: String,
+        root: String,
+    },
+    ReleaseWorkspaceLease {
+        workspace_id: WorkspaceId,
+        lease_id: LeaseId,
+        expected_generation: u64,
+    },
     ResolveWriteConflict(SessionConflictAlternative),
     /// Closing a temporary view always keeps the Agent/Process alive.
     CloseTemporaryPane {
@@ -722,7 +741,7 @@ impl<'a> TurnView<'a> {
         );
         if let Some((workspace, session)) = active_context {
             ui.scope_builder(region(context_rect, "session-context"), |ui| {
-                self.session_context_bar(ui, theme, workspace, session);
+                actions.extend(self.session_context_bar(ui, theme, workspace, session));
             });
         }
         ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
@@ -798,7 +817,9 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if let Some(conflict) = self.write_conflict {
+        if state.workspace_draft.is_some() {
+            actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
+        } else if let Some(conflict) = self.write_conflict {
             actions.extend(self.write_conflict_overlay(ui, theme, conflict, full));
         } else if state.palette.open {
             actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
@@ -1188,13 +1209,26 @@ impl<'a> TurnView<'a> {
         });
 
         if snapshot.workspaces.is_empty() {
-            ui.painter().text(
-                ui.available_rect_before_wrap().center_top() + Vec2::new(0.0, 28.0),
-                Align2::CENTER_TOP,
-                "no workspaces",
-                theme.ui_font.clone(),
-                theme.text_faint,
-            );
+            ui.vertical_centered(|ui| {
+                ui.add_space(28.0);
+                ui.label(RichText::new("No workspaces yet").color(theme.text_dim));
+                ui.label(
+                    RichText::new("Create a project root before starting a Session")
+                        .color(theme.text_faint)
+                        .small(),
+                );
+                ui.add_space(8.0);
+                if ui.button("Create workspace").clicked() {
+                    let root = std::env::current_dir()
+                        .ok()
+                        .and_then(|path| path.to_str().map(str::to_owned))
+                        .unwrap_or_else(|| "/".into());
+                    state.workspace_draft = Some(WorkspaceDraft {
+                        name: turn_core::model::Workspace::name_from_path(&root),
+                        root,
+                    });
+                }
+            });
             return actions;
         }
 
@@ -1344,7 +1378,8 @@ impl<'a> TurnView<'a> {
         theme: &Theme,
         workspace: &WorkspaceTreeView,
         session: &SessionTreeView,
-    ) {
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.raised);
         ui.painter()
@@ -1387,31 +1422,63 @@ impl<'a> TurnView<'a> {
             FontId::new(10.0, egui::FontFamily::Monospace),
             state_colour,
         );
-        ui.painter().text(
-            area.right_center() + Vec2::new(-12.0, -8.0),
-            Align2::RIGHT_CENTER,
-            if summary.needs_user {
-                "YOUR TURN"
-            } else {
-                summary.mode.label()
-            },
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            if summary.needs_user {
-                theme.attention
-            } else {
-                theme.text_dim
-            },
-        );
-        ui.painter().text(
-            area.right_center() + Vec2::new(-12.0, 9.0),
-            Align2::RIGHT_CENTER,
-            format!(
-                "{} panes · {} processes",
-                summary.pane_count, summary.node_count
-            ),
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme.text_faint,
-        );
+        let owned_lease = workspace
+            .write_lease
+            .as_ref()
+            .filter(|lease| lease.session_id == summary.id);
+        if let Some(lease) = owned_lease {
+            let button_rect = Rect::from_min_size(
+                area.right_center() + Vec2::new(-158.0, -12.0),
+                Vec2::new(146.0, 24.0),
+            );
+            let response = ui
+                .put(
+                    button_rect,
+                    egui::Button::new(if summary.running_count == 0 {
+                        "Release write lease"
+                    } else {
+                        "Stop work to release"
+                    }),
+                )
+                .on_hover_text(if summary.running_count == 0 {
+                    "Give up exclusive write access to the primary checkout"
+                } else {
+                    "Every running process must stop before the fenced lease can be released"
+                });
+            if response.clicked() && summary.running_count == 0 {
+                actions.push(ViewAction::ReleaseWorkspaceLease {
+                    workspace_id: workspace.workspace.id.clone(),
+                    lease_id: lease.id.clone(),
+                    expected_generation: lease.generation,
+                });
+            }
+        } else {
+            ui.painter().text(
+                area.right_center() + Vec2::new(-12.0, -8.0),
+                Align2::RIGHT_CENTER,
+                if summary.needs_user {
+                    "YOUR TURN"
+                } else {
+                    summary.mode.label()
+                },
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                if summary.needs_user {
+                    theme.attention
+                } else {
+                    theme.text_dim
+                },
+            );
+            ui.painter().text(
+                area.right_center() + Vec2::new(-12.0, 9.0),
+                Align2::RIGHT_CENTER,
+                format!(
+                    "{} panes · {} processes",
+                    summary.pane_count, summary.node_count
+                ),
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                theme.text_faint,
+            );
+        }
 
         let context_id = ui.id().with("active-session-context");
         ui.ctx().accesskit_node_builder(context_id, |node| {
@@ -1425,6 +1492,77 @@ impl<'a> TurnView<'a> {
                 branch
             ));
         });
+        actions
+    }
+
+    fn workspace_creator_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(560.0_f32.min(full.width() - 32.0), 250.0),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(150));
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(16.0), "workspace-creator"), |ui| {
+            ui.label(RichText::new("CREATE WORKSPACE").color(theme.text).strong());
+            ui.label(
+                RichText::new("A workspace is the persistent project above Sessions.")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            ui.add_space(10.0);
+            let Some(draft) = state.workspace_draft.as_mut() else {
+                return;
+            };
+            ui.label(RichText::new("Name").color(theme.text_dim).small());
+            ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY));
+            ui.label(
+                RichText::new("Absolute project directory")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            ui.add(egui::TextEdit::singleline(&mut draft.root).desired_width(f32::INFINITY));
+            let valid = !draft.name.trim().is_empty() && draft.root.starts_with('/');
+            if !draft.root.starts_with('/') {
+                ui.label(
+                    RichText::new(
+                        "Use an absolute path so every process resolves the same checkout.",
+                    )
+                    .color(theme.attention)
+                    .small(),
+                );
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        actions.push(ViewAction::CloseOverlay);
+                    }
+                    if ui
+                        .add_enabled(valid, egui::Button::new("Create workspace"))
+                        .clicked()
+                    {
+                        actions.push(ViewAction::CreateWorkspace {
+                            name: draft.name.trim().to_string(),
+                            root: draft.root.trim().to_string(),
+                        });
+                    }
+                });
+            });
+        });
+        actions
     }
 
     fn pane_status_bar(&self, ui: &mut Ui, theme: &Theme, session: Option<&SessionTreeView>) {

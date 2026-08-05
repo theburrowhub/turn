@@ -189,6 +189,7 @@ impl Core {
                 provider: Some(selection.adapter.provider().to_string()),
                 tool: Some(selection.adapter.id().to_string()),
                 model: None,
+                external_id: None,
             };
             agent.resumable = selection.capabilities.resumable;
         }

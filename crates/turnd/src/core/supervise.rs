@@ -119,7 +119,6 @@ impl Core {
             .count();
         let mut room = MAX_INFERRED_CHILDREN.saturating_sub(existing_children);
 
-        let mut events = Vec::new();
         for process in observed {
             if room == 0 {
                 break;
@@ -145,28 +144,28 @@ impl Core {
             } else {
                 process.command_line.clone()
             };
-            events.push(
-                TurnEvent::new(
-                    session_id.clone(),
-                    EventKind::ProcessSpawnedChild {
-                        child: NodeId::new(),
-                        pid: process.pid,
-                        command,
-                        // Never confirmed here. Only a tool reporting what it started
-                        // earns that, and the process table is not a tool.
-                        confirmed_parent: false,
-                    },
-                    EventSource::Supervisor,
-                    Confidence::Explicit,
-                    now_ms,
-                )
-                .with_node(parent),
-            );
-            room -= 1;
-        }
-
-        for event in events {
+            let event = TurnEvent::new(
+                session_id.clone(),
+                EventKind::ProcessSpawnedChild {
+                    child: NodeId::new(),
+                    pid: process.pid,
+                    ppid: process.ppid,
+                    command,
+                    cwd: process.cwd,
+                    // Never confirmed here. Only a tool reporting what it started
+                    // earns that, and the process table is not a tool.
+                    confirmed_parent: false,
+                },
+                EventSource::Supervisor,
+                Confidence::Explicit,
+                now_ms,
+            )
+            .with_node(parent);
+            // The supervisor yields a parent before its descendants. Applying
+            // immediately lets the next row attach to that newly inserted parent;
+            // batching every event first flattened grandchildren under the root.
             self.ingest(event, now_ms);
+            room -= 1;
         }
     }
 

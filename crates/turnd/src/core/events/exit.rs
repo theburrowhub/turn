@@ -335,6 +335,7 @@ mod tests {
         let mut harness = Harness::new().await;
         let session = SessionId::from_stored("sess_unreported");
         harness.add_session(session.clone(), PaneId::from_stored("pane_unreported"), NOW);
+        harness.allow_test_processes(&session);
 
         let node = harness
             .core
@@ -421,6 +422,7 @@ mod tests {
         let session = SessionId::from_stored("sess_reaped");
         let pane = PaneId::from_stored("pane_reaped");
         harness.add_session(session.clone(), pane.clone(), NOW);
+        harness.allow_test_processes(&session);
 
         let node = harness
             .core
@@ -492,6 +494,7 @@ mod tests {
         let mut harness = Harness::new().await;
         let session = SessionId::from_stored("sess_signalled");
         harness.add_session(session.clone(), PaneId::new(), NOW);
+        harness.allow_test_processes(&session);
 
         let node = harness
             .core

@@ -519,6 +519,18 @@ pub(crate) mod testing {
             self.core.sessions.insert(session_id, session);
         }
 
+        /// Marks a harness-only read-only Session as technically guarded so tests that
+        /// exercise real child-process lifecycle code can cross the production launch
+        /// boundary. Production Session creation deliberately leaves this false until
+        /// an actual filesystem guard exists.
+        pub fn allow_test_processes(&mut self, session_id: &SessionId) {
+            self.core
+                .sessions
+                .get_mut(session_id)
+                .expect("the harness session")
+                .read_only_enforced = true;
+        }
+
         /// Puts a real process on a real pty behind a pane.
         ///
         /// Spawns `cat` with the terminal's own echo turned off, so what reaches the

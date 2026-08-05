@@ -56,6 +56,16 @@ impl Core {
         if event.workspace_id.is_none() {
             event.workspace_id = Some(session.workspace_id.clone());
         }
+        if let Some(external_id) = event.agent.external_id.as_deref() {
+            if let Some(subject) = session.tree.find_by_external_id(external_id) {
+                // Hook connections belong to the main runtime process, but a
+                // worker-aware payload names its own Agent. Resolve that identity
+                // before state, preview and Attention handling so Reviewer can be
+                // YOUR TURN without pretending it owns a separate PTY.
+                event.node_id = Some(subject.id.clone());
+                event.dedup_key = format!("{}|subject:{}", event.dedup_key, subject.id);
+            }
+        }
         let policy = session.attention.clone();
 
         let changed = self.apply(&event, now_ms);
@@ -131,7 +141,9 @@ impl Core {
         if let EventKind::ProcessSpawnedChild {
             child,
             pid,
+            ppid,
             command,
+            cwd,
             confirmed_parent,
         } = &event.kind
         {
@@ -140,7 +152,9 @@ impl Core {
                 &node_id,
                 child.clone(),
                 *pid,
+                *ppid,
                 command.clone(),
+                cwd.clone(),
                 *confirmed_parent,
                 now_ms,
             );

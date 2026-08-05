@@ -377,6 +377,7 @@ mod tests {
                 provider: Some("anthropic".into()),
                 tool: Some("claude-code".into()),
                 model: Some("opus".into()),
+                external_id: None,
             })
             .with_raw(r#"{"hook_event_name":"PermissionRequest"}"#);
 
@@ -431,7 +432,9 @@ mod tests {
             EventKind::ProcessSpawnedChild {
                 child: NodeId::from_stored("proc_child"),
                 pid: 4243,
+                ppid: Some(4242),
                 command: "cargo test".into(),
+                cwd: Some("/repo".into()),
                 confirmed_parent: false,
             },
             EventKind::AgentTurnCompleted {

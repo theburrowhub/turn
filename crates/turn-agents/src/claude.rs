@@ -331,6 +331,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 .get("model")
                 .and_then(Value::as_str)
                 .and_then(text::field),
+            external_id: payload
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .and_then(text::identifier),
         };
         // The event name reaches log lines and the event panel, and it is a string
         // the sender chose. An unrecognised one is dropped further down, but the
