@@ -26,13 +26,14 @@ use egui::{
 };
 use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
-use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Layout, NodeKind, PreviewVisibility, RelationshipKind};
 use turn_core::state::{AwaitingReason, DisplayState};
 use turn_proto::cells::Grid;
 use turn_proto::{
     HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, ProtoErrorContext,
-    SessionConflictAlternative, SessionTreeView, TreeNodeView, TreeSurfaceState, WorkspaceTreeView,
+    SessionConflictAlternative, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    WorkspaceSummary, WorkspaceTreeView,
 };
 
 use crate::keymap::{Command, Keymap};
@@ -157,6 +158,9 @@ pub struct TemporaryPaneContent<'a> {
 /// What the window is showing.
 #[derive(Debug, Default)]
 pub struct TurnView<'a> {
+    /// Creation choices supplied by the daemon. They are not another navigator.
+    pub workspaces: &'a [WorkspaceSummary],
+    pub templates: &'a [TemplateSummary],
     pub sessions: Vec<SessionRow>,
     pub selected: Option<SessionId>,
     /// The daemon's layout for the selected session, which is what decides the
@@ -196,6 +200,8 @@ pub struct ViewState {
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
     pub workspace_draft: Option<WorkspaceDraft>,
+    /// The explicit New Session sheet. `Cmd+N` opens this; only Quick New may bypass it.
+    pub session_draft: Option<SessionDraft>,
     /// The daemon-owned navigation projection for this window. `None` is kept as a
     /// narrow compatibility path while the first hierarchy snapshot is in flight.
     pub hierarchy: Option<HierarchySnapshot>,
@@ -237,6 +243,7 @@ impl ViewState {
             || self.attention_panel_open
             || self.write_conflict_open
             || self.workspace_draft.is_some()
+            || self.session_draft.is_some()
             || self.quick_preview.is_some()
     }
 
@@ -258,6 +265,54 @@ impl ViewState {
 pub struct WorkspaceDraft {
     pub name: String,
     pub root: String,
+    /// `Cmd+N` with an empty desk is a two-step onboarding flow. An explicit New
+    /// Workspace command stops after the Workspace is created.
+    pub continue_to_session: bool,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl WorkspaceDraft {
+    pub fn new(continue_to_session: bool) -> Self {
+        let root = std::env::current_dir()
+            .ok()
+            .filter(|path| path != std::path::Path::new("/"))
+            .and_then(|path| path.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        let name = (!root.is_empty())
+            .then(|| turn_core::model::Workspace::name_from_path(&root))
+            .unwrap_or_default();
+        Self {
+            name,
+            root,
+            continue_to_session,
+            submitting: false,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDraft {
+    pub workspace_id: WorkspaceId,
+    pub template_id: Option<TemplateId>,
+    pub name: String,
+    pub task: String,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl SessionDraft {
+    pub fn new(workspace_id: WorkspaceId, template_id: Option<TemplateId>) -> Self {
+        Self {
+            workspace_id,
+            template_id,
+            name: String::new(),
+            task: String::new(),
+            submitting: false,
+            error: None,
+        }
+    }
 }
 
 /// A hierarchy interaction, kept separate from terminal and legacy session actions.
@@ -332,6 +387,13 @@ pub enum ViewAction {
     CreateWorkspace {
         name: String,
         root: String,
+        continue_to_session: bool,
+    },
+    CreateSessionFromTemplate {
+        workspace_id: WorkspaceId,
+        template_id: TemplateId,
+        name: String,
+        task: Option<String>,
     },
     ReleaseWorkspaceLease {
         workspace_id: WorkspaceId,
@@ -548,6 +610,26 @@ fn effective_selection(snapshot: &HierarchySnapshot, state: &ViewState) -> Optio
         .or_else(|| snapshot.tree_state.selected.clone())
 }
 
+fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option<WorkspaceId> {
+    match key {
+        HierarchyKey::Workspace { workspace_id } => Some(workspace_id.clone()),
+        HierarchyKey::Session { session_id } => snapshot.workspaces.iter().find_map(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .any(|session| &session.session.id == session_id)
+                .then(|| workspace.workspace.id.clone())
+        }),
+        HierarchyKey::Process { node_id } => snapshot.workspaces.iter().find_map(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .any(|session| session.nodes.iter().any(|node| &node.node_id == node_id))
+                .then(|| workspace.workspace.id.clone())
+        }),
+    }
+}
+
 fn row_is_expanded(snapshot: &HierarchySnapshot, state: &ViewState, key: &HierarchyKey) -> bool {
     state
         .tree_expansion
@@ -627,6 +709,37 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    fn new_session_draft(
+        &self,
+        snapshot: &HierarchySnapshot,
+        state: &ViewState,
+    ) -> Option<SessionDraft> {
+        let workspace_id = effective_selection(snapshot, state)
+            .as_ref()
+            .and_then(|key| workspace_for_key(snapshot, key))
+            .or_else(|| {
+                snapshot
+                    .workspaces
+                    .first()
+                    .map(|branch| branch.workspace.id.clone())
+            })?;
+        let configured = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.default_template.as_ref());
+        let template_id = configured
+            .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            .or_else(|| {
+                self.templates
+                    .iter()
+                    .find(|template| template.name == "Coding")
+            })
+            .or_else(|| self.templates.first())
+            .map(|template| template.id.clone());
+        Some(SessionDraft::new(workspace_id, template_id))
+    }
+
     /// Draws the whole window and returns what the user did.
     pub fn ui(
         &self,
@@ -766,7 +879,7 @@ impl<'a> TurnView<'a> {
             });
         }
         ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
-            let pane_actions = self.pane_area(ui, theme, keymap, state);
+            let pane_actions = self.pane_area(ui, theme, keymap, state, hierarchy.as_ref());
             if pane_actions.iter().any(|action| {
                 matches!(
                     action,
@@ -842,6 +955,8 @@ impl<'a> TurnView<'a> {
             actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
         } else if let Some(conflict) = self.write_conflict {
             actions.extend(self.write_conflict_overlay(ui, theme, conflict, full));
+        } else if state.session_draft.is_some() {
+            actions.extend(self.session_creator_overlay(ui, theme, state, full));
         } else if state.attention_panel_open {
             actions.extend(self.attention_queue_overlay(ui, theme, full));
         } else if state.palette.open {
@@ -1210,7 +1325,7 @@ impl<'a> TurnView<'a> {
             theme.text_dim,
         );
         ui.painter().text(
-            header.right_top() + Vec2::new(-10.0, 6.0),
+            header.right_top() + Vec2::new(-218.0, 8.0),
             Align2::RIGHT_TOP,
             format!("rev {}", snapshot.revision),
             FontId::new(10.0, egui::FontFamily::Monospace),
@@ -1228,6 +1343,26 @@ impl<'a> TurnView<'a> {
             header.max.y,
             Stroke::new(1.0, theme.border),
         );
+        let action_rect = Rect::from_min_size(
+            header.right_top() + Vec2::new(-208.0, 4.0),
+            Vec2::new(198.0, 26.0),
+        );
+        ui.scope_builder(region(action_rect, "hierarchy-create-actions"), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("+ Workspace").clicked() {
+                    state.workspace_draft = Some(WorkspaceDraft::new(false));
+                }
+                if ui
+                    .add_enabled(
+                        !snapshot.workspaces.is_empty(),
+                        egui::Button::new("+ Session").small(),
+                    )
+                    .clicked()
+                {
+                    state.session_draft = self.new_session_draft(snapshot, state);
+                }
+            });
+        });
         ui.advance_cursor_after_rect(header);
 
         let rows = visible_hierarchy_rows(snapshot, state);
@@ -1251,14 +1386,7 @@ impl<'a> TurnView<'a> {
                 );
                 ui.add_space(8.0);
                 if ui.button("Create workspace").clicked() {
-                    let root = std::env::current_dir()
-                        .ok()
-                        .and_then(|path| path.to_str().map(str::to_owned))
-                        .unwrap_or_else(|| "/".into());
-                    state.workspace_draft = Some(WorkspaceDraft {
-                        name: turn_core::model::Workspace::name_from_path(&root),
-                        root,
-                    });
+                    state.workspace_draft = Some(WorkspaceDraft::new(true));
                 }
             });
             return actions;
@@ -1624,7 +1752,7 @@ impl<'a> TurnView<'a> {
         let mut actions = Vec::new();
         let panel = Rect::from_center_size(
             full.center(),
-            Vec2::new(560.0_f32.min(full.width() - 32.0), 250.0),
+            Vec2::new(560.0_f32.min(full.width() - 32.0), 320.0),
         );
         ui.painter()
             .rect_filled(full, 0.0, Color32::from_black_alpha(150));
@@ -1638,7 +1766,7 @@ impl<'a> TurnView<'a> {
         ui.scope_builder(region(panel.shrink(16.0), "workspace-creator"), |ui| {
             ui.label(RichText::new("CREATE WORKSPACE").color(theme.text).strong());
             ui.label(
-                RichText::new("A workspace is the persistent project above Sessions.")
+                RichText::new("Choose the existing project directory Turn will supervise.")
                     .color(theme.text_dim)
                     .small(),
             );
@@ -1653,8 +1781,16 @@ impl<'a> TurnView<'a> {
                     .color(theme.text_dim)
                     .small(),
             );
-            ui.add(egui::TextEdit::singleline(&mut draft.root).desired_width(f32::INFINITY));
-            let valid = !draft.name.trim().is_empty() && draft.root.starts_with('/');
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.root)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("/Users/you/projects/my-project"),
+            );
+            let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
+            let valid = connected
+                && !draft.submitting
+                && !draft.name.trim().is_empty()
+                && draft.root.starts_with('/');
             if !draft.root.starts_with('/') {
                 ui.label(
                     RichText::new(
@@ -1664,18 +1800,246 @@ impl<'a> TurnView<'a> {
                     .small(),
                 );
             }
+            if !connected {
+                ui.label(
+                    RichText::new(
+                        "Waiting for the Turn daemon — nothing will be queued or created yet.",
+                    )
+                    .color(theme.failure)
+                    .small(),
+                );
+            }
+            if let Some(error) = &draft.error {
+                ui.label(RichText::new(error).color(theme.failure).small());
+            }
+            if draft.continue_to_session {
+                ui.label(
+                    RichText::new("After this, choose the first Session and its template.")
+                        .color(theme.text_faint)
+                        .small(),
+                );
+            }
             ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
+                    if ui
+                        .add_enabled(!draft.submitting, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
                         actions.push(ViewAction::CloseOverlay);
                     }
                     if ui
-                        .add_enabled(valid, egui::Button::new("Create workspace"))
+                        .add_enabled(
+                            valid,
+                            egui::Button::new(if draft.submitting {
+                                "Creating…"
+                            } else if draft.continue_to_session {
+                                "Create and continue"
+                            } else {
+                                "Create workspace"
+                            }),
+                        )
                         .clicked()
                     {
+                        draft.submitting = true;
+                        draft.error = None;
                         actions.push(ViewAction::CreateWorkspace {
                             name: draft.name.trim().to_string(),
                             root: draft.root.trim().to_string(),
+                            continue_to_session: draft.continue_to_session,
+                        });
+                    }
+                });
+            });
+        });
+        actions
+    }
+
+    fn session_creator_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                620.0_f32.min((full.width() - 32.0).max(280.0)),
+                430.0_f32.min((full.height() - 32.0).max(300.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(150));
+        ui.painter().rect_filled(panel, 0.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            0.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(16.0), "session-creator"), |ui| {
+            ui.label(RichText::new("NEW SESSION").color(theme.text).strong());
+            ui.label(
+                RichText::new(
+                    "A Session is one task. Creating it may launch the selected template's commands.",
+                )
+                .color(theme.text_dim)
+                .small(),
+            );
+            ui.add_space(10.0);
+            let Some(draft) = state.session_draft.as_mut() else {
+                return;
+            };
+
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == draft.workspace_id)
+            {
+                if let Some(workspace) = self.workspaces.first() {
+                    draft.workspace_id = workspace.id.clone();
+                }
+            }
+            if draft.template_id.as_ref().is_none_or(|id| {
+                !self.templates.iter().any(|template| &template.id == id)
+            }) {
+                draft.template_id = self.templates.first().map(|template| template.id.clone());
+            }
+
+            ui.label(RichText::new("Workspace").color(theme.text_dim).small());
+            let workspace_name = self
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == draft.workspace_id)
+                .map(|workspace| workspace.name.as_str())
+                .unwrap_or("No workspace available");
+            egui::ComboBox::from_id_salt("new-session-workspace")
+                .selected_text(workspace_name)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for workspace in self.workspaces {
+                        ui.selectable_value(
+                            &mut draft.workspace_id,
+                            workspace.id.clone(),
+                            format!("{}  ·  {}", workspace.name, workspace.root),
+                        );
+                    }
+                });
+
+            ui.label(RichText::new("Template").color(theme.text_dim).small());
+            let template_name = draft
+                .template_id
+                .as_ref()
+                .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+                .map(|template| template.name.as_str())
+                .unwrap_or("Templates are loading…");
+            egui::ComboBox::from_id_salt("new-session-template")
+                .selected_text(template_name)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for template in self.templates {
+                        ui.selectable_value(
+                            &mut draft.template_id,
+                            Some(template.id.clone()),
+                            format!("{}  ·  {} panes", template.name, template.pane_count),
+                        );
+                    }
+                });
+
+            ui.label(
+                RichText::new("Task / session name")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Fix climbing bugs"),
+            );
+            ui.label(
+                RichText::new("Task note (optional)")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.task)
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(2),
+            );
+
+            if let Some(template) = draft
+                .template_id
+                .as_ref()
+                .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            {
+                let commands = if template.commands.is_empty() {
+                    "no commands".to_string()
+                } else {
+                    template.commands.join(" · ")
+                };
+                ui.label(
+                    RichText::new(format!("Will start: {commands}"))
+                        .monospace()
+                        .color(theme.text_faint)
+                        .small(),
+                );
+            }
+            ui.label(
+                RichText::new(
+                    "Uses the main checkout. If it already has a writer, Turn will offer focus, read-only or an isolated worktree.",
+                )
+                .color(theme.text_faint)
+                .small(),
+            );
+
+            let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
+            if !connected {
+                ui.label(
+                    RichText::new("Waiting for the Turn daemon — this request will not be queued.")
+                        .color(theme.failure)
+                        .small(),
+                );
+            }
+            if let Some(error) = &draft.error {
+                ui.label(RichText::new(error).color(theme.failure).small());
+            }
+            let valid = connected
+                && !draft.submitting
+                && !draft.name.trim().is_empty()
+                && draft.template_id.is_some()
+                && self
+                    .workspaces
+                    .iter()
+                    .any(|workspace| workspace.id == draft.workspace_id);
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!draft.submitting, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        actions.push(ViewAction::CloseOverlay);
+                    }
+                    if ui
+                        .add_enabled(
+                            valid,
+                            egui::Button::new(if draft.submitting {
+                                "Creating…"
+                            } else {
+                                "Create session"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        let template_id = draft.template_id.clone().expect("validated above");
+                        draft.submitting = true;
+                        draft.error = None;
+                        actions.push(ViewAction::CreateSessionFromTemplate {
+                            workspace_id: draft.workspace_id.clone(),
+                            template_id,
+                            name: draft.name.trim().to_string(),
+                            task: (!draft.task.trim().is_empty())
+                                .then(|| draft.task.trim().to_string()),
                         });
                     }
                 });
@@ -1873,6 +2237,7 @@ impl<'a> TurnView<'a> {
         theme: &Theme,
         keymap: &Keymap,
         state: &mut ViewState,
+        hierarchy: Option<&HierarchySnapshot>,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
@@ -1881,24 +2246,48 @@ impl<'a> TurnView<'a> {
             // The chord, spelled out. "Press the palette shortcut" is useless to somebody
             // who does not know it, and the keymap is right here — including a chord the
             // user chose themselves.
-            let hint = match (
-                self.sessions.is_empty(),
-                keymap.chord_for(Command::QuickNewSession),
-            ) {
-                (true, Some(chord)) => format!(
-                    "no session open — press {} to start one",
-                    chord.describe(keymap.platform())
-                ),
-                (true, None) => "no session open".to_string(),
-                (false, _) => "select a session".to_string(),
-            };
-            ui.painter().text(
+            let content = Rect::from_center_size(
                 area.center(),
-                Align2::CENTER_CENTER,
-                hint,
-                theme.ui_font.clone(),
-                theme.text_faint,
+                Vec2::new(440.0_f32.min(area.width()), 150.0_f32.min(area.height())),
             );
+            ui.scope_builder(region(content, "empty-primary-action"), |ui| {
+                ui.vertical_centered(|ui| {
+                    if self.workspaces.is_empty() {
+                        ui.heading(RichText::new("Start with a workspace").color(theme.text));
+                        ui.label(
+                            RichText::new("Choose the project directory Turn will supervise.")
+                                .color(theme.text_dim),
+                        );
+                        ui.add_space(10.0);
+                        if ui.button("Create workspace").clicked() {
+                            state.workspace_draft = Some(WorkspaceDraft::new(true));
+                        }
+                    } else if self.sessions.is_empty() {
+                        ui.heading(RichText::new("Create the first session").color(theme.text));
+                        let shortcut = keymap
+                            .chord_for(Command::NewSession)
+                            .map(|chord| chord.describe(keymap.platform()))
+                            .unwrap_or_else(|| "the New Session command".to_string());
+                        ui.label(
+                            RichText::new(format!(
+                                "Pick a task and template here, or press {shortcut}."
+                            ))
+                            .color(theme.text_dim),
+                        );
+                        ui.add_space(10.0);
+                        if ui.button("New session").clicked() {
+                            if let Some(snapshot) = hierarchy {
+                                state.session_draft = self.new_session_draft(snapshot, state);
+                            }
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Select a session in the workspace tree")
+                                .color(theme.text_dim),
+                        );
+                    }
+                });
+            });
             return actions;
         };
 

@@ -87,7 +87,34 @@ impl TurnApp {
                 perform(&announcement, self.announcer.as_ref());
             }
             Reaction::Copy(text) => ctx.copy_text(text),
-            Reaction::Notice(message) => tracing::info!(%message, "notice"),
+            Reaction::Notice(message) => {
+                tracing::info!(%message, "notice");
+                self.desk.show_notice(message);
+            }
+            Reaction::WorkspaceCreated {
+                workspace_id,
+                continue_to_session,
+            } => {
+                self.state.workspace_draft = None;
+                if continue_to_session {
+                    self.state.session_draft = Some(self.desk.new_session_draft_for(workspace_id));
+                }
+            }
+            Reaction::SessionCreated { .. } | Reaction::SessionCreationCancelled => {
+                self.state.session_draft = None;
+            }
+            Reaction::WorkspaceCreationFailed(message) => {
+                if let Some(draft) = self.state.workspace_draft.as_mut() {
+                    draft.submitting = false;
+                    draft.error = Some(message);
+                }
+            }
+            Reaction::SessionCreationFailed(message) => {
+                if let Some(draft) = self.state.session_draft.as_mut() {
+                    draft.submitting = false;
+                    draft.error = Some(message);
+                }
+            }
         }
     }
 
@@ -158,9 +185,20 @@ impl TurnApp {
     /// Returns true when the key was for the sheet, so it is not also treated as input.
     fn steer_overlays(&mut self, ctx: &egui::Context) -> Vec<Command> {
         if !self.state.palette.open {
+            let creation_cancellable = self
+                .state
+                .workspace_draft
+                .as_ref()
+                .is_some_and(|draft| !draft.submitting)
+                || self
+                    .state
+                    .session_draft
+                    .as_ref()
+                    .is_some_and(|draft| !draft.submitting);
             if self.state.shortcuts_open
                 || self.state.settings_open
                 || self.state.attention_panel_open
+                || creation_cancellable
             {
                 let escape = ctx
                     .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
@@ -168,6 +206,8 @@ impl TurnApp {
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
                     self.state.attention_panel_open = false;
+                    self.state.workspace_draft = None;
+                    self.state.session_draft = None;
                 }
             }
             return Vec::new();
@@ -224,6 +264,24 @@ impl TurnApp {
             }
             Command::FocusWorkspaceTree => {
                 self.state.tree_has_focus = true;
+                true
+            }
+            Command::NewWorkspace => {
+                self.state.session_draft = None;
+                self.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(false));
+                true
+            }
+            Command::NewSession => {
+                self.state.workspace_draft = None;
+                self.state.session_draft = self.desk.new_session_draft();
+                if self.state.session_draft.is_none() {
+                    self.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(true));
+                }
+                true
+            }
+            Command::QuickNewSession if !self.desk.has_workspaces() => {
+                self.state.session_draft = None;
+                self.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(true));
                 true
             }
             _ => false,
@@ -283,9 +341,10 @@ impl eframe::App for TurnApp {
                     self.state.settings_open = false;
                     self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
+                    self.state.session_draft = None;
                 }
-                action @ ViewAction::CreateWorkspace { .. } => {
-                    self.state.workspace_draft = None;
+                action @ (ViewAction::CreateWorkspace { .. }
+                | ViewAction::CreateSessionFromTemplate { .. }) => {
                     for reaction in self.desk.apply_view_action(action, now_ms) {
                         self.perform(&ctx, reaction);
                     }
@@ -370,6 +429,64 @@ mod tests {
             "got {:?}",
             app.repaint_plan(now)
         );
+    }
+
+    #[test]
+    fn cmd_n_on_an_empty_desk_starts_workspace_then_session_onboarding() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-onboarding.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+
+        assert!(app.handle_locally(Command::NewSession));
+        let draft = app
+            .state
+            .workspace_draft
+            .as_ref()
+            .expect("Cmd+N must present a useful first step");
+        assert!(draft.continue_to_session);
+        assert!(app.state.session_draft.is_none());
+    }
+
+    #[test]
+    fn new_workspace_is_a_discoverable_standalone_flow() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-workspace.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+
+        assert!(app.handle_locally(Command::NewWorkspace));
+        let draft = app.state.workspace_draft.as_ref().unwrap();
+        assert!(!draft.continue_to_session);
+    }
+
+    #[test]
+    fn a_failed_creation_keeps_the_users_session_draft() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-errors.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let workspace_id = turn_core::ids::WorkspaceId::from_stored("ws_onboarding");
+        let mut draft = crate::view::SessionDraft::new(workspace_id, None);
+        draft.name = "Fix the startup flow".into();
+        draft.submitting = true;
+        app.state.session_draft = Some(draft);
+
+        app.perform(
+            &ctx,
+            Reaction::SessionCreationFailed("the directory disappeared".into()),
+        );
+
+        let draft = app.state.session_draft.as_ref().unwrap();
+        assert_eq!(draft.name, "Fix the startup flow");
+        assert!(!draft.submitting);
+        assert_eq!(draft.error.as_deref(), Some("the directory disappeared"));
     }
 
     /// And when something *does* change by the clock, the window asks for one frame at

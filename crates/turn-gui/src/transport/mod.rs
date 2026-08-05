@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use turn_core::ids::{NodeId, PaneId, SessionId};
+use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
 use turn_proto::{ProtoError, Request, RequestId, Response, ServerEvent};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
@@ -68,6 +68,14 @@ pub enum Ask {
         subject_node_id: NodeId,
     },
     NodePane,
+    /// A creation response must close or preserve the correct sheet; a generic label
+    /// cannot safely correlate that lifecycle.
+    CreateWorkspace {
+        continue_to_session: bool,
+    },
+    CreateSession {
+        workspace_id: WorkspaceId,
+    },
     Attach {
         session_id: SessionId,
         pane_id: PaneId,
@@ -99,6 +107,8 @@ impl Ask {
             Ask::Preview { .. } => "loading an activity preview",
             Ask::AttentionFocus { .. } => "focusing the pane that can answer attention",
             Ask::NodePane => "opening a node as a pane",
+            Ask::CreateWorkspace { .. } => "creating a workspace",
+            Ask::CreateSession { .. } => "creating a session",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",

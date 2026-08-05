@@ -41,6 +41,7 @@ pub enum Command {
     ShowKeyboardShortcuts,
     OpenSettings,
 
+    NewWorkspace,
     NewSession,
     QuickNewSession,
     SwitchSession,
@@ -82,6 +83,7 @@ impl Command {
     /// Every command, in the order the palette offers them.
     pub const ALL: &'static [Command] = &[
         Command::OpenPalette,
+        Command::NewWorkspace,
         Command::NewSession,
         Command::QuickNewSession,
         Command::SwitchSession,
@@ -121,6 +123,7 @@ impl Command {
             Command::OpenPalette => "palette.open",
             Command::ShowKeyboardShortcuts => "help.keys",
             Command::OpenSettings => "app.settings",
+            Command::NewWorkspace => "workspace.new",
             Command::NewSession => "session.new",
             Command::QuickNewSession => "session.quickNew",
             Command::SwitchSession => "session.switch",
@@ -159,6 +162,7 @@ impl Command {
             Command::OpenPalette => "Command palette",
             Command::ShowKeyboardShortcuts => "Keyboard shortcuts",
             Command::OpenSettings => "Settings",
+            Command::NewWorkspace => "New workspace",
             Command::NewSession => "New session — pick a template",
             Command::QuickNewSession => "Quick new session — the workspace default",
             Command::SwitchSession => "Switch session",
@@ -198,6 +202,7 @@ impl Command {
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
             | Command::FocusWorkspaceTree => "View",
+            Command::NewWorkspace => "Workspace",
             Command::NewSession
             | Command::QuickNewSession
             | Command::SwitchSession
@@ -1049,6 +1054,15 @@ mod tests {
             mac.resolve(Key::K, &mac_control(), true),
             None,
             "Control+K is kill-line and is not the palette"
+        );
+    }
+
+    #[test]
+    fn command_n_is_the_new_session_command_even_when_a_terminal_has_focus() {
+        let mac = Keymap::build(&Overrides::new(), Platform::MAC);
+        assert_eq!(
+            mac.resolve(Key::N, &mac_command(), true),
+            Some(Command::NewSession)
         );
     }
 

@@ -27,23 +27,23 @@ use turn_core::event::{AgentRef, Confidence, Risk};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, AgentName, Direction, Layout, NodeKind, Pane, PaneKind, PaneNodeBinding,
-    PreviewSource, ProcessNode, Relation, Session, SessionMode, Workspace, WorkspaceCheckout,
-    WorkspaceWriteLease,
+    PreviewSource, ProcessNode, Relation, Session, SessionMode, Template, Workspace,
+    WorkspaceCheckout, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
     HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, ProtoErrorContext, PtySize,
-    SessionConflictAlternative, SessionSummary, SessionTreeView, TreeNodeView, TreeSurfaceState,
-    Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
+    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
+    TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    PaneContent, PendingPermission, QueueItem, SessionRow, TemporaryPaneContent, TurnView,
-    ViewState,
+    PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRow, TemporaryPaneContent,
+    TurnView, ViewState, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -65,6 +65,8 @@ fn cursor_on() -> i64 {
 struct Fixture {
     /// The normative Workspace -> Session -> Process navigation projection.
     hierarchy: Option<HierarchySnapshot>,
+    workspaces: Vec<WorkspaceSummary>,
+    templates: Vec<TemplateSummary>,
     sessions: Vec<SessionRow>,
     selected: Option<SessionId>,
     layout: Option<Layout>,
@@ -118,6 +120,8 @@ impl Fixture {
             }
         });
         TurnView {
+            workspaces: &self.workspaces,
+            templates: &self.templates,
             sessions: self.sessions.clone(),
             selected: self.selected.clone(),
             layout: self.layout.clone(),
@@ -174,6 +178,35 @@ fn harness(fixture: Fixture) -> Harness<'static, Window> {
 
 fn connected() -> ConnectionState {
     DaemonIdentity::new().observe(&Welcome::new(1, "0.1.0", 51234, T0))
+}
+
+fn workspace_without_sessions() -> Fixture {
+    let coding = Template::coding(T0);
+    let template = TemplateSummary::from_template(&coding);
+    let mut workspace = Workspace::new("turn", "/Users/x/personal-workspace/turn", T0);
+    workspace.id = WorkspaceId::from_stored("ws_onboarding_turn");
+    workspace.default_template = Some(coding.id.clone());
+    let summary = WorkspaceSummary::from_workspace(&workspace, &[]);
+    Fixture {
+        hierarchy: Some(HierarchySnapshot {
+            revision: 2,
+            tree_state: TreeSurfaceState {
+                surface_id: "window-snapshot".into(),
+                selected: Some(HierarchyKey::workspace(workspace.id.clone())),
+                expanded: vec![HierarchyKey::workspace(workspace.id)],
+            },
+            workspaces: vec![WorkspaceTreeView {
+                workspace: summary.clone(),
+                checkouts: Vec::new(),
+                write_lease: None,
+                sessions: Vec::new(),
+            }],
+        }),
+        workspaces: vec![summary],
+        templates: vec![template],
+        connection: Some(connected()),
+        ..Fixture::default()
+    }
 }
 
 /// A grid of a fixed height, padded like a real terminal screen.
@@ -702,7 +735,9 @@ fn the_attention_queue_is_an_explicit_overlay_not_a_second_navigator() {
 #[test]
 fn an_empty_window_says_so_rather_than_looking_broken() {
     let mut h = harness(Fixture {
-        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
+        // This is the actual first frame: without a daemon there is no fabricated
+        // hierarchy response. The primary action remains visible but disabled at submit.
+        hierarchy: None,
         connection: Some(ConnectionState::Disconnected {
             message: "no Turn daemon is listening. Your processes keep running; reconnecting"
                 .into(),
@@ -712,6 +747,54 @@ fn an_empty_window_says_so_rather_than_looking_broken() {
     });
     h.run();
     h.snapshot("empty");
+}
+
+#[test]
+fn a_connected_empty_store_has_a_real_workspace_onboarding_action() {
+    let mut h = harness(Fixture {
+        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
+        connection: Some(connected()),
+        ..Fixture::default()
+    });
+    h.run();
+    let labels: Vec<String> = h
+        .query_all_by_role(egui::accesskit::Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect();
+    assert!(labels.iter().any(|label| label == "Create workspace"));
+    h.snapshot("empty_connected");
+}
+
+#[test]
+fn the_workspace_form_is_a_visible_first_step_not_a_log_message() {
+    let mut h = harness(Fixture {
+        hierarchy: Some(HierarchySnapshot::empty("window-snapshot", 1)),
+        connection: Some(connected()),
+        ..Fixture::default()
+    });
+    h.state_mut().state.workspace_draft = Some(WorkspaceDraft {
+        name: "turn".into(),
+        root: "/Users/x/personal-workspace/turn".into(),
+        continue_to_session: true,
+        submitting: false,
+        error: None,
+    });
+    h.run();
+    h.snapshot("new_workspace");
+}
+
+#[test]
+fn cmd_n_has_a_real_session_form_with_workspace_template_and_task() {
+    let fixture = workspace_without_sessions();
+    let workspace_id = fixture.workspaces[0].id.clone();
+    let template_id = fixture.templates[0].id.clone();
+    let mut h = harness(fixture);
+    let mut draft = SessionDraft::new(workspace_id, Some(template_id));
+    draft.name = "Fix startup onboarding".into();
+    draft.task = "Make Cmd+N create a visible, selected Session.".into();
+    h.state_mut().state.session_draft = Some(draft);
+    h.run();
+    h.snapshot("new_session");
 }
 
 /// The strongest form of the banner, which is the one most worth reviewing as an image:
