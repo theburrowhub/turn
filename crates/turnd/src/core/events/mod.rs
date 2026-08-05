@@ -21,7 +21,7 @@
 mod exit;
 mod tree;
 
-use super::{Core, FailedIngestCheckpoint};
+use super::{Core, DeferredRuntimeInput, FailedIngestCheckpoint};
 use turn_core::event::{Confidence, EventKind, TurnEvent};
 use turn_core::ids::NodeId;
 use turn_core::model::{NodeKind, PendingPermission, ProcessNode};
@@ -52,16 +52,22 @@ impl Core {
                 .iter()
                 .any(|pending| pending.event.id == event.id)
                 || self
-                    .deferred_ingest_events
+                    .deferred_runtime_inputs
                     .iter()
-                    .any(|(pending, _)| pending.id == event.id);
+                    .any(|pending| {
+                        matches!(pending, DeferredRuntimeInput::Event { event: held, .. } if held.id == event.id)
+                    });
             if !already_held {
                 tracing::warn!(
                     event = %event.id,
                     session = %event.session_id,
                     "deferred a runtime event behind a failed atomic checkpoint"
                 );
-                self.deferred_ingest_events.push_back((event, now_ms));
+                self.deferred_runtime_inputs
+                    .push_back(DeferredRuntimeInput::Event {
+                        event: Box::new(event),
+                        now_ms,
+                    });
             }
             return;
         }
@@ -146,7 +152,12 @@ impl Core {
                 event.dedup_key = format!("{}|lifecycle-subject:{node}", event.dedup_key);
             }
         }
-        let stopped_dependents = if matches!(&event.kind, EventKind::AgentSubagentStopped { .. }) {
+        let terminal_dependents = if matches!(
+            &event.kind,
+            EventKind::AgentSubagentStopped { .. }
+                | EventKind::ProcessExited { .. }
+                | EventKind::ProcessFailed { .. }
+        ) {
             let stopped = changed.node.clone();
             stopped.map_or_else(Vec::new, |node| {
                 self.mark_runtime_dependents(&session_id, &node, now_ms)
@@ -154,7 +165,7 @@ impl Core {
         } else {
             Vec::new()
         };
-        changed.structure |= !stopped_dependents.is_empty();
+        changed.structure |= !terminal_dependents.is_empty();
         let preview_changed = !changed.refused
             && self.update_preview_from_event(&event, changed.node.as_ref(), now_ms);
         if let Some(session) = self.sessions.get_mut(&session_id) {
@@ -166,7 +177,7 @@ impl Core {
         // node saying one thing and the sidebar asking about another. It is still
         // recorded and still pushed, so the user can see what the heuristic thought.
         let attention_before = self.attention.queue().clone();
-        for (node, parent, external_id) in &stopped_dependents {
+        for (node, parent, external_id) in &terminal_dependents {
             self.attention.resolve_lifecycle(
                 &session_id,
                 node,
@@ -300,10 +311,20 @@ impl Core {
         }
 
         while self.failed_ingest_checkpoints.is_empty() {
-            let Some((event, event_now_ms)) = self.deferred_ingest_events.pop_front() else {
+            let Some(input) = self.deferred_runtime_inputs.pop_front() else {
                 break;
             };
-            self.ingest_after_checkpoint_barrier(event, event_now_ms);
+            match input {
+                DeferredRuntimeInput::Event { event, now_ms } => {
+                    self.ingest_after_checkpoint_barrier(*event, now_ms);
+                }
+                DeferredRuntimeInput::Exit {
+                    session_id,
+                    node_id,
+                    info,
+                    now_ms,
+                } => self.record_exit(&session_id, &node_id, info, now_ms),
+            }
         }
     }
 

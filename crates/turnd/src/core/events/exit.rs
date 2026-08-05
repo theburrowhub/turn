@@ -1,6 +1,6 @@
 //! Processes ending, and the guesses made about the ones we never held.
 
-use crate::core::{Core, FINISHED_PTY_RETENTION_MS};
+use crate::core::{Core, DeferredRuntimeInput, FINISHED_PTY_RETENTION_MS};
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::{NodeKind, Relation};
@@ -109,6 +109,16 @@ impl Core {
         info: ExitInfo,
         now_ms: i64,
     ) {
+        if !self.failed_ingest_checkpoints.is_empty() {
+            self.deferred_runtime_inputs
+                .push_back(DeferredRuntimeInput::Exit {
+                    session_id: session_id.clone(),
+                    node_id: node.clone(),
+                    info,
+                    now_ms,
+                });
+            return;
+        }
         let session_id = session_id.clone();
         // Spent whether or not it still applies — the exit it was waiting for has now
         // happened, one way or another — but it only *excuses* the exit while the stop
@@ -161,28 +171,7 @@ impl Core {
             event = event.with_raw(note);
         }
         self.ingest(event, now_ms);
-
-        // Inferred processes and virtual subagents depend on this runtime's
-        // observation channel. They cannot remain running after it disappears.
-        self.orphan_runtime_dependents(&session_id, node, now_ms);
         self.request_sweep(now_ms);
-    }
-
-    /// Marks descendants that cannot outlive a dead runtime as unobservable.
-    pub(super) fn orphan_runtime_dependents(
-        &mut self,
-        session_id: &SessionId,
-        parent: &NodeId,
-        now_ms: i64,
-    ) {
-        let children = self.mark_runtime_dependents(session_id, parent, now_ms);
-        if children.is_empty() {
-            return;
-        }
-        self.persist_session_quietly(session_id);
-        self.resolve_lifecycle_attention(session_id, &children, now_ms);
-        self.push_tree(session_id, now_ms);
-        self.push_session_state(session_id, now_ms);
     }
 
     /// Applies only the in-memory part of dependent retirement. Event ingestion
@@ -334,7 +323,7 @@ mod tests {
     use super::*;
     use crate::core::clients::Attachment;
     use crate::core::testing::Harness;
-    use crate::core::Command;
+    use crate::core::{Command, FailedIngestCheckpoint};
     use turn_core::attention::AttentionDemandKind;
     use turn_core::ids::{PaneId, SessionId};
     use turn_core::model::ProcessNode;
@@ -370,6 +359,57 @@ mod tests {
                 .get(&child_id)
                 .unwrap()
                 .lifecycle,
+            Lifecycle::Lost
+        );
+    }
+
+    #[tokio::test]
+    async fn a_process_exit_checkpoints_virtual_descendants_with_the_owner() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_owner_exit_checkpoint");
+        harness.add_session(session.clone(), PaneId::new(), NOW);
+        let mut parent = ProcessNode::agent(session.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        let mut child = ProcessNode::agent(session.clone(), "reviewer", "/tmp", NOW);
+        child.kind = NodeKind::Subagent;
+        child.lifecycle = Lifecycle::Alive;
+        child.link_to(parent_id.clone(), Relation::Confirmed);
+        let child_id = child.id.clone();
+        {
+            let tree = &mut harness.core.sessions.get_mut(&session).unwrap().tree;
+            tree.insert(parent);
+            tree.insert(child);
+        }
+        harness.core.persist_session(&session).unwrap();
+
+        harness.core.record_exit(
+            &session,
+            &parent_id,
+            ExitInfo {
+                code: 0,
+                signal: None,
+            },
+            NOW + 1,
+        );
+
+        assert_eq!(
+            harness.core.sessions[&session]
+                .tree
+                .get(&child_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Lost
+        );
+        let durable = harness
+            .core
+            .store
+            .sessions()
+            .get(&session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.tree.get(&child_id).unwrap().lifecycle,
             Lifecycle::Lost
         );
     }
@@ -412,6 +452,88 @@ mod tests {
             .get(&nested_id)
             .unwrap()
             .is_running());
+    }
+
+    #[tokio::test]
+    async fn a_later_exit_waits_unapplied_behind_an_older_failed_checkpoint() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_exit_checkpoint_barrier");
+        harness.add_session(session.clone(), PaneId::new(), NOW);
+
+        let mut earlier = ProcessNode::agent(session.clone(), "claude", "/tmp", NOW);
+        earlier.lifecycle = Lifecycle::Alive;
+        earlier.turn = Some(turn_core::state::Turn::Idle);
+        let earlier_id = earlier.id.clone();
+        let mut later = ProcessNode::agent(session.clone(), "reviewer", "/tmp", NOW);
+        later.lifecycle = Lifecycle::Alive;
+        let later_id = later.id.clone();
+        {
+            let tree = &mut harness.core.sessions.get_mut(&session).unwrap().tree;
+            tree.insert(earlier);
+            tree.insert(later);
+        }
+        harness.core.persist_session(&session).unwrap();
+
+        let pending_event = TurnEvent::new(
+            session.clone(),
+            EventKind::AgentIdle,
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_node(earlier_id);
+        harness
+            .core
+            .failed_ingest_checkpoints
+            .push_back(FailedIngestCheckpoint {
+                event: pending_event,
+                effects: Vec::new(),
+            });
+
+        harness.core.record_exit(
+            &session,
+            &later_id,
+            ExitInfo {
+                code: 0,
+                signal: None,
+            },
+            NOW + 2,
+        );
+
+        assert!(harness.core.sessions[&session]
+            .tree
+            .get(&later_id)
+            .unwrap()
+            .is_running());
+        assert_eq!(harness.core.deferred_runtime_inputs.len(), 1);
+        assert!(matches!(
+            harness.core.deferred_runtime_inputs.front(),
+            Some(DeferredRuntimeInput::Exit { node_id, .. }) if node_id == &later_id
+        ));
+
+        harness.core.retry_failed_ingest_checkpoints(NOW + 3);
+
+        assert!(harness.core.failed_ingest_checkpoints.is_empty());
+        assert!(harness.core.deferred_runtime_inputs.is_empty());
+        assert_eq!(
+            harness.core.sessions[&session]
+                .tree
+                .get(&later_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Exited { code: 0 }
+        );
+        let durable = harness
+            .core
+            .store
+            .sessions()
+            .get(&session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.tree.get(&later_id).unwrap().lifecycle,
+            Lifecycle::Exited { code: 0 }
+        );
     }
 
     /// Waits for the exit watcher to report, then applies it the way the loop does.

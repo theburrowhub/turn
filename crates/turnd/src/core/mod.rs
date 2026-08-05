@@ -49,7 +49,7 @@ use turn_core::ids::{NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
-use turn_pty::{ProcessSupervisor, PtyProcess, ScreenSize};
+use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize};
 use turn_store::Store;
 
 /// How often the loop wakes up when nothing is happening.
@@ -124,6 +124,23 @@ pub(crate) struct FailedIngestCheckpoint {
     effects: Vec<Effect>,
 }
 
+/// One source fact held behind an older failed runtime checkpoint.
+pub(crate) enum DeferredRuntimeInput {
+    Event {
+        event: Box<TurnEvent>,
+        now_ms: i64,
+    },
+    /// Exit observation has richer information than `TurnEvent` (notably the
+    /// platform signal name), so retain the source fact rather than partially
+    /// mutating the Session and trying to reconstruct it later.
+    Exit {
+        session_id: SessionId,
+        node_id: NodeId,
+        info: ExitInfo,
+        now_ms: i64,
+    },
+}
+
 /// Everything the daemon owns.
 pub struct Core {
     /// Shared with the public daemon handle so the store cannot lose its process
@@ -167,7 +184,7 @@ pub struct Core {
     /// Runtime events held behind the failed-checkpoint barrier, still unapplied.
     /// Applying them early could let a later successful checkpoint persist the
     /// global attention changes of an older event whose own transaction failed.
-    pub(crate) deferred_ingest_events: VecDeque<(TurnEvent, i64)>,
+    pub(crate) deferred_runtime_inputs: VecDeque<DeferredRuntimeInput>,
 
     /// How trustworthy the source of each node's *current turn state* was.
     ///
@@ -248,7 +265,7 @@ impl Core {
             attention: AttentionManager::new(),
             user: UserContext::default(),
             failed_ingest_checkpoints: VecDeque::new(),
-            deferred_ingest_events: VecDeque::new(),
+            deferred_runtime_inputs: VecDeque::new(),
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
             preview_probes: HashMap::new(),
@@ -430,7 +447,7 @@ impl Core {
         } else {
             tracing::error!(
                 pending = self.failed_ingest_checkpoints.len(),
-                deferred = self.deferred_ingest_events.len(),
+                deferred = self.deferred_runtime_inputs.len(),
                 "runtime events remain uncheckpointed after the final retry; skipped standalone attention flush"
             );
         }
