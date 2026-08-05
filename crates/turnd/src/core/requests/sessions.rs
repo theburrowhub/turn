@@ -28,6 +28,7 @@ impl Core {
     ) -> Answer {
         let name = check_name(&name)?;
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let cwd = cwd
             .filter(|cwd| !cwd.trim().is_empty())
             .unwrap_or_else(|| workspace.root.clone());
@@ -88,6 +89,7 @@ impl Core {
     ) -> Answer {
         let name = check_name(&name)?;
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let cwd = cwd
             .filter(|cwd| !cwd.trim().is_empty())
             .unwrap_or_else(|| workspace.root.clone());
@@ -134,6 +136,7 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let template = self
             .templates
             .get(template_id)
@@ -184,6 +187,7 @@ impl Core {
         let name = check_name(&name)?;
         let branch = validate_git_branch(&branch)?;
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let path = resolve_worktree_path(
             &self.data_dir,
             workspace_id,
@@ -297,6 +301,7 @@ impl Core {
     ) -> Answer {
         let branch = validate_git_branch(&branch)?;
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let template = self
             .templates
             .get(template_id)
@@ -454,6 +459,7 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         let workspace = self.workspace(workspace_id)?.clone();
+        require_workspace_accepts_sessions(&workspace)?;
         let template = self
             .templates
             .get(template_id)
@@ -713,6 +719,16 @@ impl Core {
         Ok(Response::Session {
             session: Box::new(session),
         })
+    }
+}
+
+fn require_workspace_accepts_sessions(workspace: &Workspace) -> Result<(), ProtoError> {
+    if workspace.archived {
+        Err(ProtoError::refused(
+            "Unarchive the Workspace before creating a Session",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1462,6 +1478,51 @@ mod tests {
         assert_eq!(harness.core.sessions.len(), sessions_before);
         assert_eq!(harness.core.processes.len(), processes_before);
         assert_eq!(harness.core.store.sessions().count().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_archived_workspace_cannot_create_a_hidden_session() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace = match harness
+            .core
+            .create_workspace("filed-project".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness
+            .core
+            .archive_workspace(&workspace, true, 11)
+            .unwrap();
+        let sessions_before = harness.core.sessions.len();
+        let processes_before = harness.core.processes.len();
+
+        let error = harness
+            .core
+            .create_session(
+                &workspace,
+                "Invisible writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .expect_err("an archived Workspace must be restored before adding work");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("Unarchive"));
+        assert_eq!(harness.core.sessions.len(), sessions_before);
+        assert_eq!(harness.core.processes.len(), processes_before);
+        assert_eq!(harness.core.store.sessions().count().unwrap(), 0);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

@@ -218,8 +218,17 @@ impl Core {
         checkout_id: &CheckoutId,
         now_ms: i64,
     ) -> Answer {
-        self.workspace(workspace_id)?;
+        if self.workspace(workspace_id)?.archived {
+            return Err(ProtoError::refused(
+                "Unarchive the Workspace before acquiring its write lease",
+            ));
+        }
         let session = self.session(session_id)?;
+        if session.is_archived() {
+            return Err(ProtoError::refused(
+                "Unarchive the Session before acquiring a write lease",
+            ));
+        }
         if &session.workspace_id != workspace_id {
             return Err(ProtoError::invalid(
                 "The Session does not belong to that Workspace",
@@ -240,7 +249,6 @@ impl Core {
         session.checkout_id = checkout_id.clone();
         session.worktree_path = None;
         session.read_only_enforced = false;
-        self.persist_session(session_id)?;
         self.bump_hierarchy();
         self.push_workspace_lease(workspace_id, Some(lease.clone()), now_ms);
         Ok(Response::WorkspaceWriteLease {
@@ -295,7 +303,7 @@ impl Core {
         let released = self
             .store
             .hierarchy()
-            .release_write_lease(lease_id, expected_generation, now_ms)
+            .release_write_lease_and_assign_read_only(lease_id, expected_generation, now_ms)
             .map_err(store)?;
         if !released {
             return Err(ProtoError::new(
@@ -305,9 +313,9 @@ impl Core {
         }
         if let Some(session) = self.sessions.get_mut(&current.session_id) {
             session.mode = SessionMode::ReadOnly;
+            session.worktree_path = None;
             session.read_only_enforced = false;
         }
-        self.persist_session(&current.session_id)?;
         self.bump_hierarchy();
         self.push_workspace_lease(workspace_id, None, now_ms);
         Ok(Response::WorkspaceWriteLease {
@@ -628,6 +636,16 @@ impl Core {
         error: turn_store::StoreError,
     ) -> ProtoError {
         match &error {
+            turn_store::StoreError::ArchivedWorkspace { .. } => {
+                return ProtoError::refused(
+                    "Unarchive the Workspace before acquiring its write lease",
+                )
+                .with_detail(error.to_string());
+            }
+            turn_store::StoreError::ArchivedSession { .. } => {
+                return ProtoError::refused("Unarchive the Session before acquiring a write lease")
+                    .with_detail(error.to_string());
+            }
             turn_store::StoreError::LeaseReconciliationRequired { .. } => {
                 return ProtoError::refused(
                     "The primary checkout requires explicit write-lease reconciliation",
@@ -964,6 +982,157 @@ mod tests {
                 .unwrap()
                 .id,
             lease.id
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_sessions_and_workspaces_cannot_acquire_hidden_authority() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "archived-authority".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_read_only_session(
+                &workspace_id,
+                "reader".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let checkout = CheckoutId::primary_for(&workspace_id);
+
+        harness
+            .core
+            .archive_session(&session_id, true, NOW + 2)
+            .unwrap();
+        let archived_session = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 3)
+            .expect_err("an archived Session cannot become the hidden writer");
+        assert_eq!(archived_session.code, ErrorCode::Refused);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .is_none());
+
+        harness
+            .core
+            .archive_session(&session_id, false, NOW + 4)
+            .unwrap();
+        harness
+            .core
+            .archive_workspace(&workspace_id, true, NOW + 5)
+            .unwrap();
+        let archived_workspace = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 6)
+            .expect_err("an archived Workspace cannot grant write authority");
+        assert_eq!(archived_workspace.code, ErrorCode::Refused);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::ReadOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn acquisition_has_no_fallible_session_persist_after_the_atomic_commit() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "atomic-acquire".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_read_only_session(
+                &workspace_id,
+                "promote me".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        // Leave an invalid Pane-to-node reference only in memory. The lease
+        // transition updates the durable Session scalar itself and should still
+        // succeed. A redundant whole-Session persist after that commit would hit
+        // the real foreign key, return an error after authority had changed and
+        // reproduce the split-brain this test guards against.
+        let pane_id = harness.core.sessions[&session_id].layout.panes()[0]
+            .id
+            .clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .get_mut(&pane_id)
+            .unwrap()
+            .node_id = Some(NodeId::from_stored("proc_missing_after_lease_commit"));
+
+        let checkout = CheckoutId::primary_for(&workspace_id);
+        let response = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 2)
+            .expect("the atomic store transition is the only durable write");
+        assert!(matches!(
+            response,
+            Response::WorkspaceWriteLease { lease: Some(_), .. }
+        ));
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::MainCheckout
+        );
+        assert_eq!(
+            harness
+                .core
+                .store
+                .sessions()
+                .get(&session_id)
+                .unwrap()
+                .unwrap()
+                .mode,
+            SessionMode::MainCheckout
         );
     }
 

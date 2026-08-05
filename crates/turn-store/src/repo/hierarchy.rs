@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, Session, SessionMode,
-    TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
+    SessionStatus, TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
 };
 
 pub struct HierarchyRepo<'a> {
@@ -146,8 +146,10 @@ impl<'a> HierarchyRepo<'a> {
         now_ms: i64,
     ) -> Result<Option<WorkspaceWriteLease>> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        Self::ensure_workspace_accepts_session(&tx, session)?;
         let lease = match session.mode {
             SessionMode::MainCheckout => {
+                Self::ensure_new_session(&tx, session)?;
                 SessionRepo::save_in_transaction(&tx, session)?;
                 Some(Self::acquire_in(
                     &tx,
@@ -215,6 +217,7 @@ impl<'a> HierarchyRepo<'a> {
                 "a read-only Session cannot carry a worktree path",
             ));
         }
+        Self::ensure_workspace_accepts_session(tx, session)?;
         Self::ensure_new_session(tx, session)?;
 
         let primary: Option<String> = tx
@@ -277,6 +280,7 @@ impl<'a> HierarchyRepo<'a> {
         }
         let safe_checkout = checkout_for_persistence(checkout);
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        Self::ensure_workspace_accepts_session(&tx, session)?;
         Self::ensure_new_session(&tx, session)?;
 
         let primary: Option<(String, String)> = tx
@@ -471,6 +475,11 @@ impl<'a> HierarchyRepo<'a> {
     }
 
     fn ensure_new_session(tx: &Transaction<'_>, session: &Session) -> Result<()> {
+        if session.status == SessionStatus::Archived {
+            return Err(StoreError::ArchivedSession {
+                session_id: session.id.to_string(),
+            });
+        }
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
             params![session.id.as_str()],
@@ -483,6 +492,26 @@ impl<'a> HierarchyRepo<'a> {
             ));
         }
         Ok(())
+    }
+
+    fn ensure_workspace_accepts_session(tx: &Transaction<'_>, session: &Session) -> Result<()> {
+        let archived: Option<bool> = tx
+            .query_row(
+                "SELECT archived FROM workspaces WHERE id = ?1",
+                params![session.workspace_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match archived {
+            Some(false) => Ok(()),
+            Some(true) => Err(StoreError::ArchivedWorkspace {
+                workspace_id: session.workspace_id.to_string(),
+            }),
+            None => Err(StoreError::UnknownReference {
+                what: "session",
+                missing: session.workspace_id.to_string(),
+            }),
+        }
     }
 
     fn validate_id(what: &'static str, value: &str, prefix: &str) -> Result<()> {
@@ -594,11 +623,17 @@ impl<'a> HierarchyRepo<'a> {
                 lease.generation as i64,
             ],
         )?;
-        tx.execute(
+        let changed = tx.execute(
             "UPDATE sessions SET mode = 'main_checkout', checkout_id = ?2, \
-                    worktree_path = NULL, read_only_enforced = 0 WHERE id = ?1",
+                    worktree_path = NULL, read_only_enforced = 0 \
+             WHERE id = ?1 AND status != 'archived'",
             params![session.as_str(), checkout.as_str()],
         )?;
+        if changed != 1 {
+            return Err(StoreError::ArchivedSession {
+                session_id: session.to_string(),
+            });
+        }
         Ok(lease)
     }
 
@@ -608,9 +643,10 @@ impl<'a> HierarchyRepo<'a> {
         session: &SessionId,
         checkout: &CheckoutId,
     ) -> Result<(String, bool)> {
-        let identity: Option<(String, bool, String, String)> = tx
+        let identity: Option<(String, bool, String, String, bool, bool)> = tx
             .query_row(
-                "SELECT w.root, w.lease_reconciliation_required, c.path, c.canonical_path \
+                "SELECT w.root, w.lease_reconciliation_required, c.path, c.canonical_path, \
+                        w.archived, s.status = 'archived' \
                  FROM sessions s \
                  JOIN workspaces w ON w.id = s.workspace_id \
                  JOIN workspace_checkouts c ON c.workspace_id = s.workspace_id \
@@ -618,10 +654,26 @@ impl<'a> HierarchyRepo<'a> {
                    AND c.id = ?3 AND c.workspace_id = ?2 \
                    AND s.checkout_id = c.id AND c.is_primary = 1",
                 params![session.as_str(), workspace.as_str(), checkout.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((root, reconciliation_required, checkout_path, stored_canonical)) = identity
+        let Some((
+            root,
+            reconciliation_required,
+            checkout_path,
+            stored_canonical,
+            workspace_archived,
+            session_archived,
+        )) = identity
         else {
             return Err(StoreError::InvalidLeaseOwnership {
                 workspace_id: workspace.to_string(),
@@ -629,6 +681,16 @@ impl<'a> HierarchyRepo<'a> {
                 checkout_id: checkout.to_string(),
             });
         };
+        if workspace_archived {
+            return Err(StoreError::ArchivedWorkspace {
+                workspace_id: workspace.to_string(),
+            });
+        }
+        if session_archived {
+            return Err(StoreError::ArchivedSession {
+                session_id: session.to_string(),
+            });
+        }
         if reconciliation_required {
             return Ok((stored_canonical, true));
         }
@@ -721,29 +783,56 @@ impl<'a> HierarchyRepo<'a> {
         )? > 0)
     }
 
-    /// Releases exactly the lease generation the caller observed.
+    /// Releases exactly the lease generation the caller observed and demotes its
+    /// owning Session in the same transaction.
     ///
     /// Addressing a Session alone is not fencing: after a handoff, a stale caller
     /// could release the new owner's lease. Both the immutable lease id and its
-    /// monotonic checkout generation must match.
-    pub fn release_write_lease(&self, id: &LeaseId, generation: u64, now_ms: i64) -> Result<bool> {
+    /// monotonic checkout generation must match. A caller must never persist the
+    /// Session mode as a second step: a failure there would leave a Main Checkout
+    /// Session without its authority.
+    pub fn release_write_lease_and_assign_read_only(
+        &self,
+        id: &LeaseId,
+        generation: u64,
+        now_ms: i64,
+    ) -> Result<bool> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT session_id FROM workspace_write_leases \
+                 WHERE id = ?1 AND generation = ?2 AND state != 'released'",
+                params![id.as_str(), generation as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(owner) = owner else {
+            tx.commit()?;
+            return Ok(false);
+        };
         let changed = tx.execute(
             "UPDATE workspace_write_leases SET state = 'released', released_ms = ?3, \
                     heartbeat_ms = ?3 \
              WHERE id = ?1 AND generation = ?2 AND state != 'released'",
             params![id.as_str(), generation as i64, now_ms],
         )?;
-        tx.commit()?;
-        Ok(changed == 1)
-    }
-
-    pub fn assign_read_only(&self, session: &SessionId, enforced: bool) -> Result<bool> {
-        Ok(self.conn.execute(
+        if changed != 1 {
+            tx.commit()?;
+            return Ok(false);
+        }
+        let session_changed = tx.execute(
             "UPDATE sessions SET mode = 'read_only', worktree_path = NULL, \
-                    read_only_enforced = ?2 WHERE id = ?1",
-            params![session.as_str(), enforced],
-        )? > 0)
+                    read_only_enforced = 0 WHERE id = ?1",
+            params![&owner],
+        )?;
+        if session_changed != 1 {
+            return Err(StoreError::UnknownReference {
+                what: "workspace write lease",
+                missing: owner,
+            });
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn bind_pane(&self, binding: &PaneNodeBinding) -> Result<()> {
@@ -1022,13 +1111,145 @@ mod tests {
         assert!(matches!(error, StoreError::WriteLeaseHeld { .. }));
         assert!(store
             .hierarchy()
-            .release_write_lease(&lease.id, lease.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
             .unwrap());
         let second_lease = store
             .hierarchy()
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+        assert_eq!(
+            store.sessions().get(&first.id).unwrap().unwrap().mode,
+            SessionMode::ReadOnly,
+            "release and Session demotion are one durable transition"
+        );
+    }
+
+    #[test]
+    fn release_and_session_demotion_roll_back_as_one_transition() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "atomic-release");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::MainCheckout
+        );
+
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_session_demotion \
+                 BEFORE UPDATE OF mode ON sessions \
+                 WHEN NEW.mode = 'read_only' \
+                 BEGIN SELECT RAISE(ABORT, 'injected Session demotion failure'); END;",
+            )
+            .unwrap();
+        let error = store
+            .hierarchy()
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 1)
+            .expect_err("the injected second write must abort the whole transaction");
+        assert!(matches!(error, StoreError::Sqlite(_)));
+        assert_eq!(
+            store
+                .hierarchy()
+                .active_lease(&workspace.id)
+                .unwrap()
+                .unwrap(),
+            lease,
+            "the lease update must roll back with the failed Session update"
+        );
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::MainCheckout
+        );
+
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_session_demotion;")
+            .unwrap();
+        assert!(store
+            .hierarchy()
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
+            .unwrap());
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn archived_workspaces_cannot_create_session_authority() {
+        let store = testing::store();
+        let mut workspace = testing::saved_workspace(&store, "archived-create");
+        workspace.archived = true;
+        store.workspaces().save(&workspace).unwrap();
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "hidden writer",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Agent)),
+            T0 + 1,
+        );
+        session.mode = SessionMode::MainCheckout;
+
+        let error = store
+            .hierarchy()
+            .create_session(&session, T0 + 1)
+            .expect_err("an archived Workspace cannot mint hidden authority");
+        assert!(matches!(error, StoreError::ArchivedWorkspace { .. }));
+        assert!(store.sessions().get(&session.id).unwrap().is_none());
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn archived_sessions_and_workspaces_cannot_acquire_authority() {
+        let store = testing::store();
+        let mut workspace = testing::saved_workspace(&store, "archived-acquire");
+        let mut session = testing::saved_session(&store, &workspace.id, "reader");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+
+        session.status = SessionStatus::Archived;
+        store.sessions().save(&session).unwrap();
+        let archived_session = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0 + 1)
+            .expect_err("an archived Session cannot become a hidden writer");
+        assert!(matches!(
+            archived_session,
+            StoreError::ArchivedSession { .. }
+        ));
+
+        session.status = SessionStatus::Active;
+        store.sessions().save(&session).unwrap();
+        workspace.archived = true;
+        store.workspaces().save(&workspace).unwrap();
+        let archived_workspace = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0 + 2)
+            .expect_err("an archived Workspace cannot grant authority");
+        assert!(matches!(
+            archived_workspace,
+            StoreError::ArchivedWorkspace { .. }
+        ));
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1638,7 +1859,7 @@ mod tests {
             .unwrap();
         assert!(!store
             .hierarchy()
-            .release_write_lease(&old.id, old.generation + 1, T0 + 1)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation + 1, T0 + 1)
             .unwrap());
         assert_eq!(
             store
@@ -1652,7 +1873,7 @@ mod tests {
 
         assert!(store
             .hierarchy()
-            .release_write_lease(&old.id, old.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation, T0 + 2)
             .unwrap());
         let current = store
             .hierarchy()
@@ -1662,7 +1883,7 @@ mod tests {
 
         assert!(!store
             .hierarchy()
-            .release_write_lease(&current.id, old.generation, T0 + 4)
+            .release_write_lease_and_assign_read_only(&current.id, old.generation, T0 + 4)
             .unwrap());
         assert_eq!(
             store

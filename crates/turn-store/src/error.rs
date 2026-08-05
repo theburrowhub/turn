@@ -117,6 +117,18 @@ pub enum StoreError {
         checkout_id: String,
     },
 
+    /// Archived navigation state cannot become new checkout authority. The
+    /// daemon checks this before calling the store for a useful UI error, while
+    /// the transaction repeats the check so another writer cannot archive an
+    /// entity between the projection read and the fenced write.
+    #[error("archived workspace {workspace_id} cannot create or acquire Session authority")]
+    ArchivedWorkspace { workspace_id: String },
+
+    /// An archived Session is deliberately outside normal navigation and may
+    /// not be promoted into a hidden primary-checkout writer.
+    #[error("archived session {session_id} cannot acquire checkout authority")]
+    ArchivedSession { session_id: String },
+
     /// A specialised Session creation API received a shape that would make the
     /// persisted mode ambiguous or unsafe. The caller must fix the domain object;
     /// the store never silently converts a writer into another mode.
