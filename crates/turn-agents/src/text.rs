@@ -35,6 +35,21 @@ pub const MAX_IDENTIFIER_CHARS: usize = 128;
 /// where `&& rm -rf /` lives.
 pub const MAX_COMMAND_CHARS: usize = 4_096;
 
+/// Why a payload command can or cannot be represented faithfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandText {
+    /// Nothing legible remained after normalisation.
+    Empty,
+    /// The complete normalised command, with no omitted suffix.
+    Complete(String),
+    /// The complete command cannot fit Turn's bounded permission model.
+    TooLong,
+}
+
+/// Summary used when Turn deliberately refuses to show a partial command.
+pub const COMMAND_TOO_LONG_SUMMARY: &str =
+    "Command exceeds Turn's 4096-character display limit; inspect the agent terminal before responding";
+
 /// Cap on the raw payload kept beside an event for debugging.
 pub const MAX_RAW_BYTES: usize = 8 * 1024;
 
@@ -96,10 +111,19 @@ pub fn field(text: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// A command, made safe to display but never shortened.
-pub fn command(text: &str) -> Option<String> {
-    let cleaned = excerpt(text, MAX_COMMAND_CHARS);
-    (!cleaned.is_empty()).then_some(cleaned)
+/// A command made safe to display, or an explicit refusal to shorten it.
+pub fn command(text: &str) -> CommandText {
+    // Ask `excerpt` for one character beyond the contract so it can tell us the
+    // semantic command is too large without retaining an attacker-sized result.
+    // Its ellipsis is never returned to a permission view.
+    let cleaned = excerpt(text, MAX_COMMAND_CHARS + 1);
+    if cleaned.is_empty() {
+        CommandText::Empty
+    } else if cleaned.chars().count() > MAX_COMMAND_CHARS {
+        CommandText::TooLong
+    } else {
+        CommandText::Complete(cleaned)
+    }
 }
 
 /// An identifier Turn may later hand to a tool as an argument.
@@ -217,6 +241,16 @@ mod tests {
         let long = excerpt(&"á".repeat(500), 240);
         assert_eq!(long.chars().count(), 241);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn a_permission_command_is_complete_or_explicitly_refused_never_excerpted() {
+        let exact = "x".repeat(MAX_COMMAND_CHARS);
+        assert_eq!(command(&exact), CommandText::Complete(exact));
+
+        let hidden_tail = format!("{} && rm -rf /", "x".repeat(MAX_COMMAND_CHARS));
+        assert_eq!(command(&hidden_tail), CommandText::TooLong);
+        assert_eq!(command("  \n  "), CommandText::Empty);
     }
 
     /// The attack this module exists for: an agent puts an escape sequence in a

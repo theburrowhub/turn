@@ -84,7 +84,7 @@ use crate::adapter::{
 use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::Value;
-use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
+use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
 
 /// Hook events Turn subscribes to, in the only spelling Codex acts on.
 ///
@@ -403,11 +403,28 @@ impl AgentAdapter for CodexAdapter {
             "permission_request" => {
                 let tool_name = pick(payload, &["tool_name", "tool-name", "tool"]);
                 let command = permission_command(payload);
+                let display_command = command.as_deref().map(text::command);
+                let command_too_long = matches!(&display_command, Some(text::CommandText::TooLong));
+                let stored_command = match display_command {
+                    Some(text::CommandText::Complete(command)) => Some(command),
+                    Some(text::CommandText::TooLong) | Some(text::CommandText::Empty) | None => {
+                        None
+                    }
+                };
+                let summary = if command_too_long {
+                    text::COMMAND_TOO_LONG_SUMMARY.to_string()
+                } else {
+                    permission_summary(tool_name, command.as_deref(), payload)
+                };
                 vec![make(EventKind::AgentPermissionRequired {
-                    summary: permission_summary(tool_name, command.as_deref(), payload),
+                    summary,
                     // Rated on the command as it arrived; stored filtered.
-                    risk: risk::assess(tool_name, command.as_deref()),
-                    command: command.as_deref().and_then(text::command),
+                    risk: if command_too_long {
+                        Risk::High
+                    } else {
+                        risk::assess(tool_name, command.as_deref())
+                    },
+                    command: stored_command,
                     tool_name: tool_name.and_then(text::field),
                 })]
             }
@@ -514,10 +531,12 @@ fn permission_command(payload: &Value) -> Option<String> {
             }
             // Codex describes an exec approval as an argv array.
             if let Some(argv) = inner.get("command").and_then(Value::as_array) {
+                // One non-string member makes the representation unknown. Dropping
+                // it would display and persist a command the tool never requested.
                 let joined = argv
                     .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
                     .join(" ");
                 if !joined.is_empty() {
                     return Some(joined);
@@ -529,8 +548,8 @@ fn permission_command(payload: &Value) -> Option<String> {
     if let Some(argv) = payload.get("command").and_then(Value::as_array) {
         let joined = argv
             .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?
             .join(" ");
         if !joined.is_empty() {
             return Some(joined);
@@ -1056,6 +1075,47 @@ mod tests {
                 assert_eq!(command.as_deref(), Some("touch approval-probe.txt"));
                 assert_eq!(tool_name.as_deref(), Some("Bash"));
                 assert_eq!(*risk, Risk::Medium);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_argv_permission_with_a_non_string_member_is_not_partially_reconstructed() {
+        let events = normalise(json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "shell",
+            "tool_input": { "command": ["printf", 7, "hidden"] }
+        }));
+        match &events[0].kind {
+            EventKind::AgentPermissionRequired {
+                command, summary, ..
+            } => {
+                assert_eq!(command, &None);
+                assert_eq!(summary, "Use shell");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_permission_command_is_high_risk_and_not_excerpted() {
+        let command = format!("{} --force", "x".repeat(text::MAX_COMMAND_CHARS));
+        let events = normalise(json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "shell",
+            "command": command
+        }));
+        match &events[0].kind {
+            EventKind::AgentPermissionRequired {
+                command,
+                summary,
+                risk,
+                ..
+            } => {
+                assert_eq!(command, &None);
+                assert_eq!(summary, text::COMMAND_TOO_LONG_SUMMARY);
+                assert_eq!(*risk, Risk::High);
             }
             other => panic!("unexpected {other:?}"),
         }

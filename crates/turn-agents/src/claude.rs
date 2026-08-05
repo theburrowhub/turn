@@ -28,7 +28,7 @@ use crate::adapter::{
 use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::{json, Value};
-use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
+use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
 use turn_core::state::AwaitingReason;
 
 /// How hook callbacks reach Turn.
@@ -412,10 +412,27 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 // Rated on the command as it arrived, in full. Sanitising or
                 // shortening it first could hide the very fragment that makes it
                 // dangerous.
-                let risk = risk::assess(tool_name, command);
+                let mut risk = risk::assess(tool_name, command);
+                let display_command = command.map(text::command);
+                let command_too_long = matches!(&display_command, Some(text::CommandText::TooLong));
+                let stored_command = match display_command {
+                    Some(text::CommandText::Complete(command)) => Some(command),
+                    Some(text::CommandText::TooLong) => {
+                        // A command that cannot be reviewed faithfully is high risk
+                        // regardless of what the recogniser found in its full tail.
+                        risk = Risk::High;
+                        None
+                    }
+                    Some(text::CommandText::Empty) | None => None,
+                };
+                let summary = if command_too_long {
+                    text::COMMAND_TOO_LONG_SUMMARY.to_string()
+                } else {
+                    permission_summary(tool_name, command, payload)
+                };
                 vec![make(EventKind::AgentPermissionRequired {
-                    summary: permission_summary(tool_name, command, payload),
-                    command: command.and_then(text::command),
+                    summary,
+                    command: stored_command,
                     tool_name: tool_name.and_then(text::field),
                     risk,
                 })]
@@ -980,6 +997,30 @@ mod tests {
             events[0].attention_reason(),
             Some(AwaitingReason::Permission)
         );
+    }
+
+    #[test]
+    fn an_oversized_permission_command_is_never_presented_as_a_complete_command() {
+        let dangerous = format!("{} && rm -rf /", "x".repeat(text::MAX_COMMAND_CHARS));
+        let events = normalise(json!({
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": { "command": dangerous }
+        }));
+
+        match &events[0].kind {
+            EventKind::AgentPermissionRequired {
+                summary,
+                command,
+                risk,
+                ..
+            } => {
+                assert_eq!(summary, text::COMMAND_TOO_LONG_SUMMARY);
+                assert_eq!(command, &None, "a partial command would be a lie");
+                assert_eq!(*risk, Risk::High);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
