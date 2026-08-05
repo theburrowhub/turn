@@ -5,14 +5,15 @@
 //! different operations. None of the handlers below performs one as a side
 //! effect of another.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::workspaces::store;
 use super::Answer;
 use crate::core::Core;
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    HierarchyNodeKind, LeaseState, PaneNodeBinding, PreviewVisibility, SessionMode, TreeUiState,
+    HierarchyNodeKind, LeaseState, PaneNodeBinding, PreviewVisibility, ProcessNode,
+    RelationshipKind, SessionMode, TreeUiState,
 };
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
@@ -450,7 +451,75 @@ impl Core {
                 session_id: session_id.clone(),
                 node_id: node_id.clone(),
                 pane_id: binding.pane_id,
+                attention_subject_node_id: None,
             });
+        Ok(Response::PaneFocus { focus })
+    }
+
+    /// Focuses the existing Pane that can service an exact semantic Attention
+    /// subject without changing who the demand belongs to.
+    ///
+    /// A hook-declared subagent can be a real AgentNode while sharing its parent's
+    /// PTY. In that case the tree selection must stay on the child, while keyboard
+    /// focus goes to the nearest trusted runtime-owning ancestor with a Pane on this
+    /// surface. We never walk across provisional/merely-related edges, skip over a
+    /// distinct runtime, or create a Pane as a side effect of Attention.
+    pub(super) fn focus_pane_for_attention(
+        &self,
+        surface_id: String,
+        session_id: &SessionId,
+        subject_node_id: &NodeId,
+    ) -> Answer {
+        let surface_id = validate_surface_id(&surface_id)?;
+        let session = self.session(session_id)?;
+        let subject = session
+            .tree
+            .get(subject_node_id)
+            .ok_or_else(|| ProtoError::not_found("process node", subject_node_id.as_str()))?;
+        let bindings = self
+            .store
+            .hierarchy()
+            .bindings_for_session(session_id)
+            .map_err(store)?;
+
+        let focus_binding = if node_has_distinct_runtime(self, subject) {
+            // A node with its own runtime is its own input boundary. Its exact Pane
+            // may be focused, but a missing Pane never licenses routing to its parent.
+            visible_binding_for_node(&bindings, &surface_id, subject_node_id)
+        } else {
+            // A PreviewDetails binding is an honest view of a semantic Agent, not an
+            // input channel. Ignore it for Attention routing and find the runtime
+            // that actually owns the shared PTY.
+            (|| {
+                let mut cursor = subject;
+                let mut visited = HashSet::from([subject_node_id.clone()]);
+                loop {
+                    if !relationship_routes_to_runtime_owner(cursor) {
+                        return None;
+                    }
+                    let parent_id = cursor.parent.as_ref()?;
+                    if !visited.insert(parent_id.clone()) {
+                        return None;
+                    }
+                    let parent = session.tree.get(parent_id)?;
+                    if node_has_distinct_runtime(self, parent) {
+                        // This is the authentic input boundary. With no Pane on this
+                        // surface there is nowhere safe to focus, and walking past it
+                        // would type into a different Agent.
+                        return visible_binding_for_node(&bindings, &surface_id, parent_id);
+                    }
+                    cursor = parent;
+                }
+            })()
+        };
+
+        let focus = focus_binding.map(|binding| PaneFocusView {
+            surface_id,
+            session_id: session_id.clone(),
+            node_id: binding.node_id,
+            pane_id: binding.pane_id,
+            attention_subject_node_id: Some(subject_node_id.clone()),
+        });
         Ok(Response::PaneFocus { focus })
     }
 
@@ -704,6 +773,31 @@ impl Core {
             ],
         })
     }
+}
+
+fn visible_binding_for_node(
+    bindings: &[PaneNodeBinding],
+    surface_id: &str,
+    node_id: &NodeId,
+) -> Option<PaneNodeBinding> {
+    bindings
+        .iter()
+        .find(|binding| {
+            binding.node_id == *node_id
+                && (!binding.temporary || binding.surface_id.as_deref() == Some(surface_id))
+        })
+        .cloned()
+}
+
+fn node_has_distinct_runtime(core: &Core, node: &ProcessNode) -> bool {
+    node.pid.is_some() || core.processes.contains_key(&node.id)
+}
+
+fn relationship_routes_to_runtime_owner(node: &ProcessNode) -> bool {
+    matches!(
+        node.relationship.kind,
+        RelationshipKind::SpawnedBy | RelationshipKind::OwnsProcess
+    ) && node.relationship.confidence.may_steal_focus()
 }
 
 fn validate_surface_id(raw: &str) -> Result<String, ProtoError> {
@@ -1273,6 +1367,7 @@ mod tests {
         let mut claude = ProcessNode::agent(session_id.clone(), "claude", "/repo", NOW + 2);
         claude.title = "Claude Code".into();
         claude.lifecycle = Lifecycle::Alive;
+        claude.pid = Some(41_001);
         let claude_id = claude.id.clone();
         let main_pane = harness.core.sessions[&session_id].layout.panes()[0]
             .id
@@ -1346,6 +1441,72 @@ mod tests {
         );
         assert!(reviewer.pane_bindings.is_empty());
         assert_eq!(harness.core.sessions[&session_id].layout, saved_layout);
+
+        let generic_focus = harness
+            .core
+            .focus_pane_for_node("main-window".into(), &session_id, &reviewer_id)
+            .unwrap();
+        assert!(matches!(generic_focus, Response::PaneFocus { focus: None }));
+        let attention_focus = harness
+            .core
+            .focus_pane_for_attention("main-window".into(), &session_id, &reviewer_id)
+            .unwrap();
+        assert!(matches!(
+            attention_focus,
+            Response::PaneFocus {
+                focus: Some(PaneFocusView {
+                    node_id,
+                    pane_id,
+                    attention_subject_node_id: Some(subject),
+                    ..
+                })
+            } if node_id == claude_id && pane_id == main_pane && subject == reviewer_id
+        ));
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&reviewer_id)
+            .unwrap()
+            .relationship
+            .confidence = Confidence::InferredHigh;
+        assert!(matches!(
+            harness
+                .core
+                .focus_pane_for_attention("main-window".into(), &session_id, &reviewer_id)
+                .unwrap(),
+            Response::PaneFocus { focus: None }
+        ));
+        {
+            let reviewer = harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .get_mut(&reviewer_id)
+                .unwrap();
+            reviewer.relationship.confidence = Confidence::Explicit;
+            reviewer.pid = Some(42_424);
+        }
+        assert!(matches!(
+            harness
+                .core
+                .focus_pane_for_attention("main-window".into(), &session_id, &reviewer_id)
+                .unwrap(),
+            Response::PaneFocus { focus: None }
+        ));
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&reviewer_id)
+            .unwrap()
+            .pid = None;
 
         harness
             .core
@@ -1465,6 +1626,36 @@ mod tests {
             .get(&reviewer_id)
             .unwrap()
             .is_running());
+        let preview_focus = harness
+            .core
+            .focus_pane_for_attention("main-window".into(), &session_id, &reviewer_id)
+            .unwrap();
+        assert!(matches!(
+            preview_focus,
+            Response::PaneFocus {
+                focus: Some(PaneFocusView {
+                    node_id,
+                    pane_id,
+                    attention_subject_node_id: Some(subject),
+                    ..
+                })
+            } if node_id == claude_id && pane_id == main_pane && subject == reviewer_id
+        ));
+        let explicit_preview_focus = harness
+            .core
+            .focus_pane_for_node("main-window".into(), &session_id, &reviewer_id)
+            .unwrap();
+        assert!(matches!(
+            explicit_preview_focus,
+            Response::PaneFocus {
+                focus: Some(PaneFocusView {
+                    node_id,
+                    pane_id,
+                    attention_subject_node_id: None,
+                    ..
+                })
+            } if node_id == reviewer_id && pane_id == temporary.binding.pane_id
+        ));
 
         let (other_client, _other_frames) = harness.add_client(64);
         let other_snapshot = match harness

@@ -288,6 +288,14 @@ impl Core {
                 self.require_client_surface(client, &surface_id)?;
                 self.focus_pane_for_node(surface_id, &session_id, &node_id)
             }
+            Request::FocusPaneForAttention {
+                surface_id,
+                session_id,
+                subject_node_id,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.focus_pane_for_attention(surface_id, &session_id, &subject_node_id)
+            }
             Request::AttachPane {
                 session_id,
                 pane_id,

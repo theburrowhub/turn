@@ -281,6 +281,43 @@ async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer()
     assert_eq!(queued[0].entry.node_id.as_ref(), Some(&reviewer));
     assert!(queued[0].provisional);
 
+    let next = attention_of(ui.ask(Request::NextAttention).await).expect("Reviewer is next");
+    assert_eq!(next.entry.node_id.as_ref(), Some(&reviewer));
+    let goto = effects_of(
+        ui.ask(Request::GotoAttention {
+            attention_id: Some(next.entry.id.clone()),
+        })
+        .await,
+    );
+    assert!(goto.iter().any(|effect| matches!(
+        effect,
+        Effect::Focus {
+            session_id,
+            node_id: Some(node_id),
+        } if session_id == &agent.session && node_id == &reviewer
+    )));
+
+    let surface = "semantic-attention-window".to_string();
+    ui.ask(Request::GetHierarchy {
+        surface_id: surface.clone(),
+        include_archived: false,
+    })
+    .await;
+    let routed = ui
+        .ask(Request::FocusPaneForAttention {
+            surface_id: surface,
+            session_id: agent.session.clone(),
+            subject_node_id: reviewer.clone(),
+        })
+        .await;
+    assert!(matches!(
+        routed,
+        Response::PaneFocus {
+            focus: Some(ref focus)
+        } if focus.attention_subject_node_id.as_ref() == Some(&reviewer)
+            && focus.node_id == agent.node
+    ));
+
     let prompt = fixtures()["UserPromptSubmit"].clone();
     assert!(prompt.get("agent_id").is_none());
     post_hook(&agent.hook, &prompt).await;

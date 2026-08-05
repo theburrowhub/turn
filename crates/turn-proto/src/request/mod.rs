@@ -413,6 +413,16 @@ pub enum Request {
         session_id: SessionId,
         node_id: NodeId,
     },
+    /// Focuses the Pane through which one exact semantic attention subject can
+    /// actually be answered. The subject remains selected and attributed to
+    /// itself; the daemon may route input to a trusted runtime-owning ancestor
+    /// when the subject has neither a Pane nor an attachable runtime of its own.
+    /// It never creates a Pane implicitly.
+    FocusPaneForAttention {
+        surface_id: String,
+        session_id: SessionId,
+        subject_node_id: NodeId,
+    },
 
     /// Subscribes to a pane's screen and returns the current one.
     ///
@@ -603,6 +613,7 @@ impl Request {
             Request::ZoomPane { .. } => "zoom_pane",
             Request::OpenNodeAsTemporaryPane { .. } => "open_node_as_temporary_pane",
             Request::FocusPaneForNode { .. } => "focus_pane_for_node",
+            Request::FocusPaneForAttention { .. } => "focus_pane_for_attention",
             Request::AttachPane { .. } => "attach_pane",
             Request::ResyncPane { .. } => "resync_pane",
             Request::DetachPane { .. } => "detach_pane",
@@ -673,7 +684,9 @@ impl Request {
             | Request::SwapPanes { .. }
             | Request::ZoomPane { .. } => "layout",
             Request::OpenNodeAsTemporaryPane { .. } => "node_pane",
-            Request::FocusPaneForNode { .. } => "pane_focus",
+            Request::FocusPaneForNode { .. } | Request::FocusPaneForAttention { .. } => {
+                "pane_focus"
+            }
             Request::AttachPane { .. } => "attached",
             Request::ResyncPane { .. } => "screen",
             Request::DetachPane { .. } => "ack",
@@ -746,6 +759,7 @@ impl Request {
             | Request::ZoomPane { session_id, .. }
             | Request::OpenNodeAsTemporaryPane { session_id, .. }
             | Request::FocusPaneForNode { session_id, .. }
+            | Request::FocusPaneForAttention { session_id, .. }
             | Request::AttachPane { session_id, .. }
             | Request::ResyncPane { session_id, .. }
             | Request::DetachPane { session_id, .. }

@@ -137,7 +137,14 @@ pub struct NodePaneView {
     pub capability: NodePaneCapability,
 }
 
-/// The exact existing Pane selected by `focus_pane_for_node`.
+/// The exact existing Pane selected by a focus route.
+///
+/// `node_id` is always the node actually represented by the Pane. For ordinary
+/// tree focus that is also the requested node. Attention routing may instead
+/// carry an exact semantic subject in `attention_subject_node_id` while focusing
+/// the trusted ancestor runtime that can receive the user's input. Keeping both
+/// identities prevents a Reviewer demand from being attributed to Claude merely
+/// because Claude owns the shared PTY.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PaneFocusView {
@@ -145,6 +152,8 @@ pub struct PaneFocusView {
     pub session_id: SessionId,
     pub node_id: NodeId,
     pub pane_id: PaneId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_subject_node_id: Option<NodeId>,
 }
 
 #[cfg(test)]
@@ -159,6 +168,21 @@ mod tests {
     };
 
     const T0: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn attention_focus_keeps_the_semantic_subject_distinct_from_the_pane_node() {
+        let view = PaneFocusView {
+            surface_id: "main-window".into(),
+            session_id: SessionId::from_stored("sess_fix_climbing"),
+            node_id: NodeId::from_stored("proc_claude"),
+            pane_id: PaneId::from_stored("pane_claude"),
+            attention_subject_node_id: Some(NodeId::from_stored("proc_reviewer")),
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"node_id\":\"proc_claude\""));
+        assert!(json.contains("\"attention_subject_node_id\":\"proc_reviewer\""));
+        assert_eq!(serde_json::from_str::<PaneFocusView>(&json).unwrap(), view);
+    }
 
     #[test]
     fn hierarchy_keys_keep_entity_ids_strongly_typed_on_the_wire() {

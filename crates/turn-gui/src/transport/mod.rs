@@ -60,6 +60,13 @@ pub enum Ask {
         session_id: SessionId,
         node_id: NodeId,
     },
+    /// Resolve keyboard focus for an exact semantic Attention subject. The
+    /// response may name a different Pane-owning runtime node, but may never
+    /// change which tree node the demand belongs to.
+    AttentionFocus {
+        session_id: SessionId,
+        subject_node_id: NodeId,
+    },
     NodePane,
     Attach {
         session_id: SessionId,
@@ -90,6 +97,7 @@ impl Ask {
             Ask::Templates => "loading templates",
             Ask::AttentionQueue => "loading the attention queue",
             Ask::Preview { .. } => "loading an activity preview",
+            Ask::AttentionFocus { .. } => "focusing the pane that can answer attention",
             Ask::NodePane => "opening a node as a pane",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::Action(label) => label,

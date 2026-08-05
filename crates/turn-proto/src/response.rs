@@ -598,6 +598,7 @@ pub(crate) mod tests {
                     session_id: s.id.clone(),
                     node_id,
                     pane_id,
+                    attention_subject_node_id: Some(NodeId::from_stored("proc_reviewer")),
                 }),
             },
             Response::Attention { entry: None },

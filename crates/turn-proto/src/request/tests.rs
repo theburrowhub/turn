@@ -28,6 +28,21 @@ fn a_request_serialises_with_its_operation_as_a_tag() {
 }
 
 #[test]
+fn attention_focus_names_the_semantic_subject_not_a_guessed_pane_owner() {
+    let request = Request::FocusPaneForAttention {
+        surface_id: "window-a".into(),
+        session_id: session(),
+        subject_node_id: NodeId::from_stored("proc_reviewer"),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"op\":\"focus_pane_for_attention\""));
+    assert!(json.contains("\"subject_node_id\":\"proc_reviewer\""));
+    assert_eq!(request.expected_result(), "pane_focus");
+    assert_eq!(request.session_id(), Some(&session()));
+    assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+}
+
+#[test]
 fn keystrokes_survive_the_wire_byte_for_byte() {
     // A control character, a paste with a newline, and a non-UTF-8 byte.
     let raw = b"\x03echo hi\ncaf\xc3\xa9\xff".to_vec();
@@ -510,6 +525,11 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             node_id: node_id.clone(),
         },
+        Request::FocusPaneForAttention {
+            surface_id: "window-a".into(),
+            session_id: session_id.clone(),
+            subject_node_id: node_id.clone(),
+        },
         Request::AttachPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
@@ -598,7 +618,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 55 operations. This number is asserted so that adding one without
+    // 56 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 55, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 56, "the catalogue changed size: {names:?}");
 }

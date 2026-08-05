@@ -396,6 +396,7 @@ kind matters.
 | `set_preview_visibility` | `session_id`, `node_id`, `visibility` | `ack` |
 | `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `node_pane` |
 | `focus_pane_for_node` | `surface_id`, `session_id`, `node_id` | `pane_focus` |
+| `focus_pane_for_attention` | `surface_id`, `session_id`, `subject_node_id` | `pane_focus` |
 
 `get_hierarchy` is navigation bootstrap. `list_workspaces`, `list_sessions`, `get_session` and
 `get_process_tree` remain useful to administration, search and details, but composing them into a second
@@ -424,6 +425,15 @@ the Process stream or stop the Agent; restoring `inherit` or `show` exposes only
 `preview_history.entries` is ordered **newest first**. The optional limit is applied to that newest end, so
 with six stored facts and `limit: 4` the response contains `[6, 5, 4, 3]`; entry zero is the item Quick Preview
 highlights as current.
+
+`focus_pane_for_attention` keeps navigation identity and input ownership separate. The selected and
+acknowledged subject remains `subject_node_id`. If that semantic Agent has no attachable runtime, the daemon
+may return the nearest Pane-owning ancestor only across an `owns_process` or `spawned_by` relationship at
+`integrated` or `explicit` confidence. It never crosses a distinct child runtime, follows a provisional
+relationship or creates a Pane. `PaneFocusView.node_id` names the node represented by the actual Pane and
+`attention_subject_node_id` names the unchanged semantic subject. A PreviewDetails-only temporary Pane is
+not an input channel; a client may close that ephemeral view with `keep_processes` before focusing the
+resolved runtime Pane.
 
 ### Workspaces
 
@@ -684,7 +694,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `tree` | `session_id`, `nodes: [TreeNodeView]` |
 | `node` | `node: TreeNodeView` |
 | `node_pane` | `pane: NodePaneView` |
-| `pane_focus` | `focus?: PaneFocusView` |
+| `pane_focus` | `focus?: PaneFocusView` — absent when no safe existing Pane can receive focus |
 | `attention` | `entry?: AttentionView` — absent when the queue is empty |
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
@@ -1169,7 +1179,8 @@ on `WorkspaceCheckout`, not on the lease.
 `PaneNodeBinding` carries Pane, Session and node identity, temporary/durable ownership, optional
 `surface_id` and open time. `pane_capability` is the closed
 `NodePaneCapability::{Terminal, PreviewDetails}`, so a semantic-only subagent cannot be opened as a fake
-terminal.
+terminal. `PaneFocusView.node_id` always names the Pane's real node;
+`attention_subject_node_id?` preserves the distinct AgentNode whose Attention caused a runtime-owner route.
 
 `ActivityPreview` carries normalised text, source, confidence, stability/redaction flags, update time and
 optional source sequence for replacement ordering. It never carries raw bytes or an unredacted source.

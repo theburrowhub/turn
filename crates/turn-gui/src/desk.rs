@@ -468,6 +468,67 @@ impl Desk {
                 }
                 reactions
             }
+            (
+                Ask::AttentionFocus {
+                    session_id,
+                    subject_node_id,
+                },
+                Response::PaneFocus { focus },
+            ) => {
+                let Some(focus) = focus else {
+                    // Selection still landed on the exact semantic subject. With no
+                    // Pane on the trusted runtime boundary there is nowhere honest to
+                    // send keyboard focus, so opening remains an explicit action.
+                    return Vec::new();
+                };
+                if focus.session_id != session_id
+                    || focus.attention_subject_node_id.as_ref() != Some(&subject_node_id)
+                {
+                    return vec![Reaction::Notice(
+                        "the daemon returned an inconsistent Attention focus route".into(),
+                    )];
+                }
+                let preview_to_close = self.temporary_pane.as_ref().and_then(|pane| {
+                    (pane.binding.session_id == focus.session_id
+                        && pane.binding.node_id == subject_node_id
+                        && pane.binding.pane_id != focus.pane_id
+                        && matches!(pane.capability, NodePaneCapability::PreviewDetails))
+                    .then(|| pane.binding.clone())
+                });
+                let is_temporary = self.temporary_pane.as_ref().is_some_and(|pane| {
+                    pane.binding.pane_id == focus.pane_id
+                        && pane.binding.session_id == focus.session_id
+                });
+                if is_temporary {
+                    Vec::new()
+                } else {
+                    let mut reactions = Vec::new();
+                    if let Some(preview) = preview_to_close {
+                        self.temporary_pane = None;
+                        self.pane_owner.remove(&preview.pane_id);
+                        self.feeds.remove(&preview.pane_id);
+                        self.attaching.remove(&preview.pane_id);
+                        reactions.push(Reaction::Send {
+                            ask: Ask::Action("closing the semantic Attention preview"),
+                            request: Request::ClosePane {
+                                session_id: preview.session_id,
+                                pane_id: preview.pane_id,
+                                disposition: CloseDisposition::KeepProcesses,
+                            },
+                        });
+                    }
+                    reactions.push(Reaction::Send {
+                        ask: Ask::Action("focusing the runtime pane for Attention"),
+                        request: Request::FocusPane {
+                            session_id: focus.session_id,
+                            target: FocusTarget::Pane {
+                                pane_id: focus.pane_id,
+                            },
+                        },
+                    });
+                    reactions
+                }
+            }
             (_, Response::PaneFocus { focus }) => {
                 let Some(focus) = focus else {
                     return Vec::new();
@@ -868,11 +929,14 @@ impl Desk {
                     },
                 });
                 reactions.push(Reaction::Send {
-                    ask: Ask::Action("focusing an existing Pane for Attention"),
-                    request: Request::FocusPaneForNode {
+                    ask: Ask::AttentionFocus {
+                        session_id: session_id.clone(),
+                        subject_node_id: node_id.clone(),
+                    },
+                    request: Request::FocusPaneForAttention {
                         surface_id: self.surface_id.clone(),
                         session_id: session_id.clone(),
-                        node_id: node_id.clone(),
+                        subject_node_id: node_id.clone(),
                     },
                 });
             }
@@ -2020,14 +2084,14 @@ mod tests {
     use turn_core::event::{Confidence, Risk};
     use turn_core::ids::{AttentionId, WorkspaceId};
     use turn_core::model::{
-        NodeKind, Pane, PendingPermission as CorePermission, ProcessNode, Relation, Session,
-        Template, Workspace,
+        NodeKind, Pane, PaneNodeBinding, PendingPermission as CorePermission, ProcessNode,
+        Relation, Session, Template, Workspace,
     };
     use turn_core::state::{AwaitingReason, Lifecycle, Turn};
     use turn_core::Effect;
     use turn_proto::{
-        AttentionView, PaneAttachment, PaneStream, ScreenUpdate, ServerEvent, TerminalBytes,
-        Welcome,
+        AttentionView, PaneAttachment, PaneFocusView, PaneStream, ScreenUpdate, ServerEvent,
+        TerminalBytes, Welcome,
     };
 
     const T0: i64 = 1_700_000_000_000;
@@ -2343,6 +2407,187 @@ mod tests {
             T0,
         );
         assert_eq!(desk.selected(), Some(&target));
+    }
+
+    #[test]
+    fn semantic_attention_selects_the_child_but_focuses_its_runtime_owner_pane() {
+        let (session, pane_id, runtime_owner) = session_with_agent("Fix climbing bugs");
+        let subject = NodeId::from_stored("proc_reviewer_semantic");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 1)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+
+        let navigation = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::AttentionEffect {
+                effect: Effect::Focus {
+                    session_id: session.id.clone(),
+                    node_id: Some(subject.clone()),
+                },
+            })),
+            T0,
+        );
+        let requests = sent(&navigation);
+        let child_selection = requests
+            .iter()
+            .position(|request| {
+                matches!(
+                    request,
+                    Request::SelectTreeNode {
+                        selected: Some(HierarchyKey::Process { node_id }),
+                        ..
+                    } if node_id == &subject
+                )
+            })
+            .expect("the exact Reviewer node is selected");
+        let focus_resolution = requests
+            .iter()
+            .position(|request| {
+                matches!(
+                    request,
+                    Request::FocusPaneForAttention {
+                        session_id,
+                        subject_node_id,
+                        ..
+                    } if session_id == &session.id && subject_node_id == &subject
+                )
+            })
+            .expect("the daemon resolves the separate input target");
+        assert!(child_selection < focus_resolution);
+        assert!(!requests.iter().any(|request| matches!(
+            request,
+            Request::FocusPaneForNode { node_id, .. } if node_id == &runtime_owner
+        )));
+
+        let focused = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::AttentionFocus {
+                    session_id: session.id.clone(),
+                    subject_node_id: subject.clone(),
+                },
+                response: Box::new(Response::PaneFocus {
+                    focus: Some(PaneFocusView {
+                        surface_id: "main-window".into(),
+                        session_id: session.id.clone(),
+                        node_id: runtime_owner,
+                        pane_id: pane_id.clone(),
+                        attention_subject_node_id: Some(subject.clone()),
+                    }),
+                }),
+            },
+            T0,
+        );
+        assert!(matches!(
+            sent(&focused).as_slice(),
+            [Request::FocusPane {
+                session_id,
+                target: FocusTarget::Pane { pane_id: focused },
+            }] if session_id == &session.id && focused == &pane_id
+        ));
+        assert!(!sent(&focused)
+            .iter()
+            .any(|request| matches!(request, Request::SelectTreeNode { .. })));
+    }
+
+    #[test]
+    fn semantic_preview_and_temporary_pane_never_impersonate_the_owner_terminal() {
+        let session_id = SessionId::from_stored("sess_semantic_preview");
+        let subject = NodeId::from_stored("proc_reviewer_semantic");
+        let mut desk = Desk::new();
+
+        assert!(matches!(
+            sent(&desk.apply_hierarchy_action(HierarchyAction::QuickPreview {
+                surface_id: "main-window".into(),
+                session_id: session_id.clone(),
+                node_id: subject.clone(),
+            }))
+            .as_slice(),
+            [Request::GetPreviewHistory { node_id, .. }] if node_id == &subject
+        ));
+        assert!(matches!(
+            sent(&desk.apply_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                surface_id: "main-window".into(),
+                session_id: session_id.clone(),
+                node_id: subject.clone(),
+            }))
+            .as_slice(),
+            [Request::OpenNodeAsTemporaryPane { node_id, .. }] if node_id == &subject
+        ));
+
+        let pane_id = PaneId::from_stored("pane_reviewer_preview");
+        let opened = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::NodePane,
+                response: Box::new(Response::NodePane {
+                    pane: NodePaneView {
+                        binding: PaneNodeBinding {
+                            pane_id: pane_id.clone(),
+                            session_id: session_id.clone(),
+                            node_id: subject.clone(),
+                            temporary: true,
+                            surface_id: Some("main-window".into()),
+                            opened_ms: T0,
+                        },
+                        capability: NodePaneCapability::PreviewDetails,
+                    },
+                }),
+            },
+            T0,
+        );
+        assert!(sent(&opened).iter().any(|request| matches!(
+            request,
+            Request::GetPreviewHistory { node_id, .. } if node_id == &subject
+        )));
+        assert!(!sent(&opened)
+            .iter()
+            .any(|request| matches!(request, Request::AttachPane { .. })));
+
+        let runtime_pane = PaneId::from_stored("pane_claude_runtime");
+        let runtime_owner = NodeId::from_stored("proc_claude_runtime");
+        let routed = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::AttentionFocus {
+                    session_id: session_id.clone(),
+                    subject_node_id: subject.clone(),
+                },
+                response: Box::new(Response::PaneFocus {
+                    focus: Some(PaneFocusView {
+                        surface_id: "main-window".into(),
+                        session_id: session_id.clone(),
+                        node_id: runtime_owner,
+                        pane_id: runtime_pane.clone(),
+                        attention_subject_node_id: Some(subject),
+                    }),
+                }),
+            },
+            T0,
+        );
+        let requests = sent(&routed);
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            Request::ClosePane {
+                pane_id: closed,
+                disposition: CloseDisposition::KeepProcesses,
+                ..
+            } if closed == &pane_id
+        )));
+        assert!(requests.iter().any(|request| matches!(
+            request,
+            Request::FocusPane {
+                target: FocusTarget::Pane { pane_id },
+                ..
+            } if pane_id == &runtime_pane
+        )));
+        assert!(desk.temporary_pane().is_none());
     }
 
     /// Answering an agent is the human typing, and this is the only path to a pty.
