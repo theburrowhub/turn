@@ -223,11 +223,16 @@ impl Core {
                 actual_generation: current.generation,
             }));
         }
-        if self
-            .sessions
-            .get(&current.session_id)
-            .is_some_and(|session| session.tree.iter().any(|node| node.is_running()))
-        {
+        let owner = self.sessions.get(&current.session_id).ok_or_else(|| {
+            // Another daemon may have created the owner after this Core loaded.
+            // Absence from this process is uncertainty, never proof that it is
+            // safe to revoke a live/recovery claim.
+            ProtoError::new(
+                ErrorCode::Conflict,
+                "The lease owner is not loaded here; refresh before releasing it",
+            )
+        })?;
+        if owner.tree.iter().any(|node| node.is_running()) {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
                 "Stop the Session processes before releasing its write lease",
@@ -564,6 +569,22 @@ impl Core {
         requesting_session_id: Option<&SessionId>,
         error: turn_store::StoreError,
     ) -> ProtoError {
+        match &error {
+            turn_store::StoreError::LeaseReconciliationRequired { .. } => {
+                return ProtoError::refused(
+                    "The primary checkout requires explicit write-lease reconciliation",
+                )
+                .with_detail(error.to_string());
+            }
+            turn_store::StoreError::WorkspaceRoot { .. }
+            | turn_store::StoreError::CheckoutPath { .. } => {
+                return ProtoError::refused(
+                    "Turn cannot prove the primary checkout filesystem identity",
+                )
+                .with_detail(error.to_string());
+            }
+            _ => {}
+        }
         let lease_id = match &error {
             turn_store::StoreError::WriteLeaseHeld { lease_id, .. } => {
                 LeaseId::from_stored(lease_id.clone())
@@ -576,8 +597,15 @@ impl Core {
         let Ok(Some(lease)) = self.store.hierarchy().lease(&lease_id) else {
             return store(error);
         };
-        let Some(owner) = self.sessions.get(&lease.session_id) else {
-            return store(error);
+        // A competing daemon can create the owner after this Core's in-memory
+        // snapshot. Fall back to durable state so the typed conflict never
+        // degrades to a generic storage outage.
+        let owner = match self.sessions.get(&lease.session_id).cloned() {
+            Some(owner) => owner,
+            None => match self.store.sessions().get(&lease.session_id) {
+                Ok(Some(owner)) => owner,
+                _ => return store(error),
+            },
         };
         ProtoError::workspace_write_lease_conflict(ProtoErrorContext::WorkspaceWriteLeaseConflict {
             workspace_id: workspace_id.clone(),
@@ -643,11 +671,63 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
-    use turn_core::model::{PaneKind, PreviewVisibility, ProcessNode};
+    use turn_core::model::{Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, Session};
     use turn_core::state::Lifecycle;
     use turn_proto::{CloseDisposition, NewPane, Request};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn a_core_missing_the_owner_cannot_release_another_daemons_lease() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "shared".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let workspace = harness.core.workspaces[&workspace_id].clone();
+        let mut owner = Session::new(
+            workspace_id.clone(),
+            "remote owner",
+            workspace.root,
+            Layout::single(Pane::new(PaneKind::Agent)),
+            NOW + 1,
+        );
+        owner.mode = SessionMode::MainCheckout;
+        owner.checkout_id = CheckoutId::primary_for(&workspace_id);
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .create_session(&owner, NOW + 1)
+            .unwrap()
+            .unwrap();
+        assert!(!harness.core.sessions.contains_key(&owner.id));
+
+        let error = harness
+            .core
+            .release_workspace_write_lease(&workspace_id, &lease.id, lease.generation, NOW + 2)
+            .expect_err("a stale Core must fail closed");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            harness
+                .core
+                .store
+                .hierarchy()
+                .active_lease(&workspace_id)
+                .unwrap()
+                .unwrap()
+                .id,
+            lease.id
+        );
+    }
 
     #[tokio::test]
     async fn the_reviewer_vertical_survives_a_ui_restart_without_changing_layout() {

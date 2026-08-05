@@ -762,7 +762,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aliased_workspaces_return_the_real_write_owner_as_typed_context() {
+    async fn a_legacy_workspace_gets_a_typed_refusal_instead_of_an_implicit_lease() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let workspace = match harness
+            .core
+            .create_workspace("legacy".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let mut legacy = harness.core.workspaces[&workspace].clone();
+        legacy.lease_reconciliation_required = true;
+        harness.core.store.workspaces().save(&legacy).unwrap();
+        harness.core.workspaces.insert(workspace.clone(), legacy);
+
+        let error = harness
+            .core
+            .create_session(
+                &workspace,
+                "Unsafe writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .expect_err("reconciliation is an explicit gate");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("reconciliation"));
+        assert!(harness.core.sessions.is_empty());
+        assert_eq!(harness.core.store.sessions().count().unwrap(), 0);
+        assert!(harness.core.workspaces[&workspace].lease_reconciliation_required);
+    }
+
+    #[tokio::test]
+    async fn a_second_workspace_alias_is_refused_before_it_can_mint_a_checkout() {
         let mut harness = Harness::new().await;
         let root = harness._dir.path().to_string_lossy().to_string();
         let first_workspace = match harness
@@ -773,54 +809,18 @@ mod tests {
             Response::Workspace { workspace } => workspace.id,
             other => panic!("unexpected {other:?}"),
         };
-        let second_workspace = match harness
-            .core
-            .create_workspace("second alias".into(), root, 11)
-            .unwrap()
-        {
-            Response::Workspace { workspace } => workspace.id,
-            other => panic!("unexpected {other:?}"),
-        };
-        let owner = match harness
-            .core
-            .create_session(
-                &first_workspace,
-                "Canonical owner".into(),
-                None,
-                Some(vec![NewPane::new(PaneKind::AgentTree)]),
-                None,
-                Vec::new(),
-                12,
-            )
-            .unwrap()
-        {
-            Response::Session { session } => session.id,
-            other => panic!("unexpected {other:?}"),
-        };
-
         let error = harness
             .core
-            .create_session(
-                &second_workspace,
-                "Alias contender".into(),
-                None,
-                Some(vec![NewPane::new(PaneKind::AgentTree)]),
-                None,
-                Vec::new(),
-                13,
-            )
-            .expect_err("the canonical checkout fence must span Workspace aliases");
-        assert!(matches!(
-            error.context.as_deref(),
-            Some(turn_proto::ProtoErrorContext::WorkspaceWriteLeaseConflict {
-                workspace_id,
-                owner: conflicting_owner,
-                lease,
-                ..
-            }) if workspace_id == &second_workspace
-                && conflicting_owner.session_id == owner
-                && lease.workspace_id == first_workspace
-        ));
+            .create_workspace("second alias".into(), root, 11)
+            .expect_err("Workspace aliases are not a supported navigation identity");
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(
+            error.context.is_none(),
+            "an alias is not a lease-owner conflict"
+        );
+        assert_eq!(harness.core.workspaces.len(), 1);
+        assert!(harness.core.workspaces.contains_key(&first_workspace));
+        assert_eq!(harness.core.store.workspaces().count().unwrap(), 1);
     }
 
     #[tokio::test]

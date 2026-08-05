@@ -19,10 +19,15 @@ async fn workspace(
     ui: &mut Client,
     name: &str,
 ) -> turn_proto::WorkspaceSummary {
+    let root = daemon
+        .data_dir()
+        .join("workspaces")
+        .join(turn_core::ids::WorkspaceId::new().as_str());
+    std::fs::create_dir_all(&root).expect("surface test Workspace root");
     workspace_of(
         ui.ask(Request::CreateWorkspace {
             name: name.to_string(),
-            root: daemon.data_dir().display().to_string(),
+            root: root.display().to_string(),
         })
         .await,
     )
@@ -72,17 +77,17 @@ async fn a_workspace_can_be_renamed_duplicated_archived_and_closed() {
     })
     .await;
 
-    let copy = workspace_of(
-        ui.ask(Request::DuplicateWorkspace {
+    let error = ui
+        .try_ask(Request::DuplicateWorkspace {
             workspace_id: original.id.clone(),
             name: None,
         })
-        .await,
-    );
-    assert_eq!(copy.name, "renamed (copy)");
-    assert_ne!(copy.id, original.id);
-    assert_eq!(copy.root, original.root, "the settings come with it");
-    assert_eq!(copy.session_count, 0, "the sessions do not");
+        .await
+        .expect_err("duplicating a Workspace would create a checkout alias");
+    assert_eq!(error.code, ErrorCode::Refused);
+
+    let copy = workspace(&daemon, &mut ui, "independent copy").await;
+    assert_ne!(copy.root, original.root);
 
     // Archived workspaces leave the switcher but stay on disk.
     ui.ask(Request::ArchiveWorkspace {

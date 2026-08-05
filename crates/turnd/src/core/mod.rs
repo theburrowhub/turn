@@ -494,7 +494,13 @@ pub(crate) mod testing {
         /// are about state the daemon holds and not about launching anything: a real
         /// creation would spawn a shell per pane.
         pub fn add_session(&mut self, session_id: SessionId, pane_id: PaneId, now_ms: i64) {
-            let workspace = Workspace::new("harness", "/tmp", now_ms);
+            let workspace = self
+                .core
+                .workspaces
+                .values()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| Workspace::new("harness", "/tmp", now_ms));
             let mut pane = Pane::new(PaneKind::Shell);
             pane.id = pane_id;
             let mut session = turn_core::model::Session::new(
@@ -505,11 +511,17 @@ pub(crate) mod testing {
                 now_ms,
             );
             session.id = session_id.clone();
+            // Tests using this direct insertion helper deliberately bypass the
+            // production read-only sandbox setup; mark the synthetic Session as
+            // guarded so process-lifecycle tests can reach the code they exercise.
+            session.read_only_enforced = true;
             // Written through as well as held, because the event log has a foreign key
             // to the session: an event for a session the store has never heard of is
             // dropped, which would make a test about the log pass for the wrong reason.
-            let store = self.core.store.workspaces();
-            store.save(&workspace).expect("the workspace must save");
+            if !self.core.workspaces.contains_key(&workspace.id) {
+                let store = self.core.store.workspaces();
+                store.save(&workspace).expect("the workspace must save");
+            }
             self.core
                 .store
                 .sessions()

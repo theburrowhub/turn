@@ -208,6 +208,10 @@ impl Store {
                 [],
             )?;
         }
+        // SQL cannot resolve symlinks or prove a checkout still exists. Perform
+        // that part of the v6 safety migration against the real filesystem. The
+        // pass is idempotent and deliberately never clears a reconciliation flag.
+        repo::workspace::canonicalize_persisted_roots(&self.conn)?;
         if applied.changed() {
             tracing::info!(
                 from = applied.from,
@@ -310,7 +314,14 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn saved_workspace(store: &Store, name: &str) -> Workspace {
-        let workspace = Workspace::new(name, format!("/repos/{name}"), T0);
+        let id = WorkspaceId::new();
+        let root = std::env::temp_dir()
+            .join("turn-store-tests")
+            .join(id.as_str());
+        std::fs::create_dir_all(&root).expect("test Workspace root");
+        let root = std::fs::canonicalize(root).expect("canonical test Workspace root");
+        let mut workspace = Workspace::new(name, root.to_string_lossy(), T0);
+        workspace.id = id;
         store.workspaces().save(&workspace).expect("saved");
         workspace
     }
@@ -400,9 +411,11 @@ mod tests {
     fn reopening_a_store_finds_what_the_last_run_wrote() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("turn.db");
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
         let workspace = {
             let store = Store::open_at(&path).unwrap();
-            let workspace = Workspace::new("turn", "/repo", testing::T0);
+            let workspace = Workspace::new("turn", root.to_string_lossy(), testing::T0);
             store.workspaces().save(&workspace).unwrap();
             workspace
         };
@@ -413,6 +426,194 @@ mod tests {
             store.workspaces().get(&workspace.id).unwrap().unwrap().name,
             "turn"
         );
+    }
+
+    #[test]
+    fn opening_v4_canonicalises_a_legacy_root_but_keeps_reconciliation_required() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("turn.db");
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let legacy_spelling = root.join(".").to_string_lossy().into_owned();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            migrations::apply_to(&conn, 1).unwrap();
+            let attention = serde_json::to_string(&turn_core::AttentionPolicy::default()).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+                 attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+                 VALUES ('ws_old', 'legacy', ?1, '[]', '[]', ?2, 1, 1, 0, 0)",
+                rusqlite::params![legacy_spelling, attention],
+            )
+            .unwrap();
+            migrations::apply_to(&conn, 4).unwrap();
+            conn.execute(
+                "INSERT INTO sessions \
+                     (id, workspace_id, name, cwd, env_json, attention_json, status, \
+                      restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+                      last_activity_ms, tmux, mode, checkout_id, worktree_path, \
+                      read_only_enforced) \
+                 VALUES ('sess_old', 'ws_old', 'writer', ?1, '[]', ?2, 'active', 'live', \
+                         '[]', 0, 0, 0, 1, 1, 0, 'main_checkout', \
+                         'checkout_primary_ws_old', NULL, 0)",
+                rusqlite::params![legacy_spelling, attention],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE checkout_write_fences SET generation = 7 WHERE canonical_path = ?1",
+                rusqlite::params![legacy_spelling],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_write_leases \
+                     (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                      acquired_ms, heartbeat_ms, released_ms, generation) \
+                 VALUES ('lease_old', 'ws_old', 'sess_old', 'checkout_primary_ws_old', ?1, \
+                         'exclusive_write', 'active', 1, 1, NULL, 7)",
+                rusqlite::params![legacy_spelling],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_at(&path).unwrap();
+        let workspace = store
+            .workspaces()
+            .get(&turn_core::ids::WorkspaceId::from_stored("ws_old"))
+            .unwrap()
+            .unwrap();
+        let canonical = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(workspace.root, canonical);
+        assert!(workspace.lease_reconciliation_required);
+        let checkout = store
+            .hierarchy()
+            .primary_checkout(&workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkout.path, canonical);
+        assert_eq!(checkout.canonical_path, canonical);
+        let lease = store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, turn_core::model::LeaseState::RecoveryRequired);
+        assert_eq!(lease.generation, 7);
+        let error = store
+            .hierarchy()
+            .acquire_write_lease(
+                &workspace.id,
+                &turn_core::ids::SessionId::from_stored("sess_old"),
+                &checkout.id,
+                2,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::WriteLeaseHeld {
+                owner_session_id,
+                lease_id,
+                ..
+            } if owner_session_id == "sess_old" && lease_id == "lease_old"
+        ));
+    }
+
+    #[test]
+    fn opening_v5_preserves_a_drifted_claim_and_blocks_its_live_checkout_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("turn.db");
+        let root = temp.path().join("workspace-root");
+        let drifted = temp.path().join("still-written-checkout");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&drifted).unwrap();
+        let root = std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // Keep a deliberately non-canonical spelling in v5. Text comparison
+        // alone cannot see that it aliases `drifted`.
+        let drifted_spelling = drifted.join(".").to_string_lossy().into_owned();
+        let drifted_canonical = std::fs::canonicalize(&drifted)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            migrations::apply_to(&conn, 1).unwrap();
+            let attention = serde_json::to_string(&turn_core::AttentionPolicy::default()).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+                 attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+                 VALUES ('ws_old', 'legacy', ?1, '[]', '[]', ?2, 1, 1, 0, 0)",
+                rusqlite::params![root, attention],
+            )
+            .unwrap();
+            migrations::apply_to(&conn, 5).unwrap();
+            conn.execute(
+                "INSERT INTO checkout_write_fences (canonical_path, generation) \
+                 VALUES (?1, 9)",
+                rusqlite::params![drifted_spelling],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE workspace_checkouts SET path = ?1, canonical_path = ?1 \
+                 WHERE workspace_id = 'ws_old' AND is_primary = 1",
+                rusqlite::params![drifted_spelling],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions \
+                     (id, workspace_id, name, cwd, env_json, attention_json, status, \
+                      restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+                      last_activity_ms, tmux, mode, checkout_id, worktree_path, \
+                      read_only_enforced) \
+                 VALUES ('sess_old', 'ws_old', 'writer', ?1, '[]', ?2, 'active', 'live', \
+                         '[]', 0, 0, 0, 1, 1, 0, 'main_checkout', \
+                         'checkout_primary_ws_old', NULL, 0)",
+                rusqlite::params![drifted_spelling, attention],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspace_write_leases \
+                     (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                      acquired_ms, heartbeat_ms, released_ms, generation) \
+                 VALUES ('lease_old', 'ws_old', 'sess_old', 'checkout_primary_ws_old', ?1, \
+                         'exclusive_write', 'active', 1, 1, NULL, 9)",
+                rusqlite::params![drifted_spelling],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open_at(&path).unwrap();
+        let (required, checkout_path, lease_path, lease_state): (bool, String, String, String) =
+            store
+                .connection()
+                .query_row(
+                    "SELECT w.lease_reconciliation_required, c.canonical_path, \
+                            l.canonical_path, l.state \
+                     FROM workspaces w \
+                     JOIN workspace_checkouts c ON c.workspace_id = w.id AND c.is_primary = 1 \
+                     JOIN workspace_write_leases l ON l.workspace_id = w.id \
+                     WHERE w.id = 'ws_old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+        assert!(required);
+        assert_eq!(checkout_path, drifted_spelling);
+        assert_eq!(lease_path, drifted_spelling);
+        assert_eq!(lease_state, "recovery_required");
+
+        let alias = Workspace::new("new alias", drifted_canonical, testing::T0);
+        assert!(matches!(
+            store.workspaces().save(&alias).unwrap_err(),
+            StoreError::WorkspaceRootAlias { .. }
+        ));
+        assert_eq!(store.workspaces().count().unwrap(), 1);
     }
 
     #[test]

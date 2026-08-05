@@ -1,9 +1,11 @@
 //! Workspace persistence.
 
 use crate::codec::{from_json, json};
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use crate::redact::redact_pairs;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use turn_core::ids::{CheckoutId, TemplateId, WorkspaceId};
 use turn_core::model::Workspace;
 use turn_core::AttentionPolicy;
@@ -28,7 +30,73 @@ impl<'a> WorkspaceRepo<'a> {
     /// passed in.
     pub fn save(&self, workspace: &Workspace) -> Result<()> {
         let env = redact_pairs(&workspace.env);
-        let tx = self.conn.unchecked_transaction()?;
+        // Take the database writer lock before resolving filesystem identity. A
+        // concurrent Store must not register the canonical spelling while this
+        // one is still comparing a legacy symlink spelling.
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let canonical = canonical_workspace_root(&workspace.root)?;
+        let canonical = canonical.to_string_lossy().into_owned();
+        let existing: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT root, lease_reconciliation_required FROM workspaces WHERE id = ?1",
+                params![workspace.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if existing.as_ref().is_some_and(|(root, required)| {
+            root != &canonical || (*required && !workspace.lease_reconciliation_required)
+        }) {
+            return Err(StoreError::LeaseReconciliationRequired {
+                workspace_id: workspace.id.to_string(),
+                checkout_id: CheckoutId::primary_for(&workspace.id).to_string(),
+            });
+        }
+        let alias: Option<String> = tx
+            .query_row(
+                "SELECT id FROM workspaces WHERE root = ?1 AND id != ?2 \
+                 UNION \
+                 SELECT workspace_id FROM workspace_checkouts \
+                 WHERE canonical_path = ?1 AND workspace_id != ?2 LIMIT 1",
+                params![&canonical, workspace.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_workspace_id) = alias {
+            return Err(StoreError::WorkspaceRootAlias {
+                canonical_path: canonical,
+                existing_workspace_id,
+            });
+        }
+        // Legacy rows may still carry a non-canonical checkout spelling because
+        // v6 could not prove it was safe to rewrite an active claim. Compare the
+        // real filesystem identities as well as the stored strings so a symlink,
+        // case alias, or historically drifted checkout cannot mint a new fence.
+        let live_alias = {
+            let mut stmt = tx.prepare(
+                "SELECT id, root FROM workspaces WHERE id != ?1 \
+                 UNION ALL \
+                 SELECT workspace_id, path FROM workspace_checkouts \
+                 WHERE workspace_id != ?1 AND is_primary = 1",
+            )?;
+            let candidates = stmt
+                .query_map(params![workspace.id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            candidates.into_iter().find_map(|(workspace_id, path)| {
+                match canonical_workspace_root(&path) {
+                    Ok(identity) if identity.to_string_lossy() == canonical => Some(workspace_id),
+                    Ok(_) | Err(StoreError::WorkspaceRoot { .. }) => None,
+                    Err(_) => None,
+                }
+            })
+        };
+        if let Some(existing_workspace_id) = live_alias {
+            return Err(StoreError::WorkspaceRootAlias {
+                canonical_path: canonical,
+                existing_workspace_id,
+            });
+        }
         tx.execute(
             "INSERT INTO workspaces (id, name, root, git_remote, env_json, default_shell, \
                  default_agent, init_commands_json, default_template, attention_json, colour, \
@@ -49,7 +117,7 @@ impl<'a> WorkspaceRepo<'a> {
             params![
                 workspace.id.as_str(),
                 workspace.name,
-                workspace.root,
+                canonical,
                 workspace.git_remote,
                 json("workspace env", &env)?,
                 workspace.default_shell,
@@ -66,13 +134,9 @@ impl<'a> WorkspaceRepo<'a> {
                 workspace.lease_reconciliation_required,
             ],
         )?;
-        let canonical = std::fs::canonicalize(&workspace.root)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&workspace.root))
-            .to_string_lossy()
-            .to_string();
         // The fence is global and deliberately outlives a Workspace. A second
-        // Workspace aliasing this checkout reuses the same counter rather than
-        // minting a competing lease namespace.
+        // caller cannot alias this checkout because the IMMEDIATE transaction
+        // checked the canonical identity before inserting the Workspace.
         tx.execute(
             "INSERT INTO checkout_write_fences (canonical_path, generation) \
              VALUES (?1, 0) ON CONFLICT(canonical_path) DO NOTHING",
@@ -88,7 +152,7 @@ impl<'a> WorkspaceRepo<'a> {
             params![
                 CheckoutId::primary_for(&workspace.id).as_str(),
                 workspace.id.as_str(),
-                workspace.root,
+                canonical,
                 canonical,
                 workspace.created_ms
             ],
@@ -158,6 +222,185 @@ impl<'a> WorkspaceRepo<'a> {
     }
 }
 
+/// Resolves a Workspace root to the filesystem identity used for checkout
+/// fencing. It must already exist and be a directory: using the spelling of a
+/// missing path would let a later symlink/rename create a second fence namespace
+/// for the same checkout.
+pub(crate) fn canonical_workspace_root(path: &str) -> Result<PathBuf> {
+    let resolved =
+        std::fs::canonicalize(Path::new(path)).map_err(|cause| StoreError::WorkspaceRoot {
+            path: path.to_string(),
+            cause,
+        })?;
+    let metadata = std::fs::metadata(&resolved).map_err(|cause| StoreError::WorkspaceRoot {
+        path: path.to_string(),
+        cause,
+    })?;
+    if !metadata.is_dir() {
+        return Err(StoreError::WorkspaceRoot {
+            path: path.to_string(),
+            cause: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace root is not a directory",
+            ),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Canonicalises roots written by pre-v6 builds without ever declaring them
+/// reconciled. This runs after SQL migrations because SQLite cannot resolve
+/// symlinks or prove that a path exists.
+///
+/// Multiple legacy aliases remain visible, but are all marked reconciliation
+/// required. Their checkout rows may share one canonical fence only when doing
+/// so cannot collide two unreleased leases; otherwise their old identities are
+/// left intact and every writer stays blocked.
+pub(crate) fn canonicalize_persisted_roots(conn: &Connection) -> Result<()> {
+    // Begin before the first read. Without this lock, another Store could insert
+    // the real path between our legacy-spelling snapshot and its rewrite.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let roots = {
+        let mut stmt = tx.prepare("SELECT id, root FROM workspaces ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut groups: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for (workspace_id, root) in roots {
+        match canonical_workspace_root(&root) {
+            Ok(canonical) => groups
+                .entry(canonical.to_string_lossy().into_owned())
+                .or_default()
+                .push((workspace_id, root)),
+            Err(StoreError::WorkspaceRoot { .. }) => unresolved.push(workspace_id),
+            Err(error) => return Err(error),
+        }
+    }
+
+    for workspace_id in unresolved {
+        tx.execute(
+            "UPDATE workspaces SET lease_reconciliation_required = 1 WHERE id = ?1",
+            params![&workspace_id],
+        )?;
+        tx.execute(
+            "UPDATE workspace_write_leases SET state = 'recovery_required' \
+             WHERE workspace_id = ?1 AND state != 'released'",
+            params![&workspace_id],
+        )?;
+    }
+
+    for (canonical, members) in groups {
+        let aliases = members.len() > 1;
+        let mut old_canonicals = Vec::new();
+        let mut identity_changed = false;
+        let mut unreleased = 0_i64;
+        let mut checkout_identity_proven = true;
+
+        for (workspace_id, root) in &members {
+            let checkout: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT path, canonical_path FROM workspace_checkouts \
+                     WHERE workspace_id = ?1 AND is_primary = 1",
+                    params![workspace_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match checkout {
+                Some((path, old)) => {
+                    let same_live_identity = canonical_workspace_root(&path)
+                        .ok()
+                        .is_some_and(|resolved| resolved.to_string_lossy() == canonical);
+                    checkout_identity_proven &= same_live_identity;
+                    identity_changed |=
+                        !same_live_identity || old != canonical || root != &canonical;
+                    old_canonicals.push(old);
+                }
+                None => {
+                    checkout_identity_proven = false;
+                    identity_changed = true;
+                }
+            }
+            unreleased += tx.query_row(
+                "SELECT COUNT(*) FROM workspace_write_leases \
+                 WHERE workspace_id = ?1 AND state != 'released'",
+                params![workspace_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+        }
+
+        let requires_reconciliation = aliases || identity_changed || !checkout_identity_proven;
+        for (workspace_id, _) in &members {
+            tx.execute(
+                "UPDATE workspaces SET root = ?2, \
+                        lease_reconciliation_required = CASE \
+                            WHEN ?3 THEN 1 ELSE lease_reconciliation_required END \
+                 WHERE id = ?1",
+                params![workspace_id, &canonical, requires_reconciliation],
+            )?;
+            if requires_reconciliation {
+                tx.execute(
+                    "UPDATE workspace_write_leases SET state = 'recovery_required' \
+                     WHERE workspace_id = ?1 AND state != 'released'",
+                    params![workspace_id],
+                )?;
+            }
+        }
+
+        if !checkout_identity_proven || unreleased > 1 {
+            // Two historical claims cannot be merged without violating the
+            // canonical unique index. Likewise, a checkout that resolves away
+            // from its Workspace root may still have a live legacy writer. Keep
+            // that old claim intact; all affected Workspaces are gated above.
+            continue;
+        }
+
+        let mut generation = tx
+            .query_row(
+                "SELECT generation FROM checkout_write_fences WHERE canonical_path = ?1",
+                params![&canonical],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        for old in &old_canonicals {
+            generation = generation.max(
+                tx.query_row(
+                    "SELECT generation FROM checkout_write_fences WHERE canonical_path = ?1",
+                    params![old],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0),
+            );
+        }
+        tx.execute(
+            "INSERT INTO checkout_write_fences (canonical_path, generation) VALUES (?1, ?2) \
+             ON CONFLICT(canonical_path) DO UPDATE SET \
+                 generation = MAX(generation, excluded.generation)",
+            params![&canonical, generation],
+        )?;
+
+        for (workspace_id, _) in &members {
+            tx.execute(
+                "UPDATE workspace_write_leases SET canonical_path = ?2 \
+                 WHERE workspace_id = ?1 AND state != 'released'",
+                params![workspace_id, &canonical],
+            )?;
+            tx.execute(
+                "UPDATE workspace_checkouts SET path = ?2, canonical_path = ?2 \
+                 WHERE workspace_id = ?1 AND is_primary = 1",
+                params![workspace_id, &canonical],
+            )?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn from_row(row: &Row<'_>) -> Result<Workspace> {
     let id: String = row.get("id")?;
     let attention: AttentionPolicy = from_json(
@@ -201,10 +444,22 @@ mod tests {
 
     const T0: i64 = 1_700_000_000_000;
 
+    fn workspace(name: &str) -> Workspace {
+        let id = WorkspaceId::new();
+        let root = std::env::temp_dir()
+            .join("turn-workspace-repo-tests")
+            .join(id.as_str());
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let mut workspace = Workspace::new(name, root.to_string_lossy(), T0);
+        workspace.id = id;
+        workspace
+    }
+
     #[test]
     fn a_workspace_round_trips_with_every_field_intact() {
         let store = testing::store();
-        let mut ws = Workspace::new("turn", "/Users/x/turn", T0);
+        let mut ws = workspace("turn");
         ws.git_remote = Some("git@github.com:x/turn.git".into());
         ws.default_shell = Some("/bin/zsh".into());
         ws.default_agent = Some("claude".into());
@@ -230,7 +485,7 @@ mod tests {
     #[test]
     fn saving_the_same_workspace_twice_updates_it_instead_of_duplicating() {
         let store = testing::store();
-        let mut ws = Workspace::new("turn", "/repo", T0);
+        let mut ws = workspace("turn");
         store.workspaces().save(&ws).unwrap();
 
         ws.name = "turn (renamed)".into();
@@ -246,7 +501,7 @@ mod tests {
     #[test]
     fn a_secret_in_a_workspace_environment_is_redacted_before_it_is_written() {
         let store = testing::store();
-        let mut ws = Workspace::new("turn", "/repo", T0);
+        let mut ws = workspace("turn");
         ws.env = vec![
             ("PATH".into(), "/usr/bin".into()),
             ("GITHUB_TOKEN".into(), "ghp_verysecret".into()),
@@ -262,10 +517,10 @@ mod tests {
     #[test]
     fn listing_puts_the_most_recently_used_first_and_hides_archived_ones() {
         let store = testing::store();
-        let old = Workspace::new("old", "/a", T0);
-        let mut recent = Workspace::new("recent", "/b", T0);
+        let old = workspace("old");
+        let mut recent = workspace("recent");
         recent.last_used_ms = T0 + 10_000;
-        let mut archived = Workspace::new("archived", "/c", T0);
+        let mut archived = workspace("archived");
         archived.last_used_ms = T0 + 20_000;
         archived.archived = true;
 
@@ -295,7 +550,7 @@ mod tests {
     #[test]
     fn touching_a_workspace_only_moves_its_timestamp() {
         let store = testing::store();
-        let ws = Workspace::new("turn", "/repo", T0);
+        let ws = workspace("turn");
         store.workspaces().save(&ws).unwrap();
 
         assert!(store.workspaces().touch(&ws.id, T0 + 5_000).unwrap());
@@ -325,6 +580,58 @@ mod tests {
             .workspaces()
             .delete(&WorkspaceId::from_stored("ws_nope"))
             .unwrap());
+    }
+
+    #[test]
+    fn a_missing_root_is_refused_without_minting_a_textual_fence() {
+        let store = testing::store();
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-cloned-yet");
+        let workspace = Workspace::new("missing", missing.to_string_lossy(), T0);
+
+        let error = store.workspaces().save(&workspace).unwrap_err();
+        assert!(matches!(error, StoreError::WorkspaceRoot { .. }));
+        assert_eq!(store.workspaces().count().unwrap(), 0);
+        let fences: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM checkout_write_fences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fences, 0);
+    }
+
+    #[test]
+    fn generic_save_cannot_move_a_checkout_or_reconcile_it_implicitly() {
+        let store = testing::store();
+        let mut workspace = workspace("fixed-root");
+        store.workspaces().save(&workspace).unwrap();
+        let original = workspace.root.clone();
+
+        workspace.lease_reconciliation_required = true;
+        store.workspaces().save(&workspace).unwrap();
+        workspace.lease_reconciliation_required = false;
+        let error = store.workspaces().save(&workspace).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::LeaseReconciliationRequired { .. }
+        ));
+        workspace.lease_reconciliation_required = true;
+
+        let other = std::env::temp_dir()
+            .join("turn-workspace-repo-tests")
+            .join(WorkspaceId::new().as_str());
+        std::fs::create_dir_all(&other).unwrap();
+        workspace.root = other.to_string_lossy().into_owned();
+
+        let error = store.workspaces().save(&workspace).unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::LeaseReconciliationRequired { .. }
+        ));
+        let stored = store.workspaces().get(&workspace.id).unwrap().unwrap();
+        assert_eq!(stored.root, original);
+        assert!(stored.lease_reconciliation_required);
     }
 
     #[test]

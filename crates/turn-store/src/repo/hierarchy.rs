@@ -86,6 +86,56 @@ impl<'a> HierarchyRepo<'a> {
         Ok(lease)
     }
 
+    /// Proves that a Main Checkout Session still owns an active lease and that
+    /// its checkout still resolves to the filesystem identity that was fenced.
+    ///
+    /// This is the final process-launch check. It deliberately cannot acquire a
+    /// missing lease: adding a pane or relaunching an agent is not an ownership
+    /// transition and must fail closed if authority was released or recovered.
+    pub fn verify_active_write_lease(
+        &self,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+    ) -> Result<WorkspaceWriteLease> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let (canonical, reconciliation_required) =
+            Self::verified_checkout_identity_in(&tx, workspace, session, checkout)?;
+        if reconciliation_required {
+            return Err(StoreError::LeaseReconciliationRequired {
+                workspace_id: workspace.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        }
+
+        let held = Self::unreleased_lease_for_canonical_in(&tx, &canonical)?;
+        let Some(held) = held else {
+            return Err(StoreError::WriteLeaseNotActive {
+                workspace_id: workspace.to_string(),
+                session_id: session.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        };
+        if held.workspace_id != *workspace
+            || held.session_id != *session
+            || held.checkout_id != *checkout
+        {
+            return Err(StoreError::WriteLeaseHeld {
+                checkout_id: held.checkout_id.to_string(),
+                owner_session_id: held.session_id.to_string(),
+                lease_id: held.id.to_string(),
+            });
+        }
+        if held.state != LeaseState::Active {
+            return Err(StoreError::LeaseReconciliationRequired {
+                workspace_id: workspace.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        }
+        tx.commit()?;
+        Ok(held)
+    }
+
     /// Persists a new Session and arbitrates its checkout in one `BEGIN
     /// IMMEDIATE` transaction. No init command or PTY may be started until this
     /// succeeds; a lease conflict therefore leaves no half-created Session row.
@@ -444,35 +494,37 @@ impl<'a> HierarchyRepo<'a> {
         checkout: &CheckoutId,
         now_ms: i64,
     ) -> Result<WorkspaceWriteLease> {
-        let canonical: Option<String> = tx
-            .query_row(
-                "SELECT c.canonical_path \
-                 FROM sessions s \
-                 JOIN workspace_checkouts c ON c.workspace_id = s.workspace_id \
-                 WHERE s.id = ?1 AND s.workspace_id = ?2 \
-                   AND c.id = ?3 AND c.workspace_id = ?2",
-                params![session.as_str(), workspace.as_str(), checkout.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(canonical) = canonical else {
-            return Err(StoreError::InvalidLeaseOwnership {
+        let (canonical, reconciliation_required) =
+            Self::verified_checkout_identity_in(tx, workspace, session, checkout)?;
+        if reconciliation_required {
+            // Preserve the typed owner context for a migrated live/recovery
+            // claim. The UI can still offer "Focus existing session" while a
+            // Workspace with no recoverable owner gets a typed safety refusal.
+            let held = tx
+                .query_row(
+                    "SELECT id, workspace_id, session_id, checkout_id, mode, state, \
+                            acquired_ms, heartbeat_ms, released_ms, generation \
+                     FROM workspace_write_leases \
+                     WHERE workspace_id = ?1 AND checkout_id = ?2 \
+                       AND state != 'released' LIMIT 1",
+                    params![workspace.as_str(), checkout.as_str()],
+                    lease_from_row,
+                )
+                .optional()?;
+            if let Some(held) = held {
+                return Err(StoreError::WriteLeaseHeld {
+                    checkout_id: held.checkout_id.to_string(),
+                    owner_session_id: held.session_id.to_string(),
+                    lease_id: held.id.to_string(),
+                });
+            }
+            return Err(StoreError::LeaseReconciliationRequired {
                 workspace_id: workspace.to_string(),
-                session_id: session.to_string(),
                 checkout_id: checkout.to_string(),
             });
-        };
+        }
 
-        let held: Option<WorkspaceWriteLease> = tx
-            .query_row(
-                "SELECT l.id, l.workspace_id, l.session_id, l.checkout_id, l.mode, l.state, \
-                        l.acquired_ms, l.heartbeat_ms, l.released_ms, l.generation \
-                 FROM workspace_write_leases l \
-                 WHERE l.canonical_path = ?1 AND l.state != 'released' LIMIT 1",
-                params![&canonical],
-                lease_from_row,
-            )
-            .optional()?;
+        let held = Self::unreleased_lease_for_canonical_in(tx, &canonical)?;
         if let Some(held) = held {
             if held.session_id == *session && held.state == LeaseState::Active {
                 return Ok(held);
@@ -531,11 +583,62 @@ impl<'a> HierarchyRepo<'a> {
                     worktree_path = NULL, read_only_enforced = 0 WHERE id = ?1",
             params![session.as_str(), checkout.as_str()],
         )?;
-        tx.execute(
-            "UPDATE workspaces SET lease_reconciliation_required = 0 WHERE id = ?1",
-            params![workspace.as_str()],
-        )?;
         Ok(lease)
+    }
+
+    fn verified_checkout_identity_in(
+        tx: &Transaction<'_>,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+    ) -> Result<(String, bool)> {
+        let identity: Option<(String, bool, String, String)> = tx
+            .query_row(
+                "SELECT w.root, w.lease_reconciliation_required, c.path, c.canonical_path \
+                 FROM sessions s \
+                 JOIN workspaces w ON w.id = s.workspace_id \
+                 JOIN workspace_checkouts c ON c.workspace_id = s.workspace_id \
+                 WHERE s.id = ?1 AND s.workspace_id = ?2 \
+                   AND c.id = ?3 AND c.workspace_id = ?2",
+                params![session.as_str(), workspace.as_str(), checkout.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((root, reconciliation_required, checkout_path, stored_canonical)) = identity
+        else {
+            return Err(StoreError::InvalidLeaseOwnership {
+                workspace_id: workspace.to_string(),
+                session_id: session.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        };
+        if reconciliation_required {
+            return Ok((stored_canonical, true));
+        }
+
+        let root_identity = crate::repo::workspace::canonical_workspace_root(&root)?;
+        let checkout_identity = Self::canonicalize_checkout(&checkout_path)?;
+        let canonical = checkout_identity.to_string_lossy().into_owned();
+        if root_identity != checkout_identity || stored_canonical != canonical {
+            return Ok((canonical, true));
+        }
+        Ok((canonical, false))
+    }
+
+    fn unreleased_lease_for_canonical_in(
+        tx: &Transaction<'_>,
+        canonical: &str,
+    ) -> Result<Option<WorkspaceWriteLease>> {
+        tx.query_row(
+            "SELECT l.id, l.workspace_id, l.session_id, l.checkout_id, l.mode, l.state, \
+                    l.acquired_ms, l.heartbeat_ms, l.released_ms, l.generation \
+             FROM workspace_write_leases l \
+             WHERE l.canonical_path = ?1 AND l.state != 'released' LIMIT 1",
+            params![canonical],
+            lease_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn active_lease(&self, workspace: &WorkspaceId) -> Result<Option<WorkspaceWriteLease>> {
@@ -845,15 +948,6 @@ mod tests {
         (session, checkout)
     }
 
-    fn saved_alias_pair(store: &Store, root: &Path) -> [(Workspace, Session, CheckoutId); 2] {
-        ["first", "second"].map(|name| {
-            let workspace = saved_workspace_at(store, name, root);
-            let session = testing::saved_session(store, &workspace.id, name);
-            let checkout = CheckoutId::primary_for(&workspace.id);
-            (workspace, session, checkout)
-        })
-    }
-
     #[test]
     fn only_one_session_can_hold_a_checkout_and_release_is_explicit() {
         let store = testing::store();
@@ -880,6 +974,190 @@ mod tests {
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+    }
+
+    #[test]
+    fn reconciliation_blocks_acquisition_and_is_never_cleared_as_a_side_effect() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "legacy-lease");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        store
+            .connection()
+            .execute(
+                "UPDATE workspaces SET lease_reconciliation_required = 1 WHERE id = ?1",
+                params![workspace.id.as_str()],
+            )
+            .unwrap();
+
+        let error = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::LeaseReconciliationRequired { .. }
+        ));
+        let (required, leases): (bool, i64) = store
+            .connection()
+            .query_row(
+                "SELECT w.lease_reconciliation_required, \
+                        (SELECT COUNT(*) FROM workspace_write_leases) \
+                 FROM workspaces w WHERE w.id = ?1",
+                params![workspace.id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(required, "acquisition must not perform reconciliation");
+        assert_eq!(leases, 0, "the refusal leaves no partial claim");
+    }
+
+    #[test]
+    fn launch_verification_requires_active_state_and_never_reacquires() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "launch-authority");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        assert_eq!(
+            store
+                .hierarchy()
+                .verify_active_write_lease(&workspace.id, &session.id, &checkout)
+                .unwrap()
+                .id,
+            lease.id
+        );
+
+        store
+            .connection()
+            .execute(
+                "UPDATE workspace_write_leases SET state = 'recovery_required' WHERE id = ?1",
+                params![lease.id.as_str()],
+            )
+            .unwrap();
+        let error = store
+            .hierarchy()
+            .verify_active_write_lease(&workspace.id, &session.id, &checkout)
+            .expect_err("recovery is not live write authority");
+        assert!(matches!(
+            error,
+            StoreError::LeaseReconciliationRequired { .. }
+        ));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_write_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "verification must not mint a replacement lease");
+    }
+
+    #[test]
+    fn a_recovery_owner_remains_a_typed_conflict_for_another_writer() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "recovery-owner");
+        let owner = testing::saved_session(&store, &workspace.id, "owner");
+        let contender = testing::saved_session(&store, &workspace.id, "contender");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &owner.id, &checkout, T0)
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE workspace_write_leases SET state = 'recovery_required' WHERE id = ?1",
+                params![lease.id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE workspaces SET lease_reconciliation_required = 1 WHERE id = ?1",
+                params![workspace.id.as_str()],
+            )
+            .unwrap();
+
+        let error = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &contender.id, &checkout, T0 + 1)
+            .expect_err("the recovery owner must remain visible to conflict UX");
+        assert!(matches!(
+            error,
+            StoreError::WriteLeaseHeld {
+                owner_session_id,
+                lease_id,
+                ..
+            } if owner_session_id == owner.id.as_str() && lease_id == lease.id.as_str()
+        ));
+    }
+
+    #[test]
+    fn a_checkout_identity_drift_requires_reconciliation_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let store = testing::store();
+        let workspace = saved_workspace_at(&store, "drift", &root);
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let other = std::fs::canonicalize(other)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO checkout_write_fences (canonical_path, generation) VALUES (?1, 0)",
+                params![&other],
+            )
+            .unwrap();
+        let guarded = store
+            .connection()
+            .execute(
+                "UPDATE workspace_checkouts SET path = ?2, canonical_path = ?2 \
+                 WHERE workspace_id = ?1 AND is_primary = 1",
+                params![workspace.id.as_str(), &other],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            guarded,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ));
+        // Defence in depth: even a database whose guard was removed behind
+        // Turn's back must fail closed at lease acquisition.
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER validate_safe_primary_checkout_identity_update")
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE workspace_checkouts SET path = ?2, canonical_path = ?2 \
+                 WHERE workspace_id = ?1 AND is_primary = 1",
+                params![workspace.id.as_str(), &other],
+            )
+            .unwrap();
+
+        let error = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::LeaseReconciliationRequired { .. }
+        ));
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1288,11 +1566,11 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_aliasing_workspaces_have_one_global_winner() {
+    fn concurrent_aliasing_workspace_registration_has_one_global_winner() {
         #[derive(Debug)]
         enum Outcome {
-            Acquired(u64),
-            Held,
+            Saved,
+            Alias,
         }
 
         let temp = tempfile::tempdir().unwrap();
@@ -1300,30 +1578,25 @@ mod tests {
         let checkout_root = temp.path().join("same-checkout");
         std::fs::create_dir(&checkout_root).unwrap();
 
-        let setup = Store::open_at(&database).unwrap();
-        let [first, second] = saved_alias_pair(&setup, &checkout_root);
-        drop(setup);
-
         let stores = [
             Store::open_at(&database).unwrap(),
             Store::open_at(&database).unwrap(),
         ];
+        let workspaces = [
+            Workspace::new("first", checkout_root.to_string_lossy(), T0),
+            Workspace::new("second", checkout_root.join(".").to_string_lossy(), T0),
+        ];
         let barrier = Arc::new(Barrier::new(2));
-        let contenders = [first, second]
+        let contenders = workspaces
             .into_iter()
             .zip(stores)
-            .map(|((workspace, session, checkout), store)| {
+            .map(|(workspace, store)| {
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
                     barrier.wait();
-                    match store.hierarchy().acquire_write_lease(
-                        &workspace.id,
-                        &session.id,
-                        &checkout,
-                        T0,
-                    ) {
-                        Ok(lease) => Outcome::Acquired(lease.generation),
-                        Err(StoreError::WriteLeaseHeld { .. }) => Outcome::Held,
+                    match store.workspaces().save(&workspace) {
+                        Ok(()) => Outcome::Saved,
+                        Err(StoreError::WorkspaceRootAlias { .. }) => Outcome::Alias,
                         Err(error) => panic!("unexpected contender failure: {error}"),
                     }
                 })
@@ -1337,98 +1610,87 @@ mod tests {
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| matches!(outcome, Outcome::Acquired(_)))
+                .filter(|outcome| matches!(outcome, Outcome::Saved))
                 .count(),
             1,
-            "exactly one canonical checkout writer: {outcomes:?}"
+            "exactly one canonical Workspace registration: {outcomes:?}"
         );
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|outcome| matches!(outcome, Outcome::Held))
+                .filter(|outcome| matches!(outcome, Outcome::Alias))
                 .count(),
             1,
-            "the loser receives the current owner, not a SQLite race: {outcomes:?}"
+            "the loser receives a typed alias refusal: {outcomes:?}"
         );
-        assert!(outcomes
-            .iter()
-            .any(|outcome| matches!(outcome, Outcome::Acquired(generation) if *generation == 1)));
 
         let check = Store::open_at(&database).unwrap();
-        let active: i64 = check
+        assert_eq!(check.workspaces().count().unwrap(), 1);
+    }
+
+    #[test]
+    fn an_alternate_path_spelling_cannot_create_a_second_fence_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout_root = temp.path().join("same-checkout");
+        std::fs::create_dir(&checkout_root).unwrap();
+        let store = testing::store();
+        saved_workspace_at(&store, "first", &checkout_root);
+        let alias = Workspace::new("alias", checkout_root.join(".").to_string_lossy(), T0);
+
+        let error = store.workspaces().save(&alias).unwrap_err();
+        assert!(matches!(error, StoreError::WorkspaceRootAlias { .. }));
+        let fences: i64 = store
             .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM workspace_write_leases WHERE state != 'released'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM checkout_write_fences", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(active, 1);
+        assert_eq!(fences, 1, "the rejected spelling creates no second fence");
     }
 
     #[test]
-    fn canonical_generation_survives_a_cross_workspace_handoff() {
+    fn the_database_trigger_is_the_final_workspace_alias_arbiter() {
         let temp = tempfile::tempdir().unwrap();
         let checkout_root = temp.path().join("same-checkout");
         std::fs::create_dir(&checkout_root).unwrap();
         let store = testing::store();
-        let [first, second] = saved_alias_pair(&store, &checkout_root);
-
-        let old = store
-            .hierarchy()
-            .acquire_write_lease(&first.0.id, &first.1.id, &first.2, T0)
-            .unwrap();
-        assert!(store
-            .hierarchy()
-            .release_write_lease(&old.id, old.generation, T0 + 1)
-            .unwrap());
-        let current = store
-            .hierarchy()
-            .acquire_write_lease(&second.0.id, &second.1.id, &second.2, T0 + 2)
-            .unwrap();
-        assert_eq!(current.generation, old.generation + 1);
-    }
-
-    #[test]
-    fn the_global_unique_index_is_the_final_claim_arbiter() {
-        let temp = tempfile::tempdir().unwrap();
-        let checkout_root = temp.path().join("same-checkout");
-        std::fs::create_dir(&checkout_root).unwrap();
-        let store = testing::store();
-        let [first, second] = saved_alias_pair(&store, &checkout_root);
-
-        store
-            .hierarchy()
-            .acquire_write_lease(&first.0.id, &first.1.id, &first.2, T0)
-            .unwrap();
+        let first = saved_workspace_at(&store, "first", &checkout_root);
         let canonical = store
             .hierarchy()
-            .primary_checkout(&second.0.id)
+            .primary_checkout(&first.id)
             .unwrap()
             .unwrap()
             .canonical_path;
-        let competing_id = LeaseId::new();
+        let second = Workspace::new("second", &canonical, T0);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO workspaces \
+                 (id, name, root, env_json, init_commands_json, attention_json, created_ms, \
+                  last_used_ms, tmux_enabled, archived, lease_reconciliation_required) \
+             VALUES (?1, 'second', ?2, '[]', '[]', '{}', ?3, ?3, 0, 0, 0)",
+                params![second.id.as_str(), &canonical, T0],
+            )
+            .unwrap();
         let error = store
             .connection()
             .execute(
-                "INSERT INTO workspace_write_leases \
-                     (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
-                      acquired_ms, heartbeat_ms, released_ms, generation) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'exclusive_write', 'active', ?6, ?6, NULL, 2)",
+                "INSERT INTO workspace_checkouts \
+                     (id, workspace_id, path, canonical_path, branch, is_primary, \
+                      shared_resources_json, created_ms) \
+                 VALUES (?1, ?2, ?3, ?3, NULL, 1, '[]', ?4)",
                 params![
-                    competing_id.as_str(),
-                    second.0.id.as_str(),
-                    second.1.id.as_str(),
-                    second.2.as_str(),
-                    canonical,
-                    T0 + 1,
+                    CheckoutId::primary_for(&second.id).as_str(),
+                    second.id.as_str(),
+                    &canonical,
+                    T0,
                 ],
             )
             .unwrap_err();
         assert!(matches!(
             error,
             rusqlite::Error::SqliteFailure(code, _)
-                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
         ));
     }
 
@@ -1463,6 +1725,7 @@ mod tests {
             error,
             rusqlite::Error::SqliteFailure(code, _)
                 if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    || code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
         ));
     }
 

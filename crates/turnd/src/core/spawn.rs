@@ -47,27 +47,24 @@ impl Core {
             SessionMode::ReadOnly if !session.read_only_enforced => Err(ProtoError::refused(
                 "This read-only Session has no technical write guard, so Turn will not launch a process in it",
             )),
-            SessionMode::MainCheckout => {
-                let lease = self
-                    .store
-                    .hierarchy()
-                    .active_lease(&session.workspace_id)
-                    .map_err(|error| {
-                        ProtoError::internal(format!(
-                            "the workspace write lease could not be verified: {error}"
-                        ))
-                    })?;
-                if lease
-                    .as_ref()
-                    .is_some_and(|lease| lease.session_id == *session_id)
-                {
-                    Ok(())
-                } else {
-                    Err(ProtoError::refused(
-                        "This Session does not own the primary checkout write lease",
-                    ))
-                }
-            }
+            SessionMode::MainCheckout => self
+                .store
+                .hierarchy()
+                .verify_active_write_lease(
+                    &session.workspace_id,
+                    session_id,
+                    &session.checkout_id,
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    // Relaunch/AddPane is not a lease acquisition flow. Missing,
+                    // recovery, stale, drifted, or unprovable authority all fail
+                    // closed at the last boundary before a PTY can be spawned.
+                    ProtoError::refused(
+                        "This Session does not have a verified active write lease for the primary checkout",
+                    )
+                    .with_detail(error.to_string())
+                }),
             SessionMode::ReadOnly | SessionMode::IsolatedWorktree => Ok(()),
         }
     }
@@ -529,7 +526,9 @@ fn node_kind(pane: PaneKind, level: IntegrationLevel) -> NodeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turn_core::model::Workspace;
+    use crate::core::testing::Harness;
+    use turn_core::ids::CheckoutId;
+    use turn_core::model::{Layout, Pane, Session, Workspace};
 
     fn workspace_with_shell(shell: Option<&str>) -> Workspace {
         let mut workspace = Workspace::new("w", "/tmp", 0);
@@ -610,5 +609,60 @@ mod tests {
             NodeKind::Shell
         );
         assert!(node_kind(PaneKind::Terminal, IntegrationLevel::Heuristic).is_agentic());
+    }
+
+    #[tokio::test]
+    async fn a_recovery_lease_cannot_authorise_add_pane_or_relaunch() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().join("recovery-checkout");
+        std::fs::create_dir(&root).unwrap();
+        let workspace = Workspace::new("legacy", root.to_string_lossy(), 1);
+        harness.core.store.workspaces().save(&workspace).unwrap();
+        harness
+            .core
+            .workspaces
+            .insert(workspace.id.clone(), workspace.clone());
+
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "legacy writer",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::Shell).with_command("/bin/sh")),
+            1,
+        );
+        session.mode = SessionMode::MainCheckout;
+        session.checkout_id = CheckoutId::primary_for(&workspace.id);
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .create_session(&session, 1)
+            .unwrap()
+            .unwrap();
+        harness
+            .core
+            .sessions
+            .insert(session.id.clone(), session.clone());
+        harness
+            .core
+            .require_session_launch_allowed(&session.id)
+            .unwrap();
+
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .require_recovery(&lease.id, 2)
+            .unwrap());
+
+        let error = harness
+            .core
+            .require_session_launch_allowed(&session.id)
+            .expect_err("recovery-required is not authority to start another process");
+        assert_eq!(error.code, ErrorCode::Refused);
+        assert!(error
+            .detail
+            .unwrap()
+            .contains("requires write-lease reconciliation"));
     }
 }

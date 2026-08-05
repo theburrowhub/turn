@@ -18,15 +18,14 @@ pub struct Agent {
 }
 
 pub async fn agent_session(daemon: &TestDaemon, ui: &mut Client, name: &str) -> Agent {
-    // Each Workspace needs a distinct checkout identity. Reusing the daemon data root
-    // would ask the production lease arbiter for two writers to one canonical path,
-    // which it must reject before this attention-focused fixture can start.
-    let directory: String = name
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-        .collect();
-    let root = daemon.data_dir().join(format!("workspace-{directory}"));
-    std::fs::create_dir_all(&root).expect("the fixture checkout root");
+    // Every fixture gets a distinct canonical checkout identity. Reusing the daemon
+    // data root would correctly trip the production lease arbiter when attention
+    // tests need more than one simultaneous writing Session.
+    let root = daemon
+        .data_dir()
+        .join("workspaces")
+        .join(turn_core::ids::WorkspaceId::new().as_str());
+    std::fs::create_dir_all(&root).expect("agent test Workspace root");
     let workspace = workspace_of(
         ui.ask(Request::CreateWorkspace {
             name: format!("{name}-workspace"),

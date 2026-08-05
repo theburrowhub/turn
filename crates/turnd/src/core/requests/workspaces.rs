@@ -19,10 +19,10 @@ impl Core {
         if root.is_empty() {
             return Err(ProtoError::invalid("A workspace needs a root directory"));
         }
-        // Not required to exist: a user may point Turn at a directory a moment before
-        // they clone into it. It is required to be absolute, because every session
-        // inherits it as a working directory and a relative one would resolve against
-        // whatever directory the daemon happened to start in.
+        // It is required to be absolute because every Session inherits it. The
+        // store also requires it to exist and resolves its filesystem identity;
+        // fencing a caller-provided spelling of a missing path is unsafe because
+        // a later symlink could alias another checkout.
         if !root.starts_with('/') {
             return Err(ProtoError::invalid(
                 "A workspace root must be an absolute path",
@@ -31,7 +31,16 @@ impl Core {
 
         let workspace = Workspace::new(name, root, now_ms);
         let id = workspace.id.clone();
-        self.store.workspaces().save(&workspace).map_err(store)?;
+        self.store
+            .workspaces()
+            .save(&workspace)
+            .map_err(workspace_store)?;
+        let workspace = self
+            .store
+            .workspaces()
+            .get(&id)
+            .map_err(store)?
+            .ok_or_else(|| ProtoError::internal("the saved Workspace disappeared"))?;
         self.workspaces.insert(id.clone(), workspace);
         tracing::info!(workspace = %id, root, "created a workspace");
         self.answer_workspace(&id, now_ms)
@@ -91,7 +100,10 @@ impl Core {
         copy.last_used_ms = now_ms;
         copy.archived = false;
         let new_id = copy.id.clone();
-        self.store.workspaces().save(&copy).map_err(store)?;
+        self.store
+            .workspaces()
+            .save(&copy)
+            .map_err(workspace_store)?;
         self.workspaces.insert(new_id.clone(), copy);
         self.answer_workspace(&new_id, now_ms)
     }
@@ -137,4 +149,85 @@ pub(super) fn store(error: turn_store::StoreError) -> ProtoError {
         "The change could not be written to disk",
     )
     .with_detail(error.to_string())
+}
+
+/// Filesystem identity failures are durable safety refusals, not transient store
+/// outages. Keep that distinction machine-readable so clients never offer an
+/// automatic retry that could mint a divergent checkout fence.
+fn workspace_store(error: turn_store::StoreError) -> ProtoError {
+    match error {
+        turn_store::StoreError::WorkspaceRoot { path, cause } => ProtoError::refused(
+            "A Workspace root must already exist as a directory before Turn can fence it",
+        )
+        .with_detail(format!("{path}: {cause}")),
+        turn_store::StoreError::WorkspaceRootAlias {
+            canonical_path,
+            existing_workspace_id,
+        } => ProtoError::refused("That checkout is already registered by another Workspace")
+            .with_detail(format!(
+                "{canonical_path} belongs to {existing_workspace_id}"
+            )),
+        other @ turn_store::StoreError::LeaseReconciliationRequired { .. } => ProtoError::refused(
+            "Changing a Workspace checkout identity requires explicit lease reconciliation",
+        )
+        .with_detail(other.to_string()),
+        other => store(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+
+    #[tokio::test]
+    async fn create_workspace_refuses_a_missing_root_without_persisting_anything() {
+        let mut harness = Harness::new().await;
+        let missing = harness._dir.path().join("not-cloned-yet");
+        let error = harness
+            .core
+            .create_workspace("missing".into(), missing.to_string_lossy().into_owned(), 10)
+            .expect_err("a textual path is not a safe checkout identity");
+
+        assert_eq!(error.code, turn_proto::ErrorCode::Refused);
+        assert!(error.message.contains("already exist"));
+        assert!(harness.core.workspaces.is_empty());
+        assert_eq!(harness.core.store.workspaces().count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_workspace_returns_and_persists_the_canonical_root() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let spelling = root.join(".").to_string_lossy().into_owned();
+        let expected = std::fs::canonicalize(root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let id = match harness
+            .core
+            .create_workspace("canonical".into(), spelling, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => {
+                assert_eq!(workspace.root, expected);
+                workspace.id
+            }
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(harness.core.workspaces[&id].root, expected);
+        assert_eq!(
+            harness
+                .core
+                .store
+                .hierarchy()
+                .primary_checkout(&id)
+                .unwrap()
+                .unwrap()
+                .canonical_path,
+            expected
+        );
+    }
 }

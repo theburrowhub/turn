@@ -53,6 +53,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "drop_persisted_hook_payloads",
         statements: MIGRATION_005_DROP_PERSISTED_HOOK_PAYLOADS,
     },
+    Migration {
+        version: 6,
+        name: "require_explicit_legacy_lease_reconciliation",
+        statements: MIGRATION_006_REQUIRE_EXPLICIT_LEASE_RECONCILIATION,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -626,6 +631,152 @@ WHERE changes() > 0
 ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_ms = 0;
 "#;
 
+/// v3 used the caller's path spelling as the checkout fence during migration,
+/// and v4 could clear the legacy guard merely by acquiring a lease. A migration
+/// cannot consult the filesystem safely, so it does the only conservative thing:
+/// every pre-existing Workspace must pass an explicit reconciliation flow and
+/// every allegedly live writer becomes recovery-required. `Store::prepare`
+/// canonicalises resolvable roots afterwards, but never clears this flag.
+const MIGRATION_006_REQUIRE_EXPLICIT_LEASE_RECONCILIATION: &str = r#"
+UPDATE workspaces
+SET lease_reconciliation_required = 1;
+
+UPDATE workspace_write_leases
+SET state = 'recovery_required'
+WHERE state = 'active';
+
+-- Historical aliases stay queryable while reconciliation is pending, but a
+-- newly safe Workspace (flag = 0) may never add another name for an existing
+-- primary checkout. The repository performs the same check to return a typed
+-- error; these triggers remain the final arbiter for direct SQLite writers.
+CREATE TRIGGER prevent_safe_primary_checkout_alias_insert
+BEFORE INSERT ON workspace_checkouts
+FOR EACH ROW
+WHEN NEW.is_primary = 1
+AND COALESCE((
+    SELECT w.lease_reconciliation_required FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+), 1) = 0
+AND EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.canonical_path = NEW.canonical_path
+      AND c.workspace_id != NEW.workspace_id
+    UNION
+    SELECT 1 FROM workspaces other
+    WHERE other.root = NEW.canonical_path
+      AND other.id != NEW.workspace_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'primary checkout aliases an existing workspace');
+END;
+
+CREATE TRIGGER validate_safe_primary_checkout_identity_insert
+BEFORE INSERT ON workspace_checkouts
+FOR EACH ROW
+WHEN NEW.is_primary = 1
+AND COALESCE((
+    SELECT w.lease_reconciliation_required FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+), 1) = 0
+AND EXISTS (
+    SELECT 1 FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+      AND (NEW.path != w.root OR NEW.canonical_path != w.root)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'primary checkout identity differs from workspace root');
+END;
+
+CREATE TRIGGER prevent_safe_primary_checkout_alias_update
+BEFORE UPDATE OF canonical_path, is_primary ON workspace_checkouts
+FOR EACH ROW
+WHEN NEW.is_primary = 1
+AND COALESCE((
+    SELECT w.lease_reconciliation_required FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+), 1) = 0
+AND EXISTS (
+    SELECT 1 FROM workspace_checkouts c
+    WHERE c.canonical_path = NEW.canonical_path
+      AND c.workspace_id != NEW.workspace_id
+    UNION
+    SELECT 1 FROM workspaces other
+    WHERE other.root = NEW.canonical_path
+      AND other.id != NEW.workspace_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'primary checkout aliases an existing workspace');
+END;
+
+CREATE TRIGGER validate_safe_primary_checkout_identity_update
+BEFORE UPDATE OF path, canonical_path, is_primary ON workspace_checkouts
+FOR EACH ROW
+WHEN NEW.is_primary = 1
+AND COALESCE((
+    SELECT w.lease_reconciliation_required FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+), 1) = 0
+AND EXISTS (
+    SELECT 1 FROM workspaces w
+    WHERE w.id = NEW.workspace_id
+      AND (NEW.path != w.root OR NEW.canonical_path != w.root)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'primary checkout identity differs from workspace root');
+END;
+
+CREATE TRIGGER prevent_safe_workspace_root_retarget
+BEFORE UPDATE OF root ON workspaces
+FOR EACH ROW
+WHEN OLD.lease_reconciliation_required = 0
+AND NEW.lease_reconciliation_required = 0
+AND NEW.root != OLD.root
+BEGIN
+    SELECT RAISE(ABORT, 'workspace root change requires reconciliation');
+END;
+
+-- Builds predating this migration cleared the guard as a side effect of lease
+-- acquisition. Fail closed even if one of those daemons is still connected while
+-- a newer daemon upgrades the database. A future explicit reconciliation API
+-- must replace this trigger with its own auditable, fenced transition.
+CREATE TRIGGER prevent_implicit_workspace_reconciliation
+BEFORE UPDATE OF lease_reconciliation_required ON workspaces
+FOR EACH ROW
+WHEN OLD.lease_reconciliation_required = 1
+AND NEW.lease_reconciliation_required = 0
+BEGIN
+    SELECT RAISE(ABORT, 'workspace reconciliation requires an explicit fenced flow');
+END;
+
+CREATE TRIGGER prevent_alias_reconciliation_without_unique_root
+BEFORE UPDATE OF lease_reconciliation_required ON workspaces
+FOR EACH ROW
+WHEN NEW.lease_reconciliation_required = 0
+AND EXISTS (
+    SELECT 1
+    FROM workspace_checkouts own
+    JOIN workspace_checkouts other
+      ON other.canonical_path = own.canonical_path
+     AND other.workspace_id != own.workspace_id
+    WHERE own.workspace_id = NEW.id AND own.is_primary = 1
+    UNION
+    SELECT 1 FROM workspaces other
+    WHERE other.root = NEW.root AND other.id != NEW.id
+    UNION
+    SELECT 1 FROM workspace_checkouts own
+    WHERE own.workspace_id = NEW.id AND own.is_primary = 1
+      AND (own.path != NEW.root OR own.canonical_path != NEW.root)
+    UNION
+    SELECT 1 WHERE NOT EXISTS (
+        SELECT 1 FROM workspace_checkouts own
+        WHERE own.workspace_id = NEW.id AND own.is_primary = 1
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'aliased workspace cannot be marked reconciled');
+END;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,7 +827,8 @@ mod tests {
                 "attention_queue",
                 "unified_hierarchy_and_leases",
                 "safe_session_checkout_modes",
-                "drop_persisted_hook_payloads"
+                "drop_persisted_hook_payloads",
+                "require_explicit_legacy_lease_reconciliation"
             ]
         );
 
@@ -746,7 +898,8 @@ mod tests {
                 "attention_queue",
                 "unified_hierarchy_and_leases",
                 "safe_session_checkout_modes",
-                "drop_persisted_hook_payloads"
+                "drop_persisted_hook_payloads",
+                "require_explicit_legacy_lease_reconciliation"
             ]
         );
 
@@ -789,7 +942,8 @@ mod tests {
             applied.names,
             vec![
                 "safe_session_checkout_modes",
-                "drop_persisted_hook_payloads"
+                "drop_persisted_hook_payloads",
+                "require_explicit_legacy_lease_reconciliation"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -854,9 +1008,8 @@ mod tests {
         )
         .unwrap();
 
-        let applied = apply(&conn).unwrap();
+        let applied = apply_to(&conn, 5).unwrap();
         assert_eq!(applied.names.last(), Some(&"drop_persisted_hook_payloads"));
-
         let hook: (String, Option<String>) = conn
             .query_row(
                 "SELECT kind_slug, raw FROM events WHERE id = 'evt_hook'",
@@ -882,6 +1035,75 @@ mod tests {
             )
             .unwrap();
         assert!(pending, "the physical purge must be retried by Store::open");
+    }
+
+    #[test]
+    fn v6_from_v5_never_trusts_a_legacy_active_writer_or_clears_reconciliation() {
+        let conn = fresh();
+        apply_to(&conn, 1).unwrap();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root, env_json, init_commands_json, \
+             attention_json, created_ms, last_used_ms, tmux_enabled, archived) \
+             VALUES ('ws_old', 'legacy', '/repo', '[]', '[]', '{}', 1, 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        apply_to(&conn, 5).unwrap();
+        conn.execute(
+            "INSERT INTO sessions \
+                 (id, workspace_id, name, cwd, env_json, attention_json, status, \
+                  restore_state, tags_json, favourite, pinned, sort_key, created_ms, \
+                  last_activity_ms, tmux, mode, checkout_id, worktree_path, \
+                  read_only_enforced) \
+             VALUES ('sess_old', 'ws_old', 'writer', '/repo', '[]', '{}', 'active', \
+                     'live', '[]', 0, 0, 0, 1, 1, 0, 'main_checkout', \
+                     'checkout_primary_ws_old', NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE checkout_write_fences SET generation = 1 WHERE canonical_path = '/repo'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_write_leases \
+                 (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                  acquired_ms, heartbeat_ms, released_ms, generation) \
+             VALUES ('lease_old', 'ws_old', 'sess_old', 'checkout_primary_ws_old', \
+                     '/repo', 'exclusive_write', 'active', 1, 1, NULL, 1)",
+            [],
+        )
+        .unwrap();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(
+            applied.names,
+            vec!["require_explicit_legacy_lease_reconciliation"]
+        );
+        let (required, state): (bool, String) = conn
+            .query_row(
+                "SELECT w.lease_reconciliation_required, l.state \
+                 FROM workspaces w JOIN workspace_write_leases l ON l.workspace_id = w.id \
+                 WHERE w.id = 'ws_old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(required);
+        assert_eq!(state, "recovery_required");
+
+        let implicit_clear = conn
+            .execute(
+                "UPDATE workspaces SET lease_reconciliation_required = 0 WHERE id = 'ws_old'",
+                [],
+            )
+            .expect_err("an old daemon must not clear the v6 gate as a lease side effect");
+        assert!(matches!(
+            implicit_clear,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        ));
     }
 
     #[test]

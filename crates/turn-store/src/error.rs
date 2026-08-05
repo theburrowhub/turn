@@ -64,6 +64,47 @@ pub enum StoreError {
         lease_id: String,
     },
 
+    /// A launch-time authority check found no active lease owned by the Session.
+    /// This is distinct from a conflict: there may be no current owner at all,
+    /// but process launch must never acquire ownership as a side effect.
+    #[error(
+        "session {session_id} does not hold an active write lease for checkout {checkout_id} in workspace {workspace_id}"
+    )]
+    WriteLeaseNotActive {
+        workspace_id: String,
+        session_id: String,
+        checkout_id: String,
+    },
+
+    /// The checkout came from state written before Turn could prove exclusive
+    /// ownership. Only an explicit reconciliation flow may clear this gate; a
+    /// lease acquisition must never "repair" it as a side effect.
+    #[error("workspace {workspace_id} checkout {checkout_id} requires write-lease reconciliation")]
+    LeaseReconciliationRequired {
+        workspace_id: String,
+        checkout_id: String,
+    },
+
+    /// Workspace roots are filesystem identities, not caller-provided labels.
+    /// A missing/unresolvable/non-directory root cannot safely participate in
+    /// checkout fencing.
+    #[error("could not resolve workspace root {path}: {cause}")]
+    WorkspaceRoot {
+        path: String,
+        #[source]
+        cause: std::io::Error,
+    },
+
+    /// Two Workspace records must not name the same checkout. Historical
+    /// aliases remain visible for reconciliation, but no new alias is accepted.
+    #[error(
+        "workspace root {canonical_path} is already registered by workspace {existing_workspace_id}"
+    )]
+    WorkspaceRootAlias {
+        canonical_path: String,
+        existing_workspace_id: String,
+    },
+
     /// The requested Session or Checkout does not belong to the named Workspace.
     /// Keeping all three ids makes the programming error diagnosable without
     /// weakening it into a generic missing-row response.

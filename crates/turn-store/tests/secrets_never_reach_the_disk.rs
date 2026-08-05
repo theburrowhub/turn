@@ -87,7 +87,14 @@ fn tables_in_the_schema() -> Vec<String> {
 }
 
 fn write_everything(store: &Store) -> (WorkspaceId, Session) {
-    let mut workspace = Workspace::new("turn", "/repos/turn", T0);
+    let root = store
+        .path()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("workspace-root");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut workspace = Workspace::new("turn", root.to_string_lossy(), T0);
     workspace.env = vec![
         ("PATH".into(), "/usr/bin".into()),
         ("GITHUB_TOKEN".into(), SECRETS[0].into()),
@@ -442,7 +449,9 @@ fn a_process_environment_is_not_persisted_wholesale_even_when_it_looks_innocent(
     // are never written. A node carries only the highlights an adapter chose.
     let temp = tempfile::tempdir().unwrap();
     let store = Store::open_in(temp.path()).unwrap();
-    let workspace = Workspace::new("turn", "/repos/turn", T0);
+    let root = temp.path().join("workspace-root");
+    std::fs::create_dir(&root).unwrap();
+    let workspace = Workspace::new("turn", root.to_string_lossy(), T0);
     store.workspaces().save(&workspace).unwrap();
     let session = Session::new(
         workspace.id.clone(),

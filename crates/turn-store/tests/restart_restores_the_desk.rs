@@ -19,14 +19,24 @@ const T0: i64 = 1_700_000_000_000;
 fn seed(store: &Store) -> SessionId {
     store.templates().install_built_ins(T0).unwrap();
     let coding = store.templates().find_by_name("Coding").unwrap().unwrap();
+    let roots = store
+        .path()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("workspace-roots");
+    let turn_root = roots.join("turn");
+    let website_root = roots.join("website");
+    std::fs::create_dir_all(&turn_root).unwrap();
+    std::fs::create_dir_all(&website_root).unwrap();
 
-    let mut turn_ws = Workspace::new("turn", "/repos/turn", T0);
+    let mut turn_ws = Workspace::new("turn", turn_root.to_string_lossy(), T0);
     turn_ws.default_template = Some(coding.id.clone());
     turn_ws.default_agent = Some("claude".into());
     turn_ws.init_commands = vec!["nvm use".into()];
     store.workspaces().save(&turn_ws).unwrap();
 
-    let other_ws = Workspace::new("website", "/repos/website", T0);
+    let other_ws = Workspace::new("website", website_root.to_string_lossy(), T0);
     store.workspaces().save(&other_ws).unwrap();
 
     // The session under test, laid out from the built-in template.
