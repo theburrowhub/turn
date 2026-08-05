@@ -78,14 +78,34 @@ impl DaemonHandle {
     pub async fn shutdown(self) {
         let (done, wait) = oneshot::channel();
         if self.commands.send(Command::Shutdown { done }).await.is_ok() {
-            // The core flushes the store before answering. Bounded so a wedged handler
-            // cannot keep the process alive forever, at the cost of the last write.
+            // The core flushes before answering. This timeout only bounds the graceful
+            // phase; a timed-out task is aborted and joined below so the method never
+            // returns while it still owns the data-directory lock.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await;
         }
         self.accept.abort();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.core).await;
+        let _ = self.accept.await;
+        let mut core = self.core;
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut core)
+            .await
+            .is_err()
+        {
+            tracing::error!("core did not stop after five seconds; aborting it");
+            core.abort();
+            let _ = (&mut core).await;
+        }
+        // A completed Tokio task retains its future allocation until the JoinHandle is
+        // dropped. That allocation owned Core's Arc<DataDirLock>, so merely awaiting
+        // it still left an immediate restart racing the old lock under parallel load.
+        drop(core);
         instance::remove_socket(&self.socket_path);
         self.hooks.shutdown();
+        // `shutdown(self)` is itself a Future. Under load its storage can remain alive
+        // for one more poll after Ready, so relying on the implicit end-of-scope drop
+        // lets an immediate restart race this final Arc. Release ownership explicitly
+        // before returning to the caller.
+        drop(self.hooks);
+        drop(self._data_dir_lock);
     }
 
     /// Runs until the operating system asks the daemon to stop.

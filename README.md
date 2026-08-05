@@ -167,6 +167,22 @@ the visibly selected Workspace using that Workspace's default Layout preset, the
 preset. It never silently chooses a different Workspace, and a second create is refused while the first is
 still awaiting its daemon response.
 
+### Ending work and restoring after a restart
+
+- **Session → End session…** (or **⌘⇧K**) asks for confirmation, then stops every
+  Turn-owned process in that Session. The Session, Layout and history remain available.
+- **Session → Detach all views · keep running** closes only this window's views; it does
+  not terminate agents or shells.
+- **Session → Stop all sessions…** stops every Session in the current Workspace. To file
+  the Workspace away afterward, release its write lease from the same menu and choose
+  **Archive workspace**. Enable **Archived** in the hierarchy header to restore it later.
+
+After a daemon restart Turn restores the tree and Layout without silently running saved
+commands. For a main-checkout Session, choose **Confirm write access** and then **Start
+pane** or **Start all**. If Turn reports a surviving process that the new daemon cannot
+control, stop that process outside Turn and use **Check & confirm access**; the daemon
+revalidates it at that moment. Archiving and ending work never delete the project directory.
+
 `turn` reuses a daemon already listening on its socket. When none is listening it starts `turnd` as a
 detached companion, so closing the window does not stop the daemon, its PTYs or its agents. Packaged builds
 place `turn`, `turnd` and `turn-hook` beside one another; `turnd` resolves the helper beside itself rather

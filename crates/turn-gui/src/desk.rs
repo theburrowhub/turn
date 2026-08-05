@@ -25,7 +25,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
-use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind, PreviewVisibility};
+use turn_core::model::{
+    ActivityPreview, Direction, Layout, LeaseState, PaneKind, PreviewVisibility, SessionStatus,
+};
+use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
 use turn_proto::{
     AttentionView, CloseDisposition, FocusTarget, HierarchyKey, HierarchySnapshot, NewPane,
@@ -41,8 +44,8 @@ use crate::terminal::feed::{Desync, PaneFeed};
 use crate::terminal::PaneAction;
 use crate::transport::{Ask, ConnectionState, Inbound};
 use crate::view::{
-    HierarchyAction, PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRow,
-    TemporaryPaneContent, TurnView, ViewAction,
+    HierarchyAction, PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRestoreView,
+    SessionRow, TemporaryPaneContent, TurnView, ViewAction,
 };
 
 /// Something the application must do as a result.
@@ -113,12 +116,18 @@ pub struct Desk {
     /// compatibility indexes for commands and pane ownership, never a second
     /// navigation model.
     hierarchy: Option<HierarchySnapshot>,
+    include_archived: bool,
     surface_id: String,
     /// Window-local selection that has rendered but may not have been acknowledged by
     /// the daemon yet. Creation commands must follow what the user can see, not the
     /// previous persisted row.
     navigation_hint: Option<HierarchyKey>,
     preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
+    /// Per-Session recovery offers emitted after a daemon restart. Kept structured so
+    /// one Session cannot overwrite another with a global red string.
+    restores: HashMap<SessionId, SessionRestoreView>,
+    relaunching: HashSet<NodeId>,
+    reclaiming_leases: HashSet<WorkspaceId>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
     pending_workspace_creation: bool,
@@ -161,9 +170,13 @@ impl Desk {
             notice: None,
             companion_notice: None,
             hierarchy: None,
+            include_archived: false,
             surface_id: "main-window".to_string(),
             navigation_hint: None,
             preview_history: HashMap::new(),
+            restores: HashMap::new(),
+            relaunching: HashSet::new(),
+            reclaiming_leases: HashSet::new(),
             temporary_pane: None,
             write_conflict: None,
             pending_workspace_creation: false,
@@ -319,6 +332,54 @@ impl Desk {
         self.sessions.iter().find(|summary| &summary.id == id)
     }
 
+    /// Whether starting any new process for a Session would violate recovery or
+    /// archival state. Every launch surface (toolbar, keymap and context action) uses
+    /// the same guard so a shortcut cannot bypass a disabled button.
+    fn session_launch_blocked(&self, session_id: &SessionId) -> bool {
+        if self
+            .sessions
+            .iter()
+            .find(|summary| &summary.id == session_id)
+            .is_some_and(|summary| summary.status == SessionStatus::Archived)
+        {
+            return true;
+        }
+        self.hierarchy.as_ref().is_some_and(|snapshot| {
+            snapshot.workspaces.iter().any(|workspace| {
+                let Some(session) = workspace
+                    .sessions
+                    .iter()
+                    .find(|session| &session.session.id == session_id)
+                else {
+                    return false;
+                };
+                workspace.workspace.archived
+                    || self.reclaiming_leases.contains(&workspace.workspace.id)
+                    || workspace.write_lease.as_ref().is_some_and(|lease| {
+                        &lease.session_id == session_id
+                            && lease.state == LeaseState::RecoveryRequired
+                    })
+                    || session
+                        .nodes
+                        .iter()
+                        .any(|node| node.lifecycle == Lifecycle::Orphaned)
+            })
+        })
+    }
+
+    fn selected_launch_blocked(&self) -> bool {
+        self.selected
+            .as_ref()
+            .is_some_and(|session_id| self.session_launch_blocked(session_id))
+    }
+
+    fn node_is_orphaned(&self, session_id: &SessionId, node_id: &NodeId) -> bool {
+        self.trees
+            .get(session_id)
+            .and_then(|nodes| nodes.iter().find(|node| &node.node_id == node_id))
+            .is_some_and(|node| node.lifecycle == Lifecycle::Orphaned)
+    }
+
     /// The selected session's layout, which is what decides the geometry on screen.
     fn layout(&self) -> Option<&Layout> {
         self.layouts.get(self.selected.as_ref()?)
@@ -350,6 +411,15 @@ impl Desk {
             Inbound::Event(event) => self.apply_event(*event, now_ms),
             Inbound::Answer { ask, response } => self.apply_answer(ask, *response),
             Inbound::Failed { ask, error } => {
+                match &ask {
+                    Ask::RelaunchNode { node_id, .. } => {
+                        self.relaunching.remove(node_id);
+                    }
+                    Ask::RestoreLeaseAcquire { workspace_id, .. } => {
+                        self.reclaiming_leases.remove(workspace_id);
+                    }
+                    _ => {}
+                }
                 let lease_conflict = match (
                     &ask,
                     error.context.as_deref(),
@@ -438,6 +508,9 @@ impl Desk {
         self.hierarchy = None;
         self.navigation_hint = None;
         self.preview_history.clear();
+        self.restores.clear();
+        self.relaunching.clear();
+        self.reclaiming_leases.clear();
         self.temporary_pane = None;
         self.write_conflict = None;
         self.pending_workspace_creation = false;
@@ -450,7 +523,7 @@ impl Desk {
                 ask: Ask::Hierarchy,
                 request: Request::GetHierarchy {
                     surface_id: self.surface_id.clone(),
-                    include_archived: false,
+                    include_archived: self.include_archived,
                 },
             },
             Reaction::Send {
@@ -483,6 +556,156 @@ impl Desk {
 
     fn apply_answer(&mut self, ask: Ask, response: Response) -> Vec<Reaction> {
         match (ask, response) {
+            (
+                Ask::RestoreLeaseAcquire {
+                    workspace_id,
+                    session_id,
+                    checkout_id,
+                },
+                Response::WorkspaceWriteLease {
+                    workspace_id: answered_workspace,
+                    lease,
+                },
+            ) if answered_workspace == workspace_id => {
+                let valid = lease.as_ref().is_some_and(|lease| {
+                    lease.workspace_id == workspace_id
+                        && lease.session_id == session_id
+                        && lease.checkout_id == checkout_id
+                        && lease.state == LeaseState::Active
+                });
+                if !valid {
+                    self.reclaiming_leases.remove(&workspace_id);
+                    let message =
+                        "the daemon did not return the confirmed active write lease".to_string();
+                    self.notice = Some(message.clone());
+                    return vec![Reaction::Notice(message)];
+                }
+                if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter_mut()
+                        .find(|branch| branch.workspace.id == workspace_id)
+                }) {
+                    branch.write_lease = lease;
+                }
+                self.reclaiming_leases.remove(&workspace_id);
+                self.notice = None;
+                Vec::new()
+            }
+            (
+                Ask::RelaunchNode {
+                    session_id,
+                    node_id,
+                },
+                Response::Node { .. },
+            ) => {
+                self.relaunching.remove(&node_id);
+                self.resolve_restore_outcome(&session_id, &node_id);
+                vec![Reaction::Send {
+                    ask: Ask::Details(session_id.clone()),
+                    request: Request::GetSession { session_id },
+                }]
+            }
+            (
+                Ask::CloseSession {
+                    session_id,
+                    disposition,
+                },
+                Response::Ack,
+            ) => {
+                self.drop_session_feeds(&session_id);
+                if disposition != CloseDisposition::KeepProcesses {
+                    self.restores.remove(&session_id);
+                }
+                if disposition == CloseDisposition::KeepProcesses
+                    && self.selected.as_ref() == Some(&session_id)
+                {
+                    self.selected = None;
+                    if let Some(next) = self
+                        .sessions
+                        .iter()
+                        .find(|session| session.id != session_id)
+                        .map(|session| session.id.clone())
+                    {
+                        return self.select(next);
+                    }
+                    return vec![Reaction::Send {
+                        ask: Ask::Action("clearing the detached Session selection"),
+                        request: Request::SelectTreeNode {
+                            surface_id: self.surface_id.clone(),
+                            selected: None,
+                        },
+                    }];
+                }
+                Vec::new()
+            }
+            (
+                Ask::CloseWorkspace {
+                    workspace_id,
+                    disposition,
+                },
+                Response::Ack,
+            ) => {
+                let sessions: HashSet<SessionId> = self
+                    .hierarchy
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|branch| branch.workspace.id == workspace_id)
+                    })
+                    .map(|branch| {
+                        branch
+                            .sessions
+                            .iter()
+                            .map(|session| session.session.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for session_id in &sessions {
+                    self.drop_session_feeds(session_id);
+                }
+                if disposition != CloseDisposition::KeepProcesses {
+                    self.restores
+                        .retain(|session_id, _| !sessions.contains(session_id));
+                }
+                let selected_closed = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|session_id| sessions.contains(session_id));
+                let mut reactions = vec![Reaction::Send {
+                    ask: Ask::Action("collapsing the stopped Workspace"),
+                    request: Request::SetTreeExpanded {
+                        surface_id: self.surface_id.clone(),
+                        key: HierarchyKey::workspace(workspace_id.clone()),
+                        expanded: false,
+                    },
+                }];
+                if selected_closed {
+                    self.selected = None;
+                    if let Some(next) = self.hierarchy.as_ref().and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .filter(|branch| branch.workspace.id != workspace_id)
+                            .flat_map(|branch| branch.sessions.iter())
+                            .map(|session| session.session.id.clone())
+                            .next()
+                    }) {
+                        reactions.extend(self.select(next));
+                    } else {
+                        reactions.push(Reaction::Send {
+                            ask: Ask::Action("clearing the stopped Workspace selection"),
+                            request: Request::SelectTreeNode {
+                                surface_id: self.surface_id.clone(),
+                                selected: None,
+                            },
+                        });
+                    }
+                }
+                reactions
+            }
             (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot, true),
             (_, Response::TreeState { state }) => {
                 if let Some(hierarchy) = self.hierarchy.as_mut() {
@@ -624,10 +847,33 @@ impl Desk {
                 self.attach_wanted()
             }
             (_, Response::Layout { session_id, layout }) => self.apply_layout(&session_id, layout),
-            (_, Response::Attached { attachment }) => {
-                self.attaching.remove(&attachment.pane_id);
-                self.feeds
-                    .insert(attachment.pane_id.clone(), PaneFeed::attach(&attachment));
+            (
+                Ask::Attach {
+                    session_id,
+                    pane_id,
+                },
+                Response::Attached { attachment },
+            ) => {
+                self.attaching.remove(&pane_id);
+                let is_recovery_offer = self.restores.get(&session_id).is_some_and(|restore| {
+                    restore.panes.iter().any(|pane| pane.pane_id == pane_id)
+                });
+                let current_owner = self.pane_owner.get(&pane_id);
+                let current_node = self.node_of(&pane_id);
+                let stale = is_recovery_offer
+                    || attachment.session_id != session_id
+                    || attachment.pane_id != pane_id
+                    || current_owner != Some(&session_id)
+                    || attachment.node_id != current_node;
+                if stale {
+                    // Restore, close and relaunch can all cross an in-flight AttachPane.
+                    // Runtime identity must still match the current Layout before a
+                    // screen is accepted under this visual PaneId.
+                    self.feeds.remove(&pane_id);
+                    self.pty_sizes.remove(&pane_id);
+                    return Vec::new();
+                }
+                self.feeds.insert(pane_id, PaneFeed::attach(&attachment));
                 Vec::new()
             }
             (
@@ -801,7 +1047,7 @@ impl Desk {
             ask: Ask::Hierarchy,
             request: Request::GetHierarchy {
                 surface_id: self.surface_id.clone(),
-                include_archived: false,
+                include_archived: self.include_archived,
             },
         }
     }
@@ -817,6 +1063,22 @@ impl Desk {
             {
                 return Vec::new();
             }
+        }
+        let visible_sessions: HashSet<SessionId> = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.sessions.iter())
+            .map(|session| session.session.id.clone())
+            .collect();
+        let hidden_sessions: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|session| !visible_sessions.contains(&session.id))
+            .map(|session| session.id.clone())
+            .collect();
+        let mut reactions = Vec::new();
+        for session_id in hidden_sessions {
+            reactions.extend(self.forget_hidden_session_views(&session_id));
         }
         let previous_active = self.selected.clone();
         self.workspaces = snapshot
@@ -857,18 +1119,19 @@ impl Desk {
 
         let Some(active) = active else {
             self.selected = None;
-            return Vec::new();
+            return reactions;
         };
         let needs_details = !self.layouts.contains_key(&active);
         self.selected = Some(active.clone());
         if needs_details {
-            vec![Reaction::Send {
+            reactions.push(Reaction::Send {
                 ask: Ask::Details(active.clone()),
                 request: Request::GetSession { session_id: active },
-            }]
+            });
         } else {
-            self.attach_wanted()
+            reactions.extend(self.attach_wanted());
         }
+        reactions
     }
 
     fn apply_event(&mut self, event: turn_proto::ServerEvent, now_ms: i64) -> Vec<Reaction> {
@@ -915,7 +1178,16 @@ impl Desk {
             }
             E::SessionStateChanged { session } => {
                 let session = *session;
-                self.upsert_session(session.clone());
+                let visible = self.hierarchy.as_ref().is_none_or(|hierarchy| {
+                    hierarchy
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| workspace.sessions.iter())
+                        .any(|branch| branch.session.id == session.id)
+                });
+                if visible {
+                    self.upsert_session(session.clone());
+                }
                 if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
                     hierarchy
                         .workspaces
@@ -928,6 +1200,11 @@ impl Desk {
                 Vec::new()
             }
             E::SessionRemoved { session_id, .. } => {
+                self.relaunching.retain(|node| {
+                    self.trees.iter().any(|(owner, nodes)| {
+                        owner != &session_id && nodes.iter().any(|row| &row.node_id == node)
+                    })
+                });
                 self.sessions.retain(|summary| summary.id != session_id);
                 if let Some(hierarchy) = self.hierarchy.as_mut() {
                     for workspace in &mut hierarchy.workspaces {
@@ -939,6 +1216,7 @@ impl Desk {
                 self.layouts.remove(&session_id);
                 self.trees.remove(&session_id);
                 self.policies.remove(&session_id);
+                self.drop_session_feeds(&session_id);
                 let gone: Vec<PaneId> = self
                     .pane_owner
                     .iter()
@@ -961,6 +1239,13 @@ impl Desk {
             }
             E::LayoutChanged { session_id, layout } => self.apply_layout(&session_id, layout),
             E::TreeChanged { session_id, nodes } => {
+                let stale_temporary = self.temporary_pane.as_ref().and_then(|temporary| {
+                    (temporary.binding.session_id == session_id
+                        && !nodes
+                            .iter()
+                            .any(|node| node.node_id == temporary.binding.node_id))
+                    .then(|| temporary.binding.clone())
+                });
                 self.trees.insert(session_id.clone(), nodes.clone());
                 if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
                     hierarchy
@@ -971,7 +1256,23 @@ impl Desk {
                 }) {
                     branch.nodes = nodes;
                 }
-                Vec::new()
+                if let Some(binding) = stale_temporary {
+                    self.temporary_pane = None;
+                    self.pane_owner.remove(&binding.pane_id);
+                    self.feeds.remove(&binding.pane_id);
+                    self.attaching.remove(&binding.pane_id);
+                    self.pty_sizes.remove(&binding.pane_id);
+                    vec![Reaction::Send {
+                        ask: Ask::Action("closing a temporary view whose Process ended"),
+                        request: Request::ClosePane {
+                            session_id: binding.session_id,
+                            pane_id: binding.pane_id,
+                            disposition: CloseDisposition::KeepProcesses,
+                        },
+                    }]
+                } else {
+                    Vec::new()
+                }
             }
             E::HierarchyChanged { snapshot } => self.replace_hierarchy(*snapshot, false),
             E::ActivityPreviewChanged {
@@ -1015,6 +1316,7 @@ impl Desk {
                         self.pane_owner.remove(&pane_id);
                         self.feeds.remove(&pane_id);
                         self.attaching.remove(&pane_id);
+                        self.pty_sizes.remove(&pane_id);
                     }
                 }
                 Vec::new()
@@ -1068,18 +1370,25 @@ impl Desk {
                 panes,
             } => {
                 if !needs_explanation {
+                    self.restores.remove(&session_id);
                     return Vec::new();
                 }
-                // Nothing here has been relaunched. Saying what was found, and what
-                // could be started again, is the whole of the window's job: the user
-                // answers with a relaunch or does not.
-                let lost = panes.iter().filter(|pane| pane.can_relaunch).count();
-                let message = format!(
-                    "{session_id}: restored as {state:?}. {lost} pane(s) could be started again — \
-                     nothing has been"
+                // Merely receiving this event never starts a process. The structured
+                // outcomes become neutral, per-pane actions in the selected Session.
+                for outcome in &panes {
+                    self.feeds.remove(&outcome.pane_id);
+                    self.attaching.remove(&outcome.pane_id);
+                    self.pty_sizes.remove(&outcome.pane_id);
+                }
+                self.restores.insert(
+                    session_id.clone(),
+                    SessionRestoreView {
+                        session_id,
+                        state,
+                        panes,
+                    },
                 );
-                self.notice = Some(message.clone());
-                vec![Reaction::Notice(message)]
+                Vec::new()
             }
             E::NodeStateChanged {
                 session_id,
@@ -1232,6 +1541,69 @@ impl Desk {
         update(node);
     }
 
+    fn resolve_restore_outcome(&mut self, session_id: &SessionId, node_id: &NodeId) {
+        let mut empty = false;
+        if let Some(restore) = self.restores.get_mut(session_id) {
+            restore.panes.retain(|pane| &pane.node_id != node_id);
+            empty = restore.panes.is_empty();
+        }
+        if empty {
+            self.restores.remove(session_id);
+        }
+    }
+
+    fn drop_session_feeds(&mut self, session_id: &SessionId) {
+        if self
+            .temporary_pane
+            .as_ref()
+            .is_some_and(|pane| &pane.binding.session_id == session_id)
+        {
+            if let Some(temporary) = self.temporary_pane.take() {
+                let pane_id = temporary.binding.pane_id;
+                self.pane_owner.remove(&pane_id);
+                self.feeds.remove(&pane_id);
+                self.attaching.remove(&pane_id);
+                self.pty_sizes.remove(&pane_id);
+            }
+        }
+        let panes: Vec<PaneId> = self
+            .pane_owner
+            .iter()
+            .filter(|(_, owner)| *owner == session_id)
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane in panes {
+            self.feeds.remove(&pane);
+            self.attaching.remove(&pane);
+            self.pty_sizes.remove(&pane);
+        }
+    }
+
+    fn forget_hidden_session_views(&mut self, session_id: &SessionId) -> Vec<Reaction> {
+        let temporary = self
+            .temporary_pane
+            .as_ref()
+            .filter(|pane| &pane.binding.session_id == session_id)
+            .map(|pane| pane.binding.clone());
+        self.drop_session_feeds(session_id);
+        self.pane_owner.retain(|_, owner| owner != session_id);
+        self.layouts.remove(session_id);
+        self.trees.remove(session_id);
+        self.policies.remove(session_id);
+        temporary
+            .map(|binding| {
+                vec![Reaction::Send {
+                    ask: Ask::Action("closing a temporary view hidden with its Session"),
+                    request: Request::ClosePane {
+                        session_id: binding.session_id,
+                        pane_id: binding.pane_id,
+                        disposition: CloseDisposition::KeepProcesses,
+                    },
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     /// Which session a pane belongs to.
     ///
     /// Looked up rather than assumed to be the selected one: temporary Panes and late
@@ -1252,6 +1624,30 @@ impl Desk {
     /// grid is the largest thing the client keeps, and thirty sessions of dead panes
     /// would be a leak that looks like ordinary memory use.
     fn remember_layout(&mut self, session_id: SessionId, layout: Layout) {
+        let rebound: Vec<PaneId> = self
+            .layouts
+            .get(&session_id)
+            .map(|previous| {
+                layout
+                    .panes()
+                    .into_iter()
+                    .filter(|pane| {
+                        previous
+                            .get(&pane.id)
+                            .is_some_and(|old| old.node_id != pane.node_id)
+                    })
+                    .map(|pane| pane.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for pane in rebound {
+            // Pane identity is visual; its feed is runtime identity. A relaunch keeps
+            // PaneId but changes node_id, so retaining this feed would leave the new
+            // process running behind the dead process's final screen.
+            self.feeds.remove(&pane);
+            self.attaching.remove(&pane);
+            self.pty_sizes.remove(&pane);
+        }
         let temporary = self
             .temporary_pane
             .as_ref()
@@ -1282,7 +1678,22 @@ impl Desk {
             .and_then(|id| self.layouts.get(id).map(|layout| (id.clone(), layout)))
         {
             for pane in layout.panes() {
-                if pane.kind.is_terminal() {
+                let has_restore_outcome = self.restores.get(&session_id).is_some_and(|restore| {
+                    restore
+                        .panes
+                        .iter()
+                        .any(|outcome| outcome.pane_id == pane.id)
+                });
+                let runtime_cannot_attach = pane.node_id.as_ref().is_some_and(|node_id| {
+                    self.trees.get(&session_id).is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            &node.node_id == node_id
+                                && (node.lifecycle.is_terminal()
+                                    || node.lifecycle == Lifecycle::Orphaned)
+                        })
+                    })
+                });
+                if pane.kind.is_terminal() && !has_restore_outcome && !runtime_cannot_attach {
                     wanted.push((session_id.clone(), pane.id.clone()));
                 }
             }
@@ -1678,16 +2089,42 @@ impl Desk {
                 }
                 _ => Vec::new(),
             },
-            Command::ArchiveSession => match session {
-                Some(session_id) => vec![Reaction::Send {
+            Command::ArchiveSession => {
+                let Some(session_id) = session else {
+                    return Vec::new();
+                };
+                let Some(summary) = self.selected_summary() else {
+                    return Vec::new();
+                };
+                if summary.status == SessionStatus::Archived {
+                    return vec![Reaction::Notice("this Session is already archived".into())];
+                }
+                if summary.running_count > 0 {
+                    return vec![Reaction::Notice(
+                        "end the Session before archiving it".into(),
+                    )];
+                }
+                let owns_lease = self.hierarchy.as_ref().is_some_and(|snapshot| {
+                    snapshot.workspaces.iter().any(|workspace| {
+                        workspace
+                            .write_lease
+                            .as_ref()
+                            .is_some_and(|lease| lease.session_id == session_id)
+                    })
+                });
+                if owns_lease {
+                    return vec![Reaction::Notice(
+                        "release the Session's write lease before archiving it".into(),
+                    )];
+                }
+                vec![Reaction::Send {
                     ask: Ask::Action("archiving the session"),
                     request: Request::ArchiveSession {
                         session_id,
                         archived: true,
                     },
-                }],
-                None => Vec::new(),
-            },
+                }]
+            }
             Command::CloseSession => match session {
                 Some(session_id) => vec![Reaction::Send {
                     ask: Ask::Action("closing the session"),
@@ -1702,6 +2139,12 @@ impl Desk {
                 None => Vec::new(),
             },
             Command::SplitHorizontal | Command::SplitVertical => {
+                if self.selected_launch_blocked() {
+                    return vec![Reaction::Notice(
+                        "restore this Session and confirm recovery before starting another pane"
+                            .into(),
+                    )];
+                }
                 let Some((session_id, pane_id)) = session.zip(pane) else {
                     return Vec::new();
                 };
@@ -1783,6 +2226,12 @@ impl Desk {
                 }
             }
             Command::LaunchAgent | Command::LaunchShell | Command::LaunchTui => {
+                if self.selected_launch_blocked() {
+                    return vec![Reaction::Notice(
+                        "restore this Session and confirm recovery before starting another process"
+                            .into(),
+                    )];
+                }
                 let Some((session_id, pane_id)) = session.zip(pane) else {
                     return Vec::new();
                 };
@@ -1810,6 +2259,12 @@ impl Desk {
                 let Some(node_id) = self.node_of(&pane_id) else {
                     return vec![Reaction::Notice("no process in this pane".into())];
                 };
+                if self.node_is_orphaned(&session_id, &node_id) {
+                    return vec![Reaction::Notice(
+                        "this process survived the previous daemon and is not controllable; stop it outside Turn, then confirm recovery"
+                            .into(),
+                    )];
+                }
                 let request = if command == Command::InterruptProcess {
                     Request::InterruptNode {
                         session_id,
@@ -1882,13 +2337,143 @@ impl Desk {
             ViewAction::TerminateNode {
                 session_id,
                 node_id,
+            } => {
+                if self.node_is_orphaned(&session_id, &node_id) {
+                    return vec![Reaction::Notice(
+                        "this process survived the previous daemon and is not controllable; stop it outside Turn, then confirm recovery"
+                            .into(),
+                    )];
+                }
+                vec![Reaction::Send {
+                    ask: Ask::Action("stopping an Agent or Process"),
+                    request: Request::TerminateNode {
+                        session_id,
+                        node_id,
+                    },
+                }]
+            }
+            ViewAction::CloseSession {
+                session_id,
+                disposition,
             } => vec![Reaction::Send {
-                ask: Ask::Action("stopping an Agent or Process"),
-                request: Request::TerminateNode {
+                ask: Ask::CloseSession {
+                    session_id: session_id.clone(),
+                    disposition,
+                },
+                request: Request::CloseSession {
                     session_id,
-                    node_id,
+                    disposition,
                 },
             }],
+            ViewAction::CloseWorkspace {
+                workspace_id,
+                disposition,
+            } => vec![Reaction::Send {
+                ask: Ask::CloseWorkspace {
+                    workspace_id: workspace_id.clone(),
+                    disposition,
+                },
+                request: Request::CloseWorkspace {
+                    workspace_id,
+                    disposition,
+                },
+            }],
+            ViewAction::RelaunchNode {
+                session_id,
+                node_id,
+                resume,
+            } => {
+                if self.session_launch_blocked(&session_id) {
+                    return vec![Reaction::Notice(
+                        "restore this Session and confirm recovery before starting the pane".into(),
+                    )];
+                }
+                if !self.relaunching.insert(node_id.clone()) {
+                    return Vec::new();
+                }
+                vec![Reaction::Send {
+                    ask: Ask::RelaunchNode {
+                        session_id: session_id.clone(),
+                        node_id: node_id.clone(),
+                    },
+                    request: Request::RelaunchNode {
+                        session_id,
+                        node_id,
+                        resume,
+                    },
+                }]
+            }
+            ViewAction::SetArchivedVisibility { include } => {
+                self.include_archived = include;
+                vec![self.hierarchy_request()]
+            }
+            ViewAction::ArchiveSession {
+                session_id,
+                archived,
+            } => {
+                if !archived {
+                    let workspace_archived = self.hierarchy.as_ref().is_some_and(|snapshot| {
+                        snapshot.workspaces.iter().any(|workspace| {
+                            workspace.workspace.archived
+                                && workspace
+                                    .sessions
+                                    .iter()
+                                    .any(|session| session.session.id == session_id)
+                        })
+                    });
+                    if workspace_archived {
+                        return vec![Reaction::Notice(
+                            "restore the Workspace before restoring this Session".into(),
+                        )];
+                    }
+                }
+                vec![Reaction::Send {
+                    ask: Ask::Action(if archived {
+                        "archiving the Session"
+                    } else {
+                        "restoring the Session"
+                    }),
+                    request: Request::ArchiveSession {
+                        session_id,
+                        archived,
+                    },
+                }]
+            }
+            ViewAction::ArchiveWorkspace {
+                workspace_id,
+                archived,
+            } => vec![Reaction::Send {
+                ask: Ask::Action(if archived {
+                    "archiving the Workspace"
+                } else {
+                    "restoring the Workspace"
+                }),
+                request: Request::ArchiveWorkspace {
+                    workspace_id,
+                    archived,
+                },
+            }],
+            ViewAction::ReclaimWorkspaceWriteLease {
+                workspace_id,
+                session_id,
+                checkout_id,
+            } => {
+                if !self.reclaiming_leases.insert(workspace_id.clone()) {
+                    return Vec::new();
+                }
+                vec![Reaction::Send {
+                    ask: Ask::RestoreLeaseAcquire {
+                        workspace_id: workspace_id.clone(),
+                        session_id: session_id.clone(),
+                        checkout_id: checkout_id.clone(),
+                    },
+                    request: Request::AcquireWorkspaceWriteLease {
+                        workspace_id,
+                        session_id,
+                        checkout_id,
+                    },
+                }]
+            }
             ViewAction::CreateWorkspace {
                 name,
                 root,
@@ -2121,6 +2706,41 @@ impl Desk {
     ///
     /// Call [`Desk::refresh_screens`] first.
     pub fn view(&self, now_ms: i64) -> TurnView<'_> {
+        let restore = self
+            .selected
+            .as_ref()
+            .and_then(|session_id| self.restores.get(session_id));
+        let recovery_lease = self.selected.as_ref().and_then(|selected| {
+            self.hierarchy.as_ref().and_then(|snapshot| {
+                snapshot.workspaces.iter().find_map(|workspace| {
+                    workspace.write_lease.as_ref().filter(|lease| {
+                        &lease.session_id == selected && lease.state == LeaseState::RecoveryRequired
+                    })
+                })
+            })
+        });
+        let reclaiming_write_access = self.selected.as_ref().is_some_and(|selected| {
+            self.hierarchy.as_ref().is_some_and(|snapshot| {
+                snapshot.workspaces.iter().any(|workspace| {
+                    self.reclaiming_leases.contains(&workspace.workspace.id)
+                        && workspace
+                            .sessions
+                            .iter()
+                            .any(|session| &session.session.id == selected)
+                })
+            })
+        });
+        let unreachable_processes = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.trees.get(selected))
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .filter(|node| node.lifecycle == turn_core::state::Lifecycle::Orphaned)
+                    .count()
+            })
+            .unwrap_or(0);
         let sessions: Vec<SessionRow> = self
             .sessions
             .iter()
@@ -2194,6 +2814,12 @@ impl Desk {
             layout: self.layout().cloned(),
             panes,
             temporary_pane,
+            restore,
+            recovery_lease,
+            unreachable_processes,
+            relaunching: self.relaunching.iter().cloned().collect(),
+            reclaiming_workspaces: self.reclaiming_leases.iter().cloned().collect(),
+            reclaiming_write_access,
             permission: self.permission_banner(now_ms),
             queue: self.queue.iter().map(queue_item).collect(),
             connection: Some(self.connection.clone()),
@@ -2202,6 +2828,7 @@ impl Desk {
                 .clone()
                 .or_else(|| self.notice.clone()),
             write_conflict: self.write_conflict(),
+            include_archived: self.include_archived,
             policy: self
                 .selected
                 .as_ref()
@@ -2346,7 +2973,12 @@ fn queue_item(view: &AttentionView) -> QueueItem {
 
 fn session_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option<SessionId> {
     match key {
-        HierarchyKey::Session { session_id } => Some(session_id.clone()),
+        HierarchyKey::Session { session_id } => snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .any(|session| &session.session.id == session_id)
+            .then(|| session_id.clone()),
         HierarchyKey::Process { node_id } => snapshot.workspaces.iter().find_map(|workspace| {
             workspace.sessions.iter().find_map(|session| {
                 session
@@ -2408,7 +3040,7 @@ mod tests {
     use turn_core::Effect;
     use turn_proto::{
         AttentionView, PaneAttachment, PaneFocusView, PaneStream, ScreenUpdate, ServerEvent,
-        TerminalBytes, TreeSurfaceState, Welcome, WorkspaceTreeView,
+        SessionTreeView, TerminalBytes, TreeSurfaceState, Welcome, WorkspaceTreeView,
     };
 
     const T0: i64 = 1_700_000_000_000;
@@ -2481,23 +3113,32 @@ mod tests {
         }
     }
 
-    fn attachment(
+    fn attached(
         pane_id: &PaneId,
         session_id: &SessionId,
+        node_id: &NodeId,
         grid: Grid,
         next_seq: u64,
-    ) -> PaneAttachment {
-        PaneAttachment {
-            session_id: session_id.clone(),
-            pane_id: pane_id.clone(),
-            node_id: None,
-            stream: PaneStream::Cells,
-            screen: Some(Box::new(grid)),
-            replay: TerminalBytes::new(Vec::new()),
-            size: PtySize::new(24, 80),
-            scrollback_truncated: false,
-            bytes_seen: 0,
-            next_seq,
+    ) -> Inbound {
+        Inbound::Answer {
+            ask: Ask::Attach {
+                session_id: session_id.clone(),
+                pane_id: pane_id.clone(),
+            },
+            response: Box::new(Response::Attached {
+                attachment: Box::new(PaneAttachment {
+                    session_id: session_id.clone(),
+                    pane_id: pane_id.clone(),
+                    node_id: Some(node_id.clone()),
+                    stream: PaneStream::Cells,
+                    screen: Some(Box::new(grid)),
+                    replay: TerminalBytes::new(Vec::new()),
+                    size: PtySize::new(24, 80),
+                    scrollback_truncated: false,
+                    bytes_seen: 0,
+                    next_seq,
+                }),
+            }),
         }
     }
 
@@ -2613,6 +3254,32 @@ mod tests {
     }
 
     #[test]
+    fn reselecting_an_ended_session_shows_stopped_panes_instead_of_attaching_blank_grids() {
+        let (mut session, pane_id, node_id) = session_with_agent("Ended work");
+        session.tree.get_mut(&node_id).unwrap().lifecycle = Lifecycle::Stopped {
+            signal: "Terminated".into(),
+        };
+        let mut desk = Desk::new();
+        desk.sessions.push(summary(&session, 0));
+        desk.layouts
+            .insert(session.id.clone(), session.layout.clone());
+        desk.trees
+            .insert(session.id.clone(), TreeNodeView::for_session(&session, T0));
+
+        let reactions = desk.select(session.id.clone());
+
+        assert!(sent(&reactions).iter().any(|request| matches!(
+            request,
+            Request::GetSession { session_id } if session_id == &session.id
+        )));
+        assert!(!sent(&reactions).iter().any(|request| matches!(
+            request,
+            Request::AttachPane { pane_id: attached, .. } if attached == &pane_id
+        )));
+        assert!(!desk.attaching.contains(&pane_id));
+    }
+
+    #[test]
     fn alternating_sessions_replaces_the_central_layout_with_each_sessions_own_panes() {
         let (first, first_pane, _) = session_with_agent("One pane");
         let (mut second, second_first_pane, _) = session_with_agent("Two panes");
@@ -2686,7 +3353,7 @@ mod tests {
     /// produces a resync rather than a screen neither end believes in.
     #[test]
     fn a_missed_screen_update_asks_for_the_whole_screen_again() {
-        let (session, pane_id, _) = session_with_agent("Busy");
+        let (session, pane_id, node_id) = session_with_agent("Busy");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -2701,9 +3368,7 @@ mod tests {
             T0,
         );
         desk.apply_inbound(
-            answer(Response::Attached {
-                attachment: Box::new(attachment(&pane_id, &session.id, Grid::blank(24, 80), 1)),
-            }),
+            attached(&pane_id, &session.id, &node_id, Grid::blank(24, 80), 1),
             T0,
         );
 
@@ -2977,6 +3642,118 @@ mod tests {
         assert!(desk.temporary_pane().is_none());
     }
 
+    #[test]
+    fn removing_a_session_drops_every_local_temporary_pane_resource() {
+        let session_id = SessionId::from_stored("sess_removed_preview");
+        let node_id = NodeId::from_stored("proc_removed_preview");
+        let pane_id = PaneId::from_stored("pane_removed_preview");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::NodePane,
+                response: Box::new(Response::NodePane {
+                    pane: NodePaneView {
+                        binding: PaneNodeBinding {
+                            pane_id: pane_id.clone(),
+                            session_id: session_id.clone(),
+                            node_id,
+                            temporary: true,
+                            surface_id: Some("main-window".into()),
+                            opened_ms: T0,
+                        },
+                        capability: NodePaneCapability::PreviewDetails,
+                    },
+                }),
+            },
+            T0,
+        );
+        desk.feeds
+            .insert(pane_id.clone(), PaneFeed::blank(INITIAL_SIZE));
+        desk.attaching.insert(pane_id.clone());
+        desk.pty_sizes.insert(pane_id.clone(), INITIAL_SIZE);
+
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::SessionRemoved {
+                session_id: session_id.clone(),
+                workspace_id: workspace(),
+            })),
+            T0 + 1,
+        );
+
+        assert!(desk.temporary_pane.is_none());
+        assert!(!desk.pane_owner.contains_key(&pane_id));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attaching.contains(&pane_id));
+        assert!(!desk.pty_sizes.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn hiding_an_archived_session_closes_its_surface_scoped_temporary_pane() {
+        let (session, _, node_id) = session_with_agent("Archived task");
+        let mut project = Workspace::new("project", "/repo", T0);
+        project.id = session.workspace_id.clone();
+        let summary = summary(&session, 0);
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot {
+                    revision: 1,
+                    tree_state: TreeSurfaceState::empty("main-window"),
+                    workspaces: vec![WorkspaceTreeView {
+                        workspace: WorkspaceSummary::from_workspace(
+                            &project,
+                            std::slice::from_ref(&summary),
+                        ),
+                        checkouts: Vec::new(),
+                        write_lease: None,
+                        sessions: vec![SessionTreeView {
+                            session: summary,
+                            nodes: TreeNodeView::for_session(&session, T0),
+                        }],
+                    }],
+                }),
+            }),
+            T0,
+        );
+        let pane_id = PaneId::from_stored("pane_hidden_preview");
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::NodePane,
+                response: Box::new(Response::NodePane {
+                    pane: NodePaneView {
+                        binding: PaneNodeBinding {
+                            pane_id: pane_id.clone(),
+                            session_id: session.id.clone(),
+                            node_id,
+                            temporary: true,
+                            surface_id: Some("main-window".into()),
+                            opened_ms: T0,
+                        },
+                        capability: NodePaneCapability::PreviewDetails,
+                    },
+                }),
+            },
+            T0,
+        );
+
+        let reactions = desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot::empty("main-window", 2)),
+            }),
+            T0 + 1,
+        );
+        assert!(matches!(
+            sent(&reactions).as_slice(),
+            [Request::ClosePane {
+                session_id,
+                pane_id: closed,
+                disposition: CloseDisposition::KeepProcesses,
+            }] if session_id == &session.id && closed == &pane_id
+        ));
+        assert!(desk.temporary_pane.is_none());
+        assert!(!desk.pane_owner.contains_key(&pane_id));
+    }
+
     /// Answering an agent is the human typing, and this is the only path to a pty.
     #[test]
     fn typing_in_a_pane_writes_to_the_pty_and_nothing_else_does() {
@@ -3118,18 +3895,316 @@ mod tests {
             sent(&reactions).is_empty(),
             "a restore reports and offers; it must not start anything"
         );
-        assert!(
-            reactions
-                .iter()
-                .any(|reaction| matches!(reaction, Reaction::Notice(_))),
-            "and the user must be told"
-        );
+        let node_id = {
+            let view = desk.view(T0);
+            let restore = view.restore.expect("the selected Session exposes recovery");
+            assert_eq!(restore.panes.len(), 1);
+            assert_eq!(
+                restore.panes[0].command.as_deref(),
+                Some("cargo watch -x test")
+            );
+            assert!(
+                view.notice.is_none(),
+                "recovery is an actionable state, not a red global error"
+            );
+            restore.panes[0].node_id.clone()
+        };
 
         for command in Command::ALL {
             for request in sent(&desk.dispatch(*command, T0)) {
                 assert_ne!(request.op(), "relaunch_node", "{command:?}");
             }
         }
+
+        let explicit = desk.apply_view_action(
+            ViewAction::RelaunchNode {
+                session_id: session.id.clone(),
+                node_id: node_id.clone(),
+                resume: false,
+            },
+            T0,
+        );
+        assert!(matches!(
+            sent(&explicit).as_slice(),
+            [Request::RelaunchNode {
+                session_id,
+                node_id: requested,
+                resume: false,
+            }] if session_id == &session.id && requested == &node_id
+        ));
+    }
+
+    #[test]
+    fn restored_write_access_is_reclaimed_atomically_without_relaunching() {
+        let (mut session, _, _) = session_with_agent("Recovered writer");
+        let checkout_id = turn_core::ids::CheckoutId::primary_for(&session.workspace_id);
+        session.mode = turn_core::model::SessionMode::MainCheckout;
+        session.checkout_id = checkout_id.clone();
+        let mut lease = turn_core::model::WorkspaceWriteLease::active(
+            session.workspace_id.clone(),
+            session.id.clone(),
+            checkout_id.clone(),
+            T0,
+        );
+        lease.state = LeaseState::RecoveryRequired;
+
+        let mut desk = Desk::new();
+        let acquire = desk.apply_view_action(
+            ViewAction::ReclaimWorkspaceWriteLease {
+                workspace_id: session.workspace_id.clone(),
+                session_id: session.id.clone(),
+                checkout_id: checkout_id.clone(),
+            },
+            T0,
+        );
+        assert!(matches!(
+            sent(&acquire).as_slice(),
+            [Request::AcquireWorkspaceWriteLease {
+                workspace_id,
+                session_id,
+                checkout_id: requested,
+            }] if workspace_id == &session.workspace_id
+                && session_id == &session.id
+                && requested == &checkout_id
+        ));
+        assert_eq!(
+            sent(&acquire).len(),
+            1,
+            "recovery must have no unleased gap"
+        );
+
+        lease.state = LeaseState::Active;
+        let answered = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::RestoreLeaseAcquire {
+                    workspace_id: session.workspace_id.clone(),
+                    session_id: session.id.clone(),
+                    checkout_id: checkout_id.clone(),
+                },
+                response: Box::new(Response::WorkspaceWriteLease {
+                    workspace_id: session.workspace_id.clone(),
+                    lease: Some(lease),
+                }),
+            },
+            T0 + 1,
+        );
+        assert!(
+            sent(&answered)
+                .iter()
+                .all(|request| !matches!(request, Request::RelaunchNode { .. })),
+            "confirming authority must still leave process launch to a second user action"
+        );
+
+        let retry = desk.apply_view_action(
+            ViewAction::ReclaimWorkspaceWriteLease {
+                workspace_id: session.workspace_id.clone(),
+                session_id: session.id.clone(),
+                checkout_id,
+            },
+            T0 + 2,
+        );
+        assert_eq!(
+            sent(&retry).len(),
+            1,
+            "the completed recovery action is not left permanently spinning"
+        );
+    }
+
+    #[test]
+    fn resolving_restore_never_attaches_until_the_replacement_layout_arrives() {
+        let (session, pane_id, old_node) = session_with_agent("Recovered pane");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::RestoreResult {
+                session_id: session.id.clone(),
+                state: turn_core::model::RestoreState::LayoutOnly,
+                needs_explanation: true,
+                panes: vec![turn_proto::PaneRestoreOutcome {
+                    pane_id: pane_id.clone(),
+                    node_id: old_node,
+                    lifecycle: Lifecycle::Lost,
+                    can_relaunch: true,
+                    command: Some("claude".into()),
+                }],
+            })),
+            T0,
+        );
+        let resolved = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::RestoreResult {
+                session_id: session.id.clone(),
+                state: turn_core::model::RestoreState::Live,
+                needs_explanation: false,
+                panes: Vec::new(),
+            })),
+            T0 + 1,
+        );
+        assert!(
+            sent(&resolved).is_empty(),
+            "a recovery tombstone alone must never attach the old Layout"
+        );
+
+        let replacement_node = NodeId::from_stored("proc_replacement");
+        let mut replacement = session.layout.clone();
+        replacement.get_mut(&pane_id).unwrap().node_id = Some(replacement_node);
+        let layout = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::LayoutChanged {
+                session_id: session.id.clone(),
+                layout: replacement,
+            })),
+            T0 + 2,
+        );
+        assert!(matches!(
+            sent(&layout).as_slice(),
+            [Request::AttachPane {
+                session_id,
+                pane_id: requested,
+                ..
+            }] if session_id == &session.id && requested == &pane_id
+        ));
+    }
+
+    #[test]
+    fn a_rebound_pane_discards_its_old_feed_and_ignores_a_late_attachment() {
+        let (session, pane_id, old_node) = session_with_agent("Rebound pane");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &pane_id,
+                &session.id,
+                &old_node,
+                Grid::from_lines(&["old screen"], 20),
+                1,
+            ),
+            T0,
+        );
+        desk.refresh_screens();
+        assert_eq!(desk.view(T0).panes.len(), 1);
+
+        let new_node = NodeId::from_stored("proc_new_binding");
+        let mut replacement = session.layout.clone();
+        replacement.get_mut(&pane_id).unwrap().node_id = Some(new_node.clone());
+        let reactions = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::LayoutChanged {
+                session_id: session.id.clone(),
+                layout: replacement,
+            })),
+            T0 + 1,
+        );
+        assert!(sent(&reactions)
+            .iter()
+            .any(|request| matches!(request, Request::AttachPane { pane_id: requested, .. } if requested == &pane_id)));
+        desk.refresh_screens();
+        assert!(desk.view(T0 + 1).panes.is_empty());
+
+        desk.apply_inbound(
+            attached(
+                &pane_id,
+                &session.id,
+                &old_node,
+                Grid::from_lines(&["late old screen"], 20),
+                2,
+            ),
+            T0 + 2,
+        );
+        desk.refresh_screens();
+        assert!(
+            desk.view(T0 + 2).panes.is_empty(),
+            "a late response for the retired node must not repopulate the Pane"
+        );
+
+        desk.apply_inbound(
+            attached(
+                &pane_id,
+                &session.id,
+                &new_node,
+                Grid::from_lines(&["new screen"], 20),
+                1,
+            ),
+            T0 + 3,
+        );
+        desk.refresh_screens();
+        assert_eq!(desk.view(T0 + 3).panes.len(), 1);
+    }
+
+    #[test]
+    fn whole_session_and_workspace_stops_name_the_destructive_disposition() {
+        let (session, _, _) = session_with_agent("Stop me");
+        let mut desk = Desk::new();
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::CloseSession {
+                    session_id: session.id.clone(),
+                    disposition: CloseDisposition::Terminate,
+                },
+                T0,
+            ))
+            .as_slice(),
+            [Request::CloseSession {
+                session_id,
+                disposition: CloseDisposition::Terminate,
+            }] if session_id == &session.id
+        ));
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::CloseWorkspace {
+                    workspace_id: session.workspace_id.clone(),
+                    disposition: CloseDisposition::Terminate,
+                },
+                T0,
+            ))
+            .as_slice(),
+            [Request::CloseWorkspace {
+                workspace_id,
+                disposition: CloseDisposition::Terminate,
+            }] if workspace_id == &session.workspace_id
+        ));
+
+        assert!(matches!(
+            sent(&desk.apply_view_action(ViewAction::SetArchivedVisibility { include: true }, T0,))
+                .as_slice(),
+            [Request::GetHierarchy {
+                include_archived: true,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::ArchiveWorkspace {
+                    workspace_id: session.workspace_id.clone(),
+                    archived: false,
+                },
+                T0,
+            ))
+            .as_slice(),
+            [Request::ArchiveWorkspace {
+                workspace_id,
+                archived: false,
+            }] if workspace_id == &session.workspace_id
+        ));
     }
 
     /// The banner shows one demand and must act on that one, not on whichever the queue
@@ -3558,7 +4633,7 @@ mod tests {
     /// screens with them rather than being held for the life of the window.
     #[test]
     fn a_layout_push_replaces_the_arrangement_and_forgets_closed_panes() {
-        let (session, pane_id, _) = session_with_agent("Rearranged");
+        let (session, pane_id, node_id) = session_with_agent("Rearranged");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -3573,9 +4648,7 @@ mod tests {
             T0,
         );
         desk.apply_inbound(
-            answer(Response::Attached {
-                attachment: Box::new(attachment(&pane_id, &session.id, Grid::blank(24, 80), 1)),
-            }),
+            attached(&pane_id, &session.id, &node_id, Grid::blank(24, 80), 1),
             T0,
         );
         desk.refresh_screens();
@@ -4242,7 +5315,7 @@ mod tests {
 
     #[test]
     fn scrolling_a_pane_moves_its_viewport_and_typing_brings_it_back() {
-        let (session, pane_id, _) = session_with_agent("Scrollable");
+        let (session, pane_id, node_id) = session_with_agent("Scrollable");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -4263,9 +5336,7 @@ mod tests {
             }
         }
         desk.apply_inbound(
-            answer(Response::Attached {
-                attachment: Box::new(attachment(&pane_id, &session.id, start.clone(), 1)),
-            }),
+            attached(&pane_id, &session.id, &node_id, start.clone(), 1),
             T0,
         );
         // Scroll one row off the top so there is history to look at.
@@ -4334,7 +5405,7 @@ mod tests {
     #[test]
     fn a_resync_names_the_session_the_pane_actually_belongs_to() {
         let (first, _, _) = session_with_agent("First");
-        let (second, second_pane, _) = session_with_agent("Second");
+        let (second, second_pane, second_node) = session_with_agent("Second");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -4349,9 +5420,7 @@ mod tests {
             T0,
         );
         desk.apply_inbound(
-            answer(Response::Attached {
-                attachment: Box::new(attachment(&second_pane, &second.id, Grid::blank(4, 8), 1)),
-            }),
+            attached(&second_pane, &second.id, &second_node, Grid::blank(4, 8), 1),
             T0,
         );
 

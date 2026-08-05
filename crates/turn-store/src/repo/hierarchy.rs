@@ -783,6 +783,85 @@ impl<'a> HierarchyRepo<'a> {
         )? > 0)
     }
 
+    /// Explicitly adopts the exact lease fenced by a previous daemon generation.
+    ///
+    /// This is one transaction: there is never a gap in which the Session is demoted
+    /// to read-only or another writer can acquire the checkout. Advancing the checkout
+    /// generation invalidates any helper that retained the previous daemon's token.
+    pub fn reclaim_write_lease(
+        &self,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+        lease_id: &LeaseId,
+        expected_generation: u64,
+        now_ms: i64,
+    ) -> Result<Option<WorkspaceWriteLease>> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let canonical: Option<String> = tx
+            .query_row(
+                "SELECT canonical_path FROM workspace_write_leases \
+                 WHERE id = ?1 AND generation = ?2 AND workspace_id = ?3 \
+                   AND session_id = ?4 AND checkout_id = ?5 \
+                   AND state = 'recovery_required' LIMIT 1",
+                params![
+                    lease_id.as_str(),
+                    expected_generation as i64,
+                    workspace.as_str(),
+                    session.as_str(),
+                    checkout.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(canonical) = canonical else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let fence_changed = tx.execute(
+            "UPDATE checkout_write_fences SET generation = generation + 1 \
+             WHERE canonical_path = ?1 AND generation = ?2",
+            params![&canonical, expected_generation as i64],
+        )?;
+        if fence_changed != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM checkout_write_fences WHERE canonical_path = ?1",
+            params![&canonical],
+            |row| row.get(0),
+        )?;
+        let changed = tx.execute(
+            "UPDATE workspace_write_leases \
+             SET state = 'active', heartbeat_ms = ?3, generation = ?2 \
+             WHERE id = ?1 AND generation = ?4 AND state = 'recovery_required'",
+            params![
+                lease_id.as_str(),
+                generation,
+                now_ms,
+                expected_generation as i64,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidLeaseOwnership {
+                workspace_id: workspace.to_string(),
+                session_id: session.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        }
+        let lease = tx.query_row(
+            "SELECT id, workspace_id, session_id, checkout_id, mode, state, acquired_ms, \
+                    heartbeat_ms, released_ms, generation \
+             FROM workspace_write_leases WHERE id = ?1",
+            params![lease_id.as_str()],
+            lease_from_row,
+        )?;
+        tx.commit()?;
+        Ok(Some(lease))
+    }
+
     /// Releases exactly the lease generation the caller observed and demotes its
     /// owning Session in the same transaction.
     ///
@@ -1184,6 +1263,90 @@ mod tests {
         assert_eq!(
             store.sessions().get(&session.id).unwrap().unwrap().mode,
             SessionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn reclaiming_a_recovery_lease_is_atomic_and_advances_its_fence() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "atomic-reclaim");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        assert!(store
+            .hierarchy()
+            .require_recovery(&lease.id, T0 + 1)
+            .unwrap());
+
+        let reclaimed = store
+            .hierarchy()
+            .reclaim_write_lease(
+                &workspace.id,
+                &session.id,
+                &checkout,
+                &lease.id,
+                lease.generation,
+                T0 + 2,
+            )
+            .unwrap()
+            .expect("the exact recovery claim is adopted");
+        assert_eq!(reclaimed.id, lease.id);
+        assert_eq!(reclaimed.state, LeaseState::Active);
+        assert_eq!(reclaimed.generation, lease.generation + 1);
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::MainCheckout,
+            "reclaim never creates a read-only gap"
+        );
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_write_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "reclaim updates the existing claim in place");
+    }
+
+    #[test]
+    fn a_stale_reclaim_changes_neither_the_lease_nor_its_fence() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "stale-reclaim");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        assert!(store
+            .hierarchy()
+            .require_recovery(&lease.id, T0 + 1)
+            .unwrap());
+
+        assert!(store
+            .hierarchy()
+            .reclaim_write_lease(
+                &workspace.id,
+                &session.id,
+                &checkout,
+                &lease.id,
+                lease.generation + 1,
+                T0 + 2,
+            )
+            .unwrap()
+            .is_none());
+        let current = store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, LeaseState::RecoveryRequired);
+        assert_eq!(current.generation, lease.generation);
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::MainCheckout
         );
     }
 

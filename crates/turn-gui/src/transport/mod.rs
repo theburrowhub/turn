@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_proto::{ProtoError, Request, RequestId, Response, ServerEvent};
+use turn_core::ids::{CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
+use turn_proto::{CloseDisposition, ProtoError, Request, RequestId, Response, ServerEvent};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
 pub use link::LinkError;
@@ -82,6 +82,23 @@ pub enum Ask {
         session_id: SessionId,
         pane_id: PaneId,
     },
+    RelaunchNode {
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    RestoreLeaseAcquire {
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        checkout_id: CheckoutId,
+    },
+    CloseSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
+    CloseWorkspace {
+        workspace_id: WorkspaceId,
+        disposition: CloseDisposition,
+    },
     /// A change the user asked for. The label is what an error message names.
     Action(&'static str),
     /// Activity reporting. Its answer is a list of effects; a failure is not worth
@@ -113,6 +130,10 @@ impl Ask {
             Ask::CreateSession { .. } => "creating a session",
             Ask::CreateTemplate => "saving the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
+            Ask::RelaunchNode { .. } => "starting the restored pane",
+            Ask::RestoreLeaseAcquire { .. } => "acquiring restored write access",
+            Ask::CloseSession { .. } => "ending the session",
+            Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",
             Ask::Stream => "sending to the terminal",

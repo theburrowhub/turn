@@ -139,6 +139,26 @@ impl DataDirLock {
     }
 }
 
+#[cfg(unix)]
+impl Drop for DataDirLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // `flock` follows the open file description across fork. Agent processes are
+        // launched with CLOEXEC, but an immediate restart can otherwise race a child
+        // between fork and exec even after the daemon dropped its own descriptor.
+        // Explicitly unlocking at the ownership boundary releases that shared lock
+        // synchronously; the file itself remains as the stable inode for contenders.
+        let result = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        if result != 0 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                data_dir = %self.canonical_data_dir.display(),
+                "could not explicitly release the data-directory lock"
+            );
+        }
+    }
+}
+
 /// `flock` is tied to the open file description, does not wait, and is released by
 /// the kernel on process death. Any unsupported-filesystem error is propagated: a
 /// best-effort ownership guard is not an ownership guard.

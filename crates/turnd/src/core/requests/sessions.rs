@@ -7,14 +7,147 @@ use crate::paths;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as SystemCommand;
-use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
     Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template, Workspace,
     WorkspaceCheckout,
 };
-use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
+use turn_core::state::Lifecycle;
+use turn_proto::{
+    CloseDisposition, ErrorCode, NewPane, ProtoError, Response, ServerEvent, TemplateSummary,
+};
 
 impl Core {
+    /// Proves that a destructive close can actually signal every process it would claim
+    /// to stop. A restored orphan has a PID-shaped observation but no owned handle; PID
+    /// reuse makes signalling it blindly unsafe, and fabricating an exit would release
+    /// checkout authority while the real process may still be writing.
+    pub(crate) fn ensure_session_processes_stoppable(
+        &self,
+        id: &SessionId,
+        disposition: CloseDisposition,
+    ) -> Result<(), ProtoError> {
+        if disposition == CloseDisposition::KeepProcesses {
+            return Ok(());
+        }
+        let session = self.session(id)?;
+        let unreachable: Vec<String> = session
+            .tree
+            .iter()
+            .filter(|node| {
+                if !node.is_running() || self.processes.contains_key(&node.id) {
+                    return false;
+                }
+                // A PID is an independent runtime boundary. Even when its edge was
+                // discovered below an owned PTY, it may have detached from that process
+                // group; Turn must not claim it died merely because the parent did.
+                node.lifecycle == Lifecycle::Orphaned || node.pid.is_some()
+            })
+            .map(|node| format!("{} ({})", node.title, node.id))
+            .collect();
+        if unreachable.is_empty() {
+            return Ok(());
+        }
+        Err(ProtoError::new(
+            ErrorCode::Conflict,
+            "Turn cannot safely stop processes that survived the previous daemon",
+        )
+        .with_detail(format!(
+            "Stop these processes outside Turn, then retry: {}",
+            unreachable.join(", ")
+        )))
+    }
+
+    /// Proves that one Pane's exact runtime can be signalled before removing its view.
+    /// A semantic child can be retired through an owned ancestor when ending the whole
+    /// Session, but closing one Pane has no such authority: it must own that node's PTY.
+    pub(crate) fn ensure_node_process_stoppable(
+        &self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        disposition: CloseDisposition,
+    ) -> Result<(), ProtoError> {
+        if disposition == CloseDisposition::KeepProcesses {
+            return Ok(());
+        }
+        let node = self
+            .session(session_id)?
+            .tree
+            .get(node_id)
+            .ok_or_else(|| ProtoError::not_found("process", node_id.as_str()))?;
+        if !node.is_running() || self.processes.contains_key(node_id) {
+            return Ok(());
+        }
+        Err(ProtoError::new(
+            ErrorCode::Conflict,
+            "Turn cannot safely stop this process because it does not own its terminal",
+        )
+        .with_detail("Stop the process outside Turn, then retry closing the Pane"))
+    }
+
+    /// Removes surface-scoped temporary views for a Session without touching the
+    /// underlying Agents. This is shared by detach/end/archive paths so no hidden
+    /// binding or output pump survives after its Session leaves the visible desk.
+    pub(crate) fn clear_session_temporary_bindings(
+        &mut self,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<(), ProtoError> {
+        self.clear_temporary_bindings(session_id, None, now_ms)
+    }
+
+    /// Removes temporary views for a precise set of retiring nodes. Relaunch uses this
+    /// after the replacement process has started so an ephemeral preview cannot remain
+    /// bound to a node that is about to leave the tree.
+    pub(crate) fn clear_node_temporary_bindings(
+        &mut self,
+        session_id: &SessionId,
+        node_ids: &[NodeId],
+        now_ms: i64,
+    ) -> Result<(), ProtoError> {
+        let node_ids: HashSet<_> = node_ids.iter().cloned().collect();
+        self.clear_temporary_bindings(session_id, Some(&node_ids), now_ms)
+    }
+
+    fn clear_temporary_bindings(
+        &mut self,
+        session_id: &SessionId,
+        node_ids: Option<&HashSet<NodeId>>,
+        now_ms: i64,
+    ) -> Result<(), ProtoError> {
+        let bindings: Vec<_> = self
+            .store
+            .hierarchy()
+            .bindings_for_session(session_id)
+            .map_err(store)?
+            .into_iter()
+            .filter(|binding| {
+                binding.temporary
+                    && node_ids.is_none_or(|node_ids| node_ids.contains(&binding.node_id))
+            })
+            .collect();
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        let affected_nodes: HashSet<_> = bindings
+            .iter()
+            .map(|binding| binding.node_id.clone())
+            .collect();
+        for binding in bindings {
+            self.detach_everyone(session_id, &binding.pane_id);
+            self.store
+                .hierarchy()
+                .unbind_pane(session_id, &binding.pane_id)
+                .map_err(store)?;
+        }
+        self.bump_hierarchy();
+        for node_id in affected_nodes {
+            self.stop_pump_if_unwatched(&node_id);
+            self.push_pane_bindings(session_id, &node_id, now_ms);
+        }
+        Ok(())
+    }
+
     /// Creates a session and starts the processes its panes describe.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_session(
@@ -548,7 +681,14 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         if archived {
-            let workspace_id = self.session(id)?.workspace_id.clone();
+            let source = self.session(id)?;
+            if source.tree.iter().any(|node| node.is_running()) {
+                return Err(ProtoError::new(
+                    ErrorCode::Conflict,
+                    "End this Session's processes before archiving it",
+                ));
+            }
+            let workspace_id = source.workspace_id.clone();
             let owns_unreleased_lease = self
                 .store
                 .hierarchy()
@@ -561,6 +701,17 @@ impl Core {
                     "Release this Session's primary-checkout write lease before archiving it",
                 ));
             }
+        } else {
+            let workspace_id = self.session(id)?.workspace_id.clone();
+            if self.workspace(&workspace_id)?.archived {
+                return Err(ProtoError::new(
+                    ErrorCode::Conflict,
+                    "Restore the Workspace before restoring one of its Sessions",
+                ));
+            }
+        }
+        if archived {
+            self.clear_session_temporary_bindings(id, now_ms)?;
         }
         let session = self.session_mut(id)?;
         if archived {
@@ -579,6 +730,8 @@ impl Core {
             self.push_hierarchy_all(now_ms);
         } else {
             self.push_session_state(id, now_ms);
+            self.bump_hierarchy();
+            self.push_hierarchy_all(now_ms);
         }
         self.answer_session(id, now_ms)
     }
@@ -613,6 +766,7 @@ impl Core {
         disposition: CloseDisposition,
         now_ms: i64,
     ) -> Answer {
+        self.ensure_session_processes_stoppable(id, disposition)?;
         let session = self.session(id)?;
         let panes: Vec<turn_core::ids::PaneId> = session
             .layout
@@ -623,15 +777,15 @@ impl Core {
         let nodes: Vec<turn_core::ids::NodeId> = session
             .tree
             .iter()
-            .filter(|node| node.is_running())
+            .filter(|node| node.is_running() && self.processes.contains_key(&node.id))
             .map(|node| node.id.clone())
             .collect();
-
         // Detach every client from this session's panes whatever the disposition: the
         // session is being closed on screen in all three cases.
         for pane in &panes {
             self.detach_everyone(id, pane);
         }
+        self.clear_session_temporary_bindings(id, now_ms)?;
         for node in &nodes {
             self.stop_pump_if_unwatched(node);
         }
@@ -652,15 +806,44 @@ impl Core {
                         now_ms,
                     );
                 }
+                let remaining: Vec<String> = self
+                    .session(id)?
+                    .tree
+                    .iter()
+                    .filter(|node| node.is_running())
+                    .map(|node| format!("{} ({})", node.title, node.id))
+                    .collect();
                 if let Ok(session) = self.session_mut(id) {
-                    session.status = SessionStatus::Paused;
+                    if session.status != SessionStatus::Archived {
+                        session.status = if remaining.is_empty() {
+                            SessionStatus::Paused
+                        } else {
+                            SessionStatus::Active
+                        };
+                    }
                 }
+                if !remaining.is_empty() {
+                    self.persist_session(id)?;
+                    self.push_session_state(id, now_ms);
+                    return Err(ProtoError::new(
+                        ErrorCode::Conflict,
+                        "Some child processes are still running outside Turn",
+                    )
+                    .with_detail(format!(
+                        "Stop these processes outside Turn, then retry: {}",
+                        remaining.join(", ")
+                    )));
+                }
+                let restore_update = self.resolve_restore_session(id);
                 // The injected agent configuration goes with the processes it was
                 // written for. Nothing will read it again, and a settings file naming a
                 // hook URL that no longer answers is worse than no file.
                 paths::remove_session_scratch(&self.data_dir, id);
                 self.persist_session(id)?;
                 self.push_session_state(id, now_ms);
+                if let Some(update) = restore_update {
+                    self.push_all(update);
+                }
             }
         }
         Ok(Response::Ack)
@@ -1149,6 +1332,8 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::ids::PaneId;
+    use turn_core::model::ProcessNode;
+    use turn_core::state::Lifecycle;
     use turn_proto::{Request, ServerMessage};
 
     fn drain_session_events(
@@ -1160,6 +1345,87 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn closing_a_session_never_fabricates_the_death_of_an_uncontrolled_orphan() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_orphan_close_guard");
+        let pane_id = PaneId::from_stored("pane_orphan_close_guard");
+        harness.add_session(session_id.clone(), pane_id, 10);
+        let mut orphan = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            "/tmp",
+            10,
+        );
+        orphan.lifecycle = Lifecycle::Orphaned;
+        orphan.pid = Some(424_242);
+        let orphan_id = harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(orphan);
+
+        let error = harness
+            .core
+            .close_session(&session_id, CloseDisposition::Terminate, 11)
+            .expect_err("an unowned PID cannot be claimed as terminated");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&orphan_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Orphaned
+        );
+    }
+
+    #[tokio::test]
+    async fn a_semantic_subagent_does_not_block_ending_its_owned_parent_runtime() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_owned_parent_with_subagent");
+        let pane_id = PaneId::from_stored("pane_owned_parent_with_subagent");
+        harness.add_session(session_id.clone(), pane_id.clone(), 10);
+        let parent_id = harness.spawn_process(&session_id, &pane_id, 10).await;
+
+        let mut child = ProcessNode::agent(session_id.clone(), "Reviewer", "/tmp", 11);
+        child.kind = turn_core::model::NodeKind::Subagent;
+        child.lifecycle = Lifecycle::Alive;
+        child.parent = Some(parent_id.clone());
+        child.relation = turn_core::model::Relation::Confirmed;
+        let child_id = child.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(child);
+
+        let answer = harness
+            .core
+            .close_session(&session_id, CloseDisposition::Terminate, 12)
+            .expect("the owned parent is the stoppable runtime boundary");
+        assert_eq!(answer, Response::Ack);
+        assert!(!harness.core.processes.contains_key(&parent_id));
+        let session = &harness.core.sessions[&session_id];
+        assert_eq!(session.status, SessionStatus::Paused);
+        assert!(session
+            .tree
+            .get(&parent_id)
+            .unwrap()
+            .lifecycle
+            .is_terminal());
+        assert_eq!(
+            session.tree.get(&child_id).unwrap().lifecycle,
+            Lifecycle::Lost,
+            "the virtual child retires with the runtime that reported it"
+        );
     }
 
     #[tokio::test]

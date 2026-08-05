@@ -44,6 +44,16 @@ impl Core {
         session_id: &SessionId,
     ) -> std::result::Result<(), ProtoError> {
         let session = self.session(session_id)?;
+        if session.is_archived() {
+            return Err(ProtoError::refused(
+                "Restore the Session from Archived before starting a process",
+            ));
+        }
+        if self.workspace(&session.workspace_id)?.archived {
+            return Err(ProtoError::refused(
+                "Restore the Workspace from Archived before starting a process",
+            ));
+        }
         match session.mode {
             SessionMode::ReadOnly if !session.read_only_enforced => Err(ProtoError::refused(
                 "This read-only Session has no technical write guard, so Turn will not launch a process in it",

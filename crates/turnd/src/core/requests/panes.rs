@@ -119,6 +119,9 @@ impl Core {
                 "A session must keep at least one pane",
             ));
         }
+        if let Some(node_id) = node.as_ref() {
+            self.ensure_node_process_stoppable(session_id, node_id, disposition)?;
+        }
 
         self.detach_everyone(session_id, pane_id);
 
@@ -147,7 +150,11 @@ impl Core {
                 "That pane could not be closed",
             ));
         }
+        let restore_update = self.resolve_restore_pane(session_id, pane_id);
         self.persist_session(session_id)?;
+        if let Some(update) = restore_update {
+            self.push_all(update);
+        }
         self.push_layout(session_id, Some(client));
         self.push_session_state(session_id, now_ms);
         self.answer_layout(session_id)
@@ -613,4 +620,62 @@ fn validate_resize_delta(delta: f32) -> Result<(), ProtoError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+    use turn_core::model::{Pane, PaneKind, ProcessNode};
+    use turn_core::state::Lifecycle;
+
+    #[tokio::test]
+    async fn closing_a_pane_never_fabricates_an_orphans_death() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_orphan_pane_guard");
+        let pane_id = PaneId::from_stored("pane_orphan_pane_guard");
+        harness.add_session(session_id.clone(), pane_id.clone(), 10);
+        let second = Pane::new(PaneKind::Shell);
+        assert!(harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .split(&pane_id, Direction::Horizontal, second));
+
+        let mut orphan = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            "/tmp",
+            10,
+        );
+        orphan.lifecycle = Lifecycle::Orphaned;
+        orphan.pid = Some(424_242);
+        let orphan_id = orphan.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(orphan);
+            session.layout.get_mut(&pane_id).unwrap().node_id = Some(orphan_id.clone());
+        }
+
+        let error = harness
+            .core
+            .close_pane(
+                ClientId(7),
+                &session_id,
+                &pane_id,
+                CloseDisposition::Terminate,
+                11,
+            )
+            .expect_err("an unreachable PTY cannot be claimed as stopped");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        let session = &harness.core.sessions[&session_id];
+        assert_eq!(session.layout.pane_count(), 2);
+        assert_eq!(
+            session.tree.get(&orphan_id).unwrap().lifecycle,
+            Lifecycle::Orphaned
+        );
+    }
 }

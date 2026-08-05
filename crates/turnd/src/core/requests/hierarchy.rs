@@ -108,6 +108,10 @@ impl Core {
                 .expect("the registered client cannot disappear during dispatch")
                 .surface_id = Some(surface_id.clone());
         }
+        self.clients
+            .get_mut(&client_id)
+            .expect("the registered client cannot disappear while projecting hierarchy")
+            .include_archived = include_archived;
         Ok(Response::Hierarchy {
             snapshot: Box::new(self.hierarchy_snapshot(&surface_id, include_archived, now_ms)?),
         })
@@ -219,11 +223,13 @@ impl Core {
         checkout_id: &CheckoutId,
         now_ms: i64,
     ) -> Answer {
-        if self.workspace(workspace_id)?.archived {
+        let workspace = self.workspace(workspace_id)?;
+        if workspace.archived {
             return Err(ProtoError::refused(
                 "Unarchive the Workspace before acquiring its write lease",
             ));
         }
+        let legacy_reconciliation_required = workspace.lease_reconciliation_required;
         let session = self.session(session_id)?;
         if session.is_archived() {
             return Err(ProtoError::refused(
@@ -240,11 +246,80 @@ impl Core {
                 "The Session is not assigned to the requested checkout",
             ));
         }
-        let lease = self
+        let current = self
             .store
             .hierarchy()
-            .acquire_write_lease(workspace_id, session_id, checkout_id, now_ms)
-            .map_err(|error| self.map_lease_store_error(workspace_id, Some(session_id), error))?;
+            .active_lease(workspace_id)
+            .map_err(store)?;
+        let lease = if let Some(current) = current.filter(|lease| {
+            lease.state == LeaseState::RecoveryRequired
+                && &lease.session_id == session_id
+                && &lease.checkout_id == checkout_id
+        }) {
+            if legacy_reconciliation_required {
+                return Err(ProtoError::new(
+                    ErrorCode::Conflict,
+                    "This legacy Workspace needs checkout reconciliation before its write lease can be recovered",
+                ));
+            }
+            // The recovery prompt explicitly tells the user to stop an unreachable
+            // process outside Turn. Reconcile the OS process table at the moment they
+            // confirm so an already-dead orphan does not block this daemon generation
+            // forever. Command matching also protects against PID reuse.
+            self.reconcile_orphaned_recovery(session_id, now_ms)?;
+            let session = self.session(session_id)?;
+            if session.tree.iter().any(|node| node.is_running()) {
+                return Err(ProtoError::new(
+                    ErrorCode::Conflict,
+                    "A process from the previous daemon is still running; stop it outside Turn before confirming write access",
+                ));
+            }
+            let checkout = self
+                .store
+                .hierarchy()
+                .checkout(workspace_id, checkout_id)
+                .map_err(store)?
+                .ok_or_else(|| ProtoError::not_found("workspace checkout", checkout_id.as_str()))?;
+            let canonical = std::fs::canonicalize(&checkout.path)
+                .map_err(|error| {
+                    ProtoError::refused(
+                        "Turn cannot verify the primary checkout before recovering write access",
+                    )
+                    .with_detail(error.to_string())
+                })?
+                .to_string_lossy()
+                .into_owned();
+            if canonical != checkout.canonical_path {
+                return Err(ProtoError::new(
+                    ErrorCode::Conflict,
+                    "The primary checkout now resolves to a different directory; write access was not recovered",
+                ));
+            }
+            self.store
+                .hierarchy()
+                .reclaim_write_lease(
+                    workspace_id,
+                    session_id,
+                    checkout_id,
+                    &current.id,
+                    current.generation,
+                    now_ms,
+                )
+                .map_err(store)?
+                .ok_or_else(|| {
+                    ProtoError::new(
+                        ErrorCode::Conflict,
+                        "The recovery lease changed; refresh before confirming write access",
+                    )
+                })?
+        } else {
+            self.store
+                .hierarchy()
+                .acquire_write_lease(workspace_id, session_id, checkout_id, now_ms)
+                .map_err(|error| {
+                    self.map_lease_store_error(workspace_id, Some(session_id), error)
+                })?
+        };
         let session = self.session_mut(session_id)?;
         session.mode = SessionMode::MainCheckout;
         session.checkout_id = checkout_id.clone();

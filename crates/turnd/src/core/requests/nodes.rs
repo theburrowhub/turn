@@ -3,6 +3,7 @@
 use super::Answer;
 use crate::core::{ClientId, Core};
 use turn_core::ids::{NodeId, SessionId};
+use turn_core::model::SessionStatus;
 use turn_proto::{ErrorCode, ProtoError, PtySize, Response, ServerEvent};
 use turn_pty::ScreenSize;
 
@@ -135,9 +136,8 @@ impl Core {
                  a tool or seen in the process table",
             ));
         };
-        // Relaunch retires the old node before materialising its replacement. Prove
-        // the cwd is still inside the assigned checkout before that destructive
-        // transition; materialisation repeats the check at the PTY boundary.
+        // Prove the cwd is still inside the assigned checkout before attempting a
+        // replacement; materialisation repeats the check at the PTY boundary.
         self.resolve_authorized_launch_cwd(session_id, pane_cwd.as_deref())?;
         let session = self.session(session_id)?;
         if session.layout.get(&pane_id).is_none() {
@@ -153,40 +153,27 @@ impl Core {
             Vec::new()
         };
 
-        // Retire the old record and everything that hung off it before the new process
-        // takes the pane.
-        let mut retired_nodes = Vec::new();
-        if let Ok(session) = self.session_mut(session_id) {
-            let descendants: Vec<NodeId> = session
-                .tree
-                .descendants(node_id)
-                .into_iter()
-                .map(|node| node.id.clone())
-                .collect();
-            for id in std::iter::once(node_id).chain(descendants.iter()) {
-                if let Some(retired) = session.tree.get(id) {
-                    retired_nodes.push(retired.id.clone());
-                }
-            }
-            for id in descendants {
-                session.tree.remove(&id);
-            }
-            session.tree.remove(node_id);
-            if let Some(pane) = session.layout.get_mut(&pane_id) {
-                pane.node_id = None;
-            }
+        let descendants: Vec<NodeId> = self
+            .session(session_id)?
+            .tree
+            .descendants(node_id)
+            .into_iter()
+            .map(|node| node.id.clone())
+            .collect();
+        if descendants.iter().any(|id| {
+            self.session(session_id)
+                .ok()
+                .and_then(|session| session.tree.get(id))
+                .is_some_and(|node| node.is_running())
+        }) {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "A child process is still running; stop it before starting this pane again",
+            ));
         }
-        self.remove_attention_for_deleted_nodes(session_id, &retired_nodes, now_ms);
-        self.turn_authority.remove(node_id);
-        self.background_tasks.remove(node_id);
-        self.expected_exits.remove(node_id);
-        self.discard_process(node_id);
-        // The old launch's injected configuration goes with it. Its token was revoked
-        // when the process was discarded, so what would be left on disk is a settings
-        // file telling an agent to report to a URL that answers nothing — and the new
-        // process writes its own, under its own node id.
-        crate::paths::remove_node_scratch(&self.data_dir, session_id, node_id);
 
+        // Spawn first. If the executable is missing or adapter preparation fails, the
+        // old node, pane binding and recovery offer remain intact and retryable.
         let started = self.materialise_pane_with(session_id, &pane_id, &extra, now_ms)?;
         let Some(new_node) = started else {
             return Err(ProtoError::new(
@@ -194,7 +181,36 @@ impl Core {
                 "That pane has no command to run",
             ));
         };
+        let retired_nodes: Vec<NodeId> = std::iter::once(node_id.clone())
+            .chain(descendants.iter().cloned())
+            .collect();
+        self.clear_node_temporary_bindings(session_id, &retired_nodes, now_ms)?;
+        if let Ok(session) = self.session_mut(session_id) {
+            for id in &descendants {
+                session.tree.remove(id);
+            }
+            session.tree.remove(node_id);
+        }
+        self.remove_attention_for_deleted_nodes(session_id, &retired_nodes, now_ms);
+        for retired in &retired_nodes {
+            self.turn_authority.remove(retired);
+            self.background_tasks.remove(retired);
+            self.expected_exits.remove(retired);
+            self.discard_process(retired);
+            crate::paths::remove_node_scratch(&self.data_dir, session_id, retired);
+        }
+        let restore_update = self.resolve_restore_node(session_id, node_id);
+        if let Ok(session) = self.session_mut(session_id) {
+            session.status = SessionStatus::Active;
+        }
         self.persist_session(session_id)?;
+        // Recovery truth must arrive before the Layout that makes clients attach this
+        // PaneId. Otherwise a client still suppressing the Lost pane can miss the only
+        // transition that enables the replacement feed.
+        if let Some(update) = restore_update {
+            self.push_all(update);
+        }
+        self.push_layout(session_id, None);
         self.push_tree(session_id, now_ms);
         self.push_session_state(session_id, now_ms);
 
@@ -388,7 +404,7 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::ids::PaneId;
-    use turn_core::model::{NodeKind, ProcessNode};
+    use turn_core::model::{NodeKind, PaneNodeBinding, ProcessNode};
     use turn_core::state::Lifecycle;
 
     const NOW: i64 = 1_775_000_000_000;
@@ -562,6 +578,122 @@ mod tests {
             harness.core.expected_exits.is_empty(),
             "a process that outlived the signal owns its next exit"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_relaunch_preserves_the_old_node_binding_and_recovery_offer() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_retryable_relaunch");
+        let pane_id = PaneId::from_stored("pane_retryable_relaunch");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let mut lost = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Shell,
+            "turn-command-that-definitely-does-not-exist",
+            "/tmp",
+            NOW,
+        );
+        lost.lifecycle = Lifecycle::Lost;
+        let old_node = lost.id.clone();
+        let session = harness.core.sessions.get_mut(&session_id).unwrap();
+        session.tree.insert(lost);
+        let pane = session.layout.get_mut(&pane_id).unwrap();
+        pane.command = Some("turn-command-that-definitely-does-not-exist".into());
+        pane.node_id = Some(old_node.clone());
+        harness
+            .core
+            .restore_reports
+            .push(ServerEvent::RestoreResult {
+                session_id: session_id.clone(),
+                state: turn_core::model::RestoreState::LayoutOnly,
+                needs_explanation: true,
+                panes: vec![turn_proto::PaneRestoreOutcome {
+                    pane_id: pane_id.clone(),
+                    node_id: old_node.clone(),
+                    lifecycle: Lifecycle::Lost,
+                    can_relaunch: true,
+                    command: Some("turn-command-that-definitely-does-not-exist".into()),
+                }],
+            });
+
+        let error = harness
+            .core
+            .relaunch_node(&session_id, &old_node, false, NOW + 1)
+            .expect_err("the missing executable cannot start");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        let session = &harness.core.sessions[&session_id];
+        assert!(session.tree.get(&old_node).is_some());
+        assert_eq!(
+            session.layout.get(&pane_id).unwrap().node_id.as_ref(),
+            Some(&old_node)
+        );
+        assert!(matches!(
+            harness.core.restore_reports.as_slice(),
+            [ServerEvent::RestoreResult { panes, .. }]
+                if panes.len() == 1 && panes[0].node_id == old_node
+        ));
+    }
+
+    #[tokio::test]
+    async fn relaunch_retires_temporary_views_of_the_replaced_node() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_relaunch_temp");
+        let pane_id = PaneId::from_stored("pane_relaunch_temp");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        harness.allow_test_processes(&session_id);
+
+        let mut lost = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Shell,
+            "/usr/bin/true",
+            "/tmp",
+            NOW,
+        );
+        lost.lifecycle = Lifecycle::Lost;
+        let old_node = lost.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(lost);
+            let pane = session.layout.get_mut(&pane_id).unwrap();
+            pane.command = Some("/usr/bin/true".into());
+            pane.node_id = Some(old_node.clone());
+        }
+        harness.core.persist_session(&session_id).unwrap();
+
+        let temporary = PaneNodeBinding {
+            pane_id: PaneId::from_stored("pane_relaunch_preview"),
+            session_id: session_id.clone(),
+            node_id: old_node.clone(),
+            temporary: true,
+            surface_id: Some("main-window".into()),
+            opened_ms: NOW,
+        };
+        harness
+            .core
+            .store
+            .hierarchy()
+            .bind_pane(&temporary)
+            .unwrap();
+
+        let replacement = match harness
+            .core
+            .relaunch_node(&session_id, &old_node, false, NOW + 1)
+            .unwrap()
+        {
+            Response::Node { node } => node.node_id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let bindings = harness
+            .core
+            .store
+            .hierarchy()
+            .bindings_for_session(&session_id)
+            .unwrap();
+        assert!(bindings.iter().all(|binding| !binding.temporary));
+        assert!(bindings.iter().all(|binding| binding.node_id != old_node));
+        assert!(bindings
+            .iter()
+            .any(|binding| { binding.pane_id == pane_id && binding.node_id == replacement }));
     }
 
     #[test]

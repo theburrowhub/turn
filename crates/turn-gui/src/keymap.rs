@@ -170,7 +170,7 @@ impl Command {
             Command::PreviousSession => "Previous session",
             Command::RenameSession => "Rename session",
             Command::ArchiveSession => "Archive session",
-            Command::CloseSession => "Close session — asks what to do with the processes",
+            Command::CloseSession => "End session — confirm before stopping its processes",
             Command::SaveLayoutAsTemplate => "Save this layout as a template",
             Command::NextAttention => "Go to the next session that needs you",
             Command::ToggleAttentionPanel => "Show or hide the attention queue",

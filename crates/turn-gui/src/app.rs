@@ -367,7 +367,8 @@ impl TurnApp {
                     .state
                     .layout_draft
                     .as_ref()
-                    .is_some_and(|draft| !draft.submitting);
+                    .is_some_and(|draft| !draft.submitting)
+                || self.state.lifecycle_confirmation.is_some();
             if self.state.shortcuts_open
                 || self.state.settings_open
                 || self.state.attention_panel_open
@@ -385,6 +386,7 @@ impl TurnApp {
                     self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
+                    self.state.lifecycle_confirmation = None;
                 }
             }
             return Vec::new();
@@ -484,6 +486,24 @@ impl TurnApp {
                 }
                 true
             }
+            Command::CloseSession => {
+                let selected = self.desk.selected().cloned();
+                self.state.lifecycle_confirmation = selected.and_then(|session_id| {
+                    self.desk
+                        .sessions()
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| crate::view::LifecycleConfirmation::EndSession {
+                            session_id,
+                            name: session.name.clone(),
+                            running_count: session.running_count,
+                        })
+                });
+                if self.state.lifecycle_confirmation.is_none() {
+                    self.desk.show_notice("select a Session before ending it");
+                }
+                true
+            }
             Command::QuickNewSession if !self.desk.has_workspaces() => {
                 self.state.session_draft = None;
                 self.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(true));
@@ -543,7 +563,13 @@ impl eframe::App for TurnApp {
 
         // 3. Keystrokes: the sheets first, then the keymap.
         let mut commands = self.steer_overlays(&ctx);
-        commands.extend(self.take_commands(&ctx));
+        // Modal sheets own the keyboard. Resolving the global keymap behind them could
+        // otherwise stop a process, archive a Session, or open another sheet while a
+        // destructive confirmation is still on screen. The palette's own navigation
+        // deliberately returns a chosen Command from `steer_overlays` above.
+        if !self.state.is_sensitive() {
+            commands.extend(self.take_commands(&ctx));
+        }
         for command in commands {
             if self.handle_locally(command) {
                 continue;
@@ -570,6 +596,7 @@ impl eframe::App for TurnApp {
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
                     self.state.layout_draft = None;
+                    self.state.lifecycle_confirmation = None;
                     self.pending_folder_request = None;
                     self.state.workspace_picker_pending = false;
                 }

@@ -214,14 +214,15 @@ impl Core {
 
     /// Sends the complete unified projection to one registered window.
     pub(crate) fn push_hierarchy_to(&mut self, client: ClientId, now_ms: i64) {
-        let Some(surface_id) = self
-            .clients
-            .get(&client)
-            .and_then(|client| client.surface_id.clone())
-        else {
+        let Some((surface_id, include_archived)) = self.clients.get(&client).and_then(|client| {
+            client
+                .surface_id
+                .clone()
+                .map(|surface_id| (surface_id, client.include_archived))
+        }) else {
             return;
         };
-        match self.hierarchy_snapshot(&surface_id, false, now_ms) {
+        match self.hierarchy_snapshot(&surface_id, include_archived, now_ms) {
             Ok(snapshot) => self.push_to(
                 client,
                 ServerEvent::HierarchyChanged {

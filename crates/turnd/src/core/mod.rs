@@ -291,10 +291,15 @@ impl Core {
     ) {
         let mut ticker = tokio::time::interval(TICK_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut shutdown_done = None;
 
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
+                    Some(Command::Shutdown { done }) => {
+                        shutdown_done = Some(done);
+                        break;
+                    }
                     Some(command) => {
                         if self.handle(command) {
                             break;
@@ -312,6 +317,13 @@ impl Core {
         }
 
         self.shutdown();
+        // A clean-shutdown acknowledgement is a durability boundary. Sending it from
+        // `handle` used to happen before the run loop's final flush and before Core
+        // dropped its data-directory lock, so an immediate restart could race the old
+        // owner under load.
+        if let Some(done) = shutdown_done {
+            let _ = done.send(());
+        }
     }
 
     /// Handles one command. Returns true when the loop should end.
@@ -347,11 +359,7 @@ impl Core {
                 dropped,
             } => self.deliver_output(&node, data, dropped),
             Command::Exited { node, info } => self.node_exited(&node, info, now),
-            Command::Shutdown { done } => {
-                self.shutdown();
-                let _ = done.send(());
-                return true;
-            }
+            Command::Shutdown { .. } => unreachable!("shutdown is handled by the run loop"),
         }
         false
     }

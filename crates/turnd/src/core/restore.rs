@@ -23,7 +23,7 @@ use crate::error::Result;
 use crate::paths;
 use std::collections::HashSet;
 use turn_core::attention::AttentionManager;
-use turn_core::ids::SessionId;
+use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
@@ -81,6 +81,7 @@ impl Core {
         let ids: Vec<SessionId> = self.sessions.keys().cloned().collect();
         for id in &ids {
             let report = self.decide_session(id, now_ms);
+            self.persist_session_quietly(id);
             self.restore_reports.push(report);
         }
 
@@ -106,6 +107,153 @@ impl Core {
             "restored"
         );
         Ok(())
+    }
+
+    /// Retires one recovery offer after its pane process was explicitly relaunched.
+    /// The returned event is published by the caller only after the updated Session is
+    /// durably stored, so a reconnect never resurrects an offer that already succeeded.
+    pub(crate) fn resolve_restore_node(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+    ) -> Option<ServerEvent> {
+        self.resolve_restore_where(session_id, |outcome| &outcome.node_id == node_id)
+    }
+
+    /// Retires the offer for a pane the user explicitly removed from the Layout.
+    pub(crate) fn resolve_restore_pane(
+        &mut self,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+    ) -> Option<ServerEvent> {
+        self.resolve_restore_where(session_id, |outcome| &outcome.pane_id == pane_id)
+    }
+
+    /// Ends every unresolved recovery offer when the user explicitly terminates a
+    /// Session. Detaching with `KeepProcesses` deliberately does not call this.
+    pub(crate) fn resolve_restore_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Option<ServerEvent> {
+        self.resolve_restore_where(session_id, |_| true)
+    }
+
+    /// Rechecks runtimes that survived a daemon restart before write authority is
+    /// recovered.
+    ///
+    /// An orphan is an observation, not a permanent state. The user may stop that
+    /// process outside Turn exactly as the recovery UI asks them to. Without this
+    /// refresh the in-memory tree would continue to claim it is alive until another
+    /// daemon restart, permanently blocking both the lease and an explicit relaunch.
+    pub(crate) fn reconcile_orphaned_recovery(
+        &mut self,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> std::result::Result<(), turn_proto::ProtoError> {
+        let orphaned: Vec<(NodeId, Option<NodeId>, Option<String>)> = self
+            .sessions
+            .get(session_id)
+            .map(|session| {
+                session
+                    .tree
+                    .iter()
+                    .filter(|node| node.lifecycle == Lifecycle::Orphaned)
+                    .map(|node| {
+                        (
+                            node.id.clone(),
+                            node.parent.clone(),
+                            node.agent.as_ref().and_then(|agent| {
+                                agent
+                                    .external_id
+                                    .clone()
+                                    .or_else(|| agent.agent.external_id.clone())
+                            }),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        let previous = self.session(session_id)?.clone();
+        self.supervisor.refresh();
+        let report = self.decide_session(session_id, now_ms);
+        let lost: Vec<_> = orphaned
+            .into_iter()
+            .filter(|(node_id, _, _)| {
+                self.sessions
+                    .get(session_id)
+                    .and_then(|session| session.tree.get(node_id))
+                    .is_some_and(|node| node.lifecycle == Lifecycle::Lost)
+            })
+            .collect();
+
+        if lost.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(error) = self.persist_session(session_id) {
+            // A retry must not reclaim authority from a transition that never became
+            // durable. Restore the Orphaned truth and leave the lease fenced.
+            self.sessions.insert(session_id.clone(), previous);
+            return Err(error);
+        }
+
+        if let Some(existing) = self.restore_reports.iter_mut().find(|existing| {
+            matches!(
+                existing,
+                ServerEvent::RestoreResult {
+                    session_id: reported,
+                    ..
+                } if reported == session_id
+            )
+        }) {
+            *existing = report.clone();
+        } else {
+            self.restore_reports.push(report.clone());
+        }
+        self.resolve_lifecycle_attention(session_id, &lost, now_ms);
+        self.push_tree(session_id, now_ms);
+        self.push_session_state(session_id, now_ms);
+        self.push_all(report);
+        Ok(())
+    }
+
+    fn resolve_restore_where(
+        &mut self,
+        session_id: &SessionId,
+        resolved: impl Fn(&PaneRestoreOutcome) -> bool,
+    ) -> Option<ServerEvent> {
+        let report = self.restore_reports.iter_mut().find(|report| {
+            matches!(
+                report,
+                ServerEvent::RestoreResult { session_id: reported, .. } if reported == session_id
+            )
+        })?;
+        let ServerEvent::RestoreResult {
+            state,
+            needs_explanation,
+            panes,
+            ..
+        } = report
+        else {
+            unreachable!("the search above selected a restore result")
+        };
+        panes.retain(|outcome| !resolved(outcome));
+        *state = if panes.is_empty() {
+            RestoreState::Live
+        } else if panes.iter().any(|pane| pane.lifecycle.is_running()) {
+            RestoreState::PartiallyRestored
+        } else {
+            RestoreState::LayoutOnly
+        };
+        *needs_explanation = state.needs_explanation();
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.restore_state = *state;
+        }
+        Some(report.clone())
     }
 
     /// Rebuilds the attention manager around its exact durable queue.
@@ -302,8 +450,6 @@ impl Core {
             session = %id, orphaned, lost, eager_offers = eager, state = ?state,
             "restored a session; nothing was relaunched"
         );
-        self.persist_session_quietly(id);
-
         ServerEvent::RestoreResult {
             session_id: id.clone(),
             state,
@@ -362,7 +508,8 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
 mod migration_tests {
     use super::*;
     use crate::core::testing::Harness;
-    use turn_core::event::Risk;
+    use crate::core::FailedIngestCheckpoint;
+    use turn_core::event::{Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::{PaneId, WorkspaceId};
     use turn_core::model::{Direction, Layout, Pane, PendingPermission, ProcessNode};
     use turn_core::state::{AwaitingReason, Turn};
@@ -449,6 +596,7 @@ mod migration_tests {
             .insert(agent);
 
         harness.core.decide_session(&session_id, NOW + 1);
+        harness.core.persist_session(&session_id).unwrap();
 
         let node = harness.core.sessions[&session_id]
             .tree
@@ -473,5 +621,151 @@ mod migration_tests {
         assert!(node.agent.as_ref().is_some_and(|agent| {
             agent.pending_permission.is_none() && agent.pending_question.is_none()
         }));
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_persistence_rolls_back_orphan_reconciliation() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_restore_persist_failure");
+        let pane_id = PaneId::from_stored("pane_restore_persist_failure");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let mut process = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            "/tmp",
+            NOW,
+        );
+        process.lifecycle = Lifecycle::Orphaned;
+        process.pid = Some(u32::MAX);
+        let node_id = process.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(process);
+            let pane = session.layout.get_mut(&pane_id).unwrap();
+            pane.node_id = Some(node_id.clone());
+            pane.command = Some("sh".into());
+            session.restore_state = RestoreState::PartiallyRestored;
+        }
+        harness.core.persist_session(&session_id).unwrap();
+        harness
+            .core
+            .restore_reports
+            .push(ServerEvent::RestoreResult {
+                session_id: session_id.clone(),
+                state: RestoreState::PartiallyRestored,
+                needs_explanation: true,
+                panes: vec![PaneRestoreOutcome {
+                    pane_id,
+                    node_id: node_id.clone(),
+                    lifecycle: Lifecycle::Orphaned,
+                    can_relaunch: false,
+                    command: Some("sh".into()),
+                }],
+            });
+        harness
+            .core
+            .failed_ingest_checkpoints
+            .push_back(FailedIngestCheckpoint {
+                event: TurnEvent::new(
+                    session_id.clone(),
+                    EventKind::AgentIdle,
+                    EventSource::Supervisor,
+                    Confidence::Explicit,
+                    NOW + 1,
+                )
+                .with_node(node_id.clone()),
+                effects: Vec::new(),
+            });
+
+        let error = harness
+            .core
+            .reconcile_orphaned_recovery(&session_id, NOW + 2)
+            .expect_err("write authority cannot advance past an undurable Session");
+        assert_eq!(error.code, turn_proto::ErrorCode::Unavailable);
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&node_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Orphaned
+        );
+        assert_eq!(
+            harness
+                .core
+                .store
+                .sessions()
+                .get(&session_id)
+                .unwrap()
+                .unwrap()
+                .tree
+                .get(&node_id)
+                .unwrap()
+                .lifecycle,
+            Lifecycle::Orphaned
+        );
+        assert!(matches!(
+            harness.core.restore_reports.as_slice(),
+            [ServerEvent::RestoreResult { panes, .. }]
+                if panes[0].lifecycle == Lifecycle::Orphaned && !panes[0].can_relaunch
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolving_the_last_offer_prevents_a_new_client_from_seeing_stale_recovery() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_resolved_restore");
+        let pane_id = PaneId::from_stored("pane_resolved_restore");
+        let node_id = turn_core::ids::NodeId::from_stored("proc_resolved_restore");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .restore_state = RestoreState::LayoutOnly;
+        harness
+            .core
+            .restore_reports
+            .push(ServerEvent::RestoreResult {
+                session_id: session_id.clone(),
+                state: RestoreState::LayoutOnly,
+                needs_explanation: true,
+                panes: vec![PaneRestoreOutcome {
+                    pane_id,
+                    node_id: node_id.clone(),
+                    lifecycle: Lifecycle::Lost,
+                    can_relaunch: true,
+                    command: Some("sh".into()),
+                }],
+            });
+
+        let update = harness
+            .core
+            .resolve_restore_node(&session_id, &node_id)
+            .expect("the old offer existed");
+        assert!(matches!(
+            update,
+            ServerEvent::RestoreResult {
+                state: RestoreState::Live,
+                needs_explanation: false,
+                ref panes,
+                ..
+            } if panes.is_empty()
+        ));
+        assert_eq!(
+            harness.core.sessions[&session_id].restore_state,
+            RestoreState::Live
+        );
+        assert!(matches!(
+            harness.core.restore_reports.as_slice(),
+            [ServerEvent::RestoreResult {
+                state: RestoreState::Live,
+                needs_explanation: false,
+                panes,
+                ..
+            }] if panes.is_empty()
+        ));
     }
 }

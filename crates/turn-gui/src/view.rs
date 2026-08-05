@@ -28,15 +28,16 @@ use turn_core::attention::AttentionPolicy;
 use turn_core::event::Risk;
 use turn_core::ids::{AttentionId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, Direction, Layout, LayoutPreset, NodeKind, Pane, PaneKind, PreviewVisibility,
-    RelationshipKind, RestoreBehaviour,
+    ActivityPreview, Direction, Layout, LayoutPreset, LeaseState, NodeKind, Pane, PaneKind,
+    PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionStatus,
+    WorkspaceWriteLease,
 };
-use turn_core::state::{AwaitingReason, DisplayState};
+use turn_core::state::{AwaitingReason, DisplayState, Lifecycle};
 use turn_proto::cells::Grid;
 use turn_proto::{
-    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, ProtoErrorContext,
-    SessionConflictAlternative, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
-    WorkspaceSummary, WorkspaceTreeView,
+    CloseDisposition, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
+    PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative, SessionTreeView,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };
 
 use crate::keymap::{Command, Keymap};
@@ -158,6 +159,31 @@ pub struct TemporaryPaneContent<'a> {
     pub grid: Option<&'a Grid>,
 }
 
+/// A restart left durable layout behind but no attachable process for one or more panes.
+///
+/// This is deliberately not a generic error string. Each outcome is an explicit offer
+/// the user may accept; merely drawing it can never start a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRestoreView {
+    pub session_id: SessionId,
+    pub state: RestoreState,
+    pub panes: Vec<PaneRestoreOutcome>,
+}
+
+/// A destructive lifecycle choice awaiting a second, explicit click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleConfirmation {
+    EndSession {
+        session_id: SessionId,
+        name: String,
+        running_count: usize,
+    },
+    StopWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+    },
+}
+
 /// What the window is showing.
 #[derive(Debug, Default)]
 pub struct TurnView<'a> {
@@ -173,11 +199,25 @@ pub struct TurnView<'a> {
     /// At most one explicit temporary Pane for this window. Rendering it must never
     /// insert its PaneId into `layout`.
     pub temporary_pane: Option<TemporaryPaneContent<'a>>,
+    /// Actionable recovery for the selected Session. It never relaunches by itself.
+    pub restore: Option<&'a SessionRestoreView>,
+    /// A previous daemon owned this Session's checkout. Starting anything remains
+    /// blocked until the user explicitly confirms a new fenced lease.
+    pub recovery_lease: Option<&'a WorkspaceWriteLease>,
+    /// Processes from the previous daemon that are still alive but cannot be controlled.
+    /// They block recovery/relaunch so Turn never creates a second writer beside them.
+    pub unreachable_processes: usize,
+    /// Nodes whose explicit relaunch request is currently in flight.
+    pub relaunching: Vec<NodeId>,
+    pub reclaiming_workspaces: Vec<WorkspaceId>,
+    pub reclaiming_write_access: bool,
     pub permission: Option<PendingPermission>,
     /// The daemon's ordered queue still backs the global Next Attention action, but is
     /// not rendered as a second permanent navigation panel.
     pub queue: Vec<QueueItem>,
     pub connection: Option<ConnectionState>,
+    /// True only while the user has explicitly opened the Archived filter.
+    pub include_archived: bool,
     /// A failure worth showing, from a request that did not work.
     pub notice: Option<String>,
     /// Typed checkout conflict, rendered as a recovery flow rather than parsed text.
@@ -225,6 +265,9 @@ pub struct ViewState {
     pub tree_has_focus: bool,
     /// A read-only overlay. Opening it never changes the pane layout or terminal focus.
     pub quick_preview: Option<HierarchyKey>,
+    /// Confirmation for stopping a whole Session or Workspace. Process-row stop remains
+    /// a separate, narrowly scoped action.
+    pub lifecycle_confirmation: Option<LifecycleConfirmation>,
     /// Bounded, stable/redacted semantic history fetched on demand for Quick Preview.
     pub preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     /// The inspector is contextual and only occupies space for a selected Process.
@@ -255,6 +298,7 @@ impl ViewState {
             || self.session_draft.is_some()
             || self.layout_draft.is_some()
             || self.quick_preview.is_some()
+            || self.lifecycle_confirmation.is_some()
     }
 
     /// Drains typed hierarchy intents after drawing.
@@ -575,6 +619,35 @@ pub enum ViewAction {
         session_id: SessionId,
         node_id: NodeId,
     },
+    CloseSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
+    CloseWorkspace {
+        workspace_id: WorkspaceId,
+        disposition: CloseDisposition,
+    },
+    RelaunchNode {
+        session_id: SessionId,
+        node_id: NodeId,
+        resume: bool,
+    },
+    SetArchivedVisibility {
+        include: bool,
+    },
+    ArchiveSession {
+        session_id: SessionId,
+        archived: bool,
+    },
+    ArchiveWorkspace {
+        workspace_id: WorkspaceId,
+        archived: bool,
+    },
+    ReclaimWorkspaceWriteLease {
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        checkout_id: turn_core::ids::CheckoutId,
+    },
     CreateWorkspace {
         name: String,
         root: String,
@@ -705,6 +778,9 @@ impl HierarchyRow<'_> {
                 if summary.lease_reconciliation_required {
                     name.push_str(" — write lease needs reconciliation");
                 }
+                if summary.archived {
+                    name.push_str(" — archived");
+                }
                 name
             }
             Self::Session { session, .. } => {
@@ -724,6 +800,9 @@ impl HierarchyRow<'_> {
                 }
                 if summary.muted {
                     name.push_str(" — muted");
+                }
+                if summary.status == SessionStatus::Archived {
+                    name.push_str(" — archived");
                 }
                 name
             }
@@ -993,6 +1072,13 @@ impl<'a> TurnView<'a> {
         if let Some(notice) = &self.notice {
             self.notice_bar(ui, theme, notice);
         }
+        if self.restore.is_some()
+            || self.recovery_lease.is_some()
+            || self.reclaiming_write_access
+            || self.unreachable_processes > 0
+        {
+            actions.extend(self.restore_bar(ui, theme, self.restore));
+        }
 
         if state.quick_preview.is_some()
             && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
@@ -1074,7 +1160,7 @@ impl<'a> TurnView<'a> {
         );
         if let Some((workspace, session)) = active_context {
             ui.scope_builder(region(context_rect, "session-context"), |ui| {
-                actions.extend(self.session_context_bar(ui, theme, workspace, session));
+                actions.extend(self.session_context_bar(ui, theme, workspace, session, state));
             });
         }
         ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
@@ -1162,7 +1248,9 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.layout_draft.is_some() {
+        if state.lifecycle_confirmation.is_some() {
+            actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
+        } else if state.layout_draft.is_some() {
             actions.extend(self.layout_editor_overlay(ui, theme, state, full));
         } else if state.workspace_draft.is_some() {
             actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
@@ -1305,6 +1393,219 @@ impl<'a> TurnView<'a> {
             theme.failure,
         );
         ui.advance_cursor_after_rect(rect);
+    }
+
+    fn restore_bar(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        restore: Option<&SessionRestoreView>,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let available = restore
+            .into_iter()
+            .flat_map(|restore| &restore.panes)
+            .filter(|pane| pane.can_relaunch)
+            .count();
+        let needs_write_confirmation =
+            self.recovery_lease.is_some() || self.reclaiming_write_access;
+        let rect = Rect::from_min_size(
+            ui.available_rect_before_wrap().min,
+            Vec2::new(ui.available_width(), 34.0),
+        );
+        ui.painter().rect_filled(rect, 0.0, theme.raised);
+        ui.painter()
+            .hline(rect.x_range(), rect.max.y, Stroke::new(1.0, theme.border));
+        ui.painter().text(
+            rect.left_center() + Vec2::new(10.0, 0.0),
+            Align2::LEFT_CENTER,
+            if self.unreachable_processes > 0 {
+                format!(
+                    "RESTORED SAFELY · {} surviving process{} cannot be controlled by this daemon",
+                    self.unreachable_processes,
+                    if self.unreachable_processes == 1 {
+                        ""
+                    } else {
+                        "es"
+                    }
+                )
+            } else if needs_write_confirmation {
+                "RESTORED SAFELY · confirm main-checkout write access before starting panes"
+                    .to_string()
+            } else {
+                format!(
+                    "RESTORED SAFELY · {available} pane{} stopped · no command was restarted",
+                    if available == 1 { "" } else { "s" }
+                )
+            },
+            FontId::new(11.0, egui::FontFamily::Proportional),
+            theme.attention,
+        );
+        let controls = Rect::from_min_size(
+            rect.right_top() - Vec2::new(255.0, -4.0),
+            Vec2::new(245.0, 26.0),
+        );
+        ui.scope_builder(region(controls, "restore-actions"), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(lease) = self.recovery_lease {
+                    let pending = self.reclaiming_workspaces.contains(&lease.workspace_id);
+                    if ui
+                        .add_enabled(
+                            !pending,
+                            egui::Button::new(if pending {
+                                "Confirming…"
+                            } else if self.unreachable_processes > 0 {
+                                "Check & confirm access"
+                            } else {
+                                "Confirm write access"
+                            })
+                            .small(),
+                        )
+                        .clicked()
+                    {
+                        actions.push(ViewAction::ReclaimWorkspaceWriteLease {
+                            workspace_id: lease.workspace_id.clone(),
+                            session_id: lease.session_id.clone(),
+                            checkout_id: lease.checkout_id.clone(),
+                        });
+                    }
+                } else if self.reclaiming_write_access {
+                    ui.add_enabled(false, egui::Button::new("Confirming…").small());
+                } else if ui
+                    .add_enabled(
+                        available > 0 && self.unreachable_processes == 0,
+                        egui::Button::new("Start all").small(),
+                    )
+                    .on_disabled_hover_text(if self.unreachable_processes > 0 {
+                        "Stop surviving processes outside Turn before starting replacement panes."
+                    } else {
+                        "No stopped pane can be started again."
+                    })
+                    .clicked()
+                {
+                    if let Some(restore) = restore {
+                        for pane in restore.panes.iter().filter(|pane| pane.can_relaunch) {
+                            if !self.relaunching.contains(&pane.node_id) {
+                                actions.push(ViewAction::RelaunchNode {
+                                    session_id: restore.session_id.clone(),
+                                    node_id: pane.node_id.clone(),
+                                    resume: false,
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        ui.advance_cursor_after_rect(rect);
+        actions
+    }
+
+    fn lifecycle_confirmation_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                520.0_f32.min((full.width() - 32.0).max(300.0)),
+                250.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "lifecycle-confirmation"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_modal();
+            });
+            let Some(confirmation) = state.lifecycle_confirmation.clone() else {
+                return;
+            };
+            let (title, subject, detail, count) = match &confirmation {
+                LifecycleConfirmation::EndSession {
+                    name,
+                    running_count,
+                    ..
+                } => (
+                    "End session?",
+                    name.as_str(),
+                    "Turn will politely stop every process in this Session. Its layout and history remain available.",
+                    Some(*running_count),
+                ),
+                LifecycleConfirmation::StopWorkspace {
+                    name,
+                    ..
+                } => (
+                    "Stop all sessions in this workspace?",
+                    name.as_str(),
+                    "Turn will politely stop processes in every Session. The project directory and all files stay untouched.",
+                    None,
+                ),
+            };
+            ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
+            ui.label(RichText::new(subject).color(theme.text_dim).strong());
+            ui.add_space(10.0);
+            ui.label(RichText::new(detail).color(theme.text_dim));
+            ui.label(
+                RichText::new(match count {
+                    Some(count) => format!(
+                        "{} running process{} will receive a termination request.",
+                        count,
+                        if count == 1 { "" } else { "es" }
+                    ),
+                    None => "Every running process, including in archived Sessions, will receive a termination request."
+                        .to_string(),
+                })
+                .color(theme.attention)
+                .small(),
+            );
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let confirm_label = match confirmation {
+                    LifecycleConfirmation::EndSession { .. } => "End session",
+                    LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
+                };
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE))
+                            .fill(theme.failure),
+                    )
+                    .clicked()
+                {
+                    match confirmation {
+                        LifecycleConfirmation::EndSession { session_id, .. } => {
+                            actions.push(ViewAction::CloseSession {
+                                session_id,
+                                disposition: CloseDisposition::Terminate,
+                            });
+                        }
+                        LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
+                            actions.push(ViewAction::CloseWorkspace {
+                                workspace_id,
+                                disposition: CloseDisposition::Terminate,
+                            });
+                        }
+                    }
+                    state.lifecycle_confirmation = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    state.lifecycle_confirmation = None;
+                }
+            });
+        });
+        actions
     }
 
     fn write_conflict_overlay(
@@ -1553,8 +1854,8 @@ impl<'a> TurnView<'a> {
             Stroke::new(1.0, theme.border),
         );
         let action_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-208.0, 4.0),
-            Vec2::new(198.0, 26.0),
+            header.right_top() + Vec2::new(-278.0, 4.0),
+            Vec2::new(268.0, 26.0),
         );
         ui.scope_builder(region(action_rect, "hierarchy-create-actions"), |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1569,6 +1870,15 @@ impl<'a> TurnView<'a> {
                     .clicked()
                 {
                     state.session_draft = self.new_session_draft(snapshot, state);
+                }
+                if ui
+                    .selectable_label(self.include_archived, "Archived")
+                    .on_hover_text("Show or hide archived Workspaces and Sessions")
+                    .clicked()
+                {
+                    actions.push(ViewAction::SetArchivedVisibility {
+                        include: !self.include_archived,
+                    });
                 }
             });
         });
@@ -1680,8 +1990,164 @@ impl<'a> TurnView<'a> {
                     if response.double_clicked() && !caret_clicked {
                         actions.extend(open_or_focus_hierarchy_row(state, snapshot, *row));
                     }
-                    if let HierarchyRow::Process { node, .. } = row {
-                        response.context_menu(|ui| {
+                    match row {
+                        HierarchyRow::Workspace(workspace) => response.context_menu(|ui| {
+                            if workspace.workspace.archived {
+                                if ui.button("Restore workspace").clicked() {
+                                    actions.push(ViewAction::ArchiveWorkspace {
+                                        workspace_id: workspace.workspace.id.clone(),
+                                        archived: false,
+                                    });
+                                    ui.close();
+                                }
+                            } else {
+                                if ui.button("New session…").clicked() {
+                                    state.session_draft = Some(SessionDraft::new(
+                                        workspace.workspace.id.clone(),
+                                        self.preferred_template_id(&workspace.workspace.id),
+                                    ));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(
+                                        RichText::new("Stop all sessions…").color(theme.failure),
+                                    )
+                                    .clicked()
+                                {
+                                    state.lifecycle_confirmation =
+                                        Some(LifecycleConfirmation::StopWorkspace {
+                                            workspace_id: workspace.workspace.id.clone(),
+                                            name: workspace.workspace.name.clone(),
+                                        });
+                                    ui.close();
+                                }
+                                let running_count: usize = workspace
+                                    .sessions
+                                    .iter()
+                                    .map(|session| session.session.running_count)
+                                    .sum();
+                                let can_archive =
+                                    running_count == 0 && workspace.write_lease.is_none();
+                                if ui
+                                    .add_enabled(can_archive, egui::Button::new("Archive workspace"))
+                                    .on_disabled_hover_text(
+                                        "End its Sessions and release the write lease before archiving.",
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::ArchiveWorkspace {
+                                        workspace_id: workspace.workspace.id.clone(),
+                                        archived: true,
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        }),
+                        HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
+                            if session.session.status == SessionStatus::Archived {
+                                if ui
+                                    .add_enabled(
+                                        !workspace.workspace.archived,
+                                        egui::Button::new("Restore session"),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Restore the Workspace before restoring this Session.",
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::ArchiveSession {
+                                        session_id: session.session.id.clone(),
+                                        archived: false,
+                                    });
+                                    ui.close();
+                                }
+                                return;
+                            }
+                            if self.selected.as_ref() != Some(&session.session.id)
+                                && ui.button("Activate session").clicked()
+                            {
+                                actions.push(ViewAction::SelectSession(session.session.id.clone()));
+                                ui.close();
+                            }
+                            if ui
+                                .button("Detach all views · keep processes running")
+                                .clicked()
+                            {
+                                actions.push(ViewAction::CloseSession {
+                                    session_id: session.session.id.clone(),
+                                    disposition: CloseDisposition::KeepProcesses,
+                                });
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("End session…").color(theme.failure))
+                                .clicked()
+                            {
+                                state.lifecycle_confirmation =
+                                    Some(LifecycleConfirmation::EndSession {
+                                        session_id: session.session.id.clone(),
+                                        name: session.session.name.clone(),
+                                        running_count: session.session.running_count,
+                                });
+                                ui.close();
+                            }
+                            let owns_lease = workspace
+                                .write_lease
+                                .as_ref()
+                                .is_some_and(|lease| lease.session_id == session.session.id);
+                            if let Some(lease) = workspace.write_lease.as_ref().filter(|lease| {
+                                lease.session_id == session.session.id
+                                    && session.session.running_count == 0
+                            }) {
+                                if ui.button("Release write lease").clicked() {
+                                    actions.push(ViewAction::ReleaseWorkspaceLease {
+                                        workspace_id: workspace.workspace.id.clone(),
+                                        lease_id: lease.id.clone(),
+                                        expected_generation: lease.generation,
+                                    });
+                                    ui.close();
+                                }
+                            }
+                            if ui
+                                .add_enabled(
+                                    session.session.running_count == 0 && !owns_lease,
+                                    egui::Button::new("Archive session"),
+                                )
+                                .on_disabled_hover_text(
+                                    "End it and release its write lease before archiving.",
+                                )
+                                .clicked()
+                            {
+                                actions.push(ViewAction::ArchiveSession {
+                                    session_id: session.session.id.clone(),
+                                    archived: true,
+                                });
+                                ui.close();
+                            }
+                        }),
+                        HierarchyRow::Process { session, node } => response.context_menu(|ui| {
+                            let workspace = snapshot.workspaces.iter().find(|workspace| {
+                                workspace.workspace.id == session.session.workspace_id
+                            });
+                            let launch_blocked = session.session.status == SessionStatus::Archived
+                                || workspace.is_some_and(|workspace| {
+                                    workspace.workspace.archived
+                                        || self.reclaiming_workspaces.contains(
+                                            &workspace.workspace.id,
+                                        )
+                                        || workspace.write_lease.as_ref().is_some_and(|lease| {
+                                            lease.session_id == session.session.id
+                                                && lease.state == LeaseState::RecoveryRequired
+                                        })
+                                })
+                                || session
+                                    .nodes
+                                    .iter()
+                                    .any(|candidate| candidate.lifecycle == Lifecycle::Orphaned);
+                            let has_saved_pane =
+                                node.pane_bindings.iter().any(|binding| !binding.temporary);
                             if ui.button("Quick Preview").clicked() {
                                 state.quick_preview =
                                     Some(HierarchyKey::process(node.node_id.clone()));
@@ -1745,7 +2211,15 @@ impl<'a> TurnView<'a> {
                                     "Stop Process"
                                 };
                                 if ui
-                                    .button(RichText::new(label).color(theme.failure))
+                                    .add_enabled(
+                                        node.lifecycle != Lifecycle::Orphaned,
+                                        egui::Button::new(
+                                            RichText::new(label).color(theme.failure),
+                                        ),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "This process survived the previous daemon and is not controllable. Stop it outside Turn, then confirm recovery.",
+                                    )
                                     .clicked()
                                 {
                                     actions.push(ViewAction::TerminateNode {
@@ -1754,9 +2228,28 @@ impl<'a> TurnView<'a> {
                                     });
                                     ui.close();
                                 }
+                            } else if has_saved_pane {
+                                ui.separator();
+                                if ui
+                                    .add_enabled(
+                                        !launch_blocked,
+                                        egui::Button::new("Start again"),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Restore the Workspace/Session and confirm recovery before starting this pane.",
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::RelaunchNode {
+                                        session_id: node.session_id.clone(),
+                                        node_id: node.node_id.clone(),
+                                        resume: false,
+                                    });
+                                    ui.close();
+                                }
                             }
-                        });
-                    }
+                        }),
+                    };
                     if response.secondary_clicked() {
                         state.tree_has_focus = true;
                         response.request_focus();
@@ -1766,7 +2259,7 @@ impl<'a> TurnView<'a> {
                 }
             });
 
-        if state.tree_has_focus {
+        if hierarchy_accepts_keyboard(state) {
             let updated_rows = visible_hierarchy_rows(snapshot, state);
             actions.extend(handle_hierarchy_keyboard(
                 ui,
@@ -1824,6 +2317,7 @@ impl<'a> TurnView<'a> {
         theme: &Theme,
         workspace: &WorkspaceTreeView,
         session: &SessionTreeView,
+        state: &mut ViewState,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
@@ -1851,7 +2345,7 @@ impl<'a> TurnView<'a> {
             .unwrap_or("no branch");
         let title_clip = Rect::from_min_max(
             area.min,
-            egui::pos2((area.max.x - 230.0).max(area.min.x), area.max.y),
+            egui::pos2((area.max.x - 310.0).max(area.min.x), area.max.y),
         );
         let painter = ui.painter().with_clip_rect(title_clip);
         painter.text(
@@ -1877,26 +2371,33 @@ impl<'a> TurnView<'a> {
             .write_lease
             .as_ref()
             .filter(|lease| lease.session_id == summary.id);
+        let archived = workspace.workspace.archived || summary.status == SessionStatus::Archived;
+        let launch_blocked = archived
+            || self.recovery_lease.is_some()
+            || self.reclaiming_write_access
+            || self.unreachable_processes > 0;
         let toolbar = Rect::from_min_size(
-            area.right_top() + Vec2::new(-218.0, 7.0),
-            Vec2::new(208.0, 32.0),
+            area.right_top() + Vec2::new(-298.0, 7.0),
+            Vec2::new(288.0, 32.0),
         );
         ui.scope_builder(region(toolbar, "session-layout-toolbar"), |ui| {
             ui.horizontal(|ui| {
-                ui.menu_button("+ Pane", |ui| {
-                    if ui.button("Shell · split right").clicked() {
-                        actions.push(ViewAction::Run(Command::SplitHorizontal));
-                        ui.close();
-                    }
-                    if ui.button("Shell · split below").clicked() {
-                        actions.push(ViewAction::Run(Command::SplitVertical));
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Agent · split right").clicked() {
-                        actions.push(ViewAction::Run(Command::LaunchAgent));
-                        ui.close();
-                    }
+                ui.add_enabled_ui(!launch_blocked, |ui| {
+                    ui.menu_button("+ Pane", |ui| {
+                        if ui.button("Shell · split right").clicked() {
+                            actions.push(ViewAction::Run(Command::SplitHorizontal));
+                            ui.close();
+                        }
+                        if ui.button("Shell · split below").clicked() {
+                            actions.push(ViewAction::Run(Command::SplitVertical));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Agent · split right").clicked() {
+                            actions.push(ViewAction::Run(Command::LaunchAgent));
+                            ui.close();
+                        }
+                    });
                 });
                 ui.menu_button("Layout", |ui| {
                     for (label, preset) in [
@@ -1916,19 +2417,110 @@ impl<'a> TurnView<'a> {
                         actions.push(ViewAction::Run(Command::SaveLayoutAsTemplate));
                         ui.close();
                     }
-                    if let Some(lease) = owned_lease {
-                        ui.separator();
+                });
+                ui.menu_button("Session", |ui| {
+                    if archived {
+                        if workspace.workspace.archived && ui.button("Restore workspace").clicked()
+                        {
+                            actions.push(ViewAction::ArchiveWorkspace {
+                                workspace_id: workspace.workspace.id.clone(),
+                                archived: false,
+                            });
+                            ui.close();
+                        }
+                        if summary.status == SessionStatus::Archived
+                            && ui
+                                .add_enabled(
+                                    !workspace.workspace.archived,
+                                    egui::Button::new("Restore session"),
+                                )
+                                .on_disabled_hover_text(
+                                    "Restore the Workspace before restoring this Session.",
+                                )
+                                .clicked()
+                        {
+                            actions.push(ViewAction::ArchiveSession {
+                                session_id: summary.id.clone(),
+                                archived: false,
+                            });
+                            ui.close();
+                        }
+                    } else {
+                        if ui.button("Detach all views · keep running").clicked() {
+                            actions.push(ViewAction::CloseSession {
+                                session_id: summary.id.clone(),
+                                disposition: CloseDisposition::KeepProcesses,
+                            });
+                            ui.close();
+                        }
+                        if let Some(lease) = owned_lease.filter(|_| summary.running_count == 0) {
+                            if ui.button("Release write lease").clicked() {
+                                actions.push(ViewAction::ReleaseWorkspaceLease {
+                                    workspace_id: workspace.workspace.id.clone(),
+                                    lease_id: lease.id.clone(),
+                                    expected_generation: lease.generation,
+                                });
+                                ui.close();
+                            }
+                        }
+                        if ui
+                            .button(RichText::new("End session…").color(theme.failure))
+                            .clicked()
+                        {
+                            state.lifecycle_confirmation =
+                                Some(LifecycleConfirmation::EndSession {
+                                    session_id: summary.id.clone(),
+                                    name: summary.name.clone(),
+                                    running_count: summary.running_count,
+                                });
+                            ui.close();
+                        }
                         if ui
                             .add_enabled(
-                                summary.running_count == 0,
-                                egui::Button::new("Release write lease"),
+                                summary.running_count == 0 && owned_lease.is_none(),
+                                egui::Button::new("Archive session"),
+                            )
+                            .on_disabled_hover_text(
+                                "End the Session and release its write lease before archiving.",
                             )
                             .clicked()
                         {
-                            actions.push(ViewAction::ReleaseWorkspaceLease {
+                            actions.push(ViewAction::ArchiveSession {
+                                session_id: summary.id.clone(),
+                                archived: true,
+                            });
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .button(RichText::new("Stop all sessions…").color(theme.failure))
+                            .clicked()
+                        {
+                            state.lifecycle_confirmation =
+                                Some(LifecycleConfirmation::StopWorkspace {
+                                    workspace_id: workspace.workspace.id.clone(),
+                                    name: workspace.workspace.name.clone(),
+                                });
+                            ui.close();
+                        }
+                        let workspace_running: usize = workspace
+                            .sessions
+                            .iter()
+                            .map(|session| session.session.running_count)
+                            .sum();
+                        if ui
+                            .add_enabled(
+                                workspace_running == 0 && workspace.write_lease.is_none(),
+                                egui::Button::new("Archive workspace"),
+                            )
+                            .on_disabled_hover_text(
+                                "Stop its Sessions and release the write lease first.",
+                            )
+                            .clicked()
+                        {
+                            actions.push(ViewAction::ArchiveWorkspace {
                                 workspace_id: workspace.workspace.id.clone(),
-                                lease_id: lease.id.clone(),
-                                expected_generation: lease.generation,
+                                archived: true,
                             });
                             ui.close();
                         }
@@ -2902,6 +3494,22 @@ impl<'a> TurnView<'a> {
             return actions;
         };
 
+        let selected_archived = self.selected.as_ref().is_some_and(|selected| {
+            hierarchy.is_some_and(|snapshot| {
+                snapshot.workspaces.iter().any(|workspace| {
+                    (workspace.workspace.archived
+                        || workspace.sessions.iter().any(|session| {
+                            &session.session.id == selected
+                                && session.session.status == SessionStatus::Archived
+                        }))
+                        && workspace
+                            .sessions
+                            .iter()
+                            .any(|session| &session.session.id == selected)
+                })
+            })
+        });
+
         let arrangement = panes::arrange(layout, area);
         // Persisted pane focus and the window's keyboard lease are different things.
         // Keep the visual focus in place behind a sheet, but never let that sheet's
@@ -2949,8 +3557,103 @@ impl<'a> TurnView<'a> {
                 Stroke::new(1.0, theme.border),
             );
 
-            match content {
-                Some(content) => {
+            let restore = self.restore.and_then(|restore| {
+                restore
+                    .panes
+                    .iter()
+                    .find(|outcome| outcome.pane_id == placed.pane_id)
+                    .map(|outcome| (restore, outcome))
+            });
+            match (restore, content) {
+                (Some((restore, outcome)), _) => {
+                    ui.painter().rect_filled(body, 0.0, theme.background);
+                    let content_rect = Rect::from_center_size(
+                        body.center(),
+                        Vec2::new(body.width().min(340.0), body.height().min(132.0)),
+                    );
+                    ui.scope_builder(region(content_rect, "restored-pane-action"), |ui| {
+                        ui.vertical_centered(|ui| {
+                            let orphaned = outcome.lifecycle.is_running();
+                            ui.label(
+                                RichText::new(if orphaned {
+                                    "Process is still running"
+                                } else {
+                                    "Process is stopped"
+                                })
+                                .color(theme.text)
+                                .strong(),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    outcome.command.as_deref().unwrap_or("No command recorded"),
+                                )
+                                .monospace()
+                                .color(theme.text_dim),
+                            );
+                            ui.label(
+                                RichText::new(if orphaned {
+                                    "Its terminal belonged to the previous daemon and cannot be reattached."
+                                } else {
+                                    "Turn restored the layout without running this command."
+                                })
+                                .color(theme.text_faint)
+                                .small(),
+                            );
+                            ui.add_space(7.0);
+                            let pending = self.relaunching.contains(&outcome.node_id);
+                            let lease_blocked =
+                                self.recovery_lease.is_some() || self.reclaiming_write_access;
+                            let unreachable_blocked = self.unreachable_processes > 0;
+                            if ui
+                                .add_enabled(
+                                    outcome.can_relaunch
+                                        && !pending
+                                        && !lease_blocked
+                                        && !unreachable_blocked
+                                        && !selected_archived,
+                                    egui::Button::new(if pending {
+                                        "Starting…"
+                                    } else if orphaned {
+                                        "Still running"
+                                    } else {
+                                        "Start pane"
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                actions.push(ViewAction::RelaunchNode {
+                                    session_id: restore.session_id.clone(),
+                                    node_id: outcome.node_id.clone(),
+                                    resume: false,
+                                });
+                            }
+                            if lease_blocked && outcome.can_relaunch {
+                                ui.label(
+                                    RichText::new("Confirm write access in the banner first.")
+                                        .color(theme.attention)
+                                        .small(),
+                                );
+                            } else if unreachable_blocked && outcome.can_relaunch {
+                                ui.label(
+                                    RichText::new(
+                                        "Stop surviving processes outside Turn before starting.",
+                                    )
+                                    .color(theme.attention)
+                                    .small(),
+                                );
+                            } else if selected_archived && outcome.can_relaunch {
+                                ui.label(
+                                    RichText::new(
+                                        "Restore the Session and Workspace before starting.",
+                                    )
+                                    .color(theme.attention)
+                                    .small(),
+                                );
+                            }
+                        });
+                    });
+                }
+                (None, Some(content)) => {
                     let options = PaneOptions {
                         focused,
                         accepts_input: focused && accepts_terminal_input,
@@ -2969,18 +3672,76 @@ impl<'a> TurnView<'a> {
                         });
                     }
                 }
-                None => {
-                    // A pane the window has not attached to yet, or one with no process.
-                    // Said plainly rather than left blank, because a blank pane looks
-                    // like a bug.
+                (None, None) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
-                    ui.painter().text(
-                        body.center(),
-                        Align2::CENTER_CENTER,
-                        "no process in this pane",
-                        theme.ui_font.clone(),
-                        theme.text_faint,
-                    );
+                    let stopped = placed.node_id.as_ref().and_then(|node_id| {
+                        hierarchy.and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .flat_map(|workspace| &workspace.sessions)
+                                .flat_map(|session| &session.nodes)
+                                .find(|node| {
+                                    &node.node_id == node_id && node.lifecycle.is_terminal()
+                                })
+                        })
+                    });
+                    if let Some(node) = stopped {
+                        let content_rect = Rect::from_center_size(
+                            body.center(),
+                            Vec2::new(body.width().min(320.0), body.height().min(108.0)),
+                        );
+                        ui.scope_builder(region(content_rect, "stopped-pane-action"), |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Session process stopped")
+                                        .color(theme.text)
+                                        .strong(),
+                                );
+                                ui.label(
+                                    RichText::new(process_title(node))
+                                        .monospace()
+                                        .color(theme.text_dim),
+                                );
+                                ui.add_space(7.0);
+                                let pending = self.relaunching.contains(&node.node_id);
+                                let lease_blocked =
+                                    self.recovery_lease.is_some() || self.reclaiming_write_access;
+                                let unreachable_blocked = self.unreachable_processes > 0;
+                                if ui
+                                    .add_enabled(
+                                        !pending
+                                            && !lease_blocked
+                                            && !unreachable_blocked
+                                            && !selected_archived,
+                                        egui::Button::new(if pending {
+                                            "Starting…"
+                                        } else {
+                                            "Start pane"
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(ViewAction::RelaunchNode {
+                                        session_id: node.session_id.clone(),
+                                        node_id: node.node_id.clone(),
+                                        resume: false,
+                                    });
+                                }
+                            });
+                        });
+                    } else {
+                        // A pane the window has not attached to yet, or one with no
+                        // process. Said plainly rather than left blank, because a blank
+                        // pane looks like a rendering bug.
+                        ui.painter().text(
+                            body.center(),
+                            Align2::CENTER_CENTER,
+                            "no process in this pane",
+                            theme.ui_font.clone(),
+                            theme.text_faint,
+                        );
+                    }
                 }
             }
         }
@@ -3850,6 +4611,14 @@ fn hierarchy_row(
 
     let text_x = rect.min.x + indent + 15.0;
     let right_tag = match row {
+        HierarchyRow::Workspace(workspace) if workspace.workspace.archived => {
+            Some("ARCHIVED".into())
+        }
+        HierarchyRow::Session { session, .. }
+            if session.session.status == SessionStatus::Archived =>
+        {
+            Some("ARCHIVED".into())
+        }
         HierarchyRow::Workspace(workspace) if workspace.workspace.sessions_needing_user > 0 => {
             Some(format!(
                 "{} NEED YOU",
@@ -3891,6 +4660,9 @@ fn hierarchy_row(
                 theme.text,
             );
             let mut detail = format!("WORKSPACE · {} sessions", workspace.workspace.session_count);
+            if workspace.workspace.archived {
+                detail.push_str(" · archived");
+            }
             if workspace.workspace.lease_reconciliation_required {
                 detail.push_str(" · LEASE CHECK");
             }
@@ -3926,6 +4698,9 @@ fn hierarchy_row(
                 summary.state_label,
                 summary.running_count
             );
+            if summary.status == SessionStatus::Archived {
+                detail.push_str(" · archived");
+            }
             if summary.read_only_enforced {
                 detail.push_str(" · enforced");
             }
@@ -4133,6 +4908,10 @@ enum HierarchyKeypress {
     TemporaryPane,
     Activate,
     Blur,
+}
+
+fn hierarchy_accepts_keyboard(state: &ViewState) -> bool {
+    state.tree_has_focus && !state.is_sensitive()
 }
 
 fn handle_hierarchy_keyboard(
@@ -4981,6 +5760,23 @@ mod tests {
         state.settings_open = false;
         state.attention_panel_open = true;
         assert!(state.is_sensitive());
+    }
+
+    #[test]
+    fn an_end_session_dialog_blocks_tree_shortcuts_behind_it() {
+        let mut state = ViewState {
+            tree_has_focus: true,
+            lifecycle_confirmation: Some(LifecycleConfirmation::EndSession {
+                session_id: SessionId::from_stored("sess_modal_shortcuts"),
+                name: "Do not mutate behind me".into(),
+                running_count: 2,
+            }),
+            ..ViewState::default()
+        };
+        assert!(!hierarchy_accepts_keyboard(&state));
+
+        state.lifecycle_confirmation = None;
+        assert!(hierarchy_accepts_keyboard(&state));
     }
 
     #[test]

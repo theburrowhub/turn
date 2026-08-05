@@ -9,7 +9,7 @@ use turn_core::ids::{AttentionId, CheckoutId};
 use turn_core::model::{LeaseState, PaneKind, RestoreState, Template};
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_core::Confidence;
-use turn_proto::{ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent};
+use turn_proto::{ErrorCode, NewPane, Request, Response, ServerEvent};
 
 /// Verifies the portable shipped preset, then persists Coding as a user-owned fixture.
 async fn save_custom_coding_template(ui: &mut Client) -> turn_proto::TemplateSummary {
@@ -246,34 +246,9 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         .as_deref()
         .is_some_and(|detail| detail.contains("reconciliation")));
 
-    // Re-acquiring without releasing is also not adoption. It remains a typed
-    // conflict naming the durable owner and the recovery-required lease.
-    let conflict = ui
-        .try_ask(Request::AcquireWorkspaceWriteLease {
-            workspace_id: workspace_id.clone(),
-            session_id: session_id.clone(),
-            checkout_id: CheckoutId::primary_for(&workspace_id),
-        })
-        .await
-        .expect_err("the inherited claim must be reconciled explicitly");
-    assert_eq!(conflict.code, ErrorCode::Conflict);
-    assert!(matches!(
-        conflict.context.as_deref(),
-        Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
-            lease,
-            owner,
-            ..
-        }) if lease.id == before_lease.id
-            && lease.state == LeaseState::RecoveryRequired
-            && owner.session_id == session_id
-    ));
-
-    ui.ask(Request::ReleaseWorkspaceWriteLease {
-        workspace_id: workspace_id.clone(),
-        lease_id: recovery_lease.id,
-        expected_generation: recovery_lease.generation,
-    })
-    .await;
+    // The explicit Acquire action atomically adopts the exact recovery claim. There is
+    // no Release -> ReadOnly -> Acquire gap in which authority disappears or another
+    // writer can slip in.
     let acquired = match ui
         .ask(Request::AcquireWorkspaceWriteLease {
             workspace_id: workspace_id.clone(),
@@ -285,8 +260,9 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         Response::WorkspaceWriteLease {
             lease: Some(lease), ..
         } => lease,
-        other => panic!("expected an explicitly reacquired lease, got {other:?}"),
+        other => panic!("expected an explicitly recovered lease, got {other:?}"),
     };
+    assert_eq!(acquired.id, recovery_lease.id);
     assert_eq!(acquired.state, LeaseState::Active);
     assert!(acquired.generation > before_lease.generation);
 
@@ -784,6 +760,146 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
     daemon.shutdown().await;
     let _ = survivor.kill();
     let _ = survivor.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_an_orphan_outside_turn_unblocks_recovery_without_another_restart() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
+    let session_id = before.summary.id.clone();
+    let workspace_id = before.summary.workspace_id.clone();
+    let shell = before
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the persisted shell pane");
+    let node_id = shell.node_id.clone().expect("the shell's runtime node");
+    drop(ui);
+
+    let dir = daemon.stop().await;
+    let data_dir = dir.path().to_path_buf();
+    let mut survivor = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("the detached runtime");
+    {
+        let store = turn_store::Store::open_in(&data_dir).expect("the store must reopen");
+        let mut session = store
+            .sessions()
+            .get(&session_id)
+            .expect("the session query")
+            .expect("the persisted Session");
+        let node = session
+            .tree
+            .get_mut(&node_id)
+            .expect("the pane's persisted runtime");
+        node.pid = Some(survivor.id());
+        node.command = "sleep 300".into();
+        node.lifecycle = Lifecycle::Alive;
+        store
+            .sessions()
+            .save(&session)
+            .expect("the survivor metadata must save");
+    }
+
+    let daemon = TestDaemon::adopt(dir).await;
+    let mut ui = daemon.connect().await;
+    let initial = ui
+        .wait_for("the orphaned restore offer", |event| match event {
+            ServerEvent::RestoreResult {
+                session_id: reported,
+                panes,
+                ..
+            } if reported == &session_id => {
+                panes.iter().find(|pane| pane.node_id == node_id).cloned()
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(initial.lifecycle, Lifecycle::Orphaned);
+    assert!(!initial.can_relaunch);
+
+    let refused = ui
+        .try_ask(Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: CheckoutId::primary_for(&workspace_id),
+        })
+        .await
+        .expect_err("a verified living orphan still owns the old work");
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(
+        details_of(
+            ui.ask(Request::GetSession {
+                session_id: session_id.clone(),
+            })
+            .await,
+        )
+        .tree
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .expect("the surviving runtime remains visible")
+        .lifecycle,
+        Lifecycle::Orphaned
+    );
+
+    survivor
+        .kill()
+        .expect("the user can stop the orphan externally");
+    survivor.wait().expect("the orphan must be reaped");
+
+    let acquired = match ui
+        .ask(Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: CheckoutId::primary_for(&workspace_id),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the recovered lease, got {other:?}"),
+    };
+    assert_eq!(acquired.state, LeaseState::Active);
+
+    let updated = ui
+        .wait_for("the lost relaunch offer", |event| match event {
+            ServerEvent::RestoreResult {
+                session_id: reported,
+                panes,
+                ..
+            } if reported == &session_id => panes
+                .iter()
+                .find(|pane| pane.node_id == node_id && pane.lifecycle == Lifecycle::Lost)
+                .cloned(),
+            _ => None,
+        })
+        .await;
+    assert!(
+        updated.can_relaunch,
+        "the same confirmation that observes the dead orphan must expose the manual restart"
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session_id.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        details
+            .tree
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .expect("the reconciled runtime remains in the tree")
+            .lifecycle,
+        Lifecycle::Lost
+    );
+
+    daemon.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

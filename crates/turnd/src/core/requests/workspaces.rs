@@ -74,6 +74,16 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         if archived
+            && self.sessions.values().any(|session| {
+                session.workspace_id == *id && session.tree.iter().any(|node| node.is_running())
+            })
+        {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "Stop every Session process before archiving this Workspace",
+            ));
+        }
+        if archived
             && self
                 .store
                 .hierarchy()
@@ -85,6 +95,17 @@ impl Core {
                 turn_proto::ErrorCode::Conflict,
                 "Release this Workspace's primary-checkout write lease before archiving it",
             ));
+        }
+        if archived {
+            let sessions: Vec<SessionId> = self
+                .sessions
+                .values()
+                .filter(|session| session.workspace_id == *id)
+                .map(|session| session.id.clone())
+                .collect();
+            for session_id in sessions {
+                self.clear_session_temporary_bindings(&session_id, now_ms)?;
+            }
         }
         let workspace = self
             .workspaces
@@ -147,6 +168,12 @@ impl Core {
             .filter(|session| &session.workspace_id == id)
             .map(|session| session.id.clone())
             .collect();
+        // Validate the whole Workspace before touching the first Session. Otherwise an
+        // unreachable restored process halfway through would leave a partially stopped
+        // Workspace after returning an error.
+        for session in &sessions {
+            self.ensure_session_processes_stoppable(session, disposition)?;
+        }
         for session in sessions {
             self.close_session(&session, disposition, now_ms)?;
         }

@@ -26,16 +26,17 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentName, Direction, Layout, NodeKind, Pane, PaneKind, PaneNodeBinding,
-    PreviewSource, ProcessNode, Relation, Session, SessionMode, Template, Workspace,
-    WorkspaceCheckout, WorkspaceWriteLease,
+    ActivityPreview, AgentName, Direction, Layout, LeaseState, NodeKind, Pane, PaneKind,
+    PaneNodeBinding, PreviewSource, ProcessNode, Relation, RestoreState, Session, SessionMode,
+    Template, Workspace, WorkspaceCheckout, WorkspaceWriteLease,
 };
-use turn_core::state::{AwaitingReason, Lifecycle, Turn};
+use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
-    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, ProtoErrorContext, PtySize,
-    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
-    TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
+    CloseDisposition, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
+    PaneRestoreOutcome, ProtoErrorContext, PtySize, SessionConflictAlternative, SessionSummary,
+    SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState, Welcome, WorkspaceSummary,
+    WorkspaceTreeView, WriteLeaseOwnerView,
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
@@ -43,9 +44,9 @@ use turn_gui::terminal::PaneAction;
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    LayoutEditorOrigin, LayoutTemplateDraft, PaneContent, PendingPermission, QueueItem,
-    SessionDraft, SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState,
-    WorkspaceDraft,
+    LayoutEditorOrigin, LayoutTemplateDraft, LifecycleConfirmation, PaneContent, PendingPermission,
+    QueueItem, SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView,
+    ViewAction, ViewState, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -85,6 +86,8 @@ struct Fixture {
     temporary_pane: Option<NodePaneView>,
     temporary_previews: Vec<ActivityPreview>,
     write_conflict: Option<ProtoErrorContext>,
+    restore: Option<SessionRestoreView>,
+    recovery_lease: Option<WorkspaceWriteLease>,
 }
 
 impl Fixture {
@@ -129,11 +132,18 @@ impl Fixture {
             layout: self.layout.clone(),
             panes,
             temporary_pane,
+            restore: self.restore.as_ref(),
+            recovery_lease: self.recovery_lease.as_ref(),
+            unreachable_processes: 0,
+            relaunching: Vec::new(),
+            reclaiming_workspaces: Vec::new(),
+            reclaiming_write_access: false,
             permission: self.permission.clone(),
             queue: self.queue.clone(),
             connection: self.connection.clone(),
             notice: self.notice.clone(),
             write_conflict: self.write_conflict.as_ref(),
+            include_archived: false,
             policy: None,
             now_ms: cursor_on(),
         }
@@ -722,11 +732,125 @@ fn busy_desk() -> Fixture {
     }
 }
 
+fn restored_desk() -> Fixture {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let session_id = fixture.selected.clone().expect("selected Session");
+    let snapshot = fixture.hierarchy.as_ref().expect("Hierarchy");
+    let session = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| session.session.id == session_id)
+        .expect("selected Session in Hierarchy");
+    let panes = session
+        .nodes
+        .iter()
+        .flat_map(|node| {
+            node.pane_bindings
+                .iter()
+                .map(move |binding| PaneRestoreOutcome {
+                    pane_id: binding.pane_id.clone(),
+                    node_id: node.node_id.clone(),
+                    lifecycle: Lifecycle::Lost,
+                    can_relaunch: true,
+                    command: Some(node.command.clone()),
+                })
+        })
+        .collect();
+    let mut recovery_lease = snapshot
+        .workspaces
+        .iter()
+        .find_map(|workspace| workspace.write_lease.clone())
+        .expect("main-checkout lease");
+    recovery_lease.state = LeaseState::RecoveryRequired;
+    let stopped = DisplayState::Stopped;
+    if let Some(snapshot) = fixture.hierarchy.as_mut() {
+        for workspace in &mut snapshot.workspaces {
+            workspace.workspace.sessions_needing_user = 0;
+            workspace.workspace.badge_count = 0;
+            if let Some(lease) = workspace.write_lease.as_mut() {
+                lease.state = LeaseState::RecoveryRequired;
+            }
+            for session in &mut workspace.sessions {
+                session.session.display_state = stopped;
+                session.session.state_label = stopped.label().into();
+                session.session.severity = stopped.severity();
+                session.session.needs_user = false;
+                session.session.badge_count = 0;
+                session.session.subagent_count = 0;
+                session.session.running_count = 0;
+                for node in &mut session.nodes {
+                    node.lifecycle = Lifecycle::Lost;
+                    node.display_state = stopped;
+                    node.state_label = stopped.label().into();
+                    node.severity = stopped.severity();
+                    node.needs_user = false;
+                    node.interaction_pending = false;
+                }
+            }
+        }
+    }
+    fixture.restore = Some(SessionRestoreView {
+        session_id,
+        state: RestoreState::LayoutOnly,
+        panes,
+    });
+    fixture.recovery_lease = Some(recovery_lease);
+    fixture.grids.clear();
+    fixture
+}
+
 #[test]
 fn a_busy_desk_with_a_pending_permission() {
     let mut h = harness(busy_desk());
     h.run();
     h.snapshot("busy_desk");
+}
+
+#[test]
+fn a_restored_layout_explains_that_nothing_was_restarted_and_offers_recovery() {
+    let mut h = harness(restored_desk());
+    h.run();
+    h.snapshot("restored_layout");
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Confirm write access")
+        .expect("recovery has an explicit write-access confirmation")
+        .click();
+    h.run_steps(1);
+    assert!(matches!(
+        h.state().actions.as_slice(),
+        [ViewAction::ReclaimWorkspaceWriteLease { .. }]
+    ));
+}
+
+#[test]
+fn ending_a_session_requires_confirmation_and_requests_process_termination() {
+    let fixture = busy_desk();
+    let session_id = fixture.selected.clone().expect("selected Session");
+    let mut h = harness(fixture);
+    h.state_mut().state.lifecycle_confirmation = Some(LifecycleConfirmation::EndSession {
+        session_id: session_id.clone(),
+        name: "Fix climbing bugs".into(),
+        running_count: 6,
+    });
+    h.run();
+    h.snapshot("end_session_confirmation");
+
+    h.state_mut().actions.clear();
+    h.query_by_label("End session")
+        .expect("the destructive action is a visible button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::CloseSession {
+            session_id,
+            disposition: CloseDisposition::Terminate,
+        }]
+    );
 }
 
 #[test]

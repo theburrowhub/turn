@@ -48,6 +48,9 @@ pub struct SessionDebt {
     /// Every node's lifecycle and turn, which also answers a lost node state change.
     pub tree: bool,
     pub layout: bool,
+    /// The actionable per-pane recovery result. A Session summary cannot reconstruct
+    /// node ids, commands, or whether relaunch is safe.
+    pub restore: bool,
     /// The geometry of the ptys this client has attached in the session.
     pub sizes: bool,
 }
@@ -57,6 +60,7 @@ impl SessionDebt {
         self.summary |= other.summary;
         self.tree |= other.tree;
         self.layout |= other.layout;
+        self.restore |= other.restore;
         self.sizes |= other.sizes;
     }
 
@@ -84,6 +88,17 @@ impl SessionDebt {
     fn sizes() -> Self {
         Self {
             sizes: true,
+            ..Self::default()
+        }
+    }
+
+    fn restore() -> Self {
+        Self {
+            // RestoreResult is a gate on attachment. Even if the original Layout
+            // push happened to fit after this report was dropped, replay the Layout
+            // after repairing recovery so the client gets a fresh attach trigger.
+            layout: true,
+            restore: true,
             ..Self::default()
         }
     }
@@ -117,10 +132,10 @@ fn repair_for(event: &ServerEvent) -> (Option<(SessionId, SessionDebt)>, bool, b
         | ServerEvent::TreeChanged { session_id, .. } => session(session_id, SessionDebt::tree()),
         ServerEvent::LayoutChanged { session_id, .. } => session(session_id, SessionDebt::layout()),
         ServerEvent::PtyResized { session_id, .. } => session(session_id, SessionDebt::sizes()),
-        // The restore explanation lives on the summary, so re-sending that is what
-        // stops a user from being left to notice a dead pane on their own.
+        // The summary only says that recovery needs explanation. The report carries
+        // the exact pane/node identities and relaunch offers the GUI must render.
         ServerEvent::RestoreResult { session_id, .. } => {
-            session(session_id, SessionDebt::summary())
+            session(session_id, SessionDebt::restore())
         }
         // An effect is a moment, not a state: a sound that did not play cannot be
         // played late, and re-issuing a focus jump would move the user for something
@@ -184,6 +199,9 @@ pub struct Client {
     pub attachments: HashMap<AttachmentKey, Attachment>,
     /// Stable window identity supplied by `get_hierarchy`.
     pub surface_id: Option<String>,
+    /// Whether this window explicitly opened the Archived view. Hierarchy pushes must
+    /// preserve that choice instead of snapping back to the normal filter.
+    pub include_archived: bool,
     /// Frames dropped because this client was not draining. Surfaced in logs; a
     /// non-zero value means a UI that cannot keep up.
     pub dropped_frames: u64,
@@ -203,6 +221,7 @@ impl Client {
             agreed_version,
             attachments: HashMap::new(),
             surface_id: None,
+            include_archived: false,
             dropped_frames: 0,
             owed_state: HashMap::new(),
             owed_queue: false,
@@ -442,7 +461,11 @@ impl Core {
             // client that asks after it gets a `not_found` which says exactly that.
             return;
         };
-        if session.is_archived() {
+        let include_archived = self
+            .clients
+            .get(&client)
+            .is_some_and(|client| client.include_archived);
+        if session.is_archived() && !include_archived {
             // The push it lost was the row leaving the list, so re-sending the summary
             // would put it back.
             let event = ServerEvent::SessionRemoved {
@@ -472,6 +495,19 @@ impl Core {
                     nodes,
                 },
             );
+        }
+        // Before layout: a client must learn that a restored pane is not attachable
+        // before a layout refresh makes it consider attaching that pane.
+        if debt.restore {
+            if let Some(report) = self.restore_reports.iter().find(|report| {
+                matches!(
+                    report,
+                    ServerEvent::RestoreResult { session_id: reported, .. }
+                        if reported == session_id
+                )
+            }) {
+                self.push_to(client, report.clone());
+            }
         }
         if debt.layout {
             if let Some(session) = self.sessions.get(session_id) {
@@ -772,5 +808,70 @@ mod tests {
                 .is_behind(),
             "a repaired client stops being owed anything"
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_restore_result_is_repaired_before_the_layout_that_enables_attach() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_restore_debt");
+        let pane = PaneId::from_stored("pane_restore_debt");
+        let node = NodeId::from_stored("proc_restore_debt");
+        harness.add_session(session.clone(), pane.clone(), NOW);
+        let report = ServerEvent::RestoreResult {
+            session_id: session.clone(),
+            state: turn_core::model::RestoreState::LayoutOnly,
+            needs_explanation: true,
+            panes: vec![turn_proto::PaneRestoreOutcome {
+                pane_id: pane,
+                node_id: node,
+                lifecycle: turn_core::state::Lifecycle::Lost,
+                can_relaunch: true,
+                command: Some("claude".into()),
+            }],
+        };
+        harness.core.restore_reports.push(report.clone());
+        let (client, mut frames) = harness.add_client(1);
+        drain(&mut frames);
+
+        // Occupy the sole slot and lose the actionable recovery result.
+        harness.core.push_session_state(&session, NOW);
+        harness.core.push_all(report.clone());
+        // The receiver frees the slot between the two pushes, so the original Layout
+        // arrives successfully. This is the subtle case: recovery alone would be
+        // repaired later, after the only Layout pulse that could trigger an attach.
+        drain(&mut frames);
+        harness.core.push_layout(&session, None);
+        assert!(matches!(
+            drain(&mut frames).as_slice(),
+            [ServerEvent::LayoutChanged { session_id, .. }] if session_id == &session
+        ));
+        assert!(harness
+            .core
+            .clients
+            .get(&client)
+            .expect("client")
+            .is_behind());
+
+        harness.core.resync_clients(NOW);
+        let first = drain(&mut frames);
+        assert_eq!(first, vec![report], "RestoreResult must be repaired first");
+        assert!(harness
+            .core
+            .clients
+            .get(&client)
+            .expect("Layout is still owed")
+            .is_behind());
+
+        harness.core.resync_clients(NOW);
+        assert!(matches!(
+            drain(&mut frames).as_slice(),
+            [ServerEvent::LayoutChanged { session_id, .. }] if session_id == &session
+        ));
+        assert!(!harness
+            .core
+            .clients
+            .get(&client)
+            .expect("client")
+            .is_behind());
     }
 }
