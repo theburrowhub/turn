@@ -10,8 +10,8 @@
 //! the key, never silently replaced with a default.
 
 use crate::codec::{from_json, json};
-use crate::error::Result;
-use crate::redact::redact_json;
+use crate::error::{Result, StoreError};
+use crate::redact::{redact_json, redact_secrets};
 use rusqlite::{params, Connection};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -26,6 +26,12 @@ impl<'a> SettingsRepo<'a> {
 
     /// Stores a preference, replacing any previous value.
     pub fn set<T: Serialize>(&self, key: &str, value: &T, now_ms: i64) -> Result<()> {
+        if redact_secrets(key) != key {
+            return Err(StoreError::SecretInStructuralField {
+                what: "setting key",
+                owner_id: "settings".to_string(),
+            });
+        }
         self.conn.execute(
             "INSERT INTO settings (key, value_json, updated_ms) VALUES (?1, ?2, ?3) \
              ON CONFLICT(key) DO UPDATE SET \
@@ -118,6 +124,24 @@ mod tests {
             Some(T0 + 100)
         );
         assert_eq!(store.settings().keys().unwrap(), vec!["ui.theme"]);
+    }
+
+    #[test]
+    fn a_credential_cannot_be_persisted_as_a_setting_key() {
+        let store = testing::store();
+        let secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let error = store
+            .settings()
+            .set(secret, &"innocent value", T0)
+            .expect_err("keys are durable text too");
+        assert!(matches!(
+            error,
+            crate::StoreError::SecretInStructuralField {
+                what: "setting key",
+                ..
+            }
+        ));
+        assert!(store.settings().keys().unwrap().is_empty());
     }
 
     #[test]

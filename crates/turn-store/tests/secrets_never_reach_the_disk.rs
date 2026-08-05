@@ -591,20 +591,24 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
     );
 
     let agent = node.agent.as_ref().expect("agent metadata");
+    assert_eq!(
+        agent.agent.external_id, None,
+        "a credential cannot remain a resumable provider identity"
+    );
+    assert_eq!(
+        agent.external_id, None,
+        "a credential cannot remain a resumable runtime identity"
+    );
+    assert!(!agent.resumable, "losing identity must revoke resume");
     for (label, value) in [
         ("agent.provider", agent.agent.provider.as_deref().unwrap()),
         ("agent.tool", agent.agent.tool.as_deref().unwrap()),
         ("agent.model", agent.agent.model.as_deref().unwrap()),
         (
-            "agent.ref.external_id",
-            agent.agent.external_id.as_deref().unwrap(),
-        ),
-        (
             "agent.name.declared",
             agent.name.declared_name.as_deref().unwrap(),
         ),
         ("agent.name.display", agent.name.display_name.as_str()),
-        ("agent.external_id", agent.external_id.as_deref().unwrap()),
         ("agent.agent_type", agent.agent_type.as_deref().unwrap()),
         ("agent.current_task", agent.current_task.as_deref().unwrap()),
         ("agent.last_message", agent.last_message.as_deref().unwrap()),
@@ -688,6 +692,10 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
         } => assert_scrubbed("event.kind", prompt),
         other => panic!("unexpected event kind {other:?}"),
     }
+    assert_eq!(
+        event.agent.external_id, None,
+        "a credential cannot remain an event correlation identity"
+    );
     for (label, value) in [
         (
             "event.agent.provider",
@@ -695,10 +703,6 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
         ),
         ("event.agent.tool", event.agent.tool.as_deref().unwrap()),
         ("event.agent.model", event.agent.model.as_deref().unwrap()),
-        (
-            "event.agent.external_id",
-            event.agent.external_id.as_deref().unwrap(),
-        ),
         ("event.dedup_key", event.dedup_key.as_str()),
     ] {
         assert_scrubbed(label, value);
@@ -715,9 +719,10 @@ fn no_secret_value_is_present_anywhere_in_the_files_on_disk() {
     assert!(!entries.is_empty());
     for entry in entries {
         assert_scrubbed("attention.summary", entry.summary.as_deref().unwrap());
-        if let Some(external_id) = entry.subject_external_id.as_deref() {
-            assert_scrubbed("attention.subject_external_id", external_id);
-        }
+        assert_eq!(
+            entry.subject_external_id, None,
+            "unsafe correlation identity must be removed, not replaced by a shared marker"
+        );
     }
 }
 
@@ -1030,7 +1035,28 @@ fn v9_physically_scrubs_all_historical_text_classes_and_reopens_cleanly() {
         let agent = node.agent.expect("the agent metadata must remain readable");
         assert_eq!(agent.tokens_used, Some(4242));
         assert_eq!(agent.cost_usd, Some(12.5));
+        assert_eq!(agent.external_id, None);
+        assert_eq!(agent.agent.external_id, None);
+        assert!(!agent.resumable);
+        let attention = store
+            .attention()
+            .list_for_session(&session_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(attention.subject_external_id, None);
         let sqlite = rusqlite::Connection::open(&path).unwrap();
+        let durable_dedup: String = sqlite
+            .query_row(
+                "SELECT dedup_key FROM attention_entries WHERE id = ?1",
+                [attention.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            durable_dedup,
+            attention.dedup_key(),
+            "removing an unsafe subject must rederive, not merely redact, correlation"
+        );
         let (sensitive, redacted): (bool, bool) = sqlite
             .query_row(
                 "SELECT contains_sensitive_data, redacted FROM activity_previews \
@@ -1099,11 +1125,41 @@ fn a_busy_wal_keeps_the_marker_and_the_next_open_retries_the_physical_purge() {
         .unwrap();
     assert!(visible.contains(HISTORICAL_SECRET));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if candidate.exists() {
+                std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+        }
+    }
+
     let error = Store::open_at(&path).expect_err("the pinned WAL must defer physical erasure");
-    assert!(matches!(
-        error,
-        turn_store::StoreError::SecurityMaintenanceIncomplete { .. }
-    ));
+    assert!(
+        matches!(
+            error,
+            turn_store::StoreError::SecurityMaintenanceIncomplete { .. }
+        ),
+        "unexpected error: {error:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            if candidate.exists() {
+                assert_eq!(
+                    std::fs::metadata(&candidate).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "a failed cleanup left {} readable by other users",
+                    candidate.display()
+                );
+            }
+        }
+    }
     drop(reader);
 
     let conn = rusqlite::Connection::open(&path).unwrap();

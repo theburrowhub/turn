@@ -147,7 +147,12 @@ pub(crate) fn replace_all_in(conn: &Connection, queue: &AttentionQueue) -> Resul
 /// Writes one demand without opening a transaction, so a caller can batch.
 fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId> {
     let mut safe = entry.clone();
-    safe.subject_external_id = safe.subject_external_id.as_deref().map(redact_secrets);
+    // Correlation identity cannot be replaced by a shared marker: two workers
+    // called `[redacted]` would become the same subject. If the id itself looks
+    // like a credential, retain only the authenticated parent/session scope.
+    safe.subject_external_id = safe
+        .subject_external_id
+        .filter(|external| redact_secrets(external) == *external);
     safe.summary = safe.summary.as_deref().map(redact_secrets);
     let key = safe.dedup_key();
 
@@ -325,6 +330,21 @@ mod tests {
         store.attention().upsert(&demand).unwrap();
         let back = store.attention().get(&demand.id).unwrap().expect("stored");
         assert_eq!(back, demand);
+    }
+
+    #[test]
+    fn a_secret_shaped_external_subject_loses_identity_instead_of_aliasing_a_worker() {
+        let store = testing::store();
+        let session = testing::saved_session_anywhere(&store, "blocked");
+        let mut demand = entry(&session.id, AwaitingReason::Permission, T0);
+        demand.parent_node_id = Some(NodeId::from_stored("proc_parent"));
+        demand.subject_external_id = Some("ghp_0123456789abcdefghijklmnopqrstuvwxyz".into());
+
+        store.attention().upsert(&demand).unwrap();
+        let back = store.attention().get(&demand.id).unwrap().expect("stored");
+        assert_eq!(back.subject_external_id, None);
+        assert_eq!(back.parent_node_id, demand.parent_node_id);
+        assert!(!back.dedup_key().contains("[redacted]"));
     }
 
     #[test]

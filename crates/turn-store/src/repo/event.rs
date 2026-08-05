@@ -17,7 +17,7 @@
 
 use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
-use crate::redact::{redact_json, redact_secrets};
+use crate::redact::{agent_ref_for_persistence, redact_json, redact_secrets};
 use rusqlite::{params, Connection, Row};
 use turn_core::event::{event_name, AgentRef, EventKind};
 use turn_core::ids::{EventId, NodeId, SessionId, WorkspaceId};
@@ -283,7 +283,10 @@ pub(crate) fn insert(conn: &Connection, event: &TurnEvent) -> Result<()> {
             // under a key called `command` or `prompt_excerpt`, which no key-name
             // rule would ever notice.
             redact_json(&json("event kind", &event.kind)?),
-            redact_json(&json("event agent", &event.agent)?),
+            redact_json(&json(
+                "event agent",
+                &agent_ref_for_persistence(&event.agent),
+            )?),
             tag("confidence", &event.confidence)?,
             redact_json(&json("event source", &event.source)?),
             tag("severity", &event.severity)?,

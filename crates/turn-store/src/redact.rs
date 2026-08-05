@@ -65,6 +65,68 @@ pub fn is_sensitive_key(key: &str) -> bool {
         .any(|fragment| upper.contains(fragment))
 }
 
+/// Whether a JSON member name gives its value an unambiguous credential role.
+///
+/// Environment variables deliberately use the broader substring matcher above:
+/// dropping one environment value is cheap and the naming conventions are
+/// uncontrolled. Generic persisted JSON is different. Adapter payloads contain
+/// legitimate fields such as `keyboard_layout` and `tokens_used`; treating the
+/// `KEY`/`TOKEN` substrings inside those words as credentials silently corrupts
+/// durable state. Here we split identifiers into words and match credential
+/// nouns or well-known compound names instead.
+fn is_sensitive_json_key(key: &str) -> bool {
+    let mut words = Vec::<String>::new();
+    let mut current = String::new();
+    let mut previous_was_lower_or_digit = false;
+
+    for character in key.chars() {
+        if !character.is_ascii_alphanumeric() {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            previous_was_lower_or_digit = false;
+            continue;
+        }
+        if character.is_ascii_uppercase() && previous_was_lower_or_digit && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        current.push(character.to_ascii_uppercase());
+        previous_was_lower_or_digit = character.is_ascii_lowercase() || character.is_ascii_digit();
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    if words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "TOKEN"
+                | "PASSWORD"
+                | "PASSWD"
+                | "SECRET"
+                | "CREDENTIAL"
+                | "CREDENTIALS"
+                | "COOKIE"
+                | "AUTHORIZATION"
+        )
+    }) {
+        return true;
+    }
+    if words.as_slice() == ["AUTH"] || words.as_slice() == ["KEY"] {
+        return true;
+    }
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0].as_str(), pair[1].as_str()),
+            ("API", "KEY")
+                | ("ACCESS", "KEY")
+                | ("PRIVATE", "KEY")
+                | ("CLIENT", "SECRET")
+                | ("AUTH", "TOKEN")
+        )
+    })
+}
+
 /// Credential shapes, as `(prefix, smallest length that is plausibly real)`.
 ///
 /// Every entry is a prefix an issuer actually assigns, which is what makes this
@@ -75,7 +137,6 @@ const SECRET_SHAPES: &[(&str, usize)] = &[
     // Anthropic, OpenAI and compatible.
     ("sk-ant-", 30),
     ("sk-proj-", 30),
-    ("sk-", 24),
     // GitHub: personal, OAuth, user-to-server, server-to-server, refresh, fine-grained.
     ("ghp_", 36),
     ("gho_", 36),
@@ -126,6 +187,20 @@ fn secret_length_at(text: &str) -> Option<usize> {
             return Some(run.len());
         }
     }
+    // Legacy OpenAI keys use the very broad `sk-` prefix. Require the rest to
+    // have the issuer's compact alphanumeric shape; otherwise ordinary paths
+    // such as `sk-build-performance-regression` would permanently fail checkout
+    // identity validation during an upgrade.
+    if let Some(body) = run.strip_prefix("sk-") {
+        let plausible_legacy_openai = run.len() >= 24
+            && body.chars().all(|c| c.is_ascii_alphanumeric())
+            && body
+                .chars()
+                .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        if plausible_legacy_openai {
+            return Some(run.len());
+        }
+    }
     is_jwt(run).then_some(run.len())
 }
 
@@ -158,7 +233,8 @@ fn is_jwt(candidate: &str) -> bool {
 /// still a leak.
 pub fn redact_secrets(text: &str) -> String {
     let without_keys = redact_pem_blocks(text);
-    let source = without_keys.as_str();
+    let without_url_credentials = redact_url_credentials(&without_keys);
+    let source = without_url_credentials.as_str();
 
     let mut out = String::with_capacity(source.len());
     let mut previous: Option<char> = None;
@@ -184,6 +260,68 @@ pub fn redact_secrets(text: &str) -> String {
         previous = Some(current);
     }
     out
+}
+
+/// Redacts generic username/password material in a URL authority.
+///
+/// Prefix scanners cannot recognise an opaque password such as `correct-horse`,
+/// but `scheme://user:password@host` gives it an unambiguous credential role.
+/// A username without `:` is retained because URLs such as `ssh://git@host` use
+/// that shape as public routing identity; recognised token shapes are still
+/// removed by the normal scanner that runs after this pass.
+fn redact_url_credentials(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut copied_through = 0usize;
+    let mut search_from = 0usize;
+
+    while let Some(relative) = text[search_from..].find("://") {
+        let marker = search_from + relative;
+        let mut scheme_start = marker;
+        while scheme_start > 0
+            && bytes[scheme_start - 1].is_ascii()
+            && (bytes[scheme_start - 1].is_ascii_alphanumeric()
+                || matches!(bytes[scheme_start - 1], b'+' | b'-' | b'.'))
+        {
+            scheme_start -= 1;
+        }
+        if scheme_start == marker || !bytes[scheme_start].is_ascii_alphabetic() {
+            search_from = marker + 3;
+            continue;
+        }
+
+        let authority_start = marker + 3;
+        let authority_end = text[authority_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (character.is_whitespace() || matches!(character, '/' | '?' | '#'))
+                    .then_some(authority_start + offset)
+            })
+            .unwrap_or(text.len());
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            let userinfo = &authority[..at];
+            let lower = userinfo.to_ascii_lowercase();
+            let has_password = userinfo.contains(':') || lower.contains("%3a");
+            let host_exists = at + 1 < authority.len();
+            if has_password && !userinfo.is_empty() && host_exists {
+                output.push_str(&text[copied_through..authority_start]);
+                output.push_str("[redacted]@");
+                copied_through = authority_start + at + 1;
+            }
+        }
+        if authority_end == text.len() {
+            break;
+        }
+        search_from = authority_end + text[authority_end..].chars().next().unwrap().len_utf8();
+    }
+
+    if copied_through == 0 {
+        text.to_string()
+    } else {
+        output.push_str(&text[copied_through..]);
+        output
+    }
 }
 
 const PEM_BEGIN: &str = "-----BEGIN";
@@ -434,15 +572,35 @@ fn redact_value(key: &str, value: &str) -> String {
 /// Redacts an ordered environment list, preserving order and keys.
 pub fn redact_pairs(env: &[(String, String)]) -> Vec<(String, String)> {
     env.iter()
-        .map(|(key, value)| (key.clone(), redact_value(key, value)))
+        .enumerate()
+        .map(|(index, (key, value))| {
+            let safe_key = if redact_secrets(key) == *key {
+                key.clone()
+            } else {
+                format!("[redacted-key-{index}]")
+            };
+            (safe_key, redact_value(key, value))
+        })
         .collect()
 }
 
 /// Redacts a keyed environment map.
 pub fn redact_map(env: &HashMap<String, String>) -> HashMap<String, String> {
-    env.iter()
-        .map(|(key, value)| (key.clone(), redact_value(key, value)))
-        .collect()
+    let mut entries = env.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    let mut safe = HashMap::with_capacity(entries.len());
+    for (index, (key, value)) in entries.into_iter().enumerate() {
+        let mut safe_key = if redact_secrets(key) == *key {
+            key.clone()
+        } else {
+            format!("[redacted-key-{index}]")
+        };
+        while safe.contains_key(&safe_key) {
+            safe_key.push('_');
+        }
+        safe.insert(safe_key, redact_value(key, value));
+    }
+    safe
 }
 
 fn redact_optional(text: &Option<String>) -> Option<String> {
@@ -578,12 +736,12 @@ pub(crate) fn activity_preview_for_persistence(preview: &ActivityPreview) -> Act
     safe
 }
 
-fn agent_ref_for_persistence(agent: &AgentRef) -> AgentRef {
+pub(crate) fn agent_ref_for_persistence(agent: &AgentRef) -> AgentRef {
     AgentRef {
         provider: redact_optional(&agent.provider),
         tool: redact_optional(&agent.tool),
         model: redact_optional(&agent.model),
-        external_id: redact_optional(&agent.external_id),
+        external_id: operational_id_for_persistence(&agent.external_id),
     }
 }
 
@@ -609,10 +767,14 @@ fn pending_permission_for_persistence(permission: &PendingPermission) -> Pending
 }
 
 pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
+    let external_id = operational_id_for_persistence(&agent.external_id);
+    let reference = agent_ref_for_persistence(&agent.agent);
+    let lost_operational_identity = agent.external_id.is_some() && external_id.is_none()
+        || agent.agent.external_id.is_some() && reference.external_id.is_none();
     AgentInfo {
-        agent: agent_ref_for_persistence(&agent.agent),
+        agent: reference,
         name: agent_name_for_persistence(&agent.name),
-        external_id: redact_optional(&agent.external_id),
+        external_id,
         agent_type: redact_optional(&agent.agent_type),
         current_task: redact_optional(&agent.current_task),
         last_message: redact_optional(&agent.last_message),
@@ -625,8 +787,17 @@ pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
         cost_usd: agent.cost_usd,
         permission_mode: redact_optional(&agent.permission_mode),
         git_branch: redact_optional(&agent.git_branch),
-        resumable: agent.resumable,
+        resumable: agent.resumable && !lost_operational_identity,
     }
+}
+
+/// Operational correlation ids are not prose. A shared `[redacted]` sentinel
+/// would alias unrelated agents and might later be handed to `--resume`; losing
+/// the capability is safer than inventing an identity.
+fn operational_id_for_persistence(id: &Option<String>) -> Option<String> {
+    id.as_ref()
+        .filter(|value| redact_secrets(value) == value.as_str())
+        .cloned()
 }
 
 /// Redacts every free-text field in every pane of a layout.
@@ -671,22 +842,21 @@ pub fn redact_json(raw: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return redact_secrets(raw);
     };
-    scrub_json(&mut value);
+    scrub_json(&mut value, false);
     serde_json::to_string(&value).unwrap_or_else(|_| redact_secrets(raw))
 }
 
 /// What to store in place of a scalar under a sensitive key, keeping its type.
 ///
-/// The scrubbed document is read back into [`turn_core::event::EventKind`], so a
-/// marker *string* written over a numeric or boolean field would make the row
-/// permanently undecodable — and the key rule is a greedy substring match, so it
-/// only takes an event field called `tokens_used` or `auth_required` for the whole
-/// event to become unreadable. A zero and a `false` say just as little about the
-/// value that was there.
+/// Only strings can carry the textual credentials this scanner recognises.
+/// Numeric counts, booleans and nulls remain exact so conservative key matching
+/// cannot corrupt legitimate typed fields such as `tokens_used`.
 fn redacted_scalar(value: &serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::Number(_) => serde_json::Value::from(0),
-        serde_json::Value::Bool(_) => serde_json::Value::Bool(false),
+        // Numeric counts and booleans cannot contain text credentials. Preserving
+        // them avoids corrupting legitimate fields such as `tokens_used` and
+        // `auth_required` merely because their names are conservative matches.
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => value.clone(),
         // An absent value has nothing to hide, and must stay absent: `null` is how
         // an optional field says it was not set.
         serde_json::Value::Null => serde_json::Value::Null,
@@ -694,29 +864,53 @@ fn redacted_scalar(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn scrub_json(value: &mut serde_json::Value) {
+fn scrub_json(value: &mut serde_json::Value, under_sensitive_key: bool) {
     match value {
         serde_json::Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                if is_sensitive_key(key) && !child.is_object() && !child.is_array() {
-                    *child = redacted_scalar(child);
+            let original = std::mem::take(map);
+            for (ordinal, (key, mut child)) in original.into_iter().enumerate() {
+                let sensitive = under_sensitive_key || is_sensitive_json_key(&key);
+                if sensitive && !child.is_object() && !child.is_array() {
+                    child = redacted_scalar(&child);
                 } else {
-                    scrub_json(child);
+                    scrub_json(&mut child, sensitive);
                 }
+                let mut safe_key = if redact_secrets(&key) == key {
+                    key
+                } else {
+                    format!("[redacted-key-{ordinal}]")
+                };
+                while map.contains_key(&safe_key) {
+                    safe_key.push('_');
+                }
+                map.insert(safe_key, child);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items.iter_mut() {
-                scrub_json(item);
+                if under_sensitive_key && !item.is_object() && !item.is_array() {
+                    *item = redacted_scalar(item);
+                } else {
+                    scrub_json(item, under_sensitive_key);
+                }
             }
         }
         // Every string value, whatever it is called. This is the arm that catches
         // a bearer token inside a `command`.
         serde_json::Value::String(text) => {
-            let scanned = redact_secrets(text);
-            if scanned != *text {
-                *text = scanned;
+            if under_sensitive_key {
+                *text = REDACTED.to_string();
+            } else {
+                let scanned = redact_secrets(text);
+                if scanned != *text {
+                    *text = scanned;
+                }
             }
+        }
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) | serde_json::Value::Null
+            if under_sensitive_key =>
+        {
+            *value = redacted_scalar(value);
         }
         _ => {}
     }
@@ -780,6 +974,25 @@ mod tests {
         assert_eq!(safe[1].0, "GITHUB_TOKEN");
         assert_eq!(safe[1].1, REDACTED);
         assert_eq!(safe[2].1, "xterm");
+    }
+
+    #[test]
+    fn redacting_a_secret_shaped_map_key_never_overwrites_an_existing_entry() {
+        let env = HashMap::from([
+            ("[redacted-key-1]".to_string(), "existing".to_string()),
+            (
+                "ghp_0123456789abcdefghijklmnopqrstuvwxyz".to_string(),
+                "credential-named entry".to_string(),
+            ),
+        ]);
+
+        let safe = redact_map(&env);
+        assert_eq!(safe.len(), 2);
+        assert_eq!(safe["[redacted-key-1]"], REDACTED);
+        assert!(safe.values().any(|value| value == "credential-named entry"));
+        assert!(safe
+            .keys()
+            .all(|key| !key.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyz")));
     }
 
     #[test]
@@ -1073,6 +1286,12 @@ mod tests {
     }
 
     #[test]
+    fn an_sk_prefixed_checkout_name_is_not_mistaken_for_a_legacy_openai_key() {
+        let path = "/repo/sk-build-performance-regression";
+        assert_eq!(redact_secrets(path), path);
+    }
+
+    #[test]
     fn a_token_inside_an_otherwise_innocent_environment_value_is_caught() {
         let env = vec![(
             "NPM_CONFIG_REGISTRY".to_string(),
@@ -1092,21 +1311,26 @@ mod tests {
     /// *string* would leave the row undecodable for good, which loses the event
     /// entirely rather than one field of it.
     #[test]
-    fn redacting_a_scalar_keeps_its_json_type_so_the_row_stays_readable() {
-        let raw = r#"{"tokens_used":4096,"auth_required":true,"api_key":null,
-                      "secret_note":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}"#;
+    fn redacting_sensitive_json_preserves_non_text_counts_and_flags() {
+        let raw = r#"{"tokens_used":4096,"auth_required":true,"keyboard_layout":"dvorak",
+                      "api_key":null,"secret_note":"ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}"#;
         let safe = redact_json(raw);
         let value: serde_json::Value = serde_json::from_str(&safe).expect("still JSON");
 
         assert_eq!(
             value["tokens_used"],
-            serde_json::json!(0),
-            "a number must stay a number: {safe}"
+            serde_json::json!(4096),
+            "a numeric count contains no text credential: {safe}"
         );
         assert_eq!(
             value["auth_required"],
-            serde_json::json!(false),
-            "a boolean must stay a boolean: {safe}"
+            serde_json::json!(true),
+            "a boolean contains no text credential: {safe}"
+        );
+        assert_eq!(
+            value["keyboard_layout"],
+            serde_json::json!("dvorak"),
+            "a word containing `key` is not automatically a credential role: {safe}"
         );
         assert!(
             value["api_key"].is_null(),
@@ -1116,12 +1340,39 @@ mod tests {
     }
 
     #[test]
-    fn a_sensitive_key_holding_an_object_is_walked_rather_than_flattened() {
-        // "auth" is sensitive, but blanking the whole object would throw away
-        // the structure a bad adapter has to be debugged from.
-        let raw = r#"{"auth":{"scheme":"bearer","token":"t0ps3cret"}}"#;
+    fn a_sensitive_container_keeps_its_shape_and_redacts_every_text_leaf() {
+        let raw = r#"{"auth":{"scheme":"bearer","value":"opaque-password","flags":[true,7]}}"#;
         let safe = redact_json(raw);
-        assert!(!safe.contains("t0ps3cret"), "got {safe}");
-        assert!(safe.contains("bearer"), "got {safe}");
+        assert!(!safe.contains("opaque-password"), "got {safe}");
+        let value: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(value["auth"]["scheme"], REDACTED);
+        assert_eq!(value["auth"]["value"], REDACTED);
+        assert_eq!(value["auth"]["flags"], serde_json::json!([true, 7]));
+    }
+
+    #[test]
+    fn url_userinfo_is_redacted_even_when_the_password_has_no_known_prefix() {
+        let input =
+            "fetch https://alice:opaque-password@example.test/api then ssh://git@example.test/repo";
+        let safe = redact_secrets(input);
+        assert_eq!(
+            safe,
+            "fetch https://[redacted]@example.test/api then ssh://git@example.test/repo"
+        );
+    }
+
+    #[test]
+    fn redacting_an_external_id_revokes_resume_instead_of_minting_a_shared_identity() {
+        let mut agent = AgentInfo {
+            external_id: Some("ghp_0123456789abcdefghijklmnopqrstuvwxyz".into()),
+            ..AgentInfo::default()
+        };
+        agent.agent.external_id = agent.external_id.clone();
+        agent.resumable = true;
+
+        let safe = agent_info_for_persistence(&agent);
+        assert_eq!(safe.external_id, None);
+        assert_eq!(safe.agent.external_id, None);
+        assert!(!safe.resumable);
     }
 }

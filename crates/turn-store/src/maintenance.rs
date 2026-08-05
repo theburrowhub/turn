@@ -9,11 +9,13 @@
 
 use crate::error::{Result, StoreError};
 use crate::redact::{
-    activity_preview_for_persistence, agent_info_for_persistence, redact_json, redact_layout,
-    redact_pairs, redact_secrets,
+    activity_preview_for_persistence, agent_info_for_persistence, agent_ref_for_persistence,
+    redact_json, redact_layout, redact_pairs, redact_secrets,
 };
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
+use turn_core::attention::AttentionQueue;
+use turn_core::event::AgentRef;
 use turn_core::model::{ActivityPreview, AgentInfo, Layout};
 
 pub(crate) const LEGACY_FREE_TEXT_PURGE_MARKER: &str = "security.legacy_free_text_purge_pending";
@@ -26,9 +28,12 @@ enum RedactionKind {
     Environment,
     Layout,
     AgentInfo,
+    AgentRef,
     ActivityPreview,
     PreviewText,
     AttentionDedup,
+    NullableOperationalId,
+    SettingsKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -95,7 +100,11 @@ const REDACTABLE_COLUMNS: &[RedactableColumn] = &[
     RedactableColumn::new("process_nodes", "lifecycle_json", RedactionKind::Json),
     RedactableColumn::new("process_nodes", "turn_json", RedactionKind::Json),
     RedactableColumn::new("process_nodes", "agent_json", RedactionKind::AgentInfo),
-    RedactableColumn::new("process_nodes", "external_id", RedactionKind::Scalar),
+    RedactableColumn::new(
+        "process_nodes",
+        "external_id",
+        RedactionKind::NullableOperationalId,
+    ),
     RedactableColumn::new("process_nodes", "env_highlights_json", RedactionKind::Json),
     RedactableColumn::new("process_nodes", "declared_name", RedactionKind::Scalar),
     RedactableColumn::new("process_nodes", "display_name", RedactionKind::Scalar),
@@ -114,15 +123,16 @@ const REDACTABLE_COLUMNS: &[RedactableColumn] = &[
     RedactableColumn::new("templates", "hotkey", RedactionKind::Scalar),
     RedactableColumn::new("templates", "env_json", RedactionKind::Environment),
     RedactableColumn::new("events", "kind_json", RedactionKind::Json),
-    RedactableColumn::new("events", "agent_json", RedactionKind::Json),
+    RedactableColumn::new("events", "agent_json", RedactionKind::AgentRef),
     RedactableColumn::new("events", "source_json", RedactionKind::Json),
     RedactableColumn::new("events", "dedup_key", RedactionKind::Scalar),
     RedactableColumn::new("events", "raw", RedactionKind::Json),
     RedactableColumn::new("settings", "value_json", RedactionKind::Json),
+    RedactableColumn::new("settings", "key", RedactionKind::SettingsKey),
     RedactableColumn::new(
         "attention_entries",
         "subject_external_id",
-        RedactionKind::Scalar,
+        RedactionKind::NullableOperationalId,
     ),
     RedactableColumn::new("attention_entries", "summary", RedactionKind::Scalar),
     RedactableColumn::new("attention_entries", "state_json", RedactionKind::Json),
@@ -195,7 +205,6 @@ const INVARIANT_COLUMNS: &[InvariantColumn] = &[
     InvariantColumn::new("events", "kind_slug", "event kind"),
     InvariantColumn::new("events", "confidence", "event confidence"),
     InvariantColumn::new("events", "severity", "event severity"),
-    InvariantColumn::new("settings", "key", "setting key"),
     InvariantColumn::new("attention_entries", "id", "Attention id"),
     InvariantColumn::new("attention_entries", "session_id", "Session id"),
     InvariantColumn::new("attention_entries", "node_id", "Process Node id"),
@@ -264,6 +273,15 @@ pub(crate) fn run(conn: &Connection, physical: bool) -> Result<()> {
         return Ok(());
     }
 
+    run_pending(conn, physical).map_err(as_maintenance_failure)
+}
+
+fn run_pending(conn: &Connection, physical: bool) -> Result<()> {
+    if physical {
+        require_wal(conn)?;
+        set_locking_mode(conn, "EXCLUSIVE")?;
+    }
+
     // Makes subsequent UPDATE/DELETE operations overwrite freed cells where the
     // current SQLite backend supports it. VACUUM remains necessary for bytes
     // already stranded by an older process.
@@ -280,6 +298,61 @@ pub(crate) fn run(conn: &Connection, physical: bool) -> Result<()> {
         "DELETE FROM settings WHERE key IN (?1, ?2)",
         params![LEGACY_HOOK_PURGE_MARKER, LEGACY_FREE_TEXT_PURGE_MARKER],
     )?;
+    if physical {
+        checkpoint_truncate(conn)?;
+        set_locking_mode(conn, "NORMAL")?;
+    }
+    Ok(())
+}
+
+fn as_maintenance_failure(error: StoreError) -> StoreError {
+    match error {
+        StoreError::Sqlite(ref sqlite) if sqlite_is_busy(sqlite) => {
+            StoreError::SecurityMaintenanceIncomplete {
+                reason: format!("SQLite could not obtain the cleanup lock: {sqlite}"),
+            }
+        }
+        other => other,
+    }
+}
+
+fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn require_wal(conn: &Connection) -> Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::SecurityMaintenanceIncomplete {
+            reason: format!(
+                "physical credential erasure requires WAL mode; SQLite reported {mode}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Retains SQLite's own exclusive lock across the scrub transaction, checkpoints,
+/// VACUUM and marker deletion. The daemon lock excludes current Turn processes;
+/// this closes the gap for an older/cooperating SQLite writer that does not know
+/// that lock file yet.
+fn set_locking_mode(conn: &Connection, requested: &str) -> Result<()> {
+    let sql = format!("PRAGMA locking_mode = {requested}");
+    let actual: String = conn.query_row(&sql, [], |row| row.get(0))?;
+    if !actual.eq_ignore_ascii_case(requested) {
+        return Err(StoreError::SecurityMaintenanceIncomplete {
+            reason: format!(
+                "SQLite refused {requested} locking mode during credential cleanup (reported {actual})"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -308,151 +381,272 @@ fn checkpoint_truncate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn redact_rows_transactionally(conn: &Connection) -> Result<()> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+fn redact_rows_transactionally(conn: &Connection) -> Result<bool> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
     validate_schema_coverage(&tx)?;
     validate_invariants(&tx)?;
+    let mut changed = false;
     for spec in REDACTABLE_COLUMNS {
-        redact_column(&tx, *spec)?;
+        changed |= redact_column(&tx, *spec)?;
     }
+    changed |= reconcile_attention_entries(&tx)?;
     tx.commit()?;
-    Ok(())
+    Ok(changed)
+}
+
+/// Re-derives durable attention correlation after an unsafe legacy external id
+/// has been removed.
+///
+/// Redacting `subject_external_id` to NULL is intentionally lossy: replacing it
+/// with a shared marker would alias unrelated workers. The separately stored
+/// `dedup_key` must then be rebuilt from the surviving authenticated
+/// session/parent/node scope. We fail the whole transaction if two entries would
+/// collapse, preserving both rows for explicit reconciliation instead of
+/// silently deleting one demand.
+fn reconcile_attention_entries(tx: &Transaction<'_>) -> Result<bool> {
+    let repo = crate::repo::AttentionRepo::new(tx);
+    let entries = repo.list()?;
+    if entries.is_empty() {
+        return Ok(false);
+    }
+
+    let mut safe_queue = AttentionQueue::new();
+    let mut derived_keys = BTreeMap::<String, String>::new();
+    let mut changed = false;
+    for mut entry in entries {
+        let original_external = entry.subject_external_id.clone();
+        entry.subject_external_id = entry
+            .subject_external_id
+            .filter(|external| redact_secrets(external) == *external);
+        entry.summary = entry.summary.as_deref().map(redact_secrets);
+        changed |= entry.subject_external_id != original_external;
+
+        let derived = entry.dedup_key();
+        let stored: String = tx.query_row(
+            "SELECT dedup_key FROM attention_entries WHERE id = ?1",
+            params![entry.id.as_str()],
+            |row| row.get(0),
+        )?;
+        changed |= stored != derived;
+        if let Some(previous) = derived_keys.insert(derived.clone(), entry.id.to_string()) {
+            return Err(StoreError::SecurityMaintenanceIncomplete {
+                reason: format!(
+                    "removing unsafe attention identities would alias entries {previous} and {}",
+                    entry.id
+                ),
+            });
+        }
+        safe_queue.upsert(entry);
+    }
+
+    if changed {
+        crate::repo::attention::replace_all_in(tx, &safe_queue)?;
+    }
+    Ok(changed)
 }
 
 fn validate_invariants(tx: &Transaction<'_>) -> Result<()> {
     for spec in INVARIANT_COLUMNS {
-        for (rowid, value) in text_rows(tx, spec.table, spec.column)? {
-            if redact_secrets(&value) != value {
-                return Err(StoreError::SecretInStructuralField {
-                    what: spec.description,
-                    owner_id: format!("{}.{} row {rowid}", spec.table, spec.column),
-                });
+        let mut after = i64::MIN;
+        loop {
+            let rows = text_rows_after(tx, spec.table, spec.column, after)?;
+            if rows.is_empty() {
+                break;
             }
-        }
-    }
-    Ok(())
-}
-
-fn redact_column(tx: &Transaction<'_>, spec: RedactableColumn) -> Result<()> {
-    let rows = text_rows(tx, spec.table, spec.column)?;
-    let mut updates = Vec::new();
-    let mut attention_keys = BTreeMap::new();
-    for (rowid, raw) in rows {
-        let safe = safe_value(spec.kind, &raw)?;
-        if spec.kind == RedactionKind::AttentionDedup {
-            if let Some(previous) = attention_keys.insert(safe.clone(), rowid) {
-                if previous != rowid {
-                    return Err(StoreError::SecurityMaintenanceIncomplete {
-                        reason: format!(
-                            "redacting attention correlation keys would alias rows {previous} and {rowid}"
-                        ),
+            after = rows.last().unwrap().0;
+            for (rowid, value) in rows {
+                if redact_secrets(&value) != value {
+                    return Err(StoreError::SecretInStructuralField {
+                        what: spec.description,
+                        owner_id: format!("{}.{} row {rowid}", spec.table, spec.column),
                     });
                 }
             }
         }
-        if safe != raw {
-            updates.push((rowid, safe));
-        }
-    }
-
-    if updates.is_empty() {
-        return Ok(());
-    }
-
-    let table = quote_identifier(spec.table);
-    let column = quote_identifier(spec.column);
-    let sql = if spec.kind == RedactionKind::PreviewText {
-        format!(
-            "UPDATE {table} SET {column} = ?1, contains_sensitive_data = 1, redacted = 1 WHERE rowid = ?2"
-        )
-    } else {
-        format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2")
-    };
-    let mut statement = tx.prepare(&sql)?;
-    for (rowid, safe) in updates {
-        statement.execute(params![safe, rowid])?;
     }
     Ok(())
 }
 
+fn redact_column(tx: &Transaction<'_>, spec: RedactableColumn) -> Result<bool> {
+    let mut attention_keys = BTreeMap::new();
+    let table = quote_identifier(spec.table);
+    let column = quote_identifier(spec.column);
+    let sql = match spec.kind {
+        RedactionKind::PreviewText => format!(
+            "UPDATE {table} SET {column} = ?1, contains_sensitive_data = 1, redacted = 1 WHERE rowid = ?2"
+        ),
+        RedactionKind::NullableOperationalId => {
+            format!("UPDATE {table} SET {column} = NULL WHERE rowid = ?1")
+        }
+        RedactionKind::SettingsKey => format!("DELETE FROM {table} WHERE rowid = ?1"),
+        _ => format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2"),
+    };
+    let mut statement = tx.prepare(&sql)?;
+    let mut changed = false;
+    let mut after = i64::MIN;
+    loop {
+        let rows = text_rows_after(tx, spec.table, spec.column, after)?;
+        if rows.is_empty() {
+            break;
+        }
+        after = rows.last().unwrap().0;
+        for (rowid, raw) in rows {
+            let safe = safe_value(spec.kind, &raw)?;
+            if spec.kind == RedactionKind::AttentionDedup {
+                if let Some(previous) = attention_keys.insert(safe.clone(), rowid) {
+                    if previous != rowid {
+                        return Err(StoreError::SecurityMaintenanceIncomplete {
+                            reason: format!(
+                                "redacting attention correlation keys would alias rows {previous} and {rowid}"
+                            ),
+                        });
+                    }
+                }
+            }
+            if safe != raw {
+                changed = true;
+                if matches!(
+                    spec.kind,
+                    RedactionKind::NullableOperationalId | RedactionKind::SettingsKey
+                ) {
+                    statement.execute(params![rowid])?;
+                } else {
+                    statement.execute(params![safe, rowid])?;
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
 fn safe_value(kind: RedactionKind, raw: &str) -> Result<String> {
     match kind {
-        RedactionKind::Scalar | RedactionKind::PreviewText | RedactionKind::AttentionDedup => {
-            Ok(redact_secrets(raw))
-        }
+        RedactionKind::Scalar
+        | RedactionKind::PreviewText
+        | RedactionKind::AttentionDedup
+        | RedactionKind::NullableOperationalId
+        | RedactionKind::SettingsKey => Ok(redact_secrets(raw)),
         RedactionKind::Json => Ok(redact_json_preserving_representation(raw)),
         RedactionKind::Environment => redact_environment(raw),
         RedactionKind::Layout => redact_stored_layout(raw),
         RedactionKind::AgentInfo => redact_agent_info(raw),
+        RedactionKind::AgentRef => redact_agent_ref(raw),
         RedactionKind::ActivityPreview => redact_activity_preview(raw),
     }
 }
 
 fn redact_json_preserving_representation(raw: &str) -> String {
-    let safe = redact_json(raw);
-    match (
-        serde_json::from_str::<serde_json::Value>(raw),
-        serde_json::from_str::<serde_json::Value>(&safe),
-    ) {
-        (Ok(before), Ok(after)) if before == after => raw.to_string(),
-        _ => safe,
-    }
+    // Always return the scanned/canonical representation. Semantic equality is
+    // not byte safety: JSON permits duplicate member names, while serde keeps
+    // only the last. `{"token":"secret","token":"[redacted]"}` would compare
+    // equal before/after and preserve the hidden first member verbatim.
+    redact_json(raw)
 }
 
 fn redact_environment(raw: &str) -> Result<String> {
+    let generic = redact_json_preserving_representation(raw);
     let Ok(environment) = serde_json::from_str::<Vec<(String, String)>>(raw) else {
-        return Ok(redact_json_preserving_representation(raw));
+        return Ok(generic);
     };
     let safe = redact_pairs(&environment);
-    if safe == environment {
-        return Ok(raw.to_string());
-    }
-    serde_json::to_string(&safe).map_err(|cause| StoreError::encode("legacy environment", cause))
+    merge_typed_projection(&generic, &safe, "legacy environment")
 }
 
 fn redact_stored_layout(raw: &str) -> Result<String> {
+    let generic = redact_json_preserving_representation(raw);
     let Ok(layout) = serde_json::from_str::<Layout>(raw) else {
-        return Ok(redact_json_preserving_representation(raw));
+        return Ok(generic);
     };
     let safe = redact_layout(&layout);
-    if safe == layout {
-        return Ok(raw.to_string());
-    }
-    serde_json::to_string(&safe).map_err(|cause| StoreError::encode("legacy layout", cause))
+    merge_typed_projection(&generic, &safe, "legacy layout")
 }
 
 fn redact_agent_info(raw: &str) -> Result<String> {
+    let generic = redact_json_preserving_representation(raw);
     let Ok(agent) = serde_json::from_str::<AgentInfo>(raw) else {
-        return Ok(redact_json_preserving_representation(raw));
+        return Ok(generic);
     };
     let safe = agent_info_for_persistence(&agent);
-    if safe == agent {
-        return Ok(raw.to_string());
-    }
-    serde_json::to_string(&safe).map_err(|cause| StoreError::encode("legacy agent info", cause))
+    merge_typed_projection(&generic, &safe, "legacy agent info")
+}
+
+fn redact_agent_ref(raw: &str) -> Result<String> {
+    let generic = redact_json_preserving_representation(raw);
+    let Ok(agent) = serde_json::from_str::<AgentRef>(raw) else {
+        return Ok(generic);
+    };
+    let safe = agent_ref_for_persistence(&agent);
+    merge_typed_projection(&generic, &safe, "legacy agent reference")
 }
 
 fn redact_activity_preview(raw: &str) -> Result<String> {
+    let generic = redact_json_preserving_representation(raw);
     let Ok(preview) = serde_json::from_str::<ActivityPreview>(raw) else {
-        return Ok(redact_json_preserving_representation(raw));
+        return Ok(generic);
     };
     let safe = activity_preview_for_persistence(&preview);
-    if safe == preview {
-        return Ok(raw.to_string());
-    }
-    serde_json::to_string(&safe)
-        .map_err(|cause| StoreError::encode("legacy activity preview", cause))
+    merge_typed_projection(&generic, &safe, "legacy activity preview")
 }
 
-fn text_rows(conn: &Connection, table: &str, column: &str) -> Result<Vec<(i64, String)>> {
+/// Applies the known typed redaction without throwing away fields written by a
+/// newer/older adapter. The generic pass has already scrubbed every unknown key
+/// and value; recursive overlay restores the correctly typed known fields (for
+/// example `tokens_used`) and applies specialised env/preview rules.
+fn merge_typed_projection<T: serde::Serialize>(
+    generic: &str,
+    safe: &T,
+    what: &'static str,
+) -> Result<String> {
+    let mut target = serde_json::from_str::<serde_json::Value>(generic)
+        .map_err(|cause| StoreError::encode(what, cause))?;
+    let known = serde_json::to_value(safe).map_err(|cause| StoreError::encode(what, cause))?;
+    overlay_known(&mut target, &known);
+    serde_json::to_string(&target).map_err(|cause| StoreError::encode(what, cause))
+}
+
+fn overlay_known(target: &mut serde_json::Value, known: &serde_json::Value) {
+    match (target, known) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(known)) => {
+            for (key, known_value) in known {
+                match target.get_mut(key) {
+                    Some(target_value) => overlay_known(target_value, known_value),
+                    None => {
+                        target.insert(key.clone(), known_value.clone());
+                    }
+                }
+            }
+        }
+        (serde_json::Value::Array(target), serde_json::Value::Array(known)) => {
+            for (index, known_value) in known.iter().enumerate() {
+                match target.get_mut(index) {
+                    Some(target_value) => overlay_known(target_value, known_value),
+                    None => target.push(known_value.clone()),
+                }
+            }
+        }
+        (target, known) => *target = known.clone(),
+    }
+}
+
+const MAINTENANCE_BATCH_ROWS: i64 = 256;
+
+fn text_rows_after(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    after: i64,
+) -> Result<Vec<(i64, String)>> {
     let sql = format!(
-        "SELECT rowid, {} FROM {} WHERE {} IS NOT NULL",
+        "SELECT rowid, {} FROM {} WHERE {} IS NOT NULL AND rowid > ?1 \
+         ORDER BY rowid LIMIT ?2",
         quote_identifier(column),
         quote_identifier(table),
         quote_identifier(column),
     );
     let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = statement.query_map(params![after, MAINTENANCE_BATCH_ROWS], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -529,6 +723,84 @@ mod tests {
         let conn = legacy_connection();
         migrations::apply(&conn).unwrap();
         validate_schema_coverage(&conn).unwrap();
+    }
+
+    #[test]
+    fn duplicate_json_keys_cannot_hide_a_secret_from_the_legacy_scrub() {
+        let raw = format!(r#"{{"token":"{SECRET}","token":"[redacted]"}}"#);
+        let safe = safe_value(RedactionKind::Json, &raw).unwrap();
+        assert!(!safe.contains(SECRET), "hidden duplicate survived: {safe}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&safe).unwrap()["token"],
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn typed_documents_keep_unknown_fields_but_never_their_credentials() {
+        let node = turn_core::ids::NodeId::from_stored("proc_legacy_typed");
+        let documents = [
+            (
+                RedactionKind::Layout,
+                serde_json::to_value(Layout::single(turn_core::model::Pane::new(
+                    turn_core::model::PaneKind::Agent,
+                )))
+                .unwrap(),
+            ),
+            (
+                RedactionKind::AgentInfo,
+                serde_json::to_value(AgentInfo::default()).unwrap(),
+            ),
+            (
+                RedactionKind::ActivityPreview,
+                serde_json::to_value(ActivityPreview {
+                    node_id: node,
+                    raw_source_sequence: None,
+                    normalized_text: "working".into(),
+                    source: turn_core::model::PreviewSource::AdapterState,
+                    confidence: turn_core::Confidence::Integrated,
+                    stable: true,
+                    contains_sensitive_data: false,
+                    redacted: false,
+                    updated_ms: 1,
+                })
+                .unwrap(),
+            ),
+        ];
+        for (kind, mut value) in documents {
+            value.as_object_mut().unwrap().insert(
+                "plugin_secret".into(),
+                serde_json::Value::String(SECRET.into()),
+            );
+            let safe = safe_value(kind, &value.to_string()).unwrap();
+            assert!(!safe.contains(SECRET), "{kind:?} leaked: {safe}");
+            let reparsed: serde_json::Value = serde_json::from_str(&safe).unwrap();
+            assert_eq!(
+                reparsed["plugin_secret"], "[redacted]",
+                "unknown metadata was dropped instead of retained"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_credential_used_as_a_setting_name_is_deleted_without_aliasing_preferences() {
+        let conn = legacy_connection();
+        conn.execute(
+            "INSERT INTO settings (key, value_json, updated_ms) VALUES (?1, '\"value\"', 1)",
+            [SECRET],
+        )
+        .unwrap();
+        migrations::apply(&conn).unwrap();
+
+        redact_rows_transactionally(&conn).unwrap();
+        let present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key = ?1)",
+                [SECRET],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!present, "an unsafe preference identity cannot be retained");
     }
 
     #[test]
@@ -662,5 +934,33 @@ mod tests {
         };
         assert_eq!(ids, vec!["att_first", "att_second"]);
         assert!(purge_pending(&conn).unwrap());
+    }
+
+    #[test]
+    fn exclusive_locking_survives_the_scrub_commit_until_physical_cleanup_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("maintenance-lock.db");
+        let owner = Connection::open(&path).unwrap();
+        owner
+            .execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE proof (value TEXT NOT NULL);")
+            .unwrap();
+        let contender = Connection::open(&path).unwrap();
+        contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        set_locking_mode(&owner, "EXCLUSIVE").unwrap();
+        let transaction =
+            Transaction::new_unchecked(&owner, TransactionBehavior::Exclusive).unwrap();
+        transaction
+            .execute("INSERT INTO proof (value) VALUES ('scrubbed')", [])
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let error = contender
+            .execute("INSERT INTO proof (value) VALUES ('racing writer')", [])
+            .expect_err("the physical phase must retain ownership after COMMIT");
+        assert!(
+            sqlite_is_busy(&error),
+            "the competing writer failed for an unexpected reason: {error:?}"
+        );
     }
 }

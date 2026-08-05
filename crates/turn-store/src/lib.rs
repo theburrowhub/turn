@@ -116,21 +116,28 @@ impl Store {
                 location::ensure_dir(parent)?;
             }
         }
+        // Legacy files may already contain the very credentials preparation is
+        // about to scrub. Narrow the database and existing sidecars before even
+        // opening SQLite, so a failed migration/busy WAL cannot return while
+        // leaving those bytes world-readable.
+        for file in Self::files_for_path(&path) {
+            if file.exists() {
+                location::restrict_to_owner(&file, 0o600)?;
+            }
+        }
         let conn = Connection::open(&path)?;
         let store = Self {
             conn,
             path: Some(path.clone()),
         };
+        // `Connection::open` may just have created the main file.
+        store.restrict_files()?;
         store.prepare()?;
         // After `prepare`, because enabling WAL is what creates the sidecar files.
         // All three carry the same data and so deserve the same permissions: the
         // write-ahead log holds recent rows that have not been checkpointed yet, so
         // leaving it at 0644 would defeat narrowing the database itself.
-        for file in store.files() {
-            if file.exists() {
-                location::restrict_to_owner(&file, 0o600)?;
-            }
-        }
+        store.restrict_files()?;
         Ok(store)
     }
 
@@ -139,13 +146,26 @@ impl Store {
         let Some(path) = &self.path else {
             return Vec::new();
         };
-        let mut out = vec![path.clone()];
-        for suffix in ["-wal", "-shm"] {
-            let mut sidecar = path.clone().into_os_string();
+        Self::files_for_path(path)
+    }
+
+    fn files_for_path(path: &Path) -> Vec<PathBuf> {
+        let mut out = vec![path.to_path_buf()];
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = path.as_os_str().to_os_string();
             sidecar.push(suffix);
             out.push(PathBuf::from(sidecar));
         }
         out
+    }
+
+    fn restrict_files(&self) -> Result<()> {
+        for file in self.files() {
+            if file.exists() {
+                location::restrict_to_owner(&file, 0o600)?;
+            }
+        }
+        Ok(())
     }
 
     /// An anonymous in-memory database. For tests, and for a `--no-persist` run.
@@ -188,6 +208,9 @@ impl Store {
                     "the database rejected write-ahead logging; falling back"
                 );
             }
+            // WAL/SHM may have been created by the mode switch. Protect them
+            // before migrations or security maintenance can fail.
+            self.restrict_files()?;
         }
         let applied = migrations::apply(&self.conn)?;
         // SQL migrations can mark a physical purge as required, but VACUUM may
