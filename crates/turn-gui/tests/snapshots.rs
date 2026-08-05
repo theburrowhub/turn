@@ -42,8 +42,8 @@ use turn_gui::keymap::{Keymap, Overrides, Platform};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    Overview, PaneContent, PendingPermission, QueueItem, SessionRow, TemporaryPaneContent,
-    TurnView, ViewState,
+    PaneContent, PendingPermission, QueueItem, SessionRow, TemporaryPaneContent, TurnView,
+    ViewState,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -123,13 +123,11 @@ impl Fixture {
             layout: self.layout.clone(),
             panes,
             temporary_pane,
-            overview_screens: Vec::new(),
             permission: self.permission.clone(),
             queue: self.queue.clone(),
             connection: self.connection.clone(),
             notice: self.notice.clone(),
             write_conflict: self.write_conflict.as_ref(),
-            overview: Overview::default(),
             policy: None,
             now_ms: cursor_on(),
         }

@@ -280,14 +280,6 @@ impl PaneFeed {
         self.view.as_ref()
     }
 
-    /// The live screen, whatever the viewport is doing.
-    ///
-    /// What a thumbnail wants: the overview should show what a session is doing now,
-    /// not where somebody left a scrollbar.
-    pub fn live_screen(&self) -> &Grid {
-        &self.screen
-    }
-
     /// Builds the scrolled viewport: `offset` rows of history, then the top of the
     /// live screen.
     fn build_view(&self) -> Grid {
@@ -628,7 +620,7 @@ mod tests {
         );
         assert_eq!(feed.history_rows(), 1);
 
-        let mut tui = feed.live_screen().clone();
+        let mut tui = feed.screen.clone();
         tui.alternate_screen = true;
         assert_eq!(feed.apply(2, &ScreenUpdate::full(tui.clone())), Ok(()));
 
@@ -724,25 +716,6 @@ mod tests {
         assert!(
             !feed.scroll_by(500),
             "and it does not keep reporting a move"
-        );
-    }
-
-    /// The live screen is what a thumbnail wants, whatever the user has done with the
-    /// scrollbar.
-    #[test]
-    fn the_live_screen_is_available_regardless_of_where_the_viewport_is() {
-        let start = screen(&["l0", "l1", "l2", "l3"], 4, 8);
-        let mut feed = PaneFeed::attach(&attachment(Some(start.clone()), 1));
-        assert_eq!(
-            feed.apply(1, &ScreenUpdate::full(scrolled(&start, "l4"))),
-            Ok(())
-        );
-        assert!(feed.scroll_by(1));
-        assert_eq!(feed.grid().row_text(0), "l0", "the viewport is in the past");
-        assert_eq!(
-            feed.live_screen().row_text(0),
-            "l1",
-            "the overview must show what the session is doing now"
         );
     }
 

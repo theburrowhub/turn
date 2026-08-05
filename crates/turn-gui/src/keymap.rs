@@ -72,7 +72,6 @@ pub enum Command {
     InterruptProcess,
     StopProcess,
 
-    ToggleSessionOverview,
     ToggleAgentTree,
     ToggleEventLog,
 
@@ -110,7 +109,6 @@ impl Command {
         Command::CloseSession,
         Command::InterruptProcess,
         Command::StopProcess,
-        Command::ToggleSessionOverview,
         Command::ToggleAgentTree,
         Command::ToggleEventLog,
         Command::CopySelection,
@@ -151,7 +149,6 @@ impl Command {
             Command::LaunchTui => "launch.tui",
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
-            Command::ToggleSessionOverview => "view.overview",
             Command::ToggleAgentTree => "view.agentTree",
             Command::ToggleEventLog => "view.eventLog",
             Command::CopySelection => "edit.copy",
@@ -191,7 +188,6 @@ impl Command {
             Command::LaunchTui => "Launch a full-screen tool in this pane",
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
-            Command::ToggleSessionOverview => "Session overview",
             Command::ToggleAgentTree => "Show or hide the agent tree",
             Command::ToggleEventLog => "Show or hide the event log",
             Command::CopySelection => "Copy the selection",
@@ -205,7 +201,6 @@ impl Command {
             Command::OpenPalette
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
-            | Command::ToggleSessionOverview
             | Command::ToggleAgentTree
             | Command::ToggleEventLog => "View",
             Command::NewSession
@@ -623,7 +618,6 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     // interrupt through the tty to the whole foreground group.
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
     shared(Command::StopProcess, Chord::cmd_shift(Key::Comma)),
-    shared(Command::ToggleSessionOverview, Chord::cmd_shift(Key::G)),
     shared(Command::ToggleAgentTree, Chord::cmd_shift(Key::T)),
     shared(Command::ToggleEventLog, Chord::cmd_shift(Key::E)),
     // Copy and paste: `Mod+C` is Command+C on a Mac, which no program sees, but
@@ -912,6 +906,33 @@ mod tests {
             assert!(command.title().len() > 3, "{command:?} has no description");
             assert!(!command.group().is_empty());
             assert_eq!(Command::from_id(command.id()), Some(*command));
+        }
+    }
+
+    #[test]
+    fn the_removed_session_overview_has_no_command_palette_or_shortcut_entry() {
+        assert!(Command::from_id("view.overview").is_none());
+        assert!(Command::ALL
+            .iter()
+            .all(|command| command.id() != "view.overview"));
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            let modifiers = if platform.uses_command_key {
+                Modifiers {
+                    mac_cmd: true,
+                    command: true,
+                    shift: true,
+                    ..Modifiers::default()
+                }
+            } else {
+                Modifiers {
+                    ctrl: true,
+                    command: true,
+                    shift: true,
+                    ..Modifiers::default()
+                }
+            };
+            assert_eq!(keymap.resolve(Key::G, &modifiers, false), None);
         }
     }
 

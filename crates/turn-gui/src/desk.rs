@@ -41,8 +41,8 @@ use crate::terminal::feed::{Desync, PaneFeed};
 use crate::terminal::PaneAction;
 use crate::transport::{Ask, ConnectionState, Inbound};
 use crate::view::{
-    HierarchyAction, Overview, PaneContent, PendingPermission, QueueItem, SessionRow,
-    TemporaryPaneContent, TurnView, ViewAction,
+    HierarchyAction, PaneContent, PendingPermission, QueueItem, SessionRow, TemporaryPaneContent,
+    TurnView, ViewAction,
 };
 
 /// Something the application must do as a result.
@@ -106,12 +106,9 @@ pub struct Desk {
     /// a push so a state change moves a row without a round trip.
     sessions: Vec<SessionSummary>,
     selected: Option<SessionId>,
-    /// A layout per session the window has fetched.
-    ///
-    /// Per session rather than only for the selected one, because the overview needs a
-    /// pane to attach to in every session — and because it makes the pane-to-session
-    /// map below possible, without which a resync for a pane in another session would be
-    /// addressed to the wrong one.
+    /// A layout per Session the window has fetched. The selected Session and explicit
+    /// temporary Panes are the only layouts that cause terminal attachments; cached
+    /// layouts never become a second navigation or monitoring surface.
     layouts: HashMap<SessionId, Layout>,
     trees: HashMap<SessionId, Vec<TreeNodeView>>,
     policies: HashMap<SessionId, AttentionPolicy>,
@@ -126,7 +123,6 @@ pub struct Desk {
     /// The last arrangement drawn, for directional pane navigation — which is a question
     /// about rectangles and therefore needs the ones that were on screen.
     arrangement: Arrangement,
-    overview_open: bool,
 }
 
 impl Default for Desk {
@@ -159,7 +155,6 @@ impl Desk {
             pty_sizes: HashMap::new(),
             queue: Vec::new(),
             arrangement: Arrangement::default(),
-            overview_open: false,
         }
     }
 
@@ -200,10 +195,6 @@ impl Desk {
 
     pub fn queue(&self) -> &[AttentionView] {
         &self.queue
-    }
-
-    pub fn overview_open(&self) -> bool {
-        self.overview_open
     }
 
     /// The workspace a new session would go in.
@@ -958,9 +949,9 @@ impl Desk {
 
     /// Which session a pane belongs to.
     ///
-    /// Looked up rather than assumed to be the selected one: with the overview open the
-    /// window holds panes from every session, and a resync addressed to the wrong session
-    /// would be refused with `not_found`.
+    /// Looked up rather than assumed to be the selected one: temporary Panes and late
+    /// resyncs retain their owning Session, and the daemon rejects a request addressed
+    /// to the wrong one.
     fn session_of_pane(&self, pane: &PaneId) -> Option<SessionId> {
         self.pane_owner.get(pane).cloned()
     }
@@ -995,10 +986,9 @@ impl Desk {
 
     /// The panes the window wants a screen for.
     ///
-    /// Every terminal pane of the session on screen, and — while the overview is open —
-    /// one pane from each other session, which is what a thumbnail is a picture of. One
-    /// rather than all: the overview shows a session, not its layout, and thirty
-    /// sessions of every pane would be a great deal of screen for a postage stamp.
+    /// Every terminal Pane in the selected Session plus an explicitly opened temporary
+    /// terminal Pane. Background Sessions are supervised through semantic tree state and
+    /// Activity Preview; the client never attaches hidden terminals for thumbnails.
     fn wanted_panes(&self) -> Vec<(SessionId, PaneId)> {
         let mut wanted: Vec<(SessionId, PaneId)> = Vec::new();
         if let Some((session_id, layout)) = self
@@ -1008,20 +998,6 @@ impl Desk {
         {
             for pane in layout.panes() {
                 if pane.kind.is_terminal() {
-                    wanted.push((session_id.clone(), pane.id.clone()));
-                }
-            }
-        }
-        if self.overview_open {
-            for (session_id, layout) in &self.layouts {
-                if Some(session_id) == self.selected.as_ref() {
-                    continue;
-                }
-                if let Some(pane) = layout
-                    .panes()
-                    .into_iter()
-                    .find(|pane| pane.kind.is_terminal())
-                {
                     wanted.push((session_id.clone(), pane.id.clone()));
                 }
             }
@@ -1105,8 +1081,8 @@ impl Desk {
             return vec![select_tree];
         }
         self.selected = Some(session_id.clone());
-        // Screens for panes nothing wants any more are dropped, which for a window not
-        // showing the overview is every pane of the session just left.
+        // Screens for panes nothing wants any more are dropped, including every Pane
+        // in the Session just left unless it is an explicit temporary Pane.
         let wanted: HashSet<PaneId> = self
             .wanted_panes()
             .into_iter()
@@ -1299,36 +1275,6 @@ impl Desk {
         let session = self.selected.clone();
         let pane = self.active_pane();
         match command {
-            Command::ToggleSessionOverview => {
-                self.overview_open = !self.overview_open;
-                if !self.overview_open {
-                    // Screens taken only for thumbnails are released, so an overview that
-                    // was opened once does not hold thirty grids for the rest of the day.
-                    let wanted: HashSet<PaneId> = self
-                        .wanted_panes()
-                        .into_iter()
-                        .map(|(_, pane)| pane)
-                        .collect();
-                    self.feeds.retain(|pane, _| wanted.contains(pane));
-                    self.attaching.retain(|pane| wanted.contains(pane));
-                    return Vec::new();
-                }
-                // A session with no layout yet has no pane to attach to, so the overview
-                // asks for the ones it is missing.
-                let mut reactions: Vec<Reaction> = self
-                    .sessions
-                    .iter()
-                    .filter(|summary| !self.layouts.contains_key(&summary.id))
-                    .map(|summary| Reaction::Send {
-                        ask: Ask::Details(summary.id.clone()),
-                        request: Request::GetSession {
-                            session_id: summary.id.clone(),
-                        },
-                    })
-                    .collect();
-                reactions.extend(self.attach_wanted());
-                reactions
-            }
             Command::NextAttention => vec![Reaction::Send {
                 ask: Ask::Action("going to the next demand"),
                 // No id: the daemon picks, because it owns the order. Pressing the
@@ -1848,23 +1794,6 @@ impl Desk {
                 .collect(),
         };
 
-        // One screen per session for the overview, from the pane the window attached to
-        // for exactly that purpose. The *live* screen, not the viewport: the overview
-        // should show what a session is doing now, not where somebody left a scrollbar.
-        let overview_screens: Vec<(SessionId, &Grid)> = self
-            .sessions
-            .iter()
-            .filter_map(|summary| {
-                let layout = self.layouts.get(&summary.id)?;
-                let pane = layout
-                    .panes()
-                    .into_iter()
-                    .find(|pane| pane.kind.is_terminal())?;
-                let feed = self.feeds.get(&pane.id)?;
-                Some((summary.id.clone(), feed.live_screen()))
-            })
-            .collect();
-
         let temporary_pane = self.temporary_pane.as_ref().map(|pane| {
             let node = self.hierarchy.as_ref().and_then(|hierarchy| {
                 hierarchy
@@ -1891,15 +1820,11 @@ impl Desk {
             layout: self.layout().cloned(),
             panes,
             temporary_pane,
-            overview_screens,
             permission: self.permission_banner(now_ms),
             queue: self.queue.iter().map(queue_item).collect(),
             connection: Some(self.connection.clone()),
             notice: self.notice.clone(),
             write_conflict: self.write_conflict(),
-            overview: Overview {
-                open: self.overview_open,
-            },
             policy: self
                 .selected
                 .as_ref()
@@ -2797,6 +2722,8 @@ mod tests {
                 updated_ms: T0 + 1,
                 state: EntryState::Pending,
                 priority_boost: 0,
+                survives_owner_exit: false,
+                demand_kind: Default::default(),
             };
             let mut desk = Desk::new();
             desk.sessions.push(summary(&session, 1));
@@ -2826,6 +2753,8 @@ mod tests {
             updated_ms: T0 + 1,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         let mut desk = Desk::new();
         desk.sessions.push(summary(&session, 1));
@@ -2854,6 +2783,8 @@ mod tests {
             updated_ms: T0 + 1,
             state: EntryState::Pending,
             priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: Default::default(),
         };
         let mut desk = Desk::new();
         desk.sessions.push(summary(&session, 1));
@@ -3322,105 +3253,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_overview_with_no_sessions_costs_no_request() {
-        let mut desk = Desk::new();
-        assert!(!desk.overview_open());
-        assert!(sent(&desk.dispatch(Command::ToggleSessionOverview, T0)).is_empty());
-        assert!(desk.overview_open());
-        desk.dispatch(Command::ToggleSessionOverview, T0);
-        assert!(!desk.overview_open());
-    }
-
-    /// A thumbnail is a picture of a session, so the overview needs a screen from every
-    /// session — which means one attachment each, not one for the session on screen.
-    #[test]
-    fn opening_the_overview_asks_for_one_screen_from_every_session() {
-        let (first, first_pane, _) = session_with_agent("First");
-        let (second, second_pane, _) = session_with_agent("Second");
-        let mut desk = Desk::new();
-        desk.apply_inbound(
-            answer(Response::Sessions {
-                sessions: vec![summary(&first, 0), summary(&second, 0)],
-            }),
-            T0,
-        );
-        // The selected session's detail arrives, so only its pane is attached.
-        let selected = desk.selected().cloned().expect("one is selected");
-        let (chosen, other, other_pane) = if selected == first.id {
-            (&first, &second, second_pane.clone())
-        } else {
-            (&second, &first, first_pane.clone())
-        };
-        desk.apply_inbound(
-            answer(Response::SessionDetails {
-                details: Box::new(details(chosen)),
-            }),
-            T0,
-        );
-
-        // Opening the overview asks for the layout of the session it does not have.
-        let opening = desk.dispatch(Command::ToggleSessionOverview, T0);
-        assert!(
-            sent(&opening).iter().any(|request| matches!(
-                request,
-                Request::GetSession { session_id } if session_id == &other.id
-            )),
-            "the overview must fetch the sessions it has no pane for: {:?}",
-            sent(&opening)
-        );
-
-        // And when that layout arrives, one of its panes is attached.
-        let arriving = desk.apply_inbound(
-            answer(Response::SessionDetails {
-                details: Box::new(details(other)),
-            }),
-            T0,
-        );
-        assert!(
-            sent(&arriving).iter().any(|request| matches!(
-                request,
-                Request::AttachPane { pane_id, .. } if pane_id == &other_pane
-            )),
-            "got {:?}",
-            sent(&arriving)
-        );
-
-        desk.apply_inbound(
-            answer(Response::Attached {
-                attachment: Box::new(attachment(
-                    &other_pane,
-                    &other.id,
-                    Grid::from_lines(&["other session"], 20),
-                    1,
-                )),
-            }),
-            T0,
-        );
-        desk.refresh_screens();
-        let view = desk.view(T0);
-        assert!(
-            view.overview_screens
-                .iter()
-                .any(|(session, grid)| session == &other.id && grid.row_text(0) == "other session"),
-            "the overview must have a screen for a session that is not on screen"
-        );
-
-        // Closing it releases the screens taken only for thumbnails.
-        desk.dispatch(Command::ToggleSessionOverview, T0);
-        desk.refresh_screens();
-        assert!(
-            !desk
-                .view(T0)
-                .overview_screens
-                .iter()
-                .any(|(session, _)| session == &other.id),
-            "an overview opened once must not hold thirty screens for the rest of the day"
-        );
-    }
-
-    /// A resync for a pane in another session — which the overview makes possible — has to
-    /// name that session, or the daemon answers `not_found`.
+    /// A late resync for a cached Pane in another Session must still name its owner;
+    /// assuming the selected Session would make the daemon answer `not_found`.
     #[test]
     fn a_resync_names_the_session_the_pane_actually_belongs_to() {
         let (first, _, _) = session_with_agent("First");
@@ -3432,7 +3266,6 @@ mod tests {
             }),
             T0,
         );
-        desk.dispatch(Command::ToggleSessionOverview, T0);
         desk.apply_inbound(
             answer(Response::SessionDetails {
                 details: Box::new(details(&second)),

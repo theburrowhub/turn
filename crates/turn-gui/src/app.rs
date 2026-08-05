@@ -345,18 +345,6 @@ impl TurnApp {
             // Only when something with an elapsed time is actually on screen.
             elapsed_tick_at: (!self.desk.queue().is_empty()).then(|| next_elapsed_tick(now_ms)),
             typing_expires_at: self.activity.wake_at(now_ms),
-            thumbnails_at: if self.desk.overview_open() {
-                self.state.thumbnails.next_due_ms(
-                    &self
-                        .desk
-                        .sessions()
-                        .iter()
-                        .map(|session| session.id.clone())
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                None
-            },
             reconnect_at: None,
         }
     }

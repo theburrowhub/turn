@@ -13,8 +13,8 @@
 //!    the whole mechanism for keeping up with a build: no polling.
 //! 2. **The user did something.** egui handles that itself — input implies a frame.
 //! 3. **A deadline passed.** A few things change by the clock rather than by an event:
-//!    the cursor blinks, "blocked 47s" counts up, a burst of typing expires and the
-//!    focus governor may be waiting for it, and thumbnails refresh on a slow cadence.
+//!    the cursor blinks, "blocked 47s" counts up, and a burst of typing expires while
+//!    the focus governor may be waiting for it.
 //!    Each of those names a time, [`RepaintPlan`] takes the earliest, and the frame
 //!    happens then and not before.
 //!
@@ -106,8 +106,6 @@ pub struct Deadlines {
     /// A burst of typing that will expire, which the focus governor may be waiting
     /// for. See [`crate::activity::ActivityTracker::wake_at`].
     pub typing_expires_at: Option<i64>,
-    /// The next thumbnail refresh, on its slow cadence.
-    pub thumbnails_at: Option<i64>,
     /// The next reconnect attempt, so the status line's countdown stays honest.
     pub reconnect_at: Option<i64>,
 }
@@ -121,7 +119,6 @@ impl Deadlines {
                 self.cursor_blink_at,
                 self.elapsed_tick_at,
                 self.typing_expires_at,
-                self.thumbnails_at,
                 self.reconnect_at,
             ],
         )
@@ -177,7 +174,7 @@ mod tests {
         let deadlines = Deadlines {
             cursor_blink_at: Some(T0 + 500),
             elapsed_tick_at: Some(T0 + 1_000),
-            thumbnails_at: Some(T0 + 30_000),
+            reconnect_at: Some(T0 + 30_000),
             ..Deadlines::default()
         };
         assert_eq!(
@@ -201,7 +198,7 @@ mod tests {
     #[test]
     fn a_deadline_far_in_the_future_is_capped_rather_than_waited_out() {
         let deadlines = Deadlines {
-            thumbnails_at: Some(T0 + 3_600_000),
+            reconnect_at: Some(T0 + 3_600_000),
             ..Deadlines::default()
         };
         assert_eq!(deadlines.plan(T0), RepaintPlan::After(MAX_IDLE));

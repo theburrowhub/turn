@@ -40,7 +40,6 @@ use crate::palette::{self, Palette};
 use crate::panes::{self, Arrangement, Divider, Side};
 use crate::terminal::{self, PaneAction, PaneInteraction, PaneOptions};
 use crate::theme::Theme;
-use crate::thumbnails::Thumbnails;
 use crate::transport::ConnectionState;
 
 /// One row in the session list. The daemon supplies these already derived; the client
@@ -155,13 +154,6 @@ pub struct TemporaryPaneContent<'a> {
     pub grid: Option<&'a Grid>,
 }
 
-/// Legacy toggle retained while callers move to the unified hierarchy. It no longer
-/// replaces the explicit Pane layout in the centre.
-#[derive(Debug, Clone, Default)]
-pub struct Overview {
-    pub open: bool,
-}
-
 /// What the window is showing.
 #[derive(Debug, Default)]
 pub struct TurnView<'a> {
@@ -174,9 +166,6 @@ pub struct TurnView<'a> {
     /// At most one explicit temporary Pane for this window. Rendering it must never
     /// insert its PaneId into `layout`.
     pub temporary_pane: Option<TemporaryPaneContent<'a>>,
-    /// Legacy overview data retained for source compatibility; hierarchy previews are
-    /// structured [`turn_core::model::ActivityPreview`] values, never terminal captures.
-    pub overview_screens: Vec<(SessionId, &'a Grid)>,
     pub permission: Option<PendingPermission>,
     /// The daemon's ordered queue still backs the global Next Attention action, but is
     /// not rendered as a second permanent navigation panel.
@@ -186,7 +175,6 @@ pub struct TurnView<'a> {
     pub notice: Option<String>,
     /// Typed checkout conflict, rendered as a recovery flow rather than parsed text.
     pub write_conflict: Option<&'a ProtoErrorContext>,
-    pub overview: Overview,
     /// The attention policy in force, for the settings sheet.
     pub policy: Option<AttentionPolicy>,
     pub now_ms: i64,
@@ -198,7 +186,6 @@ pub struct TurnView<'a> {
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
-    pub thumbnails: Thumbnails,
     /// Which command sheet is open, if any.
     pub shortcuts_open: bool,
     pub settings_open: bool,
