@@ -48,7 +48,7 @@ async fn a_session_from_the_coding_template_has_its_panes_and_real_processes_beh
     assert_eq!(session.name, "Fix the flaky test");
     assert_eq!(
         session.pane_count, 3,
-        "the Coding template is an agent, a shell and the agent tree"
+        "the Coding template is an agent, a shell and Fang"
     );
 
     let details = details_of(
@@ -60,18 +60,22 @@ async fn a_session_from_the_coding_template_has_its_panes_and_real_processes_beh
     let panes = details.layout.panes();
     assert_eq!(panes.len(), 3);
 
-    // The two terminal panes have processes; Turn's own view has none, and must not have
-    // had something invented to put in it.
+    // The navigation tree is not duplicated into the layout. Claude and the shell
+    // always have processes; Fang does too when it is installed on the test machine.
     let with_process: Vec<_> = panes.iter().filter(|pane| pane.node_id.is_some()).collect();
-    assert_eq!(with_process.len(), 2, "panes with a process: {panes:#?}");
-    let view_pane = panes
+    assert!(with_process.len() >= 2, "panes with a process: {panes:#?}");
+    let files_pane = panes
         .iter()
-        .find(|pane| pane.kind == PaneKind::AgentTree)
-        .expect("the agent tree pane");
-    assert!(view_pane.node_id.is_none(), "a Turn view has no process");
+        .find(|pane| pane.kind == PaneKind::Tui)
+        .expect("the Fang pane");
+    assert_eq!(files_pane.command.as_deref(), Some("fang"));
+    assert!(
+        panes.iter().all(|pane| pane.kind != PaneKind::AgentTree),
+        "the persistent left tree must never be duplicated as a Pane"
+    );
 
     // Not "the daemon says it is running": the kernel says so.
-    assert_eq!(details.tree.len(), 2);
+    assert!(details.tree.len() >= 2);
     for node in &details.tree {
         let pid = node.pid.expect("a spawned process has a pid");
         assert!(

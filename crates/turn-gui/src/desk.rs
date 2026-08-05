@@ -23,14 +23,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use turn_core::attention::AttentionPolicy;
+use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind};
 use turn_proto::cells::Grid;
 use turn_proto::{
     AttentionView, CloseDisposition, FocusTarget, HierarchyKey, HierarchySnapshot, NewPane,
-    NodePaneCapability, NodePaneView, PtySize, Request, Response, SessionSummary, TemplateSummary,
-    TerminalBytes, TreeNodeView, WorkspaceSummary,
+    NodePaneCapability, NodePaneView, ProtoErrorContext, PtySize, Request, Response,
+    SessionConflictAlternative, SessionSummary, TemplateSummary, TerminalBytes, TreeNodeView,
+    WorkspaceSummary,
 };
 
 use crate::announce::Announcement;
@@ -66,6 +67,25 @@ pub enum Reaction {
 /// until something has been drawn.
 const INITIAL_SIZE: PtySize = PtySize { rows: 24, cols: 80 };
 
+/// The safe parts of a main-checkout creation request that may be reused only after
+/// the user chooses a typed lease-conflict alternative.
+#[derive(Debug, Clone)]
+struct PendingSessionDraft {
+    workspace_id: WorkspaceId,
+    name: String,
+    cwd: Option<String>,
+    panes: Option<Vec<NewPane>>,
+    note: Option<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartialRevision {
+    Apply,
+    IgnoreStale,
+    Resync,
+}
+
 /// Everything the window is showing.
 pub struct Desk {
     connection: ConnectionState,
@@ -77,6 +97,8 @@ pub struct Desk {
     surface_id: String,
     preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     temporary_pane: Option<NodePaneView>,
+    write_conflict: Option<ProtoErrorContext>,
+    pending_session: Option<PendingSessionDraft>,
     workspaces: Vec<WorkspaceSummary>,
     templates: Vec<TemplateSummary>,
     /// In the daemon's own order, re-sorted locally with the daemon's own ranking after
@@ -121,6 +143,8 @@ impl Desk {
             surface_id: "main-window".to_string(),
             preview_history: HashMap::new(),
             temporary_pane: None,
+            write_conflict: None,
+            pending_session: None,
             workspaces: Vec::new(),
             templates: Vec::new(),
             sessions: Vec::new(),
@@ -159,6 +183,10 @@ impl Desk {
 
     pub fn temporary_pane(&self) -> Option<&NodePaneView> {
         self.temporary_pane.as_ref()
+    }
+
+    pub fn write_conflict(&self) -> Option<&ProtoErrorContext> {
+        self.write_conflict.as_ref()
     }
 
     pub fn sessions(&self) -> &[SessionSummary] {
@@ -219,6 +247,22 @@ impl Desk {
             Inbound::Event(event) => self.apply_event(*event, now_ms),
             Inbound::Answer { ask, response } => self.apply_answer(ask, *response),
             Inbound::Failed { ask, error } => {
+                let lease_conflict = error.context.as_deref().and_then(|context| {
+                    matches!(
+                        context,
+                        ProtoErrorContext::WorkspaceWriteLeaseConflict { .. }
+                    )
+                    .then(|| context.clone())
+                });
+                if let Some(context) = lease_conflict {
+                    self.write_conflict = Some(context);
+                } else if matches!(
+                    &ask,
+                    Ask::Action("starting a session")
+                        | Ask::Action("starting a session from a template")
+                ) {
+                    self.pending_session = None;
+                }
                 if ask.is_worth_reporting() {
                     let message = format!("{}: {}", ask.describing(), error.message);
                     self.notice = Some(message.clone());
@@ -256,6 +300,8 @@ impl Desk {
         self.hierarchy = None;
         self.preview_history.clear();
         self.temporary_pane = None;
+        self.write_conflict = None;
+        self.pending_session = None;
         self.workspaces.clear();
         self.sessions.clear();
         self.selected = None;
@@ -325,6 +371,8 @@ impl Desk {
                 Vec::new()
             }
             (_, Response::Session { session }) => {
+                self.write_conflict = None;
+                self.pending_session = None;
                 self.upsert_session(*session);
                 vec![self.hierarchy_request()]
             }
@@ -426,8 +474,8 @@ impl Desk {
                 Vec::new()
             }
             (_, Response::Effects { effects }) => effects
-                .iter()
-                .map(|effect| Reaction::Announce(Announcement::from_effect(effect)))
+                .into_iter()
+                .flat_map(|effect| self.apply_attention_effect(effect))
                 .collect(),
             (Ask::Details(session_id), Response::Ack) => {
                 // A close or a detach. The session list is refreshed by a push.
@@ -611,8 +659,10 @@ impl Desk {
                 node_id,
                 preview,
             } => {
-                if !self.accept_partial_revision(hierarchy_revision) {
-                    return vec![self.hierarchy_request()];
+                match self.partial_revision(hierarchy_revision) {
+                    PartialRevision::Apply => {}
+                    PartialRevision::IgnoreStale => return Vec::new(),
+                    PartialRevision::Resync => return vec![self.hierarchy_request()],
                 }
                 self.update_hierarchy_node(&session_id, &node_id, |node| {
                     node.activity_preview = preview;
@@ -625,8 +675,10 @@ impl Desk {
                 node_id,
                 bindings,
             } => {
-                if !self.accept_partial_revision(hierarchy_revision) {
-                    return vec![self.hierarchy_request()];
+                match self.partial_revision(hierarchy_revision) {
+                    PartialRevision::Apply => {}
+                    PartialRevision::IgnoreStale => return Vec::new(),
+                    PartialRevision::Resync => return vec![self.hierarchy_request()],
                 }
                 self.update_hierarchy_node(&session_id, &node_id, |node| {
                     node.pane_bindings = bindings.clone();
@@ -651,8 +703,10 @@ impl Desk {
                 workspace_id,
                 lease,
             } => {
-                if !self.accept_partial_revision(hierarchy_revision) {
-                    return vec![self.hierarchy_request()];
+                match self.partial_revision(hierarchy_revision) {
+                    PartialRevision::Apply => {}
+                    PartialRevision::IgnoreStale => return Vec::new(),
+                    PartialRevision::Resync => return vec![self.hierarchy_request()],
                 }
                 if let Some(branch) = self.hierarchy.as_mut().and_then(|hierarchy| {
                     hierarchy
@@ -668,16 +722,7 @@ impl Desk {
                 self.queue = entries;
                 Vec::new()
             }
-            E::AttentionEffect { effect } => {
-                let announcement = Announcement::from_effect(&effect);
-                // The one place focus moves, and only because the governor cleared it.
-                let mut reactions = Vec::new();
-                if let Announcement::Focus { session_id, .. } = &announcement {
-                    reactions.extend(self.select(session_id.clone()));
-                }
-                reactions.push(Reaction::Announce(announcement));
-                reactions
-            }
+            E::AttentionEffect { effect } => self.apply_attention_effect(effect),
             E::PtyResized {
                 session_id,
                 node_id,
@@ -738,18 +783,52 @@ impl Desk {
         }
     }
 
-    fn accept_partial_revision(&mut self, revision: u64) -> bool {
+    fn partial_revision(&mut self, revision: u64) -> PartialRevision {
         let Some(hierarchy) = self.hierarchy.as_mut() else {
-            return false;
+            return PartialRevision::Resync;
         };
         if revision < hierarchy.revision {
-            return true;
+            return PartialRevision::IgnoreStale;
         }
         if revision > hierarchy.revision.saturating_add(1) {
-            return false;
+            return PartialRevision::Resync;
         }
         hierarchy.revision = revision;
-        true
+        PartialRevision::Apply
+    }
+
+    /// Turns a governor-approved attention focus into three deliberately separate
+    /// effects: activate the Session, select the exact tree node, and focus an existing
+    /// Pane only if one already exists. It never opens a Pane for a background Agent.
+    fn apply_attention_effect(&mut self, effect: Effect) -> Vec<Reaction> {
+        let announcement = Announcement::from_effect(&effect);
+        let mut reactions = Vec::new();
+        if let Effect::Focus {
+            session_id,
+            node_id,
+        } = &effect
+        {
+            reactions.extend(self.select(session_id.clone()));
+            if let Some(node_id) = node_id {
+                reactions.push(Reaction::Send {
+                    ask: Ask::Action("selecting the Agent that needs attention"),
+                    request: Request::SelectTreeNode {
+                        surface_id: self.surface_id.clone(),
+                        selected: Some(HierarchyKey::process(node_id.clone())),
+                    },
+                });
+                reactions.push(Reaction::Send {
+                    ask: Ask::Action("focusing an existing Pane for Attention"),
+                    request: Request::FocusPaneForNode {
+                        surface_id: self.surface_id.clone(),
+                        session_id: session_id.clone(),
+                        node_id: node_id.clone(),
+                    },
+                });
+            }
+        }
+        reactions.push(Reaction::Announce(announcement));
+        reactions
     }
 
     fn update_hierarchy_node(
@@ -946,6 +1025,88 @@ impl Desk {
         reactions
     }
 
+    /// Applies one of the daemon-advertised recovery choices for an exclusive
+    /// primary-checkout conflict. Nothing is retried until this explicit call.
+    pub fn resolve_write_conflict(
+        &mut self,
+        alternative: SessionConflictAlternative,
+        now_ms: i64,
+    ) -> Vec<Reaction> {
+        let Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+            workspace_id,
+            owner,
+            alternatives,
+            ..
+        }) = self.write_conflict.clone()
+        else {
+            return Vec::new();
+        };
+        if !alternatives.contains(&alternative) {
+            return vec![Reaction::Notice(
+                "that recovery choice is not available for this checkout".into(),
+            )];
+        }
+
+        match alternative {
+            SessionConflictAlternative::Cancel => {
+                self.write_conflict = None;
+                self.pending_session = None;
+                Vec::new()
+            }
+            SessionConflictAlternative::FocusOwner => {
+                self.write_conflict = None;
+                self.pending_session = None;
+                self.select(owner.session_id)
+            }
+            SessionConflictAlternative::CreateReadOnly => {
+                let draft = self.pending_session.take().unwrap_or(PendingSessionDraft {
+                    workspace_id,
+                    name: "Read-only review".into(),
+                    cwd: None,
+                    panes: None,
+                    note: None,
+                    tags: Vec::new(),
+                });
+                self.write_conflict = None;
+                vec![Reaction::Send {
+                    ask: Ask::Action("creating a read-only Session"),
+                    request: Request::CreateReadOnlySession {
+                        workspace_id: draft.workspace_id,
+                        name: draft.name,
+                        cwd: draft.cwd,
+                        panes: draft.panes,
+                        note: draft.note,
+                        tags: draft.tags,
+                    },
+                }]
+            }
+            SessionConflictAlternative::CreateIsolatedWorktree => {
+                let draft = self.pending_session.take().unwrap_or(PendingSessionDraft {
+                    workspace_id,
+                    name: "Isolated worktree".into(),
+                    cwd: None,
+                    panes: None,
+                    note: None,
+                    tags: Vec::new(),
+                });
+                let branch = isolated_branch_name(&draft.name, now_ms);
+                self.write_conflict = None;
+                vec![Reaction::Send {
+                    ask: Ask::Action("creating an isolated worktree Session"),
+                    request: Request::CreateWorktreeSession {
+                        workspace_id: draft.workspace_id,
+                        name: draft.name,
+                        branch,
+                        worktree_path: None,
+                        panes: draft.panes,
+                        note: draft.note,
+                        tags: draft.tags,
+                    },
+                }]
+            }
+        }
+    }
+
     /// Runs a command.
     ///
     /// Everything that changes the world is one request, and every one of them is
@@ -1012,33 +1173,50 @@ impl Desk {
                 }
             }
             Command::QuickNewSession => match self.current_workspace() {
-                Some(workspace_id) => vec![Reaction::Send {
-                    ask: Ask::Action("starting a session"),
-                    request: Request::CreateSession {
+                Some(workspace_id) => {
+                    let draft = PendingSessionDraft {
                         workspace_id,
                         name: format!("Session {}", self.sessions.len() + 1),
                         cwd: None,
                         panes: None,
                         note: None,
                         tags: Vec::new(),
-                    },
-                }],
+                    };
+                    self.pending_session = Some(draft.clone());
+                    vec![Reaction::Send {
+                        ask: Ask::Action("starting a session"),
+                        request: create_main_session_request(draft),
+                    }]
+                }
                 None => vec![Reaction::Notice(
                     "no workspace yet — the daemon has not answered".into(),
                 )],
             },
             Command::NewSession => match (self.current_workspace(), self.templates.first()) {
-                (Some(workspace_id), Some(template)) => vec![Reaction::Send {
-                    ask: Ask::Action("starting a session from a template"),
-                    request: Request::CreateSessionFromTemplate {
-                        workspace_id,
-                        template_id: template.id.clone(),
-                        name: None,
+                (Some(workspace_id), Some(template)) => {
+                    // A typed lease conflict may require creating a safe alternative.
+                    // The template response is daemon-owned, so the fallback keeps the
+                    // requested name but starts with no inferred commands.
+                    self.pending_session = Some(PendingSessionDraft {
+                        workspace_id: workspace_id.clone(),
+                        name: format!("Session {}", self.sessions.len() + 1),
                         cwd: None,
-                        branch: None,
-                        task: None,
-                    },
-                }],
+                        panes: None,
+                        note: None,
+                        tags: Vec::new(),
+                    });
+                    vec![Reaction::Send {
+                        ask: Ask::Action("starting a session from a template"),
+                        request: Request::CreateSessionFromTemplate {
+                            workspace_id,
+                            template_id: template.id.clone(),
+                            name: None,
+                            cwd: None,
+                            branch: None,
+                            task: None,
+                        },
+                    }]
+                }
                 _ => vec![Reaction::Notice("no template to start from yet".into())],
             },
             Command::SaveLayoutAsTemplate => match session {
@@ -1467,6 +1645,41 @@ impl Desk {
             provisional: entry.provisional,
         })
     }
+}
+
+fn create_main_session_request(draft: PendingSessionDraft) -> Request {
+    Request::CreateSession {
+        workspace_id: draft.workspace_id,
+        name: draft.name,
+        cwd: draft.cwd,
+        panes: draft.panes,
+        note: draft.note,
+        tags: draft.tags,
+    }
+}
+
+/// A deterministic, Git-valid default for the explicit worktree alternative.
+/// The daemon still validates it and owns the filesystem path.
+fn isolated_branch_name(name: &str, now_ms: i64) -> String {
+    let mut slug = String::new();
+    let mut separator = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch);
+            separator = false;
+        } else {
+            separator = true;
+        }
+        if slug.len() >= 28 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let slug = if slug.is_empty() { "session" } else { slug };
+    format!("turn/{slug}-{}", now_ms.max(0))
 }
 
 /// The line under a session's name: what the daemon counted, in words.
@@ -2253,6 +2466,80 @@ mod tests {
             other => panic!("got {other:?}"),
         }
         assert!(desk.view(T0).notice.is_some());
+    }
+
+    #[test]
+    fn a_write_lease_conflict_waits_for_an_explicit_safe_alternative() {
+        let (mut owner, _, _) = session_with_agent("Fix climbing bugs");
+        let checkout = turn_core::ids::CheckoutId::primary_for(&owner.workspace_id);
+        owner.mode = turn_core::model::SessionMode::MainCheckout;
+        owner.checkout_id = checkout.clone();
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&owner, 0)],
+            }),
+            T0,
+        );
+        let requested = sent(&desk.dispatch(Command::QuickNewSession, T0));
+        assert!(matches!(
+            requested.as_slice(),
+            [Request::CreateSession { .. }]
+        ));
+
+        let lease = turn_core::model::WorkspaceWriteLease::active(
+            owner.workspace_id.clone(),
+            owner.id.clone(),
+            checkout.clone(),
+            T0,
+        );
+        let error = turn_proto::ProtoError::workspace_write_lease_conflict(
+            ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                workspace_id: owner.workspace_id.clone(),
+                checkout_id: checkout,
+                requesting_session_id: None,
+                lease: Box::new(lease),
+                owner: Box::new(turn_proto::WriteLeaseOwnerView {
+                    session_id: owner.id.clone(),
+                    session_name: owner.name.clone(),
+                    mode: owner.mode,
+                    cwd: owner.cwd.clone(),
+                    branch: owner.git_branch.clone(),
+                    last_activity_ms: owner.last_activity_ms,
+                }),
+                alternatives: vec![
+                    SessionConflictAlternative::FocusOwner,
+                    SessionConflictAlternative::CreateReadOnly,
+                    SessionConflictAlternative::CreateIsolatedWorktree,
+                    SessionConflictAlternative::Cancel,
+                ],
+            },
+        );
+        desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::Action("starting a session"),
+                error,
+            },
+            T0,
+        );
+        assert!(desk.write_conflict().is_some());
+        assert!(
+            sent(&desk.resolve_write_conflict(SessionConflictAlternative::CreateReadOnly, T0))
+                .iter()
+                .any(|request| matches!(request, Request::CreateReadOnlySession { .. })),
+            "the failed main Session is not retried; the chosen read-only API is used"
+        );
+        assert!(desk.write_conflict().is_none());
+    }
+
+    #[test]
+    fn an_isolated_alternative_gets_a_git_valid_non_colliding_branch_name() {
+        assert_eq!(
+            isolated_branch_name("Alternative movement approach", T0),
+            "turn/alternative-movement-approac-1700000000000"
+        );
+        assert_eq!(isolated_branch_name("🔥🔥", 7), "turn/session-7");
     }
 
     /// A keystroke's failure must not put a banner on screen: one per character would be

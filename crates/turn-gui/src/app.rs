@@ -273,8 +273,9 @@ impl eframe::App for TurnApp {
             );
         }
 
-        // 6. When to draw next. Nothing on screen that changes by itself means nothing.
-        ctx.request_repaint();
+        // 6. When to draw next. An idle hierarchy sleeps until input or a daemon push;
+        // clocks such as a focused cursor request one delayed frame at their deadline.
+        self.repaint_plan(now_ms).apply(&ctx);
     }
 }
 

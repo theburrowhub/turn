@@ -82,8 +82,8 @@ impl Template {
         t
     }
 
-    /// Agent on the left, shell and file browser stacked on the right. The
-    /// default working shape from the brief.
+    /// Agent on the left, shell and file TUI stacked on the right. Navigation is
+    /// never a Pane: the unified workspace tree already owns that responsibility.
     pub fn coding(now_ms: i64) -> Template {
         let agent = Pane::new(PaneKind::Agent)
             .with_command("claude")
@@ -91,20 +91,23 @@ impl Template {
         let shell = Pane::new(PaneKind::Shell)
             .with_title("shell")
             .with_restore(crate::model::layout::RestoreBehaviour::Relaunch);
-        let tree = Pane::new(PaneKind::AgentTree).with_title("agents");
+        let files = Pane::new(PaneKind::Tui)
+            .with_command("fang")
+            .with_title("fang (files)")
+            .with_restore(crate::model::layout::RestoreBehaviour::Relaunch);
 
         let mut layout = Layout::single(agent);
         let agent_id = layout.panes()[0].id.clone();
         layout.split(&agent_id, Direction::Horizontal, shell);
         let shell_id = layout.active.clone().unwrap();
-        layout.split(&shell_id, Direction::Vertical, tree);
+        layout.split(&shell_id, Direction::Vertical, files);
         // The agent deserves the larger share.
         layout.resize(&agent_id, 0.15);
         layout.active = Some(agent_id);
 
         let mut t = Self::from_layout("Coding", &layout, now_ms);
         t.built_in = true;
-        t.description = Some("Agent, shell and the agent tree.".into());
+        t.description = Some("Agent, shell and Fang file browser.".into());
         t.hotkey = Some("cmd+shift+1".into());
         t
     }
