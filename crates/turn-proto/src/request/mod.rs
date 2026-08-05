@@ -24,7 +24,7 @@ use turn_core::attention::UserContext;
 use turn_core::ids::{
     AttentionId, CheckoutId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
-use turn_core::model::{Direction, PaneKind, RestoreBehaviour};
+use turn_core::model::{Direction, PaneKind, PreviewVisibility, RestoreBehaviour};
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
@@ -308,6 +308,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u16>,
     },
+    /// Changes whether the compact activity preview for one Process is exposed.
+    /// Hiding affects both the hierarchy projection and Quick Preview history;
+    /// raw terminal ownership and Process lifetime are unchanged.
+    SetPreviewVisibility {
+        session_id: SessionId,
+        node_id: NodeId,
+        visibility: PreviewVisibility,
+    },
 
     // ----------------------------------------------------------------- templates
     ListTemplates,
@@ -543,6 +551,7 @@ impl Request {
             Request::GetSession { .. } => "get_session",
             Request::GetProcessTree { .. } => "get_process_tree",
             Request::GetPreviewHistory { .. } => "get_preview_history",
+            Request::SetPreviewVisibility { .. } => "set_preview_visibility",
             Request::ListTemplates => "list_templates",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
             Request::SplitPane { .. } => "split_pane",
@@ -606,6 +615,7 @@ impl Request {
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
             Request::GetPreviewHistory { .. } => "preview_history",
+            Request::SetPreviewVisibility { .. } => "ack",
 
             Request::ListTemplates => "templates",
             Request::SaveLayoutAsTemplate { .. } => "template",
@@ -683,6 +693,7 @@ impl Request {
             | Request::GetSession { session_id }
             | Request::GetProcessTree { session_id }
             | Request::GetPreviewHistory { session_id, .. }
+            | Request::SetPreviewVisibility { session_id, .. }
             | Request::SaveLayoutAsTemplate { session_id, .. }
             | Request::SplitPane { session_id, .. }
             | Request::ClosePane { session_id, .. }

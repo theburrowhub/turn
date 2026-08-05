@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::redact::{redact_layout, redact_pairs};
 use rusqlite::{params, Connection, Row};
 use turn_core::ids::TemplateId;
-use turn_core::model::{Layout, Template};
+use turn_core::model::{Layout, PaneKind, Template};
 use turn_core::AttentionPolicy;
 
 const COLUMNS: &str = "id, name, description, icon, layout_json, attention_json, \
@@ -88,18 +88,59 @@ impl<'a> TemplateRepo<'a> {
         }
     }
 
-    /// Writes any built-in the store does not have yet, and returns how many.
+    /// Writes missing built-ins and upgrades an obsolete navigation Pane in a
+    /// shipped built-in, returning how many rows changed.
     ///
     /// Matching is by name, not by id: `Template::built_ins` mints fresh ids on
     /// every call, so an id comparison would install four duplicates on every
-    /// launch. Existing rows are left alone — a user who has edited the Coding
-    /// template keeps their edit across upgrades.
+    /// launch. Existing rows are normally left alone so user overrides survive.
+    /// `AgentTree` is the exception: the unified hierarchy makes a second
+    /// persistent navigator a product invariant violation, not a visual choice.
+    /// Only each obsolete Pane is replaced in place; ids, split geometry and
+    /// user-owned panes/policy/commands/environment remain stable.
     pub fn install_built_ins(&self, now_ms: i64) -> Result<usize> {
         let mut installed = 0;
-        for template in Template::built_ins(now_ms) {
-            if self.find_by_name(&template.name)?.is_none() {
-                self.save(&template)?;
-                installed += 1;
+        for shipped in Template::built_ins(now_ms) {
+            match self.find_by_name(&shipped.name)? {
+                None => {
+                    self.save(&shipped)?;
+                    installed += 1;
+                }
+                Some(existing)
+                    if existing.built_in
+                        && existing
+                            .layout
+                            .panes()
+                            .iter()
+                            .any(|pane| pane.kind == PaneKind::AgentTree) =>
+                {
+                    let mut upgraded = existing;
+                    let obsolete: Vec<_> = upgraded
+                        .layout
+                        .panes()
+                        .iter()
+                        .filter(|pane| pane.kind == PaneKind::AgentTree)
+                        .map(|pane| pane.id.clone())
+                        .collect();
+                    for pane_id in obsolete {
+                        let pane = upgraded
+                            .layout
+                            .get_mut(&pane_id)
+                            .expect("the Pane id came from this Layout");
+                        pane.kind = PaneKind::Tui;
+                        pane.title = Some("fang (files)".into());
+                        pane.command = Some("fang".into());
+                        pane.args.clear();
+                        pane.cwd = None;
+                        pane.env.clear();
+                        pane.node_id = None;
+                        pane.restore = turn_core::model::RestoreBehaviour::Relaunch;
+                    }
+                    upgraded.description = shipped.description;
+                    self.save(&upgraded)?;
+                    installed += 1;
+                }
+                Some(_) => {}
             }
         }
         Ok(installed)
@@ -230,6 +271,54 @@ mod tests {
 
         let back = store.templates().get(&coding.id).unwrap().unwrap();
         assert_eq!(back.init_commands, vec!["nvm use".to_string()]);
+    }
+
+    #[test]
+    fn the_legacy_coding_tree_is_replaced_without_changing_identity_or_user_settings() {
+        use turn_core::model::{Direction, Pane};
+
+        let store = testing::store();
+        let agent = Pane::new(PaneKind::Agent).with_command("claude");
+        let mut layout = Layout::single(agent);
+        let agent_id = layout.panes()[0].id.clone();
+        layout.split(
+            &agent_id,
+            Direction::Horizontal,
+            Pane::new(PaneKind::AgentTree).with_title("agents"),
+        );
+        let tree_id = layout.active.clone().unwrap();
+        layout.split(
+            &tree_id,
+            Direction::Vertical,
+            Pane::new(PaneKind::Server)
+                .with_command("cargo run")
+                .with_title("custom server"),
+        );
+        let mut legacy = Template::from_layout("Coding", &layout, T0);
+        legacy.built_in = true;
+        legacy.init_commands = vec!["nvm use".into()];
+        let original_id = legacy.id.clone();
+        store.templates().save(&legacy).unwrap();
+
+        assert_eq!(store.templates().install_built_ins(T0 + 1).unwrap(), 4);
+        let coding = store.templates().find_by_name("Coding").unwrap().unwrap();
+        assert_eq!(coding.id, original_id);
+        assert_eq!(coding.created_ms, T0);
+        assert_eq!(coding.init_commands, vec!["nvm use"]);
+        assert!(coding
+            .layout
+            .panes()
+            .iter()
+            .all(|pane| pane.kind != PaneKind::AgentTree));
+        assert!(coding
+            .layout
+            .panes()
+            .iter()
+            .any(|pane| { pane.kind == PaneKind::Tui && pane.command.as_deref() == Some("fang") }));
+        assert!(coding.layout.panes().iter().any(|pane| {
+            pane.kind == PaneKind::Server && pane.command.as_deref() == Some("cargo run")
+        }));
+        assert_eq!(store.templates().install_built_ins(T0 + 2).unwrap(), 0);
     }
 
     #[test]

@@ -110,6 +110,10 @@ impl TurnApp {
                     modifiers,
                     ..
                 } => match keymap.resolve(*key, modifiers, in_terminal) {
+                    // Cmd+Enter is contextual in the unified tree. Leave the event for
+                    // the tree widget; everywhere else the existing Next Attention
+                    // binding remains global and is consumed here.
+                    Some(Command::NextAttention) if self.state.tree_has_focus => true,
                     Some(command) => {
                         commands.push(command);
                         false
@@ -210,6 +214,12 @@ impl TurnApp {
                 self.state.settings_open = !self.state.settings_open;
                 true
             }
+            // This legacy command now focuses the sole, always-present hierarchy. It
+            // never shows or hides a second agent tree.
+            Command::ToggleAgentTree => {
+                self.state.tree_has_focus = true;
+                true
+            }
             _ => false,
         }
     }
@@ -226,6 +236,16 @@ impl eframe::App for TurnApp {
                 self.perform(&ctx, reaction);
             }
         }
+        // Clone only when the daemon-owned projection actually changed. Comparing the
+        // small revisioned value each frame avoids cloning hundreds of rows while still
+        // carrying tree-state responses that intentionally keep the same revision.
+        if self.state.hierarchy.as_ref() != self.desk.hierarchy() {
+            self.state.hierarchy = self.desk.hierarchy().cloned();
+        }
+        if &self.state.preview_history != self.desk.preview_histories() {
+            self.state.preview_history = self.desk.preview_histories().clone();
+        }
+        self.state.write_conflict_open = self.desk.write_conflict().is_some();
 
         // 2. What the user is doing to the window.
         self.observe_activity(&ctx, now_ms);
@@ -262,6 +282,11 @@ impl eframe::App for TurnApp {
                         self.perform(&ctx, reaction);
                     }
                 }
+            }
+        }
+        for action in self.state.take_hierarchy_actions() {
+            for reaction in self.desk.apply_hierarchy_action(action) {
+                self.perform(&ctx, reaction);
             }
         }
 

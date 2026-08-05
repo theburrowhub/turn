@@ -22,7 +22,7 @@ use crate::paths;
 use turn_agents::{IntegrationLevel, LaunchContext, OutputHeuristic};
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{NodeKind, PaneKind, ProcessNode};
+use turn_core::model::{NodeKind, PaneKind, ProcessNode, SessionMode};
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
 use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
@@ -35,6 +35,43 @@ use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
 const INITIAL_SIZE: ScreenSize = ScreenSize { rows: 24, cols: 80 };
 
 impl Core {
+    /// Enforces checkout ownership at the final launch boundary. Every route that
+    /// can create a process reaches this check, including later splits, relaunches
+    /// and start-up commands; creation-time validation alone is not sufficient.
+    pub(crate) fn require_session_launch_allowed(
+        &self,
+        session_id: &SessionId,
+    ) -> std::result::Result<(), ProtoError> {
+        let session = self.session(session_id)?;
+        match session.mode {
+            SessionMode::ReadOnly if !session.read_only_enforced => Err(ProtoError::refused(
+                "This read-only Session has no technical write guard, so Turn will not launch a process in it",
+            )),
+            SessionMode::MainCheckout => {
+                let lease = self
+                    .store
+                    .hierarchy()
+                    .active_lease(&session.workspace_id)
+                    .map_err(|error| {
+                        ProtoError::internal(format!(
+                            "the workspace write lease could not be verified: {error}"
+                        ))
+                    })?;
+                if lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.session_id == *session_id)
+                {
+                    Ok(())
+                } else {
+                    Err(ProtoError::refused(
+                        "This Session does not own the primary checkout write lease",
+                    ))
+                }
+            }
+            SessionMode::ReadOnly | SessionMode::IsolatedWorktree => Ok(()),
+        }
+    }
+
     /// Starts a process for every pane of a session that describes one.
     ///
     /// A pane whose command cannot be launched is left empty and logged rather than
@@ -101,6 +138,7 @@ impl Core {
         let Some(command) = pane_command(pane.kind, pane.command.as_deref(), workspace) else {
             return Ok(None);
         };
+        self.require_session_launch_allowed(session_id)?;
 
         let cwd = resolve_cwd(pane.cwd.as_deref(), &session.cwd);
         let title = pane
@@ -308,6 +346,7 @@ impl Core {
         command: &str,
         now_ms: i64,
     ) -> std::result::Result<NodeId, ProtoError> {
+        self.require_session_launch_allowed(session_id)?;
         let session = self.session(session_id)?;
         let cwd = session.cwd.clone();
         let mut env: Vec<(String, String)> = Vec::new();

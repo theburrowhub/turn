@@ -110,7 +110,11 @@ impl TreeNodeView {
             severity: display_state.severity(),
             needs_user: display_state.demands_user(),
             interaction_pending: node.interaction_pending,
-            activity_preview: node.activity_preview.clone(),
+            activity_preview: if node.preview_visibility == PreviewVisibility::Hide {
+                None
+            } else {
+                node.activity_preview.clone()
+            },
             preview_visibility: node.preview_visibility,
             pane_bindings: Vec::new(),
             pane_capability: NodePaneCapability::default(),

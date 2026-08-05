@@ -94,6 +94,7 @@ impl Fixture {
             selected: self.selected.clone(),
             layout: self.layout.clone(),
             panes,
+            temporary_pane: None,
             overview_screens: self
                 .overview_screens
                 .iter()
@@ -103,6 +104,7 @@ impl Fixture {
             queue: self.queue.clone(),
             connection: self.connection.clone(),
             notice: self.notice.clone(),
+            write_conflict: None,
             overview: Overview {
                 open: self.overview_open,
             },

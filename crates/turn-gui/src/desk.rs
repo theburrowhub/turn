@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind};
+use turn_core::model::{ActivityPreview, Direction, Layout, PaneKind, PreviewVisibility};
 use turn_proto::cells::Grid;
 use turn_proto::{
     AttentionView, CloseDisposition, FocusTarget, HierarchyKey, HierarchySnapshot, NewPane,
@@ -41,7 +41,8 @@ use crate::terminal::feed::{Desync, PaneFeed};
 use crate::terminal::PaneAction;
 use crate::transport::{Ask, ConnectionState, Inbound};
 use crate::view::{
-    Overview, PaneContent, PendingPermission, QueueItem, SessionRow, TurnView, ViewAction,
+    HierarchyAction, Overview, PaneContent, PendingPermission, QueueItem, SessionRow,
+    TemporaryPaneContent, TurnView, ViewAction,
 };
 
 /// Something the application must do as a result.
@@ -179,6 +180,10 @@ impl Desk {
             .get(node)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn preview_histories(&self) -> &HashMap<NodeId, Vec<ActivityPreview>> {
+        &self.preview_history
     }
 
     pub fn temporary_pane(&self) -> Option<&NodePaneView> {
@@ -417,13 +422,25 @@ impl Desk {
             }
             (_, Response::NodePane { pane }) => {
                 let session_id = pane.binding.session_id.clone();
+                let node_id = pane.binding.node_id.clone();
                 let pane_id = pane.binding.pane_id.clone();
                 self.pane_owner.insert(pane_id.clone(), session_id.clone());
                 let terminal = matches!(pane.capability, NodePaneCapability::Terminal { .. });
                 self.temporary_pane = Some(pane);
+                let mut reactions = vec![Reaction::Send {
+                    ask: Ask::Preview {
+                        session_id: session_id.clone(),
+                        node_id: node_id.clone(),
+                    },
+                    request: Request::GetPreviewHistory {
+                        session_id: session_id.clone(),
+                        node_id,
+                        limit: Some(8),
+                    },
+                }];
                 if terminal {
                     self.attaching.insert(pane_id.clone());
-                    vec![Reaction::Send {
+                    reactions.push(Reaction::Send {
                         ask: Ask::Attach {
                             session_id: session_id.clone(),
                             pane_id: pane_id.clone(),
@@ -434,10 +451,9 @@ impl Desk {
                             size: INITIAL_SIZE,
                             stream: turn_proto::PaneStream::Cells,
                         },
-                    }]
-                } else {
-                    Vec::new()
+                    });
                 }
+                reactions
             }
             (_, Response::PaneFocus { focus }) => {
                 let Some(focus) = focus else {
@@ -810,6 +826,16 @@ impl Desk {
         {
             reactions.extend(self.select(session_id.clone()));
             if let Some(node_id) = node_id {
+                for key in self.attention_ancestor_keys(session_id, node_id) {
+                    reactions.push(Reaction::Send {
+                        ask: Ask::Action("revealing the Agent that needs attention"),
+                        request: Request::SetTreeExpanded {
+                            surface_id: self.surface_id.clone(),
+                            key,
+                            expanded: true,
+                        },
+                    });
+                }
                 reactions.push(Reaction::Send {
                     ask: Ask::Action("selecting the Agent that needs attention"),
                     request: Request::SelectTreeNode {
@@ -829,6 +855,49 @@ impl Desk {
         }
         reactions.push(Reaction::Announce(announcement));
         reactions
+    }
+
+    fn attention_ancestor_keys(
+        &self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+    ) -> Vec<HierarchyKey> {
+        let Some((workspace, session)) = self.hierarchy.as_ref().and_then(|hierarchy| {
+            hierarchy.workspaces.iter().find_map(|workspace| {
+                workspace
+                    .sessions
+                    .iter()
+                    .find(|session| &session.session.id == session_id)
+                    .map(|session| (workspace, session))
+            })
+        }) else {
+            return Vec::new();
+        };
+        let mut keys = vec![
+            HierarchyKey::workspace(workspace.workspace.id.clone()),
+            HierarchyKey::session(session_id.clone()),
+        ];
+        let mut parent = session
+            .nodes
+            .iter()
+            .find(|node| &node.node_id == node_id)
+            .and_then(|node| node.parent.clone());
+        let mut ancestors = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(id) = parent {
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            ancestors.push(id.clone());
+            parent = session
+                .nodes
+                .iter()
+                .find(|node| node.node_id == id)
+                .and_then(|node| node.parent.clone());
+        }
+        ancestors.reverse();
+        keys.extend(ancestors.into_iter().map(HierarchyKey::process));
+        keys
     }
 
     fn update_hierarchy_node(
@@ -1023,6 +1092,89 @@ impl Desk {
         ];
         reactions.extend(self.attach_wanted());
         reactions
+    }
+
+    /// Routes typed intents from the unified tree. Selection, Pane focus and opening a
+    /// view stay separate protocol operations, so selecting a waiting subagent neither
+    /// resolves its Attention nor changes the Layout.
+    pub fn apply_hierarchy_action(&mut self, action: HierarchyAction) -> Vec<Reaction> {
+        match action {
+            HierarchyAction::Select { surface_id, key } => vec![Reaction::Send {
+                ask: Ask::Action("selecting a node in the workspace tree"),
+                request: Request::SelectTreeNode {
+                    surface_id,
+                    selected: Some(key),
+                },
+            }],
+            HierarchyAction::SetExpanded {
+                surface_id,
+                key,
+                expanded,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("changing workspace tree expansion"),
+                request: Request::SetTreeExpanded {
+                    surface_id,
+                    key,
+                    expanded,
+                },
+            }],
+            HierarchyAction::QuickPreview {
+                session_id,
+                node_id,
+                ..
+            } => vec![Reaction::Send {
+                ask: Ask::Preview {
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                },
+                request: Request::GetPreviewHistory {
+                    session_id,
+                    node_id,
+                    limit: Some(8),
+                },
+            }],
+            HierarchyAction::SetPreviewVisibility {
+                session_id,
+                node_id,
+                visibility,
+            } => vec![Reaction::Send {
+                ask: Ask::Action(match visibility {
+                    PreviewVisibility::Hide => "hiding an activity preview",
+                    PreviewVisibility::Inherit | PreviewVisibility::Show => {
+                        "showing an activity preview"
+                    }
+                }),
+                request: Request::SetPreviewVisibility {
+                    session_id,
+                    node_id,
+                    visibility,
+                },
+            }],
+            HierarchyAction::OpenTemporaryPane {
+                surface_id,
+                session_id,
+                node_id,
+            } => vec![Reaction::Send {
+                ask: Ask::NodePane,
+                request: Request::OpenNodeAsTemporaryPane {
+                    surface_id,
+                    session_id,
+                    node_id,
+                },
+            }],
+            HierarchyAction::FocusPaneForNode {
+                surface_id,
+                session_id,
+                node_id,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("focusing an existing Pane for a tree node"),
+                request: Request::FocusPaneForNode {
+                    surface_id,
+                    session_id,
+                    node_id,
+                },
+            }],
+        }
     }
 
     /// Applies one of the daemon-advertised recovery choices for an exclusive
@@ -1423,6 +1575,31 @@ impl Desk {
                 ask: Ask::Action("dismissing a demand"),
                 request: Request::DismissAttention { attention_id },
             }],
+            ViewAction::ResolveWriteConflict(alternative) => {
+                self.resolve_write_conflict(alternative, now_ms)
+            }
+            ViewAction::CloseTemporaryPane {
+                session_id,
+                pane_id,
+            } => {
+                if self.temporary_pane.as_ref().is_some_and(|temporary| {
+                    temporary.binding.session_id == session_id
+                        && temporary.binding.pane_id == pane_id
+                }) {
+                    self.temporary_pane = None;
+                    self.pane_owner.remove(&pane_id);
+                    self.feeds.remove(&pane_id);
+                    self.attaching.remove(&pane_id);
+                }
+                vec![Reaction::Send {
+                    ask: Ask::Action("closing a temporary Agent view"),
+                    request: Request::ClosePane {
+                        session_id,
+                        pane_id,
+                        disposition: CloseDisposition::KeepProcesses,
+                    },
+                }]
+            }
             ViewAction::ResizeDivider { pane_id, fraction } => match self.selected.clone() {
                 Some(session_id) => vec![Reaction::Send {
                     ask: Ask::Action("resizing the pane"),
@@ -1440,7 +1617,10 @@ impl Desk {
     }
 
     fn apply_pane_action(&mut self, pane_id: PaneId, action: PaneAction) -> Vec<Reaction> {
-        let Some(session_id) = self.selected.clone() else {
+        let Some(session_id) = self
+            .session_of_pane(&pane_id)
+            .or_else(|| self.selected.clone())
+        else {
             return Vec::new();
         };
         match action {
@@ -1588,16 +1768,38 @@ impl Desk {
             })
             .collect();
 
+        let temporary_pane = self.temporary_pane.as_ref().map(|pane| {
+            let node = self.hierarchy.as_ref().and_then(|hierarchy| {
+                hierarchy
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.sessions)
+                    .flat_map(|session| &session.nodes)
+                    .find(|node| node.node_id == pane.binding.node_id)
+            });
+            TemporaryPaneContent {
+                pane,
+                node,
+                previews: self.preview_history(&pane.binding.node_id),
+                grid: self
+                    .feeds
+                    .get(&pane.binding.pane_id)
+                    .and_then(PaneFeed::peek),
+            }
+        });
+
         TurnView {
             sessions,
             selected: self.selected.clone(),
             layout: self.layout().cloned(),
             panes,
+            temporary_pane,
             overview_screens,
             permission: self.permission_banner(now_ms),
             queue: self.queue.iter().map(queue_item).collect(),
             connection: Some(self.connection.clone()),
             notice: self.notice.clone(),
+            write_conflict: self.write_conflict(),
             overview: Overview {
                 open: self.overview_open,
             },

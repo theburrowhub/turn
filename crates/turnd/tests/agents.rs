@@ -263,6 +263,11 @@ async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_re
     let surface = "reviewer-window".to_string();
     let reviewer_key = HierarchyKey::process(subagent.node_id.clone());
     let root_key = HierarchyKey::process(agent.node.clone());
+    ui.ask(Request::GetHierarchy {
+        surface_id: surface.clone(),
+        include_archived: false,
+    })
+    .await;
     ui.ask(Request::SetTreeExpanded {
         surface_id: surface.clone(),
         key: root_key.clone(),

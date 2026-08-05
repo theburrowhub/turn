@@ -11,7 +11,9 @@ use super::workspaces::store;
 use super::Answer;
 use crate::core::Core;
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{HierarchyNodeKind, PaneNodeBinding, SessionMode, TreeUiState};
+use turn_core::model::{
+    HierarchyNodeKind, PaneNodeBinding, PreviewVisibility, SessionMode, TreeUiState,
+};
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
     PaneStream, ProtoError, ProtoErrorContext, Response, SessionConflictAlternative,
@@ -22,6 +24,24 @@ const MAX_SURFACE_ID_CHARS: usize = 128;
 const LEASE_HEARTBEAT_INTERVAL_MS: i64 = 5_000;
 
 impl Core {
+    pub(super) fn require_client_surface(
+        &self,
+        client_id: super::ClientId,
+        surface_id: &str,
+    ) -> Result<(), ProtoError> {
+        let expected = self
+            .clients
+            .get(&client_id)
+            .and_then(|client| client.surface_id.as_deref());
+        if expected == Some(surface_id) {
+            Ok(())
+        } else {
+            Err(ProtoError::refused(
+                "This connection does not own the requested UI surface; refresh its hierarchy first",
+            ))
+        }
+    }
+
     /// Associates a protocol client with its window id before producing the
     /// snapshot. Kept separate from `get_hierarchy` because client identity is a
     /// transport concern, while snapshot construction is pure projection.
@@ -244,8 +264,15 @@ impl Core {
         limit: Option<u16>,
     ) -> Answer {
         let session = self.session(session_id)?;
-        if session.tree.get(node_id).is_none() {
+        let Some(node) = session.tree.get(node_id) else {
             return Err(ProtoError::not_found("process node", node_id.as_str()));
+        };
+        if node.preview_visibility == turn_core::model::PreviewVisibility::Hide {
+            return Ok(Response::PreviewHistory {
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+                entries: Vec::new(),
+            });
         }
         let mut entries = self
             .store
@@ -258,6 +285,23 @@ impl Core {
             node_id: node_id.clone(),
             entries,
         })
+    }
+
+    pub(super) fn set_preview_visibility(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        visibility: PreviewVisibility,
+        now_ms: i64,
+    ) -> Answer {
+        let session = self.session_mut(session_id)?;
+        let Some(node) = session.tree.get_mut(node_id) else {
+            return Err(ProtoError::not_found("process node", node_id.as_str()));
+        };
+        node.preview_visibility = visibility;
+        self.persist_session(session_id)?;
+        self.push_tree(session_id, now_ms);
+        Ok(Response::Ack)
     }
 
     pub(super) fn open_node_as_temporary_pane(
@@ -520,10 +564,16 @@ impl Core {
         requesting_session_id: Option<&SessionId>,
         error: turn_store::StoreError,
     ) -> ProtoError {
-        if !matches!(error, turn_store::StoreError::WriteLeaseHeld { .. }) {
-            return store(error);
-        }
-        let Ok(Some(lease)) = self.store.hierarchy().active_lease(workspace_id) else {
+        let lease_id = match &error {
+            turn_store::StoreError::WriteLeaseHeld { lease_id, .. } => {
+                LeaseId::from_stored(lease_id.clone())
+            }
+            _ => return store(error),
+        };
+        // The writer may belong to another Workspace record that aliases the same
+        // canonical checkout. The conflict names the globally unique lease; filtering
+        // by the requesting Workspace would lose the owner and degrade to a string.
+        let Ok(Some(lease)) = self.store.hierarchy().lease(&lease_id) else {
             return store(error);
         };
         let Some(owner) = self.sessions.get(&lease.session_id) else {
@@ -593,7 +643,7 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
-    use turn_core::model::{PaneKind, ProcessNode};
+    use turn_core::model::{PaneKind, PreviewVisibility, ProcessNode};
     use turn_core::state::Lifecycle;
     use turn_proto::{CloseDisposition, NewPane, Request};
 
@@ -750,9 +800,41 @@ mod tests {
                 if entries.last().is_some_and(|preview| preview.normalized_text == "Reviewing climb_system.gd…")
         ));
 
+        harness
+            .core
+            .set_preview_visibility(&session_id, &reviewer_id, PreviewVisibility::Hide, NOW + 8)
+            .unwrap();
+        let hidden = harness
+            .core
+            .hierarchy_snapshot("main-window", false, NOW + 8)
+            .unwrap();
+        assert!(hidden.workspaces[0].sessions[0]
+            .nodes
+            .iter()
+            .find(|node| node.node_id == reviewer_id)
+            .unwrap()
+            .activity_preview
+            .is_none());
+        assert!(matches!(
+            harness
+                .core
+                .get_preview_history(&session_id, &reviewer_id, Some(8))
+                .unwrap(),
+            Response::PreviewHistory { entries, .. } if entries.is_empty()
+        ));
+        harness
+            .core
+            .set_preview_visibility(
+                &session_id,
+                &reviewer_id,
+                PreviewVisibility::Inherit,
+                NOW + 9,
+            )
+            .unwrap();
+
         let temporary = match harness
             .core
-            .open_node_as_temporary_pane("main-window".into(), &session_id, &reviewer_id, NOW + 8)
+            .open_node_as_temporary_pane("main-window".into(), &session_id, &reviewer_id, NOW + 10)
             .unwrap()
         {
             Response::NodePane { pane } => pane,
@@ -767,6 +849,37 @@ mod tests {
             .unwrap()
             .is_running());
 
+        let (other_client, _other_frames) = harness.add_client(64);
+        harness
+            .core
+            .dispatch(
+                other_client,
+                Request::GetHierarchy {
+                    surface_id: "other-window".into(),
+                    include_archived: false,
+                },
+                NOW + 11,
+            )
+            .unwrap();
+        assert!(harness
+            .core
+            .close_pane(
+                other_client,
+                &session_id,
+                &temporary.binding.pane_id,
+                CloseDisposition::KeepProcesses,
+                NOW + 12,
+            )
+            .is_err());
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .bindings_for_session(&session_id)
+            .unwrap()
+            .iter()
+            .any(|binding| binding.pane_id == temporary.binding.pane_id));
+
         harness
             .core
             .close_pane(
@@ -774,7 +887,7 @@ mod tests {
                 &session_id,
                 &temporary.binding.pane_id,
                 CloseDisposition::KeepProcesses,
-                NOW + 9,
+                NOW + 13,
             )
             .unwrap();
         assert!(harness.core.sessions[&session_id]

@@ -60,13 +60,21 @@ impl Core {
         // one removes only the view binding; stopping the Agent remains a
         // separate explicit node-control operation.
         if self.session(session_id)?.layout.get(pane_id).is_none() {
+            let surface_id = self
+                .clients
+                .get(&client)
+                .and_then(|client| client.surface_id.as_deref());
             let binding = self
                 .store
                 .hierarchy()
                 .bindings_for_session(session_id)
                 .map_err(store)?
                 .into_iter()
-                .find(|binding| binding.pane_id == *pane_id && binding.temporary)
+                .find(|binding| {
+                    binding.pane_id == *pane_id
+                        && binding.temporary
+                        && binding.surface_id.as_deref() == surface_id
+                })
                 .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
             if disposition != CloseDisposition::KeepProcesses {
                 return Err(ProtoError::refused(

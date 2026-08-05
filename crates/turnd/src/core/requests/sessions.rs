@@ -11,7 +11,10 @@ use turn_core::model::{
     Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template,
     WorkspaceCheckout,
 };
-use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
+use turn_proto::{
+    CloseDisposition, NewPane, ProtoError, ProtoErrorContext, Response, ServerEvent,
+    TemplateSummary,
+};
 
 impl Core {
     /// Creates a session and starts the processes its panes describe.
@@ -762,6 +765,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aliased_workspaces_return_the_real_write_owner_as_typed_context() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().to_string_lossy().to_string();
+        let first_workspace = match harness
+            .core
+            .create_workspace("first alias".into(), root.clone(), 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let second_workspace = match harness
+            .core
+            .create_workspace("second alias".into(), root, 11)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let owner = match harness
+            .core
+            .create_session(
+                &first_workspace,
+                "Canonical owner".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let error = harness
+            .core
+            .create_session(
+                &second_workspace,
+                "Alias contender".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                13,
+            )
+            .expect_err("the canonical checkout fence must span Workspace aliases");
+        assert!(matches!(
+            error.context.as_deref(),
+            Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                workspace_id,
+                owner: conflicting_owner,
+                lease,
+                ..
+            }) if workspace_id == &second_workspace
+                && conflicting_owner.session_id == owner
+                && lease.workspace_id == first_workspace
+        ));
+    }
+
+    #[tokio::test]
     async fn a_read_only_alternative_never_launches_without_a_technical_guard() {
         let mut harness = Harness::new().await;
         let root = harness._dir.path().to_string_lossy().to_string();
@@ -807,6 +872,39 @@ mod tests {
         assert!(
             session.tree.is_empty(),
             "an unguarded command must not start"
+        );
+        assert!(harness
+            .core
+            .processes
+            .values()
+            .all(|process| process.session_id != id));
+
+        let marker = harness._dir.path().join("read-only-escape");
+        let existing_pane = session.layout.panes()[0].id.clone();
+        let (client, _frames) = harness.add_client(8);
+        harness
+            .core
+            .split_pane(
+                client,
+                &id,
+                &existing_pane,
+                Direction::Horizontal,
+                NewPane {
+                    kind: PaneKind::Shell,
+                    title: Some("write attempt".into()),
+                    command: Some("sh".into()),
+                    args: vec!["-c".into(), format!("touch {}", marker.display())],
+                    cwd: None,
+                    env: Vec::new(),
+                    restore: turn_core::model::RestoreBehaviour::ReattachOnly,
+                },
+                13,
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !marker.exists(),
+            "a later split bypassed the read-only guard"
         );
         assert!(harness
             .core

@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use turn_core::attention::{Action, AttentionPolicy, Trigger};
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::SessionId;
-use turn_core::model::{RestoreBehaviour, RestoreState};
+use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
 
@@ -50,7 +50,13 @@ impl Core {
         for id in &stored {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
-            if let Some(session) = self.store.sessions().load_for_restore(id)? {
+            if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
+                if migrate_obsolete_navigation_panes(&mut session) {
+                    // The old central AgentTree cannot coexist with the unified
+                    // sidebar. Persist the structural migration immediately, but
+                    // never materialise Fang during restore.
+                    self.store.sessions().save(&session)?;
+                }
                 self.sessions.insert(session.id.clone(), session);
             }
         }
@@ -302,5 +308,79 @@ impl Core {
             return false;
         };
         observed.name.contains(expected) || observed.command_line.contains(expected)
+    }
+}
+
+fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
+    let obsolete: Vec<_> = session
+        .layout
+        .panes()
+        .iter()
+        .filter(|pane| pane.kind == PaneKind::AgentTree)
+        .map(|pane| pane.id.clone())
+        .collect();
+    for pane_id in &obsolete {
+        let pane = session
+            .layout
+            .get_mut(pane_id)
+            .expect("the Pane id came from this Layout");
+        pane.kind = PaneKind::Tui;
+        pane.title = Some("fang (files)".into());
+        pane.command = Some("fang".into());
+        pane.args.clear();
+        pane.cwd = None;
+        pane.env.clear();
+        pane.node_id = None;
+        pane.restore = RestoreBehaviour::Relaunch;
+    }
+    !obsolete.is_empty()
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use turn_core::ids::WorkspaceId;
+    use turn_core::model::{Direction, Layout, Pane};
+
+    #[test]
+    fn a_legacy_session_keeps_its_geometry_but_not_a_second_navigator() {
+        let agent = Pane::new(PaneKind::Agent).with_command("claude");
+        let mut layout = Layout::single(agent);
+        let agent_id = layout.active.clone().unwrap();
+        layout.split(
+            &agent_id,
+            Direction::Horizontal,
+            Pane::new(PaneKind::AgentTree),
+        );
+        let mut session = Session::new(
+            WorkspaceId::from_stored("ws_restore"),
+            "Legacy",
+            "/repo",
+            layout,
+            1,
+        );
+        let pane_ids: Vec<_> = session
+            .layout
+            .panes()
+            .iter()
+            .map(|pane| pane.id.clone())
+            .collect();
+
+        assert!(migrate_obsolete_navigation_panes(&mut session));
+        assert_eq!(
+            session
+                .layout
+                .panes()
+                .iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>(),
+            pane_ids
+        );
+        assert!(session
+            .layout
+            .panes()
+            .iter()
+            .all(|pane| pane.kind != PaneKind::AgentTree));
+        assert!(!migrate_obsolete_navigation_panes(&mut session));
     }
 }

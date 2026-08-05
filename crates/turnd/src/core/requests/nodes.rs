@@ -110,6 +110,7 @@ impl Core {
         resume: bool,
         now_ms: i64,
     ) -> Answer {
+        self.require_session_launch_allowed(session_id)?;
         let node = self.node_of(session_id, node_id)?.clone();
         if node.is_running() {
             return Err(ProtoError::new(

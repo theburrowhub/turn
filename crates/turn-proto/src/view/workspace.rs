@@ -192,11 +192,11 @@ mod tests {
 
     #[test]
     fn a_template_pane_with_no_command_contributes_no_command() {
-        // The Coding template has an agent, a shell with no command, and one of
-        // Turn's own views which never has a process.
+        // The Coding template has an agent, a shell with no command and Fang.
+        // The blank shell contributes no command of its own.
         let view = TemplateSummary::from_template(&Template::coding(T0));
         assert_eq!(view.pane_count, 3);
-        assert_eq!(view.commands, vec!["claude"]);
+        assert_eq!(view.commands, vec!["claude", "fang"]);
         assert_eq!(view.hotkey.as_deref(), Some("cmd+shift+1"));
     }
 

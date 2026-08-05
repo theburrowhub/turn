@@ -1,4 +1,4 @@
-//! The request surface: all forty-one operations.
+//! The request surface: every protocol operation.
 //!
 //! Split by subsystem, dispatched from one place so the daemon's whole surface is
 //! visible in a single match — the same reason [`turn_proto::Request`] is one flat
@@ -53,11 +53,17 @@ impl Core {
                 surface_id,
                 key,
                 expanded,
-            } => self.set_tree_expanded(surface_id, key, expanded, now_ms),
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.set_tree_expanded(surface_id, key, expanded, now_ms)
+            }
             Request::SelectTreeNode {
                 surface_id,
                 selected,
-            } => self.select_tree_node(surface_id, selected, now_ms),
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.select_tree_node(surface_id, selected, now_ms)
+            }
 
             // ----------------------------------------------------- checkout lease
             Request::GetWorkspaceWriteLease { workspace_id } => {
@@ -170,6 +176,11 @@ impl Core {
                 node_id,
                 limit,
             } => self.get_preview_history(&session_id, &node_id, limit),
+            Request::SetPreviewVisibility {
+                session_id,
+                node_id,
+                visibility,
+            } => self.set_preview_visibility(&session_id, &node_id, visibility, now_ms),
 
             // ----------------------------------------------------------- templates
             Request::ListTemplates => Ok(Response::Templates {
@@ -211,12 +222,18 @@ impl Core {
                 surface_id,
                 session_id,
                 node_id,
-            } => self.open_node_as_temporary_pane(surface_id, &session_id, &node_id, now_ms),
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.open_node_as_temporary_pane(surface_id, &session_id, &node_id, now_ms)
+            }
             Request::FocusPaneForNode {
                 surface_id,
                 session_id,
                 node_id,
-            } => self.focus_pane_for_node(surface_id, &session_id, &node_id),
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.focus_pane_for_node(surface_id, &session_id, &node_id)
+            }
             Request::AttachPane {
                 session_id,
                 pane_id,

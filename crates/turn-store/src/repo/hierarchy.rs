@@ -553,6 +553,22 @@ impl<'a> HierarchyRepo<'a> {
             .map_err(Into::into)
     }
 
+    /// Looks up the exact fenced lease named by a conflict. Unlike
+    /// [`HierarchyRepo::active_lease`], this crosses Workspace aliases that resolve to
+    /// the same canonical checkout; the lease id is globally unique.
+    pub fn lease(&self, id: &LeaseId) -> Result<Option<WorkspaceWriteLease>> {
+        self.conn
+            .query_row(
+                "SELECT id, workspace_id, session_id, checkout_id, mode, state, acquired_ms, \
+                        heartbeat_ms, released_ms, generation \
+                 FROM workspace_write_leases WHERE id = ?1 LIMIT 1",
+                params![id.as_str()],
+                lease_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn heartbeat_lease(&self, id: &LeaseId, generation: u64, now_ms: i64) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE workspace_write_leases SET heartbeat_ms = ?3 \

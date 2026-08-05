@@ -439,6 +439,11 @@ pub(crate) fn all_requests() -> Vec<Request> {
             node_id: node_id.clone(),
             limit: Some(20),
         },
+        Request::SetPreviewVisibility {
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            visibility: turn_core::model::PreviewVisibility::Hide,
+        },
         Request::ListTemplates,
         Request::SaveLayoutAsTemplate {
             session_id: session_id.clone(),
@@ -575,7 +580,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 52 operations. This number is asserted so that adding one without
+    // 53 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 52, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 53, "the catalogue changed size: {names:?}");
 }
