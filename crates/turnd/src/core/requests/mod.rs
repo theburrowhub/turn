@@ -24,16 +24,17 @@ impl Core {
     /// Routes one request to its handler.
     pub(crate) fn dispatch(&mut self, client: ClientId, request: Request, now_ms: i64) -> Answer {
         // A runtime checkpoint mutates the in-memory Session before SQLite commits
-        // it. Let that oldest fact recover first, then refuse every new mutation if
-        // the durable barrier is still closed. Otherwise a handler could mutate a
-        // Layout/name/lease, fail only at `persist_session`, and have that rejected
-        // user action hitch a ride on the older checkpoint's later retry.
+        // it. Let that oldest fact recover first, then refuse every request if the
+        // durable barrier is still closed. A read would otherwise expose a
+        // projection no client push was allowed to announce; a write could mutate a
+        // Layout/name/lease and hitch that rejected action onto the checkpoint's
+        // later retry.
         self.retry_failed_ingest_checkpoints(now_ms);
-        if request.is_mutating() && !self.failed_ingest_checkpoints.is_empty() {
+        if !self.failed_ingest_checkpoints.is_empty() {
             tracing::warn!(
                 operation = request.op(),
                 pending = self.failed_ingest_checkpoints.len(),
-                "refused a mutation behind a failed atomic runtime checkpoint"
+                "refused a request behind a failed atomic runtime checkpoint"
             );
             return Err(ProtoError::new(
                 turn_proto::ErrorCode::Unavailable,
@@ -442,7 +443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mutating_request_cannot_hitch_a_ride_on_an_older_failed_checkpoint() {
+    async fn requests_cannot_observe_or_hitch_a_ride_on_a_failed_checkpoint() {
         let mut harness = Harness::new().await;
         let session_id = SessionId::from_stored("sess_request_checkpoint_barrier");
         let pane_id = PaneId::from_stored("pane_request_checkpoint_barrier");
@@ -475,6 +476,19 @@ mod tests {
         assert_eq!(harness.core.failed_ingest_checkpoints.len(), 1);
 
         let (client, _frames) = harness.add_client(16);
+        let error = harness
+            .core
+            .dispatch(
+                client,
+                Request::ListSessions {
+                    workspace_id: None,
+                    include_archived: true,
+                },
+                NOW + 2,
+            )
+            .expect_err("a read must not expose the uncommitted projection");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+
         let error = harness
             .core
             .dispatch(
