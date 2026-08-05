@@ -23,6 +23,23 @@ pub type Answer = std::result::Result<Response, ProtoError>;
 impl Core {
     /// Routes one request to its handler.
     pub(crate) fn dispatch(&mut self, client: ClientId, request: Request, now_ms: i64) -> Answer {
+        // A runtime checkpoint mutates the in-memory Session before SQLite commits
+        // it. Let that oldest fact recover first, then refuse every new mutation if
+        // the durable barrier is still closed. Otherwise a handler could mutate a
+        // Layout/name/lease, fail only at `persist_session`, and have that rejected
+        // user action hitch a ride on the older checkpoint's later retry.
+        self.retry_failed_ingest_checkpoints(now_ms);
+        if request.is_mutating() && !self.failed_ingest_checkpoints.is_empty() {
+            tracing::warn!(
+                operation = request.op(),
+                pending = self.failed_ingest_checkpoints.len(),
+                "refused a mutation behind a failed atomic runtime checkpoint"
+            );
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "Turn is waiting for an earlier runtime event to reach durable storage",
+            ));
+        }
         match request {
             // ---------------------------------------------------------- workspaces
             Request::ListWorkspaces { include_archived } => {
@@ -392,6 +409,14 @@ pub(super) fn check_name(name: &str) -> std::result::Result<String, ProtoError> 
 #[cfg(test)]
 mod tests {
     use super::check_name;
+    use crate::core::testing::Harness;
+    use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
+    use turn_core::ids::{NodeId, PaneId, SessionId};
+    use turn_core::model::ProcessNode;
+    use turn_core::state::Lifecycle;
+    use turn_proto::{ErrorCode, Request};
+
+    const NOW: i64 = 1_775_000_000_000;
 
     #[test]
     fn navigation_names_reject_adversarial_text_instead_of_rewriting_it() {
@@ -414,5 +439,88 @@ mod tests {
             "ordinary surrounding spaces retain the established API behaviour"
         );
         assert!(check_name(&"x".repeat(turn_pty::MAX_TITLE_CHARS + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_mutating_request_cannot_hitch_a_ride_on_an_older_failed_checkpoint() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_request_checkpoint_barrier");
+        let pane_id = PaneId::from_stored("pane_request_checkpoint_barrier");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let original_name = harness.core.sessions[&session_id].name.clone();
+        let missing_node = NodeId::from_stored("proc_missing_checkpoint_subject");
+        // Make the next Session checkpoint fail through the real pane-to-node
+        // foreign key. This models any durable-store failure after event reduction
+        // without exposing a test-only failure switch in production code.
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .get_mut(&pane_id)
+            .unwrap()
+            .node_id = Some(missing_node.clone());
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentIdle,
+                EventSource::Supervisor,
+                Confidence::Explicit,
+                NOW + 1,
+            )
+            .with_node(missing_node.clone()),
+            NOW + 1,
+        );
+        assert_eq!(harness.core.failed_ingest_checkpoints.len(), 1);
+
+        let (client, _frames) = harness.add_client(16);
+        let error = harness
+            .core
+            .dispatch(
+                client,
+                Request::RenameSession {
+                    session_id: session_id.clone(),
+                    name: "must not stick".into(),
+                },
+                NOW + 2,
+            )
+            .expect_err("a mutation must stop before its handler runs");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert_eq!(harness.core.sessions[&session_id].name, original_name);
+
+        let mut recovered = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 3);
+        recovered.id = missing_node;
+        recovered.lifecycle = Lifecycle::Alive;
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(recovered);
+        harness
+            .core
+            .dispatch(
+                client,
+                Request::ListSessions {
+                    workspace_id: None,
+                    include_archived: true,
+                },
+                NOW + 3,
+            )
+            .unwrap();
+        assert!(harness.core.failed_ingest_checkpoints.is_empty());
+        assert_eq!(
+            harness
+                .core
+                .store
+                .sessions()
+                .get(&session_id)
+                .unwrap()
+                .unwrap()
+                .name,
+            original_name
+        );
     }
 }
