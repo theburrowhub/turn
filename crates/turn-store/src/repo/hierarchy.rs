@@ -599,7 +599,8 @@ impl<'a> HierarchyRepo<'a> {
                  JOIN workspaces w ON w.id = s.workspace_id \
                  JOIN workspace_checkouts c ON c.workspace_id = s.workspace_id \
                  WHERE s.id = ?1 AND s.workspace_id = ?2 \
-                   AND c.id = ?3 AND c.workspace_id = ?2",
+                   AND c.id = ?3 AND c.workspace_id = ?2 \
+                   AND s.checkout_id = c.id AND c.is_primary = 1",
                 params![session.as_str(), workspace.as_str(), checkout.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -1672,6 +1673,52 @@ mod tests {
             count, 0,
             "a rejected ownership tuple writes no partial lease"
         );
+    }
+
+    #[test]
+    fn a_session_cannot_acquire_a_lease_for_a_different_checkout() {
+        let store = testing::store();
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let workspace = saved_workspace_at(&store, "checkout-binding", &primary);
+        let (isolated, isolated_checkout) = worktree_pair(&workspace, &worktree, "isolated");
+        store
+            .hierarchy()
+            .create_worktree_session(&isolated, &isolated_checkout)
+            .unwrap();
+        let primary_checkout = CheckoutId::primary_for(&workspace.id);
+
+        let error = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &isolated.id, &primary_checkout, T0 + 1)
+            .expect_err("a worktree Session is not assigned to the primary checkout");
+        assert!(matches!(error, StoreError::InvalidLeaseOwnership { .. }));
+
+        let primary_session = testing::saved_session(&store, &workspace.id, "primary-reader");
+        let inverse = store
+            .hierarchy()
+            .acquire_write_lease(
+                &workspace.id,
+                &primary_session.id,
+                &isolated_checkout.id,
+                T0 + 2,
+            )
+            .expect_err("a primary Session is not assigned to an isolated checkout");
+        assert!(matches!(inverse, StoreError::InvalidLeaseOwnership { .. }));
+
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
+        let restored = store.sessions().get(&isolated.id).unwrap().unwrap();
+        assert_eq!(restored.mode, SessionMode::IsolatedWorktree);
+        assert_eq!(restored.checkout_id, isolated_checkout.id);
+        assert_eq!(restored.cwd, isolated.cwd);
+        assert_eq!(restored.worktree_path, isolated.worktree_path);
     }
 
     #[test]

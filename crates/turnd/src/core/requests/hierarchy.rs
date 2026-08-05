@@ -176,6 +176,11 @@ impl Core {
                 "The Session does not belong to that Workspace",
             ));
         }
+        if &session.checkout_id != checkout_id {
+            return Err(ProtoError::invalid(
+                "The Session is not assigned to the requested checkout",
+            ));
+        }
         let lease = self
             .store
             .hierarchy()
@@ -670,7 +675,9 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
-    use turn_core::model::{Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, Session};
+    use turn_core::model::{
+        Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, Session, WorkspaceCheckout,
+    };
     use turn_core::state::Lifecycle;
     use turn_proto::{CloseDisposition, NewPane, Request};
 
@@ -726,6 +733,103 @@ mod tests {
                 .id,
             lease.id
         );
+    }
+
+    #[tokio::test]
+    async fn a_worktree_session_cannot_be_promoted_with_the_primary_checkout_lease() {
+        let mut harness = Harness::new().await;
+        let primary_root = harness._dir.path().join("primary");
+        let worktree_root = harness._dir.path().join("worktree");
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "checkout-binding".into(),
+                primary_root.to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let checkout_id = CheckoutId::new();
+        let branch = "turn/isolated".to_string();
+        let canonical = std::fs::canonicalize(&worktree_root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let checkout = WorkspaceCheckout {
+            id: checkout_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: canonical.clone(),
+            canonical_path: canonical.clone(),
+            branch: Some(branch.clone()),
+            primary: false,
+            shared_resources: vec!["docker".into()],
+            created_ms: NOW + 1,
+        };
+        let mut session = Session::new(
+            workspace_id.clone(),
+            "isolated",
+            canonical.clone(),
+            Layout::single(Pane::new(PaneKind::Agent)),
+            NOW + 1,
+        );
+        session.mode = SessionMode::IsolatedWorktree;
+        session.checkout_id = checkout_id.clone();
+        session.worktree_path = Some(canonical.clone());
+        session.git_branch = Some(branch);
+        let mut agent =
+            ProcessNode::agent(session.id.clone(), "claude", canonical.clone(), NOW + 1);
+        agent.lifecycle = Lifecycle::Alive;
+        let agent_id = agent.id.clone();
+        session.tree.insert(agent);
+        harness
+            .core
+            .store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+            .unwrap();
+        let session_id = session.id.clone();
+        harness
+            .core
+            .sessions
+            .insert(session_id.clone(), session.clone());
+
+        let primary_checkout = CheckoutId::primary_for(&workspace_id);
+        let error = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &primary_checkout, NOW + 2)
+            .expect_err("a worktree Session cannot claim a different checkout");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .is_none());
+
+        let in_memory = &harness.core.sessions[&session_id];
+        assert_eq!(in_memory.mode, SessionMode::IsolatedWorktree);
+        assert_eq!(in_memory.checkout_id, checkout_id);
+        assert_eq!(in_memory.cwd, canonical);
+        assert_eq!(in_memory.worktree_path, session.worktree_path);
+        assert!(in_memory.tree.get(&agent_id).unwrap().is_running());
+        let persisted = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.mode, SessionMode::IsolatedWorktree);
+        assert_eq!(persisted.checkout_id, in_memory.checkout_id);
+        assert_eq!(persisted.cwd, in_memory.cwd);
+        assert_eq!(persisted.worktree_path, in_memory.worktree_path);
+        assert!(persisted.tree.get(&agent_id).unwrap().is_running());
     }
 
     #[tokio::test]
