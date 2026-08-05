@@ -22,8 +22,9 @@ pub struct WorkspaceSummary {
     pub lease_reconciliation_required: bool,
 
     pub session_count: usize,
-    /// Sessions inside this workspace that are blocked on the human. This is what
-    /// puts a dot on a workspace the user is not currently looking at.
+    /// Sessions inside this workspace with outstanding attention. This includes
+    /// node-less worker demands whose parent agent can still be RUNNING; it is
+    /// what puts a dot on a workspace the user is not currently looking at.
     pub sessions_needing_user: usize,
     /// Total outstanding attention demands across the workspace's sessions.
     pub badge_count: usize,
@@ -58,7 +59,10 @@ impl WorkspaceSummary {
             archived: workspace.archived,
             lease_reconciliation_required: workspace.lease_reconciliation_required,
             session_count: mine.len(),
-            sessions_needing_user: mine.iter().filter(|s| s.needs_user).count(),
+            sessions_needing_user: mine
+                .iter()
+                .filter(|s| s.needs_user || s.badge_count > 0)
+                .count(),
             badge_count: mine.iter().map(|s| s.badge_count).sum(),
             default_agent: workspace.default_agent.clone(),
             default_shell: workspace.default_shell.clone(),
@@ -170,7 +174,23 @@ mod tests {
         ];
         let view = WorkspaceSummary::from_workspace(&mine, &summaries);
         assert_eq!(view.session_count, 1);
+        assert_eq!(
+            view.sessions_needing_user, 1,
+            "a node-less demand must keep its workspace navigable"
+        );
         assert_eq!(view.badge_count, 1, "another project's noise stays there");
+    }
+
+    #[test]
+    fn a_node_less_demand_counts_as_attention_without_changing_agent_state() {
+        let ws = workspace();
+        let session = session_in(&ws, "worker waiting");
+        let summary = SessionSummary::from_session(&session, 1, false, T0);
+
+        assert!(!summary.needs_user, "the Session tree itself stays truthful");
+        let view = WorkspaceSummary::from_workspace(&ws, &[summary]);
+        assert_eq!(view.sessions_needing_user, 1);
+        assert_eq!(view.badge_count, 1);
     }
 
     #[test]

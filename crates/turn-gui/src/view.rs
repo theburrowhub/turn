@@ -903,7 +903,7 @@ impl<'a> TurnView<'a> {
                     || {
                         self.sessions
                             .iter()
-                            .filter(|row| row.state.demands_user())
+                            .filter(|row| row.state.demands_user() || row.badge > 0)
                             .count()
                     },
                     |snapshot| {
@@ -3512,6 +3512,25 @@ mod tests {
             action,
             HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
         )));
+    }
+
+    #[test]
+    fn node_less_attention_is_visible_without_relabelling_the_running_agent() {
+        let (snapshot, root_id, _, _) = hierarchy_fixture();
+        let workspace = HierarchyRow::Workspace(&snapshot.workspaces[0]);
+        assert!(workspace
+            .accessible_name(false)
+            .contains("1 sessions need attention"));
+
+        let session = &snapshot.workspaces[0].sessions[0];
+        let root = session
+            .nodes
+            .iter()
+            .find(|node| node.node_id == root_id)
+            .expect("running parent agent");
+        assert_eq!(root.display_state, DisplayState::Running);
+        assert!(!root.needs_user);
+        assert_eq!(session.session.badge_count, 1);
     }
 
     #[test]
