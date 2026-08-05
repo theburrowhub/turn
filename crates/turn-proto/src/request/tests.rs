@@ -396,6 +396,14 @@ pub(crate) fn all_requests() -> Vec<Request> {
             note: Some("No writes".into()),
             tags: vec!["review".into()],
         },
+        Request::CreateReadOnlySessionFromTemplate {
+            workspace_id: workspace_id.clone(),
+            template_id: template_id.clone(),
+            name: None,
+            cwd: Some("crates/turn-core".into()),
+            branch: Some("feat/attention".into()),
+            task: Some("Review the queue".into()),
+        },
         Request::CreateWorktreeSession {
             workspace_id: workspace_id.clone(),
             name: "Fix independently".into(),
@@ -404,6 +412,16 @@ pub(crate) fn all_requests() -> Vec<Request> {
             panes: Some(vec![NewPane::new(PaneKind::Agent).with_command("codex")]),
             note: None,
             tags: vec!["isolated".into()],
+        },
+        Request::CreateWorktreeSessionFromTemplate {
+            workspace_id: workspace_id.clone(),
+            template_id: template_id.clone(),
+            name: Some("Fix independently".into()),
+            cwd: Some("crates/turn-core".into()),
+            template_branch: Some("feat/attention".into()),
+            task: Some("Fix the queue".into()),
+            branch: "turn/fix-independently".into(),
+            worktree_path: None,
         },
         Request::CreateSessionFromTemplate {
             workspace_id: workspace_id.clone(),
@@ -580,7 +598,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 53 operations. This number is asserted so that adding one without
+    // 55 operations. This number is asserted so that adding one without
     // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 53, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 55, "the catalogue changed size: {names:?}");
 }

@@ -68,16 +68,17 @@ pub enum Reaction {
 /// until something has been drawn.
 const INITIAL_SIZE: PtySize = PtySize { rows: 24, cols: 80 };
 
-/// The safe parts of a main-checkout creation request that may be reused only after
-/// the user chooses a typed lease-conflict alternative.
+/// The original daemon-owned Template intent retained while the user chooses a
+/// typed lease-conflict alternative. It deliberately stores no flattened panes:
+/// only `turnd` may turn a Template id into commands, environment and policy.
 #[derive(Debug, Clone)]
 struct PendingSessionDraft {
     workspace_id: WorkspaceId,
-    name: String,
+    template_id: turn_core::ids::TemplateId,
+    name: Option<String>,
     cwd: Option<String>,
-    panes: Option<Vec<NewPane>>,
-    note: Option<String>,
-    tags: Vec<String>,
+    branch: Option<String>,
+    task: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1219,48 +1220,64 @@ impl Desk {
                 self.select(owner.session_id)
             }
             SessionConflictAlternative::CreateReadOnly => {
-                let draft = self.pending_session.take().unwrap_or(PendingSessionDraft {
-                    workspace_id,
-                    name: "Read-only review".into(),
-                    cwd: None,
-                    panes: None,
-                    note: None,
-                    tags: Vec::new(),
-                });
+                let draft = self.pending_session.take();
                 self.write_conflict = None;
                 vec![Reaction::Send {
                     ask: Ask::Action("creating a read-only Session"),
-                    request: Request::CreateReadOnlySession {
-                        workspace_id: draft.workspace_id,
-                        name: draft.name,
-                        cwd: draft.cwd,
-                        panes: draft.panes,
-                        note: draft.note,
-                        tags: draft.tags,
+                    request: match draft {
+                        Some(draft) => Request::CreateReadOnlySessionFromTemplate {
+                            workspace_id: draft.workspace_id,
+                            template_id: draft.template_id,
+                            name: draft.name,
+                            cwd: draft.cwd,
+                            branch: draft.branch,
+                            task: draft.task,
+                        },
+                        None => Request::CreateReadOnlySession {
+                            workspace_id,
+                            name: "Read-only review".into(),
+                            cwd: None,
+                            panes: None,
+                            note: None,
+                            tags: Vec::new(),
+                        },
                     },
                 }]
             }
             SessionConflictAlternative::CreateIsolatedWorktree => {
-                let draft = self.pending_session.take().unwrap_or(PendingSessionDraft {
-                    workspace_id,
-                    name: "Isolated worktree".into(),
-                    cwd: None,
-                    panes: None,
-                    note: None,
-                    tags: Vec::new(),
-                });
-                let branch = isolated_branch_name(&draft.name, now_ms);
+                let draft = self.pending_session.take();
                 self.write_conflict = None;
                 vec![Reaction::Send {
                     ask: Ask::Action("creating an isolated worktree Session"),
-                    request: Request::CreateWorktreeSession {
-                        workspace_id: draft.workspace_id,
-                        name: draft.name,
-                        branch,
-                        worktree_path: None,
-                        panes: draft.panes,
-                        note: draft.note,
-                        tags: draft.tags,
+                    request: match draft {
+                        Some(draft) => {
+                            let branch_seed = draft
+                                .name
+                                .as_deref()
+                                .or(draft.task.as_deref())
+                                .unwrap_or("isolated-session")
+                                .to_string();
+                            let branch = isolated_branch_name(&branch_seed, now_ms);
+                            Request::CreateWorktreeSessionFromTemplate {
+                                workspace_id: draft.workspace_id,
+                                template_id: draft.template_id,
+                                name: draft.name,
+                                cwd: draft.cwd,
+                                template_branch: draft.branch,
+                                task: draft.task,
+                                branch,
+                                worktree_path: None,
+                            }
+                        }
+                        None => Request::CreateWorktreeSession {
+                            workspace_id,
+                            name: "Isolated worktree".into(),
+                            branch: isolated_branch_name("Isolated worktree", now_ms),
+                            worktree_path: None,
+                            panes: None,
+                            note: None,
+                            tags: Vec::new(),
+                        },
                     },
                 }]
             }
@@ -1312,11 +1329,11 @@ impl Desk {
                     };
                     let draft = PendingSessionDraft {
                         workspace_id: workspace_id.clone(),
-                        name: format!("Session {}", self.sessions.len() + 1),
+                        template_id: template_id.clone(),
+                        name: Some(format!("Session {}", self.sessions.len() + 1)),
                         cwd: None,
-                        panes: None,
-                        note: None,
-                        tags: Vec::new(),
+                        branch: None,
+                        task: None,
                     };
                     self.pending_session = Some(draft.clone());
                     vec![Reaction::Send {
@@ -1324,7 +1341,7 @@ impl Desk {
                         request: Request::CreateSessionFromTemplate {
                             workspace_id,
                             template_id,
-                            name: Some(draft.name),
+                            name: draft.name,
                             cwd: None,
                             branch: None,
                             task: None,
@@ -1344,15 +1361,15 @@ impl Desk {
                         return vec![Reaction::Notice("no template to start from yet".into())];
                     };
                     // A typed lease conflict may require creating a safe alternative.
-                    // The template response is daemon-owned, so the fallback keeps the
-                    // requested name but starts with no inferred commands.
+                    // Keep only the original Template request; the daemon remains the
+                    // authority that turns it into a complete Session definition.
                     self.pending_session = Some(PendingSessionDraft {
                         workspace_id: workspace_id.clone(),
-                        name: format!("Session {}", self.sessions.len() + 1),
+                        template_id: template_id.clone(),
+                        name: None,
                         cwd: None,
-                        panes: None,
-                        note: None,
-                        tags: Vec::new(),
+                        branch: None,
+                        task: None,
                     });
                     vec![Reaction::Send {
                         ask: Ask::Action("starting a session from a template"),
@@ -2986,9 +3003,11 @@ mod tests {
             }),
             T0,
         );
+        let coding = Template::coding(T0);
+        let coding_id = coding.id.clone();
         desk.apply_inbound(
             answer(Response::Templates {
-                templates: vec![TemplateSummary::from_template(&Template::coding(T0))],
+                templates: vec![TemplateSummary::from_template(&coding)],
             }),
             T0,
         );
@@ -3034,13 +3053,103 @@ mod tests {
             T0,
         );
         assert!(desk.write_conflict().is_some());
+        let safe =
+            sent(&desk.resolve_write_conflict(SessionConflictAlternative::CreateReadOnly, T0));
         assert!(
-            sent(&desk.resolve_write_conflict(SessionConflictAlternative::CreateReadOnly, T0))
-                .iter()
-                .any(|request| matches!(request, Request::CreateReadOnlySession { .. })),
-            "the failed main Session is not retried; the chosen read-only API is used"
+            matches!(
+                safe.as_slice(),
+                [Request::CreateReadOnlySessionFromTemplate {
+                    template_id,
+                    name: Some(name),
+                    cwd: None,
+                    branch: None,
+                    task: None,
+                    ..
+                }] if template_id == &coding_id && name == "Session 2"
+            ),
+            "the exact Template intent must reach the safe daemon API: {safe:?}"
         );
         assert!(desk.write_conflict().is_none());
+    }
+
+    #[test]
+    fn a_template_conflict_keeps_daemon_owned_defaults_for_an_isolated_retry() {
+        let (mut owner, _, _) = session_with_agent("Fix climbing bugs");
+        let checkout = turn_core::ids::CheckoutId::primary_for(&owner.workspace_id);
+        owner.mode = turn_core::model::SessionMode::MainCheckout;
+        owner.checkout_id = checkout.clone();
+        let coding = Template::coding(T0);
+        let coding_id = coding.id.clone();
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&owner, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::Templates {
+                templates: vec![TemplateSummary::from_template(&coding)],
+            }),
+            T0,
+        );
+        let requested = sent(&desk.dispatch(Command::NewSession, T0));
+        assert!(matches!(
+            requested.as_slice(),
+            [Request::CreateSessionFromTemplate { name: None, .. }]
+        ));
+
+        let lease = turn_core::model::WorkspaceWriteLease::active(
+            owner.workspace_id.clone(),
+            owner.id.clone(),
+            checkout.clone(),
+            T0,
+        );
+        let error = turn_proto::ProtoError::workspace_write_lease_conflict(
+            ProtoErrorContext::WorkspaceWriteLeaseConflict {
+                workspace_id: owner.workspace_id.clone(),
+                checkout_id: checkout,
+                requesting_session_id: None,
+                lease: Box::new(lease),
+                owner: Box::new(turn_proto::WriteLeaseOwnerView {
+                    session_id: owner.id.clone(),
+                    session_name: owner.name.clone(),
+                    mode: owner.mode,
+                    cwd: owner.cwd.clone(),
+                    branch: owner.git_branch.clone(),
+                    last_activity_ms: owner.last_activity_ms,
+                }),
+                alternatives: vec![SessionConflictAlternative::CreateIsolatedWorktree],
+            },
+        );
+        desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::Action("starting a session from a template"),
+                error,
+            },
+            T0,
+        );
+
+        let safe = sent(
+            &desk.resolve_write_conflict(SessionConflictAlternative::CreateIsolatedWorktree, T0),
+        );
+        assert!(
+            matches!(
+                safe.as_slice(),
+                [Request::CreateWorktreeSessionFromTemplate {
+                    template_id,
+                    name: None,
+                    cwd: None,
+                    template_branch: None,
+                    task: None,
+                    branch,
+                    worktree_path: None,
+                    ..
+                }] if template_id == &coding_id && branch.starts_with("turn/isolated-session-")
+            ),
+            "the GUI must not rebuild Coding from TemplateSummary: {safe:?}"
+        );
     }
 
     #[test]

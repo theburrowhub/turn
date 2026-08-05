@@ -244,6 +244,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
     },
+    /// Resolves a primary-checkout lease conflict without flattening the
+    /// original Template into client-supplied panes. The daemon reloads and
+    /// instantiates the authoritative Template, but keeps processes stopped
+    /// until read-only execution has a technical guard.
+    CreateReadOnlySessionFromTemplate {
+        workspace_id: WorkspaceId,
+        template_id: TemplateId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+    },
     /// The explicit concurrent-writer alternative. The daemon creates and
     /// records the checkout; it never reuses a caller-provided path silently.
     CreateWorktreeSession {
@@ -258,6 +274,25 @@ pub enum Request {
         note: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
+    },
+    /// Resolves a primary-checkout lease conflict by instantiating the original
+    /// Template in a daemon-created isolated checkout. `template_branch` is the
+    /// value from the failed request used for name rendering; `branch` is the
+    /// isolated Git branch that will actually be created.
+    CreateWorktreeSessionFromTemplate {
+        workspace_id: WorkspaceId,
+        template_id: TemplateId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template_branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
     },
     CreateSessionFromTemplate {
         workspace_id: WorkspaceId,
@@ -542,7 +577,13 @@ impl Request {
             Request::ListSessions { .. } => "list_sessions",
             Request::CreateSession { .. } => "create_session",
             Request::CreateReadOnlySession { .. } => "create_read_only_session",
+            Request::CreateReadOnlySessionFromTemplate { .. } => {
+                "create_read_only_session_from_template"
+            }
             Request::CreateWorktreeSession { .. } => "create_worktree_session",
+            Request::CreateWorktreeSessionFromTemplate { .. } => {
+                "create_worktree_session_from_template"
+            }
             Request::CreateSessionFromTemplate { .. } => "create_session_from_template",
             Request::RenameSession { .. } => "rename_session",
             Request::ArchiveSession { .. } => "archive_session",
@@ -606,7 +647,9 @@ impl Request {
             Request::ListSessions { .. } => "sessions",
             Request::CreateSession { .. }
             | Request::CreateReadOnlySession { .. }
+            | Request::CreateReadOnlySessionFromTemplate { .. }
             | Request::CreateWorktreeSession { .. }
+            | Request::CreateWorktreeSessionFromTemplate { .. }
             | Request::CreateSessionFromTemplate { .. }
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }

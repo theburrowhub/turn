@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as SystemCommand;
 use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template,
+    Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template, Workspace,
     WorkspaceCheckout,
 };
 use turn_proto::{CloseDisposition, NewPane, ProtoError, Response, ServerEvent, TemplateSummary};
@@ -101,6 +101,60 @@ impl Core {
         session.attention = workspace.attention.clone();
         session.env = workspace.env.clone();
         session.mode = SessionMode::ReadOnly;
+        session.read_only_enforced = false;
+        session.cwd = self.validate_session_definition_cwds(&session)?;
+        let id = session.id.clone();
+        self.store
+            .hierarchy()
+            .create_read_only_session(&session, false)
+            .map_err(store)?;
+        self.sessions.insert(id.clone(), session);
+        self.touch_workspace(workspace_id, now_ms);
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        self.answer_session(&id, now_ms)
+    }
+
+    /// Creates the safe read-only alternative from the same authoritative
+    /// Template request that lost the primary-checkout lease race.
+    ///
+    /// The client supplies only Template identity and interpolation inputs. It
+    /// cannot flatten a summary back into panes, environment or policy. As with
+    /// ordinary read-only Sessions, configured commands remain visible in the
+    /// Layout but are not launched without a technical write guard.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_read_only_session_from_template(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        template_id: &TemplateId,
+        name: Option<String>,
+        cwd: Option<String>,
+        branch: Option<String>,
+        task: Option<String>,
+        now_ms: i64,
+    ) -> Answer {
+        let workspace = self.workspace(workspace_id)?.clone();
+        let template = self
+            .templates
+            .get(template_id)
+            .ok_or_else(|| ProtoError::not_found("template", template_id.as_str()))?
+            .clone();
+        let cwd = cwd
+            .filter(|cwd| !cwd.trim().is_empty())
+            .unwrap_or_else(|| workspace.root.clone());
+        let git_branch = branch.clone();
+        let mut session = instantiate_template_session(
+            workspace_id,
+            &workspace,
+            &template,
+            name,
+            cwd,
+            branch.as_deref(),
+            task.as_deref(),
+            git_branch,
+            SessionMode::ReadOnly,
+            now_ms,
+        )?;
         session.read_only_enforced = false;
         session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
@@ -218,6 +272,164 @@ impl Core {
         }
         self.sessions.insert(id.clone(), session);
         self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
+        self.materialise_session(&id, now_ms);
+        self.touch_workspace(workspace_id, now_ms);
+        self.persist_session(&id)?;
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        self.answer_session(&id, now_ms)
+    }
+
+    /// Creates the isolated alternative from an authoritative Template rather
+    /// than from a client's lossy summary of it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_worktree_session_from_template(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        template_id: &TemplateId,
+        name: Option<String>,
+        cwd: Option<String>,
+        template_branch: Option<String>,
+        task: Option<String>,
+        branch: String,
+        worktree_path: Option<String>,
+        now_ms: i64,
+    ) -> Answer {
+        let branch = validate_git_branch(&branch)?;
+        let workspace = self.workspace(workspace_id)?.clone();
+        let template = self
+            .templates
+            .get(template_id)
+            .ok_or_else(|| ProtoError::not_found("template", template_id.as_str()))?
+            .clone();
+        // Validate the user-visible name before Git or the filesystem is changed.
+        let name = render_template_session_name(
+            &template,
+            name,
+            template_branch.as_deref(),
+            task.as_deref(),
+        )?;
+        let path = resolve_worktree_path(
+            &self.data_dir,
+            workspace_id,
+            &branch,
+            worktree_path.as_deref(),
+        )?;
+        if path.exists() {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "The isolated worktree path already exists",
+            )
+            .with_detail(path.display().to_string()));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| ProtoError::invalid("The worktree path needs a parent directory"))?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "The worktree parent directory could not be created",
+            )
+            .with_detail(error.to_string())
+        })?;
+        create_git_worktree(Path::new(&workspace.root), &path, &branch)?;
+
+        let canonical = std::fs::canonicalize(&path).map_err(|error| {
+            rollback_git_worktree(Path::new(&workspace.root), &path);
+            ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "The new worktree could not be resolved",
+            )
+            .with_detail(error.to_string())
+        })?;
+        let session_cwd = match remap_template_cwd_to_worktree(
+            Path::new(&workspace.root),
+            &canonical,
+            cwd.as_deref(),
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                rollback_git_worktree(Path::new(&workspace.root), &path);
+                return Err(error);
+            }
+        };
+        let mut session = match instantiate_template_session(
+            workspace_id,
+            &workspace,
+            &template,
+            Some(name),
+            session_cwd,
+            template_branch.as_deref(),
+            task.as_deref(),
+            Some(branch.clone()),
+            SessionMode::IsolatedWorktree,
+            now_ms,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                rollback_git_worktree(Path::new(&workspace.root), &path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = remap_absolute_template_pane_cwds(
+            &mut session.layout,
+            Path::new(&workspace.root),
+            &canonical,
+        ) {
+            rollback_git_worktree(Path::new(&workspace.root), &path);
+            return Err(error);
+        }
+        session.checkout_id = CheckoutId::new();
+        session.worktree_path = Some(canonical.to_string_lossy().to_string());
+        let id = session.id.clone();
+        let inherited_resources = match self
+            .store
+            .hierarchy()
+            .primary_checkout(workspace_id)
+            .map_err(store)
+        {
+            Ok(checkout) => checkout
+                .map(|checkout| checkout.shared_resources)
+                .unwrap_or_default(),
+            Err(error) => {
+                rollback_git_worktree(Path::new(&workspace.root), &path);
+                return Err(error);
+            }
+        };
+        let checkout = WorkspaceCheckout {
+            id: session.checkout_id.clone(),
+            workspace_id: workspace_id.clone(),
+            path: canonical.to_string_lossy().to_string(),
+            canonical_path: canonical.to_string_lossy().to_string(),
+            branch: Some(branch),
+            primary: false,
+            shared_resources: inherited_resources,
+            created_ms: now_ms,
+        };
+        session.cwd = match self.validate_session_definition_cwds_for_checkout(&session, &checkout)
+        {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                rollback_git_worktree(Path::new(&workspace.root), &path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .store
+            .hierarchy()
+            .create_worktree_session(&session, &checkout)
+        {
+            rollback_git_worktree(Path::new(&workspace.root), &path);
+            return Err(store(error));
+        }
+        self.sessions.insert(id.clone(), session);
+        let init: Vec<String> = workspace
+            .init_commands
+            .iter()
+            .cloned()
+            .chain(template.init_commands.iter().cloned())
+            .collect();
+        self.run_init_commands(&id, &init, now_ms);
         self.materialise_session(&id, now_ms);
         self.touch_workspace(workspace_id, now_ms);
         self.persist_session(&id)?;
@@ -502,6 +714,133 @@ impl Core {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn instantiate_template_session(
+    workspace_id: &WorkspaceId,
+    workspace: &Workspace,
+    template: &Template,
+    name: Option<String>,
+    cwd: String,
+    render_branch: Option<&str>,
+    task: Option<&str>,
+    git_branch: Option<String>,
+    mode: SessionMode,
+    now_ms: i64,
+) -> Result<Session, ProtoError> {
+    let name = render_template_session_name(template, name, render_branch, task)?;
+    let mut session = Session::new(
+        workspace_id.clone(),
+        name,
+        cwd,
+        template.instantiate(),
+        now_ms,
+    );
+    session.template_id = Some(template.id.clone());
+    session.attention = template
+        .attention
+        .clone()
+        .unwrap_or_else(|| workspace.attention.clone());
+    session.env = workspace
+        .env
+        .iter()
+        .cloned()
+        .chain(template.env.iter().cloned())
+        .collect();
+    session.tmux = template.tmux;
+    session.git_branch = git_branch;
+    session.mode = mode;
+    Ok(session)
+}
+
+fn render_template_session_name(
+    template: &Template,
+    name: Option<String>,
+    branch: Option<&str>,
+    task: Option<&str>,
+) -> Result<String, ProtoError> {
+    let rendered = match name {
+        Some(name) => name,
+        None => template
+            .render_name(branch, task)
+            .unwrap_or_else(|| template.name.clone()),
+    };
+    check_name(&rendered)
+}
+
+/// Maps a cwd from the primary checkout to the same repository-relative
+/// directory in a freshly created worktree. No process is launched in the
+/// primary checkout, and an absolute path outside it is never carried over.
+fn remap_template_cwd_to_worktree(
+    primary_root: &Path,
+    worktree_root: &Path,
+    requested: Option<&str>,
+) -> Result<String, ProtoError> {
+    let primary = std::fs::canonicalize(primary_root).map_err(|error| {
+        ProtoError::refused("The primary checkout cannot be resolved safely")
+            .with_detail(format!("{}: {error}", primary_root.display()))
+    })?;
+    let worktree = std::fs::canonicalize(worktree_root).map_err(|error| {
+        ProtoError::refused("The isolated checkout cannot be resolved safely")
+            .with_detail(format!("{}: {error}", worktree_root.display()))
+    })?;
+    let source = match requested.filter(|cwd| !cwd.trim().is_empty()) {
+        Some(cwd) if Path::new(cwd).is_absolute() => PathBuf::from(cwd),
+        Some(cwd) => primary.join(cwd),
+        None => primary.clone(),
+    };
+    let source = std::fs::canonicalize(&source).map_err(|error| {
+        ProtoError::refused("The Template working directory cannot be resolved safely")
+            .with_detail(format!("{}: {error}", source.display()))
+    })?;
+    if !source.is_dir() || !source.starts_with(&primary) {
+        return Err(ProtoError::refused(
+            "The Template working directory is outside the primary checkout",
+        )
+        .with_detail(source.display().to_string()));
+    }
+    let relative = source.strip_prefix(&primary).map_err(|_| {
+        ProtoError::refused("The Template working directory cannot be mapped safely")
+    })?;
+    let target = std::fs::canonicalize(worktree.join(relative)).map_err(|error| {
+        ProtoError::refused("The Template working directory is absent from the worktree")
+            .with_detail(format!("{}: {error}", worktree.join(relative).display()))
+    })?;
+    if !target.is_dir() || !target.starts_with(&worktree) {
+        return Err(ProtoError::refused(
+            "The mapped Template working directory is outside the worktree",
+        )
+        .with_detail(target.display().to_string()));
+    }
+    Ok(target.to_string_lossy().into_owned())
+}
+
+/// Absolute Pane cwds saved from the primary checkout need the same repository-
+/// relative translation as the Session cwd. Relative Pane cwds are already
+/// relative to the newly mapped Session cwd and remain byte-for-byte intact.
+fn remap_absolute_template_pane_cwds(
+    layout: &mut Layout,
+    primary_root: &Path,
+    worktree_root: &Path,
+) -> Result<(), ProtoError> {
+    let absolute: Vec<_> = layout
+        .panes()
+        .into_iter()
+        .filter_map(|pane| {
+            pane.cwd
+                .as_ref()
+                .filter(|cwd| Path::new(cwd).is_absolute())
+                .map(|cwd| (pane.id.clone(), cwd.clone()))
+        })
+        .collect();
+    for (pane_id, cwd) in absolute {
+        let mapped = remap_template_cwd_to_worktree(primary_root, worktree_root, Some(&cwd))?;
+        if let Some(pane) = layout.get_mut(&pane_id) {
+            pane.cwd = Some(mapped);
+        }
+    }
+    Ok(())
+}
+
 /// Builds a layout from a list of panes.
 ///
 /// Each new pane joins the previous one's split in the same direction, which
@@ -756,6 +1095,171 @@ mod tests {
             before,
             "refused labels must not create partial navigation state"
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_template_resolution_keeps_daemon_owned_configuration() {
+        let mut harness = Harness::new().await;
+        let project = harness._dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let root = harness._dir.path().to_string_lossy().into_owned();
+        let workspace_id = match harness
+            .core
+            .create_workspace("space-troopers".into(), root, 10)
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness.core.workspaces.get_mut(&workspace_id).unwrap().env =
+            vec![("FROM_WORKSPACE".into(), "workspace".into())];
+        harness
+            .core
+            .create_session(
+                &workspace_id,
+                "Primary writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap();
+
+        let mut template = Template::coding(12);
+        template.name_pattern = Some("Review {branch}: {task}".into());
+        template.env = vec![("FROM_TEMPLATE".into(), "template".into())];
+        let policy = turn_core::attention::AttentionPolicy {
+            cooldown_seconds: 37,
+            ..Default::default()
+        };
+        template.attention = Some(policy.clone());
+        template.tmux = true;
+        let agent_id = template.layout.panes()[0].id.clone();
+        let agent = template.layout.get_mut(&agent_id).unwrap();
+        agent.args = vec!["--model".into(), "sonnet".into()];
+        agent.cwd = Some(".".into());
+        agent.env = vec![("PANE_SETTING".into(), "kept".into())];
+        let template_id = template.id.clone();
+        let expected_panes: Vec<_> = template
+            .layout
+            .panes()
+            .into_iter()
+            .map(|pane| {
+                (
+                    pane.kind,
+                    pane.title.clone(),
+                    pane.command.clone(),
+                    pane.args.clone(),
+                    pane.cwd.clone(),
+                    pane.env.clone(),
+                    pane.restore,
+                )
+            })
+            .collect();
+        harness.core.templates.insert(template_id.clone(), template);
+
+        let response = harness
+            .core
+            .create_read_only_session_from_template(
+                &workspace_id,
+                &template_id,
+                None,
+                Some(project.to_string_lossy().into_owned()),
+                Some("feat/layout".into()),
+                Some("preserve everything".into()),
+                13,
+            )
+            .unwrap();
+        let id = match response {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session = &harness.core.sessions[&id];
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        assert_eq!(session.name, "Review feat/layout: preserve everything");
+        assert_eq!(session.mode, SessionMode::ReadOnly);
+        assert_eq!(session.template_id.as_ref(), Some(&template_id));
+        assert_eq!(Path::new(&session.cwd), canonical_project);
+        assert_eq!(session.git_branch.as_deref(), Some("feat/layout"));
+        assert_eq!(
+            session.env,
+            vec![
+                ("FROM_WORKSPACE".into(), "workspace".into()),
+                ("FROM_TEMPLATE".into(), "template".into())
+            ]
+        );
+        assert_eq!(session.attention, policy);
+        assert!(session.tmux);
+        let actual_panes: Vec<_> = session
+            .layout
+            .panes()
+            .into_iter()
+            .map(|pane| {
+                (
+                    pane.kind,
+                    pane.title.clone(),
+                    pane.command.clone(),
+                    pane.args.clone(),
+                    pane.cwd.clone(),
+                    pane.env.clone(),
+                    pane.restore,
+                )
+            })
+            .collect();
+        assert_eq!(actual_panes, expected_panes);
+        assert!(harness
+            .core
+            .processes
+            .values()
+            .all(|process| process.session_id != id));
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .get(&id)
+            .unwrap()
+            .expect("the safe Session is durable");
+        assert_eq!(stored.template_id.as_ref(), Some(&template_id));
+        assert_eq!(stored.layout.pane_count(), 3);
+    }
+
+    #[test]
+    fn worktree_template_mapping_preserves_relative_cwds_and_remaps_absolute_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let isolated = temp.path().join("isolated");
+        for root in [&primary, &isolated] {
+            std::fs::create_dir_all(root.join("project/tools")).unwrap();
+        }
+        let absolute = Pane::new(PaneKind::Agent)
+            .with_command("claude")
+            .with_cwd(primary.join("project/tools").to_string_lossy());
+        let mut layout = Layout::single(absolute);
+        let first = layout.active.clone().unwrap();
+        layout.split(
+            &first,
+            Direction::Horizontal,
+            Pane::new(PaneKind::Shell).with_cwd("tools"),
+        );
+
+        let primary_project = primary.join("project");
+        let mapped_session = remap_template_cwd_to_worktree(
+            &primary,
+            &isolated,
+            Some(primary_project.to_string_lossy().as_ref()),
+        )
+        .unwrap();
+        let isolated_project = std::fs::canonicalize(isolated.join("project")).unwrap();
+        assert_eq!(Path::new(&mapped_session), isolated_project);
+        remap_absolute_template_pane_cwds(&mut layout, &primary, &isolated).unwrap();
+        let panes = layout.panes();
+        let isolated_tools = std::fs::canonicalize(isolated.join("project/tools"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(panes[0].cwd.as_deref(), Some(isolated_tools.as_str()));
+        assert_eq!(panes[1].cwd.as_deref(), Some("tools"));
     }
 
     #[test]

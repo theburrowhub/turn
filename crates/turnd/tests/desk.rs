@@ -3,9 +3,12 @@
 mod common;
 
 use common::*;
-use turn_core::model::{PaneKind, RestoreBehaviour};
+use std::path::Path;
+use std::process::Command as SystemCommand;
+use turn_core::model::{PaneKind, RestoreBehaviour, SessionMode};
 use turn_proto::{
-    CloseDisposition, ErrorCode, FocusTarget, NewPane, PtySize, Request, Response, ServerEvent,
+    CloseDisposition, ErrorCode, FocusTarget, NewPane, ProtoErrorContext, PtySize, Request,
+    Response, ServerEvent,
 };
 
 /// Creates a workspace and a session from the built-in Coding template.
@@ -102,6 +105,219 @@ async fn a_session_from_the_coding_template_has_its_panes_and_real_processes_beh
     assert!(
         shell.turn.is_none(),
         "a shell owes the user nothing, so it has no turn state"
+    );
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_lease_conflict_alternatives_keep_coding_authoritative_and_isolated() {
+    let daemon = TestDaemon::start().await;
+    let repository = daemon.data_dir().join("template-conflict-repository");
+    std::fs::create_dir_all(repository.join("project")).unwrap();
+    let run_git = |args: &[&str]| {
+        let output = SystemCommand::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(args)
+            .output()
+            .expect("Git must run");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "turn@example.invalid"]);
+    run_git(&["config", "user.name", "Turn Test"]);
+    std::fs::write(repository.join("README.md"), "turn\n").unwrap();
+    std::fs::write(repository.join("project/.keep"), "tracked\n").unwrap();
+    run_git(&["add", "README.md", "project/.keep"]);
+    run_git(&["commit", "-m", "initial"]);
+
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "turn".into(),
+            root: repository.to_string_lossy().into_owned(),
+        })
+        .await,
+    );
+    let coding = match ui.ask(Request::ListTemplates).await {
+        Response::Templates { templates } => templates
+            .into_iter()
+            .find(|template| template.name == "Coding")
+            .expect("Coding is installed"),
+        other => panic!("expected templates, got {other:?}"),
+    };
+    let writer = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id.clone(),
+            name: "Primary writer".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let requested_cwd = repository.join("project").to_string_lossy().into_owned();
+
+    for name in ["Read-only Coding", "Isolated Coding"] {
+        let error = ui
+            .try_ask(Request::CreateSessionFromTemplate {
+                workspace_id: workspace.id.clone(),
+                template_id: coding.id.clone(),
+                name: Some(name.into()),
+                cwd: Some(requested_cwd.clone()),
+                branch: None,
+                task: Some("keep the complete template".into()),
+            })
+            .await
+            .expect_err("the primary writer must keep its lease");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(matches!(
+            error.context.as_deref(),
+            Some(ProtoErrorContext::WorkspaceWriteLeaseConflict { .. })
+        ));
+    }
+
+    let read_only = session_of(
+        ui.ask(Request::CreateReadOnlySessionFromTemplate {
+            workspace_id: workspace.id.clone(),
+            template_id: coding.id.clone(),
+            name: Some("Read-only Coding".into()),
+            cwd: Some(requested_cwd.clone()),
+            branch: None,
+            task: Some("keep the complete template".into()),
+        })
+        .await,
+    );
+    let read_only = details_of(
+        ui.ask(Request::GetSession {
+            session_id: read_only.id,
+        })
+        .await,
+    );
+    assert_eq!(read_only.summary.name, "Read-only Coding");
+    assert_eq!(read_only.summary.mode, SessionMode::ReadOnly);
+    assert_eq!(read_only.summary.template_id.as_ref(), Some(&coding.id));
+    assert_eq!(
+        Path::new(&read_only.summary.cwd),
+        std::fs::canonicalize(&requested_cwd).unwrap()
+    );
+    assert!(read_only.tree.is_empty(), "read-only commands stay guarded");
+
+    let isolated = session_of(
+        ui.ask(Request::CreateWorktreeSessionFromTemplate {
+            workspace_id: workspace.id.clone(),
+            template_id: coding.id.clone(),
+            name: Some("Isolated Coding".into()),
+            cwd: Some(requested_cwd),
+            template_branch: None,
+            task: Some("keep the complete template".into()),
+            branch: "turn/isolated-coding".into(),
+            worktree_path: None,
+        })
+        .await,
+    );
+    let isolated = details_of(
+        ui.ask(Request::GetSession {
+            session_id: isolated.id,
+        })
+        .await,
+    );
+    assert_eq!(isolated.summary.name, "Isolated Coding");
+    assert_eq!(isolated.summary.mode, SessionMode::IsolatedWorktree);
+    assert_eq!(isolated.summary.template_id.as_ref(), Some(&coding.id));
+    let worktree = isolated
+        .summary
+        .worktree_path
+        .as_ref()
+        .expect("the daemon records its isolated checkout");
+    assert_ne!(Path::new(worktree), repository.as_path());
+    assert!(isolated.summary.cwd.starts_with(worktree));
+    assert!(isolated.summary.cwd.ends_with("project"));
+    assert!(
+        isolated.tree.len() >= 2,
+        "Coding must start its agent and shell in the isolated checkout: {:#?}",
+        isolated.tree
+    );
+    assert!(isolated
+        .tree
+        .iter()
+        .all(|node| node.cwd.starts_with(worktree)));
+
+    let pane_shape = |details: &turn_proto::SessionDetails| {
+        details
+            .layout
+            .panes()
+            .into_iter()
+            .map(|pane| {
+                (
+                    pane.kind,
+                    pane.title.clone(),
+                    pane.command.clone(),
+                    pane.args.clone(),
+                    pane.env.clone(),
+                    pane.restore,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        (
+            PaneKind::Agent,
+            Some("claude".into()),
+            Some("claude".into()),
+            Vec::new(),
+            Vec::new(),
+            RestoreBehaviour::ReattachOnly,
+        ),
+        (
+            PaneKind::Shell,
+            Some("shell".into()),
+            None,
+            Vec::new(),
+            Vec::new(),
+            RestoreBehaviour::Relaunch,
+        ),
+        (
+            PaneKind::Tui,
+            Some("fang (files)".into()),
+            Some("fang".into()),
+            Vec::new(),
+            Vec::new(),
+            RestoreBehaviour::Relaunch,
+        ),
+    ];
+    assert_eq!(pane_shape(&read_only), expected);
+    assert_eq!(pane_shape(&isolated), expected);
+
+    let lease = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace.id,
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the original lease, got {other:?}"),
+    };
+    assert_eq!(lease.session_id, writer.id);
+    let status = SystemCommand::new("git")
+        .arg("-C")
+        .arg(&repository)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(
+        status.stdout.is_empty(),
+        "the primary checkout was modified: {}",
+        String::from_utf8_lossy(&status.stdout)
     );
 
     daemon.shutdown().await;
