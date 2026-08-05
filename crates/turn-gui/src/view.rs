@@ -279,9 +279,11 @@ impl WorkspaceDraft {
             .filter(|path| path != std::path::Path::new("/"))
             .and_then(|path| path.to_str().map(str::to_owned))
             .unwrap_or_default();
-        let name = (!root.is_empty())
-            .then(|| turn_core::model::Workspace::name_from_path(&root))
-            .unwrap_or_default();
+        let name = if root.is_empty() {
+            String::new()
+        } else {
+            turn_core::model::Workspace::name_from_path(&root)
+        };
         Self {
             name,
             root,
