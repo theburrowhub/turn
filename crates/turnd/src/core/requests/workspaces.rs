@@ -69,6 +69,19 @@ impl Core {
         archived: bool,
         now_ms: i64,
     ) -> Answer {
+        if archived
+            && self
+                .store
+                .hierarchy()
+                .active_lease(id)
+                .map_err(store)?
+                .is_some()
+        {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "Release this Workspace's primary-checkout write lease before archiving it",
+            ));
+        }
         let workspace = self
             .workspaces
             .get_mut(id)
@@ -76,8 +89,8 @@ impl Core {
         workspace.archived = archived;
         let workspace = workspace.clone();
         self.store.workspaces().save(&workspace).map_err(store)?;
-        // Archiving is a filing decision, not an instruction to stop work. The
-        // processes carry on; the row leaves the switcher.
+        // Archiving is a filing decision, not an instruction to stop work. A live
+        // write owner was rejected above so filing cannot hide checkout authority.
         self.answer_workspace(id, now_ms)
     }
 
@@ -179,6 +192,8 @@ fn workspace_store(error: turn_store::StoreError) -> ProtoError {
 mod tests {
     use super::*;
     use crate::core::testing::Harness;
+    use turn_core::model::PaneKind;
+    use turn_proto::NewPane;
 
     #[tokio::test]
     async fn create_workspace_refuses_a_missing_root_without_persisting_anything() {
@@ -229,5 +244,70 @@ mod tests {
                 .canonical_path,
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn a_workspace_with_an_unreleased_writer_cannot_be_archived() {
+        let mut harness = Harness::new().await;
+        let root = harness._dir.path().join("archive-root");
+        std::fs::create_dir(&root).unwrap();
+        let workspace = match harness
+            .core
+            .create_workspace(
+                "visible authority".into(),
+                root.to_string_lossy().into_owned(),
+                10,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness
+            .core
+            .create_session(
+                &workspace,
+                "writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap();
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .expect("the main Session owns the primary checkout");
+
+        let error = harness
+            .core
+            .archive_workspace(&workspace, true, 12)
+            .expect_err("archiving must not hide a live write owner");
+        assert_eq!(error.code, turn_proto::ErrorCode::Conflict);
+        assert!(!harness.core.workspaces[&workspace].archived);
+        assert!(
+            !harness
+                .core
+                .store
+                .workspaces()
+                .get(&workspace)
+                .unwrap()
+                .unwrap()
+                .archived
+        );
+
+        harness
+            .core
+            .release_workspace_write_lease(&workspace, &lease.id, lease.generation, 13)
+            .unwrap();
+        harness
+            .core
+            .archive_workspace(&workspace, true, 14)
+            .unwrap();
+        assert!(harness.core.workspaces[&workspace].archived);
     }
 }
