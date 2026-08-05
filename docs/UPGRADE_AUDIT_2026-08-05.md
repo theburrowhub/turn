@@ -16,7 +16,8 @@ packaging and platform accessibility sign-off remain open.
 
 | Requirement | Delivered invariant | Reproducible evidence |
 | --- | --- | --- |
-| One persistent hierarchy | The left AccessKit tree is the only persistent navigator; no Session tabs, thumbnail strip or second Agent tree | 20 native GUI tests, including 12 PNG baselines and a dense 30-Session fixture |
+| One persistent hierarchy | The left AccessKit tree is the only persistent navigator; no Session tabs, thumbnail strip or second Agent tree | 29 native GUI tests, including 15 PNG baselines and a dense 30-Session fixture |
+| Usable zero state | `+ Workspace` and `+ Session` are persistent actions; `Cmd+N` chains Workspace → Session on first run; `turn` starts a detached daemon companion when needed | Real macOS key-event test plus GUI → socket → daemon → SQLite restart integration |
 | One primary-checkout writer | One process owns the canonical data directory before Store/restore; canonical checkout identity, store-wide monotonic fence, atomic Session+lease creation and typed alternatives enforce one writer inside that authority domain | Same-data-dir/different-socket, data-dir alias, crash recovery, rollback, stale generation and conflict tests |
 | Safe parallel alternatives | Read-only Sessions refuse a write-capable launch without a technical guard; isolated Sessions create a real independent Git worktree and retain shared-resource declarations | Session request and real-worktree integration tests |
 | Agent independent of Pane | A node has zero-to-many bindings; closing a view never stops the Agent | Reviewer vertical and temporary-pane tests |
@@ -141,6 +142,17 @@ packaging and platform accessibility sign-off remain open.
     the authentic runtime that can receive input. It traverses only integrated/explicit `spawned_by` or
     `owns_process` ancestry, never crosses a distinct child runtime or provisional edge, never attributes
     the demand to the parent and never opens a Pane implicitly. `PaneFocusView` returns both identities.
+28. **First run rendered a product the user could not enter.** Workspace creation had no persistent visible
+    action, `Cmd+N` could resolve only a pre-existing Session path, requests issued offline could cross a
+    later daemon connection, and the desktop did not start that daemon. The unified tree now exposes
+    `+ Workspace` and `+ Session`; an empty `Cmd+N` opens Workspace creation and **Create and continue**
+    chains into the Session form. The desktop reuses or starts a detached sibling daemon, offline mutations
+    fail immediately, and connection generations fence stale requests. Creation is serialised until the
+    protocol gains operation ids, so a late conflict or unrelated Session response cannot borrow another
+    draft. Modal forms own keyboard and pointer input: Text/Paste/Enter cannot leak into a still-focused PTY,
+    fields receive initial focus, Enter submits single-line forms, and controls carry modal-dialog/label
+    accessibility relationships. A real boundary test proves Workspace → Blank Session → active lease →
+    selected hierarchy → daemon restart → SQLite restoration without launching Claude.
 
 ## Validation performed on the integrated branch
 
@@ -167,13 +179,15 @@ cargo test -p turnd \
   a_data_directory_rejects_another_socket_and_recovers_after_sigkill \
   -- --test-threads=1 --nocapture
 
+cargo test -p turn-gui --test onboarding -- --test-threads=1
+cargo test -p turn-gui --all-targets -- --test-threads=4
 cargo test --workspace --all-targets --no-fail-fast -- --test-threads=1
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
 ```
 
-The workspace run includes 20 native GUI tests, 12 of which compare committed PNG baselines without
+The workspace run includes 29 native GUI integration tests, 15 of which compare committed PNG baselines without
 regenerating them. The exact Reviewer test crosses the real loopback Claude hook transport and production
 normaliser, closes a temporary view without stopping the worker, reconnects a replacement UI to the same
 daemon and verifies that relationship, name, preview, live process and Layout facts survive. Separate daemon
