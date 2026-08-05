@@ -325,8 +325,8 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_full_screen_program_reports_its_alternate_screen_and_its_input_modes`,
 `the_indexed_palette_matches_the_xterm_cube_and_greys` — plus
 `every_state_has_a_glyph_as_well_as_a_colour` and
-`the_attention_colour_is_reserved_for_states_that_block_the_user`. The native suite has 20 tests, including
-12 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
+`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 24
+tests, including 15 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
 `an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
@@ -404,8 +404,9 @@ packaging are still open.
 - **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and the
   full Rust suite, all green on both runners. There is no Node/UI job in the current native-Rust frontend;
   Linux still needs reviewed visual baselines rather than a silently skipped comparison.
-- **Packaging**: a signed macOS bundle, a Linux artefact, `turn-hook` installed and locatable, and a
-  first-run experience that works with no configuration.
+- **Packaging**: the runtime topology and first-run bootstrap are implemented — `turn` reuses or starts a
+  detached sibling `turnd`, and `turnd` locates a sibling `turn-hook`. What remains is a signed macOS bundle,
+  a Linux archive, an explicit cross-binary version check and release acceptance of that sibling set.
 - **Contract-drift monitoring**: re-record the Claude Code fixture against the current release, add a Codex
   fixture recorded live rather than shaped from documentation, and verify the two Codex assumptions still
   outstanding (§Open decisions).
@@ -456,10 +457,10 @@ global or per-Workspace navigator.
 | 3 | ~~Does installing hooks into Codex require interactive trust on first launch?~~ **Settled live: yes.** See Risk 5 — `codex exec` silently runs nothing, the TUI blocks on a review dialog, `notify` is ungated. `HooksAndNotify` therefore cannot claim `Structured` by default; what remains is a product decision, not a question about Codex. | Done; the two product decisions moved to Risk 5. |
 | 4 | **What are the `execution_mode` semantics** (`blocking` / `await`)? Left unset deliberately, because guessing risks configuring Codex to wait on Turn. | Reading Codex's source or a controlled experiment. |
 | 5 | **How does the daemon defend against pid reuse when re-attaching?** The stored command line is the only corroboration and it is weak. | M9 restore hardening, tested adversarially. |
-| 6 | **Where does the daemon live, and what is the single-instance rule?** Settled in the daemon: `paths::resolve_socket_path` takes flag, then `TURN_SOCKET`, then `<runtime-or-data-dir>/turnd.sock`, and refuses a path too long for macOS `sun_path`. Socket occupancy is probed through the real handshake, while store ownership is separately enforced by a non-blocking OS lock on the canonical `data_dir` before SQLite/migrations/restore. Different sockets do not permit two store owners; stale socket files and process locks recover after process death. The remaining question is only which packaged component starts the daemon on first run. | M9 packaging. |
+| 6 | ~~**Where does the daemon live, who starts it, and what is the single-instance rule?**~~ **Settled:** `turn` resolves one absolute data-dir/socket pair, reuses a reachable endpoint or starts a detached sibling `turnd`; a debug source build uses its fixed Cargo workspace. The daemon's canonical data-directory lock — not socket occupancy — is the store/PTY ownership authority, so concurrent windows and socket aliases cannot create two owners. See ADR-042. | Done. |
 | 8 | **Per-`PaneKind` buffer bounds.** `with_capacity` takes both bounds; nothing uses them non-default yet. | M9 measurement. |
 | 9 | **Does `TerminalBuffer::replay()` need scrollback, or is the visible screen enough?** Today a re-attached Pane starts with no history above the fold (ADR-023). | M8 scenario 5, with real users. |
-| 10 | **How is `turn-hook` located at runtime,** and what happens on version skew with the daemon? | M9 packaging. |
+| 10 | ~~**How is `turn-hook` located at runtime?**~~ **Settled:** it is a packaged sibling located beside `turnd`, never an arbitrary `PATH` result; source bootstrap builds both together. **Open remainder:** add an explicit version-skew check and define the user-facing degraded state for a mismatched sibling. | M9 packaging. |
 
 ---
 
@@ -747,8 +748,10 @@ Concrete, verified items. Each is real today.
 
 ### Missing artefacts
 
-4. **No `turn-hook` install story.** It is built as a workspace binary; nothing locates it at runtime, and
-   there is no version-skew check against the daemon.
+4. **The sibling package is not yet a signed/distributed artefact.** Runtime location is implemented:
+   release builds expect `turn`, `turnd` and `turn-hook` beside one another, `turnd` locates the helper beside
+   itself, and source bootstrap builds both companions. A signed bundle/archive and an explicit version-skew
+   check are still missing.
 5. **`docs/PROTOCOL.md` is not checked against the code by CI.** `turn-proto`'s catalogue tests keep
    `Request::expected_result` honest, but nothing asserts the prose document still matches it.
 

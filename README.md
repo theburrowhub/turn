@@ -60,7 +60,8 @@ and no second lockfile. The tests are real: `turn-pty` spawns
 actual processes on actual ptys and asks the tty itself via `stty size`; `turn-agents` asserts against hook
 payloads recorded from a live Claude Code run; `turn-store` writes real SQLite files and searches them for
 secrets; `turn-gui`'s snapshot tests render the real widget tree through `wgpu` with no display attached and
-diff it against committed PNGs. The native suite contains 20 tests, 12 of which maintain PNG baselines;
+diff it against committed PNGs. The snapshot integration target contains 24 tests, 15 of which maintain
+committed PNG baselines;
 the dense fixture contains 30 Sessions, not a measured 30-Agent performance result. See `ROADMAP.md` for
 what each milestone delivered and how it was verified.
 
@@ -141,14 +142,26 @@ cargo test -p turn-gui
 UPDATE_SNAPSHOTS=1 cargo test -p turn-gui   # re-record after an intended change
 ```
 
-On an empty first launch, press **⌘N**, choose **Create Workspace**, complete the
-workspace sheet with **Create and continue**, then create the first task with **New
-Session**. The Workspace action remains visible even when there is no selection; once a
-workspace is selected, **⌘N** and **New Session** both create a Session inside it.
+### First run: create real work
+
+1. In an empty window, click **+ Workspace** in the left hierarchy. **⌘N** is the keyboard route to the
+   same first-run flow when no Workspace exists.
+2. Enter a name and an existing absolute project directory, then choose **Create and continue**. Turn
+   persists the Workspace and opens the Session form; this is not a launcher-only placeholder.
+3. Choose the Workspace and Template, name the task, optionally add a note, and choose **Create session**.
+   The new Session is selected in the hierarchy and owns the main-checkout write lease.
+
+After first run, **+ Workspace** always creates another Workspace. Select a Workspace and use **+ Session**
+or **⌘N** to open the full Session form. **⌘⇧N** is **Quick New**: it creates `Session N` immediately in
+the visibly selected Workspace using that Workspace's default Template, then `Coding`, then the first
+available Template. It never silently chooses a different Workspace, and a second create is refused while
+the first is still awaiting its daemon response.
 
 `turn` reuses a daemon already listening on its socket. When none is listening it starts `turnd` as a
 detached companion, so closing the window does not stop the daemon, its PTYs or its agents. Packaged builds
-place `turnd` beside `turn`; a source build falls back to the exact Cargo workspace it was compiled from.
+place `turn`, `turnd` and `turn-hook` beside one another; `turnd` resolves the helper beside itself rather
+than searching `PATH`. A debug source build falls back to the exact Cargo workspace it was compiled from
+and builds both companions before starting the daemon.
 `TURN_TURND_BIN` can name an explicit companion binary for an unusual development layout. Companion output
 is appended to `turnd.log` under `TURN_DATA_DIR` (or Turn's platform data directory), and a launch failure is
 shown in the window.

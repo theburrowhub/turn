@@ -55,6 +55,7 @@ Status values:
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
 | [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implemented for the first vertical; narrowly amends ADR-036 |
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
+| [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 
 ---
 
@@ -2049,9 +2050,10 @@ and the flag would take it on their behalf — asserted by
 - **Downside:** the `notify` payload has no `background_tasks` equivalent, so the case ADR-014 made a
   reported fact for Claude Code is unavailable here. `background_tasks` is hard-coded to 0 for Codex rather
   than inferred, which is honest and also means the asymmetry is visible to users.
-- **Downside:** `notify` is a command invocation, so this path depends on the `turn-hook` helper being
-  installed and locatable (ADR-026, `ROADMAP.md` Open decision 10). Codex has no HTTP handler type, so
-  unlike Claude Code there is no helper-free route.
+- **Downside:** `notify` is a command invocation, so this path depends on the packaged `turn-hook` sibling
+  being present beside `turnd` (ADR-026, ADR-042). A missing helper degrades explicitly rather than falling
+  back to an arbitrary binary on `PATH`; cross-binary version validation remains packaging work. Codex has
+  no HTTP handler type, so unlike Claude Code there is no helper-free route.
 
 ---
 
@@ -2437,3 +2439,98 @@ change onto a later retry. Effects published after a successful checkpoint do no
 - **Downside:** while SQLite remains unavailable the in-memory reducer is ahead of durable state and later
   runtime events wait in memory. The hook ingress remains bounded and may drop rather than stall Agents;
   explicit queue bounds/coalescing for a prolonged disk outage remain hardening work.
+
+---
+
+<a id="adr-042"></a>
+## ADR-042 — The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs
+
+**Status:** Accepted, implemented. Extends ADR-002's daemon boundary, ADR-030's socket transport and
+ADR-040's Workspace/Session creation rules.
+
+### Context
+
+The native window was a real protocol client but still assumed that somebody had started `turnd` by hand.
+On a clean machine that made the product's first instruction fail before the user could create a Workspace:
+the form could render, but no authority existed to persist it or acquire its write lease. Requiring a shell
+command before the first desktop action contradicted both the zero-state experience and the reason to ship a
+desktop entry point.
+
+Startup also has two distinct notions of ownership. A socket says where clients should connect; it does not
+prove who may migrate or write the database. Conversely, the canonical data-directory lock establishes one
+store/PTY owner even when two clients race through different socket aliases. Collapsing those concepts would
+make stale endpoints or two simultaneously opened windows dangerous.
+
+Finally, protocol request envelopes correlate a response to a transport request, but Workspace and Session
+creation do not yet carry a durable operation id into the UI's product state. Allowing two creations to
+overlap would let a late lease conflict or generic Session response consume the newer form's intent.
+
+### Alternatives considered
+
+**Require the user to install and start a service.** Rejected for the first-run product path. A service may
+be a future distribution option, but creating the first Workspace cannot depend on terminal setup.
+
+**Run the daemon in the window process.** Rejected. Closing or crashing the window would close every PTY,
+and the protocol/process boundary that made the UI replaceable would become theatre.
+
+**Spawn an ordinary child and kill it with the window.** Rejected for the same lifetime reason. The daemon
+must outlive the UI that happened to start it.
+
+**Search `PATH` for `turnd` and `turn-hook`.** Rejected. It can pair the window, daemon and hook helper from
+different installations, and it makes the effective executable depend on mutable shell configuration a GUI
+may not even inherit.
+
+**Permit parallel create requests and infer which draft a response belongs to.** Rejected until the
+protocol carries explicit operation ids. Workspace identity is insufficient when two Session attempts can
+target the same Workspace.
+
+### Decision
+
+The `turn` desktop binary resolves one absolute data-directory/socket pair once at startup. It probes the
+endpoint first. A reachable listener is left untouched and the normal protocol handshake decides whether it
+is a compatible Turn daemon. If the endpoint is absent or stale, the window starts `turnd` as a **detached
+companion** with the exact `--socket` and `--data-dir` values. No shell is involved; stdin is null, output is
+appended to an owner-only, symlink-refusing `turnd.log`, and on Unix the companion receives its own process
+session. Dropping the monitor or closing the window never terminates it.
+
+Executable resolution is closed and ordered:
+
+1. a non-blank `TURN_TURND_BIN` override for controlled development/package layouts;
+2. `turnd` beside the running `turn` executable — the release package contract;
+3. in debug builds only, `cargo run` against the fixed workspace manifest compiled into this source build.
+
+The source fallback builds both `turnd` and `turn-hook` first. Release builds fail visibly if the packaged
+sibling is absent; they do not search `PATH`. The release/CI build produces the sibling set `turn`, `turnd`
+and `turn-hook`, and `turnd` locates `turn-hook` beside its own executable. A missing helper is non-fatal but
+forces the affected adapter to report its degraded integration level.
+
+Socket probing is only a bootstrap hint. `turnd` remains authoritative: before SQLite, migrations or
+restore it must acquire the non-blocking lock on the canonical data directory. Two windows may race to
+launch; one daemon wins that lock and the other's exit code 3 is treated as provisional contention until a
+real handshake succeeds. The GUI never removes a non-socket filesystem entry, never adopts an unverified
+listener, and never treats a different socket as permission for a second store owner.
+
+Synchronous launch errors and later companion exits are shown in the window and logged. A successful
+handshake clears only the companion diagnostic. The daemon surviving the UI is guaranteed; surviving a
+daemon exit is not, because its process owns the PTY masters (ADR-002).
+
+Until create operations gain explicit ids, the desktop permits exactly **one Workspace or Session creation
+in flight**. New, Quick New and form submission all share that gate. The pending Template/workspace/name/task
+intent remains attached to its own request; unrelated Session responses cannot clear it, and a connection
+generation change returns the form to a visible failed/retry state rather than replaying the mutation to a
+different daemon.
+
+### Consequences
+
+- A clean desktop launch can create a Workspace and Session without a separate daemon command.
+- Quitting the window does not stop Agents. Reopening it reconnects through the same protocol and store.
+- Endpoint discovery cannot weaken the data-directory singleton boundary; startup races fail safely.
+- The helper install location is no longer open-ended: package all three sibling binaries from the same
+  build. Signed bundles/archives and an explicit cross-binary version check remain M9 work.
+- Companion failure is actionable in the UI and has a stable local log, rather than looking like an inert
+  button.
+- **Downside:** the first debug launch may block while Cargo builds both companions.
+- **Downside:** there is no automatic idle-daemon shutdown policy; persistence is preferred to guessing
+  that a background Agent is disposable.
+- **Downside:** serial creation prevents legitimate parallel setup. Add operation ids to the protocol and
+  drafts before relaxing this gate; timing-based correlation is not an acceptable substitute.

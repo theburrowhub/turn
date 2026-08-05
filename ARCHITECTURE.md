@@ -50,12 +50,19 @@ Turn is one Rust cargo workspace: six library crates, the daemon, and the window
 (`turnd`, the daemon); another renders it (`turn-gui`). They talk over a protocol rather than sharing memory,
 because the whole point of the daemon is that the UI can go away.
 
+The desktop executable is also the zero-state bootstrapper, but not the daemon owner. It resolves one
+absolute data-directory/socket pair, reuses a reachable endpoint or starts a detached sibling `turnd`, then
+connects through the same protocol either way. The companion has an independent process lifetime: closing
+the window drops only its monitor, never the daemon or its PTYs. ADR-042 records the launch and packaging
+contract.
+
 ```
                      ┌──────────────────────────────────────────────────┐
                      │  turn-gui  (eframe/egui on wgpu — native, no     │
                      │  webview)              BUILT: FIRST VERTICAL    │
                      │  unified hierarchy · user-chosen panes ·         │
-                     │  contextual inspector · permission banner        │
+                     │  contextual inspector · permission banner ·      │
+                     │  reuse/start detached sibling daemon             │
                      └───────────────────┬──────────────────────────────┘
                                          │ turn-proto  v3 BUILT
                                          │ newline-delimited JSON over a unix socket
@@ -813,6 +820,32 @@ Reviewer tests cross both the production reducer and the real loopback Claude ho
 authenticated external Claude Code session in the packaged native window remains a separate acceptance
 gate; deterministic coverage is not evidence that credentials, signing or the installed release work.
 
+#### Desktop bootstrap and process lifetime
+
+`turn-gui::transport::socket::startup_paths` resolves the data directory and control socket once and anchors
+relative overrides before any development fallback changes working directory. `turn-gui::companion` then
+probes that exact endpoint. It never replaces a reachable listener or a non-socket filesystem entry. An
+absent/refused socket causes a detached launch with explicit `--socket` and `--data-dir`; the protocol
+handshake, not the probe, establishes that the listener is a compatible daemon.
+
+The launch source order is `TURN_TURND_BIN`, a `turnd` sibling beside `turn`, then — for debug builds only —
+`cargo run` against the fixed source-workspace manifest. The debug path builds both `turnd` and `turn-hook`
+before launch. Packaged and CI builds produce `turn`, `turnd` and `turn-hook` as siblings; the daemon locates
+the helper beside its own executable and never searches `PATH`. This prevents pairing components from two
+installations. Missing `turn-hook` degrades only adapters that require command hooks and is reported in the
+launch plan.
+
+The companion receives null stdin, append-only owner-only log files and, on Unix, its own process session.
+The GUI retains a child handle only to reap and surface exit status; dropping it is not termination.
+Synchronous launch errors and later exits are visible in the window and `turnd.log`. Exit code 3 is treated
+as provisional startup contention because a second window may have lost a safe race; a successful handshake
+with the winning daemon clears that diagnostic.
+
+Endpoint occupancy is not authority over durable state. Before opening SQLite or restoring anything,
+`turnd` acquires the canonical data-directory process lock described below. That lock makes two simultaneous
+launches and two socket aliases safe: at most one process owns the store and PTYs. UI lifetime independence
+does not change the daemon-restart limitation — if `turnd` exits, its PTY masters do too.
+
 #### Responsibility
 
 The daemon is the only process that holds a pty handle. It owns:
@@ -1210,6 +1243,19 @@ pending Attention. `Enter` activates or focuses an existing Pane, `Space` opens 
 Expansion and selection persist through daemon-owned `TreeSurfaceState` keyed by stable `surface_id`, but
 one surface's selection is never broadcast to another. Rows expose native accessibility Tree/TreeItem roles,
 names that include state/confidence in words, and complete keyboard equivalents.
+
+Zero state is a real creation flow, not a log message. **+ Workspace** is always present; with no Workspace,
+`Cmd+N` opens the Workspace form and **Create and continue** chains into the Session form. Once a Workspace
+exists, **+ Session** and `Cmd+N` open the explicit Workspace/Template/task form, while `Cmd+Shift+N` creates
+from the visibly selected Workspace and its preferred Template. Creation requests fail immediately while
+offline and are never replayed across a connection generation.
+
+The protocol does not yet carry durable operation ids for those creates, so the client serialises the
+creation lifecycle: only one Workspace or Session creation may be awaiting a response. Its pending
+Workspace/Template/name/task intent cannot be replaced by a second command or cleared by an unrelated
+Session response. A reconnect returns the preserved form to an explicit failed/retry state. This is a
+correctness fence, not the intended final concurrency model; ADR-042 requires operation ids before it may be
+relaxed.
 
 What exists today:
 
