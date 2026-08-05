@@ -1674,7 +1674,7 @@ impl<'a> TurnView<'a> {
                         if caret_clicked {
                             set_hierarchy_expanded(state, snapshot, key.clone(), !expanded);
                         } else {
-                            set_hierarchy_selection(state, snapshot, key.clone());
+                            actions.extend(select_hierarchy_row(state, snapshot, *row));
                         }
                     }
                     if response.double_clicked() && !caret_clicked {
@@ -4032,6 +4032,26 @@ fn set_hierarchy_selection(state: &mut ViewState, snapshot: &HierarchySnapshot, 
     });
 }
 
+/// Applies the ordinary single-click contract of the unified navigator.
+///
+/// A Session row is both the navigation destination and the container whose saved
+/// Layout belongs in the centre, so selecting it activates that Session immediately.
+/// Process rows remain selection-only: inspecting a background Agent must not switch
+/// Sessions, open a Pane or disturb the current Layout.
+fn select_hierarchy_row(
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    row: HierarchyRow<'_>,
+) -> Vec<ViewAction> {
+    set_hierarchy_selection(state, snapshot, row.key());
+    match row {
+        HierarchyRow::Session { session, .. } => {
+            vec![ViewAction::SelectSession(session.session.id.clone())]
+        }
+        HierarchyRow::Workspace(_) | HierarchyRow::Process { .. } => Vec::new(),
+    }
+}
+
 fn set_hierarchy_expanded(
     state: &mut ViewState,
     snapshot: &HierarchySnapshot,
@@ -4700,6 +4720,65 @@ mod tests {
             action,
             HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
         )));
+    }
+
+    #[test]
+    fn clicking_a_session_selects_it_and_activates_its_layout() {
+        let (snapshot, _, _, session_id) = hierarchy_fixture();
+        let session = &snapshot.workspaces[0].sessions[0];
+        let mut state = ViewState::default();
+
+        let actions = select_hierarchy_row(
+            &mut state,
+            &snapshot,
+            HierarchyRow::Session {
+                workspace: &snapshot.workspaces[0],
+                session,
+            },
+        );
+
+        assert_eq!(
+            state.selected_tree,
+            Some(HierarchyKey::session(session_id.clone()))
+        );
+        assert!(matches!(
+            actions.as_slice(),
+            [ViewAction::SelectSession(selected)] if selected == &session_id
+        ));
+        assert!(state.take_hierarchy_actions().iter().any(|action| matches!(
+            action,
+            HierarchyAction::Select {
+                key: HierarchyKey::Session { session_id: selected },
+                ..
+            } if selected == &session_id
+        )));
+    }
+
+    #[test]
+    fn clicking_a_background_process_does_not_replace_the_active_session_layout() {
+        let (snapshot, root_id, _, _) = hierarchy_fixture();
+        let session = &snapshot.workspaces[0].sessions[0];
+        let process = session
+            .nodes
+            .iter()
+            .find(|node| node.node_id == root_id)
+            .expect("root process");
+        let mut state = ViewState::default();
+
+        let actions = select_hierarchy_row(
+            &mut state,
+            &snapshot,
+            HierarchyRow::Process {
+                session,
+                node: process,
+            },
+        );
+
+        assert!(actions.is_empty());
+        assert_eq!(
+            effective_selection(&snapshot, &state),
+            Some(HierarchyKey::process(root_id))
+        );
     }
 
     #[test]

@@ -3,12 +3,20 @@
 //! Claude Code ships a hook engine with an event for nearly everything Turn cares
 //! about, so this adapter reaches [`IntegrationLevel::Structured`]: turn
 //! boundaries, pending permissions and — the one that matters most for the
-//! hierarchy — real `SubagentStart`/`SubagentStop` callbacks. No output parsing.
+//! hierarchy — real lifecycle and tool callbacks. No terminal-output parsing.
 //!
 //! The configuration is injected with `--settings`, pointing at a file Turn owns
 //! inside the session's scratch directory. The user's own `~/.claude/settings.json`
 //! and `.claude/settings.json` are read as usual and never modified: `--settings`
 //! adds a layer, it does not replace them.
+//!
+//! The same isolated layer pins Agent Teams to Claude Code's `in-process` teammate
+//! backend. A daemon launched from iTerm inherits `ITERM_SESSION_ID`, and Claude's
+//! automatic or user-configured `iterm2` backend would otherwise create teammates in
+//! another application, outside Turn's hierarchy and attention model. In-process
+//! teammates remain owned by the Claude process in Turn's PTY. Agent Teams do not
+//! use the classic `SubagentStart` contract in Claude Code 2.1.222, so Turn also
+//! observes the structured `PostToolUse(Agent)` result that declares a teammate.
 //!
 //! That file holds the node's hook URL, and the token in it is what stops another
 //! account on the machine forging "your agent is waiting for you" for this
@@ -53,12 +61,23 @@ const SUBSCRIBED_EVENTS: &[&str] = &[
     "PermissionRequest",
     "PermissionDenied",
     "Notification",
+    "PostToolUse",
     "SubagentStart",
     "SubagentStop",
     "Stop",
     "StopFailure",
     "SessionEnd",
 ];
+
+/// The only high-frequency tool hook Turn installs is narrowed at Claude's hook
+/// engine. Receiving every tool completion just to discard almost all of them would
+/// add avoidable callbacks to active coding sessions.
+fn matcher_for(event: &str) -> &'static str {
+    match event {
+        "PostToolUse" => "Agent",
+        _ => "*",
+    }
+}
 
 /// Events Claude Code refuses to deliver over HTTP.
 ///
@@ -93,6 +112,13 @@ const NON_DEMANDING_NOTIFICATIONS: &[&str] = &[
 /// Short on purpose: if the daemon is gone, the agent must carry on rather than
 /// stall on every event. A local POST answers in well under a millisecond.
 const HOOK_TIMEOUT_SECONDS: u32 = 3;
+
+/// Claude Code 2.1.222's settings value for teammates hosted by the parent process.
+///
+/// This belongs in Turn's per-launch settings document, not in the user's global
+/// configuration: running Claude directly in iTerm should keep doing whatever the
+/// user configured there.
+const TEAMMATE_MODE_IN_PROCESS: &str = "in-process";
 
 pub struct ClaudeCodeAdapter {
     transport: HookTransport,
@@ -146,14 +172,20 @@ impl ClaudeCodeAdapter {
                 Some(handler) => {
                     hooks.insert(
                         (*event).to_string(),
-                        json!([{ "matcher": "*", "hooks": [handler] }]),
+                        json!([{ "matcher": matcher_for(event), "hooks": [handler] }]),
                     );
                 }
                 None => undeliverable.push(*event),
             }
         }
 
-        (json!({ "hooks": hooks }), undeliverable)
+        (
+            json!({
+                "hooks": hooks,
+                "teammateMode": TEAMMATE_MODE_IN_PROCESS,
+            }),
+            undeliverable,
+        )
     }
 
     /// A handler that shells out to `turn-hook`, when there is a `turn-hook` to
@@ -518,6 +550,47 @@ impl AgentAdapter for ClaudeCodeAdapter {
                 }
             }
 
+            // Claude Code Agent Teams are launched with the Agent tool, but in
+            // 2.1.222 they do not emit the classic SubagentStart callback. The
+            // successful tool result is structured and contains the exact name,
+            // type and tool-owned id, so it is an explicit declaration rather
+            // than an inference from terminal output or the process table.
+            "PostToolUse"
+                if payload.get("tool_name").and_then(Value::as_str) == Some("Agent")
+                    && payload
+                        .get("tool_response")
+                        .and_then(|response| response.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("teammate_spawned") =>
+            {
+                let input = payload.get("tool_input").unwrap_or(&Value::Null);
+                let response = payload.get("tool_response").unwrap_or(&Value::Null);
+                vec![make(EventKind::AgentSpawned {
+                    declared_name: response
+                        .get("name")
+                        .or_else(|| input.get("name"))
+                        .and_then(Value::as_str)
+                        .and_then(text::field),
+                    agent_type: response
+                        .get("agent_type")
+                        .or_else(|| input.get("subagent_type"))
+                        .and_then(Value::as_str)
+                        .and_then(text::field),
+                    agent_id: response
+                        .get("agent_id")
+                        .or_else(|| response.get("teammate_id"))
+                        .or_else(|| response.get("agentId"))
+                        .and_then(Value::as_str)
+                        .and_then(text::identifier),
+                    task: input
+                        .get("description")
+                        .or_else(|| response.get("prompt"))
+                        .or_else(|| input.get("prompt"))
+                        .and_then(Value::as_str)
+                        .map(|task| excerpt(task, 240)),
+                })]
+            }
+
             // Confirmed hierarchy, straight from the tool. No inference.
             //
             // Newer runtimes may report the parent's declared worker name separately
@@ -753,6 +826,49 @@ mod tests {
         let handler = &hooks["Stop"][0]["hooks"][0];
         assert_eq!(handler["type"], "http");
         assert_eq!(handler["url"], "http://127.0.0.1:51234/hook/tok_abc");
+        assert_eq!(
+            hooks["PostToolUse"][0]["matcher"], "Agent",
+            "the high-frequency tool hook must be filtered before it reaches Turn"
+        );
+    }
+
+    /// Claude Code 2.1.222 recognises `teammateMode` with the value `in-process`.
+    /// Keeping this alongside the hooks is a product boundary, not presentation:
+    /// teammates must stay inside the Claude process supervised by Turn instead of
+    /// opening iTerm panes that Turn cannot navigate or focus reliably.
+    #[test]
+    fn agent_teams_stay_in_process_without_losing_subagent_lifecycle_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = launch_ctx(dir.path());
+        let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
+
+        let settings_index = plan.args.iter().position(|a| a == "--settings").unwrap();
+        let settings_path = PathBuf::from(&plan.args[settings_index + 1]);
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+
+        assert_eq!(
+            document["teammateMode"], TEAMMATE_MODE_IN_PROCESS,
+            "Turn's isolated launch settings must override an ambient iTerm teammate backend"
+        );
+        for event in ["SubagentStart", "SubagentStop"] {
+            let handler = &document["hooks"][event][0]["hooks"][0];
+            assert_eq!(handler["type"], "http", "{event} lost its hook: {document}");
+            assert_eq!(
+                handler["url"], "http://127.0.0.1:51234/hook/tok_abc",
+                "{event} must still report on the parent node's authenticated channel"
+            );
+        }
+        assert!(
+            !plan.args.iter().any(|arg| arg == "--teammate-mode"),
+            "the containment policy belongs to the isolated settings file: {:?}",
+            plan.args
+        );
+        assert!(
+            settings_path.starts_with(dir.path()),
+            "the adapter must not modify ~/.claude/settings.json: {}",
+            settings_path.display()
+        );
     }
 
     /// Claude Code 2.1.221 silently drops HTTP handlers registered for
@@ -1187,6 +1303,75 @@ mod tests {
                 assert_eq!(task.as_deref(), Some("Review the climbing diff"));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Agent Teams in Claude Code 2.1.222 report their declaration as the
+    /// successful Agent tool result rather than through SubagentStart. This shape
+    /// is projected from a live transcript; the hook uses `tool_response` for the
+    /// same structured value.
+    #[test]
+    fn an_agent_team_member_is_declared_from_the_agent_tool_result() {
+        let spawned = normalise(json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_reviewer",
+            "tool_input": {
+                "name": "Reviewer",
+                "description": "Review the climbing changes",
+                "prompt": "A much longer private task prompt",
+                "subagent_type": "Explore"
+            },
+            "tool_response": {
+                "status": "teammate_spawned",
+                "agent_id": "Reviewer@session-a1b2c3d4",
+                "teammate_id": "Reviewer@session-a1b2c3d4",
+                "name": "Reviewer",
+                "agent_type": "Explore",
+                "team_name": "session-a1b2c3d4",
+                "is_splitpane": false
+            }
+        }));
+
+        assert_eq!(spawned.len(), 1);
+        match &spawned[0].kind {
+            EventKind::AgentSpawned {
+                declared_name,
+                agent_type,
+                agent_id,
+                task,
+            } => {
+                assert_eq!(declared_name.as_deref(), Some("Reviewer"));
+                assert_eq!(agent_type.as_deref(), Some("Explore"));
+                assert_eq!(agent_id.as_deref(), Some("Reviewer@session-a1b2c3d4"));
+                assert_eq!(task.as_deref(), Some("Review the climbing changes"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(spawned[0].node_id.as_ref(), Some(&ctx().node_id));
+        assert_eq!(spawned[0].confidence, Confidence::Explicit);
+    }
+
+    #[test]
+    fn ordinary_agent_tool_results_do_not_create_phantom_teammates() {
+        for payload in [
+            json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_response": { "status": "teammate_spawned" }
+            }),
+            json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Agent",
+                "tool_response": { "status": "completed", "agentId": "sub-42" }
+            }),
+            json!({
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Agent",
+                "tool_response": "not structured"
+            }),
+        ] {
+            assert!(normalise(payload).is_empty());
         }
     }
 

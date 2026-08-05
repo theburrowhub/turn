@@ -2612,6 +2612,76 @@ mod tests {
         assert!(sent(&again).is_empty(), "one attach per pane");
     }
 
+    #[test]
+    fn alternating_sessions_replaces_the_central_layout_with_each_sessions_own_panes() {
+        let (first, first_pane, _) = session_with_agent("One pane");
+        let (mut second, second_first_pane, _) = session_with_agent("Two panes");
+        let second_shell = Pane::new(PaneKind::Shell).with_title("second session shell");
+        let second_shell_id = second_shell.id.clone();
+        assert!(second
+            .layout
+            .split(&second_first_pane, Direction::Horizontal, second_shell));
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&first, 0), summary(&second, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&first)),
+            }),
+            T0,
+        );
+        // Session details may be prefetched or arrive from an earlier navigation.
+        // Caching them must not make their Layout global.
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&second)),
+            }),
+            T0,
+        );
+
+        let first_view = desk.view(T0);
+        assert_eq!(first_view.selected.as_ref(), Some(&first.id));
+        assert_eq!(
+            first_view
+                .layout
+                .as_ref()
+                .expect("first layout")
+                .panes()
+                .iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>(),
+            vec![first_pane.clone()]
+        );
+
+        desk.apply_view_action(ViewAction::SelectSession(second.id.clone()), T0 + 1);
+        let second_view = desk.view(T0 + 1);
+        assert_eq!(second_view.selected.as_ref(), Some(&second.id));
+        assert_eq!(
+            second_view
+                .layout
+                .as_ref()
+                .expect("second layout")
+                .panes()
+                .iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>(),
+            vec![second_first_pane.clone(), second_shell_id.clone()]
+        );
+
+        desk.apply_view_action(ViewAction::SelectSession(first.id.clone()), T0 + 2);
+        assert_eq!(desk.view(T0 + 2).layout.unwrap().pane_count(), 1);
+        desk.apply_view_action(ViewAction::SelectSession(second.id.clone()), T0 + 3);
+        let restored_second = desk.view(T0 + 3).layout.expect("cached second layout");
+        assert_eq!(restored_second.pane_count(), 2);
+        assert!(restored_second.get(&second_first_pane).is_some());
+        assert!(restored_second.get(&second_shell_id).is_some());
+    }
+
     /// The whole point of the sequence number, from the window's side: a missed update
     /// produces a resync rather than a screen neither end believes in.
     #[test]

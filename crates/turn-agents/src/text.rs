@@ -27,7 +27,7 @@ use turn_pty::sanitise_label;
 pub const MAX_FIELD_CHARS: usize = 160;
 
 /// Longest external identifier accepted. Claude Code uses a UUID, Codex a short
-/// thread id; nothing legitimate comes close to this.
+/// thread id and Agent Team member id; nothing legitimate comes close to this.
 pub const MAX_IDENTIFIER_CHARS: usize = 128;
 
 /// Longest command Turn stores and shows. Commands are *not* excerpted for
@@ -145,7 +145,7 @@ pub fn identifier(text: &str) -> Option<String> {
     }
     let acceptable = trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'));
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@'));
     acceptable.then(|| trimmed.to_string())
 }
 
@@ -329,6 +329,7 @@ mod tests {
             "claude-abc123",
             "session.1",
             "ns:thread:7",
+            "reviewer@session-a1b2c3d4",
         ] {
             assert_eq!(
                 identifier(real).as_deref(),

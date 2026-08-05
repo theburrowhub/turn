@@ -743,11 +743,24 @@ async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_re
     post_hook(
         &agent.hook,
         &serde_json::json!({
-            "hook_event_name": "SubagentStart",
-            "agent_name": "Reviewer",
-            "agent_type": "Explore",
-            "agent_id": "sub-reviewer",
-            "task": "Review the climbing logic changes",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "tool_use_id": "toolu_reviewer",
+            "tool_input": {
+                "name": "Reviewer",
+                "subagent_type": "Explore",
+                "description": "Review the climbing logic changes",
+                "prompt": "Inspect the movement implementation and report defects"
+            },
+            "tool_response": {
+                "status": "teammate_spawned",
+                "agent_id": "Reviewer@session-test",
+                "teammate_id": "Reviewer@session-test",
+                "name": "Reviewer",
+                "agent_type": "Explore",
+                "team_name": "session-test",
+                "is_splitpane": false
+            },
             "session_id": fixture_session_id(),
             "cwd": "/private/tmp"
         }),
@@ -933,28 +946,6 @@ async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_re
     );
     assert!(restored_reviewer.activity_preview.is_some());
     assert!(restored_reviewer.pane_bindings.is_empty());
-
-    // And it leaves again when the tool says so.
-    post_hook(
-        &agent.hook,
-        &serde_json::json!({
-            "hook_event_name": "SubagentStop",
-            "agent_id": "sub-reviewer",
-            "session_id": fixture_session_id(),
-        }),
-    )
-    .await;
-    let nodes = ui
-        .wait_for("the subagent to finish", |event| match event {
-            ServerEvent::TreeChanged { session_id, nodes } if session_id == &agent.session => nodes
-                .iter()
-                .find(|node| node.kind == turn_core::model::NodeKind::Subagent)
-                .filter(|node| !node.lifecycle.is_running())
-                .map(|_| nodes.clone()),
-            _ => None,
-        })
-        .await;
-    assert_eq!(nodes.len(), 2, "a finished subagent stays visible");
 
     daemon.shutdown().await;
 }
