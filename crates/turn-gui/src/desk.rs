@@ -430,6 +430,7 @@ impl Desk {
                 Response::Workspace { workspace },
             ) => {
                 let workspace_id = workspace.id.clone();
+                self.notice = None;
                 self.workspaces.retain(|known| known.id != workspace_id);
                 self.workspaces.push(workspace);
                 vec![
@@ -484,6 +485,7 @@ impl Desk {
                     )];
                 }
                 let session_id = session.id.clone();
+                self.notice = None;
                 self.write_conflict = None;
                 self.pending_session = None;
                 self.upsert_session(*session);
@@ -1784,18 +1786,22 @@ impl Desk {
                 name,
                 root,
                 continue_to_session,
-            } => vec![Reaction::Send {
-                ask: Ask::CreateWorkspace {
-                    continue_to_session,
-                },
-                request: Request::CreateWorkspace { name, root },
-            }],
+            } => {
+                self.notice = None;
+                vec![Reaction::Send {
+                    ask: Ask::CreateWorkspace {
+                        continue_to_session,
+                    },
+                    request: Request::CreateWorkspace { name, root },
+                }]
+            }
             ViewAction::CreateSessionFromTemplate {
                 workspace_id,
                 template_id,
                 name,
                 task,
             } => {
+                self.notice = None;
                 let draft = PendingSessionDraft {
                     workspace_id: workspace_id.clone(),
                     template_id: template_id.clone(),
@@ -3573,6 +3579,7 @@ mod tests {
     #[test]
     fn first_run_workspace_creation_is_a_typed_user_action() {
         let mut desk = Desk::new();
+        desk.show_notice("an earlier failure");
         let requests = sent(&desk.apply_view_action(
             ViewAction::CreateWorkspace {
                 name: "turn".into(),
@@ -3587,6 +3594,10 @@ mod tests {
                 name: "turn".into(),
                 root: "/repo/turn".into(),
             }]
+        );
+        assert!(
+            desk.view(T0).notice.is_none(),
+            "retrying must clear a stale creation failure"
         );
     }
 
