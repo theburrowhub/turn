@@ -219,9 +219,10 @@ moved, or retroactively made read-only by the migration.
 
 Keyboard while the tree owns focus: Up/Down visible node, Right expand/first child, Left collapse/parent, Enter activate/focus existing pane, Space Quick Preview, Cmd+Enter temporary pane, Esc close preview/return to tree. Expand/collapse and selection persist.
 
-## Incompatible implementation identified
+## Historical incompatible implementation identified
 
-The pre-upgrade prototype must not be preserved where it contradicts the invariant:
+This is the audit that drove the migration. The current first vertical has removed or replaced each item;
+the list remains so a future refactor does not reintroduce them:
 
 1. `turn-gui::view` renders only a flat Session sidebar; Workspaces and process nodes are absent.
 2. The Attention Queue is a second persistent right navigation panel, while the right side must become an optional contextual inspector. Queue ordering remains a logical service and `Next Attention` command, with non-navigation UI on demand.
@@ -235,6 +236,9 @@ The pre-upgrade prototype must not be preserved where it contradicts the invaria
 10. Protocol clients bootstrap Workspaces, Sessions and per-Session trees separately; a unified workspace-tree projection and change push are required.
 
 ## Implementation and migration sequence
+
+Steps 1–8 and the deterministic half of step 9 are implemented. The authenticated live Claude Code smoke
+test in step 9 remains pending.
 
 1. Land this normative document and ADR-040; update product/architecture/protocol claims.
 2. Add domain types, event variants and deterministic migration 003 with upgrade tests.

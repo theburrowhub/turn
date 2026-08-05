@@ -15,7 +15,7 @@ Status values:
 | # | Decision | Status |
 | --- | --- | --- |
 | [001](#adr-001) | Rust daemon plus a Tauri/`xterm.js` UI | Daemon half accepted, implemented; **UI half superseded by ADR-039** |
-| [002](#adr-002) | A daemon from day one, not later | Accepted, implementation in progress |
+| [002](#adr-002) | A daemon from day one, not later | Accepted, implemented |
 | [003](#adr-003) | Hooks are the primary detection mechanism; heuristics are a fallback | Accepted, implemented |
 | [004](#adr-004) | Two-axis state model with a derived `DisplayState` | Accepted, implemented |
 | [005](#adr-005) | `Confidence` is first-class, and a heuristic can never move focus | Accepted, implemented |
@@ -52,8 +52,8 @@ Status values:
 | [036](#adr-036) | Persist node metadata, never terminal history | Implemented; narrowly amended by ADR-040 |
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
-| [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implementation in progress; supersedes the UI half of ADR-001 |
-| [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implementation in progress; narrowly amends ADR-036 |
+| [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
+| [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implemented for the first vertical; narrowly amends ADR-036 |
 
 ---
 
@@ -129,10 +129,9 @@ uses the system webview, so no runtime is shipped.
 <a id="adr-002"></a>
 ## ADR-002 — A daemon from day one, not later
 
-**Status:** Accepted, implementation in progress. `crates/turnd` holds `config`, `paths`, `instance`,
-`logging`, `options`, `error`, `server` and `core` (itself split into `spawn`, `supervise`, `restore`,
-`events`, `requests`, `views`, `attention`, `clients`, `command`, `output`), plus 71 test functions. None of
-that behaviour is verified in this log; the decision below is what it is being built to.
+**Status:** Accepted, implemented. `crates/turnd` owns PTYs, process supervision, restore, events, requests,
+views, attention and client projections behind the Unix-socket protocol. The deterministic Reviewer
+vertical and daemon unit/integration suites exercise that boundary; packaging/lifetime policy remains M9.
 
 ### Context
 
@@ -2030,13 +2029,13 @@ and the flag would take it on their behalf — asserted by
 <a id="adr-039"></a>
 ## ADR-039 — The frontend is native Rust drawn on the GPU, not a webview
 
-**Status:** Accepted, implementation in progress. Supersedes the UI half of ADR-001. The webview frontend
+**Status:** Accepted, implemented for the upgraded first vertical. Supersedes the UI half of ADR-001. The webview frontend
 is deleted: `ui/` (51 TypeScript files, 13,317 lines, of which 18 test files and 3,821 lines were tests,
 plus 1,390 lines of CSS) and `crates/turn-ui` (the Tauri shell, 2,230 lines) are gone, and `turn-ui` is out
 of the workspace members. What exists in their place is `crates/turn-gui`: an `eframe`/`egui` window over
-`wgpu`, with `cells.rs`, `theme.rs` and `view.rs` covered by unit tests plus snapshot tests that render the
-real widget tree through `wgpu` with no display attached. The window has not yet been driven against a live
-daemon; see `ROADMAP.md` §M7.
+`wgpu`, covered by unit tests plus snapshot tests that render the real widget tree through `wgpu` with no
+display attached. The deterministic Reviewer vertical now crosses the daemon/client model; the manual
+authenticated external-CLI smoke test remains, as recorded in `ROADMAP.md` §M8.
 
 ### Context
 
@@ -2149,12 +2148,10 @@ and far more testable job than an emulator, and one a snapshot test can actually
 - **Downside: accessibility is now work rather than something the platform provides.** A webview hands over
   the accessibility tree: an element with a role and a label is exposed to VoiceOver and Orca without
   anyone asking. A GPU-drawn window has no DOM, so every accessible name has to be constructed and attached
-  deliberately. `egui` builds an AccessKit tree and the session rows do call `widget_info` with their state
-  in words, but the snapshot suite carries
-  `every_session_row_is_reachable_by_its_accessible_name` **marked `#[ignore]` because it does not yet
-  pass** — the rows are painted with the raw painter rather than composed from widgets, and `kittest`'s
-  queries cannot see them. It is left failing and named rather than deleted, because a screen-reader user
-  cannot use this window until it passes. That is a regression against the webview, stated as one.
+  deliberately. `egui` now exposes the unified navigator through AccessKit `Tree`/`TreeItem` roles; tests
+  reach every hierarchy level by accessible name and reject duplicate legacy `ListItem` navigation.
+  VoiceOver/Orca acceptance with real assistive technology remains work, so passing the structural test is
+  necessary but not claimed sufficient.
 - **Downside: IME is work too.** Composing Japanese, Chinese or Korean text, dead keys, and the candidate
   window are things WKWebView and WebKitGTK do. `egui` has IME support and `winit` delivers the events, but
   wiring them into a terminal that also has to forward raw bytes to a pty is unwritten and untested here,
@@ -2206,17 +2203,16 @@ is in the retirement report; the load-bearing items are:
 <a id="adr-040"></a>
 ## ADR-040 — One unified hierarchy, one main-checkout writer, background subagents
 
-**Status:** Accepted, implementation in progress. Extends ADR-017's flat parent-pointer model, ADR-032's
+**Status:** Accepted, implemented for the first vertical. Extends ADR-017's flat parent-pointer model, ADR-032's
 daemon-derived views, ADR-033's append-only migration discipline and ADR-039's native egui/wgpu client.
 It does not supersede any of them. It narrowly amends ADR-036 as described there.
 
 ### Context
 
-The backend already models `Workspace → Session → ProcessNode`, but the native client projects only a
-flat list of Sessions and an optional, separate process view. That duplicates the product's hierarchy and
-makes an Agent appear to be a pane rather than a long-lived runtime entity. It also lets two Sessions start
-against one checkout without arbitration. For coding agents this is not merely untidy: two independent
-writers can change the same index, branch and files while each assumes exclusive control.
+Before this decision, the backend modelled `Workspace → Session → ProcessNode` while the native client
+projected a flat Session list plus a separate process view, and Session creation did not arbitrate checkout
+ownership. The implementation now projects one hierarchy and enforces a fenced canonical writer; this
+context remains the reason the migration cannot preserve the former visual model.
 
 A subagent is work, not a layout instruction. Automatically opening one spends screen space and focus on
 an event the parent produced, violating Turn's rule that the user decides what to view.
@@ -2257,9 +2253,10 @@ The full normative model, migration, events, API and wireframe are in
 
 Activity Preview is not restored scrollback or a conversation summary: it is short, provenance-labelled
 navigation status. Turn persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
-most 20 snapshots per node and 2,000 globally, and displays a recovered preview only as stale until fresh
-activity arrives. High-frequency preview updates are snapshot state and coalesced pushes, not append-only
-domain events. ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
+most 20 snapshots per node and 2,000 globally. A recovered preview retains its original timestamp; a
+separate recovered/stale visual marker remains planned and clients must not reinterpret it as fresh.
+High-frequency preview updates are snapshot state and coalesced pushes, not append-only domain events.
+ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
 
 Hook callbacks are hostile ingress, not event-log content. The Claude adapter reduces a callback directly
 to typed `EventKind`, `EventSource`, confidence and node/session identity; it does not attach the callback

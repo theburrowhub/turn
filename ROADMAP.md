@@ -543,20 +543,18 @@ the workflow says so in place of skipping quietly. Nobody has opened the window 
 baseline under lavapipe, and measuring how far it sits from the Metal one, is the first real evidence this
 risk will have — and it needs a Linux machine, which is also what M9's Linux sign-off needs.
 
-### 2b. Accessibility and IME are now Turn's problem, and are unbuilt
+### 2b. Accessibility and IME are now Turn's problem
 
 The webview supplied both. A GPU-drawn window supplies neither: there is no DOM, so every accessible name
 must be constructed deliberately, and text composition for CJK input, dead keys and the candidate window is
 work rather than a platform service.
 
-*Mitigated by:* `eframe` built with `accesskit`, so there is a real accessibility tree to populate rather than
-nothing at all; session rows already calling `widget_info` with their state in words; and a test that names
-the gap instead of hiding it.
-*Still missing:* that test — `every_session_row_is_reachable_by_its_accessible_name` — is committed
-**failing** and `#[ignore]`d, because the rows are painted with the raw painter rather than composed from
-widgets, so `kittest`'s queries cannot see them. Until it passes, this window cannot be used with a screen
-reader. IME has no code and no test at all. Both were free before and neither is now; this is the clearest
-price paid for ADR-039.
+*Mitigated by:* `eframe` built with AccessKit and automated tests that require the unified navigator to
+expose one `Tree`, reachable `TreeItem`s at every hierarchy level and no duplicate legacy `ListItem`
+navigator. State and confidence are included in accessible names rather than encoded only by colour.
+*Still missing:* manual VoiceOver/Orca acceptance and complete terminal IME composition tests. Structural
+AccessKit coverage is necessary but does not prove the whole assistive-technology workflow. Both were free
+before and are now Turn's maintenance responsibility.
 
 ### 3. Memory and throughput at the design point are unmeasured
 

@@ -18,43 +18,29 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 
 | Crate | Status | Tests | Notes |
 | --- | --- | --- | --- |
-| `turn-core` | In progress | 120+ | Built baseline plus ADR-040 hierarchy/checkout values under integration. |
-| `turn-proto` | In progress | 172+ | Built v2 transport/cells; v3 hierarchy/errors/catalogue under integration. |
-| `turn-store` | In progress | 140+ | Built baseline; migration 003, global fences and hierarchy repository under hardening. |
+| `turn-core` | Built | reproduce | Domain, state, attention and ADR-040 hierarchy/lease/preview values. |
+| `turn-proto` | Built | reproduce | Framing, terminal cells and implemented protocol-v3 hierarchy operations. |
+| `turn-store` | Built | reproduce | Append-only migrations, global fences, hierarchy and secure hook cleanup. |
 | `turn-pty` | Built | 47 | Ptys, buffers, supervision. |
 | `turn-hook` | Built | 21 | The `turn-hook` helper binary and its library. |
-| `turn-agents` | Built | 169 | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
-| `turnd` | In progress | 88+ | Real entry point/baseline; atomic Session/lease/projection lifecycle not yet accepted. |
-| `turn-gui` | In progress | 80 | The native window: cells, theme, view, keymap, panes, transport, plus `wgpu` snapshots. |
+| `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
+| `turnd` | Built | reproduce | Atomic Session/lease lifecycle, PTYs, hierarchy projection and restore vertical. |
+| `turn-gui` | Built for first vertical | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
 
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
 `vitest` and no second lockfile.
 
 ```sh
-cargo test --workspace -- --test-threads=4
+cargo test --workspace -- --test-threads=1
 ```
 
-**These figures are a snapshot and this is the one section where that caveat is load-bearing.** The whole
-workspace was green together at **730** in one run immediately after the webview frontend was retired
-(2026-08-04). `turn-proto` and `turn-gui` have both been extended since — the protocol gained a cell
-representation and the window gained a keymap, a pane arranger and a daemon transport — and `turnd` is being
-changed to match, so the total is higher than 730 and moving. Reproduce it; do not quote it.
+Counts are intentionally not pinned here: every regression proof changes them. The release audit runs the
+workspace serially because PTY and loopback-hook tests allocate real operating-system resources.
 
-What is **not** done, so the statuses above are not read as "finished": nothing has been run end to end
-against real agents in a real window — see `ROADMAP.md` §M7 — and `turn-gui` is a spike that settles the
-stack rather than a finished window. One snapshot test,
-`every_session_row_is_reachable_by_its_accessible_name`, is committed `#[ignore]`d because it does not pass:
-the session rows are painted rather than composed from widgets, so `kittest` cannot find them in the
-accessibility tree. It is the count's one ignored test and it is a real gap, not a placeholder.
-
-`cargo test --workspace -- --test-threads=4` is what CI runs and is the right command once the daemon and the
-adapter layer settle; while `turnd` and `turn-agents` are mid-write it will also build those, so a failure
-there says nothing about the five settled crates.
-
-**Nothing has yet been shown to run end to end.** `turnd` is the caller that assembles the pieces and it is
-being written now: its modules and 71 test functions exist, but no claim in this document about its
-behaviour has been verified. Everything below marked "intended" for the daemon should be read as the
-design it is being built to, not as observed behaviour.
+What is **not** done, so “built” is not read as “shippable”: the deterministic Reviewer vertical crosses
+daemon/store/protocol/GUI state and the real loopback Claude hook transport, but an authenticated installed
+Claude Code binary has not completed the manual native-window smoke test. Advanced tree management,
+performance measurement, packaging, Linux visual sign-off and IME remain; see `ROADMAP.md`.
 
 ---
 
@@ -150,7 +136,7 @@ TLS stack to POST a few hundred bytes to loopback. Its HTTP client is hand-writt
 
 ## 2. turn-core — domain, state, attention
 
-**Status: built baseline, ADR-040 model integration in progress.** No I/O, no pty, no database, no UI. This
+**Status: built, including ADR-040 hierarchy/lease/preview values.** No I/O, no pty, no database, no UI. This
 is why the rules that matter can
 be tested exhaustively without spawning a process, and why every function that needs the time takes
 `now_ms: i64` as a parameter instead of reading the clock.
@@ -899,12 +885,12 @@ guard degrades to nothing.
 
 ## 6. turn-proto and turn-store
 
-Both v2/base layers are built. Their ADR-040 protocol-v3 and migration-003 extensions are **in progress**
-and are not counted complete merely because domain/schema types exist.
+Both base layers and their ADR-040 protocol-v3/migration extensions are built and exercised through the
+daemon vertical. Planned operations are labelled as such in `docs/PROTOCOL.md`; types alone do not count.
 
 ### 6.1 turn-proto — the daemon↔UI protocol
 
-**Status: protocol v2 built; protocol v3 hierarchy contract in progress.** Framing, terminal cell transport,
+**Status: protocol v3 hierarchy vertical built.** Framing, terminal cell transport,
 request correlation and the safety omissions remain unchanged. Version 3 replaces independent navigation
 bootstrap with one revisioned hierarchy projection and adds structured checkout conflict, Preview, binding
 and per-surface tree-state operations. It is still types only — no I/O, tokio or socket — so the contract can
@@ -1120,14 +1106,15 @@ testable without a test mutating process-global state every other test in the bi
 
 ### 6.3 The UI
 
-**Status: In progress.** `crates/turn-gui` is a native window drawn on the GPU — `eframe`/`egui` over
+**Status: built for the upgraded first vertical.** `crates/turn-gui` is a native window drawn on the GPU — `eframe`/`egui` over
 `wgpu`, one binary named `turn`, no webview, HTML or TypeScript. ADR-039 records the stack decision;
 ADR-040 defines the accepted information architecture.
 
 The persistent left surface is one Workspace hierarchy: Workspace → Session → Agent/Tool → child. It is
 the only navigation home for those identities. There is no parallel Session tab strip, permanent overview,
-permanent Attention Queue navigator or optional second Agent tree. Collapse, search, state filters and
-virtualised rows make the same projection work at 3, 10 and 30 Sessions. The centre contains only the
+permanent Attention Queue navigator or optional second Agent tree. Collapse and stable row ordering make
+the same projection work at 3, 10 and 30 Sessions; search, state filters and virtualisation remain planned.
+The centre contains only the
 user/template-selected Layout. The right side is an optional contextual inspector, and Quick Preview is a
 non-layout overlay.
 
@@ -1138,7 +1125,7 @@ Expansion and selection persist through daemon-owned `TreeSurfaceState` keyed by
 one surface's selection is never broadcast to another. Rows expose native accessibility Tree/TreeItem roles,
 names that include state/confidence in words, and complete keyboard equivalents.
 
-What exists today is a transitional stack spike:
+What exists today:
 
 - **`src/cells.rs`** — a pane's screen as `Grid`/`Cell`/`CellAttrs`/`Rgb`, and the conversion from the
   daemon's `vt100`-parsed screen. The client paints cells; it does not parse an escape stream, so there is
@@ -1147,9 +1134,9 @@ What exists today is a transitional stack spike:
   that no caller can signal a state by colour alone. `every_state_has_a_glyph_as_well_as_a_colour` and
   `the_attention_colour_is_reserved_for_states_that_block_the_user` make that structural rather than a
   convention.
-- **`src/view.rs`** — a flat Session sidebar, terminal painter, permission banner and permanent queue. The
-  painter/banner survive; the two navigation surfaces are replaced by the unified hierarchy and contextual
-  Attention actions rather than preserved as product structure.
+- **`src/view.rs`** — the single Workspace hierarchy, terminal painter, non-modal permission banner,
+  contextual inspector, Quick Preview, temporary Pane and explicit Attention Queue overlay. The queue is
+  not a persistent navigation surface.
 - **`tests/snapshots.rs`** — `egui_kittest` renders the real widget tree through `wgpu` **with no display
   attached** and diffs against committed PNGs; `UPDATE_SNAPSHOTS=1 cargo test -p turn-gui` re-records. This
   is what makes a GPU-drawn frontend reviewable at all, and it has already earned itself: the first snapshot
@@ -1161,13 +1148,10 @@ never derives a state, hierarchy edge, rank, score or preview confidence; those 
 models (ADR-032). Only `Effect::focus` may move the user;
 `focus_deferred` and `focus_denied` are verdicts to report.
 
-Not built yet, stated plainly rather than implied by the target above: protocol-v3 hierarchy bootstrap and
-revision resync, checkout-conflict chooser, contextual inspector/Quick Preview, zero-to-many Pane actions,
-the complete keymap/command palette, perceptible effect channels and hierarchy restoration. The current
-flat sidebar/queue must be removed as navigation, not wired up and renamed. There is also no complete
-accessibility coverage yet
-(`every_session_row_is_reachable_by_its_accessible_name` is committed failing and `#[ignore]`d) and no IME
-work at all, which are the two things the webview used to provide for free.
+Not built yet, stated plainly: tree search/filter/manual order, daemon-authoritative rename and relationship
+correction, permanent Pane placement choices, complete context menus, IME sign-off and packaging. AccessKit
+tests now require `Tree`/`TreeItem` roles for every hierarchy level and explicitly reject duplicate legacy
+`ListItem` navigation; screen-reader acceptance on real macOS/Linux assistive technology remains.
 
 ---
 
@@ -1313,7 +1297,7 @@ So the net position is: one injection vector removed, one containment layer remo
 than the second in this specific product, because the containment only ever mattered if the injection
 succeeded — but it is a trade, not a free win.
 
-### 7.10 Checkouts, leases and previews — **accepted, implementation in progress**
+### 7.10 Checkouts, leases and previews — **implemented for the first vertical**
 
 Write exclusivity is enforced on canonical checkout identity, not a user-supplied path string. Session,
 Workspace and checkout ownership must agree before acquisition. Symlink/path aliases cannot create a second
@@ -1328,7 +1312,8 @@ writer is dead. Migration 003 grants no lease and changes no filesystem permissi
 Activity Preview and agent names cross an untrusted-text boundary before entering navigation chrome. They
 use the same control/bidi sanitisation as titles, known-secret redaction, strict character/history limits
 and provenance. Raw PTY bytes, prompts, spinners and raw hook bodies are not stored as previews. Restored
-preview text is marked stale so it cannot impersonate current activity.
+previews retain their original `updated_ms`; the current client does not yet add a separate recovered/stale
+marker, so it must not present their age as fresh activity.
 
 ---
 
@@ -1338,7 +1323,7 @@ preview text is marked stale so it cannot impersonate current activity.
 
 Targets are for the design point: **30 concurrent panes across 10 sessions, one of them producing
 build-volume output.** Values marked *enforced* are constants in the code today; values marked *target*
-are not yet measured, because there is no running application.
+are not yet measured in a release-build profiling run.
 
 | Property | Value | Status |
 | --- | --- | --- |
