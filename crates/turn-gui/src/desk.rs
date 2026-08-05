@@ -3591,6 +3591,44 @@ mod tests {
     }
 
     #[test]
+    fn the_created_workspace_is_added_selected_and_can_continue_to_a_session() {
+        let workspace = Workspace::new("turn", "/repo/turn", T0);
+        let workspace_id = workspace.id.clone();
+        let mut desk = Desk::new();
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::CreateWorkspace {
+                    continue_to_session: true,
+                },
+                response: Box::new(Response::Workspace {
+                    workspace: WorkspaceSummary::from_workspace(&workspace, &[]),
+                }),
+            },
+            T0,
+        );
+
+        assert!(desk.has_workspaces());
+        assert!(reactions.iter().any(|reaction| matches!(
+            reaction,
+            Reaction::WorkspaceCreated {
+                workspace_id: created,
+                continue_to_session: true,
+            } if created == &workspace_id
+        )));
+        assert!(reactions.iter().any(|reaction| matches!(
+            reaction,
+            Reaction::Send {
+                request: Request::SelectTreeNode {
+                    selected: Some(HierarchyKey::Workspace { workspace_id: selected }),
+                    ..
+                },
+                ..
+            } if selected == &workspace_id
+        )));
+    }
+
+    #[test]
     fn the_selected_workspace_is_the_target_for_new_and_quick_sessions() {
         let first = Workspace::new("first", "/repo/first", T0);
         let second = Workspace::new("second", "/repo/second", T0 + 1);

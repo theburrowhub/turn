@@ -489,6 +489,52 @@ mod tests {
         assert_eq!(draft.error.as_deref(), Some("the directory disappeared"));
     }
 
+    #[test]
+    fn a_created_workspace_continues_into_a_session_draft_for_that_workspace() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-continuation.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let workspace_id = turn_core::ids::WorkspaceId::from_stored("ws_continuation");
+        app.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(true));
+
+        app.perform(
+            &ctx,
+            Reaction::WorkspaceCreated {
+                workspace_id: workspace_id.clone(),
+                continue_to_session: true,
+            },
+        );
+
+        assert!(app.state.workspace_draft.is_none());
+        assert_eq!(
+            app.state
+                .session_draft
+                .as_ref()
+                .map(|draft| &draft.workspace_id),
+            Some(&workspace_id)
+        );
+    }
+
+    #[test]
+    fn a_command_notice_is_visible_in_the_window() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-notice.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+
+        app.perform(&ctx, Reaction::Notice("No template is available".into()));
+
+        assert_eq!(
+            app.desk.view(0).notice.as_deref(),
+            Some("No template is available")
+        );
+    }
+
     /// And when something *does* change by the clock, the window asks for one frame at
     /// that moment rather than for a continuous repaint.
     #[test]

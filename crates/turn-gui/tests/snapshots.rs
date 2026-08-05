@@ -1236,6 +1236,42 @@ fn the_real_application_settles_while_it_waits_for_a_daemon() {
     );
 }
 
+/// Regression for the first-run dead end that prompted the onboarding repair. This
+/// drives the real native application with a real macOS Command+N event; testing the
+/// keymap and the form separately would allow the wiring between them to break again.
+#[test]
+fn command_n_opens_workspace_onboarding_in_the_real_application() {
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_eframe(|cc| {
+            turn_gui::app::TurnApp::new(
+                &cc.egui_ctx,
+                std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-command-n.sock"),
+                Keymap::build(&Overrides::new(), Platform::MAC),
+            )
+        });
+    h.run();
+
+    h.key_press_modifiers(
+        egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            ..egui::Modifiers::NONE
+        },
+        egui::Key::N,
+    );
+    h.run_steps(2);
+
+    assert!(
+        h.query_by_label("CREATE WORKSPACE").is_some(),
+        "Command+N must produce visible onboarding, not a log-only notice"
+    );
+    assert!(
+        h.query_by_label("Create and continue").is_some(),
+        "first-run onboarding must continue into the first Session"
+    );
+}
+
 /// The product's most explicit performance criterion, measured rather than asserted.
 ///
 /// `Harness::run` steps until nothing asks for another frame. An idle window settles in a
