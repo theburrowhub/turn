@@ -244,7 +244,8 @@ requirement rather than an aspiration.
 **Domain and attention**
 - Workspaces, Sessions, Panes, Layouts, Templates.
 - Closed Session modes: `main_checkout`, `read_only`, `isolated_worktree`; daemon-owned arbitration that
-  allows at most one writer on the primary checkout and returns structured alternatives on conflict.
+  allows at most one writer on the primary checkout inside one canonical Turn data directory and returns
+  structured alternatives on conflict. Separate data directories do not yet share a checkout lock.
 - The two-axis state model (`Lifecycle` × `Turn`) with a derived `DisplayState` for the UI.
 - The Attention Queue: deduplication, priority, ageing without starvation, snooze, acknowledge,
   dismiss, and a `next-attention` command that is deterministic rather than a lottery.
@@ -538,6 +539,10 @@ document. Unchecked items say what evidence or implementation is still missing, 
   the saved Layout or another surface.
   `quick_preview_is_semantic_and_does_not_replace_the_layout`,
   `a_temporary_reviewer_pane_is_visually_distinct_from_the_saved_layout`.
+- [x] **Next Attention preserves the semantic Agent while routing input to its authentic runtime.** A
+  background Reviewer remains selected and owns the demand; only an integrated/explicit ancestor runtime
+  with an existing Pane may receive keyboard focus. No provisional edge is followed and no Pane opens as a
+  side effect. `semantic_attention_selects_the_child_but_focuses_its_runtime_owner_pane` and the hook E2E.
 
 ### Checkout safety
 
@@ -629,8 +634,10 @@ document. Unchecked items say what evidence or implementation is still missing, 
 - [x] **A stored `Alive` is never believed after a restart.** `SessionRepo::load_for_restore` downgrades
   anything stored as running to `Lifecycle::Orphaned`, because a stored `Alive` only ever meant "alive when
   we last wrote". `restart_restores_the_desk::a_partial_restore_is_recorded_so_the_ui_can_explain_itself`.
-- [x] **A pending demand for the user outlives the daemon that recorded it.** An Agent that blocked on a
-  permission at 17:58 is still blocked at 18:02, and a queue rebuilt from nothing would drop it silently.
+- [x] **A pending demand for the user outlives the daemon that recorded it when its runtime owner remains
+  corroborated.** An Agent that blocked on a permission at 17:58 is still blocked at 18:02 when its restored
+  node/parent remains `Orphaned`; a queue rebuilt from nothing would drop it silently. Interaction demands
+  whose owner is lost are removed, while explicit postmortem failure/completion evidence may survive.
   `restart_restores_the_desk::a_pending_demand_for_the_user_outlives_the_daemon_that_recorded_it`.
 - [x] **The event log still says which states were guesses,** weeks later — every row keeps its
   `Confidence` and its source. `restart_restores_the_desk::the_event_log_still_says_which_states_were_guesses`.

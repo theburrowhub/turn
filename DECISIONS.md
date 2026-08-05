@@ -165,9 +165,9 @@ writes, from the first milestone. The UI is a client over `turn-proto`.
 - **Downside — and it must be said clearly:** this buys survival of *the UI* exiting, **not** survival
   of *the daemon* exiting. The pty master lives in the daemon's file table, and `PtyProcess::drop`
   deliberately terminates the process it owns, because closing a Session must not leave strays holding
-  ptys — a finite kernel resource. Kill the daemon and the Agents die with it. `Lifecycle::Orphaned`,
-  `Reconnected` and `Lost` exist precisely so Turn can report that truth instead of inventing an exit
-  code. Closing the gap properly is tmux's job (ADR-007), deferred.
+  ptys — a finite kernel resource. Kill the daemon and the Agents die with it. Current restore uses
+  `Lifecycle::Orphaned`/`Lost`; `Reconnected` is reserved for a future persistent backend rather than
+  forged. Closing the gap properly is tmux's job (ADR-007), deferred.
 - **Downside:** a daemon needs a lifecycle of its own — start, stop, upgrade, version skew against the
   UI, log location, and a story for "the daemon is not running". None of that is free.
 - **Downside:** debugging is harder. A bug is now potentially in the daemon, in the protocol, or in the
@@ -1831,8 +1831,8 @@ memory.
 ### Decision
 
 Store only the metadata a restart needs in order to be honest: pid, command, cwd, `Lifecycle`, `Relation`,
-exit code, and the tool's own `external_id`. That is enough to look a process up in the process table and try
-to re-attach, and enough to say "this was running and we can no longer find it" when re-attaching fails.
+exit code, and the tool's own `external_id`. That is enough to corroborate a stored PID for conservative
+diagnostics and say "this was running and we can no longer reach/find it"; it is not enough to reattach a PTY.
 
 Not stored: the pty, the scrollback, the terminal grid, the output channel. A pty master cannot outlive the
 process that holds it, and the rest is ephemeral by nature.
@@ -1853,7 +1853,7 @@ unredacted hook payloads remain outside this exception.
   found. `Reconnected` remains reserved until a backend can prove reattachment; it is not emitted today.
 - **Downside:** a re-attached Pane starts with no history above the fold, compounding the same limitation
   replay already has (ADR-023). Users who expected tmux-like fidelity will notice.
-- **Downside:** re-attaching to a live process from metadata is not implemented anywhere yet, and matching a
+- **Downside:** re-attaching to a live process from metadata is not implemented, and matching a
   stored pid against the process table is inherently racy — pids are reused. The stored command line is the
   only corroboration, and it is weak.
 
@@ -2260,10 +2260,12 @@ independent. Tree expansion and selection persist per stable UI `surface_id`; th
 are never broadcast as another window's selection.
 
 `SessionMode` is a closed enum with wire values `main_checkout`, `read_only` and `isolated_worktree`.
-Every primary checkout has at most one unreleased blocking `exclusive_write` claim, owned and arbitrated by the daemon.
+Inside one canonical Turn data directory, every primary checkout has at most one unreleased blocking
+`exclusive_write` claim, owned and arbitrated by the daemon.
 Its semantic record is `workspace_id`, `session_id`, `checkout_id`, `mode`, `state`, `acquired_at` and
 `heartbeat_at`; implementation identifiers, fencing generations and release timestamps may support that
-contract but do not change it. The fencing generation is monotonic per canonical checkout path even if a
+contract but do not change it. The fencing generation is monotonic per canonical checkout path within that
+store even if a
 Workspace or lease row is deleted and recreated; every non-released state remains blocking. A heartbeat
 timeout alone never transfers ownership. A second Session must
 focus the owner, use technically enforced read-only mode where available, create an isolated worktree, or
@@ -2277,6 +2279,8 @@ The checkout lease is not the daemon-instance boundary. Before SQLite, migration
 checked separately, so configuring another socket cannot create a second cooperating owner of the same
 store and fence live leases while the first daemon still owns PTYs. The stable lock file is retained and the
 kernel releases the lock on process death; unsupported locking fails closed.
+Two deliberately separate data directories are independent authority domains today; a host-global claim
+would require a checkout-scoped OS lock and remains hardening work.
 
 The lease does not authorise an arbitrary launch directory. Session creation validates the Session cwd and
 all configured Pane cwds against the assigned canonical checkout before acquiring the lease or running init

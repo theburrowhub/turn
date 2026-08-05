@@ -1,7 +1,7 @@
 //! The cell screens attached clients render, and the diffs that keep them current.
 //!
-//! The daemon already parses every pane's output — it has to, because previews and
-//! the output heuristics work with no client attached. So a client that renders cells
+//! The daemon already parses every PTY-backed node's output — it has to, because previews
+//! and the output heuristics work with no client attached. So a client that renders cells
 //! costs almost nothing extra: the screen is there, and what travels is the
 //! difference between it and the screen that client last saw.
 //!

@@ -221,7 +221,7 @@ PTYs. This is an advisory local-filesystem boundary between cooperating Turn dae
 the same account deliberately unlinking or replacing the lock inode.
 
 The protected resource is a **canonical checkout path**, not a Workspace name, UI window or the spelling of
-`cwd`. The store maintains a global monotonic fence per canonical path, so deleting/recreating a Workspace
+`cwd`. The store maintains a monotonic fence per canonical path inside one canonical data directory, so deleting/recreating a Workspace
 or using a symlink alias cannot reset generation and resurrect a stale owner. Active, stale and
 `recovery_required` claims all block a new writer until explicit fenced reconciliation; only `released` is
 non-blocking.
@@ -317,7 +317,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Required invariant | Required proof |
 | --- | --- |
 | One canonical data directory has one daemon owner | different sockets and symlink aliases are rejected before Store/restore; a real `SIGKILL` releases the kernel lock and stale socket recovery succeeds |
-| One canonical checkout has one blocking write claim globally | concurrent acquisition through path aliases and recreated Workspaces yields exactly one owner |
+| One canonical checkout has one blocking write claim per canonical data directory | concurrent acquisition through path aliases and recreated Workspaces in that store yields exactly one owner |
 | Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
@@ -517,7 +517,7 @@ bounded before reducer, protocol or store. The remaining boundaries are:
 - Never add a response body to the hook endpoint.
 - Bounds are not optional: a new buffer that a process can grow needs a cap and a
   counter for what it dropped.
-- Never arbitrate a checkout by raw path spelling. Canonical identity and the global generation fence are
+- Never arbitrate a checkout by raw path spelling. Canonical identity and the store-wide generation fence are
   required, including after Workspace deletion/recreation.
 - Never pass a caller/stored Session or Pane cwd directly to a PTY. Resolve it against the assigned checkout,
   canonicalise it, enforce component containment and repeat the check at the final launch boundary.

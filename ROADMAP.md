@@ -50,7 +50,7 @@ restart instead of being attributed or resolved session-wide.
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
-Preview → temporary Pane → close without stop → restart and reattach` sequence in
+Preview → temporary Pane → close without stop → reconnect the UI` sequence in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`: the live-runtime part restarts only the UI; a separate daemon restart
 proves metadata recovery and honest loss without claiming PTY reattachment.
 
@@ -240,7 +240,7 @@ live acceptance, not something the deterministic stand-in proves.
 This milestone makes ADR-040 true below the UI before M7 builds on it.
 
 **Delivers.** Normalised Workspace/Session/Process ownership plus one revisioned `HierarchySnapshot`;
-closed Session modes; canonical checkout identity with one global fenced primary-writer claim; lossless
+closed Session modes; canonical checkout identity with one store-wide fenced primary-writer claim; lossless
 Agent naming and relationship confidence; background nodes independent of Pane bindings; bounded/redacted
 Activity Preview; per-surface tree state; and protocol v3 with structured lease conflict/recovery.
 
@@ -501,13 +501,18 @@ The catastrophic failure is two Sessions believing they exclusively own the same
 strings alias through symlinks and spelling; a daemon can crash between side effect and commit; a stale
 client can release a newer claim; deleting/recreating a Workspace can reset locally scoped generation.
 
-*Mitigated by:* canonical-path uniqueness across Workspaces, one global monotonic fence per canonical path,
+*Mitigated by:* canonical-path uniqueness across Workspaces and one monotonic fence per canonical path
+inside the canonical data directory,
 `BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release,
 blocking `recovery_required`, a canonical-data-directory process lock established before SQLite/restore, and
 canonical Session/Pane cwd containment repeated at the final PTY boundary. Adversarial tests cover concurrent
 aliases, delete/recreate generations, stale release, transaction rollback, same-data/different-socket daemons,
 symlink data-dir aliases, crash recovery, absolute/`..`/symlink cwd escapes and worktree→primary launches.
 Migration 003 grants no lease; migration 006 trusts no pre-existing one.
+
+*Still missing:* a checkout-scoped OS lock across deliberately separate `--data-dir` installations. Today
+those stores are independent authority domains and can each claim the same path.
+
 *Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
 old writer stopped. Cwd containment is not an OS sandbox: same-user code can still open another path after
 launch, so stronger isolation remains a separate security feature. The local-filesystem `flock` is an

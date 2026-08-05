@@ -94,7 +94,8 @@ A pane can be carried two ways, and the client chooses at `attach_pane` with
 
 **Cells are the default because the daemon has already parsed the screen.** It has to:
 on-demand previews and the output heuristics work with no client attached, so a `vt100` screen
-per pane exists whether or not anybody is looking. Sending that screen means there is
+exists for each PTY-backed runtime node whether or not anybody is looking. Sending that screen through a
+bound Pane means there is
 exactly one terminal emulator in the system, which removes the whole class of bug where
 the daemon's idea of a pane and the client's disagree — and it means a client does not
 need an emulator at all.
@@ -426,8 +427,8 @@ the Process stream or stop the Agent; restoring `inherit` or `show` exposes only
 with six stored facts and `limit: 4` the response contains `[6, 5, 4, 3]`; entry zero is the item Quick Preview
 highlights as current.
 
-`focus_pane_for_attention` keeps navigation identity and input ownership separate. The selected and
-acknowledged subject remains `subject_node_id`. If that semantic Agent has no attachable runtime, the daemon
+`focus_pane_for_attention` keeps navigation identity and input ownership separate. The selected semantic
+subject remains `subject_node_id`; focusing it does not itself resolve or acknowledge Attention. If that semantic Agent has no attachable runtime, the daemon
 may return the nearest Pane-owning ancestor only across an `owns_process` or `spawned_by` relationship at
 `integrated` or `explicit` confidence. It never crosses a distinct child runtime, follows a provisional
 relationship or creates a Pane. `PaneFocusView.node_id` names the node represented by the actual Pane and
@@ -522,7 +523,8 @@ return their own runtime result without pretending they changed Layout.
 Pane identity and runtime identity are many-to-one through `PaneNodeBinding`: one Pane binds at most one
 node, one node may have zero or many Panes. `ProcessNode.pane_id` is not a v3 authority. Opening a semantic
 subagent with no independent PTY yields a Preview/Process Details pane capability, not a terminal that
-cannot work. Closing/detaching a binding never implies terminating the node.
+cannot work. Detach or `ClosePane(KeepProcesses)` never terminates the node; explicit `Terminate`/`Kill`
+dispositions apply only where process-control rules allow them, and an Agent requires a separate node action.
 
 - `direction`: `"horizontal"` \| `"vertical"`
 - `target`: `{"kind":"pane","pane_id":…}` \| `{"kind":"next"}` \| `{"kind":"previous"}`
@@ -636,8 +638,9 @@ user wanted kept or leak processes they thought were gone.
 | `kill` | Stop them without asking. |
 
 `keep_processes`, closing the UI and archiving a Session with a live writer do not release its checkout
-lease. A fenced explicit release is valid only after write-capable processes stopped or the Session changed
-mode. Before restoring Sessions or emitting any heartbeat, a new daemon changes every non-`released` lease
+lease. A fenced explicit release is valid only after no runtime node owned by the Session remains running;
+the same atomic operation demotes the Session to `read_only`. Before restoring Sessions or emitting any
+heartbeat, a new daemon changes every non-`released` lease
 to `recovery_required` while preserving its id, generation and previous heartbeat. Loading the former owner
 never auto-adopts that authority; release/reacquisition remains explicit.
 

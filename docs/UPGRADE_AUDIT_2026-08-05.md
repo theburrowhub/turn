@@ -4,7 +4,7 @@
 
 The upgrade is implemented as a domain and authority correction for the first reproducible vertical. Turn
 now has one persistent Workspace → Session → Agent/Tool → Child navigator, one canonical writer for a
-primary checkout, background subagents independent of panes, durable semantic previews and node-specific
+primary checkout inside one canonical Turn data directory, background subagents independent of panes, durable semantic previews and node-specific
 Attention. The shared primary Git checkout was not modified during this work; implementation happened on the
 dedicated `codex/unified-hierarchy-20260805` worktree.
 
@@ -17,7 +17,7 @@ packaging and platform accessibility sign-off remain open.
 | Requirement | Delivered invariant | Reproducible evidence |
 | --- | --- | --- |
 | One persistent hierarchy | The left AccessKit tree is the only persistent navigator; no Session tabs, thumbnail strip or second Agent tree | 20 native GUI tests, including 12 PNG baselines and a dense 30-Session fixture |
-| One primary-checkout writer | One process owns the canonical data directory before Store/restore; canonical checkout identity, global monotonic fence, atomic Session+lease creation and typed alternatives enforce one writer inside it | Different-socket/data-dir, alias, crash recovery, rollback, stale generation and conflict tests |
+| One primary-checkout writer | One process owns the canonical data directory before Store/restore; canonical checkout identity, store-wide monotonic fence, atomic Session+lease creation and typed alternatives enforce one writer inside that authority domain | Same-data-dir/different-socket, data-dir alias, crash recovery, rollback, stale generation and conflict tests |
 | Safe parallel alternatives | Read-only Sessions refuse a write-capable launch without a technical guard; isolated Sessions create a real independent Git worktree and retain shared-resource declarations | Session request and real-worktree integration tests |
 | Agent independent of Pane | A node has zero-to-many bindings; closing a view never stops the Agent | Reviewer vertical and temporary-pane tests |
 | Background subagents | `Reviewer` is inserted under Claude with declared name and relationship confidence, without layout/focus mutation | Hook-transport vertical and tree projection tests |
@@ -25,7 +25,7 @@ packaging and platform accessibility sign-off remain open.
 | Safe Activity Preview | Semantic/stable text is ANSI/CR/noise-normalised, redacted before persistence, bounded and returned newest-first | Preview, secret-on-disk, restart and Quick Preview tests |
 | Attention coordination | Entries are per exact node or durable parent/external-id scope; lifecycle cleanup, deferred focus and queue triage preserve that same subject boundary across mute/snooze/dismiss/restart | Core, store, restart, daemon and GUI Attention suites |
 | Honest permission detail | The banner resolves an exact Agent (including a primary Agent projected before the tree); scoped node-less and stale identities never borrow command, cwd or risk from the primary Agent | GUI permission-attribution tests |
-| Honest restart | A daemon fences every unreleased lease before loading, relaunches nothing, restores exact surviving Attention entries and does not open panes | Store and daemon restart suites |
+| Honest restart | A daemon fences every unreleased lease before loading, relaunches nothing, restores exact interaction entries only while their runtime owner is corroborated, preserves marked postmortem evidence and does not open Panes | Store and daemon restart suites |
 | Checkout launch boundary | Session, template, Pane, init and relaunch cwd values must canonically remain inside the assigned checkout at creation and immediately before PTY spawn | Absolute, `..`, symlink, persisted-Layout and worktree-to-primary adversarial tests |
 | Template intent survives conflict | Safe read-only/worktree retries retain only Template identity/inputs; the daemon reapplies the authoritative Layout/env/Attention/tmux/naming contract and maps worktree cwd values | GUI request-shape, daemon unit and real-Git end-to-end tests |
 | Surface-scoped temporary views | Temporary Pane bindings are visible only to their live UI surface and expire on replacement/disconnect/restart without stopping the node or changing Layout | Two-surface, reconnect and daemon-restart tests |
@@ -50,8 +50,9 @@ packaging and platform accessibility sign-off remain open.
    Restore now fences every unreleased lease as `recovery_required` before loading Sessions; heartbeat and
    launch accept only `active` authority acquired by the current explicit flow.
 5. **Lossy Attention restoration.** Replaying stored demands minted new ids and lost age, snooze,
-   acknowledgement and priority. Restore now retains the exact durable queue and only removes demands whose
-   runtime owner did not survive.
+   acknowledgement and priority. Restore now retains the exact durable queue, removes non-surviving
+   interaction demands whose runtime owner no longer runs, and preserves entries explicitly marked
+   `survives_owner_exit` as postmortem failure/completion evidence.
 6. **Reversed Quick Preview history.** The limit was applied to the newest rows but a daemon reversal made
    the client highlight the wrong end. Store, protocol and GUI now use newest-first consistently.
 7. **Hostile hook retention.** Raw Claude callback bodies no longer enter the event log, and migration 005
@@ -135,6 +136,11 @@ packaging and platform accessibility sign-off remain open.
     for every Session-creation or lease-acquisition path. Fenced release and the owner's transition to
     `ReadOnly` now commit in one `IMMEDIATE` transaction, update memory only after success and roll both
     changes back on an injected failure.
+27. **Semantic Attention had no honest input route for a background Agent without a PTY.** `Next Attention`
+    now keeps/selects the exact subject (for example Reviewer) while resolving a separate existing Pane for
+    the authentic runtime that can receive input. It traverses only integrated/explicit `spawned_by` or
+    `owns_process` ancestry, never crosses a distinct child runtime or provisional edge, never attributes
+    the demand to the parent and never opens a Pane implicitly. `PaneFocusView` returns both identities.
 
 ## Validation performed on the integrated branch
 
@@ -161,7 +167,7 @@ cargo test -p turnd \
   a_data_directory_rejects_another_socket_and_recovers_after_sigkill \
   -- --test-threads=1 --nocapture
 
-cargo test --workspace -- --test-threads=1
+cargo test --workspace --all-targets --no-fail-fast -- --test-threads=1
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
@@ -187,6 +193,12 @@ restart tests restore durable metadata as `Orphaned`/`Lost` and prove that nothi
 - **Process lock trust boundary:** the canonical-data-directory `flock` is advisory on a supported local
   filesystem and protects cooperating Turn daemons. It is not a sandbox against the same account deliberately
   unlinking/replacing the lock inode or mutating SQLite outside Turn.
+- **Cross-installation checkout authority:** two deliberately separate `--data-dir` stores do not share a
+  checkout-scoped OS lock and can each claim the same path. Host-global exclusivity remains a hardening gate.
+- **Opaque credentials:** every durable free-text class is covered by sensitive-key and known-shape
+  redaction, but an unlabelled credential with no distinctive shape cannot be identified reliably without
+  unacceptable false positives. Raw terminal streams remain ephemeral; arbitrary diagnostic persistence
+  requires a separate opt-in threat review.
 - **Recovered Preview marker:** timestamps and confidence survive, but the UI still needs a distinct stale /
   recovered marker instead of merely showing the old timestamp.
 - **Reconnection identity:** stored PIDs/commands support conservative restore diagnostics, but successful

@@ -65,7 +65,8 @@ WorkspaceWriteLease
   acquired_ms, heartbeat_ms, released_ms?, generation
 ```
 
-SQLite and the daemon transaction enforce one canonical writer namespace per checkout. Every non-released
+Within one canonical Turn data directory/store, SQLite and the daemon transaction enforce one canonical
+writer namespace per checkout. Every non-released
 lease blocks acquisition; the fencing generation remains monotonic even if a Workspace is deleted and
 recreated. The daemon owns acquisition, heartbeat and release. A new daemon first changes every unreleased
 lease to `recovery_required`; loading the former Session never adopts it. A stale or recovery lease is never
@@ -76,6 +77,10 @@ the daemon acquires an exclusive process lock on the canonical data directory. S
 endpoints and do not define store ownership: a second daemon using another socket or a symlink alias is
 refused before it can fence live leases. Process death releases the kernel lock; the stable lock file itself
 is never removed.
+
+This is not yet host-global across deliberately separate `--data-dir` values. Two independent stores can
+register the same checkout without sharing a fence; a checkout-scoped OS lock is a hardening gate before
+Turn may claim exclusivity across multiple installations.
 
 ### AgentNode independent of Pane
 
@@ -120,6 +125,12 @@ Permission detail follows identity, never Session proximity. A client may show c
 for the exact `node_id` (including an exact primary-Agent summary received before the tree). A scoped
 node-less demand or stale exact id remains provisional in the queue and never borrows the primary Agent's
 pending permission.
+
+Attention navigation also separates semantic subject from input ownership. `Next Attention` selects the
+exact AgentNode. If a semantic subagent shares an ancestor's PTY, the daemon may focus that existing runtime
+Pane only across an integrated/explicit `spawned_by` or `owns_process` edge, returning both node identities.
+It never relabels the parent, crosses a distinct child runtime/provisional edge or creates a Pane. With no
+safe existing input Pane, selection remains on the subject and opening stays explicit.
 
 ## Activity preview
 
@@ -244,7 +255,7 @@ Tree:    ListWorkspaceTree, SubscribeTreeChanges, ExpandNode, CollapseNode,
 Preview: SubscribeActivityPreviews, GetActivityPreview, GetPreviewHistory,
          SetPreviewVisibility, RedactPreview
 Pane:    OpenNodeAsPane, OpenNodeAsTemporaryPane, FocusPaneForNode,
-         ClosePane, ListPanesForNode
+         FocusPaneForAttention, ClosePane, ListPanesForNode
 Lease:   AcquireWorkspaceWriteLease, ReleaseWorkspaceWriteLease,
          GetWorkspaceWriteLease, CreateReadOnlySession, CreateWorktreeSession,
          CreateReadOnlySessionFromTemplate, CreateWorktreeSessionFromTemplate

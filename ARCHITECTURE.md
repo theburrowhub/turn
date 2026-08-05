@@ -20,7 +20,7 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | --- | --- | --- | --- |
 | `turn-core` | Built | reproduce | Domain, state, attention and ADR-040 hierarchy/lease/preview values. |
 | `turn-proto` | Built | reproduce | Framing, terminal cells and implemented protocol-v3 hierarchy operations. |
-| `turn-store` | Built | reproduce | Append-only migrations, global fences, hierarchy and secure hook cleanup. |
+| `turn-store` | Built | reproduce | Append-only migrations, store-wide fences, hierarchy and secure hook cleanup. |
 | `turn-pty` | Built | reproduce | Ptys, buffers, supervision. |
 | `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
 | `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
@@ -31,7 +31,7 @@ There is one command and one test runner: the frontend is Rust now (ADR-039), so
 `vitest` and no second lockfile.
 
 ```sh
-cargo test --workspace -- --test-threads=1
+cargo test --workspace --all-targets -- --test-threads=1
 ```
 
 Counts are intentionally not pinned here: every regression proof changes them. The release audit runs the
@@ -807,7 +807,8 @@ options, initialises logging, resolves a `Config` and calls `turnd::start`. The 
 Unit and integration coverage lives beside those modules and in `tests/{desk,agents,surface,restart,
 attention,binary,cells}.rs`; counts are intentionally reproduced rather than frozen here.
 
-The release audit runs `cargo test -p turnd -- --test-threads=1` and the full workspace serially. The exact
+The release audit runs `cargo test -p turnd -- --test-threads=1` and the full workspace with all targets
+serially. The exact
 Reviewer tests cross both the production reducer and the real loopback Claude hook transport. An
 authenticated external Claude Code session in the packaged native window remains a separate acceptance
 gate; deterministic coverage is not evidence that credentials, signing or the installed release work.
@@ -1115,7 +1116,7 @@ writer; daemon reconciliation or an explicit user decision must do that later. C
 sources are surfaced for reconciliation rather than silently choosing two authorities.
 
 Migration 005 removes historical raw hook callback bodies from both SQLite and WAL. Migration 006
-re-resolves legacy checkout identity, preserves global fence monotonicity and marks every ambiguous legacy
+re-resolves legacy checkout identity, preserves fence monotonicity inside the store and marks every ambiguous legacy
 claim for explicit reconciliation rather than granting authority. Migration 007 adds the authenticated
 parent and optional external-worker correlation scope to node-less Attention entries; old rows remain valid
 and acquire null scope rather than being broadened by a guessed parent. Migration 008 distinguishes
@@ -1130,7 +1131,8 @@ fails the open rather than claiming a partial cleanup succeeded.
 The schema additions are Session mode/checkout/enforcement fields and
 `workspace_checkouts`, `checkout_write_fences`, `workspace_write_leases`, `activity_previews`,
 `pane_node_bindings` and `tree_ui_state`. `checkout_write_fences` is keyed by canonical path and survives
-Workspace/lease recreation, so generation is globally monotonic for the protected filesystem identity.
+Workspace/lease recreation, so generation is monotonic for that filesystem identity inside one canonical
+data directory. Separate data directories do not yet share a checkout-scoped OS lock.
 Partial uniqueness treats every non-released lease state — including stale/recovery-required — as blocking.
 
 **Codec.** Two column shapes, chosen per column. `tag` for payload-free enums, which land as a bare
@@ -1153,8 +1155,8 @@ Per-repository notes worth knowing:
   because a Session whose layout survived but whose nodes did not is not a Session anybody can restore.
 - **`node`** — stores runtime metadata: pid, command, cwd, lifecycle, relationship, naming, exit code and
   external id.
-  Enough to look a process up in the process table and try to re-attach, and enough to say "this was
-  running and we can no longer find it" when that fails. **Not** stored: the pty, the scrollback, the
+  Enough to corroborate a stored PID for conservative diagnostics and say "this was running and we can no
+  longer reach/find it". It cannot reattach the PTY. **Not** stored: the pty, the scrollback, the
   terminal grid, the output channel — a pty master cannot outlive the process, and a restored scrollback
   would be a screenshot of a conversation the Agent no longer remembers.
 - **`hierarchy`** — checkout assignments; acquire/heartbeat/fenced release for main-checkout leases;
