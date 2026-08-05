@@ -25,6 +25,7 @@ pub mod link;
 pub mod socket;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as sync_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,6 +136,9 @@ pub enum Inbound {
 
 /// One request, on its way out.
 struct Outbound {
+    /// The live socket generation this intent was created against. A request from an
+    /// older generation may never cross a later daemon connection.
+    generation: u64,
     ask: Ask,
     request: Request,
 }
@@ -143,7 +147,11 @@ struct Outbound {
 pub struct DaemonLink {
     socket: PathBuf,
     outbound: tokio_mpsc::UnboundedSender<Outbound>,
+    inbound_sender: sync_mpsc::Sender<Inbound>,
     inbound: sync_mpsc::Receiver<Inbound>,
+    wake: Waker,
+    /// Zero while disconnected; otherwise the generation accepted by `serve`.
+    connection_generation: Arc<AtomicU64>,
     /// Kept so the runtime thread is not detached; dropping the link ends it.
     _thread: std::thread::JoinHandle<()>,
 }
@@ -159,6 +167,10 @@ impl DaemonLink {
         let (outbound, outbound_rx) = tokio_mpsc::unbounded_channel::<Outbound>();
         let (inbound_tx, inbound) = sync_mpsc::channel::<Inbound>();
         let path = socket.clone();
+        let inbound_sender = inbound_tx.clone();
+        let link_wake = Arc::clone(&wake);
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let supervisor_generation = Arc::clone(&connection_generation);
 
         let thread = std::thread::Builder::new()
             .name("turn-daemon-link".to_string())
@@ -185,6 +197,7 @@ impl DaemonLink {
                     outbound_rx,
                     inbound_tx,
                     wake,
+                    supervisor_generation,
                 ));
             });
 
@@ -202,7 +215,10 @@ impl DaemonLink {
         DaemonLink {
             socket,
             outbound,
+            inbound_sender,
             inbound,
+            wake: link_wake,
+            connection_generation,
             _thread: thread,
         }
     }
@@ -211,15 +227,43 @@ impl DaemonLink {
         &self.socket
     }
 
-    /// Queues a request. Never blocks, and never waits for a connection.
+    /// Queues a request for the connection that is live *now*. Never blocks and never
+    /// waits for a future daemon.
     ///
     /// A window that queued requests across a reconnect would replay a `close_pane`
     /// against a layout the daemon rebuilt from disk. The window re-fetches on
     /// reconnect instead, which is the only correct recovery, so dropping a request
     /// sent while disconnected is what makes that happen.
     pub fn send(&self, ask: Ask, request: Request) {
-        if self.outbound.send(Outbound { ask, request }).is_err() {
-            tracing::debug!("the connection thread has ended; a request was dropped");
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        if generation == 0 {
+            self.reject_offline(ask);
+            return;
+        }
+        if let Err(error) = self.outbound.send(Outbound {
+            generation,
+            ask,
+            request,
+        }) {
+            self.reject_offline(error.0.ask);
+        }
+    }
+
+    fn reject_offline(&self, ask: Ask) {
+        tracing::debug!(
+            intent = ask.describing(),
+            "a request was dropped without a live daemon connection"
+        );
+        if !ask.is_worth_reporting() {
+            return;
+        }
+        let error = disconnected_request_error(&ask);
+        if self
+            .inbound_sender
+            .send(Inbound::Failed { ask, error })
+            .is_ok()
+        {
+            (self.wake)();
         }
     }
 
@@ -243,10 +287,12 @@ async fn supervise(
     mut outbound: tokio_mpsc::UnboundedReceiver<Outbound>,
     inbound: sync_mpsc::Sender<Inbound>,
     wake: Waker,
+    connection_generation: Arc<AtomicU64>,
 ) {
     let mut identity = DaemonIdentity::new();
     let mut attempt: u32 = 0;
     let mut last_status = ConnectionState::Starting;
+    let mut generation: u64 = 0;
 
     loop {
         attempt = attempt.saturating_add(1);
@@ -303,17 +349,25 @@ async fn supervise(
             protocol = connection.agreed_version(),
             "connected to turnd"
         );
+        generation = generation.saturating_add(1).max(1);
+        connection_generation.store(generation, Ordering::Release);
         if !publish(
             &inbound,
             &wake,
             &mut last_status,
             identity.observe(&welcome),
         ) {
+            connection_generation.store(0, Ordering::Release);
             return;
         }
 
         let opened = tokio::time::Instant::now();
-        let ended_cleanly = serve(&mut connection, &mut outbound, &inbound, &wake).await;
+        let ended_cleanly =
+            serve(&mut connection, &mut outbound, &inbound, &wake, generation).await;
+        // Close the gate before publishing Disconnected. An intent racing the socket
+        // teardown either fails on that socket or carries this old generation and is
+        // rejected by the next one; it can never be replayed there.
+        connection_generation.store(0, Ordering::Release);
 
         // The backoff is only forgiven by a connection that lasted. A daemon that
         // handshakes and dies is a crash loop, and starting the next attempt from
@@ -350,6 +404,7 @@ async fn serve(
     outbound: &mut tokio_mpsc::UnboundedReceiver<Outbound>,
     inbound: &sync_mpsc::Sender<Inbound>,
     wake: &Waker,
+    generation: u64,
 ) -> bool {
     let mut pending: std::collections::HashMap<RequestId, Ask> = std::collections::HashMap::new();
     let mut next_id: u64 = 1;
@@ -381,10 +436,20 @@ async fn serve(
                 wake();
             }
             request = outbound.recv() => {
-                let Some(Outbound { ask, request }) = request else {
+                let Some(Outbound { generation: request_generation, ask, request }) = request else {
                     // The window dropped its handle.
                     return false;
                 };
+                if request_generation != generation {
+                    if ask.is_worth_reporting() {
+                        let error = disconnected_request_error(&ask);
+                        if inbound.send(Inbound::Failed { ask, error }).is_err() {
+                            return false;
+                        }
+                        wake();
+                    }
+                    continue;
+                }
                 let id = RequestId::new(format!("r-{next_id}"));
                 next_id = next_id.saturating_add(1);
                 match connection.send(id.clone(), request).await {
@@ -428,6 +493,16 @@ async fn serve(
     true
 }
 
+fn disconnected_request_error(ask: &Ask) -> ProtoError {
+    ProtoError::new(
+        turn_proto::ErrorCode::Unavailable,
+        format!(
+            "Turn is not connected to its daemon, so it did not send the request for {}. Try again after it reconnects",
+            ask.describing()
+        ),
+    )
+}
+
 /// Publishes a state change, and only a change.
 ///
 /// Re-announcing "connecting, attempt 4" every four seconds would make the status
@@ -455,7 +530,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
-    use turn_proto::{ServerFrame, Welcome};
+    use turn_proto::{ClientMessage, ServerFrame, Welcome};
 
     fn socket_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -780,21 +855,102 @@ mod tests {
 
     #[test]
     fn a_request_sent_with_no_connection_is_dropped_rather_than_queued_for_later() {
-        // Replaying a queued `close_pane` after a reconnect would act on a layout the
-        // daemon rebuilt from disk. The window re-fetches instead.
+        // Replaying a queued mutation after a reconnect would act on a world the
+        // window has not fetched. Start with no peer and wait until that fact is
+        // observable, so this is a real offline send rather than a connection race.
+        let path = socket_path("dropped");
         let (wake, _) = counting_waker();
-        let link = DaemonLink::spawn(socket_path("dropped"), "0.1.0", wake);
-        link.send(Ask::Action("closing the pane"), Request::ListTemplates);
-        std::thread::sleep(Duration::from_millis(50));
-        let answers: Vec<Inbound> = link
-            .drain()
-            .into_iter()
-            .filter(|message| matches!(message, Inbound::Answer { .. }))
-            .collect();
-        assert!(
-            answers.is_empty(),
-            "nothing can be answered; saw {answers:?}"
+        let link = DaemonLink::spawn(path.clone(), "0.1.0", wake);
+        wait_for(&link, |message| {
+            matches!(
+                message,
+                Inbound::Status(ConnectionState::Disconnected { .. })
+            )
+        });
+        link.send(
+            Ask::Action("creating a workspace"),
+            Request::CreateWorkspace {
+                name: "must-not-appear".into(),
+                root: "/tmp/must-not-appear".into(),
+            },
         );
+
+        let rejected = wait_for(&link, |message| matches!(message, Inbound::Failed { .. }));
+        assert!(
+            rejected.iter().any(|message| matches!(
+                message,
+                Inbound::Failed { ask: Ask::Action("creating a workspace"), error }
+                    if error.code == turn_proto::ErrorCode::Unavailable
+            )),
+            "an offline user action must be rejected immediately; saw {rejected:?}"
+        );
+
+        // Now make a real peer appear. It holds the connection open, first watching
+        // long enough for the stale mutation to arrive, then watching for a new read
+        // sent against this live generation. The old implementation fails here: its
+        // unbounded channel delivers CreateWorkspace immediately after the Welcome.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the late fake daemon");
+        let listener_path = path.clone();
+        let (observed_tx, observed_rx) = sync_mpsc::channel::<Option<Request>>();
+        let daemon = runtime.spawn(async move {
+            let Ok(listener) = UnixListener::bind(&listener_path) else {
+                return;
+            };
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let _ = lines.next_line().await;
+            let welcome = Welcome::new(1, "0.1.0-test", 4242, 1_700_000_000_000);
+            if let Ok(bytes) = turn_proto::encode(&ServerFrame::welcome(welcome)) {
+                let _ = write.write_all(&bytes).await;
+            }
+
+            for timeout in [Duration::from_millis(500), Duration::from_secs(2)] {
+                let observed = match tokio::time::timeout(timeout, lines.next_line()).await {
+                    Ok(Ok(Some(line))) => serde_json::from_str::<turn_proto::ClientFrame>(&line)
+                        .ok()
+                        .and_then(|frame| match frame.message {
+                            ClientMessage::Request { request, .. } => Some(request),
+                            ClientMessage::Hello(_) => None,
+                        }),
+                    _ => None,
+                };
+                let _ = observed_tx.send(observed);
+            }
+        });
+
+        let connected = wait_for(&link, |message| {
+            matches!(message, Inbound::Status(ConnectionState::Connected { .. }))
+        });
+        assert!(
+            connected.iter().any(|message| matches!(
+                message,
+                Inbound::Status(ConnectionState::Connected { .. })
+            )),
+            "the late peer must actually connect; saw {connected:?}"
+        );
+        let stale = observed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the peer reports what arrived before a fresh send");
+        assert_eq!(
+            stale, None,
+            "an intent created offline crossed a later connection: {stale:?}"
+        );
+
+        link.send(Ask::Templates, Request::ListTemplates);
+        let fresh = observed_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the peer reports the request from its own generation");
+        assert_eq!(fresh, Some(Request::ListTemplates));
+
+        drop(link);
+        daemon.abort();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
