@@ -805,6 +805,10 @@ pub fn send_signal(pid: u32, signal: i32) {
 /// unwritten state has to handle.
 pub const SIGTERM: i32 = 15;
 
+/// `SIGKILL`. Used only to prove that kernel-owned daemon locks do not require a
+/// cleanup handler to become available after a crash.
+pub const SIGKILL: i32 = 9;
+
 /// Waits for a path to appear, so a test does not race a daemon's start-up.
 pub async fn wait_for_path(path: &Path) {
     let deadline = tokio::time::Instant::now() + TIMEOUT;

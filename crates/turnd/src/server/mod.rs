@@ -40,6 +40,10 @@ pub struct DaemonHandle {
     commands: mpsc::Sender<Command>,
     accept: JoinHandle<()>,
     core: JoinHandle<()>,
+    /// Shared with the core task. Keeping it here makes ownership visible in the
+    /// daemon's RAII boundary; keeping it in the core means dropping this handle
+    /// cannot unlock a still-running detached daemon.
+    _data_dir_lock: Arc<instance::DataDirLock>,
     /// Kept alive for as long as the daemon runs: dropping it stops the hook server,
     /// and an agent whose callbacks start failing is a worse outcome than an idle port.
     hooks: Arc<HookServer>,
@@ -100,8 +104,14 @@ impl DaemonHandle {
 pub async fn start(config: Config) -> Result<DaemonHandle> {
     paths::ensure_dir(&config.data_dir)?;
 
+    // This is the first operation after making the directory exist. The socket is
+    // only a transport address and may be overridden, so it cannot protect the
+    // SQLite store or prevent a second Core::restore from fencing live leases.
+    let data_dir_lock = Arc::new(instance::DataDirLock::acquire(&config.data_dir)?);
+    let data_dir = data_dir_lock.data_dir().to_path_buf();
+
     let store = if config.persist {
-        Store::open_in(&config.data_dir)?
+        Store::open_in(&data_dir)?
     } else {
         // Everything else behaves identically; nothing survives the process.
         Store::open_in_memory()?
@@ -111,16 +121,17 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
     let hooks = Arc::new(hooks);
     let hook_base_url = hooks.base_url().to_string();
 
-    // Bound the socket before doing anything else that a second daemon would also do,
-    // so contention is detected before two processes touch the same store.
+    // The data-directory guard above protects persistent ownership. This independent
+    // boundary protects the transport path from a daemon using another store.
     let listener = instance::bind_exclusive(&config.socket_path).await?;
 
     let (commands, inbox) = mpsc::channel(COMMAND_CAPACITY);
     let core = Core::new(
+        Arc::clone(&data_dir_lock),
         store,
         Arc::clone(&hooks),
         config.registry,
-        config.data_dir.clone(),
+        data_dir.clone(),
         commands.clone(),
     )?;
 
@@ -135,7 +146,7 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
 
     tracing::info!(
         socket = %config.socket_path.display(),
-        data_dir = %config.data_dir.display(),
+        data_dir = %data_dir.display(),
         hooks = %hook_base_url,
         pid = info.pid,
         version = %info.version,
@@ -146,11 +157,12 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
     Ok(DaemonHandle {
         socket_path: config.socket_path,
         hook_base_url,
-        data_dir: config.data_dir,
+        data_dir,
         info,
         commands,
         accept: accept_task,
         core: core_task,
+        _data_dir_lock: data_dir_lock,
         hooks,
     })
 }

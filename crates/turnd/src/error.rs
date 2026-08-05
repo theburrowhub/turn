@@ -9,6 +9,28 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonError {
+    /// Another process owns the persistent state, independently of which socket it
+    /// chose. The socket alone is not a store-ownership boundary: two daemons can
+    /// be configured with different socket paths while pointing at the same SQLite
+    /// database.
+    #[error(
+        "a Turn daemon is already running for data directory {data_dir} \
+         (owner pid {owner_pid:?}); stop it before starting another"
+    )]
+    DataDirInUse {
+        data_dir: PathBuf,
+        owner_pid: Option<u32>,
+    },
+
+    /// Failing to establish the store-ownership lock is fatal. Continuing would
+    /// allow restore to fence another daemon's live leases and split PTY ownership.
+    #[error("could not lock Turn data directory {data_dir}: {cause}")]
+    DataDirLock {
+        data_dir: PathBuf,
+        #[source]
+        cause: std::io::Error,
+    },
+
     /// Another daemon answered on the socket. Starting a second one would mean two
     /// owners for the same store and the same ptys, so this is fatal rather than
     /// something to work around.
@@ -89,7 +111,9 @@ impl DaemonError {
     pub fn is_contention(&self) -> bool {
         matches!(
             self,
-            DaemonError::AlreadyRunning { .. } | DaemonError::SocketNotOurs { .. }
+            DaemonError::DataDirInUse { .. }
+                | DaemonError::AlreadyRunning { .. }
+                | DaemonError::SocketNotOurs { .. }
         )
     }
 }

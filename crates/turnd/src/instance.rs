@@ -1,9 +1,15 @@
 //! Being the only daemon.
 //!
+//! There are two independent ownership boundaries:
+//!
+//! * a process lock on the canonical data directory, which is the authority for the
+//!   store, leases and PTYs even when daemons choose different sockets; and
+//! * the unix socket itself, which must not be displaced when another listener owns it.
+//!
 //! A unix socket file outlives the process that bound it, so its presence proves
-//! nothing. The only reliable question is whether something *answers*, and the only
-//! answer that means "a Turn daemon owns this" is a `welcome` or a `rejected` —
-//! both of which come out of [`turn_proto`]'s handshake.
+//! nothing. The only reliable question at that boundary is whether something
+//! *answers*, and the only answer that means "a Turn daemon owns this" is a `welcome`
+//! or a `rejected` — both of which come out of [`turn_proto`]'s handshake.
 //!
 //! Getting this wrong is expensive in both directions. Refusing to start because a
 //! file exists leaves the user unable to run Turn after a crash, with no way to know
@@ -13,7 +19,9 @@
 
 use crate::error::{DaemonError, Result};
 use crate::paths;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -25,6 +33,180 @@ use turn_proto::envelope::{ClientFrame, Hello, ServerFrame, ServerMessage};
 /// hung process does not delay start-up noticeably. A daemon that cannot complete a
 /// handshake in a second is not one we should hand the user's sessions back to.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
+
+/// Stable inode used as the process-level ownership boundary for one data directory.
+///
+/// The file is deliberately retained after clean shutdown. Removing a lock file can
+/// split the lock domain: a contender may already hold the old inode while a third
+/// process creates and locks a new one at the same pathname. An unlocked leftover is
+/// harmless because the kernel releases `flock` when the owning process exits.
+const DATA_DIR_LOCK_FILE: &str = ".turnd.lock";
+
+/// Exclusive ownership of a canonical Turn data directory.
+///
+/// The open file is the guard. Closing it, including after a crash, releases the
+/// kernel lock. The canonical directory is retained so every store and scratch path
+/// in the daemon is derived from the same filesystem identity rather than the user's
+/// possibly aliased spelling.
+pub struct DataDirLock {
+    canonical_data_dir: PathBuf,
+    _file: File,
+}
+
+impl std::fmt::Debug for DataDirLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataDirLock")
+            .field("canonical_data_dir", &self.canonical_data_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataDirLock {
+    /// Acquires the single-writer guard before SQLite is opened or migrations and
+    /// restore can mutate durable state.
+    pub fn acquire(data_dir: &Path) -> Result<Self> {
+        let canonical_data_dir =
+            std::fs::canonicalize(data_dir).map_err(|cause| DaemonError::DataDirLock {
+                data_dir: data_dir.to_path_buf(),
+                cause,
+            })?;
+        let lock_path = canonical_data_dir.join(DATA_DIR_LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // A pre-created symlink must not redirect the ownership boundary to a
+            // different inode. `CLOEXEC` also prevents launched agents inheriting a
+            // descriptor that would keep the daemon lock alive after a crash.
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(&lock_path)
+            .map_err(|cause| DaemonError::DataDirLock {
+                data_dir: canonical_data_dir.clone(),
+                cause,
+            })?;
+        if !file
+            .metadata()
+            .map_err(|cause| DaemonError::DataDirLock {
+                data_dir: canonical_data_dir.clone(),
+                cause,
+            })?
+            .is_file()
+        {
+            return Err(DaemonError::DataDirLock {
+                data_dir: canonical_data_dir,
+                cause: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the daemon lock is not a regular file",
+                ),
+            });
+        }
+
+        if let Err(cause) = try_lock_exclusive(&file) {
+            if cause.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(DaemonError::DataDirInUse {
+                    data_dir: canonical_data_dir,
+                    owner_pid: read_owner_pid(&mut file),
+                });
+            }
+            return Err(DaemonError::DataDirLock {
+                data_dir: canonical_data_dir,
+                cause,
+            });
+        }
+
+        verify_lock_identity(&file, &lock_path).map_err(|cause| DaemonError::DataDirLock {
+            data_dir: canonical_data_dir.clone(),
+            cause,
+        })?;
+        write_owner_pid(&mut file).map_err(|cause| DaemonError::DataDirLock {
+            data_dir: canonical_data_dir.clone(),
+            cause,
+        })?;
+
+        Ok(Self {
+            canonical_data_dir,
+            _file: file,
+        })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.canonical_data_dir
+    }
+}
+
+/// `flock` is tied to the open file description, does not wait, and is released by
+/// the kernel on process death. Any unsupported-filesystem error is propagated: a
+/// best-effort ownership guard is not an ownership guard.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of the call. The
+        // operation neither reads nor writes Rust memory.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "data-directory process locking is unavailable on this platform",
+    ))
+}
+
+/// Ensures a concurrent unlink/recreate during acquisition cannot make us lock an
+/// inode other contenders will no longer open. This is an acquisition check; the
+/// lock file must never be removed during daemon operation or clean shutdown.
+#[cfg(unix)]
+fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let opened = file.metadata()?;
+    let named = std::fs::symlink_metadata(path)?;
+    if opened.dev() != named.dev() || opened.ino() != named.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the daemon lock pathname changed during acquisition",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_lock_identity(_file: &File, _path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn write_owner_pid(file: &mut File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    writeln!(file, "{}", std::process::id())?;
+    file.flush()
+}
+
+fn read_owner_pid(file: &mut File) -> Option<u32> {
+    let mut owner = String::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    // Owner metadata is one decimal PID. Never trust an already-present lock file
+    // enough to allocate for its entire contents merely to improve an error message.
+    Read::by_ref(file)
+        .take(64)
+        .read_to_string(&mut owner)
+        .ok()?;
+    owner.trim().parse().ok()
+}
 
 /// What was found at a socket path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +341,55 @@ pub fn remove_socket(socket: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_data_directory_lock_follows_filesystem_identity_and_recovers_after_exit() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("state");
+        std::fs::create_dir(&data_dir).unwrap();
+        let alias = temp.path().join("state-alias");
+        symlink(&data_dir, &alias).unwrap();
+
+        let first = DataDirLock::acquire(&data_dir).expect("the first owner");
+        let error = DataDirLock::acquire(&alias).expect_err("an alias must not split ownership");
+        assert!(
+            matches!(
+                error,
+                DaemonError::DataDirInUse {
+                    owner_pid: Some(pid),
+                    ..
+                } if pid == std::process::id()
+            ),
+            "{error}"
+        );
+
+        // The file remains, but the kernel lock follows the process/open file rather
+        // than stale text. Dropping the simulated process owner makes restart safe.
+        drop(first);
+        let restarted = DataDirLock::acquire(&alias).expect("a crashed owner releases the lock");
+        assert_eq!(
+            restarted.data_dir(),
+            std::fs::canonicalize(&data_dir).unwrap()
+        );
+        assert!(data_dir.join(DATA_DIR_LOCK_FILE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_redirect_the_data_directory_lock() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("not-the-lock");
+        std::fs::write(&target, b"").unwrap();
+        symlink(&target, temp.path().join(DATA_DIR_LOCK_FILE)).unwrap();
+
+        let error = DataDirLock::acquire(temp.path()).expect_err("O_NOFOLLOW must fail closed");
+        assert!(matches!(error, DaemonError::DataDirLock { .. }), "{error}");
+    }
 
     #[tokio::test]
     async fn a_path_with_nothing_at_it_is_absent() {

@@ -34,6 +34,7 @@ pub mod views;
 pub use command::{ClientId, Command};
 
 use crate::error::Result;
+use crate::instance::DataDirLock;
 use clients::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -118,6 +119,9 @@ pub struct Process {
 
 /// Everything the daemon owns.
 pub struct Core {
+    /// Shared with the public daemon handle so the store cannot lose its process
+    /// ownership guard while either the API handle or the detached core task lives.
+    pub(crate) _data_dir_lock: Arc<DataDirLock>,
     pub(crate) store: Store,
     pub(crate) hooks: Arc<HookServer>,
     pub(crate) registry: AdapterRegistry,
@@ -200,6 +204,7 @@ pub struct Core {
 impl Core {
     /// Builds the core and loads what is on disk. Nothing is launched here.
     pub fn new(
+        data_dir_lock: Arc<DataDirLock>,
         store: Store,
         hooks: Arc<HookServer>,
         registry: AdapterRegistry,
@@ -207,6 +212,7 @@ impl Core {
         commands: mpsc::Sender<Command>,
     ) -> Result<Self> {
         let mut core = Self {
+            _data_dir_lock: data_dir_lock,
             store,
             hooks,
             registry,
@@ -472,7 +478,11 @@ pub(crate) mod testing {
             let store = Store::open_in_memory().expect("an in-memory store");
             let (hooks, hook_events) = HookServer::start().await.expect("the hook server");
             let (commands, inbox) = mpsc::channel(COMMAND_CAPACITY);
+            let data_dir_lock = Arc::new(
+                DataDirLock::acquire(dir.path()).expect("the harness data directory lock"),
+            );
             let core = Core::new(
+                data_dir_lock,
                 store,
                 Arc::new(hooks),
                 AdapterRegistry::bare(),

@@ -8,7 +8,7 @@ use turn_core::ids::{AttentionId, CheckoutId};
 use turn_core::model::{LeaseState, PaneKind, RestoreState};
 use turn_core::state::{AwaitingReason, Lifecycle};
 use turn_core::Confidence;
-use turn_proto::{ErrorCode, ProtoErrorContext, Request, Response, ServerEvent};
+use turn_proto::{ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent};
 
 /// Creates a workspace and a session from the Coding template.
 async fn seed(daemon: &TestDaemon, ui: &mut Client) -> turn_proto::SessionDetails {
@@ -471,28 +471,118 @@ async fn a_process_that_outlived_the_daemon_is_reported_as_orphaned_not_lost() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_daemon_refuses_to_share_a_socket_and_a_stale_one_is_cleared_away() {
+async fn data_directory_and_socket_ownership_are_independent_and_recoverable() {
     let daemon = TestDaemon::start().await;
     let socket = daemon.socket().to_path_buf();
 
-    // Two daemons over one store would mean two owners for every pty.
-    let config = turnd::Config::in_dir(daemon.data_dir());
+    // Seed an active lease without starting a process. If the contender reaches
+    // Core::restore it will fence this lease as recovery-required, which is the
+    // split-brain regression this test is meant to catch.
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "single writer".to_string(),
+            root: daemon.data_dir().display().to_string(),
+        })
+        .await,
+    );
+    session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id.clone(),
+            name: "lease owner".to_string(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Terminal)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let lease_before = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace.id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the active lease, got {other:?}"),
+    };
+    assert_eq!(lease_before.state, LeaseState::Active);
+    drop(ui);
+
+    // A different socket does not create another store/PTY ownership domain.
+    let alternate_socket = daemon.data_dir().join("alternate.sock");
+    let mut config = turnd::Config::in_dir(daemon.data_dir());
+    config.socket_path = alternate_socket.clone();
     let error = turnd::start(config)
         .await
         .expect_err("a second daemon must refuse to start");
     assert!(
-        matches!(error, turnd::DaemonError::AlreadyRunning { .. }),
+        matches!(error, turnd::DaemonError::DataDirInUse { .. }),
         "{error}"
     );
     assert!(error.is_contention());
     assert!(error.to_string().contains("already running"), "{error}");
+    assert!(
+        !alternate_socket.exists(),
+        "contention is rejected before the second transport is bound"
+    );
 
-    // The first one is still serving.
+    // A symlink spelling of the same directory reaches the same inode lock rather
+    // than creating a textual second ownership claim.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let alias = daemon.data_dir().join("state-alias");
+        symlink(daemon.data_dir(), &alias).expect("the data directory alias");
+        let mut aliased = turnd::Config::in_dir(&alias);
+        aliased.socket_path = daemon.data_dir().join("aliased.sock");
+        let error = turnd::start(aliased)
+            .await
+            .expect_err("a filesystem alias must not evade store ownership");
+        assert!(matches!(error, turnd::DaemonError::DataDirInUse { .. }));
+    }
+
+    // The first one is still serving and, crucially, the rejected Core never fenced
+    // its lease. A heartbeat may advance naturally; identity and active state may not.
     let mut ui = daemon.connect().await;
-    ui.ask(Request::ListTemplates).await;
+    let lease_after = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace.id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the original active lease, got {other:?}"),
+    };
+    assert_eq!(lease_after.id, lease_before.id);
+    assert_eq!(lease_after.generation, lease_before.generation);
+    assert_eq!(lease_after.session_id, lease_before.session_id);
+    assert_eq!(lease_after.state, LeaseState::Active);
     let pid = ui.welcome.daemon_pid;
     assert_eq!(pid, std::process::id());
     drop(ui);
+
+    // Socket ownership remains a separate guard: a daemon with a different store
+    // cannot displace the first daemon's live transport. Its data-dir lock is dropped
+    // on this failed start, so a subsequent normal start there succeeds.
+    let other_dir = tempfile::tempdir().expect("another data directory");
+    let mut socket_contender = turnd::Config::in_dir(other_dir.path());
+    socket_contender.socket_path = socket.clone();
+    let error = turnd::start(socket_contender)
+        .await
+        .expect_err("the live socket must not be displaced");
+    assert!(
+        matches!(error, turnd::DaemonError::AlreadyRunning { .. }),
+        "{error}"
+    );
+    let independent = turnd::start(turnd::Config::in_dir(other_dir.path()))
+        .await
+        .expect("a failed socket bind must release its unrelated data-dir lock");
+    independent.shutdown().await;
 
     let dir = daemon.stop().await;
     assert!(
@@ -506,6 +596,30 @@ async fn a_second_daemon_refuses_to_share_a_socket_and_a_stale_one_is_cleared_aw
     let mut ui = daemon.connect().await;
     ui.ask(Request::ListTemplates).await;
     daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_api_handle_does_not_unlock_a_detached_core() {
+    let dir = tempfile::tempdir().expect("a temporary data directory");
+    let first = turnd::start(turnd::Config::in_dir(dir.path()))
+        .await
+        .expect("the first daemon");
+    drop(first);
+
+    // DaemonHandle explicitly documents that Drop does not stop the daemon. The
+    // detached Core still owns its PTYs and therefore must retain the shared lock.
+    let mut contender = turnd::Config::in_dir(dir.path());
+    contender.socket_path = dir.path().join("detached-contender.sock");
+    let error = turnd::start(contender)
+        .await
+        .expect_err("a detached core must keep store ownership");
+    assert!(
+        matches!(error, turnd::DaemonError::DataDirInUse { .. }),
+        "{error}"
+    );
+
+    // The test runtime owns and cancels the deliberately detached tasks at the end
+    // of this test, which models the process boundary that finally releases the lock.
 }
 
 /// `--no-persist` has to mean it: a daemon told not to write must not leave a database

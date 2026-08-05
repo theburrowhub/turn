@@ -138,17 +138,18 @@ async fn the_daemon_serves_until_a_signal_and_then_flushes_and_goes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_second_daemon_on_one_socket_exits_with_a_code_a_launcher_can_branch_on() {
+async fn a_data_directory_rejects_another_socket_and_recovers_after_sigkill() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let socket = dir.path().join("turnd.sock");
     let mut first = spawn_daemon(dir.path());
     wait_for_path(&socket).await;
 
+    let alternate_socket = dir.path().join("other.sock");
     let second = Command::new(TURND)
         .arg("--data-dir")
         .arg(dir.path())
         .arg("--socket")
-        .arg(&socket)
+        .arg(&alternate_socket)
         .arg("--log-level")
         .arg("error")
         .output()
@@ -171,6 +172,36 @@ async fn a_second_daemon_on_one_socket_exits_with_a_code_a_launcher_can_branch_o
     ui.ask(Request::ListTemplates).await;
     drop(ui);
 
-    send_signal(first.id(), SIGTERM);
-    let _ = tokio::task::spawn_blocking(move || first.wait()).await;
+    // No shutdown handler runs. The socket file is stale, but the kernel releases
+    // the process lock when SIGKILL closes the owning file table.
+    send_signal(first.id(), SIGKILL);
+    let status = tokio::task::spawn_blocking(move || first.wait())
+        .await
+        .expect("the wait task")
+        .expect("the killed daemon must be reaped");
+    assert!(!status.success());
+    assert!(socket.exists(), "SIGKILL leaves the old socket pathname");
+
+    let mut replacement = spawn_daemon(dir.path());
+    let replacement_pid = replacement.id();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match turnd::instance::probe(&socket).await {
+            turnd::instance::Occupant::Live { pid, .. } if pid == replacement_pid => break,
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            occupant => panic!("replacement daemon never acquired stale socket: {occupant:?}"),
+        }
+    }
+    let mut ui = Client::connect(&socket).await;
+    ui.ask(Request::ListTemplates).await;
+    drop(ui);
+
+    send_signal(replacement.id(), SIGTERM);
+    let status = tokio::task::spawn_blocking(move || replacement.wait())
+        .await
+        .expect("the wait task")
+        .expect("the replacement daemon must stop");
+    assert!(status.success());
 }
