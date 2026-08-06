@@ -116,10 +116,29 @@ pub struct Limits {
     /// meaning the same number rather than as meaning zero.
     #[serde(default = "default_max_screen_cells")]
     pub max_screen_cells: usize,
+    /// Most pixels one inline image may carry.
+    ///
+    /// Announced for the same reason as the cell limit: it is one a client can hit — a
+    /// `pane_image` payload is checked against it on the way in — and it is how a client
+    /// knows how much memory to be ready for per picture. Defaulted so a daemon that
+    /// predates the field reads as meaning the number rather than as meaning zero.
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u32,
+    /// Most inline images one screen may place at a time.
+    #[serde(default = "default_max_placed_images")]
+    pub max_placed_images: usize,
 }
 
 fn default_max_screen_cells() -> usize {
     MAX_SCREEN_CELLS
+}
+
+fn default_max_image_pixels() -> u32 {
+    crate::images::MAX_IMAGE_PIXELS
+}
+
+fn default_max_placed_images() -> usize {
+    crate::images::MAX_PLACED_IMAGES
 }
 
 impl Default for Limits {
@@ -128,6 +147,8 @@ impl Default for Limits {
             max_line_bytes: MAX_LINE_BYTES,
             max_output_chunk_bytes: MAX_OUTPUT_CHUNK_BYTES,
             max_screen_cells: MAX_SCREEN_CELLS,
+            max_image_pixels: crate::images::MAX_IMAGE_PIXELS,
+            max_placed_images: crate::images::MAX_PLACED_IMAGES,
         }
     }
 }

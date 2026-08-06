@@ -37,7 +37,19 @@ pub struct TreeNodeView {
     /// Whether this node carries the agent turn axis at all. A shell has no turn
     /// state and the UI must not render an empty slot for one.
     pub is_agentic: bool,
+    /// The title to show, already resolved through the precedence: a name the user
+    /// typed, then what an agent declared about itself, then what the process printed,
+    /// then the command. Resolved here so no client can apply a different order.
     pub title: String,
+    /// Whether that title is something Turn read rather than was told.
+    ///
+    /// True for a title a process set for itself. It is drawn differently for a
+    /// reason no filter can address: `✓ tests passed`, or the name of another of the
+    /// user's sessions, are both valid text a process is free to print, so such a
+    /// name must never carry the same authority as one a tool reported through a
+    /// contract.
+    #[serde(default)]
+    pub title_is_provisional: bool,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: String,
@@ -83,6 +95,8 @@ impl TreeNodeView {
     /// Projects one node, given its place in the tree.
     pub fn from_node(node: &ProcessNode, depth: usize, child_count: usize, now_ms: i64) -> Self {
         let display_state = node.display_state();
+        // One call, so a client cannot apply a different precedence than the daemon.
+        let (resolved_title, title_source) = node.resolved_title();
         Self {
             node_id: node.id.clone(),
             session_id: node.session_id.clone(),
@@ -97,7 +111,8 @@ impl TreeNodeView {
             child_count,
             kind: node.kind,
             is_agentic: node.kind.is_agentic(),
-            title: node.title.clone(),
+            title: resolved_title,
+            title_is_provisional: title_source.is_provisional(),
             command: node.command.clone(),
             args: node.args.clone(),
             cwd: node.cwd.clone(),

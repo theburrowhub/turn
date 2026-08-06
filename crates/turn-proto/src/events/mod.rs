@@ -43,6 +43,25 @@ pub struct PaneRestoreOutcome {
     /// authoritative relaunch target remains `node_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Whether starting this pane again would use the Session's checkout write
+    /// authority.
+    ///
+    /// An agent, or any command the pane names, would; opening the user's own shell
+    /// would not. A UI that is waiting for the user to confirm write access can
+    /// therefore keep offering the panes that write nothing instead of blocking the
+    /// whole Session — including the terminal they need in order to go and stop the
+    /// process the confirmation is about.
+    ///
+    /// Defaults to `true` when absent, so an older peer's payload is read as the
+    /// gated case rather than as permission.
+    #[serde(default = "crate::events::needs_checkout_write_default")]
+    pub needs_checkout_write: bool,
+}
+
+/// A missing `needs_checkout_write` means "assume it does": the field only ever
+/// unlocks something, so its absence must not.
+fn needs_checkout_write_default() -> bool {
+    true
 }
 
 /// A push from the daemon.

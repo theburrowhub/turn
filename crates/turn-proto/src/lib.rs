@@ -32,7 +32,10 @@
 //! * [`ServerEvent`] — what the daemon pushes without being asked ([`events`]).
 //! * [`view`] — projections that keep product rules out of the client.
 //! * [`cells`] — a pane's screen as cells, and the compact form it travels in.
+//! * [`images`] — inline images: how a picture is anchored to cells and how its pixels
+//!   are fetched.
 //! * [`screen`] — screen diffs, the sequence rule, and which stream a pane carries.
+//! * [`search`] — searching a pane's scrollback, and the bounds that keep it cheap.
 //! * [`framing`] — newline-delimited JSON, robust to partial reads and bad lines.
 //! * [`bytes`] — binary payloads, and an honest note about what base64 costs.
 //!
@@ -84,16 +87,19 @@ pub mod error;
 pub mod events;
 pub mod framing;
 pub mod geometry;
+pub mod images;
 pub mod request;
 pub mod response;
 pub mod screen;
+pub mod search;
 pub mod view;
 
 pub use bytes::{decode_base64, encode_base64, Base64Error, TerminalBytes};
 #[cfg(feature = "vt100")]
-pub use cells::from_screen;
+pub use cells::{from_screen, from_screen_with_images, from_screen_with_links, ScreenLink};
 pub use cells::{
-    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, MAX_SCREEN_CELLS,
+    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, RowLink,
+    RowMeta, MAX_LINK_URI_CHARS, MAX_SCREEN_CELLS, MAX_SCREEN_LINKS,
 };
 pub use envelope::{
     negotiate, negotiate_within, peek_version, version_refusal, ClientFrame, ClientMessage, Hello,
@@ -109,9 +115,19 @@ pub use framing::{
     MAX_OUTPUT_CHUNK_BYTES,
 };
 pub use geometry::PtySize;
+pub use images::{
+    is_marker, GridImage, ImageCell, ImageError, ImageId, ImagePayload, MAX_IMAGE_CELL_COLS,
+    MAX_IMAGE_CELL_ROWS, MAX_IMAGE_PIXELS, MAX_PLACED_IMAGES,
+};
 pub use request::{CloseDisposition, FocusTarget, NewPane, Request, RequestId};
 pub use response::{PaneAttachment, Response};
 pub use screen::{GridRow, PaneStream, ScreenUpdate};
+#[cfg(feature = "vt100")]
+pub use search::{history_grid, history_len, search_screen};
+pub use search::{
+    search_grid, viewport_offset, viewport_row, PaneMatch, SearchError, SearchMode, SearchOutcome,
+    SearchQuery, MAX_MATCHES, MAX_MATCHES_PER_ROW, MAX_QUERY_CHARS, MAX_SEARCH_ROWS,
+};
 pub use view::{
     AgentSummary, AttentionView, ContextHandoffText, ContextHandoffView, HierarchyKey,
     HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView, SessionDetails,

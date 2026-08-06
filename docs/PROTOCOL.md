@@ -33,6 +33,8 @@ in §2.
 | `max_line_bytes` | 8 MiB | Longest line either side accepts. Announced in `welcome`. |
 | `max_output_chunk_bytes` | 256 KiB | Raw bytes per `pane_output` frame before the daemon splits it. |
 | `max_screen_cells` | 65,536 | Largest `rows * cols` `attach_pane` accepts, and the most cells any grid may describe. |
+| `max_image_pixels` | 1,048,576 | Most pixels one inline image may carry — 4 MiB of RGBA, so one image is always one frame. |
+| `max_placed_images` | 8 | Most inline images one screen may place at a time. |
 
 Nothing legitimate approaches 8 MiB — the largest message is a pane's screen, a few
 kilobytes (§2.2). The limit exists so a peer cannot exhaust memory by opening a socket
@@ -180,7 +182,60 @@ costs a few bytes per style change and keeps the frame readable. The daemon also
 one `String` per non-blank cell when it builds a grid; that is the price of a cell that
 can hold a grapheme cluster, and it is paid only for panes somebody is actually watching.
 
-### 2.3 What is *not* sanitised
+### 2.3 Inline images
+
+A pane may hold pictures. Three protocols put them there — iTerm2's `OSC 1337 File=`,
+Sixel, and the Kitty graphics protocol — and the daemon decodes all three, because it has to:
+the number of *cells* a picture occupies depends on its pixel dimensions, and the cells are
+what the terminal parser scrolls, clears and overwrites.
+
+**Placement travels in the cells.** Every cell a picture covers carries an *image marker*
+as its text — a character in private-use plane 16 encoding which of the screen's
+`max_placed_images` slots the picture is in, and which tile of it that cell shows — and the
+`image` attribute bit (`0x80`). A grid also carries a small `images` table mapping slots to
+payload ids:
+
+```jsonc
+"images":[{"slot":0,"id":6023794128384115081,"rows":8,"cols":30,
+           "width":240,"height":160,"preserve_aspect":true}]
+```
+
+`rows`/`cols` are the **cell box** the daemon gave the picture; `width`/`height` are the
+payload's own pixel size. Both are needed, and the split is deliberate: only the client knows
+how many pixels a cell is, so only the client can fit the picture inside the box without
+distorting it. `preserve_aspect` is absent when true, which is the usual case.
+
+Doing it this way is what makes a picture behave like text without a second implementation of
+a terminal. Scrolling moves it because rows move. `clear` drops it because cells are cleared.
+A program printing over the middle of one punches a hole in it and the surviving tiles still
+say which part of the picture they are. A client re-attaching gets the pictures still on
+screen because they are *in* the screen the daemon has been keeping.
+
+**Pixels do not travel in the grid.** A grid crosses the socket many times a second and a
+megabyte of picture must not, so `pane_image` fetches a payload once per id and a client
+caches it (§5). Ids are derived from the contents. On a `rows` update the `images` field is
+absent when the table has not changed — which is every update for a picture that is merely
+scrolling — and `[]` when the screen has lost its last picture. An empty list is not the same
+as silence.
+
+**A receiver must treat all of it as hostile.** Every bound is enforced on the way in, before
+anything is indexed or allocated: `max_placed_images` on the table's length, one placement per
+slot, the cell box against the marker alphabet, and `max_image_pixels` on the declared pixel
+size. A grid that breaks any of them is refused whole, exactly like a row whose runs do not
+account for its cells.
+
+**What the client renders for a cell it cannot resolve.** A marker whose slot the table does
+not fill, or a payload not yet fetched, is a framed placeholder rather than a blank. A picture
+that silently did not appear is indistinguishable from a defect.
+
+**Anything Turn refuses to show is said in the pane.** A payload over the limit, a
+decompression bomb, a format Turn does not read, iTerm2 without `inline=1` (which is a request
+to write a file to the user's disk), or Kitty's `t=f`/`t=t`/`t=s` (which are requests to read
+one) all produce a line of ordinary text in the pane reading
+`[turn: image not shown — …]`. Turn also never writes the Kitty protocol's
+acknowledgement back to the pty: nothing types into a pane except a human.
+
+### 2.4 What is *not* sanitised
 
 Screen cells are the terminal's own contents, passed through as the program wrote them.
 That is the opposite of the rule for **labels** — a pane title or Activity Preview line is
@@ -245,6 +300,13 @@ Version 3 adds:
   bindings;
 - revisioned `hierarchy_changed` full replacements and bounded preview/binding/lease pushes.
 
+Additive since v3, so the version does not move: `pane_image` and the `pane_image` result
+(§2.3), the `images` table on a grid and the `image` attribute bit on a cell, and
+`max_image_pixels` and `max_placed_images` in `limits`. An older client ignores the table, and
+because an image cell's *text* is a private-use marker with the `image` bit set it draws as
+nothing recognisable rather than as somebody else's character — which is the reason the marker
+alphabet is in plane 16 rather than in the private-use area real fonts use.
+
 The cell protocol introduced in v2 is retained unchanged. This pre-release codebase serves v3 only:
 `MIN_PROTOCOL_VERSION == PROTOCOL_VERSION == 3`. Legacy list/detail operations may remain as administrative
 endpoints, not as a dual-v2 compatibility mode.
@@ -280,7 +342,8 @@ base64.
  "agreed_version":3,"daemon_version":"0.1.0","daemon_pid":51234,
  "daemon_started_ms":1700000000000,
  "limits":{"max_line_bytes":8388608,"max_output_chunk_bytes":262144,
-           "max_screen_cells":65536},
+           "max_screen_cells":65536,"max_image_pixels":1048576,
+           "max_placed_images":8},
  "output_encoding":"base64"}
 ```
 
@@ -515,11 +578,15 @@ draft identity only, and every Session instantiation mints a fresh set.
 | `equalize_divider` | `session_id`, `before`, `after` | `layout` |
 | `apply_layout_preset` | `session_id`, `preset` | `layout` |
 | `focus_pane` | `session_id`, `target` | `layout` |
-| `swap_panes` | `session_id`, `a`, `b` | `layout` |
+| `relocate_pane` | `session_id`, `moved`, `target`, `zone` | `layout` |
+| `swap_panes` | `session_id`, `a`, `b` — superseded by `relocate_pane` | `layout` |
 | `zoom_pane` | `session_id`, `pane_id` — **toggles** | `layout` |
 | `attach_pane` | `session_id`, `pane_id`, `size`, `stream?` | `attached` |
 | `resync_pane` | `session_id`, `pane_id` | `screen` |
+| `pane_image` | `session_id`, `pane_id`, `image_id` | `pane_image` |
 | `detach_pane` | `session_id`, `pane_id` | `ack` |
+| `get_pane_history` | `session_id`, `pane_id`, `offset?` | `pane_history` |
+| `search_pane` | `session_id`, `pane_id`, `query` | `pane_matches` |
 
 Every Layout-mutating pane operation above answers with the resulting `layout` rather than an ack, so
 the UI renders the daemon's arrangement instead of its own optimistic guess at what
@@ -541,8 +608,27 @@ dispositions apply only where process-control rules allow them, and an Agent req
 - `equalize_divider` is the double-click operation and gives every sibling in that split an equal
   share. `preset` is one of `balanced`, `columns`, `rows`, `main_left`, `grid`; presets preserve Pane
   and Process identity and change geometry only.
+- `relocate_pane` **moves** a pane: it leaves where it was and arrives beside `target`,
+  so the layout changes shape. `zone` is `"left"` \| `"right"` \| `"above"` \| `"below"` \|
+  `"centre"`. The four edges make `moved` a sibling of `target` on that side —
+  left/right in a horizontal split, above/below in a vertical one — and `centre`
+  exchanges the two panes in place. A pane relocated next to a target that already sits
+  in a split of the required direction **joins** that split as a sibling rather than
+  nesting a new two-way split inside it, so repeated rearrangement cannot turn a flat row
+  into a staircase of nested splits and the dividers keep lining up. The space the moved
+  pane vacates goes to its former siblings, a split left with one child collapses, and no
+  pane is left below the minimum visible share. `moved == target`, an unknown pane and a
+  single-pane layout are refused (`conflict`/`not_found`) rather than approximated.
+- A relocation **starts and stops no process.** The pane keeps its id and its node
+  binding, so a session full of running agents can be rearranged freely; only the Layout
+  is written back, and only `layout_changed` is pushed.
+- `swap_panes` is the older spelling of `relocate_pane` with `zone: "centre"`. It remains
+  on the wire because a shipped client already sends it, and the daemon serves it through
+  the same relocation — one behaviour with two names, not two implementations. New clients
+  should send `relocate_pane`; nothing else it can express is missing from `relocate_pane`.
 - `zoom_pane` leaves the layout tree untouched, so un-zooming restores the exact
-  previous geometry.
+  previous geometry. Zoom and focus both survive a relocation: moving a pane must not
+  change what the user is looking at or typing into.
 - `pane` (a `NewPane`): `kind` plus optional `title`, `command`, `args`, `cwd`,
   `env`, `restore`. The daemon mints the `PaneId` — it is the only writer of state,
   and a client minting its own would collide with a second client on the same
@@ -555,6 +641,38 @@ dispositions apply only where process-control rules allow them, and an Agent req
   read-only, it requires an attachment (`pane_not_attached` otherwise), and on a `bytes`
   attachment it answers `conflict`: what that client lost was bytes, and its way back is
   to attach again for the replay.
+- `pane_image` fetches the pixels of one inline image the pane's screen refers to (§2.3). It
+  is read-only, and `not_found` is a normal answer: an image that has scrolled out of the
+  daemon's bounded store is gone, and saying so is better than handing back a different
+  picture.
+- `get_pane_history` reads a screen-shaped window of the pane's **scrollback**, as cells.
+  The scrollback belongs to the daemon because the daemon is the only thing that has it: a
+  client is sent the screen, and a pane that printed five hundred lines between two
+  coalesced updates never sent the four hundred and eighty in the middle. `offset` is rows
+  above the top of the live screen and is **clamped** to what the daemon still holds, so
+  scrolling past the beginning answers with the oldest window rather than an error. The
+  answer says which offset it actually is (`scrollback_offset`) and how deep the record goes
+  (`scrollback_len`). Read-only: the daemon borrows its parser's viewport and puts it back,
+  so one client's history read cannot move another client's screen. A `bytes` attachment
+  answers `conflict` — history as cells is not what that client is rendering.
+- `search_pane` searches everything the daemon retains for the pane: the history, then the
+  live screen. `query` is `{"text":…,"mode":"literal"|"regex","case_sensitive":bool}`, where
+  absent `mode` is `literal` and absent `case_sensitive` is false — case-insensitive is what
+  a user means by default. Every part of it is bounded, and the bounds are the reason a
+  pattern from a text field is safe to accept:
+
+  | Bound | Value | Why |
+  | --- | --- | --- |
+  | `text` length | 256 characters | a search box is not a program; longer is `invalid_argument` |
+  | compiled pattern | 1 MiB of automaton, same cap on its lazy DFA | a generated pattern cannot make the daemon allocate |
+  | match time | linear in the row | a finite automaton, so `(a+)+$` cannot be made to backtrack |
+  | rows read | 8,192 | above the 5,000-row scrollback, so a real search is never cut short |
+  | matches returned | 1,000, and 64 from any one row | `a` against a row of `a`s is a real thing a user types |
+
+  A pattern that will not compile is `invalid_argument` **with the reason in the message**,
+  because "invalid regular expression" with nothing else is a dead end. When a cap stops the
+  scan the answer sets `truncated`, so a UI says "1000+" rather than implying it counted them
+  all. Read-only, and it moves nobody's viewport.
 
 ### PTY
 
@@ -808,6 +926,68 @@ screen its next diff is computed against, not with a fresher read of the pty. A 
 one would look more helpful and be wrong: a row that changed and changed back in between
 would never be corrected.
 
+### `pane_image` — the answer to `pane_image`
+
+```jsonc
+{"v":3,"type":"response","id":"r-7","response":{"result":"pane_image",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
+  "image":{"id":6023794128384115081,"width":240,"height":160,"pixels":"<base64 RGBA>"}}}
+```
+
+`pixels` is `width * height * 4` bytes of RGBA — unassociated alpha, sRGB, row-major, no
+padding — and it is by a wide margin the largest thing this protocol carries. `id` is derived
+from the contents, so the same picture printed twice is one payload and a client's cache
+survives a re-attach.
+
+A receiver **must** check the three things before trusting it, and
+`turn_proto::ImagePayload`'s decoder does: `width * height` against `max_image_pixels`, the
+byte length against those dimensions, and the id against the hash of the pixels. The last
+one matters because a cache keyed by id would otherwise be poisonable by a payload arriving
+under somebody else's name.
+
+### `pane_history` — the answer to `get_pane_history`
+
+```jsonc
+{"v":3,"type":"response","id":"r-8","response":{"result":"pane_history",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
+  "grid":{"rows":40,"cols":120,"scrollback_offset":1240,"scrollback_len":5000,"…":"…"}}}
+```
+
+The same `Grid` shape a live screen arrives in, so a client paints history with the code it
+already has rather than with a second renderer. It carries no cursor: the cursor is on the
+live screen, and drawing it at the same coordinates over history would put it on an
+unrelated character. `scrollback_offset` is the offset actually served after clamping, and
+`scrollback_len` is the depth of the record — together they say which absolute rows the
+window holds, so a client can file them and know when it has reached the beginning.
+
+### `pane_matches` — the answer to `search_pane`
+
+```jsonc
+{"v":3,"type":"response","id":"r-9","response":{"result":"pane_matches",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
+  "outcome":{"matches":[{"line":1240,"col":4,"cols":5},{"line":4812,"col":0,"cols":5}],
+    "scanned_lines":5040,"total_lines":5040,"screen_rows":40,"scrollback_len":5000}}}
+```
+
+A match is a **line index** and a **column range**:
+
+- `line` `0` is the oldest row the daemon still holds; `scrollback_len` is the line index of
+  the live screen's top row, and `scrollback_len + screen_rows - 1` is the bottom of it. That
+  is the only coordinate both ends can compute. `offset = scrollback_len - line` is the
+  `get_pane_history` offset that puts the match on the top row; centring it is
+  `scrollback_len - (line - screen_rows/2)`, clamped — `turn_proto::search::viewport_offset`.
+- `col`/`cols` are **columns, not characters**. A wide glyph is one character of text and two
+  columns of screen, so a character offset would highlight the wrong cells on every row
+  containing an ideograph or an emoji.
+- Matches are ordered oldest first, so "next" moves towards the live screen.
+- `scrollback_len` is the depth the search was taken at. A client that later sees a different
+  one knows the line indices may have moved — rows drop off the top once the ring is full —
+  and re-runs the query rather than scrolling to a line that has since shifted.
+- `truncated` (absent when false) means a cap stopped the scan and the count is a floor.
+- While a full-screen application is in front there is no history to search: the alternate
+  screen has no scrollback of its own, so `scrollback_len` is `0` and the search covers what
+  is on screen. Turn stands down from scrolling for the same reason.
+
 ### `effects`
 
 `turn_core::attention::Effect`, passed through unchanged. The manager already
@@ -881,9 +1061,20 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 ```
 
 **Applying a `rows` update**: replace each named row's cells outright, then take
-`cursor` and `alternate_screen` from the update. Rows are whole — there is no partial-row
-addressing, so a client can never leave a row half written. A row is `runs` in exactly
-the grid encoding of §2.2.
+`cursor`, `alternate_screen` and `scrollback_len` from the update. Rows are whole — there is
+no partial-row addressing, so a client can never leave a row half written. A row is `runs` in
+exactly the grid encoding of §2.2.
+
+`scrollback_len` — absent when zero, which is every update for a pane that has not scrolled
+yet — is how much history now sits above the screen. It is on every update rather than only
+on the `full` ones because a client needs two things from it that it cannot work out for
+itself: that there is history to scroll into at all, and **how many rows just left the top**.
+The second is what keeps a scrolled viewport still. A client's scroll offset is measured from
+the live screen, so when rows scroll off, an unchanged offset would show newer content and
+the line the user was reading would slide away a row at a time. The increase in
+`scrollback_len` is exactly the number of rows that left, however many screens' worth arrived
+at once — which is the case a client cannot prove for itself, since a burst bigger than the
+screen leaves no overlap to compare.
 
 `size` is carried so a client can **refuse** an update meant for a geometry it is no
 longer rendering, rather than writing rows into the wrong shape. That happens if it

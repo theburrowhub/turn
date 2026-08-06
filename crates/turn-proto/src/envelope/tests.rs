@@ -22,6 +22,12 @@ fn the_welcome_announces_the_limits_a_client_can_actually_hit() {
         serde_json::from_str("{\"max_line_bytes\":8388608,\"max_output_chunk_bytes\":262144}")
             .expect("an absent limit is defaulted");
     assert_eq!(older.max_screen_cells, crate::MAX_SCREEN_CELLS);
+    assert_eq!(
+        older.max_image_pixels,
+        crate::MAX_IMAGE_PIXELS,
+        "a daemon that predates the image limits must read as meaning them, not as zero"
+    );
+    assert_eq!(older.max_placed_images, crate::MAX_PLACED_IMAGES);
 }
 
 #[test]

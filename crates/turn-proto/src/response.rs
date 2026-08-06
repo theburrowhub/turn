@@ -20,6 +20,7 @@ use crate::bytes::TerminalBytes;
 use crate::cells::Grid;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
+use crate::search::SearchOutcome;
 use crate::view::{
     AttentionView, ContextHandoffView, HierarchySnapshot, NodePaneView, PaneFocusView,
     SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, TreeSurfaceState,
@@ -154,6 +155,44 @@ pub enum Response {
         grid: Box<Grid>,
     },
 
+    /// A screen-shaped window of a pane's history.
+    ///
+    /// The same [`Grid`] shape a live screen arrives in, so a client paints history with
+    /// the code it already has rather than with a second renderer. `scrollback_offset` is
+    /// the offset actually served — clamped to what the daemon still holds — and
+    /// `scrollback_len` is how deep the record goes, so a client never has to guess
+    /// whether it has reached the beginning.
+    PaneHistory {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<NodeId>,
+        grid: Box<Grid>,
+    },
+    /// What a search found in a pane's retained output.
+    ///
+    /// Boxed for the same reason as the other large payloads: the hot response is an ack
+    /// per keystroke, and an enum sized for a thousand matches would widen every one of
+    /// them.
+    PaneMatches {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<NodeId>,
+        outcome: Box<SearchOutcome>,
+    },
+
+    /// The pixels of one inline image, RGBA, for a client to upload as a texture.
+    ///
+    /// Boxed for the same reason as every other large payload here, and for a stronger
+    /// one: this is by a wide margin the biggest thing the protocol carries, and an enum
+    /// sized for it would widen the ack sent for every keystroke.
+    PaneImage {
+        session_id: SessionId,
+        pane_id: PaneId,
+        image: Box<crate::images::ImagePayload>,
+    },
+
     Tree {
         session_id: SessionId,
         nodes: Vec<TreeNodeView>,
@@ -221,6 +260,9 @@ impl Response {
             Response::Layout { .. } => "layout",
             Response::Attached { .. } => "attached",
             Response::Screen { .. } => "screen",
+            Response::PaneHistory { .. } => "pane_history",
+            Response::PaneMatches { .. } => "pane_matches",
+            Response::PaneImage { .. } => "pane_image",
             Response::Tree { .. } => "tree",
             Response::Node { .. } => "node",
             Response::PreviewHistory { .. } => "preview_history",
@@ -250,6 +292,9 @@ impl Response {
         "layout",
         "attached",
         "screen",
+        "pane_history",
+        "pane_matches",
+        "pane_image",
         "tree",
         "node",
         "preview_history",
@@ -476,9 +521,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 23 result shapes. Asserted so adding one without documenting it in
+        // 26 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 23, "the response catalogue changed size");
+        assert_eq!(declared.len(), 26, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -575,6 +620,33 @@ pub(crate) mod tests {
                 node_id: Some(NodeId::from_stored("proc_a")),
                 next_seq: 12,
                 grid: Box::new(Grid::blank(24, 80)),
+            },
+            Response::PaneHistory {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                grid: Box::new(Grid::from_lines(&["scrolled off the top"], 40)),
+            },
+            Response::PaneMatches {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                outcome: Box::new(crate::search::SearchOutcome {
+                    matches: vec![crate::search::PaneMatch::new(1_240, 4, 5)],
+                    truncated: false,
+                    scanned_lines: 5_040,
+                    total_lines: 5_040,
+                    screen_rows: 40,
+                    scrollback_len: 5_000,
+                }),
+            },
+            Response::PaneImage {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                image: Box::new(
+                    crate::images::ImagePayload::new(2, 2, vec![0x40; 16])
+                        .expect("a 2x2 image is a valid payload"),
+                ),
             },
             Response::Tree {
                 session_id: s.id.clone(),

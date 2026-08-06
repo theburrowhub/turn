@@ -26,13 +26,14 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
+    Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
 };
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
+use crate::search::SearchQuery;
 use crate::view::{ContextHandoffText, HierarchyKey};
 
 /// A client-supplied correlation id.
@@ -436,6 +437,30 @@ pub enum Request {
         session_id: SessionId,
         target: FocusTarget,
     },
+    /// Moves an existing pane so that it sits beside another one.
+    ///
+    /// The operation behind dragging a pane onto a drop zone, and the one that lets a
+    /// layout change *shape*: a row can become a column, and a pane can leave one
+    /// split for another. `zone` says which side of `target` the moved pane lands on,
+    /// or `centre` to exchange the two.
+    ///
+    /// It starts and stops nothing. A pane moving is a view change, and the runtime
+    /// behind it never learns it happened — which is what makes rearranging a session
+    /// full of running agents safe.
+    RelocatePane {
+        session_id: SessionId,
+        moved: PaneId,
+        target: PaneId,
+        zone: DropZone,
+    },
+    /// The exchange-in-place case of [`Request::RelocatePane`], which is
+    /// `zone: "centre"`.
+    ///
+    /// Kept because it is a shipped wire name and removing it would break a client
+    /// that already speaks it for no gain. It is not a second implementation: the
+    /// daemon answers it through the same relocation, so there is one behaviour with
+    /// two spellings rather than two behaviours that can drift apart. New clients
+    /// should send `relocate_pane`.
     SwapPanes {
         session_id: SessionId,
         a: PaneId,
@@ -504,10 +529,56 @@ pub enum Request {
         session_id: SessionId,
         pane_id: PaneId,
     },
+    /// Fetches the pixels of one inline image a pane's screen refers to.
+    ///
+    /// Images are the one thing in this protocol that is *pulled* rather than pushed, and
+    /// the reason is bandwidth. A screen carries only the small table saying which slot
+    /// holds which [`ImageId`](crate::ImageId); a payload is up to four mebibytes of RGBA
+    /// and would otherwise be resent every time the picture scrolled. So a client fetches
+    /// each id once, caches it, and a re-attaching client asks only for the ids it does
+    /// not already hold.
+    ///
+    /// Answered with `not_found` when the pane's store no longer has that id: an image
+    /// that scrolled out of the daemon's bounded store is gone, and the honest answer is
+    /// to say so rather than to hand back a different picture.
+    PaneImage {
+        session_id: SessionId,
+        pane_id: PaneId,
+        image_id: crate::images::ImageId,
+    },
     /// Stops the output stream for a pane. The process keeps running.
     DetachPane {
         session_id: SessionId,
         pane_id: PaneId,
+    },
+    /// A screen-shaped window of a pane's history, as cells.
+    ///
+    /// The scrollback belongs to the daemon, because the daemon is the only thing that
+    /// has it: a client is sent the *screen*, and a pane that printed five hundred lines
+    /// between two coalesced updates never sent the four hundred and eighty in the
+    /// middle. Reading history is therefore a request rather than something a client
+    /// reconstructs from what it happened to watch.
+    ///
+    /// `offset` is rows above the top of the live screen and is clamped to what the
+    /// daemon still holds, so scrolling past the beginning shows the oldest window rather
+    /// than failing. The answer says which offset it actually is and how deep the record
+    /// goes.
+    GetPaneHistory {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default)]
+        offset: usize,
+    },
+    /// Searches everything the daemon retains for a pane: the history, then the live
+    /// screen.
+    ///
+    /// Answered by the daemon for the same reason as [`Request::GetPaneHistory`]. The
+    /// query is bounded ([`SearchQuery`]) and so is the answer, which says when a cap
+    /// stopped it rather than implying it counted every match.
+    SearchPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+        query: SearchQuery,
     },
 
     // ----------------------------------------------------------------------- pty
@@ -663,6 +734,7 @@ impl Request {
             Request::EqualizeDivider { .. } => "equalize_divider",
             Request::ApplyLayoutPreset { .. } => "apply_layout_preset",
             Request::FocusPane { .. } => "focus_pane",
+            Request::RelocatePane { .. } => "relocate_pane",
             Request::SwapPanes { .. } => "swap_panes",
             Request::ZoomPane { .. } => "zoom_pane",
             Request::OpenNodeAsTemporaryPane { .. } => "open_node_as_temporary_pane",
@@ -670,7 +742,10 @@ impl Request {
             Request::FocusPaneForAttention { .. } => "focus_pane_for_attention",
             Request::AttachPane { .. } => "attach_pane",
             Request::ResyncPane { .. } => "resync_pane",
+            Request::PaneImage { .. } => "pane_image",
             Request::DetachPane { .. } => "detach_pane",
+            Request::GetPaneHistory { .. } => "get_pane_history",
+            Request::SearchPane { .. } => "search_pane",
             Request::WritePty { .. } => "write_pty",
             Request::ResizePty { .. } => "resize_pty",
             Request::InterruptNode { .. } => "interrupt_node",
@@ -742,6 +817,7 @@ impl Request {
             | Request::EqualizeDivider { .. }
             | Request::ApplyLayoutPreset { .. }
             | Request::FocusPane { .. }
+            | Request::RelocatePane { .. }
             | Request::SwapPanes { .. }
             | Request::ZoomPane { .. } => "layout",
             Request::OpenNodeAsTemporaryPane { .. } => "node_pane",
@@ -750,7 +826,10 @@ impl Request {
             }
             Request::AttachPane { .. } => "attached",
             Request::ResyncPane { .. } => "screen",
+            Request::PaneImage { .. } => "pane_image",
             Request::DetachPane { .. } => "ack",
+            Request::GetPaneHistory { .. } => "pane_history",
+            Request::SearchPane { .. } => "pane_matches",
 
             Request::WritePty { .. } | Request::ResizePty { .. } => "ack",
 
@@ -794,6 +873,13 @@ impl Request {
                 // Asking for the screen again changes nothing about it: the daemon
                 // hands over what it already has.
                 | Request::ResyncPane { .. }
+                // Nor does asking for the pixels of a picture already on that screen.
+                | Request::PaneImage { .. }
+                // Reading history and searching it are reads. Neither moves the pane's
+                // own viewport: the daemon restores the offset it borrowed, so one
+                // client's search cannot scroll another client's screen.
+                | Request::GetPaneHistory { .. }
+                | Request::SearchPane { .. }
         )
     }
 
@@ -821,6 +907,7 @@ impl Request {
             | Request::EqualizeDivider { session_id, .. }
             | Request::ApplyLayoutPreset { session_id, .. }
             | Request::FocusPane { session_id, .. }
+            | Request::RelocatePane { session_id, .. }
             | Request::SwapPanes { session_id, .. }
             | Request::ZoomPane { session_id, .. }
             | Request::OpenNodeAsTemporaryPane { session_id, .. }
@@ -828,7 +915,10 @@ impl Request {
             | Request::FocusPaneForAttention { session_id, .. }
             | Request::AttachPane { session_id, .. }
             | Request::ResyncPane { session_id, .. }
+            | Request::PaneImage { session_id, .. }
             | Request::DetachPane { session_id, .. }
+            | Request::GetPaneHistory { session_id, .. }
+            | Request::SearchPane { session_id, .. }
             | Request::WritePty { session_id, .. }
             | Request::ResizePty { session_id, .. }
             | Request::InterruptNode { session_id, .. }

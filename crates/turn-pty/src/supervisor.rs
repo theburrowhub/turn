@@ -27,6 +27,13 @@ pub struct ObservedProcess {
     /// data; the daemon creates a bounded safe projection before persistence.
     pub args: Vec<String>,
     pub cwd: Option<String>,
+    /// When the OS says this process began, in epoch milliseconds.
+    ///
+    /// The only fact that can separate a process from a stranger wearing its
+    /// recycled pid: a process that began *after* Turn wrote a pid down cannot be
+    /// the one Turn launched. `None` when the platform will not say, which is not
+    /// evidence of anything and must never be read as agreement.
+    pub start_time_ms: Option<i64>,
     /// Our guess at what this process is for.
     pub kind: NodeKind,
 }
@@ -147,6 +154,12 @@ impl ProcessSupervisor {
             command_line,
             args,
             cwd: process.cwd().map(|path| path.to_string_lossy().to_string()),
+            // sysinfo reports whole seconds and zero when it has nothing. Both are
+            // kept honest here: zero becomes `None` rather than 1970.
+            start_time_ms: match process.start_time() {
+                0 => None,
+                seconds => i64::try_from(seconds).ok().map(|seconds| seconds * 1_000),
+            },
             kind: classify(&effective),
         })
     }
@@ -296,6 +309,26 @@ mod tests {
         let observed = supervisor.observe(me).expect("our own process");
         assert_eq!(observed.pid, me);
         assert!(!observed.name.is_empty());
+    }
+
+    /// Pid reuse is the reason anything reads `start_time_ms`, so a platform that
+    /// silently stopped reporting it has to fail here rather than in the daemon,
+    /// where a missing start time is deliberately treated as "cannot corroborate".
+    #[test]
+    fn the_supervisor_reports_when_a_process_began() {
+        let mut supervisor = ProcessSupervisor::new();
+        supervisor.refresh();
+        let observed = supervisor
+            .observe(std::process::id())
+            .expect("our own process");
+        let started = observed
+            .start_time_ms
+            .expect("this platform must report process start times");
+        let now = turn_core::now_ms();
+        assert!(started > 0 && started <= now + 1_000, "{started} vs {now}");
+        // A test process is minutes old at most, so a wildly older value would mean
+        // the units were misread rather than that the process is ancient.
+        assert!(now - started < 24 * 60 * 60 * 1_000, "{started} vs {now}");
     }
 
     #[test]
