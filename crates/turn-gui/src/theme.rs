@@ -131,6 +131,12 @@ impl Theme {
 
     /// Applies the theme to a context.
     pub fn install(&self, ctx: &egui::Context) {
+        // The icon family is bound here, because every surface that draws anything installs
+        // the theme and a named family panics rather than falling back: an icon asked for
+        // before its font is bound is a mistake worth failing on, and this is the one call that
+        // makes it impossible.
+        crate::icons::install(ctx);
+
         let theme = egui::Theme::Dark;
         let mut style = (*ctx.style_of(theme)).clone();
         let radius = CornerRadius::same(6);
@@ -316,7 +322,7 @@ mod tests {
         let context = egui::Context::default();
         let theme = Theme::dark();
         let mut measured = None;
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        crate::frames::run(&context, |ui| {
             measured = theme.cell_size(ui);
         });
         let cell = measured.expect("the bundled monospace face can be measured");
@@ -355,7 +361,7 @@ mod tests {
             ..Theme::dark()
         };
         let mut cells = (None, None);
-        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        crate::frames::run(&context, |ui| {
             cells = (small.cell_size(ui), large.cell_size(ui));
         });
         let (small, large) = (

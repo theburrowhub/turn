@@ -2053,7 +2053,8 @@ impl<'a> TurnView<'a> {
             }
             ToolbarIntent::LayoutMenu => {
                 let menu = egui::containers::menu::MenuButton::from_button(
-                    egui::Button::new(RichText::new(button.icon).size(15.0)).min_size(icons::SIZE),
+                    egui::Button::new(RichText::new(button.icon).font(icons::font(15.0)))
+                        .min_size(icons::SIZE),
                 );
                 let (response, _) = menu.ui(ui, |ui| {
                     for (label, preset) in [
@@ -2317,16 +2318,135 @@ impl<'a> TurnView<'a> {
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
-        // Measured from the variant rather than fixed at the tallest, because the Workspace
-        // stop says one more thing than the Session one — how many Sessions it reaches — and
-        // a panel sized for the longer of the two leaves the shorter one with a band of
-        // empty space under its buttons.
-        let wanted_height = match state.lifecycle_confirmation {
-            Some(LifecycleConfirmation::StopWorkspace { .. })
-            | Some(LifecycleConfirmation::DeleteWorkspace { .. }) => 300.0_f32,
-            _ => 272.0_f32,
+        let Some(confirmation) = state.lifecycle_confirmation.clone() else {
+            return actions;
         };
-        let panel = Rect::from_center_size(
+        // `full` is no longer used to place anything: the modal owns its own backdrop and
+        // centres its own card, and it measures the card from what is put in it rather than
+        // from a height guessed per variant — which is what the hand-painted panel had to do,
+        // and got wrong every time a sentence was added.
+        let _ = full;
+
+        let (title, subject, detail, scope, terminating) = match &confirmation {
+            LifecycleConfirmation::EndSession {
+                name,
+                running_count,
+                ..
+            } => (
+                "End session?",
+                name.as_str(),
+                "Turn will politely stop every process in this Session. Its layout and history remain available.",
+                None,
+                format!(
+                    "{} running process{} will receive a termination request.",
+                    running_count,
+                    if *running_count == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::StopWorkspace {
+                name,
+                session_count,
+                running_sessions,
+                running_processes,
+                ..
+            } => (
+                "Stop all sessions in this workspace?",
+                name.as_str(),
+                "Turn will politely stop processes in every Session. The project directory and all files stay untouched.",
+                // The blast radius, in numbers, because "this workspace" is not a
+                // quantity and the user is about to stop everything in it.
+                Some(format!(
+                    "{} session{} in this Workspace · {} with something running.",
+                    session_count,
+                    if *session_count == 1 { "" } else { "s" },
+                    running_sessions
+                )),
+                format!(
+                    "{} running process{} will receive a termination request, including in archived Sessions.",
+                    running_processes,
+                    if *running_processes == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::DeleteSession {
+                name,
+                running_count,
+                ..
+            } => (
+                "Delete this session?",
+                name.as_str(),
+                // What is deleted, then what is not, in that order. A person reading
+                // "delete" is asking about their work, and the answer is in the second
+                // half of the sentence.
+                "Turn will forget this Session: its layout, its history and its record. \
+                 Your files, branches and worktrees are not touched.",
+                None,
+                format!(
+                    "This cannot be undone. {} running process{} will be stopped first.",
+                    running_count,
+                    if *running_count == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::DeleteWorkspace {
+                name,
+                session_count,
+                running_processes,
+                root,
+                ..
+            } => (
+                "Delete this workspace?",
+                name.as_str(),
+                "Turn will forget this Workspace and every Session in it.",
+                // The path, verbatim: the one thing worth reading twice is what stays.
+                Some(format!("{root} stays exactly as it is.")),
+                format!(
+                    "This cannot be undone. {} session{} and {} running process{} will \
+                     be stopped and deleted.",
+                    session_count,
+                    if *session_count == 1 { "" } else { "s" },
+                    running_processes,
+                    if *running_processes == 1 { "" } else { "es" }
+                ),
+            ),
+        };
+        // The other door, named on the way through this one. Somebody who only wants the row
+        // gone must be able to see that stopping the work is not the price of a tidy tree.
+        let alternative = match &confirmation {
+            LifecycleConfirmation::EndSession { .. } => {
+                "Only tidying up? Archive it instead — the row leaves the tree and nothing stops."
+            }
+            LifecycleConfirmation::StopWorkspace { .. } => {
+                "Only tidying up? Archive it instead — the Workspace leaves the tree and nothing stops."
+            }
+            LifecycleConfirmation::DeleteSession { .. } => {
+                "Want it back later? Archive it instead — the row leaves the tree and the Session keeps everything."
+            }
+            LifecycleConfirmation::DeleteWorkspace { .. } => {
+                "Want it back later? Archive it instead — the Workspace leaves the tree and keeps its Sessions."
+            }
+        };
+        // Named for what it does, and the same word the control that opened it used.
+        let confirm_label = match &confirmation {
+            LifecycleConfirmation::EndSession { .. } => "End session",
+            LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
+            LifecycleConfirmation::DeleteSession { .. } => "Delete session",
+            LifecycleConfirmation::DeleteWorkspace { .. } => "Delete workspace",
+        };
+
+        // Turn paints this itself. `egui-elegance` was tried for it and rejected: its symbols
+        // font is inserted into the same private-use range as Turn's icon font at the same
+        // priority, and it won — every archive drawer in the tree became a plus sign. What it
+        // was worth having, though, was three properties this dialog did not have, and they are
+        // implemented below rather than lost with it: the accessibility role of an *alert*, a
+        // way out with the keyboard, and giving focus back to whatever had it.
+        // Taller for the two that say one thing more — how many Sessions the act reaches, or
+        // which directory it leaves alone. A panel sized for the longest of the four would leave
+        // the shortest with a band of empty space under its buttons.
+        let wanted_height = match &confirmation {
+            LifecycleConfirmation::StopWorkspace { .. }
+            | LifecycleConfirmation::DeleteWorkspace { .. } => 312.0_f32,
+            _ => 284.0_f32,
+        };
+        let bounds = Rect::from_center_size(
             full.center(),
             Vec2::new(
                 520.0_f32.min((full.width() - 32.0).max(300.0)),
@@ -2335,184 +2455,99 @@ impl<'a> TurnView<'a> {
         );
         ui.painter()
             .rect_filled(full, 0.0, Color32::from_black_alpha(165));
-        ui.painter().rect_filled(panel, 10.0, theme.panel);
+
+        // Escape declines. A modal question with no keyboard way out is a trap for anyone not
+        // using a pointer, and declining is always the safe answer — every one of these four
+        // stops or destroys something.
+        //
+        // Dismissing on a click outside the panel was written and then removed. The click that
+        // *opens* the dialog is in the same frame's input as the first frame it is drawn on, so
+        // the question appeared and closed again in one frame — caught by the test that presses
+        // the row's own control. Distinguishing the two would mean tracking which frame the
+        // dialog appeared on, and the convention buys nothing here: Escape covers the keyboard,
+        // Cancel covers the pointer, and neither can be triggered by the act of asking.
+        let mut confirmed = false;
+        let mut cancelled = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        ui.painter().rect_filled(bounds, 10.0, theme.panel);
         ui.painter().rect_stroke(
-            panel,
+            bounds,
             10.0,
             Stroke::new(1.0, theme.border),
             egui::StrokeKind::Outside,
         );
-        ui.scope_builder(region(panel.shrink(20.0), "lifecycle-confirmation"), |ui| {
-            ui.ctx().accesskit_node_builder(ui.id(), |node| {
-                node.set_role(egui::accesskit::Role::Dialog);
-                node.set_modal();
-            });
-            let Some(confirmation) = state.lifecycle_confirmation.clone() else {
-                return;
-            };
-            let (title, subject, detail, scope, terminating) = match &confirmation {
-                LifecycleConfirmation::EndSession {
-                    name,
-                    running_count,
-                    ..
-                } => (
-                    "End session?",
-                    name.as_str(),
-                    "Turn will politely stop every process in this Session. Its layout and history remain available.",
-                    None,
-                    format!(
-                        "{} running process{} will receive a termination request.",
-                        running_count,
-                        if *running_count == 1 { "" } else { "es" }
-                    ),
-                ),
-                LifecycleConfirmation::StopWorkspace {
-                    name,
-                    session_count,
-                    running_sessions,
-                    running_processes,
-                    ..
-                } => (
-                    "Stop all sessions in this workspace?",
-                    name.as_str(),
-                    "Turn will politely stop processes in every Session. The project directory and all files stay untouched.",
-                    // The blast radius, in numbers, because "this workspace" is not a
-                    // quantity and the user is about to stop everything in it.
-                    Some(format!(
-                        "{} session{} in this Workspace · {} with something running.",
-                        session_count,
-                        if *session_count == 1 { "" } else { "s" },
-                        running_sessions
-                    )),
-                    format!(
-                        "{} running process{} will receive a termination request, including in archived Sessions.",
-                        running_processes,
-                        if *running_processes == 1 { "" } else { "es" }
-                    ),
-                ),
-                LifecycleConfirmation::DeleteSession {
-                    name,
-                    running_count,
-                    ..
-                } => (
-                    "Delete this session?",
-                    name.as_str(),
-                    // What is deleted, then what is not, in that order. A person reading
-                    // "delete" is asking about their work, and the answer is in the second
-                    // half of the sentence.
-                    "Turn will forget this Session: its layout, its history and its record. \
-                     Your files, branches and worktrees are not touched.",
-                    None,
-                    format!(
-                        "This cannot be undone. {} running process{} will be stopped first.",
-                        running_count,
-                        if *running_count == 1 { "" } else { "es" }
-                    ),
-                ),
-                LifecycleConfirmation::DeleteWorkspace {
-                    name,
-                    session_count,
-                    running_processes,
-                    root,
-                    ..
-                } => (
-                    "Delete this workspace?",
-                    name.as_str(),
-                    "Turn will forget this Workspace and every Session in it.",
-                    // The path, verbatim: the one thing worth reading twice is what stays.
-                    Some(format!("{root} stays exactly as it is.")),
-                    format!(
-                        "This cannot be undone. {} session{} and {} running process{} will \
-                         be stopped and deleted.",
-                        session_count,
-                        if *session_count == 1 { "" } else { "s" },
-                        running_processes,
-                        if *running_processes == 1 { "" } else { "es" }
-                    ),
-                ),
-            };
-            ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
-            ui.label(RichText::new(subject).color(theme.text_dim).strong());
-            ui.add_space(10.0);
-            ui.label(RichText::new(detail).color(theme.text_dim));
-            if let Some(scope) = scope {
-                ui.label(RichText::new(scope).color(theme.text_dim));
+        ui.scope_builder(
+            region(bounds.shrink(20.0), "lifecycle-confirmation"),
+            |ui| {
+                ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                    // An *alert* dialog, not a plain one. Every one of these four questions is about
+                    // stopping or destroying something, and a screen reader announces an alert
+                    // before its content rather than waiting to be asked.
+                    node.set_role(egui::accesskit::Role::AlertDialog);
+                    node.set_modal();
+                    node.set_label(title);
+                });
+                ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
+                ui.label(RichText::new(subject).color(theme.text_dim).strong());
+                ui.add_space(10.0);
+                ui.label(RichText::new(detail).color(theme.text_dim));
+                if let Some(scope) = scope {
+                    ui.label(RichText::new(scope).color(theme.text_dim));
+                }
+                // At body size, not small. This is the line that says how much of the world the
+                // button reaches, and for a delete it is also the line that says it does not come
+                // back — it must not be the same weight as the hint underneath it, which is the
+                // way *out*.
+                ui.label(RichText::new(terminating).color(theme.attention));
+                ui.label(RichText::new(alternative).color(theme.text_faint).small());
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE))
+                                .fill(theme.failure),
+                        )
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            },
+        );
+
+        if confirmed {
+            match confirmation {
+                LifecycleConfirmation::EndSession { session_id, .. } => {
+                    actions.push(ViewAction::CloseSession {
+                        session_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
+                    actions.push(ViewAction::CloseWorkspace {
+                        workspace_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::DeleteSession { session_id, .. } => {
+                    actions.push(ViewAction::DeleteSession {
+                        session_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::DeleteWorkspace { workspace_id, .. } => {
+                    actions.push(ViewAction::DeleteWorkspace {
+                        workspace_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
             }
-            // At body size, not small. This is the line that says how much of the world the
-            // button reaches, and for a delete it is also the line that says it does not come
-            // back — it must not be the same weight as the hint underneath it, which is the
-            // way *out*.
-            ui.label(RichText::new(terminating).color(theme.attention));
-            // The other door, named on the way through this one. Somebody who only wants
-            // the row gone must be able to see that stopping the work is not the price of
-            // a tidy tree.
-            ui.label(
-                RichText::new(match &confirmation {
-                    LifecycleConfirmation::EndSession { .. } => {
-                        "Only tidying up? Archive it instead — the row leaves the tree and nothing stops."
-                    }
-                    LifecycleConfirmation::StopWorkspace { .. } => {
-                        "Only tidying up? Archive it instead — the Workspace leaves the tree and nothing stops."
-                    }
-                    LifecycleConfirmation::DeleteSession { .. } => {
-                        "Want it back later? Archive it instead — the row leaves the tree and the Session keeps everything."
-                    }
-                    LifecycleConfirmation::DeleteWorkspace { .. } => {
-                        "Want it back later? Archive it instead — the Workspace leaves the tree and keeps its Sessions."
-                    }
-                })
-                .color(theme.text_faint)
-                .small(),
-            );
-            ui.add_space(14.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Named for what it does, and the same word the control that opened it used.
-                let confirm_label = match confirmation {
-                    LifecycleConfirmation::EndSession { .. } => "End session",
-                    LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
-                    LifecycleConfirmation::DeleteSession { .. } => "Delete session",
-                    LifecycleConfirmation::DeleteWorkspace { .. } => "Delete workspace",
-                };
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE))
-                            .fill(theme.failure),
-                    )
-                    .clicked()
-                {
-                    match confirmation {
-                        LifecycleConfirmation::EndSession { session_id, .. } => {
-                            actions.push(ViewAction::CloseSession {
-                                session_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                        LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
-                            actions.push(ViewAction::CloseWorkspace {
-                                workspace_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                        LifecycleConfirmation::DeleteSession { session_id, .. } => {
-                            actions.push(ViewAction::DeleteSession {
-                                session_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                        LifecycleConfirmation::DeleteWorkspace { workspace_id, .. } => {
-                            actions.push(ViewAction::DeleteWorkspace {
-                                workspace_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                    }
-                    state.lifecycle_confirmation = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    state.lifecycle_confirmation = None;
-                }
-            });
-        });
+        }
+        if confirmed || cancelled {
+            state.lifecycle_confirmation = None;
+        }
         actions
     }
 
@@ -7196,7 +7231,9 @@ fn pane_header_controls(
         |ui| {
             let close = ui.add(
                 egui::Button::new(
-                    RichText::new(icons::CLOSE).size(12.0).color(theme.text_dim),
+                    RichText::new(icons::CLOSE)
+                        .font(icons::font(12.0))
+                        .color(theme.text_dim),
                 )
                 // No frame while it is idle, so a header with three panes is not three
                 // boxes; a frame the moment the pointer is on it, so it is visibly a

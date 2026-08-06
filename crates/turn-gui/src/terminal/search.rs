@@ -659,7 +659,7 @@ fn toggle(on: bool, label: &str) -> egui::Button<'_> {
 
 /// One of the bar's icon buttons.
 fn icon(glyph: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(glyph).size(13.0))
+    egui::Button::new(egui::RichText::new(glyph).font(crate::icons::font(13.0)))
 }
 
 /// Splits a fixed width off the right of a rectangle.

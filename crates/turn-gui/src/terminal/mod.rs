@@ -3046,7 +3046,7 @@ mod tests {
     #[test]
     fn pasting_asks_the_platform_rather_than_reading_the_clipboard_itself() {
         let ctx = egui::Context::default();
-        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let output = crate::frames::measure(&ctx, |ui| {
             request_clipboard_paste(ui.ctx());
         });
         let commands: Vec<&egui::ViewportCommand> = output

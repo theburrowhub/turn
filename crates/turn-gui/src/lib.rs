@@ -17,6 +17,9 @@ pub mod announce;
 pub mod app;
 pub mod companion;
 pub mod desk;
+/// Running one frame without a window. Test support, and public because the snapshot tests are
+/// a separate crate; see the module docs for why it exists at all.
+pub mod frames;
 pub mod icons;
 pub mod keymap;
 pub mod logging;

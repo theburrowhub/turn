@@ -3290,7 +3290,7 @@ fn a_panes_reported_size_matches_the_cells_it_can_paint() {
     let context = egui::Context::default();
     let theme = Theme::dark();
     let mut measured = None;
-    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+    turn_gui::frames::run(&context, |ui| {
         measured = theme.cell_size(ui);
     });
     let cell = measured.expect("the bundled monospace face can be measured");
@@ -3322,7 +3322,7 @@ fn a_panes_reported_size_matches_the_cells_it_can_paint() {
 fn measured_cell(theme: &Theme) -> egui::Vec2 {
     let context = egui::Context::default();
     let mut cell = None;
-    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+    turn_gui::frames::run(&context, |ui| {
         cell = theme.cell_size(ui);
     });
     cell.expect("the bundled monospace face can be measured")

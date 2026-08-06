@@ -158,7 +158,8 @@ pub fn show(
     crate::icons::install(ui.ctx());
     let response = ui.put(
         dismiss,
-        egui::Button::new(egui::RichText::new(crate::icons::CLOSE).size(12.0)).frame(false),
+        egui::Button::new(egui::RichText::new(crate::icons::CLOSE).font(crate::icons::font(12.0)))
+            .frame(false),
     );
     // The button's name carries the sentence, not just "dismiss". A screen reader user has
     // no other way to reach text that was painted rather than laid out, and the reason a

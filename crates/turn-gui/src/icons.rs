@@ -19,13 +19,54 @@
 
 use egui::{Response, RichText, Ui, Vec2};
 
-pub use egui_phosphor::regular::{
-    ARCHIVE, BELL, CARET_DOWN as NEXT, CARET_UP as PREVIOUS, COMMAND, FILE_PLUS, FOLDER_PLUS, GEAR,
-    KEYBOARD, LAYOUT, PLUS_SQUARE, POWER, TRAY_ARROW_UP as UNARCHIVE, X as CLOSE,
-};
+/// The glyphs Turn draws, by their codepoint in the Phosphor font.
+///
+/// Declared here rather than imported from `egui-phosphor`, which bundles the same font and
+/// generates a constant for all nine thousand icons. That crate pins `egui = "0.35"`, and cargo
+/// reads the pin as "not 0.36" — so a dependency whose whole job is a font file and a list of
+/// numbers was deciding which version of egui Turn could build against. The font is vendored
+/// beside this file (see `assets/fonts/NOTICE.md`, MIT) and these are the fourteen numbers.
+///
+/// The names are Turn's, not Phosphor's, where the two disagree: an icon is named for the act it
+/// stands for in this window — `UNARCHIVE`, not `TRAY_ARROW_UP` — because that is what a reader
+/// of the call site needs to know. The Phosphor name is in the comment so the glyph can be
+/// looked up again at phosphoricons.com.
+pub const ARCHIVE: &str = "\u{E00C}";
+pub const BELL: &str = "\u{E0CE}";
+/// `caret-down`
+pub const NEXT: &str = "\u{E136}";
+/// `caret-up`
+pub const PREVIOUS: &str = "\u{E13C}";
+pub const COMMAND: &str = "\u{E1C4}";
+pub const FILE_PLUS: &str = "\u{E236}";
+pub const FOLDER_PLUS: &str = "\u{E258}";
+pub const GEAR: &str = "\u{E270}";
+pub const KEYBOARD: &str = "\u{E2D8}";
+pub const LAYOUT: &str = "\u{E6D6}";
+pub const PLUS_SQUARE: &str = "\u{ED4A}";
+pub const POWER: &str = "\u{E3DA}";
+/// `tray-arrow-up`
+pub const UNARCHIVE: &str = "\u{EE52}";
+/// `x`
+pub const CLOSE: &str = "\u{E4F6}";
+
+/// The icon font itself, compiled in.
+///
+/// Compiled in rather than read at run time for the reason every other asset is: a window that
+/// cannot find its icons draws boxes, and a missing file is a failure with no good moment to
+/// discover it.
+const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/Phosphor-Regular.ttf");
 
 /// The name the icon font is registered under.
 const FONT: &str = "phosphor-regular";
+
+/// The font id an icon is drawn with, at `size` points.
+///
+/// A helper rather than `RichText::size`, so every call site asks for the icon face explicitly
+/// and none of them can drift into whatever the surrounding text is set in.
+pub fn font(size: f32) -> egui::FontId {
+    egui::FontId::new(size, egui::FontFamily::Proportional)
+}
 
 /// Makes the icon glyphs available on `ctx`.
 ///
@@ -34,12 +75,21 @@ const FONT: &str = "phosphor-regular";
 pub fn install(ctx: &egui::Context) {
     ctx.add_font(egui::epaint::text::FontInsert::new(
         FONT,
-        egui::FontData::from_static(egui_phosphor::Variant::Regular.font_bytes()),
+        egui::FontData::from_static(FONT_BYTES),
         vec![egui::epaint::text::InsertFontFamily {
             family: egui::FontFamily::Proportional,
             // Lowest, deliberately. The icons occupy the private use area, so nothing
             // that is actually text can resolve to them, and a higher priority would
             // put an icon font in front of the face the body text is set in.
+            //
+            // A family of their own would be stronger — a second crate's icon font inserted at
+            // the same priority wins these codepoints, which is exactly what happened when
+            // `egui-elegance` was tried and turned every archive drawer into a plus sign. It is
+            // not done here because `Context::add_font` takes effect at the *start of the next*
+            // frame: a named family is unbound on the frame it is added, and asking for an
+            // unbound family panics. Binding it would mean every surface registering its fonts
+            // before its first frame. Worth doing the day a second icon font arrives, and not
+            // before.
             priority: egui::epaint::text::FontPriority::Lowest,
         }],
     ));
@@ -57,7 +107,7 @@ pub fn icon_button(
     shortcut: Option<&str>,
     enabled: bool,
 ) -> Response {
-    let button = egui::Button::new(RichText::new(icon).size(15.0)).min_size(SIZE);
+    let button = egui::Button::new(RichText::new(icon).font(font(15.0))).min_size(SIZE);
     let response = ui.add_enabled(enabled, button);
     let tooltip = match shortcut {
         Some(shortcut) if !shortcut.is_empty() => format!("{label} · {shortcut}"),
@@ -141,7 +191,7 @@ pub fn row_button(
                 // floored at it, and the style's is wider *and* taller than a row can hold.
                 ui.spacing_mut().button_padding = Vec2::ZERO;
                 ui.spacing_mut().interact_size = ROW_SIZE;
-                let button = egui::Button::new(RichText::new(icon).size(ROW_GLYPH))
+                let button = egui::Button::new(RichText::new(icon).font(font(ROW_GLYPH)))
                     .min_size(ROW_SIZE)
                     // Ink at rest, a box under the pointer. Three framed boxes on every
                     // Workspace row competed with the name and the state for a row whose job
@@ -237,7 +287,7 @@ mod tests {
     fn installing_the_icon_font_twice_leaves_one_copy_of_it() {
         let ctx = egui::Context::default();
         for _ in 0..2 {
-            let _ = ctx.run_ui(Default::default(), |ui| install(ui.ctx()));
+            crate::frames::run(&ctx, |ui| install(ui.ctx()));
         }
         let names = ctx.fonts(|fonts| {
             fonts
