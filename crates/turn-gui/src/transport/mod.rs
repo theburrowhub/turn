@@ -108,6 +108,16 @@ pub enum Ask {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// An archive or a restore. Distinct from [`Ask::Action`] because its
+    /// acknowledgement has work to do: whether the row still belongs in the tree
+    /// depends on the window's archived preference, and only the daemon can answer
+    /// what the tree contains under that preference.
+    ArchiveSession {
+        archived: bool,
+    },
+    ArchiveWorkspace {
+        archived: bool,
+    },
     /// A change the user asked for. The label is what an error message names.
     Action(&'static str),
     /// Activity reporting. Its answer is a list of effects; a failure is not worth
@@ -145,6 +155,10 @@ impl Ask {
             Ask::RestoreLeaseAcquire { .. } => "acquiring restored write access",
             Ask::CloseSession { .. } => "ending the session",
             Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
+            Ask::ArchiveSession { archived: true } => "archiving the session",
+            Ask::ArchiveSession { archived: false } => "restoring the session",
+            Ask::ArchiveWorkspace { archived: true } => "archiving the workspace",
+            Ask::ArchiveWorkspace { archived: false } => "restoring the workspace",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",
             Ask::Stream => "sending to the terminal",

@@ -16,6 +16,18 @@ use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::Relation;
 use turn_core::state::Lifecycle;
+use turn_pty::ObservedProcess;
+
+/// Whether an observed process looks like the program a command names.
+///
+/// Both fields are consulted because an agent CLI is routinely a script: `claude` is
+/// run by `node`, so the process name is the interpreter and the executable's own name
+/// only appears in the command line. This is the same test the restore path applies to
+/// a surviving pid, for the same reason.
+fn names_command(observed: &ObservedProcess, executable: &str) -> bool {
+    !executable.is_empty()
+        && (observed.name.contains(executable) || observed.command_line.contains(executable))
+}
 
 /// Shortest gap between two sweeps, however much has happened.
 pub const SWEEP_MIN_INTERVAL_MS: i64 = 2_000;
@@ -89,10 +101,68 @@ impl Core {
             .map(|(node, process)| (process.session_id.clone(), node.clone(), process.pty.pid()))
             .collect();
 
+        // Identification before adoption, and the order matters: the agent Turn started
+        // in a pane's shell is already in the tree with a confirmed edge, and letting
+        // the generic pass reach it first would both duplicate the node and file the
+        // edge as a guess.
+        for (session_id, node_id, pid) in &roots {
+            self.identify_hosted_process(session_id, node_id, *pid, now_ms);
+        }
         for (session_id, node_id, pid) in roots {
             self.adopt_children(&session_id, &node_id, pid, now_ms);
         }
         self.retire_vanished_children(now_ms);
+    }
+
+    /// Learns the pid of the command Turn started inside one of its shells.
+    ///
+    /// This is identification, not inference. The node, its parent and its adapter were
+    /// all decided when Turn wrote the command line; the only thing missing is which
+    /// row of the process table is that command, because the shell forked it and Turn
+    /// never held it. Matching a direct child of the shell against the executable Turn
+    /// asked for answers that — and if nothing matches, nothing is claimed: the node
+    /// keeps no pid rather than borrowing one from whatever else is running there.
+    fn identify_hosted_process(
+        &mut self,
+        session_id: &SessionId,
+        shell: &NodeId,
+        shell_pid: u32,
+        now_ms: i64,
+    ) {
+        let Some(hosted) = self.processes.get(shell).and_then(|p| p.hosted.clone()) else {
+            return;
+        };
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        let Some(node) = session.tree.get(&hosted) else {
+            return;
+        };
+        if node.pid.is_some() || !node.is_running() {
+            return;
+        }
+        let wanted = crate::core::spawn::executable_name(&node.command).to_string();
+        let Some(found) = self
+            .supervisor
+            .descendants(shell_pid)
+            .into_iter()
+            .find(|observed| observed.ppid == Some(shell_pid) && names_command(observed, &wanted))
+        else {
+            return;
+        };
+
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if let Some(node) = session.tree.get_mut(&hosted) {
+                node.pid = Some(found.pid);
+                node.ppid = found.ppid;
+            }
+        }
+        tracing::debug!(
+            %session_id, %hosted, pid = found.pid, ppid = ?found.ppid, executable = %wanted,
+            "identified the process Turn started in a pane's shell"
+        );
+        self.persist_session_quietly(session_id);
+        self.push_tree(session_id, now_ms);
     }
 
     /// Adds children of one node that are not in the tree yet.
@@ -170,16 +240,29 @@ impl Core {
         }
     }
 
-    /// Marks inferred children that are no longer in the process table.
+    /// Marks children that are no longer in the process table.
     ///
     /// They become [`Lifecycle::Lost`] rather than exited: Turn never held these
     /// processes and did not see them end, so it has no exit code to report and will
-    /// not make one up.
+    /// not make one up. `Lost` is terminal without being a failure, which is the right
+    /// reading for an agent the user quit with `/exit` as much as for a dev server that
+    /// vanished — Turn watched neither of them die.
+    ///
+    /// Both kinds of pid Turn does not hold are covered: the children a sweep inferred,
+    /// and the agent Turn started in a pane's shell. Leaving the second out would make
+    /// an agent that quit go on claiming to be running for as long as its shell lived,
+    /// which is exactly the pane the user is looking at.
     fn retire_vanished_children(&mut self, now_ms: i64) {
+        let hosted: Vec<NodeId> = self
+            .processes
+            .values()
+            .filter_map(|process| process.hosted.clone())
+            .collect();
         let mut gone: Vec<(SessionId, NodeId, Option<NodeId>, Option<String>)> = Vec::new();
         for session in self.sessions.values() {
             for node in session.tree.iter() {
-                if node.relation != Relation::Inferred || !node.is_running() {
+                let ours = node.relation == Relation::Inferred || hosted.contains(&node.id);
+                if !ours || !node.is_running() {
                     continue;
                 }
                 let Some(pid) = node.pid else { continue };
@@ -200,6 +283,7 @@ impl Core {
         }
 
         let mut touched: Vec<SessionId> = Vec::new();
+        let mut changed: Vec<(SessionId, NodeId)> = Vec::new();
         for (session_id, node_id, parent_id, external_id) in gone {
             let retired_root = if let Some(session) = self.sessions.get_mut(&session_id) {
                 if let Some(node) = session
@@ -223,6 +307,13 @@ impl Core {
             let mut retired = vec![(node_id.clone(), parent_id, external_id)];
             retired.extend(self.mark_runtime_dependents(&session_id, &node_id, now_ms));
             self.resolve_lifecycle_attention(&session_id, &retired, now_ms);
+            // Each retired node's own state, not only the tree it sits in. A node going
+            // from alive to lost is the transition a client is waiting on to stop drawing
+            // it as running, and the tree push does not carry which node changed.
+            // `caused_by` stays empty: nothing here is a reason to move anybody.
+            for (node, _, _) in &retired {
+                changed.push((session_id.clone(), node.clone()));
+            }
             if !touched.contains(&session_id) {
                 touched.push(session_id);
             }
@@ -231,6 +322,9 @@ impl Core {
             self.persist_session_quietly(&session_id);
             self.push_tree(&session_id, now_ms);
             self.push_session_state(&session_id, now_ms);
+        }
+        for (session_id, node_id) in changed {
+            self.push_node_state(&session_id, &node_id, None, now_ms);
         }
     }
 }

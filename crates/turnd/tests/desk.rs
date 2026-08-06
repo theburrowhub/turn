@@ -112,9 +112,10 @@ async fn a_session_from_a_custom_coding_template_has_real_processes_behind_its_p
         "the persistent left tree must never be duplicated as a Pane"
     );
 
-    // Not "the daemon says it is running": the kernel says so.
+    // Not "the daemon says it is running": the kernel says so. Every pane's own process
+    // has a pid from the moment it is spawned.
     assert!(details.tree.len() >= 2);
-    for node in &details.tree {
+    for node in details.tree.iter().filter(|node| !node.is_agentic) {
         let pid = node.pid.expect("a spawned process has a pid");
         assert!(
             pid_is_alive(pid),
@@ -132,6 +133,11 @@ async fn a_session_from_a_custom_coding_template_has_real_processes_behind_its_p
         .find(|node| node.is_agentic)
         .expect("the agent pane's node");
     assert!(agent.turn.is_some(), "an agent carries the turn axis");
+    // The agent's process was forked by its pane's shell, so Turn learns its pid from
+    // the process table rather than from the launch. It is never claimed before it is
+    // known, and once it is known the kernel agrees with it too.
+    let agent_pid = common::agent::wait_for_agent_pid(&mut ui, &session.id, &agent.node_id).await;
+    assert!(pid_is_alive(agent_pid));
     let shell = details
         .tree
         .iter()
@@ -950,6 +956,207 @@ async fn a_child_process_nothing_announced_is_adopted_as_an_inferred_link() {
     assert_eq!(child.parent.as_ref(), Some(&nodes[0].node_id));
     assert!(child.command.contains("sleep"));
     assert!(pid_is_alive(child.pid.expect("an observed pid")));
+
+    daemon.shutdown().await;
+}
+
+/// A process sets its own pane title through a real pty, and the daemon reports it.
+///
+/// This is the reproducible test the issue asks for: no fixture, no injected event —
+/// a shell emits `ESC ] 2 ; … BEL` and the title arrives in the tree projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_sets_its_own_pane_title_through_a_real_pty() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let shell = details
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the shell pane");
+    let node = shell.node_id.clone().expect("the shell has a process");
+
+    // Attach first: the title is noticed when output arrives, and attaching is what
+    // makes the pump run.
+    ui.attach_cells(&session.id, &shell.id, PtySize::new(30, 100))
+        .await;
+
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: node.clone(),
+        data: turn_proto::TerminalBytes::new(
+            // `sleep` after the title, on one line: a shell rewrites its title from
+            // its prompt, so a test that returns to the prompt races its own set-up.
+            // An agent mid-task does not return to a prompt either.
+            b"printf '\\033]2;fixing the climbing bug\\007'; sleep 10\n".to_vec(),
+        ),
+    })
+    .await;
+
+    let title = ui
+        .wait_for_node_title(&session.id, &node, "fixing the climbing bug")
+        .await;
+    assert_eq!(title.title, "fixing the climbing bug");
+    assert!(
+        title.title_is_provisional,
+        "a title the process printed is the program's word about itself, \
+         and must never be presented with the authority of a reported name"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// Two shells in one session keep separate titles, and neither disturbs the other.
+///
+/// The isolation is structural — each pty has its own buffer — but a test is what
+/// keeps a future change from routing titles through anything shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_processes_in_one_session_keep_independent_titles() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "turn".to_string(),
+            root: daemon.data_dir().display().to_string(),
+        })
+        .await,
+    );
+
+    // Two shells of its own: the shipped templates carry one, and an agent pane is
+    // named by its adapter, which deliberately outranks a process title.
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "two titled shells".into(),
+            cwd: None,
+            panes: Some(vec![
+                NewPane::new(PaneKind::Shell).with_command("sh"),
+                NewPane::new(PaneKind::Shell).with_command("sh"),
+            ]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let panes: Vec<_> = details
+        .layout
+        .panes()
+        .into_iter()
+        .filter(|pane| pane.node_id.is_some())
+        .cloned()
+        .collect();
+    assert_eq!(panes.len(), 2, "two shells were asked for");
+
+    for (index, pane) in panes.iter().enumerate() {
+        let node = pane.node_id.clone().unwrap();
+        ui.attach_cells(&session.id, &pane.id, PtySize::new(24, 80))
+            .await;
+        ui.ask(Request::WritePty {
+            session_id: session.id.clone(),
+            node_id: node,
+            data: turn_proto::TerminalBytes::new(
+                format!("printf '\\033]2;instance {index}\\007'; sleep 10\n").into_bytes(),
+            ),
+        })
+        .await;
+    }
+
+    for (index, pane) in panes.iter().enumerate() {
+        let node = pane.node_id.clone().unwrap();
+        let expected = format!("instance {index}");
+        let view = ui.wait_for_node_title(&session.id, &node, &expected).await;
+        assert_eq!(view.title, expected, "titles must not bleed between panes");
+        assert!(view.title_is_provisional);
+    }
+
+    daemon.shutdown().await;
+}
+
+/// A title never opens a pane, moves focus, changes the layout or raises attention.
+///
+/// The issue asks for this explicitly, and it is the difference between a label and
+/// an event: a shell rewriting its title on every prompt must not be able to pull the
+/// user anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_title_change_moves_nothing_and_raises_nothing() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let shell = before
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the shell pane");
+    let node = shell.node_id.clone().expect("the shell has a process");
+    let panes_before = before.layout.panes().len();
+
+    ui.attach_cells(&session.id, &shell.id, PtySize::new(24, 80))
+        .await;
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: node.clone(),
+        data: turn_proto::TerminalBytes::new(b"printf '\\033]2;busy\\007'; sleep 10\n".to_vec()),
+    })
+    .await;
+    ui.wait_for_node_title(&session.id, &node, "busy").await;
+
+    let after = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        after.layout.panes().len(),
+        panes_before,
+        "a title opened or closed a pane"
+    );
+    assert_eq!(
+        after.layout.active, before.layout.active,
+        "a title moved the focused pane"
+    );
+    assert!(
+        !after.summary.needs_user,
+        "a title raised an attention demand"
+    );
+    assert_eq!(after.summary.badge_count, 0, "a title produced a badge");
+
+    match ui
+        .ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await
+    {
+        Response::AttentionList { entries } => {
+            assert!(entries.is_empty(), "a title queued something: {entries:?}");
+        }
+        other => panic!("expected the attention list, got {other:?}"),
+    }
 
     daemon.shutdown().await;
 }

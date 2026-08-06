@@ -571,9 +571,61 @@ impl Core {
     /// the parsed screen, and whoever asked for bytes is sent the bytes. A pane with no
     /// cells attachment never has a grid built for it, and a pane with no byte
     /// attachment never pays for base64.
-    pub(crate) fn deliver_output(&mut self, node: &NodeId, data: Vec<u8>, dropped: u64) {
+    pub(crate) fn deliver_output(
+        &mut self,
+        node: &NodeId,
+        data: Vec<u8>,
+        dropped: u64,
+        now_ms: i64,
+    ) {
+        // Checked here rather than on a timer: output arriving is the only way a title
+        // can have changed, and this call is already coalesced by the pump. The check
+        // itself is an integer comparison, so a node whose title never moves — most of
+        // them — pays nothing.
+        self.observe_process_title(node, now_ms);
         self.deliver_screen(node);
         self.deliver_bytes(node, data, dropped);
+    }
+
+    /// Picks up a title the process set for itself and, if it wins the precedence,
+    /// tells everyone watching.
+    ///
+    /// The title arrives already sanitised from `turn_pty`: escape sequences, control
+    /// characters, bidi overrides and invisible tag characters are gone and the length
+    /// is capped. What sanitising cannot do is make the *content* trustworthy — a
+    /// process is free to print `✓ tests passed` or the name of another of the user's
+    /// sessions — so it is recorded as [`NameSource::ProcessTitle`], which the UI draws
+    /// as provisional rather than with the authority of a name a tool reported.
+    ///
+    /// A title never opens a pane, moves focus, changes the layout or touches
+    /// attention. It is a label.
+    pub(crate) fn observe_process_title(&mut self, node: &NodeId, now_ms: i64) {
+        let Some(process) = self.processes.get(node) else {
+            return;
+        };
+        let Some((generation, title)) = process.pty.title_if_changed(process.title_generation)
+        else {
+            return;
+        };
+        let session_id = process.session_id.clone();
+        if let Some(process) = self.processes.get_mut(node) {
+            process.title_generation = generation;
+        }
+
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let Some(target) = session.tree.get_mut(node) else {
+            return;
+        };
+        let changed = match title {
+            Some(title) => target.set_process_title(title),
+            // The process cleared its own title.
+            None => target.clear_process_title(),
+        };
+        if changed {
+            self.push_node_state(&session_id, node, None, now_ms);
+        }
     }
 
     /// The byte stream: raw output for the attachments that asked for it.
@@ -739,7 +791,7 @@ mod tests {
         drain(&mut frames);
         harness
             .core
-            .deliver_output(&first_node, b"hello".to_vec(), 0);
+            .deliver_output(&first_node, b"hello".to_vec(), 0, 0);
         let addressed: Vec<SessionId> = drain(&mut frames)
             .into_iter()
             .filter_map(|event| match event {
@@ -831,6 +883,7 @@ mod tests {
                 lifecycle: turn_core::state::Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("claude".into()),
+                needs_checkout_write: true,
             }],
         };
         harness.core.restore_reports.push(report.clone());

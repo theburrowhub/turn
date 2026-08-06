@@ -26,7 +26,7 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentName, Direction, Layout, LeaseState, NodeKind, Pane, PaneKind,
+    ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane, PaneKind,
     PaneNodeBinding, PreviewSource, ProcessNode, Relation, RestoreState, Session, SessionMode,
     Template, Workspace, WorkspaceCheckout, WorkspaceWriteLease,
 };
@@ -40,7 +40,9 @@ use turn_proto::{
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
-use turn_gui::terminal::PaneAction;
+use turn_gui::terminal::menu::{MenuItem, PaneCommand, PaneContext, PaneMenu, PaneShortcuts};
+use turn_gui::terminal::selection::{CellPos, Selection, SelectionKind};
+use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
@@ -88,6 +90,9 @@ struct Fixture {
     write_conflict: Option<ProtoErrorContext>,
     restore: Option<SessionRestoreView>,
     recovery_lease: Option<WorkspaceWriteLease>,
+    /// The Settings preference. Off by default, as it is in the window, so a fixture that
+    /// contains an archived row has to say it wants it shown.
+    include_archived: bool,
 }
 
 impl Fixture {
@@ -143,7 +148,7 @@ impl Fixture {
             connection: self.connection.clone(),
             notice: self.notice.clone(),
             write_conflict: self.write_conflict.as_ref(),
-            include_archived: false,
+            include_archived: self.include_archived,
             policy: None,
             now_ms: cursor_on(),
         }
@@ -756,6 +761,9 @@ fn restored_desk() -> Fixture {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some(node.command.clone()),
+                    // Every pane in this fixture is an agent or a named command, so all of
+                    // them would use the Session's checkout write authority.
+                    needs_checkout_write: true,
                 })
         })
         .collect();
@@ -824,6 +832,1058 @@ fn a_restored_layout_explains_that_nothing_was_restarted_and_offers_recovery() {
         h.state().actions.as_slice(),
         [ViewAction::ReclaimWorkspaceWriteLease { .. }]
     ));
+}
+
+/// The other half of the recovery rule, in the window: a pending write confirmation holds
+/// back what would use the checkout, not the whole Session.
+///
+/// A pane that would only open the user's own shell keeps a clickable offer — which is
+/// what the owner needs in order to go and stop the process being asked about — while a
+/// pane that would run an agent says plainly what it is waiting for.
+#[test]
+fn a_restored_pane_that_writes_nothing_is_still_startable_while_write_access_is_pending() {
+    let gated = harness(restored_desk());
+    let mut gated = gated;
+    gated.run();
+    gated.run();
+    assert!(
+        gated
+            .query_all_by_label("Confirm write access in the status bar first.")
+            .count()
+            > 0,
+        "an agent pane must say what it is waiting for: {:?}",
+        button_labels(&gated)
+    );
+
+    let mut fixture = restored_desk();
+    let shell_pane = fixture
+        .restore
+        .as_mut()
+        .map(|restore| {
+            for outcome in &mut restore.panes {
+                // The same panes, but as terminals: nothing Turn starts in them writes to
+                // the shared checkout.
+                outcome.needs_checkout_write = false;
+                outcome.command = None;
+            }
+            restore.panes[0].node_id.clone()
+        })
+        .expect("the restored fixture offers panes");
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    assert_eq!(
+        h.query_all_by_label("Confirm write access in the status bar first.")
+            .count(),
+        0,
+        "a terminal is not gated, so nothing may tell the user it is"
+    );
+
+    h.state_mut().actions.clear();
+    h.query_all_by_label("Start pane")
+        .next()
+        .expect("the offer for a pane that writes nothing remains a real button")
+        .click();
+    h.run_steps(1);
+    assert!(
+        matches!(
+            h.state().actions.as_slice(),
+            [ViewAction::RelaunchNode { node_id, .. }] if node_id == &shell_pane
+        ),
+        "{:?}",
+        h.state().actions
+    );
+}
+
+/// Every accessible name in the window, for the tests that care that a control can be
+/// found by a person who cannot see it.
+fn button_labels(h: &Harness<'static, Window>) -> Vec<String> {
+    h.query_all_by_role(egui::accesskit::Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect()
+}
+
+/// The rows the command palette is offering, as a screen reader would read them.
+fn palette_rows(h: &Harness<'static, Window>) -> Vec<String> {
+    h.query_all_by_role(egui::accesskit::Role::ListItem)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect()
+}
+
+/// What a screen reader would read out of the tree, one string per visible row.
+fn tree_row_labels(h: &Harness<'static, Window>) -> Vec<String> {
+    h.query_all_by_role(egui::accesskit::Role::TreeItem)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect()
+}
+
+fn group_labels(h: &Harness<'static, Window>) -> Vec<String> {
+    h.query_all_by_role(egui::accesskit::Role::Group)
+        .filter_map(|node| node.accesskit_node().label())
+        .collect()
+}
+
+/// The toolbar that took the place of the `RESTORED SAFELY` strip.
+///
+/// Worth a screenshot of its own because the thing that goes wrong with a row of controls
+/// beside a right-aligned label is overlap, and because every button in it has to be
+/// findable by name: an icon nobody can name is a control a screen-reader user does not
+/// have.
+#[test]
+fn the_top_bar_carries_a_toolbar_of_named_actions_and_the_version() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let buttons = button_labels(&h);
+    for label in [
+        "New pane",
+        "Layout",
+        "New session",
+        "New workspace",
+        "Command palette",
+        "Attention queue",
+        "Keyboard shortcuts",
+        "Settings",
+    ] {
+        assert!(
+            buttons.iter().any(|found| found == label),
+            "the toolbar must offer {label:?} by name; found {buttons:?}"
+        );
+    }
+    // `Archived` was a third button beside two that create things. It is gone from the
+    // Workspaces bar entirely.
+    assert!(
+        !buttons.iter().any(|found| found == "Archived"),
+        "the archived filter must not be in the workspaces bar: {buttons:?}"
+    );
+
+    let groups = group_labels(&h);
+    assert!(
+        groups
+            .iter()
+            .any(|group| group.starts_with("Turn ") && group.contains("connected")),
+        "the version and the connection are announced, not only painted: {groups:?}"
+    );
+    h.snapshot("chrome_toolbar");
+}
+
+/// The toolbar has to give way rather than draw over what is beside it. At 520 points
+/// there is no room for eight buttons, and the version and the connection must both
+/// survive.
+#[test]
+fn a_narrow_window_drops_toolbar_buttons_rather_than_overlapping_the_version() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(520.0, 600.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window(fixture),
+        );
+    h.run();
+    h.run();
+
+    let buttons = button_labels(&h);
+    let toolbar_present = [
+        "New pane",
+        "Layout",
+        "New session",
+        "New workspace",
+        "Command palette",
+        "Attention queue",
+        "Keyboard shortcuts",
+        "Settings",
+    ]
+    .into_iter()
+    .filter(|label| buttons.iter().any(|found| found == label))
+    .count();
+    assert!(
+        toolbar_present < 8,
+        "a 520-point window cannot hold the whole toolbar; it kept {toolbar_present}"
+    );
+    assert!(
+        group_labels(&h)
+            .iter()
+            .any(|group| group.starts_with("Turn ")),
+        "the connection and version must never be the thing that is dropped"
+    );
+    // The tree obeys the same rule. A 520-point window leaves its rows about 218 points
+    // wide, which is not enough for a name, a status tag and a pair of controls — so the
+    // controls give way, and the rows still say which Session they are.
+    assert!(
+        !buttons
+            .iter()
+            .any(|label| label.starts_with("Close session")
+                || label.starts_with("Archive session")),
+        "a tree this narrow must keep its names rather than its controls; found {buttons:?}"
+    );
+    assert!(
+        tree_row_labels(&h)
+            .iter()
+            .any(|label| label.contains("Fix climbing bugs")),
+        "and the name has to survive whole: {:?}",
+        tree_row_labels(&h)
+    );
+}
+
+/// `Command::ClosePane` existed from the first keymap with nothing on screen to invoke it.
+/// This is the affordance, on the pane it closes, and it says in its own tooltip that the
+/// process survives — which is the rule the daemon already enforces.
+#[test]
+fn closing_a_pane_is_a_control_on_that_panes_own_header() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    // One pane zoomed, which is the case where a header has to fit a long title, the
+    // `zoomed` tag and the close control on one line without any of them running into
+    // another.
+    if let Some(layout) = fixture.layout.as_mut() {
+        layout.zoomed = layout.panes().first().map(|pane| pane.id.clone());
+    }
+    let panes: Vec<PaneId> = fixture
+        .layout
+        .as_ref()
+        .expect("layout")
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    h.snapshot("pane_close_control");
+    assert!(
+        button_labels(&h)
+            .iter()
+            .any(|label| label == "Close pane claude · agent · sonnet"),
+        "a zoomed pane keeps its close control beside the zoom tag"
+    );
+
+    // Un-zoomed, every pane has one, and each names the pane it belongs to.
+    if let Some(layout) = h.state_mut().fixture.layout.as_mut() {
+        layout.zoomed = None;
+    }
+    h.run();
+    h.run();
+    let buttons = button_labels(&h);
+    for title in ["claude · agent · sonnet", "fang · files", "zsh"] {
+        assert!(
+            buttons
+                .iter()
+                .any(|label| label == &format!("Close pane {title}")),
+            "every pane header names its own close control; found {buttons:?}"
+        );
+    }
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Close pane zsh")
+        .expect("the close control is a real button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::ClosePane {
+            pane_id: panes[2].clone()
+        }],
+        "the control closes its own pane and nothing else"
+    );
+}
+
+/// A three-pane desk with nothing blocked on the user, so the panes have the window to
+/// themselves and a drag can be aimed at real geometry.
+///
+/// The three screens are deliberately different sizes. The rectangles a gesture is aimed
+/// at are read back out of the accessibility tree, and two panes that describe themselves
+/// identically would make "the pane under the pointer" ambiguous in the test rather than in
+/// the window.
+fn relocation_desk() -> Fixture {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let panes = relocation_panes(&fixture);
+    fixture.grids.insert(panes[0].clone(), agent_screen());
+    fixture.grids.insert(
+        panes[1].clone(),
+        screen(
+            &[
+                "src/ai/climb_system.gd",
+                "  198  func _on_jump():",
+                "  199    var new_state = _calculate_state()",
+                "+ 200    if new_state == STATE_WALL or STATE_CEILING:",
+                "  201      _transition_to(new_state)",
+            ],
+            24,
+            46,
+        ),
+    );
+    fixture.grids.insert(
+        panes[2].clone(),
+        screen(&["~/space-troopers on climb $ "], 12, 44),
+    );
+    fixture
+}
+
+fn relocation_panes(fixture: &Fixture) -> Vec<PaneId> {
+    fixture
+        .layout
+        .as_ref()
+        .expect("layout")
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect()
+}
+
+/// The rectangle a pane was actually drawn at, reassembled from the accessibility tree.
+///
+/// A drop zone is a fraction of a pane's own width and height, so a test that guessed the
+/// rectangle would be testing its guess. The header grip and the terminal body are both in
+/// the tree, and together they are the whole pane.
+fn drawn_pane(h: &mut Harness<'static, Window>, title: &str, terminal: &str) -> egui::Rect {
+    let header = h
+        .get_by_label_contains(&format!("{title} pane header"))
+        .rect();
+    let body = h.get_by_label_contains(terminal).rect();
+    header.union(body)
+}
+
+/// The gesture people already know from every tiling editor: drag a pane by its header onto
+/// another pane, and which of that pane's five regions the pointer is in decides the result.
+/// It has to name both panes and the zone, and go through the daemon — the window must not
+/// rearrange its own copy of the layout on the way.
+#[test]
+fn dropping_a_pane_on_an_edge_of_another_asks_to_land_on_that_side_of_it() {
+    let fixture = relocation_desk();
+    let panes = relocation_panes(&fixture);
+    let untouched = fixture.layout.clone();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+    // Well inside the right-hand band, and vertically in the middle so it is that band and
+    // not a corner.
+    let on_the_right_edge = egui::pos2(
+        target.max.x - turn_gui::panes::drop_edge_band(target.width()) / 2.0,
+        target.center().y,
+    );
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(on_the_right_edge);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.drop_at(on_the_right_edge);
+    h.run_steps(1);
+
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::RelocatePane {
+            moved: panes[2].clone(),
+            target: panes[0].clone(),
+            zone: DropZone::Right,
+        }]
+    );
+    assert_eq!(
+        h.state().fixture.layout,
+        untouched,
+        "the window asks the daemon to move the pane; it does not move its own copy"
+    );
+}
+
+/// The middle of a pane is the one zone that changes no shape: the two panes exchange
+/// places. It has to be easy to mean, which is what the band sizes are for.
+#[test]
+fn dropping_a_pane_on_the_middle_of_another_asks_to_exchange_the_two() {
+    let fixture = relocation_desk();
+    let panes = relocation_panes(&fixture);
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(target.center());
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.drop_at(target.center());
+    h.run_steps(1);
+
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::RelocatePane {
+            moved: panes[2].clone(),
+            target: panes[0].clone(),
+            zone: DropZone::Centre,
+        }]
+    );
+}
+
+/// What the user sees while dragging, aimed at an edge: the region the pane will occupy,
+/// which is half of the target, with the side named in words. A rearrangement nobody can
+/// predict before letting go is one they will not use.
+#[test]
+fn a_drag_aimed_at_a_panes_right_edge_shows_the_half_it_would_take() {
+    let mut h = harness(relocation_desk());
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+    let on_the_right_edge = egui::pos2(
+        target.max.x - turn_gui::panes::drop_edge_band(target.width()) / 2.0,
+        target.center().y,
+    );
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(on_the_right_edge);
+    h.run_steps(2);
+    h.snapshot("pane_drop_zone_right_edge");
+}
+
+/// The same drag, moved to the middle of the same pane. Told apart from the edge without
+/// dropping: a different shape, a different word.
+#[test]
+fn the_same_drag_over_the_middle_of_the_pane_shows_the_whole_of_it_instead() {
+    let mut h = harness(relocation_desk());
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(target.center());
+    h.run_steps(2);
+    h.snapshot("pane_drop_zone_centre");
+}
+
+/// Escape during a drag leaves the layout exactly as it was, even when the pointer is
+/// released over a perfectly good target. A gesture people are afraid to start is one they
+/// will not use.
+#[test]
+fn escape_during_a_drag_cancels_it_and_a_later_drop_moves_nothing() {
+    let fixture = relocation_desk();
+    let untouched = fixture.layout.clone();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(target.center());
+    h.run_steps(1);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.drop_at(target.center());
+    h.run_steps(1);
+
+    assert!(
+        h.state().actions.is_empty(),
+        "a cancelled drag must ask for nothing; got {:?}",
+        h.state().actions
+    );
+    assert_eq!(h.state().fixture.layout, untouched);
+}
+
+/// The Escape that cancels a drag is spent on the drag. A temporary pane is open — it is
+/// not a sheet, so panes stay draggable behind it — and closing it is what Escape means
+/// when nothing is being dragged. Cancelling a rearrangement must not also throw away what
+/// the user was reading, and the *next* Escape must still work normally.
+#[test]
+fn escape_cancelling_a_drag_is_not_also_spent_closing_what_is_open_behind_it() {
+    let mut fixture = relocation_desk();
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    let reviewer = snapshot
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| {
+            node.agent
+                .as_ref()
+                .is_some_and(|agent| agent.name.display_name == "Reviewer")
+        })
+        .expect("Reviewer");
+    let binding = PaneNodeBinding {
+        pane_id: PaneId::from_stored("pane_reviewer_temporary"),
+        session_id: reviewer.session_id.clone(),
+        node_id: reviewer.node_id.clone(),
+        temporary: true,
+        surface_id: Some(snapshot.tree_state.surface_id.clone()),
+        opened_ms: T0 + 15_000,
+    };
+    reviewer.pane_bindings.push(binding.clone());
+    fixture.temporary_pane = Some(NodePaneView {
+        binding,
+        capability: NodePaneCapability::PreviewDetails,
+    });
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    // The left-hand end of the leftmost pane's header, which the temporary pane's panel
+    // does not cover.
+    let source = h
+        .get_by_label_contains("claude · agent · sonnet pane header")
+        .rect();
+    let grip = egui::pos2(source.min.x + 12.0, source.center().y);
+    h.hover_at(grip);
+    h.run_steps(1);
+    h.drag_at(grip);
+    h.run_steps(1);
+    h.hover_at(grip + egui::vec2(30.0, 90.0));
+    h.run_steps(1);
+
+    h.state_mut().actions.clear();
+    h.key_press(egui::Key::Escape);
+    h.run_steps(1);
+    assert!(
+        !h.state()
+            .actions
+            .iter()
+            .any(|action| matches!(action, ViewAction::CloseTemporaryPane { .. })),
+        "the drag's Escape closed the temporary pane as well; got {:?}",
+        h.state().actions
+    );
+
+    // With no drag in progress, Escape goes back to meaning what it always meant.
+    h.drop_at(grip + egui::vec2(30.0, 90.0));
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.key_press(egui::Key::Escape);
+    h.run_steps(1);
+    assert!(
+        h.state()
+            .actions
+            .iter()
+            .any(|action| matches!(action, ViewAction::CloseTemporaryPane { .. })),
+        "Escape must still close the temporary pane afterwards; got {:?}",
+        h.state().actions
+    );
+}
+
+/// A pane let go of over the sidebar, the toolbar or the status bar has not been dropped
+/// anywhere. Nothing happens, and nothing is sent.
+#[test]
+fn dropping_a_pane_outside_every_pane_moves_nothing() {
+    let fixture = relocation_desk();
+    let untouched = fixture.layout.clone();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    // The workspace tree, which is a long way from any pane.
+    let outside = egui::pos2(40.0, 400.0);
+
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(outside);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.drop_at(outside);
+    h.run_steps(1);
+
+    assert!(
+        h.state().actions.is_empty(),
+        "a drop with no target must ask for nothing; got {:?}",
+        h.state().actions
+    );
+    assert_eq!(h.state().fixture.layout, untouched);
+}
+
+/// A drop onto a pane too narrow for the sentence. The failure to watch for here is text
+/// painted past the edge of the region it describes, landing on the pane next door: the
+/// label gives way to a single word, and then to nothing, while the highlighted shape — the
+/// part that actually says where the pane lands — is unaffected.
+#[test]
+fn a_drop_onto_a_narrow_pane_shortens_its_label_rather_than_spilling_over_the_pane_beside_it() {
+    let mut fixture = relocation_desk();
+    let mut layout = fixture.layout.clone().expect("layout");
+    // Five columns, so every pane is narrower than the sentence about the widest title.
+    assert!(layout.apply_preset(turn_core::model::LayoutPreset::Columns));
+    let mut last = layout.panes().last().expect("a pane").id.clone();
+    for (index, name) in ["make", "logs"].iter().enumerate() {
+        let pane = Pane::new(PaneKind::Shell).with_title(*name);
+        let id = pane.id.clone();
+        assert!(layout.split(&last, Direction::Horizontal, pane));
+        fixture.titles.insert(id.clone(), (*name).to_string());
+        // A different size per pane, so each one describes itself uniquely in the
+        // accessibility tree the test reads its rectangle back out of.
+        fixture.grids.insert(
+            id.clone(),
+            screen(&[&format!("$ {name}")], 16 + index as u16, 12),
+        );
+        last = id;
+    }
+    let panes: Vec<PaneId> = layout
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect();
+    fixture.layout = Some(layout);
+    let untouched = fixture.layout.clone();
+
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let source = h.get_by_label_contains("zsh pane header").rect();
+    // The pane with the longest title, so the sentence cannot possibly fit in it.
+    let target = drawn_pane(&mut h, "claude · agent · sonnet", "Terminal, 40 rows");
+    h.hover_at(source.center());
+    h.run_steps(1);
+    h.drag_at(source.center());
+    h.run_steps(1);
+    h.hover_at(target.center());
+    h.run_steps(2);
+    h.snapshot("pane_drop_zone_narrow");
+
+    // The gesture still works, and still names the pane and the zone exactly.
+    h.state_mut().actions.clear();
+    h.drop_at(target.center());
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::RelocatePane {
+            moved: panes[2].clone(),
+            target: panes[0].clone(),
+            zone: DropZone::Centre,
+        }]
+    );
+    assert_eq!(h.state().fixture.layout, untouched);
+}
+
+/// The layout the owner said was impossible to reach, in two pictures: three panes as a
+/// tall column beside a stack, and the same three after one pane was relocated across the
+/// window. The shape changed — which is the whole complaint — and the window drew the
+/// layout the daemon sent back rather than one of its own.
+#[test]
+fn a_three_pane_layout_before_and_after_a_relocation_that_changes_its_orientation() {
+    let before = relocation_desk();
+    let panes = relocation_panes(&before);
+    let mut h = harness(before);
+    h.run();
+    h.snapshot("relocation_before");
+
+    // What the daemon answers with: the shell that was stacked on the right becomes the
+    // bottom of the left-hand column, so the right-hand side is now one pane and the left
+    // is two. No pane, and no process behind one, changed identity on the way.
+    let mut relocated = h.state().fixture.layout.clone().expect("a layout");
+    assert!(
+        relocated.relocate(&panes[2], &panes[0], DropZone::Below),
+        "the relocation the drag asks for has to be one the domain can do"
+    );
+    assert!(relocated.sizes_are_normalised());
+    h.state_mut().fixture.layout = Some(relocated);
+    h.run();
+    h.run();
+    h.snapshot("relocation_after");
+}
+
+/// A Session is created *in* a Workspace, and a global `+ Session` could not say which
+/// one. The control lives on the Workspace's row, and it says which Workspace in its name.
+/// Archiving and closing live beside it, because they are the same kind of thing — an act
+/// on this row — and are told apart by their icon, their name and their tooltip.
+#[test]
+fn a_workspace_row_carries_creation_archiving_and_closing() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let workspace_id = fixture.hierarchy.as_ref().expect("hierarchy").workspaces[0]
+        .workspace
+        .id
+        .clone();
+    if let Some(snapshot) = fixture.hierarchy.as_mut() {
+        // Collapsed, so all three Workspace rows and their controls are in one image, and
+        // one of them archived — where the control is disabled rather than absent, because
+        // a control that vanishes teaches nothing about why.
+        snapshot.tree_state.expanded.clear();
+        if let Some(last) = snapshot.workspaces.last_mut() {
+            last.workspace.archived = true;
+        }
+    }
+    // An archived row is only in the tree when the preference says so, and this image is
+    // about what the row's controls do when it is.
+    fixture.include_archived = true;
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    h.snapshot("workspace_row_controls");
+
+    let buttons = button_labels(&h);
+    for workspace in ["space-troopers", "turn"] {
+        for control in [
+            format!("New session in {workspace}"),
+            format!("Archive workspace {workspace}"),
+            format!("Close workspace {workspace}"),
+        ] {
+            assert!(
+                buttons.iter().any(|label| label == &control),
+                "every Workspace row offers {control:?}; found {buttons:?}"
+            );
+        }
+    }
+    // The archived one offers the way back rather than a second way out, and its name says
+    // which Workspace it would restore.
+    assert!(
+        buttons
+            .iter()
+            .any(|label| label == "Restore workspace personal-infra"),
+        "an archived Workspace's control is the one that undoes it; found {buttons:?}"
+    );
+
+    let selected_before = h.state().state.selected_tree.clone();
+    h.query_by_label("New session in space-troopers")
+        .expect("the per-workspace control is a real button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state()
+            .state
+            .session_draft
+            .as_ref()
+            .map(|draft| draft.workspace_id.clone()),
+        Some(workspace_id.clone()),
+        "the draft is already pointed at the Workspace whose row was used"
+    );
+    assert_eq!(
+        h.state().state.selected_tree,
+        selected_before,
+        "the control must not double as a click on the row underneath it"
+    );
+
+    // Closing asks; it does not close. Nothing leaves the window on this click.
+    h.state_mut().state.session_draft = None;
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    h.query_by_label("Close workspace space-troopers")
+        .expect("the destructive control is a real button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        Vec::new(),
+        "the control must not stop anything by itself"
+    );
+    assert!(
+        matches!(
+            h.state().state.lifecycle_confirmation,
+            Some(LifecycleConfirmation::StopWorkspace { workspace_id: ref opened, .. })
+                if opened == &workspace_id
+        ),
+        "it opens the confirmation for its own Workspace, got {:?}",
+        h.state().state.lifecycle_confirmation
+    );
+
+    // Restoring an archived Workspace is a request with a flag, not a stop.
+    h.state_mut().state.lifecycle_confirmation = None;
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    h.query_by_label("Restore workspace personal-infra")
+        .expect("the archived Workspace can be brought back")
+        .click();
+    h.run_steps(1);
+    assert!(
+        matches!(
+            h.state().actions.as_slice(),
+            [ViewAction::ArchiveWorkspace {
+                archived: false,
+                ..
+            }]
+        ),
+        "got {:?}",
+        h.state().actions
+    );
+}
+
+/// The three states a row's archive control has to tell apart, in one image: a Session with
+/// work running (archiving is refused, closing is offered), a Session with nothing running
+/// (archiving is offered), and an archived one (only the way back).
+fn tree_of_session_rows() -> Fixture {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    // Workspaces expanded, Sessions collapsed: this image is about the Session rows.
+    snapshot
+        .tree_state
+        .expanded
+        .retain(|key| matches!(key, HierarchyKey::Workspace { .. }));
+    let second = &mut snapshot.workspaces[1];
+    let mut idle = second.sessions[0].clone();
+    // Nothing running, and the derived state says so: the daemon would never send `running`
+    // with a count of zero, and a fixture that did would be teaching the row to lie.
+    idle.session.running_count = 0;
+    idle.session.display_state = DisplayState::Idle;
+    idle.session.state_label = "idle".into();
+    idle.session.needs_user = false;
+    idle.session.badge_count = 0;
+    idle.nodes.clear();
+    idle.session.name = "Ship the release notes".into();
+    idle.session.id = SessionId::from_stored("sess_releasenotes");
+
+    let mut archived = idle.clone();
+    archived.session.id = SessionId::from_stored("sess_lastmonth");
+    archived.session.name = "Last month's spike".into();
+    archived.session.status = turn_core::model::SessionStatus::Archived;
+    second.sessions.push(idle);
+    second.sessions.push(archived);
+    second.workspace = WorkspaceSummary {
+        session_count: second.sessions.len(),
+        ..second.workspace.clone()
+    };
+    fixture
+}
+
+/// Every Session row carries the same pair, and the pair is the whole point: one of them
+/// takes the row out of the way, the other stops the work, and they never look alike.
+#[test]
+fn a_session_row_offers_archiving_and_closing_as_different_acts() {
+    let mut fixture = tree_of_session_rows();
+    fixture.include_archived = true;
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    h.snapshot("session_row_controls");
+
+    let buttons = button_labels(&h);
+    for control in [
+        "Archive session Fix climbing bugs",
+        "Close session Fix climbing bugs",
+        "Archive session Ship the release notes",
+        "Close session Ship the release notes",
+        // The archived row offers the way back instead of a second way out.
+        "Restore session Last month's spike",
+    ] {
+        assert!(
+            buttons.iter().any(|label| label == control),
+            "{control:?} must be a named control; found {buttons:?}"
+        );
+    }
+
+    // Archiving is a request with a flag on it. Nothing in this path can stop a process.
+    h.state_mut().actions.clear();
+    h.query_by_label("Archive session Ship the release notes")
+        .expect("a Session with nothing running can be archived")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::ArchiveSession {
+            session_id: SessionId::from_stored("sess_releasenotes"),
+            archived: true,
+        }],
+        "archiving asks for exactly one thing, and it is not a termination"
+    );
+    assert!(
+        h.state().state.lifecycle_confirmation.is_none(),
+        "archiving needs no confirmation, because it destroys nothing"
+    );
+
+    // Closing asks first, and asks about the row it belongs to.
+    h.state_mut().actions.clear();
+    h.query_by_label("Close session Fix climbing bugs")
+        .expect("the destructive control is a real button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        Vec::new(),
+        "the control must not stop anything by itself"
+    );
+    assert_eq!(
+        h.state().state.lifecycle_confirmation,
+        Some(LifecycleConfirmation::EndSession {
+            session_id: SessionId::from_stored("sess_fixclimbing"),
+            name: "Fix climbing bugs".into(),
+            running_count: 6,
+        })
+    );
+}
+
+/// An archived row is out of the way. Archiving is only believable if the row actually
+/// leaves, so this is the half of the pair where the preference is off.
+///
+/// A test and an image each, rather than one test taking two: a harness collects its
+/// snapshot results and writes them together, so two `snapshot` calls in one test wrote the
+/// *same* frame to both files — and a pair of identical images would have shown the row
+/// leaving whether it did or not.
+#[test]
+fn an_archived_session_is_out_of_the_tree_while_the_preference_is_off() {
+    let mut h = harness(tree_of_session_rows());
+    h.run();
+    h.run();
+    h.snapshot("archived_session_hidden");
+    let hidden = tree_row_labels(&h);
+    assert!(
+        !hidden
+            .iter()
+            .any(|label| label.contains("Last month's spike")),
+        "an archived Session must not be in the tree while the preference is off; got {hidden:?}"
+    );
+    assert!(
+        hidden
+            .iter()
+            .any(|label| label.contains("Ship the release notes")),
+        "and the Sessions that are not archived stay; got {hidden:?}"
+    );
+}
+
+/// The other half: nothing was lost, and the preference in Settings brings it back saying
+/// what it is.
+#[test]
+fn the_archived_preference_brings_the_row_back_and_the_row_says_it_is_archived() {
+    let mut fixture = tree_of_session_rows();
+    fixture.include_archived = true;
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    h.snapshot("archived_session_shown");
+    let shown = tree_row_labels(&h);
+    let archived_row = shown
+        .iter()
+        .find(|label| label.contains("Last month's spike"))
+        .expect("the preference brings the row back");
+    assert!(
+        archived_row.contains("archived"),
+        "and the row says what it is: {archived_row:?}"
+    );
+}
+
+/// Closing a Workspace reaches every Session in it, so the question says how many there are
+/// and how many are working. "This workspace" is not a quantity.
+#[test]
+fn closing_a_workspace_says_how_many_sessions_it_would_stop() {
+    let mut fixture = tree_of_session_rows();
+    fixture.include_archived = true;
+    let workspace = fixture.hierarchy.as_ref().expect("hierarchy").workspaces[1].clone();
+    let mut h = harness(fixture);
+    h.state_mut().state.lifecycle_confirmation =
+        Some(LifecycleConfirmation::stop_workspace(&workspace));
+    h.run();
+    h.run();
+    h.snapshot("workspace_close_confirmation");
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Stop all sessions")
+        .expect("the destructive action is a visible button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::CloseWorkspace {
+            workspace_id: workspace.workspace.id.clone(),
+            disposition: CloseDisposition::Terminate,
+        }],
+        "and only the accepted confirmation asks for the stop"
+    );
+}
+
+/// A window whose main checkout is waiting to be confirmed. The decision is an authority
+/// the user grants, so it stays a named button in the bottom bar rather than becoming a
+/// sentence with no way to act on it.
+#[test]
+fn the_bottom_status_bar_keeps_a_pending_write_confirmation_actionable() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let mut lease = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .find_map(|workspace| workspace.write_lease.clone())
+        .expect("main-checkout lease");
+    lease.state = LeaseState::RecoveryRequired;
+    if let Some(snapshot) = fixture.hierarchy.as_mut() {
+        for workspace in &mut snapshot.workspaces {
+            if let Some(lease) = workspace.write_lease.as_mut() {
+                lease.state = LeaseState::RecoveryRequired;
+            }
+        }
+    }
+    fixture.recovery_lease = Some(lease);
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+    h.snapshot("write_access_status_bar");
+
+    assert!(
+        group_labels(&h).iter().any(|group| {
+            group.starts_with("Status:") && group.contains("confirm main-checkout write access")
+        }),
+        "the bottom bar says what is pending, in words: {:?}",
+        group_labels(&h)
+    );
+    h.state_mut().actions.clear();
+    h.query_by_label("Confirm write access")
+        .expect("the authority decision remains a reachable button")
+        .click();
+    h.run_steps(1);
+    assert!(matches!(
+        h.state().actions.as_slice(),
+        [ViewAction::ReclaimWorkspaceWriteLease { .. }]
+    ));
+}
+
+/// The archived filter is a preference about what the list contains, not one of the
+/// actions in the Workspaces bar. It moved to Settings and still works.
+#[test]
+fn the_archived_filter_is_a_setting_rather_than_a_button_in_the_workspaces_bar() {
+    let mut h = harness(workspace_without_sessions());
+    h.state_mut().state.settings_open = true;
+    h.run();
+    h.run();
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Show archived Workspaces and Sessions")
+        .expect("the archived preference is in Settings")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::SetArchivedVisibility { include: true }]
+    );
 }
 
 #[test]
@@ -968,6 +2028,54 @@ fn a_layout_preset_is_created_in_the_visual_row_and_column_editor() {
     h.snapshot("layout_editor");
 }
 
+/// The editor is where a layout is designed, so it has the same five-zone gesture — and it
+/// applies the move to its own draft, since no daemon owns a template that does not exist
+/// yet. Which makes cancelling load-bearing in a way it is not for a session pane: the drop
+/// happens when the pointer is released, so an abandoned drag has to be forgotten or letting
+/// go would still move the cell.
+#[test]
+fn escape_during_a_drag_in_the_layout_editor_leaves_the_draft_alone() {
+    let mut h = harness(workspace_without_sessions());
+    let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::NewSession);
+    let cells: Vec<PaneId> = draft
+        .layout
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect();
+    draft.dragged_pane = Some(cells[1].clone());
+    let untouched = draft.layout.clone();
+    h.state_mut().state.layout_draft = Some(draft);
+    h.run();
+
+    h.key_press(egui::Key::Escape);
+    h.run_steps(1);
+    let after = h
+        .state()
+        .state
+        .layout_draft
+        .clone()
+        .expect("the sheet is still open");
+    assert_eq!(
+        after.dragged_pane, None,
+        "the gesture must be forgotten, or releasing the pointer would still move the cell"
+    );
+    assert_eq!(after.layout, untouched, "and nothing may have moved yet");
+
+    // Letting go afterwards, over the other cell, changes nothing.
+    h.drop_at(egui::pos2(400.0, 300.0));
+    h.run_steps(1);
+    assert_eq!(
+        h.state()
+            .state
+            .layout_draft
+            .as_ref()
+            .expect("the sheet is still open")
+            .layout,
+        untouched
+    );
+}
+
 #[test]
 fn settings_exposes_layout_presets_as_a_first_class_section() {
     let mut h = harness(workspace_without_sessions());
@@ -1096,7 +2204,7 @@ fn onboarding_blocks_clicks_through_to_background_controls() {
     });
     h.run_steps(2);
 
-    h.query_by_label("+ Session")
+    h.query_by_label("New session in space-troopers")
         .expect("the background session control remains rendered")
         .click();
     h.run_steps(1);
@@ -1635,6 +2743,42 @@ fn the_command_palette_lists_commands_with_their_shortcuts() {
     h.snapshot("palette");
 }
 
+/// The keyboard half of the row controls, in the place a user goes looking for a command
+/// they cannot see. All four are here, each with the chord that runs it — which is also how
+/// the palette teaches the pairing: the Workspace act is the Session chord plus Option.
+#[test]
+fn the_palette_offers_every_way_to_close_or_archive_with_its_chord() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.palette.open();
+    h.state_mut().state.palette.set_query("archive");
+    h.run_steps(3);
+    h.snapshot("palette_archive");
+
+    let rows = palette_rows(&h);
+    for wanted in [
+        "Archive session — take it out of the tree, stop nothing — Session — Shift+Cmd+Y",
+        "Archive workspace — take it out of the tree, stop nothing — Workspace — Opt+Shift+Cmd+Y",
+    ] {
+        assert!(
+            rows.iter().any(|row| row == wanted),
+            "the palette must offer {wanted:?}; found {rows:?}"
+        );
+    }
+
+    h.state_mut().state.palette.set_query("close");
+    h.run_steps(3);
+    let rows = palette_rows(&h);
+    for wanted in [
+        "Close session — confirm before stopping its processes — Session — Shift+Cmd+K",
+        "Close workspace — confirm before stopping every Session in it — Workspace — Opt+Shift+Cmd+K",
+    ] {
+        assert!(
+            rows.iter().any(|row| row == wanted),
+            "the palette must offer {wanted:?}; found {rows:?}"
+        );
+    }
+}
+
 /// The same criterion, measured on the **real application** rather than on its view.
 ///
 /// `build_eframe` runs `TurnApp` itself: the transport thread, the keymap, the repaint
@@ -1953,18 +3097,1207 @@ fn the_window_survives_being_dragged_smaller_than_its_own_chrome() {
     }
 }
 
-/// The size in cells a pane reports has to match what is painted, or every wrapped line
-/// ends a column off the edge. Checked here rather than only in the geometry unit test,
-/// because this is the composition that decides it.
+/// The size in cells a pane reports has to match what is painted, or a program lays itself
+/// out for a width Turn never drew and truncates its own file names. Measured through the
+/// same font the window uses, because a cell taken from anywhere else is the defect.
 #[test]
 fn a_panes_reported_size_matches_the_cells_it_can_paint() {
+    let context = egui::Context::default();
     let theme = Theme::dark();
-    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(8.0 * 100.0, 17.0 * 30.0));
-    let size = turn_gui::panes::size_in_cells(rect, theme.cell_size);
+    let mut measured = None;
+    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        measured = theme.cell_size(ui);
+    });
+    let cell = measured.expect("the bundled monospace face can be measured");
+
+    // A pane of exactly a hundred columns and thirty rows of that cell.
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, cell * egui::vec2(100.0, 30.0));
+    let size = turn_gui::panes::size_in_cells(rect, cell);
     assert_eq!(size, PtySize::new(30, 100));
 
     // And the pane paints exactly the rows it claims to have.
     let grid = Grid::blank(size.rows, size.cols);
-    let rows = turn_gui::terminal::visible_rows(&grid, rect.min, theme.cell_size, rect);
+    let rows = turn_gui::terminal::visible_rows(&grid, rect.min, cell, rect);
     assert_eq!(rows, 0..30);
+
+    // The invented cell reported a size neither the drawing nor the font agreed with.
+    assert_ne!(cell, egui::vec2(8.0, 17.0));
+}
+
+// ---------------------------------------------------------------------------------------
+// The terminal grid itself.
+//
+// These render one pane, without the window's chrome, because what they are about is the
+// lattice: whether a border meets the border above it, whether a table's columns line up,
+// whether an emoji shifts the rest of its row. A whole-window snapshot answers none of
+// those questions — the panes in it are too small to see a one-pixel seam.
+// ---------------------------------------------------------------------------------------
+
+/// The cell the window will actually use, measured the way the window measures it.
+fn measured_cell(theme: &Theme) -> egui::Vec2 {
+    let context = egui::Context::default();
+    let mut cell = None;
+    let _ = context.run_ui(egui::RawInput::default(), |ui| {
+        cell = theme.cell_size(ui);
+    });
+    cell.expect("the bundled monospace face can be measured")
+}
+
+/// Renders one pane, sized to exactly the grid it holds, and returns the harness so the
+/// caller can snapshot it or read its pixels.
+fn pane_harness(grid: Grid, focused: bool) -> Harness<'static, ()> {
+    selected_pane_harness(grid, focused, None)
+}
+
+/// The same, with a selection painted over it.
+fn selected_pane_harness(
+    grid: Grid,
+    focused: bool,
+    selection: Option<Selection>,
+) -> Harness<'static, ()> {
+    let theme = Theme::dark();
+    let cell = measured_cell(&theme);
+    let size = egui::vec2(cell.x * f32::from(grid.cols), cell.y * f32::from(grid.rows));
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        theme.install(ui.ctx());
+        turn_gui::terminal::paint(
+            ui,
+            &theme,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+            &grid,
+            selection.as_ref(),
+            turn_gui::terminal::PaneOptions {
+                focused,
+                now_ms: cursor_on(),
+                ..Default::default()
+            },
+        );
+    });
+    harness.run();
+    harness
+}
+
+/// Fills a grid from lines of text, leaving the rest blank.
+fn grid_of(lines: &[&str], rows: u16, cols: u16) -> Grid {
+    let mut grid = screen(lines, rows, cols);
+    // No cursor: these images are about the lattice, and a blinking block over the first
+    // corner is a hole in the exact place a reviewer looks first.
+    grid.cursor = None;
+    grid
+}
+
+/// A frame with every join in it. If any arm stops short of its cell edge, this image shows
+/// it as a broken corner; the report's screenshot showed exactly that, drawn from the
+/// font's own glyphs.
+#[test]
+fn a_box_drawn_frame_joins_at_every_corner_and_tee() {
+    let grid = grid_of(
+        &[
+            "┌──────────────┬─────────────────────────────┐",
+            "│ light        │ ┏━━━━━━━━━━━━━━━━━━━━━━━━━┓ │",
+            "│ frame        │ ┃ heavy frame inside it   ┃ │",
+            "├──────────────┼─╂─────────────────────────┨ │",
+            "│ a tee ┬ and  │ ┃ ├─┼─┤ mixed ╀ joins ╂   ┃ │",
+            "│ a cross ┼ in │ ┗━━━━━━━━━━━━━━━━━━━━━━━━━┛ │",
+            "│ running text │                             │",
+            "└──────────────┴─────────────────────────────┘",
+            "╭──── rounded ─────╮ ╔═══ double ═══╦═══════╗",
+            "│ ╌╌╌╌ dashed ╌╌╌╌ │ ║ two strokes  ║ meet  ║",
+            "╰──────────────────╯ ╚═══════════════╩═══════╝",
+            "─ │ ┼ ┴ ┬ ├ ┤ ┌ ┐ └ ┘ ━ ┃ ╋ ╱ ╲ ╳ · ▏▎▍▌▋▊▉█",
+        ],
+        12,
+        46,
+    );
+    pane_harness(grid, false).snapshot("terminal_box_frame");
+}
+
+/// A table: the case where a column that drifts by a fraction of a cell is unmissable,
+/// because the numbers stop lining up with their heading.
+#[test]
+fn a_table_keeps_its_columns_aligned_down_the_pane() {
+    let mut grid = grid_of(
+        &[
+            "┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┓",
+            "┃ crate               ┃  tests ┃     time ┃ result  ┃",
+            "┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━┩",
+            "│ turn-core           │    412 │   0.31 s │ ok      │",
+            "│ turn-proto          │    288 │   0.18 s │ ok      │",
+            "│ turn-gui            │    193 │   4.02 s │ ok      │",
+            "│ turnd               │    301 │   1.77 s │ ok      │",
+            "├─────────────────────┼────────┼──────────┼─────────┤",
+            "│ total               │  1 194 │   6.28 s │ ok      │",
+            "└─────────────────────┴────────┴──────────┴─────────┘",
+        ],
+        10,
+        53,
+    );
+    // The heading in bold, and the totals row in the theme's own attention colour, so the
+    // image also proves a coloured run still lands on the grid.
+    for col in 0..53u16 {
+        if let Some(cell) = grid.cell_mut(1, col) {
+            cell.attrs = CellAttrs::default().with(CellAttrs::BOLD);
+        }
+        if let Some(cell) = grid.cell_mut(8, col) {
+            cell.fg = Some(Rgb::new(0xe8, 0xa8, 0x3a));
+        }
+    }
+    pane_harness(grid, false).snapshot("terminal_table");
+}
+
+/// Wide glyphs. Each takes two columns, and the rules above and below say whether the rest
+/// of the row moved: if a wide cell were painted one column wide, every pipe after it would
+/// step left.
+#[test]
+fn a_wide_glyph_takes_two_columns_without_shifting_its_row() {
+    let mut grid = grid_of(
+        &[
+            "┌────┬────┬────┬────┐",
+            "│    │    │    │    │",
+            "├────┼────┼────┼────┤",
+            "│ ab │ cd │ ef │ gh │",
+            "└────┴────┴────┴────┘",
+            "0123456789 123456789",
+        ],
+        6,
+        21,
+    );
+    // Two emoji and two ideographs in the cells of row 1, each with its WIDE_TRAILER to the
+    // right, which paints background only. The bundled faces have no CJK coverage, so the
+    // ideographs come out as the missing-glyph box — a font question, not a layout one: the
+    // box still occupies its two columns and the rules below stay where they were.
+    for (row, col, glyph) in [
+        (1u16, 2u16, "🔥"),
+        (1, 7, "🔒"),
+        (1, 12, "中"),
+        (1, 17, "文"),
+    ] {
+        assert!(grid.set_wide(row, col, glyph), "no room for {glyph}");
+    }
+    pane_harness(grid, false).snapshot("terminal_wide_glyphs");
+}
+
+/// The screenshot from the report, rebuilt: a file browser with nested frames, a highlighted
+/// row, a scrollbar and a right-hand info panel. The file names are the tell — the report
+/// showed them truncated to `.g...` and `po...` because the program had been told a width
+/// Turn never drew.
+#[test]
+fn a_file_browser_pane_shows_its_frames_columns_and_names_whole() {
+    let mut grid = grid_of(
+        &[
+            "╭─ ~/personal-workspace/turn ────────────────╮╭─ ARCHITECTURE.md ──────────────╮",
+            "│ ▸ crates/                                  ││ # Turn                         │",
+            "│   ├── turn-core/                           ││                                │",
+            "│   ├── turn-gui/                            ││ One window, one daemon, and    │",
+            "│   │   ├── src/terminal/boxdraw.rs          ││ a store that survives a        │",
+            "│   │   ├── src/terminal/geometry.rs         ││ restart.                       │",
+            "│   │   └── src/theme.rs                     ││                                │",
+            "│   └── turnd/                               ││ ## The pane                    │",
+            "│ ▸ docs/                                    ││                                │",
+            "│   ARCHITECTURE.md                          ││ A pane hosts the user's        │",
+            "│   CONTRIBUTING.md                          ││ shell. An agent runs in it.    │",
+            "│   Cargo.toml                               ││                                │",
+            "│   Makefile                                 ││ ┌ metrics ───────────────────┐ │",
+            "│   README.md                                ││ │ cell     8 x 15 px         │ │",
+            "│   rust-toolchain.toml                      ││ │ advance  7.82666 pt        │ │",
+            "│                                            ││ │ rows     41 x 100          │ │",
+            "│                                            ││ └────────────────────────────┘ │",
+            "╰────────────────────────────────────────────╯╰────────────────────────────────╯",
+            " 15 entries · ▓▓▓▓▓▓▒▒▒▒▒▒▒▒ 34%                j/k move · enter open · q quit  ",
+        ],
+        19,
+        80,
+    );
+    // The highlighted row arrives as a background, the way a TUI sends it: the whole row,
+    // wall to wall, which is where a gap between cells would be unmissable.
+    for col in 1..44u16 {
+        if let Some(cell) = grid.cell_mut(9, col) {
+            cell.bg = Some(Rgb::new(0x2a, 0x3a, 0x50));
+        }
+    }
+    // The directory rows in the running colour, dimmed status at the bottom.
+    for row in [1u16, 8] {
+        for col in 1..44u16 {
+            if let Some(cell) = grid.cell_mut(row, col) {
+                cell.fg = Some(Rgb::new(0x6a, 0x9e, 0xd8));
+                cell.attrs = CellAttrs::default().with(CellAttrs::BOLD);
+            }
+        }
+    }
+    for col in 0..80u16 {
+        if let Some(cell) = grid.cell_mut(18, col) {
+            cell.attrs = CellAttrs::default().with(CellAttrs::DIM);
+        }
+    }
+    pane_harness(grid, true).snapshot("terminal_file_browser");
+}
+
+/// The pixels, not the recording. A snapshot only says the image matches the last one
+/// recorded; this says the line is a line, all the way across. It fails on the font's own
+/// glyphs, whose strokes stop short of the cell box and leave a gap at every boundary.
+#[test]
+fn a_drawn_rule_is_continuous_in_the_pixels_it_paints() {
+    let cols = 24u16;
+    let rows = 6u16;
+    // A full-width rule and a full-height rule, so both directions are one run of cells with
+    // nothing else in them. The corners of a frame are covered by the unit tests, which can
+    // see the geometry rather than guess at it from pixels.
+    let horizontal = "─".repeat(cols as usize);
+    let mut lines = vec![horizontal.as_str()];
+    lines.extend(std::iter::repeat_n("│", rows as usize - 1));
+    let grid = grid_of(&lines, rows, cols);
+
+    let mut harness = pane_harness(grid, false);
+    let image = harness.render().expect("the pane renders");
+    let lit = |x: u32, y: u32| -> bool {
+        let pixel = image.get_pixel(x, y);
+        u32::from(pixel.0[0]) + u32::from(pixel.0[1]) + u32::from(pixel.0[2]) > 150
+    };
+    let (width, height) = (image.width(), image.height());
+
+    let rule_row = (0..height / 4)
+        .find(|y| lit(width / 2, *y))
+        .expect("a horizontal rule in the first row of cells");
+    let gaps: Vec<u32> = (0..width).filter(|x| !lit(*x, rule_row)).collect();
+    assert!(
+        gaps.is_empty(),
+        "the horizontal rule has gaps at {gaps:?} of {width} pixels"
+    );
+
+    let rule_col = (0..width / 8)
+        .find(|x| lit(*x, height / 2))
+        .expect("a vertical rule in the first column of cells");
+    // From the second row of cells down: the first row holds the horizontal rule instead.
+    let second_row = measured_cell(&Theme::dark()).y as u32;
+    let gaps: Vec<u32> = (second_row..height)
+        .filter(|y| !lit(rule_col, *y))
+        .collect();
+    assert!(
+        gaps.is_empty(),
+        "the vertical rule has gaps at {gaps:?} of the {height} pixels below {second_row}"
+    );
+}
+
+/// "Loose and doubled" measured. The bundled face draws `│` as a 1.17-point stroke at a
+/// fractional offset, so the GPU spreads it over two pixel columns at 85% and 62% of the
+/// foreground: a soft grey double line. Drawn by Turn it is one column at full strength.
+///
+/// The property is scale-independent — no partially covered pixel anywhere in a rule — which
+/// is what "crisp" means and what the report was looking at.
+#[test]
+fn a_rule_is_one_crisp_column_of_pixels_rather_than_a_soft_smear() {
+    let rows = 8u16;
+    let cols = 4u16;
+    let lines = vec!["│"; rows as usize];
+    let grid = grid_of(&lines, rows, cols);
+
+    let mut harness = pane_harness(grid, false);
+    let image = harness.render().expect("the pane renders");
+    let value = |x: u32, y: u32| -> u32 {
+        let pixel = image.get_pixel(x, y);
+        u32::from(pixel.0[0]) + u32::from(pixel.0[1]) + u32::from(pixel.0[2])
+    };
+    let cell = measured_cell(&Theme::dark());
+    let background = value(image.width() - 1, image.height() / 2);
+    let middle = image.height() / 2;
+    let full = (0..cell.x as u32)
+        .map(|x| value(x, middle))
+        .max()
+        .expect("a rule somewhere in the first cell");
+    assert!(
+        full > background + 300,
+        "the rule is not being painted at all: {full} against a background of {background}"
+    );
+
+    let mut columns = Vec::new();
+    for x in 0..cell.x as u32 {
+        let painted = value(x, middle);
+        if painted <= background + 20 {
+            continue;
+        }
+        assert_eq!(
+            painted, full,
+            "the pixel column {x} of the rule is only partly covered ({painted} of {full}), \
+             which is the soft doubled line the font produces"
+        );
+        columns.push(x);
+    }
+    assert_eq!(
+        columns.len(),
+        1,
+        "at this size a light rule is one pixel wide; it covered {columns:?}"
+    );
+
+    // And it is the same pixel on every row, all the way down: no seam, no drift.
+    for y in 0..image.height() {
+        assert_eq!(
+            value(columns[0], y),
+            full,
+            "the rule is interrupted at the pixel row {y}"
+        );
+    }
+}
+
+/// The other half of the same property: text sits on the same lattice as the borders, so a
+/// rule drawn after different amounts of text is one straight line rather than the doubled,
+/// drifting pipes in the report. This is the test the old renderer could not pass: it drew a
+/// row as one string, and 19 columns of the font's advance are 3.3 pixels short of 19 cells.
+#[test]
+fn a_rule_after_text_stays_on_the_pixel_column_the_grid_gives_it() {
+    let cols = 40u16;
+    let rows = 12u16;
+    let column_of_the_rule = 19u16;
+    let mut lines = Vec::new();
+    for row in 0..rows {
+        // Text of a different length on every row, so a renderer that let the font decide
+        // would put each row's rule in a slightly different place.
+        let label = format!("row {row} of {rows}");
+        lines.push(format!("│{label:<18}│{:>19}", row * 7));
+    }
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let grid = grid_of(&borrowed, rows, cols);
+
+    let mut harness = pane_harness(grid, false);
+    let image = harness.render().expect("the pane renders");
+    let lit = |x: u32, y: u32| -> bool {
+        let pixel = image.get_pixel(x, y);
+        u32::from(pixel.0[0]) + u32::from(pixel.0[1]) + u32::from(pixel.0[2]) > 150
+    };
+    let cell = measured_cell(&Theme::dark());
+    let from = (cell.x * f32::from(column_of_the_rule)) as u32;
+    let to = (cell.x * f32::from(column_of_the_rule + 1)) as u32;
+
+    let mut columns = std::collections::BTreeSet::new();
+    for y in 0..image.height() {
+        let found: Vec<u32> = (from..to).filter(|x| lit(*x, y)).collect();
+        assert!(
+            !found.is_empty(),
+            "the rule is missing from the pixel row {y}: it must be inside cell \
+             {column_of_the_rule}, pixels {from}..{to}"
+        );
+        columns.extend(found);
+    }
+    assert_eq!(
+        columns.len(),
+        1,
+        "every row's rule must be on the same pixel column, not spread over {columns:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Selection and the pane's own menu. These are the images that say whether a selection
+// looks like a selection: the highlight is the only feedback a drag gives, and a menu that
+// greys an item without saying why is the defect the menu exists to remove.
+// ---------------------------------------------------------------------------------------
+
+/// A double-click on a compiler error. The whole of `src/main.rs:42` is highlighted —
+/// including the colon and the line number, which a word class borrowed from a text editor
+/// would have split at three separate places.
+#[test]
+fn a_double_clicked_path_is_highlighted_whole() {
+    let grid = grid_of(
+        &[
+            "error[E0425]: cannot find value `paint` in this scope",
+            "  --> src/main.rs:42:17",
+            "   |",
+            "42 |     let cell = paint(ui, &theme);",
+            "   |                ^^^^^ not found in this scope",
+        ],
+        5,
+        54,
+    );
+    // The cell the pointer was over: inside the path, on the `main` of `src/main.rs:42`.
+    let selection = Selection::word(&grid, CellPos::new(1, 12), SelectionKind::Linear);
+    assert_eq!(
+        selection.text(&grid),
+        "src/main.rs:42:17",
+        "the image is only worth recording if the selection is the one being claimed"
+    );
+    selected_pane_harness(grid, true, Some(selection)).snapshot("terminal_word_selection");
+}
+
+/// A rectangle over one column of a table. The highlight is a block, not a run of lines:
+/// the two columns either side of it are untouched on every row.
+#[test]
+fn a_rectangular_selection_takes_one_column_out_of_a_table() {
+    let mut grid = grid_of(
+        &[
+            "CONTAINER ID   IMAGE            STATUS         PORTS",
+            "9f2b1c4d8e7a   turn/daemon      Up 3 hours     8080/tcp",
+            "3c7d5e9f1a2b   turn/gateway     Up 3 hours     9000/tcp",
+            "b8e4f6a2c9d1   postgres:17      Up 2 days      5432/tcp",
+            "5a1d3f7b9e2c   redis:7          Up 2 days      6379/tcp",
+        ],
+        5,
+        56,
+    );
+    for col in 0..56u16 {
+        if let Some(cell) = grid.cell_mut(0, col) {
+            cell.attrs = CellAttrs::default().with(CellAttrs::BOLD);
+        }
+    }
+    // The PORTS column starts at 47 and is eight cells wide.
+    let mut selection = Selection::new(CellPos::new(1, 47), SelectionKind::Block);
+    selection.extend_to(CellPos::new(4, 55));
+    assert_eq!(
+        selection.text(&grid),
+        "8080/tcp\n9000/tcp\n5432/tcp\n6379/tcp",
+        "a linear selection could not produce this, which is why the block kind exists"
+    );
+    selected_pane_harness(grid, true, Some(selection)).snapshot("terminal_block_selection");
+}
+
+/// A selection across a line the terminal broke at the margin. The highlight runs to the
+/// end of the first row and continues on the second, because it is one line — and the text
+/// it copies has no newline in the middle of the path.
+#[test]
+fn a_selection_over_a_hard_wrapped_line_covers_both_of_its_rows() {
+    // The first row is exactly as wide as the pane, which is what a row that wrapped looks
+    // like: the terminal broke it because it ran out of columns.
+    let mut grid = grid_of(
+        &[
+            "$ cargo build --manifest-path /Users/xy/personal-w",
+            "orkspace/turn/crates/turn-gui/Cargo.toml --release",
+            "   Compiling turn-gui v0.1.0",
+            "    Finished `dev` profile in 4.02s",
+        ],
+        4,
+        50,
+    );
+    // The first row wrapped into the second: the program printed one long command line.
+    assert!(grid.set_row_wrapped(0, true));
+    // A triple-click anywhere in it takes the logical line, both rows of it.
+    let selection = Selection::line(&grid, CellPos::new(1, 10));
+    assert_eq!(
+        selection.text(&grid),
+        "$ cargo build --manifest-path /Users/xy/personal-workspace/turn/crates/turn-gui/Cargo.toml \
+         --release",
+        "the wrap must not become a newline"
+    );
+    selected_pane_harness(grid, true, Some(selection)).snapshot("terminal_wrapped_selection");
+}
+
+/// The menu, open, with half of it unavailable — and every unavailable item saying why.
+///
+/// This is the image the whole module exists for: "Copy" greyed with *nothing is selected*
+/// under it teaches the user what to do, where a "Copy" that had quietly disappeared would
+/// leave them wondering whether the terminal can copy at all.
+#[test]
+fn the_pane_menu_explains_every_item_it_cannot_offer() {
+    let grid = screen(&["$ cargo test", "running 3 tests"], 24, 60);
+    let shortcuts = PaneShortcuts::from_keymap(&Keymap::build(&Overrides::new(), Platform::MAC));
+    let context = PaneContext {
+        close_unavailable: Some("this is the only pane in the session".into()),
+        ..PaneContext::default()
+    };
+    let items = PaneMenu {
+        grid: &grid,
+        at: CellPos::new(0, 3),
+        selection: None,
+        context: &context,
+        shortcuts: &shortcuts,
+        links: None,
+    }
+    .items();
+
+    // The image is worth recording only if it is showing the state being claimed.
+    let unavailable: Vec<PaneCommand> = items
+        .iter()
+        .filter(|item| !item.enabled())
+        .map(|item| item.command)
+        .collect();
+    assert_eq!(
+        unavailable,
+        vec![
+            PaneCommand::Copy,
+            PaneCommand::ClearBuffer,
+            PaneCommand::SearchSelection,
+            PaneCommand::OpenLink,
+            PaneCommand::ClosePane,
+        ]
+    );
+    for item in &items {
+        assert!(item.shortcut.is_some(), "{} teaches no chord", item.label());
+    }
+
+    menu_harness(items).snapshot("terminal_pane_menu");
+}
+
+/// Renders a menu's items in a panel of their own, which is the only way to get a
+/// reviewable image of a menu: a popup belongs to a frame that has already ended.
+fn menu_harness(items: Vec<MenuItem>) -> Harness<'static, ()> {
+    let theme = Theme::dark();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(420.0, 470.0))
+        .build_ui(move |ui| {
+            theme.install(ui.ctx());
+            ui.painter()
+                .rect_filled(ui.max_rect(), 0.0, theme.background);
+            egui::Frame::menu(ui.style()).show(ui, |ui| {
+                ui.set_width(392.0);
+                let _ = turn_gui::terminal::menu::show_items(ui, &theme, &items);
+            });
+        });
+    harness.run();
+    harness
+}
+
+// ---------------------------------------------------------------------------------------
+// Searching the scrollback, and the scrollback itself.
+//
+// These render one pane with its own interaction state, because what they are about is the
+// pane: where a match is highlighted, which one is current, what the bar says when nothing
+// matched, and where the position indicator sits when the view is a long way back. A
+// whole-window image would show all of that four pixels tall.
+// ---------------------------------------------------------------------------------------
+
+/// Renders one pane through `show_pane`, with the interaction state the caller set up, and
+/// returns the harness so it can be snapshotted.
+///
+/// Sized to the grid plus a margin, so the search bar has somewhere to sit and the
+/// indicator's track is against a real edge.
+fn interactive_pane(
+    grid: Grid,
+    state: PaneInteraction,
+    options: PaneOptions,
+) -> Harness<'static, PaneInteraction> {
+    let theme = Theme::dark();
+    let cell = measured_cell(&theme);
+    let size = egui::vec2(cell.x * f32::from(grid.cols), cell.y * f32::from(grid.rows));
+    let mut harness = Harness::builder().with_size(size).build_ui_state(
+        move |ui, state: &mut PaneInteraction| {
+            theme.install(ui.ctx());
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let _ = turn_gui::terminal::show_pane(
+                ui,
+                state,
+                turn_gui::terminal::PaneInput {
+                    theme: &theme,
+                    rect,
+                    grid: &grid,
+                    options,
+                    id: ui.id().with("pane-under-test"),
+                    chrome: None,
+                },
+            );
+        },
+        state,
+    );
+    // Twice: the first frame opens the bar and asks for the keyboard, the second draws it
+    // with the focus it was given.
+    harness.run();
+    harness.run();
+    harness
+}
+
+/// A build log with an error in it, searched. Several matches are highlighted and the one
+/// the user is on is a different colour — a search where every hit looks the same is one
+/// where "next" appears to do nothing.
+#[test]
+fn a_search_highlights_every_match_and_distinguishes_the_current_one() {
+    let grid = grid_of(
+        &[
+            "   Compiling turn-proto v0.1.0 (/Users/x/turn/crates/turn-proto)",
+            "   Compiling turn-pty v0.1.0 (/Users/x/turn/crates/turn-pty)",
+            "error[E0599]: no method named `set_size` found for struct `Screen`",
+            "   --> crates/turn-pty/src/buffer.rs:248:29",
+            "    |",
+            "248 |         self.parser.screen_mut().set_size(size.rows, size.cols);",
+            "    |                                  ^^^^^^^^ method not found",
+            "",
+            "error[E0308]: mismatched types in crates/turnd/src/core/screens.rs",
+            "   --> crates/turnd/src/core/screens.rs:47:31",
+            "",
+            "error: could not compile `turn-pty` (lib) due to 2 previous errors",
+            "warning: build failed, waiting for other jobs to finish...",
+            "~/turn on main $ ",
+        ],
+        14,
+        66,
+    );
+
+    // The matches the daemon would return for this screen, produced by the daemon's own
+    // engine rather than by hand, so the highlights are the ones a real search produces.
+    let query = turn_proto::search::SearchQuery::literal("error");
+    let outcome = turn_proto::search::search_grid(&grid, &query).expect("a valid query");
+    // Four: the two `error[E…]` lines, and both halves of "error: could not compile … due to
+    // 2 previous errors".
+    assert_eq!(outcome.count(), 4, "{:?}", outcome.matches);
+
+    let mut state = PaneInteraction::default();
+    state.search.open_with("error", 0, T0);
+    let _ = state.search.take_intents();
+    state.search.receive(&query, outcome);
+    // The second match: stepping to it is what makes one of the three the current one.
+    assert!(state.search.next_match());
+    assert!(state.search.next_match());
+    assert_eq!(state.search.status(), "2 of 4");
+    let _ = state.search.take_intents();
+
+    let highlights = state.search.highlights(&grid);
+    assert_eq!(highlights.len(), 4, "{highlights:?}");
+    assert_eq!(
+        highlights.iter().filter(|h| h.current).count(),
+        1,
+        "exactly one match is the current one"
+    );
+
+    interactive_pane(
+        grid,
+        state,
+        PaneOptions {
+            focused: true,
+            accepts_input: true,
+            now_ms: cursor_on(),
+            ..Default::default()
+        },
+    )
+    .snapshot("terminal_search_matches");
+}
+
+/// A search that found nothing says so, in the one loud colour, rather than leaving the user
+/// to wonder whether it ran.
+#[test]
+fn a_search_with_no_matches_says_so_in_the_bar() {
+    let grid = grid_of(
+        &[
+            "~/turn on main $ cargo test --workspace",
+            "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s",
+            "     Running unittests src/lib.rs (target/debug/deps/turn_proto-9c1f)",
+            "",
+            "running 241 tests",
+            "test result: ok. 241 passed; 0 failed; 0 ignored; 0 measured",
+            "~/turn on main $ ",
+        ],
+        14,
+        66,
+    );
+
+    let query = turn_proto::search::SearchQuery::literal("segfault");
+    let outcome = turn_proto::search::search_grid(&grid, &query).expect("a valid query");
+    assert!(outcome.is_empty());
+
+    let mut state = PaneInteraction::default();
+    state.search.open_with("segfault", 0, T0);
+    let _ = state.search.take_intents();
+    state.search.receive(&query, outcome);
+    assert_eq!(state.search.status(), "no matches");
+    assert!(state.search.found_nothing());
+
+    interactive_pane(
+        grid,
+        state,
+        PaneOptions {
+            focused: true,
+            accepts_input: true,
+            now_ms: cursor_on(),
+            ..Default::default()
+        },
+    )
+    .snapshot("terminal_search_no_matches");
+}
+
+/// The behaviour that decides whether people trust a terminal: output arriving while the
+/// user is reading history must leave what they are reading exactly where it is.
+///
+/// Driven through a real `PaneFeed` — attach, scroll back, then let six more lines arrive —
+/// so the image is of the view the feed actually produced and the assertions are about the
+/// same view.
+#[test]
+fn new_output_while_scrolled_back_leaves_the_view_where_it_was() {
+    use turn_gui::terminal::feed::PaneFeed;
+    use turn_proto::{PaneAttachment, PaneStream, PtySize, ScreenUpdate, TerminalBytes};
+
+    let rows = 14u16;
+    let cols = 66u16;
+    let line = |index: usize| {
+        format!("[{index:04}] compiling turn-proto v0.1.0 — one more line of a long build")
+    };
+
+    // The daemon's screen: a build that has already scrolled forty lines past.
+    let mut daemon = Grid::blank(rows, cols);
+    for row in 0..rows {
+        let text = line(40 + usize::from(row));
+        for (col, ch) in text.chars().enumerate().take(usize::from(cols)) {
+            if let Some(cell) = daemon.cell_mut(row, col as u16) {
+                cell.text = ch.to_string();
+            }
+        }
+    }
+    daemon.scrollback_len = 40;
+    daemon.cursor = Some((rows - 1, 0));
+
+    let mut feed = PaneFeed::attach(&PaneAttachment {
+        session_id: SessionId::from_stored("sess_scroll01"),
+        pane_id: PaneId::from_stored("pane_scroll01"),
+        node_id: None,
+        stream: PaneStream::Cells,
+        screen: Some(Box::new(daemon.clone())),
+        replay: TerminalBytes::new(Vec::new()),
+        size: PtySize::new(rows, cols),
+        scrollback_truncated: false,
+        bytes_seen: 4_096,
+        next_seq: 1,
+    });
+
+    // The window has never seen those forty rows, so it fetches them the way it would from
+    // the daemon: a screen-shaped window at the offset it is showing.
+    assert!(feed.scroll_by(30));
+    assert_eq!(feed.take_history_request(), Some(30));
+    let mut window = Grid::blank(rows, cols);
+    for row in 0..rows {
+        let text = line(10 + usize::from(row));
+        for (col, ch) in text.chars().enumerate().take(usize::from(cols)) {
+            if let Some(cell) = window.cell_mut(row, col as u16) {
+                cell.text = ch.to_string();
+            }
+        }
+    }
+    window.scrollback_offset = 30;
+    window.scrollback_len = 40;
+    window.cursor = None;
+    feed.receive_history(&window);
+    let reading = feed.grid().row_text(0);
+    assert_eq!(reading, line(10), "the view starts at line ten");
+
+    // Six more lines arrive while the user reads.
+    for step in 0..6u64 {
+        let mut next = Grid::blank(rows, cols);
+        for row in 1..rows {
+            next.set_row(row - 1, daemon.row(row));
+        }
+        let text = line(54 + step as usize);
+        for (col, ch) in text.chars().enumerate().take(usize::from(cols)) {
+            if let Some(cell) = next.cell_mut(rows - 1, col as u16) {
+                cell.text = ch.to_string();
+            }
+        }
+        next.scrollback_len = daemon.scrollback_len + 1;
+        next.cursor = Some((rows - 1, 0));
+        feed.apply(1 + step, &ScreenUpdate::between(&daemon, &next))
+            .expect("the update applies");
+        daemon = next;
+    }
+
+    assert!(feed.is_scrolled(), "the view was not yanked to the bottom");
+    assert_eq!(feed.offset(), 36, "the offset grew by what scrolled off");
+    assert_eq!(
+        feed.grid().row_text(0),
+        reading,
+        "and the line the user was reading is still the line on screen"
+    );
+
+    let view = feed.grid().clone();
+    assert_eq!(view.scrollback_len, 46);
+    interactive_pane(
+        view,
+        PaneInteraction::default(),
+        PaneOptions {
+            focused: true,
+            accepts_input: true,
+            now_ms: cursor_on(),
+            scrolled: true,
+            history_complete: true,
+        },
+    )
+    .snapshot("terminal_scrolled_new_output");
+}
+
+/// The position indicator: a thumb against the right edge saying how far through a long
+/// record the viewport is, next to a marker that says the same thing in words.
+///
+/// A count of rows on its own tells the user how far they have come and nothing about how
+/// much is left, which is the half of the sentence people notice is missing.
+#[test]
+fn a_deeply_scrolled_pane_shows_where_it_is_in_the_record() {
+    let mut grid = grid_of(
+        &[
+            "   Compiling turn-core v0.1.0 (/Users/x/turn/crates/turn-core)",
+            "   Compiling turn-proto v0.1.0 (/Users/x/turn/crates/turn-proto)",
+            "   Compiling turn-store v0.1.0 (/Users/x/turn/crates/turn-store)",
+            "   Compiling turn-pty v0.1.0 (/Users/x/turn/crates/turn-pty)",
+            "warning: unused variable: `rows`",
+            "   --> crates/turn-pty/src/buffer.rs:248:29",
+            "    |",
+            "248 |         self.parser.screen_mut().set_size(rows, cols);",
+            "    |                                           ^^^^ help: `_rows`",
+            "    |",
+            "   Compiling turn-agents v0.1.0 (/Users/x/turn/crates/turn-agents)",
+            "   Compiling turnd v0.1.0 (/Users/x/turn/crates/turnd)",
+            "   Compiling turn-gui v0.1.0 (/Users/x/turn/crates/turn-gui)",
+            "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.02s",
+        ],
+        14,
+        66,
+    );
+    // A long record, a long way back: the thumb belongs near the top of its track.
+    grid.scrollback_offset = 4_600;
+    grid.scrollback_len = 5_000;
+
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(520.0, 240.0));
+    let options = PaneOptions {
+        focused: true,
+        accepts_input: true,
+        now_ms: cursor_on(),
+        scrolled: true,
+        history_complete: false,
+    };
+    let (track, thumb) =
+        turn_gui::terminal::scroll_indicator(rect, &grid, options).expect("a position to show");
+    assert!(
+        thumb.center().y < track.center().y,
+        "four hundred rows from the top of five thousand belongs in the top half"
+    );
+    assert!(
+        turn_gui::terminal::scroll_marker_label(4_600, 5_000, false).contains("4600 of 5000"),
+        "got {}",
+        turn_gui::terminal::scroll_marker_label(4_600, 5_000, false)
+    );
+
+    interactive_pane(grid, PaneInteraction::default(), options)
+        .snapshot("terminal_scroll_position");
+}
+
+// ---------------------------------------------------------------------------------------
+// Links.
+// ---------------------------------------------------------------------------------------
+
+/// A resolver that knows one path, so a link over a compiler error can be rendered without
+/// the image depending on what happens to exist on the machine running the test.
+struct KnownPaths(&'static str);
+
+impl turn_gui::terminal::links::PathResolver for KnownPaths {
+    fn resolve(&mut self, candidate: &str) -> Option<std::path::PathBuf> {
+        (candidate == self.0).then(|| std::path::PathBuf::from("/repo").join(candidate))
+    }
+}
+
+/// Renders a pane with the link under `pointer` decorated, exactly as a hover draws it.
+fn link_harness(grid: Grid, pointer: CellPos, resolves: &'static str) -> Harness<'static, ()> {
+    let theme = Theme::dark();
+    let cell = measured_cell(&theme);
+    let size = egui::vec2(cell.x * f32::from(grid.cols), cell.y * f32::from(grid.rows));
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        theme.install(ui.ctx());
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let options = PaneOptions {
+            now_ms: cursor_on(),
+            ..Default::default()
+        };
+        turn_gui::terminal::paint(ui, &theme, rect, &grid, None, options);
+
+        let map = turn_gui::terminal::links::LinkMap::find(&grid, &mut KnownPaths(resolves));
+        let link = map
+            .at(pointer.row, pointer.col)
+            .expect("there is a link under the pointer");
+        turn_gui::terminal::paint_link_underline(ui, &theme, rect, cell, link, options);
+        // The pointer sits in the middle of the cell, which is where it would be.
+        let at = egui::pos2(
+            (f32::from(pointer.col) + 0.5) * cell.x,
+            (f32::from(pointer.row) + 0.5) * cell.y,
+        );
+        turn_gui::terminal::paint_link_target(ui, &theme, egui::Id::new("link-snapshot"), at, link);
+    });
+    harness.run();
+    harness
+}
+
+/// What the user sees when the pointer rests on a URL: the link underlined where it is, and
+/// the whole target next to the pointer with the gesture that opens it.
+#[test]
+fn a_hovered_url_is_underlined_and_its_whole_target_is_shown() {
+    let grid = grid_of(
+        &[
+            "$ cargo test --workspace",
+            "opened https://github.com/TheBurrowHub/turn/pull/42 for the fix",
+            "",
+            "error[E0308]: mismatched types",
+            "  --> src/main.rs:42:8",
+            "",
+            "serving docs on localhost:3000",
+        ],
+        10,
+        66,
+    );
+    link_harness(grid, CellPos::new(1, 20), "src/main.rs").snapshot("terminal_link_hover");
+}
+
+/// The phishing shape: an OSC 8 hyperlink whose text says one host and whose destination is
+/// another. The hover names both and says which one the click would reach.
+#[test]
+fn a_link_whose_text_names_another_host_shows_the_disagreement() {
+    let mut grid = grid_of(
+        &[
+            "The agent opened a pull request:",
+            "",
+            "  https://github.com/TheBurrowHub/turn/pull/42",
+            "",
+            "Review it before merging.",
+        ],
+        8,
+        84,
+    );
+    assert!(grid.set_row_meta(
+        2,
+        turn_proto::cells::RowMeta {
+            wrapped: false,
+            links: vec![turn_proto::cells::RowLink::new(
+                2,
+                47,
+                "https://evil.example/steal?token=1",
+            )],
+        }
+    ));
+    link_harness(grid, CellPos::new(2, 4), "").snapshot("terminal_link_disguised");
+}
+
+// ---------------------------------------------------------------------------------------
+// Inline images.
+//
+// These are the one feature where a snapshot really is the only evidence. Every other
+// property of a picture — which cells it occupies, what happens when the screen scrolls,
+// whether an over-large payload is refused — can be asserted on a grid. Whether the pixels
+// come out the right way up, in the right cells, at the right shape, cannot.
+//
+// So each of these drives the **whole path**: a real escape sequence is fed to the daemon's
+// own terminal buffer, the grid that comes out is what the window paints, and the payload
+// the window uploads is the one the daemon decoded.
+// ---------------------------------------------------------------------------------------
+
+/// A picture whose orientation is unmistakable: four quadrants, and a white border.
+///
+/// Chosen so a mis-tiled, flipped or mirrored picture is obvious at a glance rather than
+/// plausible. Red is top-left, green top-right, blue bottom-left, yellow bottom-right.
+fn quadrant_rgba(width: u32, height: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let border = x < 2 || y < 2 || x + 2 >= width || y + 2 >= height;
+            let colour = if border {
+                [255, 255, 255, 255]
+            } else {
+                match (x * 2 < width, y * 2 < height) {
+                    (true, true) => [220, 40, 40, 255],
+                    (false, true) => [40, 190, 60, 255],
+                    (true, false) => [50, 90, 230, 255],
+                    (false, false) => [235, 200, 40, 255],
+                }
+            };
+            out.extend_from_slice(&colour);
+        }
+    }
+    out
+}
+
+/// The Kitty sequence that transmits and places a raw RGBA picture.
+///
+/// Raw RGBA rather than a PNG so the test needs no encoder, and Kitty rather than iTerm2 so
+/// the cell box is stated in cells and the snapshot is not at the mercy of the nominal cell
+/// size the daemon assumes for a pixel request.
+fn kitty_rgba(width: u32, height: u32, cols: u16, rows: u16) -> Vec<u8> {
+    let payload = turn_proto::encode_base64(&quadrant_rgba(width, height));
+    format!("\x1b_Ga=T,f=32,s={width},v={height},c={cols},r={rows};{payload}\x1b\\").into_bytes()
+}
+
+/// Feeds a script to the daemon's terminal buffer and returns what a client would receive:
+/// the grid, and the payloads for the pictures on it.
+fn daemon_pane(rows: u16, cols: u16, script: &[&[u8]]) -> (Grid, Vec<turn_proto::ImagePayload>) {
+    let mut buffer = turn_pty::TerminalBuffer::new(turn_pty::ScreenSize::new(rows, cols));
+    for chunk in script {
+        buffer.write(chunk);
+    }
+    let mut grid = buffer.grid();
+    // No cursor: these images are about the picture, and a blinking block is a hole in one
+    // of the cells a reviewer looks at.
+    grid.cursor = None;
+    let payloads = grid
+        .images
+        .iter()
+        .filter_map(|image| buffer.image_payload(image.id).cloned())
+        .collect();
+    (grid, payloads)
+}
+
+/// Renders one pane with its pictures uploaded, the way the window does.
+fn image_pane_harness(
+    grid: Grid,
+    payloads: Vec<turn_proto::ImagePayload>,
+    selection: Option<Selection>,
+) -> Harness<'static, ()> {
+    let theme = Theme::dark();
+    let cell = measured_cell(&theme);
+    let size = egui::vec2(cell.x * f32::from(grid.cols), cell.y * f32::from(grid.rows));
+    let mut cache = turn_gui::terminal::images::ImageCache::default();
+    let mut harness = Harness::builder().with_size(size).build_ui(move |ui| {
+        theme.install(ui.ctx());
+        for payload in &payloads {
+            cache.insert(ui.ctx(), payload);
+        }
+        turn_gui::terminal::paint_with_images(
+            ui,
+            &theme,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+            &grid,
+            turn_gui::terminal::Decoration::selected(selection.as_ref()),
+            turn_gui::terminal::PaneOptions {
+                now_ms: cursor_on(),
+                ..Default::default()
+            },
+            Some(&mut cache),
+        );
+    });
+    harness.run();
+    harness
+}
+
+/// A picture among ordinary output, which is what `imgcat` in a shell looks like.
+///
+/// What to look for: the four-quadrant block sits in the cells between the prompt line above
+/// it and the line below, red top-left and yellow bottom-right, its white border unbroken and
+/// square on the cell grid. The text around it is undisturbed.
+#[test]
+fn an_image_sits_inline_among_the_output_around_it() {
+    let (grid, payloads) = daemon_pane(
+        14,
+        56,
+        &[
+            b"~/turn on main $ kitten icat plot.png\r\n",
+            &kitty_rgba(240, 160, 30, 8),
+            b"\r\n~/turn on main $ ",
+        ],
+    );
+    assert_eq!(grid.images.len(), 1, "the picture reached the grid");
+    assert_eq!(payloads.len(), 1, "and its pixels came with it");
+    let mut harness = image_pane_harness(grid, payloads, None);
+    harness.snapshot("terminal_inline_image");
+}
+
+/// Text around a picture: before it, after it, and below it.
+///
+/// What to look for: `chart:` to the left of the block on its first row, `<- last run`
+/// immediately to the right of the block's **bottom** row — where both iTerm2 and Kitty leave
+/// the cursor after drawing — and the sentence below running the full width of the pane. The
+/// picture claims exactly its own columns and nothing on any row shifts.
+#[test]
+fn text_flows_around_an_image_on_the_same_line() {
+    let (grid, payloads) = daemon_pane(
+        10,
+        56,
+        &[
+            b"chart: ",
+            &kitty_rgba(180, 120, 16, 4),
+            b" <- last run\r\n",
+            b"the line below runs the whole width of the pane, undisturbed\r\n",
+        ],
+    );
+    assert!(grid.row_text(0).starts_with("chart:"));
+    assert!(
+        grid.row_text(3).contains("<- last run"),
+        "the text after a four-row picture belongs beside its bottom row: {:?}",
+        grid.row_text(3)
+    );
+    assert!(grid.row_text(4).starts_with("the line below"));
+    let mut harness = image_pane_harness(grid, payloads, None);
+    harness.snapshot("terminal_image_with_text_around_it");
+}
+
+/// A picture the screen has scrolled halfway out of.
+///
+/// What to look for: the *bottom* part of the four-quadrant block only — blue and yellow,
+/// with the white border along the bottom and sides but **no top edge** — sitting at the top
+/// of the pane above the lines that pushed it up. This is the case the tile coordinates in
+/// the marker exist for: the picture's own first row is gone, so every surviving row has to
+/// say which part of the picture it is.
+#[test]
+fn an_image_scrolled_partly_off_the_top_shows_the_part_that_is_left() {
+    let mut script: Vec<Vec<u8>> = vec![kitty_rgba(200, 200, 20, 10)];
+    // Enough output to push the top half of the picture off a ten-row pane.
+    for line in 0..9 {
+        script.push(format!("output line {line}\r\n").into_bytes());
+    }
+    let borrowed: Vec<&[u8]> = script.iter().map(|chunk| chunk.as_slice()).collect();
+    let (grid, payloads) = daemon_pane(10, 48, &borrowed);
+
+    // The picture is still on screen, and the top row of it carries a tile from the middle
+    // of the image rather than its first.
+    let first_tile = (0..grid.cols)
+        .find_map(|col| {
+            grid.cell(0, col)
+                .and_then(turn_proto::cells::Cell::image_tile)
+        })
+        .expect("the picture still has cells on the top row");
+    assert!(
+        first_tile.dy > 0,
+        "the picture's own first row must have scrolled away, got {first_tile:?}"
+    );
+    let mut harness = image_pane_harness(grid, payloads, None);
+    harness.snapshot("terminal_image_scrolled_off_the_top");
+}
+
+/// A payload Turn refuses, and what the user is told about it.
+///
+/// What to look for: no picture at all, and a line of text reading
+/// `[turn: image not shown — payload over 8 MB]` where the picture would have been, between
+/// the command that produced it and the prompt that follows. The notice is the whole point:
+/// a picture that silently did not appear is a bug report nobody can write.
+#[test]
+fn a_refused_payload_tells_the_user_why_nothing_appeared() {
+    // Nine mebibytes of base64, over the eight-mebibyte payload limit.
+    let mut sequence = Vec::from(b"\x1b]1337;File=inline=1:".as_slice());
+    sequence.extend(std::iter::repeat_n(b'A', 13 * 1024 * 1024));
+    sequence.push(0x07);
+    let (grid, payloads) = daemon_pane(
+        8,
+        62,
+        &[
+            b"~/turn on main $ imgcat enormous.png\r\n",
+            &sequence,
+            b"~/turn on main $ ",
+        ],
+    );
+    assert!(payloads.is_empty(), "nothing was decoded");
+    assert!(!grid.has_images(), "and nothing was placed");
+    assert!(
+        grid.text().contains("image not shown"),
+        "the pane must say so: {:?}",
+        grid.text()
+    );
+    let mut harness = image_pane_harness(grid, payloads, None);
+    harness.snapshot("terminal_image_refused");
+}
+
+/// A selection dragged across a picture.
+///
+/// What to look for: the picture tinted with the selection colour over the columns inside the
+/// selection and untinted outside it, and the words on either side highlighted as usual. A
+/// selection that stopped at a picture would be the one thing on screen it did not touch.
+#[test]
+fn a_selection_over_an_image_highlights_it_like_anything_else() {
+    let (grid, payloads) =
+        daemon_pane(6, 44, &[b"pick: ", &kitty_rgba(160, 80, 16, 3), b" ok\r\n"]);
+    let mut selection = Selection::new(
+        turn_gui::terminal::selection::CellPos::new(0, 2),
+        turn_gui::terminal::selection::SelectionKind::Linear,
+    );
+    selection.extend_to(turn_gui::terminal::selection::CellPos::new(0, 16));
+    let mut harness = image_pane_harness(grid, payloads, Some(selection));
+    harness.snapshot("terminal_image_selected");
+}
+
+/// A picture whose pixels have not arrived yet.
+///
+/// What to look for: a framed rectangle in the cells the picture will occupy — filled with
+/// the raised panel colour and outlined on all four sides — with the text around it in place.
+/// This is what a pane looks like for the frame or two between a screen arriving and the
+/// payload being fetched, and it is deliberately visible.
+#[test]
+fn an_image_whose_pixels_have_not_arrived_shows_a_frame_rather_than_a_hole() {
+    let (grid, _payloads) = daemon_pane(
+        8,
+        44,
+        &[b"waiting: ", &kitty_rgba(160, 120, 12, 5), b" done\r\n"],
+    );
+    // Deliberately no payloads: the window has the screen and not the pixels.
+    let mut harness = image_pane_harness(grid, Vec::new(), None);
+    harness.snapshot("terminal_image_placeholder");
 }

@@ -38,6 +38,12 @@ impl Core {
                 if !node.is_running() || self.processes.contains_key(&node.id) {
                     return false;
                 }
+                // An agent Turn started inside a terminal it still owns is reachable:
+                // closing that terminal ends it, so it is not a process that has
+                // escaped Turn the way a survivor of a previous daemon has.
+                if self.is_hosted(&node.id) {
+                    return false;
+                }
                 // A PID is an independent runtime boundary. Even when its edge was
                 // discovered below an owned PTY, it may have detached from that process
                 // group; Turn must not claim it died merely because the parent did.
@@ -75,7 +81,7 @@ impl Core {
             .tree
             .get(node_id)
             .ok_or_else(|| ProtoError::not_found("process", node_id.as_str()))?;
-        if !node.is_running() || self.processes.contains_key(node_id) {
+        if !node.is_running() || self.processes.contains_key(node_id) || self.is_hosted(node_id) {
             return Ok(());
         }
         Err(ProtoError::new(

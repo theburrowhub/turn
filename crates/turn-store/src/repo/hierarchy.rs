@@ -775,6 +775,101 @@ impl<'a> HierarchyRepo<'a> {
             .map_err(Into::into)
     }
 
+    /// Gives up every lease this daemon holds, as the last durable act of a clean stop.
+    ///
+    /// This is the other half of [`HierarchyRepo::require_recovery_after_daemon_restart`],
+    /// and without it every ordinary quit looked exactly like a crash: the next start
+    /// found an unreleased lease, could not tell the two apart, and asked the user to
+    /// confirm write access they had never given up.
+    ///
+    /// Only `active` rows are released. A `recovery_required` row is evidence that some
+    /// *earlier* generation stopped without releasing and that this daemon never adopted
+    /// it; releasing it here would destroy the only record of that and let the next start
+    /// grant authority silently. Owning the data directory lock is what makes "every
+    /// active row" mean "every lease this process holds".
+    ///
+    /// The owning Session keeps `main_checkout`: it is still the writer the user chose,
+    /// and the next start reacquires for it. Demoting it to read-only would make a clean
+    /// quit silently change the Session's mode.
+    pub fn release_active_write_leases(&self, now_ms: i64) -> Result<usize> {
+        self.conn
+            .execute(
+                "UPDATE workspace_write_leases \
+                 SET state = 'released', released_ms = ?1, heartbeat_ms = ?1 \
+                 WHERE state = 'active'",
+                params![now_ms],
+            )
+            .map_err(Into::into)
+    }
+
+    /// Records that write authority for a checkout is being *withheld* pending an
+    /// explicit confirmation, when no unreleased lease survived to be fenced.
+    ///
+    /// The case is a previous daemon that released its lease cleanly and left a process
+    /// behind that outlived it. There is then nothing to fence, but granting the checkout
+    /// again silently would put a second writer in it. This row is not authority: it is
+    /// `recovery_required` from the moment it exists, holds the current fence generation
+    /// so [`HierarchyRepo::reclaim_write_lease`] can adopt exactly it, and its timestamps
+    /// describe when the withholding was recorded rather than forging an acquisition.
+    ///
+    /// Returns the existing unreleased lease untouched when there already is one, so a
+    /// caller can never replace a live or fenced claim by asking for this.
+    pub fn withhold_write_lease(
+        &self,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+        now_ms: i64,
+    ) -> Result<WorkspaceWriteLease> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
+        let (canonical, reconciliation_required) =
+            Self::verified_checkout_identity_in(&tx, workspace, session, checkout)?;
+        if reconciliation_required {
+            return Err(StoreError::LeaseReconciliationRequired {
+                workspace_id: workspace.to_string(),
+                checkout_id: checkout.to_string(),
+            });
+        }
+        if let Some(held) = Self::unreleased_lease_for_canonical_in(&tx, &canonical)? {
+            tx.commit()?;
+            return Ok(held);
+        }
+
+        let generation: i64 = tx.query_row(
+            "SELECT generation FROM checkout_write_fences WHERE canonical_path = ?1",
+            params![&canonical],
+            |row| row.get(0),
+        )?;
+        let mut lease = WorkspaceWriteLease::active(
+            workspace.clone(),
+            session.clone(),
+            checkout.clone(),
+            now_ms,
+        );
+        lease.state = LeaseState::RecoveryRequired;
+        lease.generation = generation as u64;
+        tx.execute(
+            "INSERT INTO workspace_write_leases \
+                 (id, workspace_id, session_id, checkout_id, canonical_path, mode, state, \
+                  acquired_ms, heartbeat_ms, released_ms, generation) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+            params![
+                lease.id.as_str(),
+                lease.workspace_id.as_str(),
+                lease.session_id.as_str(),
+                lease.checkout_id.as_str(),
+                canonical,
+                tag("lease mode", &lease.mode)?,
+                tag("lease state", &lease.state)?,
+                lease.acquired_ms,
+                lease.heartbeat_ms,
+                lease.generation as i64,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(lease)
+    }
+
     pub fn require_recovery(&self, id: &LeaseId, now_ms: i64) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE workspace_write_leases SET state = 'recovery_required', heartbeat_ms = ?2 \
@@ -1551,6 +1646,157 @@ mod tests {
             assert_eq!(after.id, before.id);
             assert_eq!(after.generation, before.generation);
         }
+    }
+
+    /// The half of the lifecycle that was missing: a clean stop gives the checkout
+    /// back, so the next start has nothing to ask about.
+    #[test]
+    fn a_clean_stop_releases_active_authority_and_leaves_the_session_as_the_writer() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "clean-stop");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .hierarchy()
+                .release_active_write_leases(T0 + 5)
+                .unwrap(),
+            1
+        );
+        let released = store.hierarchy().lease(&lease.id).unwrap().unwrap();
+        assert_eq!(released.state, LeaseState::Released);
+        assert_eq!(released.released_ms, Some(T0 + 5));
+        assert!(store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.sessions().get(&session.id).unwrap().unwrap().mode,
+            SessionMode::MainCheckout,
+            "a clean stop must not silently change the writer the user chose"
+        );
+
+        // And the next start can simply take it again: no fenced row remains.
+        let reacquired = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0 + 6)
+            .unwrap();
+        assert_eq!(reacquired.state, LeaseState::Active);
+        assert!(reacquired.generation > lease.generation);
+    }
+
+    /// A `recovery_required` row is the only evidence that some earlier daemon died
+    /// without releasing. A later clean stop must not launder it into a release.
+    #[test]
+    fn releasing_on_a_clean_stop_never_clears_an_unadopted_recovery_claim() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "unadopted-recovery");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let lease = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        assert_eq!(
+            store
+                .hierarchy()
+                .require_recovery_after_daemon_restart()
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            store
+                .hierarchy()
+                .release_active_write_leases(T0 + 5)
+                .unwrap(),
+            0
+        );
+        let after = store.hierarchy().lease(&lease.id).unwrap().unwrap();
+        assert_eq!(after.state, LeaseState::RecoveryRequired);
+        assert_eq!(after.released_ms, None);
+        assert_eq!(after.generation, lease.generation);
+    }
+
+    #[test]
+    fn withholding_authority_records_a_recovery_claim_the_confirm_flow_can_adopt() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "withheld");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let released = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+        store
+            .hierarchy()
+            .release_active_write_leases(T0 + 1)
+            .unwrap();
+
+        let withheld = store
+            .hierarchy()
+            .withhold_write_lease(&workspace.id, &session.id, &checkout, T0 + 2)
+            .unwrap();
+        assert_eq!(withheld.state, LeaseState::RecoveryRequired);
+        assert_ne!(withheld.id, released.id, "a new record, not a resurrection");
+        assert_eq!(withheld.released_ms, None);
+        assert_eq!(withheld.acquired_ms, T0 + 2);
+        assert_eq!(
+            withheld.generation, released.generation,
+            "withholding is not an acquisition, so it advances no fence"
+        );
+        // It is not authority, and cannot become authority by accident.
+        assert!(store
+            .hierarchy()
+            .verify_active_write_lease(&workspace.id, &session.id, &checkout)
+            .is_err());
+
+        let reclaimed = store
+            .hierarchy()
+            .reclaim_write_lease(
+                &workspace.id,
+                &session.id,
+                &checkout,
+                &withheld.id,
+                withheld.generation,
+                T0 + 3,
+            )
+            .unwrap()
+            .expect("the user's confirmation adopts exactly the withheld claim");
+        assert_eq!(reclaimed.state, LeaseState::Active);
+        assert_eq!(reclaimed.generation, withheld.generation + 1);
+    }
+
+    #[test]
+    fn withholding_authority_cannot_displace_a_live_or_fenced_claim() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "withhold-conflict");
+        let session = testing::saved_session(&store, &workspace.id, "writer");
+        let checkout = CheckoutId::primary_for(&workspace.id);
+        let live = store
+            .hierarchy()
+            .acquire_write_lease(&workspace.id, &session.id, &checkout, T0)
+            .unwrap();
+
+        let observed = store
+            .hierarchy()
+            .withhold_write_lease(&workspace.id, &session.id, &checkout, T0 + 1)
+            .unwrap();
+        assert_eq!(observed.id, live.id);
+        assert_eq!(observed.state, LeaseState::Active);
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM workspace_write_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]

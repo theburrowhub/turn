@@ -558,6 +558,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    /// How long a test waits for the monitor to report a child's exit.
+    ///
+    /// Generous on purpose. What these tests assert is *which* event arrives, not how quickly:
+    /// the work in between is spawning a shell script and reaping it, and on a machine that is
+    /// also building something the difference between two seconds and ten is the difference
+    /// between a suite that passes and a suite that passes when the machine is idle.
+    const EVENT_WAIT: Duration = Duration::from_secs(20);
+
     fn context(root: &Path) -> LaunchContext {
         LaunchContext {
             current_exe: root.join("bin/turn"),
@@ -715,8 +723,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         let events = launch.monitor.watch(Arc::new(|| {}));
-        let CompanionEvent::Failed(message) = events.recv_timeout(Duration::from_secs(2)).unwrap()
-        else {
+        let CompanionEvent::Failed(message) = events.recv_timeout(EVENT_WAIT).unwrap() else {
             panic!("a non-contention exit must be a failure")
         };
         assert!(message.contains("exit status: 7"), "{message}");
@@ -778,8 +785,7 @@ mod tests {
             wake_counter.fetch_add(1, Ordering::SeqCst);
         }));
 
-        let CompanionEvent::Failed(message) = events.recv_timeout(Duration::from_secs(2)).unwrap()
-        else {
+        let CompanionEvent::Failed(message) = events.recv_timeout(EVENT_WAIT).unwrap() else {
             panic!("a non-contention exit must be a failure")
         };
         assert!(message.contains("exit status: 7"), "{message}");
@@ -804,7 +810,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         let events = launch.monitor.watch(Arc::new(|| {}));
-        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let event = events.recv_timeout(EVENT_WAIT).unwrap();
         assert!(matches!(event, CompanionEvent::Contended(_)));
     }
 

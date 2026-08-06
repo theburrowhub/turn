@@ -17,6 +17,7 @@ pub mod announce;
 pub mod app;
 pub mod companion;
 pub mod desk;
+pub mod icons;
 pub mod keymap;
 pub mod logging;
 pub mod palette;

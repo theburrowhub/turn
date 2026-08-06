@@ -57,6 +57,7 @@ Status values:
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
+| [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
 
 ---
 
@@ -2592,3 +2593,111 @@ tree selection, focus and layout are not part of the operation.
 - **Downside:** the destination must support bracketed paste and be at a safe input boundary.
 - **Downside:** delivery proves a PTY submission, not semantic receipt. End-to-end acknowledgement would need
   an adapter-level protocol rather than a terminal heuristic.
+
+---
+
+<a id="adr-044"></a>
+## ADR-044 — A terminal pane hosts the user's shell, and an agent runs inside it
+
+**Status:** Accepted, implemented. Narrows ADR-017's evidence ladder to say that Turn's own launch is
+evidence, and extends ADR-019's on-demand process scan with a single-pid liveness check.
+
+### Context
+
+A pane's process *was* the agent. Two reports followed from that one fact, and neither was a bug in the
+code that could be fixed where it was observed:
+
+* Leaving Claude Code with `/exit` left the pane flickering and dead. The process the pane was a view of
+  had ended, so there was nothing left to draw and nothing left to type into. In every terminal the user
+  already owns, quitting an agent returns them to a prompt.
+* `+ Pane Agent` did nothing. With no `default_agent` configured, the pane's command resolved to `None`,
+  the pane opened empty, and nothing said why.
+
+### Alternatives considered
+
+**Relaunch the agent when it exits.** Rejected outright. Turn never relaunches on its own — not on
+restore, not after a crash — and the pane's emptiness is not a reason to make an exception.
+
+**Keep the agent as the pane's process and re-draw the dead pane as a recovery offer.** This is what the
+restore path does for a process that did not survive a daemon restart, and it is right *there*: the daemon
+was not running, so it cannot know what the user wants. It is wrong here. The user quit the agent
+deliberately, in a terminal, and expects the terminal.
+
+**Put the agent in the shell's `argv`: `shell -i -c '<agent>; exec <shell> -i'`.** Tried, measured on real
+pseudo-terminals, and rejected. It is the tidier shape — the command cannot race the shell's start-up — but
+**zsh exits with 130 when a command given to it with `-c` is interrupted**, interactive or not, with `exec`
+waiting after the semicolon or not. Ctrl-C in the pane would then take the pane down along with the agent:
+the same report arriving by a different route. bash and `sh` survive it; zsh is the default shell on macOS.
+
+**Host every pane's command in a shell.** Rejected. A pane that names a job — `npm run dev`, a test run —
+exists to show that job and its ending. Wrapping it in a shell that outlives it would hide the exit code
+that is the whole point of the pane.
+
+### Decision
+
+A pane whose command the adapter registry recognises as an agent runs `shell -i`, and the agent's command
+line is **written to the pty**, exactly as if the user had typed it. The pane's process is the user's shell;
+the agent is a command running in it; and when the agent ends the shell is still there with its prompt, its
+pid and its scrollback. Which panes this applies to is decided by the adapter, not by the pane's label
+(ADR-029): `claude` typed into a plain terminal pane is an agent, and `npm run dev` in an agent pane is not.
+
+Writing the command in does not race the shell's start-up, and that was measured rather than assumed: the
+bytes wait in the terminal's input queue until the shell begins reading, so they survive an rc file being
+sourced and a line editor being set up — verified with a zero-millisecond delay against a shell with a slow
+rc, on zsh, bash and `sh`, for both ctrl-C and ctrl-D. It also puts the command in the user's shell history,
+which is what makes "the user can start it again by typing" an up-arrow rather than a paragraph of
+documentation.
+
+The agent's *environment* is never typed. One of its values is a URL carrying this node's hook token, and an
+input line reaches the pane's screen, its scrollback and the user's history file. A launch into a shell Turn
+is about to start puts it in that shell's environment, where it is invisible and inherited. A launch into a
+shell that is already running — which is what `RelaunchNode` does — writes it to an owner-only file in the
+node's scratch directory and tells the shell to source it.
+
+One launch produces **two nodes**. A `Shell` node owns the pty and the pane. An agent node owns everything
+that makes an agent an agent — its `AgentInfo`, its adapter, the integration level the launch achieved, its
+hook token and its turn axis — and hangs off the shell at `Relation::Confirmed`. Confirmed is the whole
+point: Turn wrote that command line itself, so the edge is knowledge, not an inference from the process
+table. ADR-017's ladder is unchanged; this is a new source at its top rather than a new rung.
+
+The agent's *pid* is a separate question from its *identity*. The shell forked it, so Turn never held it:
+the pid is learned by matching one direct child of the shell against the executable Turn asked for, and
+until that happens the node carries no pid rather than borrowing the shell's. Its death is noticed by
+asking the kernel about that one pid on each tick — a single `kill(pid, 0)`, not the process-table refresh
+ADR-019 keeps on demand — and recorded as `Lifecycle::Lost`, because Turn did not see it exit and will not
+invent an exit code.
+
+Everything Turn types now passes through a shell, so every word is quoted with `shell-words`: notably the
+`--settings` path the adapter generated, which Turn produced from a data directory the user chose and which
+may contain a space, a `$` or a backtick. It has to arrive at the agent unchanged, and it must not be able to
+run anything.
+
+`+ Pane Agent` always resolves to something: the workspace's configured agent, else the first agent CLI on
+the user's `PATH`, else the shell with a printed sentence saying why it is only a shell. A configured agent
+that is missing is named rather than silently replaced by a different one.
+
+### Consequences
+
+- Quitting an agent leaves a working shell in the pane. Ctrl-C leaves one too. The pane is never dead, and
+  the user starts the agent again by typing — or with `RelaunchNode`, which types it for them into the shell
+  that never died.
+- Closing an agent pane still refuses to stop the agent, as it always did; the check now also asks whether
+  the pane's shell is *hosting* one.
+- `Stop Agent` signals the agent's own pid, which is the difference between stopping the agent and
+  interrupting whatever is in the foreground. `Interrupt` still goes through the tty, and for a hosted
+  agent that is not a detail but the only correct route.
+- Attention routing walks from a hosted agent to its shell, because the shell's tty is where an answer is
+  typed. A node with a pid but no terminal of its own is not an input boundary.
+- **Downside:** an agent pane now starts two processes and shows two rows. The tree is one deeper, and a
+  session's `running_count` counts the shell.
+- **Downside:** the pane's shell sources the user's rc, which is what makes the agent's `PATH` theirs — and
+  also means an rc that prints, or that `cd`s, does so in the pane. Launch-root containment still resolves
+  and proves the starting directory; it does not follow a process that moves.
+- **Downside:** the command Turn typed is in the user's shell history, alongside the commands they typed
+  themselves. That is the same thing typing it would have done, and it is what makes an up-arrow work.
+- **Downside:** Turn does not hold the agent's process, so `SIGTERM` from `TerminateNode` is refused in the
+  moment between the launch and the sweep that identifies the pid.
+- **Downside:** `Process::hosted` is in-memory only. After a daemon restart the surviving parent edge is
+  still durable and still confirmed, but the recovery offer is the pane's — the shell's — as it is for
+  every other pane.
+

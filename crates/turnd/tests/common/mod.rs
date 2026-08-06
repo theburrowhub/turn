@@ -305,6 +305,45 @@ impl Client {
             .expect("that pane was never attached for cells")
     }
 
+    /// Asks for the tree until a node's resolved title is `expected`.
+    ///
+    /// Polls the projection rather than watching for a specific push, because a title
+    /// reaches the client through the hierarchy and a test that waited for one exact
+    /// event would be asserting the transport instead of the outcome.
+    pub async fn wait_for_node_title(
+        &mut self,
+        session: &turn_core::ids::SessionId,
+        node: &turn_core::ids::NodeId,
+        expected: &str,
+    ) -> turn_proto::TreeNodeView {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut last = None;
+        loop {
+            let tree = match self
+                .ask(Request::GetProcessTree {
+                    session_id: session.clone(),
+                })
+                .await
+            {
+                Response::Tree { nodes, .. } => nodes,
+                other => panic!("expected the process tree, got {other:?}"),
+            };
+            if let Some(view) = tree.iter().find(|view| &view.node_id == node) {
+                if view.title == expected {
+                    return view.clone();
+                }
+                last = Some(view.title.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for node {node} to be titled {expected:?}; \
+                     its title is {last:?}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Applies pushed screen updates until some pane's text contains `needle`.
     ///
     /// Checks the sequence as it goes: an update that skips a number would mean the
@@ -497,6 +536,33 @@ pub fn session_of(response: Response) -> turn_proto::SessionSummary {
         Response::Session { session } => *session,
         other => panic!("expected a session, got {other:?}"),
     }
+}
+
+/// The one node in a session's tree that is an agent.
+///
+/// Tests ask for "the agent" rather than for a row number. A pane's process is the
+/// user's shell and the agent runs inside it, so the agent is never the first row — and
+/// where it sits is not what any of these tests are about.
+pub fn agent_row(details: &turn_proto::SessionDetails) -> &TreeNodeView {
+    let mut agents = details.tree.iter().filter(|view| view.is_agentic);
+    let agent = agents
+        .next()
+        .unwrap_or_else(|| panic!("no agent in this session's tree: {:#?}", details.tree));
+    assert!(
+        agents.next().is_none(),
+        "this session has more than one agent, so `the` agent is ambiguous: {:#?}",
+        details.tree
+    );
+    agent
+}
+
+/// One named node's row.
+pub fn row<'a>(details: &'a turn_proto::SessionDetails, node: &NodeId) -> &'a TreeNodeView {
+    details
+        .tree
+        .iter()
+        .find(|view| &view.node_id == node)
+        .unwrap_or_else(|| panic!("{node} is not in this session's tree: {:#?}", details.tree))
 }
 
 pub fn details_of(response: Response) -> turn_proto::SessionDetails {

@@ -17,11 +17,15 @@
 //! **Nothing is relaunched.** Panes that could be started again are marked
 //! `can_relaunch` with the command shown verbatim, and that is an offer. The user
 //! answers it with [`turn_proto::Request::RelaunchNode`] or does not.
+//!
+//! Checkout write authority is decided in the same pass, by [`super::authority`]: every
+//! unreleased lease is fenced before a single Session is loaded, and only evidence — the
+//! data-directory lock plus the process table — can give it back without asking.
 
 use super::Core;
 use crate::error::Result;
 use crate::paths;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
@@ -78,6 +82,10 @@ impl Core {
             self.supervisor.refresh();
             self.last_sweep_ms = now_ms;
         }
+        // Before the per-node verdicts, which collapse "alive but unrecognisable" into
+        // `Lost`. That is the right thing to show a user and the wrong thing to hand a
+        // checkout on, so write authority is decided from the raw process table.
+        let authority = self.restore_write_authority(now_ms);
         let ids: Vec<SessionId> = self.sessions.keys().cloned().collect();
         for id in &ids {
             let report = self.decide_session(id, now_ms);
@@ -102,6 +110,9 @@ impl Core {
             built_ins_installed = installed,
             attention = self.attention.queue().len(),
             leases_requiring_recovery,
+            leases_recovered = authority.recovered,
+            leases_reacquired = authority.reacquired,
+            leases_withheld = authority.withheld,
             temporary_bindings_pruned,
             scratch_pruned = pruned,
             "restored"
@@ -380,6 +391,25 @@ impl Core {
             }
         }
 
+        // Also while the borrow is immutable: what each pane's offer would need from the
+        // checkout. A pane that only opens the user's shell is not gated on write access,
+        // and the UI has to be told which is which rather than blocking the lot.
+        let needs_write: HashMap<PaneId, bool> = match self.sessions.get(id) {
+            Some(session) => session
+                .layout
+                .panes()
+                .iter()
+                .map(|pane| {
+                    (
+                        pane.id.clone(),
+                        self.pane_launch_authority(id, &pane.id)
+                            == crate::core::spawn::LaunchAuthority::CheckoutWrite,
+                    )
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+
         let Some(session) = self.sessions.get_mut(id) else {
             return ServerEvent::RestoreResult {
                 session_id: id.clone(),
@@ -423,6 +453,9 @@ impl Core {
                 can_relaunch: relaunchable,
                 // Descriptive only; relaunch authority is the durable node id.
                 command: pane.command.clone(),
+                // Absent means "assume it does", which is also the honest answer for a
+                // pane whose launch shape could not be resolved at all.
+                needs_checkout_write: needs_write.get(&pane.id).copied().unwrap_or(true),
             });
         }
 
@@ -463,19 +496,15 @@ impl Core {
     /// Pids are reused. Without this check a session could report a stranger's process
     /// as its own surviving agent, which is worse than reporting it lost: the user
     /// would be told their work is still running when it is not.
+    ///
+    /// This decides what to *show*, and so it is stricter than the identical question
+    /// asked about write authority in [`super::authority`]: a process Turn cannot
+    /// recognise is one it cannot display, but it may still be writing to the checkout.
     fn matches_command(&self, pid: u32, command: &str) -> bool {
         let Some(observed) = self.supervisor.observe(pid) else {
             return false;
         };
-        let Some(expected) = command
-            .split_whitespace()
-            .next()
-            .and_then(|first| first.rsplit('/').next())
-            .filter(|name| !name.is_empty())
-        else {
-            return false;
-        };
-        observed.name.contains(expected) || observed.command_line.contains(expected)
+        super::authority::runs_the_recorded_command(command, &observed)
     }
 }
 
@@ -661,6 +690,7 @@ mod migration_tests {
                     lifecycle: Lifecycle::Orphaned,
                     can_relaunch: false,
                     command: Some("sh".into()),
+                    needs_checkout_write: false,
                 }],
             });
         harness
@@ -738,6 +768,7 @@ mod migration_tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("sh".into()),
+                    needs_checkout_write: false,
                 }],
             });
 

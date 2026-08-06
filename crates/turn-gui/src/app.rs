@@ -562,21 +562,20 @@ impl TurnApp {
                 }
                 true
             }
+            // Both of these ask before they stop anything. The confirmation is built by the
+            // Desk, from the row the tree is pointing at, so the keyboard and the row's own
+            // control act on the same thing and say the same numbers.
             Command::CloseSession => {
-                let selected = self.desk.selected().cloned();
-                self.state.lifecycle_confirmation = selected.and_then(|session_id| {
-                    self.desk
-                        .sessions()
-                        .iter()
-                        .find(|session| session.id == session_id)
-                        .map(|session| crate::view::LifecycleConfirmation::EndSession {
-                            session_id,
-                            name: session.name.clone(),
-                            running_count: session.running_count,
-                        })
-                });
-                if self.state.lifecycle_confirmation.is_none() {
-                    self.desk.show_notice("select a Session before ending it");
+                match self.desk.end_session_confirmation() {
+                    Ok(confirmation) => self.state.lifecycle_confirmation = Some(confirmation),
+                    Err(reason) => self.desk.show_notice(reason),
+                }
+                true
+            }
+            Command::CloseWorkspace => {
+                match self.desk.stop_workspace_confirmation() {
+                    Ok(confirmation) => self.state.lifecycle_confirmation = Some(confirmation),
+                    Err(reason) => self.desk.show_notice(reason),
                 }
                 true
             }
@@ -853,6 +852,110 @@ mod tests {
                 .map(|draft| &draft.workspace_id),
             Some(&second_id)
         );
+    }
+
+    /// The keyboard reaches both closes, and neither of them closes anything: each one puts
+    /// the confirmation on screen, aimed at the row the tree is pointing at and carrying the
+    /// numbers that row would stop. Nothing is sent until the dialog is accepted.
+    #[test]
+    fn the_close_chords_open_a_confirmation_for_the_selected_row_and_send_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-closing.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let now = 1_700_000_000_000;
+        let workspace = turn_core::model::Workspace::new("infra", "/repo/infra", now);
+        let mut session = turn_core::model::Session::new(
+            workspace.id.clone(),
+            "Rotate the certificates",
+            "/repo/infra",
+            turn_core::model::Layout::single(turn_core::model::Pane::new(
+                turn_core::model::PaneKind::Agent,
+            )),
+            now,
+        );
+        let mut agent =
+            turn_core::model::ProcessNode::agent(session.id.clone(), "claude", "/repo/infra", now);
+        agent.lifecycle = turn_core::state::Lifecycle::Alive;
+        agent.turn = Some(turn_core::state::Turn::Active);
+        session.tree.insert(agent);
+        let session_id = session.id.clone();
+        let summary = turn_proto::SessionSummary::from_session(&session, 0, false, now);
+        app.desk.apply_inbound(
+            crate::transport::Inbound::Answer {
+                ask: Ask::Hierarchy,
+                response: Box::new(turn_proto::Response::Hierarchy {
+                    snapshot: Box::new(turn_proto::HierarchySnapshot {
+                        revision: 1,
+                        tree_state: turn_proto::TreeSurfaceState {
+                            surface_id: "main-window".into(),
+                            selected: Some(turn_proto::HierarchyKey::session(session_id.clone())),
+                            expanded: Vec::new(),
+                        },
+                        workspaces: vec![turn_proto::WorkspaceTreeView {
+                            workspace: turn_proto::WorkspaceSummary::from_workspace(
+                                &workspace,
+                                std::slice::from_ref(&summary),
+                            ),
+                            checkouts: Vec::new(),
+                            write_lease: None,
+                            sessions: vec![turn_proto::SessionTreeView {
+                                session: summary,
+                                nodes: turn_proto::TreeNodeView::for_session(&session, now),
+                            }],
+                        }],
+                    }),
+                }),
+            },
+            now,
+        );
+        app.state.hierarchy = app.desk.hierarchy().cloned();
+
+        assert!(app.handle_locally(Command::CloseSession));
+        assert_eq!(
+            app.state.lifecycle_confirmation,
+            Some(crate::view::LifecycleConfirmation::EndSession {
+                session_id: session_id.clone(),
+                name: "Rotate the certificates".into(),
+                running_count: 1,
+            }),
+            "the chord asks about the row the tree has selected"
+        );
+
+        app.state.lifecycle_confirmation = None;
+        assert!(app.handle_locally(Command::CloseWorkspace));
+        assert_eq!(
+            app.state.lifecycle_confirmation,
+            Some(crate::view::LifecycleConfirmation::StopWorkspace {
+                workspace_id: workspace.id.clone(),
+                name: "infra".into(),
+                session_count: 1,
+                running_sessions: 1,
+                running_processes: 1,
+            }),
+            "and the Workspace one says how much of the world it would reach"
+        );
+    }
+
+    /// The other half of the pair is not a question, because it destroys nothing: archiving
+    /// goes straight to the daemon with a flag on it, and no confirmation appears.
+    #[test]
+    fn the_archive_chord_is_not_a_question_because_it_stops_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-archiving.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+
+        assert!(
+            !app.handle_locally(Command::ArchiveSession),
+            "archiving is a request, not a sheet the window opens"
+        );
+        assert!(!app.handle_locally(Command::ArchiveWorkspace));
+        assert!(app.state.lifecycle_confirmation.is_none());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
 use turn_core::model::SessionStatus;
 use turn_proto::{
-    AttentionView, NodePaneCapability, PaneStream, ServerEvent, SessionDetails, SessionSummary,
+    AttentionView, NodePaneCapability, ServerEvent, SessionDetails, SessionSummary,
     TemplateSummary, TreeNodeView, WorkspaceSummary,
 };
 
@@ -111,19 +111,13 @@ impl Core {
                         tracing::warn!(%error, session = %id, "could not load Pane bindings");
                         Vec::new()
                     });
+                // One answer for what an explicit open action may render, shared with
+                // every other route that reports it: an agent running in a pane's shell
+                // has a terminal, and it is that shell's.
                 let capabilities: HashMap<NodeId, NodePaneCapability> = session
                     .tree
                     .iter()
-                    .map(|node| {
-                        let capability = if self.processes.contains_key(&node.id) {
-                            NodePaneCapability::Terminal {
-                                streams: vec![PaneStream::Cells, PaneStream::Bytes],
-                            }
-                        } else {
-                            NodePaneCapability::PreviewDetails
-                        };
-                        (node.id.clone(), capability)
-                    })
+                    .map(|node| (node.id.clone(), self.node_pane_capability(&node.id)))
                     .collect();
                 TreeNodeView::for_session_with_panes(session, &bindings, &capabilities, now_ms)
             }

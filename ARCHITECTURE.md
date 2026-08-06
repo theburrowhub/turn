@@ -1267,7 +1267,21 @@ What exists today:
 - **`src/theme.rs`** — the palette, and `state_marker()`, which returns a colour **and** a glyph together so
   that no caller can signal a state by colour alone. `every_state_has_a_glyph_as_well_as_a_colour` and
   `the_attention_colour_is_reserved_for_states_that_block_the_user` make that structural rather than a
-  convention.
+  convention. It also **measures the terminal cell** — `cell_size()` reads the monospace advance and line
+  height out of egui's font metrics and rounds them to whole physical pixels. The cell was a hard-coded
+  `8.0 x 17.0` until somebody put Turn next to iTerm2: the real figures are 7.82666 and 15.125, and the
+  difference was 12% of the rows and a doubled border on every box-drawn frame. There is no fallback size —
+  a pane with no measurement paints nothing, because an invented cell is invisible until it is compared.
+- **`src/terminal/geometry.rs`** — `CellGrid`, which places every cell from its own `(row, col)` rounded to
+  the pixel grid rather than by advancing a float across the row, so column *n*'s right edge is column
+  *n+1*'s left edge exactly. That is the property a box-drawing run needs, and it is unit-tested at awkward
+  cell sizes and scale factors instead of eyeballed.
+- **`src/terminal/boxdraw.rs`** — `─ │ ┌ ┼ █ ▄ ░ ╭` and the rest of U+2500–U+259F, drawn by Turn as
+  pixel-snapped bars instead of by the font. A font's box glyph is sized by the face's ascent and descent
+  while a terminal row is its line height, so stacked glyphs do not meet: the report's "loose and doubled
+  pipes". The table is derived from the Unicode names, and
+  `a_rule_is_one_crisp_column_of_pixels_rather_than_a_soft_smear` reads the rendered pixels rather than
+  trusting a recording.
 - **`src/view.rs`** — the single Workspace hierarchy, terminal painter, non-modal permission banner,
   contextual inspector, Quick Preview, temporary Pane and explicit Attention Queue overlay. The queue is
   not a persistent navigation surface.

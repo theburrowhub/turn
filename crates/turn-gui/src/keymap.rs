@@ -42,6 +42,8 @@ pub enum Command {
     OpenSettings,
 
     NewWorkspace,
+    ArchiveWorkspace,
+    CloseWorkspace,
     NewSession,
     QuickNewSession,
     SwitchSession,
@@ -65,6 +67,10 @@ pub enum Command {
     FocusPaneRight,
     FocusPaneUp,
     FocusPaneDown,
+    MovePaneLeft,
+    MovePaneRight,
+    MovePaneUp,
+    MovePaneDown,
 
     LaunchAgent,
     LaunchShell,
@@ -102,14 +108,23 @@ impl Command {
         Command::FocusPaneRight,
         Command::FocusPaneUp,
         Command::FocusPaneDown,
+        Command::MovePaneLeft,
+        Command::MovePaneRight,
+        Command::MovePaneUp,
+        Command::MovePaneDown,
         Command::LaunchAgent,
         Command::LaunchShell,
         Command::LaunchTui,
         Command::PassContext,
         Command::SaveLayoutAsTemplate,
         Command::RenameSession,
+        // The Session pair before the Workspace pair, so a search for `archive` or
+        // `close` offers the narrower target first: closing a Workspace stops every
+        // Session in it, and the palette should not put that at the top of the list.
         Command::ArchiveSession,
         Command::CloseSession,
+        Command::ArchiveWorkspace,
+        Command::CloseWorkspace,
         Command::InterruptProcess,
         Command::StopProcess,
         Command::FocusWorkspaceTree,
@@ -126,6 +141,8 @@ impl Command {
             Command::ShowKeyboardShortcuts => "help.keys",
             Command::OpenSettings => "app.settings",
             Command::NewWorkspace => "workspace.new",
+            Command::ArchiveWorkspace => "workspace.archive",
+            Command::CloseWorkspace => "workspace.close",
             Command::NewSession => "session.new",
             Command::QuickNewSession => "session.quickNew",
             Command::SwitchSession => "session.switch",
@@ -147,6 +164,10 @@ impl Command {
             Command::FocusPaneRight => "pane.focusRight",
             Command::FocusPaneUp => "pane.focusUp",
             Command::FocusPaneDown => "pane.focusDown",
+            Command::MovePaneLeft => "pane.moveLeft",
+            Command::MovePaneRight => "pane.moveRight",
+            Command::MovePaneUp => "pane.moveUp",
+            Command::MovePaneDown => "pane.moveDown",
             Command::LaunchAgent => "launch.agent",
             Command::LaunchShell => "launch.shell",
             Command::LaunchTui => "launch.tui",
@@ -166,14 +187,20 @@ impl Command {
             Command::ShowKeyboardShortcuts => "Keyboard shortcuts",
             Command::OpenSettings => "Settings",
             Command::NewWorkspace => "New workspace",
+            Command::ArchiveWorkspace => {
+                "Archive workspace — take it out of the tree, stop nothing"
+            }
+            Command::CloseWorkspace => {
+                "Close workspace — confirm before stopping every Session in it"
+            }
             Command::NewSession => "New session — pick a template",
             Command::QuickNewSession => "Quick new session — the workspace default",
             Command::SwitchSession => "Switch session",
             Command::NextSession => "Next session",
             Command::PreviousSession => "Previous session",
             Command::RenameSession => "Rename session",
-            Command::ArchiveSession => "Archive session",
-            Command::CloseSession => "End session — confirm before stopping its processes",
+            Command::ArchiveSession => "Archive session — take it out of the tree, stop nothing",
+            Command::CloseSession => "Close session — confirm before stopping its processes",
             Command::SaveLayoutAsTemplate => "Save this layout as a template",
             Command::NextAttention => "Go to the next session that needs you",
             Command::ToggleAttentionPanel => "Show or hide the attention queue",
@@ -187,6 +214,10 @@ impl Command {
             Command::FocusPaneRight => "Focus the pane to the right",
             Command::FocusPaneUp => "Focus the pane above",
             Command::FocusPaneDown => "Focus the pane below",
+            Command::MovePaneLeft => "Move pane left — move it past the pane on its left",
+            Command::MovePaneRight => "Move pane right — move it past the pane on its right",
+            Command::MovePaneUp => "Move pane up — move it above the pane over it",
+            Command::MovePaneDown => "Move pane down — move it below the pane under it",
             Command::LaunchAgent => "Launch an agent in this pane",
             Command::LaunchShell => "Launch a shell in this pane",
             Command::LaunchTui => "Launch a full-screen tool in this pane",
@@ -206,7 +237,9 @@ impl Command {
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
             | Command::FocusWorkspaceTree => "View",
-            Command::NewWorkspace => "Workspace",
+            Command::NewWorkspace | Command::ArchiveWorkspace | Command::CloseWorkspace => {
+                "Workspace"
+            }
             Command::NewSession
             | Command::QuickNewSession
             | Command::SwitchSession
@@ -226,7 +259,11 @@ impl Command {
             | Command::FocusPaneLeft
             | Command::FocusPaneRight
             | Command::FocusPaneUp
-            | Command::FocusPaneDown => "Pane",
+            | Command::FocusPaneDown
+            | Command::MovePaneLeft
+            | Command::MovePaneRight
+            | Command::MovePaneUp
+            | Command::MovePaneDown => "Pane",
             Command::LaunchAgent
             | Command::LaunchShell
             | Command::LaunchTui
@@ -331,6 +368,17 @@ impl Chord {
         }
     }
 
+    /// `Alt+Shift+key`, which is what moving something uses where `Alt+key` navigates
+    /// to it. The Shift is the rule that everything which rearranges the world takes
+    /// one, so a mistyped navigation chord cannot move a pane.
+    pub const fn alt_shift(key: Key) -> Chord {
+        Chord {
+            alt: true,
+            shift: true,
+            ..Chord::plain(key)
+        }
+    }
+
     /// Parses a chord written as text, for a user's own overrides.
     ///
     /// Case-insensitive in its modifiers and its key names, and it accepts both the
@@ -419,26 +467,37 @@ impl Chord {
         out
     }
 
-    /// The chord as the user should read it: glyphs on a Mac, words elsewhere.
+    /// The chord as the user should read it.
+    ///
+    /// Words on both platforms, including on a Mac where `⌃⌥⇧⌘` is the idiom — and that
+    /// is a decision made from measurements rather than taste. In the fonts this build
+    /// bundles, `⌥` (U+2325) and `⌃` (U+2303) have an advance of **zero** in both the
+    /// proportional and the monospace family, so they draw nothing and the character after
+    /// them lands on top; `⇧` (U+21E7) is zero in the proportional face; and `⌘` (U+2318)
+    /// has ink wider than the advance it declares, so it collides with the key beside it.
+    /// A modifier that renders as an overlap, or as nothing at all, is a shortcut the user
+    /// cannot read — which costs more than the platform idiom is worth. `Cmd` rather than
+    /// `Ctrl` on a Mac keeps Command and Control apart, which is the one distinction the
+    /// glyphs were there to make.
+    ///
+    /// [`GLYPHS_THE_BUNDLED_FONTS_CANNOT_PLACE`] and the test beside it keep this honest,
+    /// so a well-meant future change back to glyphs fails rather than ships an overlap.
     pub fn describe(&self, platform: Platform) -> String {
+        let mut parts: Vec<&str> = Vec::new();
         if platform.uses_command_key {
-            let mut out = String::new();
             if self.ctrl {
-                out.push('⌃');
+                parts.push("Ctrl");
             }
             if self.alt {
-                out.push('⌥');
+                parts.push("Opt");
             }
             if self.shift {
-                out.push('⇧');
+                parts.push("Shift");
             }
             if self.command {
-                out.push('⌘');
+                parts.push("Cmd");
             }
-            out.push_str(self.key.symbol_or_name());
-            out
         } else {
-            let mut parts: Vec<&str> = Vec::new();
             if self.command || self.ctrl {
                 parts.push("Ctrl");
             }
@@ -448,10 +507,31 @@ impl Chord {
             if self.shift {
                 parts.push("Shift");
             }
-            let key = self.key.symbol_or_name();
-            parts.push(key);
-            parts.join("+")
         }
+        parts.push(key_label(self.key));
+        parts.join("+")
+    }
+}
+
+/// The modifier glyphs the bundled fonts cannot place.
+///
+/// Measured, not assumed: `⌥` and `⌃` advance zero points in both families, `⇧` advances
+/// zero in the proportional one, and `⌘` declares a narrower advance than its ink
+/// occupies. Every one of them ends up drawn on top of its neighbour.
+pub const GLYPHS_THE_BUNDLED_FONTS_CANNOT_PLACE: &[char] = &['⌘', '⌥', '⌃', '⇧'];
+
+/// What one key is called in a shortcut.
+///
+/// `Key::symbol_or_name` gives the arrows the private-use-ish `⏴⏵⏶⏷`, which do render, but
+/// "Opt+Shift+Right" is a phrase somebody can say out loud and read in a tooltip, and an
+/// arrowhead beside two words is not.
+fn key_label(key: Key) -> &'static str {
+    match key {
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        _ => key.symbol_or_name(),
     }
 }
 
@@ -612,6 +692,13 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     shared(Command::FocusPaneRight, Chord::alt(Key::ArrowRight)),
     shared(Command::FocusPaneUp, Chord::alt(Key::ArrowUp)),
     shared(Command::FocusPaneDown, Chord::alt(Key::ArrowDown)),
+    // Moving a pane is the same gesture as going to one, with the modifier that means
+    // "and take this with you". Dragging a header does the same thing; a keyboard user
+    // must not be left with only the drag.
+    shared(Command::MovePaneLeft, Chord::alt_shift(Key::ArrowLeft)),
+    shared(Command::MovePaneRight, Chord::alt_shift(Key::ArrowRight)),
+    shared(Command::MovePaneUp, Chord::alt_shift(Key::ArrowUp)),
+    shared(Command::MovePaneDown, Chord::alt_shift(Key::ArrowDown)),
     shared(Command::LaunchAgent, Chord::cmd_shift(Key::J)),
     shared(Command::LaunchShell, Chord::cmd_shift(Key::L)),
     shared(Command::LaunchTui, Chord::cmd_shift(Key::U)),
@@ -619,6 +706,13 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     shared(Command::RenameSession, Chord::cmd_shift(Key::R)),
     shared(Command::ArchiveSession, Chord::cmd_shift(Key::Y)),
     shared(Command::CloseSession, Chord::cmd_shift(Key::K)),
+    // One level up is the same gesture plus Option: whatever `Mod+Shift+…` does to the
+    // selected Session, `Mod+Opt+Shift+…` does to its whole Workspace. Nothing to learn
+    // twice, and the wider blast radius costs the wider chord —
+    // `the_workspace_level_of_a_lifecycle_command_is_the_session_chord_plus_option` keeps
+    // the pairing true.
+    shared(Command::ArchiveWorkspace, Chord::cmd_alt_shift(Key::Y)),
+    shared(Command::CloseWorkspace, Chord::cmd_alt_shift(Key::K)),
     // Not Ctrl+C: that belongs to the process and always will. This sends the
     // interrupt through the tty to the whole foreground group.
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
@@ -1167,10 +1261,56 @@ mod tests {
     }
 
     #[test]
-    fn a_chord_reads_as_glyphs_on_a_mac_and_as_words_elsewhere() {
+    fn a_chord_reads_as_words_and_keeps_command_and_control_apart() {
         let chord = Chord::cmd_shift(Key::P);
-        assert_eq!(chord.describe(Platform::MAC), "⇧⌘P");
+        assert_eq!(chord.describe(Platform::MAC), "Shift+Cmd+P");
         assert_eq!(chord.describe(Platform::PC), "Ctrl+Shift+P");
+        // The one distinction the Mac glyphs existed to make survives.
+        assert_eq!(Chord::cmd(Key::K).describe(Platform::MAC), "Cmd+K");
+        assert_ne!(
+            Chord::cmd(Key::K).describe(Platform::MAC),
+            Chord {
+                ctrl: true,
+                ..Chord::plain(Key::K)
+            }
+            .describe(Platform::MAC)
+        );
+        // And an arrow is a word, so a shortcut can be read aloud.
+        assert_eq!(
+            Chord::alt_shift(Key::ArrowRight).describe(Platform::MAC),
+            "Opt+Shift+Right"
+        );
+        assert_eq!(
+            Chord::alt(Key::ArrowDown).describe(Platform::PC),
+            "Alt+Down"
+        );
+    }
+
+    /// The regression guard for a defect that was visible in three committed screenshots:
+    /// `⇧⌘W` drawn as one glyph on top of another, and `Opt` drawn as nothing at all,
+    /// because the bundled fonts declare a zero advance for those codepoints. No shortcut
+    /// the window shows may contain one of them.
+    #[test]
+    fn no_shortcut_is_written_with_a_glyph_the_bundled_fonts_cannot_place() {
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            for bound in keymap.bindings() {
+                let text = bound.chord.describe(platform);
+                for glyph in GLYPHS_THE_BUNDLED_FONTS_CANNOT_PLACE {
+                    assert!(
+                        !text.contains(*glyph),
+                        "{:?} reads as {text:?} on {platform:?}, and {glyph:?} \
+                         is drawn on top of whatever follows it",
+                        bound.command
+                    );
+                }
+                assert!(
+                    !text.is_empty(),
+                    "{:?} has a shortcut nobody can read",
+                    bound.command
+                );
+            }
+        }
     }
 
     #[test]
@@ -1210,6 +1350,61 @@ mod tests {
         assert_eq!(keymap.chord_for(Command::ZoomPane), None);
     }
 
+    /// Dragging a pane header is the gesture people reach for, and it is unusable
+    /// without a pointer. Every direction a pane can be moved therefore has a chord, on
+    /// both platforms, and it is never the same chord as going there without it.
+    #[test]
+    fn moving_a_pane_is_bound_in_every_direction_and_is_not_the_navigation_chord() {
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            for (move_command, focus_command) in [
+                (Command::MovePaneLeft, Command::FocusPaneLeft),
+                (Command::MovePaneRight, Command::FocusPaneRight),
+                (Command::MovePaneUp, Command::FocusPaneUp),
+                (Command::MovePaneDown, Command::FocusPaneDown),
+            ] {
+                let moving = keymap
+                    .chord_for(move_command)
+                    .unwrap_or_else(|| panic!("{move_command:?} must be reachable by keyboard"));
+                let focusing = keymap.chord_for(focus_command);
+                assert_ne!(
+                    Some(moving),
+                    focusing,
+                    "{move_command:?} shares a chord with {focus_command:?}"
+                );
+                assert!(
+                    moving.shift,
+                    "{move_command:?} rearranges the layout and must take a Shift"
+                );
+                assert!(!moving.shadows_control_character(platform));
+            }
+        }
+    }
+
+    /// The shortcut sheet and the palette are where a user learns what a command does, and
+    /// these four used to promise a swap — which is what they did, and was the complaint.
+    /// The words have to say the pane moves, or the keyboard would still be teaching the
+    /// old model of a layout whose shape cannot change.
+    #[test]
+    fn the_move_pane_commands_describe_moving_a_pane_rather_than_exchanging_two() {
+        for command in [
+            Command::MovePaneLeft,
+            Command::MovePaneRight,
+            Command::MovePaneUp,
+            Command::MovePaneDown,
+        ] {
+            let title = command.title();
+            assert!(
+                !title.contains("swap") && !title.contains("neighbour"),
+                "{command:?} still promises an exchange: {title:?}"
+            );
+            assert!(
+                title.contains("past") || title.contains("above") || title.contains("below"),
+                "{command:?} does not say where the pane ends up: {title:?}"
+            );
+        }
+    }
+
     /// Everything that changes the world takes a Shift, so a mistyped navigation
     /// chord cannot archive a session.
     #[test]
@@ -1218,14 +1413,74 @@ mod tests {
         for command in [
             Command::CloseSession,
             Command::ArchiveSession,
+            Command::CloseWorkspace,
+            Command::ArchiveWorkspace,
             Command::ClosePane,
             Command::StopProcess,
             Command::InterruptProcess,
+            Command::MovePaneLeft,
+            Command::MovePaneRight,
+            Command::MovePaneUp,
+            Command::MovePaneDown,
         ] {
             let chord = keymap
                 .chord_for(command)
                 .unwrap_or_else(|| panic!("{command:?} must be bound"));
             assert!(chord.shift, "{command:?} is one keystroke from a mistake");
+        }
+    }
+
+    /// Closing a Workspace stops every Session in it, so its chord is the Session chord
+    /// with one more modifier held: the gesture is learnt once, and the wider act costs
+    /// the wider chord rather than a letter nobody can guess.
+    #[test]
+    fn the_workspace_level_of_a_lifecycle_command_is_the_session_chord_plus_option() {
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            for (session_command, workspace_command) in [
+                (Command::ArchiveSession, Command::ArchiveWorkspace),
+                (Command::CloseSession, Command::CloseWorkspace),
+            ] {
+                let session = keymap
+                    .chord_for(session_command)
+                    .unwrap_or_else(|| panic!("{session_command:?} must be bound"));
+                let workspace = keymap
+                    .chord_for(workspace_command)
+                    .unwrap_or_else(|| panic!("{workspace_command:?} must be reachable"));
+                assert_eq!(
+                    workspace,
+                    Chord {
+                        alt: true,
+                        ..session
+                    },
+                    "{workspace_command:?} must be {session_command:?} plus the option key"
+                );
+                assert!(!workspace.shadows_control_character(platform));
+            }
+        }
+    }
+
+    /// Every act in this family is reachable from the keyboard on both platforms. A
+    /// control that only a pointer can reach is a control half the users do not have.
+    #[test]
+    fn every_way_to_take_something_out_of_the_ui_has_a_chord_on_both_platforms() {
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            for command in [
+                Command::ArchiveSession,
+                Command::CloseSession,
+                Command::ArchiveWorkspace,
+                Command::CloseWorkspace,
+            ] {
+                assert!(
+                    keymap.chord_for(command).is_some(),
+                    "{command:?} has no chord on {platform:?}"
+                );
+                assert!(
+                    Command::ALL.contains(&command),
+                    "{command:?} is missing from the palette"
+                );
+            }
         }
     }
 }

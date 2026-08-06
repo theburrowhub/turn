@@ -234,8 +234,11 @@ async fn workspace_then_two_shell_session_is_selected_leased_and_restored_from_d
     let mut restored = GuiHarness::connect(daemon.socket_path().to_path_buf());
     restored.wait_until_ready().await;
 
+    // The first daemon was stopped on purpose, so it handed the checkout back and this
+    // window opens with write access already in place. Nothing is asked of the user, and
+    // the status bar has no confirmation to offer.
     restored
-        .wait_for("the persisted tree, selection, and fenced lease", |gui| {
+        .wait_for("the persisted tree, selection, and restored lease", |gui| {
             let hierarchy = gui.desk.hierarchy()?;
             let workspace = hierarchy
                 .workspaces
@@ -252,10 +255,11 @@ async fn workspace_then_two_shell_session_is_selected_leased_and_restored_from_d
                 && session.session.mode == SessionMode::MainCheckout
                 && gui.desk.selected() == Some(&session_id)
                 && hierarchy.tree_state.selected == Some(HierarchyKey::session(session_id.clone()))
-                && lease.id == active_lease.id
                 && lease.session_id == session_id
-                && lease.state == LeaseState::RecoveryRequired)
-                .then_some(())
+                && lease.state == LeaseState::Active
+                && lease.generation > active_lease.generation
+                && gui.view().recovery_lease.is_none())
+            .then_some(())
         })
         .await;
 

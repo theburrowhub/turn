@@ -11,11 +11,13 @@ mod handoff;
 mod hierarchy;
 mod nodes;
 mod panes;
+mod scrollback;
 mod sessions;
 mod workspaces;
 
 use super::command::ClientId;
 use super::Core;
+use turn_core::model::DropZone;
 use turn_proto::{ProtoError, Request, Response};
 
 /// The result every handler returns: a typed response, or the one error shape.
@@ -304,7 +306,17 @@ impl Core {
             Request::FocusPane { session_id, target } => {
                 self.focus_pane(client, &session_id, target)
             }
-            Request::SwapPanes { session_id, a, b } => self.swap_panes(client, &session_id, &a, &b),
+            Request::RelocatePane {
+                session_id,
+                moved,
+                target,
+                zone,
+            } => self.relocate_pane(client, &session_id, &moved, &target, zone),
+            // The older spelling of a `centre` relocation, served by the same code so
+            // the two cannot drift apart.
+            Request::SwapPanes { session_id, a, b } => {
+                self.relocate_pane(client, &session_id, &a, &b, DropZone::Centre)
+            }
             Request::ZoomPane {
                 session_id,
                 pane_id,
@@ -347,6 +359,16 @@ impl Core {
                 session_id,
                 pane_id,
             } => self.detach_pane(client, &session_id, &pane_id),
+            Request::GetPaneHistory {
+                session_id,
+                pane_id,
+                offset,
+            } => self.pane_history(client, &session_id, &pane_id, offset),
+            Request::SearchPane {
+                session_id,
+                pane_id,
+                query,
+            } => self.search_pane(client, &session_id, &pane_id, &query),
 
             // ----------------------------------------------------------------- pty
             Request::WritePty {
@@ -410,6 +432,16 @@ impl Core {
                 turn,
                 note,
             } => self.correct_state(&session_id, &node_id, lifecycle, turn, note, now_ms),
+
+            // Inline images belong to another workflow, whose daemon half is still being
+            // written. Answered as unavailable rather than left out of this match: a
+            // non-exhaustive dispatch stops the whole crate compiling, which stops every
+            // other feature's tests from running. Replace this arm with the real handler —
+            // do not delete it, or the client's request has no answer at all.
+            Request::PaneImage { .. } => Err(ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "this daemon does not serve inline images yet",
+            )),
 
             // ------------------------------------------------------ user behaviour
             Request::UpdateUserActivity { context } => self.update_user_activity(context, now_ms),

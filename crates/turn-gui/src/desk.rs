@@ -45,8 +45,8 @@ use crate::terminal::feed::{Desync, PaneFeed};
 use crate::terminal::PaneAction;
 use crate::transport::{Ask, ConnectionState, Inbound};
 use crate::view::{
-    HierarchyAction, PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRestoreView,
-    SessionRow, TemporaryPaneContent, TurnView, ViewAction,
+    HierarchyAction, LifecycleConfirmation, PaneContent, PendingPermission, QueueItem,
+    SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView, ViewAction,
 };
 
 /// Something the application must do as a result.
@@ -348,10 +348,87 @@ impl Desk {
         self.sessions.iter().find(|summary| &summary.id == id)
     }
 
-    /// Whether starting any new process for a Session would violate recovery or
-    /// archival state. Every launch surface (toolbar, keymap and context action) uses
-    /// the same guard so a shortcut cannot bypass a disabled button.
-    fn session_launch_blocked(&self, session_id: &SessionId) -> bool {
+    /// The row the tree is pointing at: the window's optimistic selection when it has one,
+    /// and the daemon's persisted selection otherwise.
+    fn selected_tree_key(&self) -> Option<&HierarchyKey> {
+        self.navigation_hint.as_ref().or_else(|| {
+            self.hierarchy
+                .as_ref()
+                .and_then(|hierarchy| hierarchy.tree_state.selected.as_ref())
+        })
+    }
+
+    /// The Session a lifecycle command acts on.
+    ///
+    /// The tree's selected row when that row is a Session or one of its Processes, and the
+    /// Session whose panes are on screen otherwise. A selected *Workspace* deliberately
+    /// resolves to nothing: "the first Session in it" is not what the user pointed at, and
+    /// a command that guessed would archive or close a Session nobody named.
+    pub fn target_session(&self) -> Option<&SessionSummary> {
+        let from_tree = self.selected_tree_key().and_then(|key| match key {
+            HierarchyKey::Session { session_id } => Some(session_id.clone()),
+            HierarchyKey::Process { .. } => self
+                .hierarchy
+                .as_ref()
+                .and_then(|snapshot| session_for_key(snapshot, key)),
+            HierarchyKey::Workspace { .. } => None,
+        });
+        let id = from_tree.or_else(|| self.selected.clone())?;
+        self.sessions.iter().find(|summary| summary.id == id)
+    }
+
+    /// The Workspace a lifecycle command acts on, with its Sessions, so a confirmation can
+    /// say how much of the world it is about to reach.
+    ///
+    /// A Session or Process selection resolves to the Workspace that contains it, which is
+    /// the one the row is visibly nested under.
+    pub fn target_workspace_branch(&self) -> Option<&turn_proto::WorkspaceTreeView> {
+        let workspace_id = self.current_workspace()?;
+        self.hierarchy
+            .as_ref()?
+            .workspaces
+            .iter()
+            .find(|branch| branch.workspace.id == workspace_id)
+    }
+
+    /// The confirmation for closing the Session the tree points at, or the reason there is
+    /// none.
+    ///
+    /// A `Result` rather than an `Option` because the window must show one or the other and
+    /// never both, and because the reason belongs next to the rule that produced it rather
+    /// than at the call site.
+    pub fn end_session_confirmation(&self) -> Result<LifecycleConfirmation, &'static str> {
+        let Some(summary) = self.target_session() else {
+            return Err("select a Session in the tree before closing it");
+        };
+        if summary.status == SessionStatus::Archived {
+            return Err("this Session is archived and has nothing running; restore it first");
+        }
+        Ok(LifecycleConfirmation::end_session(summary))
+    }
+
+    /// The same for a whole Workspace. Closing one reaches every Session in it, which is
+    /// why the confirmation is built from the tree branch and not from a name.
+    pub fn stop_workspace_confirmation(&self) -> Result<LifecycleConfirmation, &'static str> {
+        let Some(branch) = self.target_workspace_branch() else {
+            return Err("select a Workspace in the tree before closing it");
+        };
+        if branch.workspace.archived {
+            return Err("this Workspace is archived and has nothing running; restore it first");
+        }
+        Ok(LifecycleConfirmation::stop_workspace(branch))
+    }
+
+    /// Whether starting a process for a Session would violate recovery or archival
+    /// state. Every launch surface (toolbar, keymap and context action) uses the same
+    /// guard so a shortcut cannot bypass a disabled button.
+    ///
+    /// `needs_checkout_write` is what the launch would actually do with the shared
+    /// checkout. Archival blocks everything — an archived Session is not a place to work
+    /// — but withheld write access only blocks what would use it. Opening a terminal is
+    /// not a write to the checkout, and blocking it left the user without the one thing
+    /// they needed to go and stop the process Turn was asking them about.
+    fn session_launch_blocked(&self, session_id: &SessionId, needs_checkout_write: bool) -> bool {
         if self
             .sessions
             .iter()
@@ -369,24 +446,44 @@ impl Desk {
                 else {
                     return false;
                 };
-                workspace.workspace.archived
-                    || self.reclaiming_leases.contains(&workspace.workspace.id)
-                    || workspace.write_lease.as_ref().is_some_and(|lease| {
-                        &lease.session_id == session_id
-                            && lease.state == LeaseState::RecoveryRequired
-                    })
-                    || session
-                        .nodes
-                        .iter()
-                        .any(|node| node.lifecycle == Lifecycle::Orphaned)
+                if workspace.workspace.archived {
+                    return true;
+                }
+                needs_checkout_write
+                    && (self.reclaiming_leases.contains(&workspace.workspace.id)
+                        || workspace.write_lease.as_ref().is_some_and(|lease| {
+                            &lease.session_id == session_id
+                                && lease.state == LeaseState::RecoveryRequired
+                        })
+                        || session
+                            .nodes
+                            .iter()
+                            .any(|node| node.lifecycle == Lifecycle::Orphaned))
             })
         })
     }
 
-    fn selected_launch_blocked(&self) -> bool {
+    fn selected_launch_blocked(&self, needs_checkout_write: bool) -> bool {
         self.selected
             .as_ref()
-            .is_some_and(|session_id| self.session_launch_blocked(session_id))
+            .is_some_and(|session_id| self.session_launch_blocked(session_id, needs_checkout_write))
+    }
+
+    /// Whether starting this node's pane again would use the Session's checkout write
+    /// authority, according to the daemon's own restore report.
+    ///
+    /// Unknown means yes: the field only ever unlocks something, so a node with no report
+    /// is treated as the gated case.
+    fn node_needs_checkout_write(&self, session_id: &SessionId, node_id: &NodeId) -> bool {
+        self.restores
+            .get(session_id)
+            .and_then(|restore| {
+                restore
+                    .panes
+                    .iter()
+                    .find(|outcome| &outcome.node_id == node_id)
+            })
+            .is_none_or(|outcome| outcome.needs_checkout_write)
     }
 
     fn node_is_orphaned(&self, session_id: &SessionId, node_id: &NodeId) -> bool {
@@ -743,6 +840,14 @@ impl Desk {
                     }
                 }
                 reactions
+            }
+            (Ask::ArchiveSession { .. } | Ask::ArchiveWorkspace { .. }, Response::Ack) => {
+                // The tree is refetched rather than edited in place. Whether an archived
+                // row still belongs in it is a question about the archived preference and
+                // about what else the daemon has, so the daemon answers it — and the row
+                // leaves, or comes back, as a consequence of the same request that decides
+                // what the tree contains.
+                vec![self.hierarchy_request()]
             }
             (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot, true),
             (_, Response::TreeState { state }) => {
@@ -2151,13 +2256,15 @@ impl Desk {
                 }
                 _ => Vec::new(),
             },
+            // Archiving acts on the row the user is looking at, which is the tree's
+            // selection — not necessarily the Session whose panes are on screen.
             Command::ArchiveSession => {
-                let Some(session_id) = session else {
-                    return Vec::new();
+                let Some(summary) = self.target_session() else {
+                    return vec![Reaction::Notice(
+                        "select a Session before archiving it".into(),
+                    )];
                 };
-                let Some(summary) = self.selected_summary() else {
-                    return Vec::new();
-                };
+                let session_id = summary.id.clone();
                 if summary.status == SessionStatus::Archived {
                     return vec![Reaction::Notice("this Session is already archived".into())];
                 }
@@ -2180,31 +2287,60 @@ impl Desk {
                     )];
                 }
                 vec![Reaction::Send {
-                    ask: Ask::Action("archiving the session"),
+                    ask: Ask::ArchiveSession { archived: true },
                     request: Request::ArchiveSession {
                         session_id,
                         archived: true,
                     },
                 }]
             }
-            Command::CloseSession => match session {
-                Some(session_id) => vec![Reaction::Send {
-                    ask: Ask::Action("closing the session"),
-                    request: Request::CloseSession {
-                        session_id,
-                        // The processes keep running. "Close" is ambiguous and the safe
-                        // reading is the one that cannot destroy work; stopping them is
-                        // a separate, named command.
-                        disposition: CloseDisposition::KeepProcesses,
-                    },
-                }],
-                None => Vec::new(),
-            },
-            Command::SplitHorizontal | Command::SplitVertical => {
-                if self.selected_launch_blocked() {
+            Command::ArchiveWorkspace => {
+                let Some(branch) = self.target_workspace_branch() else {
                     return vec![Reaction::Notice(
-                        "restore this Session and confirm recovery before starting another pane"
-                            .into(),
+                        "select a Workspace before archiving it".into(),
+                    )];
+                };
+                let workspace_id = branch.workspace.id.clone();
+                if branch.workspace.archived {
+                    return vec![Reaction::Notice(
+                        "this Workspace is already archived".into(),
+                    )];
+                }
+                let running: usize = branch
+                    .sessions
+                    .iter()
+                    .map(|session| session.session.running_count)
+                    .sum();
+                if running > 0 {
+                    return vec![Reaction::Notice(
+                        "end the Workspace's Sessions before archiving it".into(),
+                    )];
+                }
+                if branch.write_lease.is_some() {
+                    return vec![Reaction::Notice(
+                        "release the Workspace's write lease before archiving it".into(),
+                    )];
+                }
+                vec![Reaction::Send {
+                    ask: Ask::ArchiveWorkspace { archived: true },
+                    request: Request::ArchiveWorkspace {
+                        workspace_id,
+                        archived: true,
+                    },
+                }]
+            }
+            // Nothing here. Both of these stop processes, and the only thing allowed to
+            // do that is an accepted confirmation, which the window opens from
+            // [`Desk::end_session_confirmation`] and [`Desk::stop_workspace_confirmation`]
+            // and delivers back as a [`ViewAction`]. A command that closed on the
+            // keystroke would be a process stopped by surprise.
+            Command::CloseSession | Command::CloseWorkspace => Vec::new(),
+            Command::SplitHorizontal | Command::SplitVertical => {
+                // A split opens a shell with no command in it, so it needs no write
+                // authority; only an archived Session refuses it.
+                if self.selected_launch_blocked(false) {
+                    return vec![Reaction::Notice(
+                        "restore this Session before starting another pane".into(),
                     )];
                 }
                 let Some((session_id, pane_id)) = session.zip(pane) else {
@@ -2287,20 +2423,55 @@ impl Desk {
                     None => Vec::new(),
                 }
             }
-            Command::LaunchAgent | Command::LaunchShell | Command::LaunchTui => {
-                if self.selected_launch_blocked() {
-                    return vec![Reaction::Notice(
-                        "restore this Session and confirm recovery before starting another process"
-                            .into(),
-                    )];
-                }
-                let Some((session_id, pane_id)) = session.zip(pane) else {
+            Command::MovePaneLeft
+            | Command::MovePaneRight
+            | Command::MovePaneUp
+            | Command::MovePaneDown => {
+                let Some((session_id, from)) = session.zip(pane) else {
                     return Vec::new();
                 };
+                // The same request the drag sends, with the target and the zone worked out
+                // from the same geometry the directional focus commands use — so the
+                // keyboard is the accessible path to the same rearrangement rather than a
+                // degraded alias for exchanging two panes. See
+                // [`crate::panes::relocation`] for what "there is nothing on that side"
+                // means: the pane goes to the outer edge of the layout, and only a pane
+                // that already spans that edge alone has nowhere to go. The daemon does
+                // the move; the window never rearranges its own copy of the layout, or the
+                // two would disagree the moment a request failed.
+                match crate::view::relocation_for(&self.arrangement, &from, command) {
+                    Some((target, zone)) => vec![Reaction::Send {
+                        ask: Ask::Action("moving the pane"),
+                        request: Request::RelocatePane {
+                            session_id,
+                            moved: from,
+                            target,
+                            zone,
+                        },
+                    }],
+                    None => vec![Reaction::Notice(
+                        "this pane already spans that edge of the layout".into(),
+                    )],
+                }
+            }
+            Command::LaunchAgent | Command::LaunchShell | Command::LaunchTui => {
                 let kind = match command {
                     Command::LaunchAgent => PaneKind::Agent,
                     Command::LaunchTui => PaneKind::Tui,
                     _ => PaneKind::Shell,
+                };
+                // An agent, or a tool the pane will name, runs against the checkout. A
+                // plain shell does not, so it starts while write access is still pending.
+                if self.selected_launch_blocked(kind != PaneKind::Shell) {
+                    return vec![Reaction::Notice(if kind == PaneKind::Shell {
+                        "restore this Session before starting another process".into()
+                    } else {
+                        "confirm main-checkout write access before starting an agent or a tool"
+                            .to_string()
+                    })];
+                }
+                let Some((session_id, pane_id)) = session.zip(pane) else {
+                    return Vec::new();
                 };
                 // A split with something in it, rather than a "run this" verb: a process
                 // starts from a pane definition the user chose.
@@ -2446,9 +2617,13 @@ impl Desk {
                 node_id,
                 resume,
             } => {
-                if self.session_launch_blocked(&session_id) {
+                if self.session_launch_blocked(
+                    &session_id,
+                    self.node_needs_checkout_write(&session_id, &node_id),
+                ) {
                     return vec![Reaction::Notice(
-                        "restore this Session and confirm recovery before starting the pane".into(),
+                        "restore this Session and confirm write access before starting the pane"
+                            .into(),
                     )];
                 }
                 if !self.relaunching.insert(node_id.clone()) {
@@ -2491,11 +2666,10 @@ impl Desk {
                     }
                 }
                 vec![Reaction::Send {
-                    ask: Ask::Action(if archived {
-                        "archiving the Session"
-                    } else {
-                        "restoring the Session"
-                    }),
+                    // Nothing is stopped here, and nothing may be: archiving is the
+                    // reversible half of this pair, and the request carries no
+                    // disposition to argue about.
+                    ask: Ask::ArchiveSession { archived },
                     request: Request::ArchiveSession {
                         session_id,
                         archived,
@@ -2506,11 +2680,7 @@ impl Desk {
                 workspace_id,
                 archived,
             } => vec![Reaction::Send {
-                ask: Ask::Action(if archived {
-                    "archiving the Workspace"
-                } else {
-                    "restoring the Workspace"
-                }),
+                ask: Ask::ArchiveWorkspace { archived },
                 request: Request::ArchiveWorkspace {
                     workspace_id,
                     archived,
@@ -2702,6 +2872,49 @@ impl Desk {
                 }],
                 None => Vec::new(),
             },
+            ViewAction::ClosePane { pane_id } => {
+                let Some(session_id) = self
+                    .session_of_pane(&pane_id)
+                    .or_else(|| self.selected.clone())
+                else {
+                    return Vec::new();
+                };
+                // `KeepProcesses`, always. Closing a view is not stopping what it was
+                // showing, and the header control that produces this says so.
+                vec![Reaction::Send {
+                    ask: Ask::Action("closing the pane"),
+                    request: Request::ClosePane {
+                        session_id,
+                        pane_id,
+                        disposition: CloseDisposition::KeepProcesses,
+                    },
+                }]
+            }
+            ViewAction::RelocatePane {
+                moved,
+                target,
+                zone,
+            } => {
+                // A pane dropped on itself is not a move, and must not cost a round trip.
+                if moved == target {
+                    return Vec::new();
+                }
+                let Some(session_id) = self
+                    .session_of_pane(&moved)
+                    .or_else(|| self.selected.clone())
+                else {
+                    return Vec::new();
+                };
+                vec![Reaction::Send {
+                    ask: Ask::Action("moving the pane"),
+                    request: Request::RelocatePane {
+                        session_id,
+                        moved,
+                        target,
+                        zone,
+                    },
+                }]
+            }
             ViewAction::ChooseWorkspaceDirectory
             | ViewAction::OpenLayoutEditor(_)
             | ViewAction::CloseLayoutEditor
@@ -3128,8 +3341,8 @@ mod tests {
     use turn_core::event::{Confidence, Risk};
     use turn_core::ids::{AttentionId, WorkspaceId};
     use turn_core::model::{
-        NodeKind, Pane, PaneNodeBinding, PendingPermission as CorePermission, ProcessNode,
-        Relation, Session, Template, Workspace,
+        DropZone, NodeKind, Pane, PaneNodeBinding, PendingPermission as CorePermission,
+        ProcessNode, Relation, Session, Template, Workspace,
     };
     use turn_core::state::{AwaitingReason, Lifecycle, Turn};
     use turn_core::Effect;
@@ -3941,10 +4154,17 @@ mod tests {
         assert_eq!(sent(&changed).len(), 1);
     }
 
-    /// "Close" is ambiguous, and the reading that cannot destroy work is the right one.
-    #[test]
-    fn closing_a_session_keeps_the_processes_running() {
-        let (session, _, _) = session_with_agent("Keep my work");
+    /// A session of two side-by-side panes, drawn once so the arrangement exists.
+    fn two_pane_session() -> (Desk, Session, PaneId, PaneId) {
+        let left = Pane::new(PaneKind::Shell).with_title("left");
+        let left_id = left.id.clone();
+        let mut session = Session::new(workspace(), "Move me", "/repo", Layout::single(left), T0);
+        let right = Pane::new(PaneKind::Shell).with_title("right");
+        let right_id = right.id.clone();
+        session.layout.split(&left_id, Direction::Horizontal, right);
+        // The daemon says which pane has focus, and a directional command is about that
+        // pane. Leaving it unset would make this a test of "nothing is selected".
+        session.layout.active = Some(left_id.clone());
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -3952,12 +4172,596 @@ mod tests {
             }),
             T0,
         );
-        match sent(&desk.dispatch(Command::CloseSession, T0)).as_slice() {
-            [Request::CloseSession { disposition, .. }] => {
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        // The geometry the window drew. Directional commands are answered from it rather
+        // than from tree order, so a test that skipped this would be testing nothing.
+        let arrangement = desk.arrange(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 600.0),
+        ));
+        desk.remember_arrangement(arrangement);
+        (desk, session, left_id, right_id)
+    }
+
+    /// A session of three panes: one tall on the left, two stacked on the right, drawn
+    /// once so the arrangement exists. The shape a keyboard move has to be able to change.
+    fn three_pane_session() -> (Desk, Session, PaneId, PaneId, PaneId) {
+        let tall = Pane::new(PaneKind::Shell).with_title("tall");
+        let tall_id = tall.id.clone();
+        let mut session = Session::new(workspace(), "Move me", "/repo", Layout::single(tall), T0);
+        let top = Pane::new(PaneKind::Shell).with_title("top");
+        let top_id = top.id.clone();
+        session.layout.split(&tall_id, Direction::Horizontal, top);
+        let bottom = Pane::new(PaneKind::Shell).with_title("bottom");
+        let bottom_id = bottom.id.clone();
+        session.layout.split(&top_id, Direction::Vertical, bottom);
+        session.layout.active = Some(bottom_id.clone());
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        let arrangement = desk.arrange(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 600.0),
+        ));
+        desk.remember_arrangement(arrangement);
+        (desk, session, tall_id, top_id, bottom_id)
+    }
+
+    /// The keyboard equivalent of dragging a header, and it has to be the *same*
+    /// operation: a relocation naming a zone, not an exchange of two panes. Drag-only
+    /// would be unusable without a pointer, and the daemon is the one that rearranges the
+    /// tree either way.
+    #[test]
+    fn moving_a_pane_by_keyboard_relocates_it_past_the_neighbour_on_that_side() {
+        let (mut desk, session, left, right) = two_pane_session();
+        match sent(&desk.dispatch(Command::MovePaneRight, T0)).as_slice() {
+            [Request::RelocatePane {
+                session_id,
+                moved,
+                target,
+                zone,
+            }] => {
+                assert_eq!(session_id, &session.id);
+                assert_eq!(moved, &left, "the active pane is the one that moves");
+                assert_eq!(
+                    target, &right,
+                    "and it is relocated against the pane actually on that side"
+                );
+                assert_eq!(
+                    zone,
+                    &DropZone::Right,
+                    "past that pane, not into the side of it that it already occupies"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The reading that makes the keyboard a first-class path: with nothing above either
+    /// pane of a row, "move up" turns the row into a column instead of doing nothing. A
+    /// keyboard that refused here could never change a layout's orientation at all.
+    #[test]
+    fn moving_a_pane_of_a_row_upwards_relocates_it_to_the_top_of_the_layout() {
+        let (mut desk, session, left, right) = two_pane_session();
+        match sent(&desk.dispatch(Command::MovePaneUp, T0)).as_slice() {
+            [Request::RelocatePane {
+                session_id,
+                moved,
+                target,
+                zone,
+            }] => {
+                assert_eq!(session_id, &session.id);
+                assert_eq!(moved, &left);
+                assert_eq!(target, &right);
+                assert_eq!(zone, &DropZone::Above);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Focus belongs to the daemon, and a directional command is about the pane that has
+    /// it, so a test that wants to move a different pane has to be told about it the way
+    /// the window would be.
+    fn focus_pane(desk: &mut Desk, session: &mut Session, pane: &PaneId) {
+        session.layout.active = Some(pane.clone());
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(session)),
+            }),
+            T0,
+        );
+        let arrangement = desk.arrange(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 600.0),
+        ));
+        desk.remember_arrangement(arrangement);
+    }
+
+    /// The one case with nowhere to go: the pane already spans that edge of the layout on
+    /// its own. The window says so rather than sending a request that could only be
+    /// refused, and rather than wrapping the pane round to the far side.
+    #[test]
+    fn a_pane_that_already_spans_an_edge_alone_reports_that_it_cannot_move_further() {
+        let (mut desk, mut session, tall, _top, _bottom) = three_pane_session();
+        focus_pane(&mut desk, &mut session, &tall);
+
+        let nothing = desk.dispatch(Command::MovePaneLeft, T0);
+        assert!(sent(&nothing).is_empty(), "it sent a request anyway");
+        assert!(
+            nothing
+                .iter()
+                .any(|reaction| matches!(reaction, Reaction::Notice(_))),
+            "it said nothing about doing nothing"
+        );
+    }
+
+    /// A pane nested in a column, moved along the axis the column does not run in: it
+    /// leaves the column. This is the rearrangement that was impossible before — the
+    /// layout's shape used to be fixed at creation.
+    #[test]
+    fn moving_a_nested_pane_out_of_its_column_names_the_pane_owning_that_edge() {
+        let (mut desk, session, tall, top, bottom) = three_pane_session();
+        // Within the column there is a neighbour, and the two exchange ends of it.
+        match sent(&desk.dispatch(Command::MovePaneUp, T0)).as_slice() {
+            [Request::RelocatePane {
+                moved,
+                target,
+                zone,
+                ..
+            }] => {
+                assert_eq!(moved, &bottom);
+                assert_eq!(target, &top);
+                assert_eq!(zone, &DropZone::Above);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Downwards there is nothing below it, so it goes to the outer edge: beside the
+        // tall pane, which is what owns the bottom of the layout.
+        match sent(&desk.dispatch(Command::MovePaneDown, T0)).as_slice() {
+            [Request::RelocatePane {
+                session_id,
+                moved,
+                target,
+                zone,
+            }] => {
+                assert_eq!(session_id, &session.id);
+                assert_eq!(moved, &bottom);
+                assert_eq!(target, &tall);
+                assert_eq!(zone, &DropZone::Below);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The same move, from the header drag. It names both panes and the zone, so the daemon
+    /// is never asked to guess which one was dropped where, or where in it.
+    #[test]
+    fn dropping_a_pane_on_a_region_of_another_asks_for_exactly_that_relocation() {
+        let (mut desk, session, left, right) = two_pane_session();
+        for zone in [
+            DropZone::Left,
+            DropZone::Right,
+            DropZone::Above,
+            DropZone::Below,
+            DropZone::Centre,
+        ] {
+            match sent(&desk.apply_view_action(
+                ViewAction::RelocatePane {
+                    moved: right.clone(),
+                    target: left.clone(),
+                    zone,
+                },
+                T0,
+            ))
+            .as_slice()
+            {
+                [Request::RelocatePane {
+                    session_id,
+                    moved,
+                    target,
+                    zone: sent_zone,
+                }] => {
+                    assert_eq!(session_id, &session.id);
+                    assert_eq!(moved, &right);
+                    assert_eq!(target, &left);
+                    assert_eq!(sent_zone, &zone);
+                }
+                other => panic!("got {other:?}"),
+            }
+        }
+        // A pane dropped back on itself is not a move, and must not cost a round trip.
+        assert!(sent(&desk.apply_view_action(
+            ViewAction::RelocatePane {
+                moved: left.clone(),
+                target: left,
+                zone: DropZone::Left,
+            },
+            T0,
+        ))
+        .is_empty());
+    }
+
+    /// The architecture's own rule, checked at the seam it matters: the window sends the
+    /// request and keeps the layout it has until the daemon answers. A window that moved
+    /// the pane optimistically and then received a different layout would flicker.
+    #[test]
+    fn relocating_a_pane_does_not_move_the_windows_own_copy_of_the_layout() {
+        let (mut desk, session, left, right) = two_pane_session();
+        let before = desk.layout().cloned().expect("a layout was pushed");
+
+        let reactions = desk.apply_view_action(
+            ViewAction::RelocatePane {
+                moved: left.clone(),
+                target: right.clone(),
+                zone: DropZone::Below,
+            },
+            T0,
+        );
+        assert_eq!(sent(&reactions).len(), 1);
+        assert_eq!(
+            desk.layout(),
+            Some(&before),
+            "the window must not rearrange its own copy"
+        );
+
+        // And when the daemon answers, the window renders what it decided — including a
+        // shape the window could not have produced on its own.
+        let mut moved = before.clone();
+        assert!(moved.relocate(&left, &right, DropZone::Below));
+        desk.apply_inbound(
+            answer(Response::Layout {
+                session_id: session.id.clone(),
+                layout: moved.clone(),
+            }),
+            T0,
+        );
+        assert_eq!(desk.layout(), Some(&moved));
+        assert!(desk.layout().expect("a layout").sizes_are_normalised());
+    }
+
+    /// The close control on a pane header closes *that* pane, and the process it was
+    /// showing keeps running — which is the promise the tooltip makes.
+    #[test]
+    fn closing_one_pane_from_its_header_keeps_its_process_running() {
+        let (mut desk, session, _, right) = two_pane_session();
+        match sent(&desk.apply_view_action(
+            ViewAction::ClosePane {
+                pane_id: right.clone(),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::ClosePane {
+                session_id,
+                pane_id,
+                disposition,
+            }] => {
+                assert_eq!(session_id, &session.id);
+                assert_eq!(pane_id, &right, "the named pane, not whichever is active");
                 assert_eq!(*disposition, CloseDisposition::KeepProcesses);
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// The same Session with nothing running in it, which is the state archiving requires.
+    fn with_nothing_running(mut session: Session) -> Session {
+        let nodes: Vec<NodeId> = session.tree.iter().map(|node| node.id.clone()).collect();
+        for node in nodes {
+            if let Some(process) = session.tree.get_mut(&node) {
+                process.lifecycle = Lifecycle::Exited { code: 0 };
+                process.turn = None;
+            }
+        }
+        session
+    }
+
+    /// A tree of one Workspace holding `sessions`, with one row selected.
+    ///
+    /// Built through the same protocol answer the daemon sends, so the tests below
+    /// exercise the projection the window actually navigates rather than a second model
+    /// assembled for their convenience.
+    fn hierarchy_of(sessions: &[&Session], selected: Option<HierarchyKey>) -> Inbound {
+        let mut project = Workspace::new("project", "/repo", T0);
+        project.id = workspace();
+        let summaries: Vec<SessionSummary> =
+            sessions.iter().map(|session| summary(session, 0)).collect();
+        answer(Response::Hierarchy {
+            snapshot: Box::new(HierarchySnapshot {
+                revision: 1,
+                tree_state: TreeSurfaceState {
+                    surface_id: "main-window".into(),
+                    selected,
+                    expanded: vec![HierarchyKey::workspace(project.id.clone())],
+                },
+                workspaces: vec![WorkspaceTreeView {
+                    workspace: WorkspaceSummary::from_workspace(&project, &summaries),
+                    checkouts: Vec::new(),
+                    write_lease: None,
+                    sessions: sessions
+                        .iter()
+                        .zip(summaries)
+                        .map(|(session, summary)| SessionTreeView {
+                            session: summary,
+                            nodes: TreeNodeView::for_session(session, T0),
+                        })
+                        .collect(),
+                }],
+            }),
+        })
+    }
+
+    /// The rule that makes the pair of controls on every row safe to click: closing is the
+    /// only thing that stops a process, and the keystroke does not close. It opens the
+    /// question, and only an accepted answer sends anything.
+    #[test]
+    fn a_close_command_stops_nothing_until_its_confirmation_is_accepted() {
+        let (session, _, _) = session_with_agent("Keep my work");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+
+        assert_eq!(
+            sent(&desk.dispatch(Command::CloseSession, T0)),
+            Vec::new(),
+            "the keystroke may not terminate anything on its own"
+        );
+        assert_eq!(
+            sent(&desk.dispatch(Command::CloseWorkspace, T0)),
+            Vec::new(),
+            "and neither may the Workspace-wide one"
+        );
+
+        // What it does instead: name what would be stopped.
+        let confirmation = desk
+            .end_session_confirmation()
+            .expect("the selected Session can be closed");
+        assert_eq!(
+            confirmation,
+            LifecycleConfirmation::EndSession {
+                session_id: session.id.clone(),
+                name: "Keep my work".into(),
+                running_count: 1,
+            }
+        );
+
+        // And accepting it is the one path that terminates.
+        match sent(&desk.apply_view_action(
+            ViewAction::CloseSession {
+                session_id: session.id.clone(),
+                disposition: CloseDisposition::Terminate,
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::CloseSession {
+                session_id,
+                disposition: CloseDisposition::Terminate,
+            }] => assert_eq!(session_id, &session.id),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Taking a row out of the tree is not stopping the work in it. Nothing in the archive
+    /// path carries a disposition, so there is no version of this that could terminate.
+    #[test]
+    fn archiving_from_the_tree_selection_asks_for_nothing_to_be_stopped() {
+        // Archiving requires that nothing is running, which is the point: it is what the
+        // action does *not* have to stop in order to work.
+        let idle = with_nothing_running(session_with_agent("Finished last week").0);
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&idle], Some(HierarchyKey::session(idle.id.clone()))),
+            T0,
+        );
+
+        match sent(&desk.dispatch(Command::ArchiveSession, T0)).as_slice() {
+            [Request::ArchiveSession {
+                session_id,
+                archived: true,
+            }] => assert_eq!(session_id, &idle.id),
+            other => panic!("got {other:?}"),
+        }
+        match sent(&desk.dispatch(Command::ArchiveWorkspace, T0)).as_slice() {
+            [Request::ArchiveWorkspace {
+                workspace_id,
+                archived: true,
+            }] => assert_eq!(workspace_id, &workspace()),
+            other => panic!("got {other:?}"),
+        }
+
+        // The negative half, which is the product rule: no archive path asks for a stop.
+        for command in [Command::ArchiveSession, Command::ArchiveWorkspace] {
+            for request in sent(&desk.dispatch(command, T0)) {
+                assert!(
+                    !matches!(
+                        request,
+                        Request::CloseSession { .. }
+                            | Request::CloseWorkspace { .. }
+                            | Request::TerminateNode { .. }
+                            | Request::InterruptNode { .. }
+                    ),
+                    "{command:?} sent {request:?}"
+                );
+            }
+        }
+    }
+
+    /// Archiving something that is still working is refused with a reason rather than
+    /// quietly stopping it to make the archive possible.
+    #[test]
+    fn archiving_something_that_is_still_running_says_so_and_sends_nothing() {
+        let (running, _, _) = session_with_agent("Still working");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&running], Some(HierarchyKey::session(running.id.clone()))),
+            T0,
+        );
+
+        for command in [Command::ArchiveSession, Command::ArchiveWorkspace] {
+            let reactions = desk.dispatch(command, T0);
+            assert_eq!(sent(&reactions), Vec::new(), "{command:?} sent a request");
+            assert!(
+                matches!(reactions.as_slice(), [Reaction::Notice(message)] if message.contains("end the")),
+                "{command:?} gave {reactions:?}"
+            );
+        }
+    }
+
+    /// An archived row has to leave the tree, and the tree is the daemon's answer. The
+    /// acknowledgement therefore asks again, carrying the archived preference — the same
+    /// request that decides what the tree contains.
+    #[test]
+    fn an_archive_acknowledgement_refetches_the_tree_under_the_archived_preference() {
+        let mut desk = Desk::new();
+        for ask in [
+            Ask::ArchiveSession { archived: true },
+            Ask::ArchiveWorkspace { archived: true },
+        ] {
+            match sent(&desk.apply_inbound(
+                Inbound::Answer {
+                    ask: ask.clone(),
+                    response: Box::new(Response::Ack),
+                },
+                T0,
+            ))
+            .as_slice()
+            {
+                [Request::GetHierarchy {
+                    include_archived: false,
+                    ..
+                }] => {}
+                other => panic!("{ask:?} gave {other:?}"),
+            }
+        }
+
+        // And a refusal names the act rather than arriving as a bare protocol message, which
+        // is the other half of why these are typed asks and not `Ask::Action`.
+        let reactions = desk.apply_inbound(
+            Inbound::Failed {
+                ask: Ask::ArchiveSession { archived: true },
+                error: turn_proto::ProtoError::new(
+                    turn_proto::ErrorCode::Conflict,
+                    "the Session still holds the write lease",
+                ),
+            },
+            T0,
+        );
+        match reactions.as_slice() {
+            [Reaction::Notice(message)] => {
+                assert!(message.contains("archiving the session"), "got {message}");
+                assert!(message.contains("write lease"), "got {message}");
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        // With the preference on, the same acknowledgement asks for the archived rows, so
+        // restoring one shows it again instead of leaving a gap where it used to be.
+        desk.apply_view_action(ViewAction::SetArchivedVisibility { include: true }, T0);
+        match sent(&desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::ArchiveSession { archived: false },
+                response: Box::new(Response::Ack),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::GetHierarchy {
+                include_archived: true,
+                ..
+            }] => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// The tree's selection is what these act on, not whichever Session happens to own the
+    /// panes on screen. Selecting a row and pressing the chord must not reach past it.
+    #[test]
+    fn a_lifecycle_command_acts_on_the_row_the_tree_is_pointing_at() {
+        let (visible, _, _) = session_with_agent("On screen");
+        let (other, _, _) = session_with_agent("Selected in the tree");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(
+                &[&visible, &other],
+                Some(HierarchyKey::session(visible.id.clone())),
+            ),
+            T0,
+        );
+        desk.select(visible.id.clone());
+        desk.set_navigation_hint(Some(HierarchyKey::session(other.id.clone())));
+
+        assert_eq!(
+            desk.target_session().map(|summary| summary.id.clone()),
+            Some(other.id.clone()),
+            "the row the user is pointing at wins over the panes on screen"
+        );
+        assert_eq!(
+            desk.end_session_confirmation()
+                .expect("a Session is selected"),
+            LifecycleConfirmation::EndSession {
+                session_id: other.id.clone(),
+                name: "Selected in the tree".into(),
+                running_count: 1,
+            }
+        );
+
+        // A selected Workspace names no Session: "the first one in it" is not the row the
+        // user pointed at, and closing it would end work nobody named.
+        desk.set_navigation_hint(Some(HierarchyKey::workspace(workspace())));
+        assert_eq!(
+            desk.target_session().map(|summary| summary.id.clone()),
+            Some(visible.id.clone()),
+            "with a Workspace selected it falls back to the Session on screen, not to a guess"
+        );
+    }
+
+    /// Closing a Workspace reaches every Session in it, so the confirmation counts them.
+    #[test]
+    fn the_workspace_confirmation_counts_the_sessions_it_would_reach() {
+        let (busy, _, _) = session_with_agent("Fix climbing bugs");
+        let (also_busy, _, _) = session_with_agent("Review the physics");
+        let quiet = with_nothing_running(session_with_agent("Nothing running here").0);
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(
+                &[&busy, &also_busy, &quiet],
+                Some(HierarchyKey::workspace(workspace())),
+            ),
+            T0,
+        );
+
+        assert_eq!(
+            desk.stop_workspace_confirmation()
+                .expect("a Workspace is selected"),
+            LifecycleConfirmation::StopWorkspace {
+                workspace_id: workspace(),
+                name: "project".into(),
+                session_count: 3,
+                running_sessions: 2,
+                running_processes: 2,
+            }
+        );
     }
 
     /// Nothing relaunches on its own: no push and no command produces one.
@@ -3982,6 +4786,7 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("cargo watch -x test".into()),
+                    needs_checkout_write: true,
                 }],
             })),
             T0,
@@ -4105,6 +4910,110 @@ mod tests {
         );
     }
 
+    /// While write access is pending, the Session is still usable. A pane that would only
+    /// open the user's own shell starts; the one that would run an agent against the
+    /// shared checkout waits, and says so.
+    #[test]
+    fn pending_write_access_holds_back_only_the_panes_that_would_use_the_checkout() {
+        let (session, _, agent_node) = session_with_agent("Recovering writer");
+        let shell_node = NodeId::from_stored("proc_recovering_shell");
+        let mut project = Workspace::new("project", "/repo", T0);
+        project.id = session.workspace_id.clone();
+        let summary = summary(&session, 0);
+        let mut lease = turn_core::model::WorkspaceWriteLease::active(
+            session.workspace_id.clone(),
+            session.id.clone(),
+            session.checkout_id.clone(),
+            T0,
+        );
+        lease.state = LeaseState::RecoveryRequired;
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary.clone()],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot {
+                    revision: 1,
+                    tree_state: TreeSurfaceState::empty("main-window"),
+                    workspaces: vec![WorkspaceTreeView {
+                        workspace: WorkspaceSummary::from_workspace(
+                            &project,
+                            std::slice::from_ref(&summary),
+                        ),
+                        checkouts: Vec::new(),
+                        write_lease: Some(lease),
+                        sessions: vec![SessionTreeView {
+                            session: summary,
+                            nodes: TreeNodeView::for_session(&session, T0),
+                        }],
+                    }],
+                }),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::RestoreResult {
+                session_id: session.id.clone(),
+                state: turn_core::model::RestoreState::LayoutOnly,
+                needs_explanation: true,
+                panes: vec![
+                    turn_proto::PaneRestoreOutcome {
+                        pane_id: PaneId::from_stored("pane_recovering_agent"),
+                        node_id: agent_node.clone(),
+                        lifecycle: Lifecycle::Lost,
+                        can_relaunch: true,
+                        command: Some("claude".into()),
+                        needs_checkout_write: true,
+                    },
+                    turn_proto::PaneRestoreOutcome {
+                        pane_id: PaneId::from_stored("pane_recovering_shell"),
+                        node_id: shell_node.clone(),
+                        lifecycle: Lifecycle::Lost,
+                        can_relaunch: true,
+                        command: None,
+                        needs_checkout_write: false,
+                    },
+                ],
+            })),
+            T0,
+        );
+
+        let shell = desk.apply_view_action(
+            ViewAction::RelaunchNode {
+                session_id: session.id.clone(),
+                node_id: shell_node.clone(),
+                resume: false,
+            },
+            T0 + 1,
+        );
+        assert!(
+            matches!(
+                sent(&shell).as_slice(),
+                [Request::RelaunchNode { node_id, .. }] if node_id == &shell_node
+            ),
+            "a terminal writes nothing to the checkout, so it must not wait for write access: {shell:?}"
+        );
+
+        let agent = desk.apply_view_action(
+            ViewAction::RelaunchNode {
+                session_id: session.id.clone(),
+                node_id: agent_node,
+                resume: false,
+            },
+            T0 + 2,
+        );
+        assert!(sent(&agent).is_empty());
+        assert!(
+            matches!(agent.as_slice(), [Reaction::Notice(message)] if message.contains("write access")),
+            "the refusal has to say what is missing: {agent:?}"
+        );
+    }
+
     #[test]
     fn resolving_restore_never_attaches_until_the_replacement_layout_arrives() {
         let (session, pane_id, old_node) = session_with_agent("Recovered pane");
@@ -4132,6 +5041,7 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("claude".into()),
+                    needs_checkout_write: true,
                 }],
             })),
             T0,

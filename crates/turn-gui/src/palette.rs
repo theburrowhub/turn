@@ -435,9 +435,102 @@ mod tests {
         assert!(ranked.contains(&Command::NewSession));
     }
 
+    /// The row controls have a keyboard half, and the palette is where a user goes looking
+    /// for it. Both levels of both acts have to be findable by the word a person would type,
+    /// and the narrower target — the Session — has to come first: closing a Workspace stops
+    /// every Session in it, and that does not belong at the top of a list.
+    #[test]
+    fn typing_close_or_archive_offers_the_session_and_the_workspace() {
+        let archiving = ranked("archive");
+        assert_eq!(
+            archiving.first(),
+            Some(&Command::ArchiveSession),
+            "got {archiving:?}"
+        );
+        assert!(
+            archiving.contains(&Command::ArchiveWorkspace),
+            "the Workspace level must be findable too; got {archiving:?}"
+        );
+        assert!(
+            archiving.iter().position(|c| *c == Command::ArchiveSession)
+                < archiving
+                    .iter()
+                    .position(|c| *c == Command::ArchiveWorkspace),
+            "the narrower target comes first; got {archiving:?}"
+        );
+
+        let closing = ranked("close");
+        for command in [
+            Command::CloseSession,
+            Command::CloseWorkspace,
+            Command::ClosePane,
+        ] {
+            assert!(
+                closing.contains(&command),
+                "{command:?} must be findable by typing `close`; got {closing:?}"
+            );
+        }
+        assert!(
+            closing.iter().position(|c| *c == Command::CloseSession)
+                < closing.iter().position(|c| *c == Command::CloseWorkspace),
+            "got {closing:?}"
+        );
+
+        // And by the word the owner used for it, which is not the word in every title.
+        assert!(
+            ranked("workspace").contains(&Command::CloseWorkspace),
+            "got {:?}",
+            ranked("workspace")
+        );
+    }
+
+    /// Whatever the ranking does, the palette must never leave a user believing that
+    /// archiving stops work or that closing does not.
+    #[test]
+    fn every_lifecycle_command_says_in_its_own_title_what_it_does_to_a_process() {
+        for command in [Command::ArchiveSession, Command::ArchiveWorkspace] {
+            assert!(
+                command.title().contains("stop nothing"),
+                "{command:?} reads as {:?}",
+                command.title()
+            );
+        }
+        for command in [Command::CloseSession, Command::CloseWorkspace] {
+            let title = command.title();
+            assert!(
+                title.contains("confirm") && title.contains("stopping"),
+                "{command:?} reads as {title:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_query_matching_nothing_returns_nothing_rather_than_everything() {
         assert!(ranked("zzqqxx").is_empty());
+    }
+
+    /// Dragging a pane header is the gesture, and it is unusable without a pointer. The
+    /// keyboard equivalent has to be findable by the word a person would type, in all four
+    /// directions, or it is a feature only the shortcut sheet knows about.
+    #[test]
+    fn typing_move_finds_a_way_to_move_a_pane_in_every_direction() {
+        let ranked = ranked("move pane");
+        for command in [
+            Command::MovePaneLeft,
+            Command::MovePaneRight,
+            Command::MovePaneUp,
+            Command::MovePaneDown,
+        ] {
+            assert!(
+                ranked.contains(&command),
+                "{command:?} must be findable by typing `move pane`; got {ranked:?}"
+            );
+        }
+        assert_eq!(
+            ranked.first().map(Command::group),
+            Some("Pane"),
+            "the pane commands come first; got {ranked:?}"
+        );
     }
 
     #[test]
@@ -529,7 +622,9 @@ mod tests {
             .iter()
             .find(|row| row.command == Command::OpenPalette)
             .expect("the palette itself");
-        assert_eq!(palette_row.shortcut.as_deref(), Some("⌘K"));
+        // Words, not `⌘K`: the bundled fonts draw the Command glyph wider than the advance
+        // it declares, so it collided with the key beside it in every recorded screenshot.
+        assert_eq!(palette_row.shortcut.as_deref(), Some("Cmd+K"));
         assert_eq!(palette_row.group, "View");
     }
 
