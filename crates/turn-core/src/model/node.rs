@@ -4,7 +4,7 @@ use crate::event::AgentRef;
 use crate::event::Confidence;
 use crate::ids::{NodeId, SessionId};
 use crate::model::hierarchy::{
-    ActivityPreview, AgentName, PreviewVisibility, Relationship, RelationshipKind,
+    ActivityPreview, AgentName, NameSource, PreviewVisibility, Relationship, RelationshipKind,
 };
 use crate::state::{DisplayState, Lifecycle, Turn};
 use serde::{Deserialize, Serialize};
@@ -132,6 +132,19 @@ pub struct ProcessNode {
     pub activity_preview: Option<ActivityPreview>,
     #[serde(default)]
     pub preview_visibility: PreviewVisibility,
+    /// The title the process set for itself, already sanitised by `turn-pty`.
+    ///
+    /// Lives on every node rather than only on agents because everything that runs
+    /// in a terminal sets titles: a shell through `PROMPT_COMMAND`, `vim` on every
+    /// file it opens, `ssh` on connect. Agents route theirs through
+    /// [`AgentName::apply_process_title`] so it competes with declared names;
+    /// non-agent nodes have no declared name, so this is simply the better title
+    /// when it exists.
+    #[serde(default)]
+    pub process_title: Option<String>,
+    /// A name the user typed for this node, which nothing else may override.
+    #[serde(default)]
+    pub user_title: Option<String>,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     pub exit_code: Option<i32>,
@@ -170,6 +183,8 @@ impl ProcessNode {
             relationship: Relationship::default(),
             activity_preview: None,
             preview_visibility: PreviewVisibility::Inherit,
+            process_title: None,
+            user_title: None,
             started_ms,
             ended_ms: None,
             exit_code: None,
@@ -198,6 +213,68 @@ impl ProcessNode {
     /// The flattened state for display.
     pub fn display_state(&self) -> DisplayState {
         DisplayState::derive(&self.lifecycle, self.turn.as_ref())
+    }
+
+    /// The title to show, and where it came from.
+    ///
+    /// One function so no caller can apply a different precedence: a name the user
+    /// typed, then whatever an agent declared about itself, then the title the
+    /// process wrote, then the command it was launched with. The source travels
+    /// with the text because a title read off a terminal must never be presented
+    /// with the authority of one a tool reported — no amount of sanitising makes
+    /// `✓ tests passed` a fact.
+    pub fn resolved_title(&self) -> (String, NameSource) {
+        if let Some(user) = &self.user_title {
+            return (user.clone(), NameSource::ExplicitParentEvent);
+        }
+        if let Some(agent) = &self.agent {
+            let name = &agent.name;
+            if name.user_renamed || !name.display_name.is_empty() {
+                // The agent's own naming already ran the precedence, including any
+                // process title it accepted.
+                if !name.display_name.is_empty() {
+                    return (name.display_name.clone(), name.source);
+                }
+            }
+        }
+        if let Some(title) = &self.process_title {
+            return (title.clone(), NameSource::ProcessTitle);
+        }
+        (self.title.clone(), NameSource::Fallback)
+    }
+
+    /// Records a title the process set for itself, and reports whether anything
+    /// visible changed.
+    ///
+    /// Returning a bool is what lets the daemon avoid pushing an update per
+    /// keystroke: a shell that rewrites an identical title on every prompt is
+    /// common, and each accepted change would otherwise become traffic.
+    pub fn set_process_title(&mut self, title: impl Into<String>) -> bool {
+        let title = title.into();
+        if title.is_empty() {
+            return false;
+        }
+        if self.process_title.as_deref() == Some(title.as_str()) {
+            return false;
+        }
+        self.process_title = Some(title.clone());
+        match &mut self.agent {
+            Some(agent) => agent.name.apply_process_title(title),
+            // A shell or a TUI has no declared name to lose, so the title stands
+            // unless the user named it.
+            None => self.user_title.is_none(),
+        }
+    }
+
+    /// Forgets the process title, so a dead process stops announcing what it was
+    /// doing. Reports whether anything visible changed.
+    pub fn clear_process_title(&mut self) -> bool {
+        let had = self.process_title.take().is_some();
+        let fallback = self.title.clone();
+        match &mut self.agent {
+            Some(agent) => agent.name.clear_process_title(fallback) || had,
+            None => had,
+        }
     }
 
     /// Attaches this node under a parent, recording how sure we are.
@@ -432,6 +509,136 @@ mod tests {
         let agent = ProcessNode::agent(session, "claude", "/repo", T0);
         let id = tree.insert(agent);
         (tree, id)
+    }
+
+    /// The issue's headline case: two instances of the same agent must be tellable
+    /// apart, and neither may affect the other.
+    #[test]
+    fn two_instances_of_one_agent_keep_independent_titles() {
+        let session = SessionId::from_stored("sess_a");
+        let mut first = ProcessNode::agent(session.clone(), "claude", "/repo", T0);
+        let mut second = ProcessNode::agent(session, "claude", "/repo", T0);
+
+        assert!(first.set_process_title("fixing the climbing bug"));
+        assert!(second.set_process_title("reviewing PR #104"));
+
+        assert_eq!(first.resolved_title().0, "fixing the climbing bug");
+        assert_eq!(second.resolved_title().0, "reviewing PR #104");
+
+        // Changing one leaves the other alone.
+        assert!(first.set_process_title("running the tests"));
+        assert_eq!(second.resolved_title().0, "reviewing PR #104");
+    }
+
+    /// A name someone typed is the one thing a process may not overwrite. A shell
+    /// rewriting its title on every prompt would otherwise erase it.
+    #[test]
+    fn a_title_the_user_typed_is_never_overwritten_by_the_process() {
+        let session = SessionId::from_stored("sess_a");
+        let mut node = ProcessNode::agent(session, "claude", "/repo", T0);
+        node.user_title = Some("Auth refactor".into());
+
+        node.set_process_title("something the agent printed");
+        let (title, source) = node.resolved_title();
+        assert_eq!(title, "Auth refactor");
+        assert!(!source.is_provisional(), "a typed name is not a guess");
+    }
+
+    /// A subagent whose parent declared it "Reviewer" keeps that name: a hook
+    /// payload is a contract, a title is free text the process writes.
+    #[test]
+    fn a_declared_name_outranks_whatever_the_process_prints() {
+        let session = SessionId::from_stored("sess_a");
+        let mut node = ProcessNode::agent(session, "claude", "/repo", T0);
+        node.agent.as_mut().unwrap().name = AgentName::declared("Reviewer");
+
+        let changed = node.set_process_title("bash-3.2");
+        assert!(!changed, "nothing visible should change");
+        assert_eq!(node.resolved_title().0, "Reviewer");
+        // The title is still recorded, so the inspector can show what it said.
+        assert_eq!(node.process_title.as_deref(), Some("bash-3.2"));
+    }
+
+    /// Shells and TUIs have no declared name, so their title simply is the better
+    /// one. This is why the field lives on the node and not only on agents.
+    #[test]
+    fn a_shell_takes_its_process_title_because_it_has_no_declared_name() {
+        let session = SessionId::from_stored("sess_a");
+        let mut node = ProcessNode::process(session, NodeKind::Shell, "zsh", "/repo", T0);
+        assert_eq!(node.resolved_title().0, "zsh");
+
+        assert!(node.set_process_title("~/space-troopers"));
+        let (title, source) = node.resolved_title();
+        assert_eq!(title, "~/space-troopers");
+        assert_eq!(source, NameSource::ProcessTitle);
+        assert!(source.is_provisional(), "read off a terminal, not reported");
+    }
+
+    /// A repeated identical title changes nothing, which is what keeps a
+    /// `PROMPT_COMMAND` firing on every command from becoming a push per command.
+    #[test]
+    fn an_unchanged_title_reports_no_change_so_it_produces_no_traffic() {
+        let session = SessionId::from_stored("sess_a");
+        let mut node = ProcessNode::process(session, NodeKind::Shell, "zsh", "/", T0);
+        assert!(node.set_process_title("~/repo"));
+        assert!(!node.set_process_title("~/repo"), "identical, so no change");
+        assert!(!node.set_process_title(""), "empty is not a title");
+    }
+
+    /// A dead process must stop announcing what it was doing.
+    #[test]
+    fn a_finished_process_stops_advertising_its_last_title() {
+        let session = SessionId::from_stored("sess_a");
+        let mut shell = ProcessNode::process(session.clone(), NodeKind::Shell, "zsh", "/", T0);
+        shell.set_process_title("compiling…");
+        assert!(shell.clear_process_title());
+        assert_eq!(shell.resolved_title().0, "zsh");
+
+        // An agent falls back to what its parent declared, not to the command.
+        let mut sub = ProcessNode::agent(session, "claude", "/", T0);
+        sub.agent.as_mut().unwrap().name = AgentName::declared("Reviewer");
+        sub.process_title = Some("stale".into());
+        sub.agent
+            .as_mut()
+            .unwrap()
+            .name
+            .apply_process_title("stale");
+        sub.clear_process_title();
+        assert_eq!(sub.resolved_title().0, "Reviewer");
+    }
+
+    /// Precedence is a total order and it is asserted as one, so adding a source
+    /// cannot silently re-rank the others.
+    #[test]
+    fn what_a_tool_reports_always_outranks_what_a_terminal_prints() {
+        assert!(NameSource::ExplicitParentEvent.outranks(NameSource::Integration));
+        assert!(NameSource::Integration.outranks(NameSource::StructuredTask));
+        assert!(NameSource::StructuredTask.outranks(NameSource::ProcessTitle));
+        assert!(NameSource::ProcessTitle.outranks(NameSource::Inferred));
+        assert!(NameSource::Inferred.outranks(NameSource::Fallback));
+
+        // And only the bottom three are shown as guesses.
+        assert!(!NameSource::ExplicitParentEvent.is_provisional());
+        assert!(!NameSource::Integration.is_provisional());
+        assert!(!NameSource::StructuredTask.is_provisional());
+        assert!(NameSource::ProcessTitle.is_provisional());
+    }
+
+    /// A title never destroys the declared name, even while it is on screen.
+    #[test]
+    fn a_process_title_never_erases_what_the_parent_declared() {
+        let mut name = AgentName::declared("Reviewer");
+        name.source = NameSource::Inferred; // weaker than ProcessTitle
+        assert!(name.apply_process_title("whatever the process says"));
+        assert_eq!(name.display_name, "whatever the process says");
+        assert_eq!(
+            name.declared_name.as_deref(),
+            Some("Reviewer"),
+            "the declaration survives underneath"
+        );
+        // And clearing restores it rather than the fallback.
+        name.clear_process_title("zsh");
+        assert_eq!(name.display_name, "Reviewer");
     }
 
     #[test]
