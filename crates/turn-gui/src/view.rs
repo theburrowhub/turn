@@ -38,9 +38,9 @@ use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
 use turn_proto::{
     CloseDisposition, ContextHandoffView, HierarchyKey, HierarchySnapshot, NodePaneCapability,
-    NodePaneView, PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative, SessionSummary,
-    SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
-    WorkspaceTreeView,
+    NodePaneView, PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative,
+    SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    WorkspaceSummary, WorkspaceTreeView,
 };
 
 use crate::icons;

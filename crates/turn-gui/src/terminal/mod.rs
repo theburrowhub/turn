@@ -40,6 +40,7 @@ pub mod keys;
 pub mod links;
 pub mod menu;
 pub mod mouse;
+pub mod notices;
 pub mod search;
 pub mod selection;
 
@@ -208,6 +209,8 @@ pub struct PaneInteraction {
     /// remembers between frames — and because a GPU texture has to outlive the frame that
     /// uploaded it. See [`images::ImageCache`].
     pub images: ImageCache,
+    /// Whether this pane's image notices have been put away — see [`notices::NoticeStrip`].
+    notices: notices::NoticeStrip,
 }
 
 impl PaneInteraction {
@@ -1128,10 +1131,20 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     search::show_bar(ui, theme, rect, &mut state.search, options.now_ms);
     let searching = state.search.is_open();
 
+    // Turn's own sentence about this pane, over the bottom of it. Drawn after the cells for
+    // the same reason the find bar is — it sits over the screen — and never *in* them: the
+    // grid belongs to the program.
+    if grid.notices.is_empty() {
+        state.notices.reset();
+    } else if notices::show(ui, theme, rect, &grid.notices, &state.notices) {
+        state.notices.dismiss(&grid.notices);
+    }
+    let notice_strip = state.notices.is_open(&grid.notices);
+
     if response.clicked() && !options.focused {
         outcome.actions.push(PaneAction::Focus);
     }
-    if !(searching && pointer_in_bar(ui, rect)) {
+    if !(searching && pointer_in_bar(ui, rect)) && !(notice_strip && pointer_in_strip(ui, rect)) {
         collect_pointer(
             ui,
             &response,
@@ -1194,6 +1207,13 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
 fn pointer_in_bar(ui: &Ui, rect: Rect) -> bool {
     ui.input(|i| i.pointer.hover_pos())
         .is_some_and(|pos| search::bar_rect(rect).contains(pos))
+}
+
+/// Whether the pointer is over the notice strip, so a click on it is not also a click in the
+/// pane — which would move the program's cursor while the user was only dismissing a sentence.
+fn pointer_in_strip(ui: &Ui, rect: Rect) -> bool {
+    ui.input(|i| i.pointer.hover_pos())
+        .is_some_and(|pos| notices::strip_rect(rect).contains(pos))
 }
 
 /// The cell the pointer is over, for a menu that has to know what it was opened on.

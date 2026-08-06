@@ -58,6 +58,7 @@ Status values:
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 | [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
+| [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
 
 ---
 
@@ -2701,3 +2702,71 @@ that is missing is named rather than silently replaced by a different one.
   still durable and still confirmed, but the recovery offer is the pane's — the shell's — as it is for
   every other pane.
 
+---
+
+<a id="adr-045"></a>
+## ADR-045 — Turn never writes its own words into a program's screen
+
+**Status:** Accepted, implemented for inline-image refusals, which is the only place Turn was doing it.
+
+### Context
+
+A pane refused to draw a picture — a Kitty transmission naming a file on disk, which Turn will not open —
+and explained itself by **feeding the sentence to the terminal parser**, at the cursor, with a newline
+after it. The intent was right and is unchanged: a picture that silently did not appear is a bug report
+nobody can write.
+
+The surface was wrong, and it showed up as soon as a real agent ran in a real pane. Codex printed a line
+about an interrupted MCP server; the sentence landed in the middle of it; the line wrapped; the row below
+shifted by one. Turn had corrupted output that had nothing to do with pictures.
+
+This is not a bug in the notice's wording or its length. A program's screen is the program's: it computed
+a layout, it addresses its cursor absolutely, and it repaints. Anything Turn inserts is therefore
+permanent — the program will never overwrite it, because the program does not know it is there — and every
+row after it is off by one. The same reasoning already forbids inventing an exit code (ADR-010). This is
+the display equivalent: Turn does not put words in a program's mouth.
+
+### Alternatives considered
+
+**Make the notice shorter, or draw it without a newline.** Rejected. Both reduce how much of the screen is
+corrupted without changing that it is corrupted. A one-character marker in the wrong cell still moves the
+program's text.
+
+**Say nothing and count it.** Rejected for the reason the notice existed: the user watched something not
+appear, and a counter they never look at does not tell them why.
+
+**Reserve the cells the picture would have occupied and leave them blank.** Considered seriously, because
+it is the least surprising thing for a program's layout. Rejected as the *only* answer: it is silent, and
+for a refused file transmission Turn does not know the intended box in the first place.
+
+**Keep the sentence, move it out of the grid.** Chosen.
+
+### Decision
+
+Refusals are recorded against the pane rather than drawn into it, as a bounded table of sentences with a
+count each, and they travel to the client *beside* the grid — a field of `Grid`, checked on arrival like
+every other field, never cells. The client shows them in a strip across the bottom of the pane, in the
+same register as the find bar, which is Turn's furniture and Turn's to write in.
+
+The strip can be dismissed, because while it is up it covers a row of the program's output and nothing
+Turn has to say about a pane outranks the pane. Dismissal is recorded against *how much* the pane had
+refused, not as a boolean, so putting away the first explanation does not silence the second. Clicking it
+is not also a click in the pane, so dismissing a sentence does not move the program's cursor.
+
+Identical refusals are counted rather than repeated, and the table is capped at eight distinct sentences,
+so a program in a loop cannot grow it.
+
+### Consequences
+
+- A refused picture leaves the program's screen byte for byte what the program wrote, which is asserted
+  directly: the same output with and without the refused sequence produces the same text and the same
+  cursor.
+- The explanation can no longer scroll away, since it is not on the screen that scrolls. The test that
+  used to write five pictures hoping the notice would still be visible now just reads it.
+- **Downside:** the strip covers the pane's bottom row while it is up. That is a row of the program's
+  output hidden, which is recoverable, rather than a row overwritten, which is not.
+- **Downside:** a ninth distinct kind of refusal does not reopen a dismissed strip, because the pane
+  tracks eight and the ninth changes no count.
+- **Downside:** Turn still shows nothing where the picture would have been, so a program whose layout
+  assumed a picture occupies rows is laid out for a screen Turn did not draw. Honouring the box would need
+  the size the sequence asked for, which a refused file transmission does not carry.

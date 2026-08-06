@@ -329,13 +329,17 @@ impl TerminalBuffer {
     /// means as cells.
     pub fn grid(&self) -> turn_proto::Grid {
         let links = self.screen_links();
-        turn_proto::from_screen_with_images(
+        let mut grid = turn_proto::from_screen_with_images(
             self.parser.screen(),
             links
                 .iter()
                 .map(|(row, from, to, uri)| (*row, *from, *to, uri.as_ref())),
             &self.images.table(),
-        )
+        );
+        // Beside the cells, never in them. What Turn has to say about a picture it would not
+        // draw travels next to the program's screen rather than inside it.
+        grid.attach_notices(&self.images.notices());
+        grid
     }
 
     /// A screen-shaped window of this pane's history, with its pictures.
@@ -349,8 +353,10 @@ impl TerminalBuffer {
     /// asked for pixels it has somewhere to draw.
     pub fn history_grid(&mut self, offset: usize) -> turn_proto::Grid {
         let table = self.images.table();
+        let notices = self.images.notices();
         let mut grid = self.with_history(|screen| turn_proto::history_grid(screen, offset));
         grid.attach_images(&table);
+        grid.attach_notices(&notices);
         grid
     }
 
@@ -358,9 +364,11 @@ impl TerminalBuffer {
     ///
     /// Inline-image sequences are taken out of the stream first, decoded, and replaced by
     /// the marker cells that stand for the picture — so what the parser sees is the output
-    /// minus the pictures, plus the cells they occupy. A sequence Turn will not act on
-    /// becomes a line of text saying so, because a picture that silently did not appear is
-    /// a bug report nobody can write.
+    /// minus the pictures, plus the cells they occupy. A sequence Turn will not act on is
+    /// consumed and *recorded*, never drawn: the reason is still shown, because a picture
+    /// that silently did not appear is a bug report nobody can write, but it is shown in the
+    /// pane's own chrome. Nothing Turn has to say goes into the program's screen — see
+    /// [`images::Refusals`].
     pub fn write(&mut self, data: &[u8]) {
         self.parser
             .callbacks_mut()
@@ -373,17 +381,13 @@ impl TerminalBuffer {
             match event {
                 images::ScanEvent::Text(bytes) => self.parser.process(&bytes),
                 images::ScanEvent::Image(sequence) => {
-                    if let Some(reason) =
-                        images::apply(&mut self.parser, &mut self.images, *sequence)
-                    {
-                        self.parser.process(&reason.notice_bytes());
-                    }
+                    // `apply` records its own refusals, where the reason is decided.
+                    let _ = images::apply(&mut self.parser, &mut self.images, *sequence);
                 }
                 images::ScanEvent::Refused(reason) => {
                     // Refused by the scanner rather than by a decoder — a payload past its
-                    // limit, or base64 that is not base64 — so it is counted here.
-                    self.images.note_refusal();
-                    self.parser.process(&reason.notice_bytes());
+                    // limit, or base64 that is not base64 — so it is recorded here.
+                    self.images.note_refusal(&reason);
                 }
             }
         }
@@ -1505,26 +1509,79 @@ mod tests {
         );
     }
 
-    /// The refusal a user has to be able to see. A payload past the limit produces a line
-    /// in the pane, not silence.
+    /// The refusal a user has to be able to see. A payload past the limit is recorded for the
+    /// pane's chrome to say, not silently dropped.
     #[test]
     fn a_payload_over_the_limit_is_refused_with_a_line_the_user_can_read() {
         let mut buffer = TerminalBuffer::new(ScreenSize::new(8, 60));
         let flood = turn_proto::encode_base64(&vec![0u8; 9 * 1024 * 1024]);
         buffer.write(format!("\x1b]1337;File=inline=1:{flood}\x07").as_bytes());
 
-        let text = buffer.snapshot().text();
-        assert!(
-            text.contains("image not shown"),
-            "the user must be told: {text:?}"
-        );
-        assert!(text.contains("payload over"), "got {text:?}");
+        let notices = buffer.grid().notices;
+        assert_eq!(notices.len(), 1, "the user must be told: {notices:?}");
+        assert!(notices[0].text.contains("payload over"), "got {notices:?}");
+        assert_eq!(notices[0].count, 1);
         assert!(!buffer.grid().has_images());
         assert_eq!(buffer.images().refusals(), 1);
         assert!(
             buffer.retained_bytes() <= DEFAULT_BYTE_CAPACITY,
             "and the ring stayed bounded"
         );
+    }
+
+    /// The reported defect, at the level it was caused.
+    ///
+    /// A refused picture must leave the program's screen **byte for byte** what the program
+    /// wrote. The notice used to be fed to the parser at the cursor, which cut the line an
+    /// agent was in the middle of printing and pushed everything below it down by one.
+    #[test]
+    fn a_refused_picture_does_not_touch_a_single_cell_of_the_programs_screen() {
+        let before = {
+            let mut clean = TerminalBuffer::new(ScreenSize::new(8, 60));
+            clean.write(b"MCP startup interrupted: codex_apps");
+            clean.write(b" ok\r\n$ ");
+            clean.grid()
+        };
+
+        // The same output, with a refused Kitty file transmission in the middle of the line —
+        // the exact shape that was reported.
+        let mut buffer = TerminalBuffer::new(ScreenSize::new(8, 60));
+        buffer.write(b"MCP startup interrupted: codex_apps");
+        let path = turn_proto::encode_base64(b"/tmp/plot.png");
+        buffer.write(format!("\x1b_Ga=T,f=100,t=f;{path}\x1b\\").as_bytes());
+        buffer.write(b" ok\r\n$ ");
+        let after = buffer.grid();
+
+        assert_eq!(
+            after.text(),
+            before.text(),
+            "a refused picture changed the program's screen"
+        );
+        assert_eq!(
+            after.cursor, before.cursor,
+            "and it moved the program's cursor"
+        );
+        // Said, but said beside the screen rather than in it.
+        assert_eq!(after.notices.len(), 1);
+        assert!(after.notices[0]
+            .text
+            .contains("does not read images from a file on disk"));
+    }
+
+    /// Refusing the same thing twice is counted rather than repeated, so a program in a loop
+    /// cannot fill the strip.
+    #[test]
+    fn the_same_refusal_twice_is_one_notice_with_a_count() {
+        let mut buffer = TerminalBuffer::new(ScreenSize::new(8, 60));
+        let path = turn_proto::encode_base64(b"/tmp/plot.png");
+        let sequence = format!("\x1b_Ga=T,f=100,t=f;{path}\x1b\\");
+        for _ in 0..3 {
+            buffer.write(sequence.as_bytes());
+        }
+        let notices = buffer.grid().notices;
+        assert_eq!(notices.len(), 1, "got {notices:?}");
+        assert_eq!(notices[0].count, 3);
+        assert_eq!(buffer.images().refusals(), 3);
     }
 
     /// A program asking Turn to write a file to the user's disk, or to read one, is refused
@@ -1535,17 +1592,21 @@ mod tests {
         let payload = turn_proto::encode_base64(&png(8, 8));
         // iTerm2 without `inline=1` is a download request.
         buffer.write(format!("\x1b]1337;File=size=99:{payload}\x07").as_bytes());
-        assert!(buffer
-            .snapshot()
-            .text()
-            .contains("a download was requested"));
+        let notices = buffer.grid().notices;
+        assert!(
+            notices[0].text.contains("a download was requested"),
+            "got {notices:?}"
+        );
 
         // Kitty asking Turn to open a path the process chose.
         let mut buffer = TerminalBuffer::new(ScreenSize::new(8, 60));
         let path = turn_proto::encode_base64(b"/etc/passwd");
         buffer.write(format!("\x1b_Ga=T,f=100,t=f;{path}\x1b\\").as_bytes());
-        let text = buffer.snapshot().text();
-        assert!(text.contains("does not read images from"), "got {text:?}");
+        let notices = buffer.grid().notices;
+        assert!(
+            notices[0].text.contains("does not read images from"),
+            "got {notices:?}"
+        );
         assert!(!buffer.grid().has_images());
     }
 
@@ -1750,21 +1811,24 @@ mod tests {
             body.extend_from_slice(b"!1000~-");
         }
         body.extend_from_slice(b"\x1b\\");
-        // Five of them: enough for the budget to run out while the notice is still on
-        // screen rather than scrolled away by the pictures that did fit.
-        let mut refused_text = None;
+        // Five of them: enough for the budget to run out. The notice no longer has to survive
+        // on screen to be read — it is kept beside the grid, so a picture that did fit cannot
+        // scroll away the explanation of the one that did not.
+        let mut refused = None;
         for _ in 0..5 {
             buffer.write(&body);
-            let text = buffer.snapshot().text();
-            if text.contains("image not shown") {
-                refused_text = Some(text);
+            let notices = buffer.grid().notices;
+            if !notices.is_empty() {
+                refused = Some(notices);
                 break;
             }
         }
-        let text = refused_text.expect("the budget must run out within five megapixel Sixels");
+        let notices = refused.expect("the budget must run out within five megapixel Sixels");
         assert!(
-            text.contains("too many images too quickly"),
-            "the user must be told why a picture stopped appearing: {text:?}"
+            notices
+                .iter()
+                .any(|notice| notice.text.contains("too many images too quickly")),
+            "the user must be told why a picture stopped appearing: {notices:?}"
         );
         assert!(buffer.images().refusals() > 0);
         let allowed = crate::images::PIXELS_PER_INPUT_BYTE

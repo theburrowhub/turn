@@ -452,6 +452,13 @@ pub struct Grid {
     /// socket many times a second and a megabyte of picture must not — and are fetched
     /// once per id with [`crate::Request::PaneImage`].
     pub images: Vec<crate::images::GridImage>,
+    /// What this pane refused to draw, for the client to say in the pane's own chrome.
+    ///
+    /// Not cells, and deliberately so. The refusal used to be written into the screen at
+    /// the program's cursor, which corrupted a layout the program then repainted around
+    /// Turn's text. It travels beside the grid instead: the grid is the program's, and the
+    /// notice is Turn's. Empty for almost every pane that ever runs.
+    pub notices: Vec<crate::images::ImageNotice>,
 }
 
 impl Grid {
@@ -470,6 +477,7 @@ impl Grid {
             scrollback_offset: 0,
             scrollback_len: 0,
             images: Vec::new(),
+            notices: Vec::new(),
         }
     }
 
@@ -705,6 +713,24 @@ impl Grid {
             out.push(*image);
         }
         self.images = out;
+    }
+
+    /// Attaches what the pane refused to draw, dropping anything unshowable.
+    ///
+    /// Clamped rather than refused: a notice is a courtesy, and losing the ninth one is
+    /// better than failing to deliver a screen because of it. The text is Turn's own, so
+    /// there is nothing here to sanitise — only to bound.
+    pub fn attach_notices(&mut self, notices: &[crate::images::ImageNotice]) {
+        self.notices = notices
+            .iter()
+            .filter(|notice| {
+                notice.count > 0
+                    && (1..=crate::images::MAX_IMAGE_NOTICE_CHARS)
+                        .contains(&notice.text.chars().count())
+            })
+            .take(crate::images::MAX_IMAGE_NOTICES)
+            .cloned()
+            .collect();
     }
 
     /// Whether any cell of this screen is part of a picture.
@@ -987,6 +1013,9 @@ struct GridWire {
     /// Absent on the overwhelming majority of screens, which have no pictures on them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     images: Vec<crate::images::GridImage>,
+    /// What the pane refused to draw. Absent on every screen that refused nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notices: Vec<crate::images::ImageNotice>,
     /// One entry per row, top to bottom.
     runs: Vec<Vec<CellRun>>,
 }
@@ -1049,6 +1078,7 @@ impl Serialize for Grid {
                 })
                 .collect(),
             images: self.images.clone(),
+            notices: self.notices.clone(),
             runs: (0..self.rows).map(|row| self.row_runs(row)).collect(),
         };
         wire.serialize(serializer)
@@ -1092,6 +1122,7 @@ impl Grid {
         // width is: an impossible placement is a peer disagreeing about the format, not a
         // state to repair by clamping something into range.
         crate::images::check_table(&wire.images).map_err(GridError::Image)?;
+        crate::images::check_notices(&wire.notices).map_err(GridError::Image)?;
         Ok(Self {
             rows: wire.rows,
             cols: wire.cols,
@@ -1103,6 +1134,7 @@ impl Grid {
             scrollback_offset: wire.scrollback_offset,
             scrollback_len: wire.scrollback_len,
             images: wire.images,
+            notices: wire.notices,
         })
     }
 }

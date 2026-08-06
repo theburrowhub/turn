@@ -1368,6 +1368,16 @@ wrong breaks arrow keys inside `vim`.
 live screen only, and there is no request that asks for history. A client should treat
 them as "no history offered" rather than as "no history exists".
 
+`notices` is what the pane **refused to draw**, and it is the one field that is not the
+program's: a list of `{text, count}` where each `text` is a complete sentence Turn
+generated, already bracketed and containing nothing the process supplied. It travels here,
+beside the cells, rather than as cells, because a sentence written into the grid lands at
+the program's cursor and corrupts a layout the program repaints without ever overwriting it
+(ADR-045). A client shows it in its own furniture — never in the screen — and may render
+the text as-is. At most eight entries, each at most 160 characters, each
+with a `count` of at least 1; a peer sending otherwise is refused. Absent on the wire for
+every pane that refused nothing, which is nearly all of them.
+
 ### `SessionDetails`
 
 `summary`, `layout` (the domain `Layout`), `tree` (`[TreeNodeView]`), `attention`

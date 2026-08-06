@@ -157,17 +157,75 @@ impl RefusalReason {
         };
         format!("[turn: image not shown — {detail}]")
     }
+}
 
-    /// The bytes to feed the terminal parser so the notice lands in the pane.
+/// What a pane has refused to draw, and how often.
+///
+/// The record exists because the notice used to be **written into the emulated screen** at
+/// the cursor, followed by a newline. That is the one thing a terminal emulator must never
+/// do. A program's screen is its own: it computed a layout, it positions its cursor
+/// absolutely, and it repaints. Text Turn inserted stays there as garbage the program will
+/// never overwrite and cannot be told about, and the newline shifts every row below it by
+/// one — so a refused picture corrupted output that had nothing to do with pictures. It
+/// was reported as exactly that: a sentence about images cut into the middle of an agent's
+/// startup line.
+///
+/// So the sentence moves out of the grid and into Turn's own furniture, where it belongs.
+/// The reason for showing it at all is unchanged — a picture that silently did not appear
+/// is a bug report nobody can write — and the place it appears is the pane's chrome, which
+/// is Turn's to write in.
+///
+/// Bounded on both axes: at most [`MAX_TRACKED_REFUSALS`] distinct sentences, each counted,
+/// with everything past that folded into the total. A process printing a thousand different
+/// broken sequences must not grow this without limit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refusals {
+    kinds: Vec<(String, u32)>,
+    total: u64,
+}
+
+/// How many distinct refusal sentences a pane keeps.
+///
+/// One per [`RefusalReason`] variant would be eight, but two of them carry numbers in their
+/// text, so the list is capped instead of sized to the enum.
+pub const MAX_TRACKED_REFUSALS: usize = 8;
+
+impl Refusals {
+    /// Records one refusal.
+    pub fn note(&mut self, reason: &RefusalReason) {
+        self.total = self.total.saturating_add(1);
+        let notice = reason.notice();
+        if let Some(entry) = self.kinds.iter_mut().find(|(text, _)| text == &notice) {
+            entry.1 = entry.1.saturating_add(1);
+            return;
+        }
+        if self.kinds.len() < MAX_TRACKED_REFUSALS {
+            self.kinds.push((notice, 1));
+        }
+    }
+
+    /// How many sequences this pane has refused, including any past the tracked kinds.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// The sentences to show, each with its count, in the order first seen.
     ///
-    /// Plain text, in whatever colours the program had set. No SGR of Turn's own and no
-    /// `DECSC`/`DECRC` around it: a program may be in the middle of using the saved-cursor
-    /// register, and clobbering it to style a notice would corrupt output that has nothing
-    /// to do with pictures. The bracketed prefix carries the meaning instead.
-    pub fn notice_bytes(&self) -> Vec<u8> {
-        let mut out = self.notice().into_bytes();
-        out.extend_from_slice(b"\r\n");
-        out
+    /// First-seen order rather than most-frequent: the list is read by a person who just
+    /// watched something not appear, and reordering it under them as counts change would
+    /// make it harder to read, not easier.
+    pub fn notices(&self) -> Vec<turn_proto::images::ImageNotice> {
+        self.kinds
+            .iter()
+            .map(|(text, count)| turn_proto::images::ImageNotice {
+                text: text.clone(),
+                count: *count,
+            })
+            .collect()
     }
 }
 
@@ -207,7 +265,7 @@ pub struct ImageStore {
     budget: u64,
     cell_pixels: (u16, u16),
     placements: u64,
-    refusals: u64,
+    refusals: Refusals,
     decoded_pixels: u64,
 }
 
@@ -230,7 +288,7 @@ impl ImageStore {
             budget: turn_proto::MAX_IMAGE_PIXELS as u64,
             cell_pixels: NOMINAL_CELL_PIXELS,
             placements: 0,
-            refusals: 0,
+            refusals: Refusals::default(),
             decoded_pixels: 0,
         }
     }
@@ -305,7 +363,12 @@ impl ImageStore {
 
     /// How many sequences were refused. Surfaced so the UI can say a process tried.
     pub fn refusals(&self) -> u64 {
-        self.refusals
+        self.refusals.total()
+    }
+
+    /// The refusal sentences to show in the pane's chrome, each with its count.
+    pub fn notices(&self) -> Vec<turn_proto::images::ImageNotice> {
+        self.refusals.notices()
     }
 
     /// Total pixels this pane has ever decoded.
@@ -327,10 +390,14 @@ impl ImageStore {
         self.budget = self.budget.saturating_sub(pixels);
     }
 
-    /// Records a refusal the scanner made on its own — a payload past its limit, base64
-    /// that is not base64 — which never reaches [`apply`] and would otherwise go uncounted.
-    pub fn note_refusal(&mut self) {
-        self.refusals = self.refusals.saturating_add(1);
+    /// Records a refusal, wherever it was decided.
+    ///
+    /// Takes the reason rather than just incrementing, because the sentence is what the user
+    /// reads and the store is now the only place it is kept. Both sources come here: the
+    /// scanner's own refusals — a payload past its limit, base64 that is not base64 — and a
+    /// decoder's.
+    pub fn note_refusal(&mut self, reason: &RefusalReason) {
+        self.refusals.note(reason);
     }
 
     /// Adds a payload, evicting to stay inside both bounds.
@@ -447,8 +514,10 @@ pub fn apply<CB: vt100::Callbacks>(
         Sequence::Sixel { body } => apply_sixel(parser, store, &body),
         Sequence::Kitty { control, payload } => apply_kitty(parser, store, &control, payload),
     };
-    if outcome.is_some() {
-        store.refusals += 1;
+    // Recorded here, where the reason is known, rather than counted here and described
+    // somewhere else: the sentence and the count are one fact.
+    if let Some(reason) = &outcome {
+        store.refusals.note(reason);
     }
     outcome
 }
@@ -1002,7 +1071,16 @@ mod tests {
                 notice.chars().all(crate::is_display_safe),
                 "a notice must be safe to display: {notice:?}"
             );
-            assert!(reason.notice_bytes().ends_with(b"\r\n"));
+            // It has to survive the trip to the client that shows it, since Turn no
+            // longer shows it by writing it into the program's screen.
+            assert!(
+                turn_proto::images::check_notices(&[turn_proto::images::ImageNotice {
+                    text: notice.clone(),
+                    count: 1,
+                }])
+                .is_ok(),
+                "the protocol must accept a notice Turn generates: {notice:?}"
+            );
         }
         assert!(RefusalReason::PayloadTooLarge {
             limit: 8 * 1024 * 1024

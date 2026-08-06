@@ -599,6 +599,55 @@ mod tests {
         assert!(result.is_err(), "a missing binary must not panic");
     }
 
+    /// The reported defect, through a real pseudo-terminal.
+    ///
+    /// The buffer's own tests write the bytes in directly. This one has a shell print them, so
+    /// what is exercised is the whole path a user's output takes: a process writes a Kitty
+    /// transmission naming a file on disk — which Turn will not open — in the middle of a line
+    /// of ordinary output. The line must arrive as the process wrote it, and the refusal must
+    /// arrive beside the screen rather than in it.
+    #[test]
+    fn a_refused_picture_from_a_real_process_leaves_its_line_alone() {
+        // `printf` in three parts, so the sequence really does land mid-line.
+        let script = "printf 'MCP startup interrupted: codex_apps'; \
+                      printf '\\033_Ga=T,f=100,t=f;L3RtcC9wbG90LnBuZw==\\033\\\\'; \
+                      printf ' ok\\r\\n> Explain this codebase\\r\\n'";
+        let process = spawn(ProcessSpec::new("sh", "/").arg("-c").arg(script));
+
+        wait_until("the whole script to print", || {
+            process
+                .snapshot()
+                .map(|s| s.text().contains("Explain this codebase"))
+                .unwrap_or(false)
+        });
+
+        let grid = process.buffer().lock().expect("the buffer lock").grid();
+
+        assert_eq!(
+            grid.notices.len(),
+            1,
+            "the refusal must be recorded: {:?}",
+            grid.notices
+        );
+        assert!(
+            grid.notices[0]
+                .text
+                .contains("does not read images from a file on disk"),
+            "got {:?}",
+            grid.notices
+        );
+
+        let text = grid.text();
+        assert!(
+            text.contains("MCP startup interrupted: codex_apps ok"),
+            "the process's own line must be whole: {text:?}"
+        );
+        assert!(
+            !text.contains("image not shown"),
+            "Turn's sentence must not be in the process's screen: {text:?}"
+        );
+    }
+
     #[test]
     fn input_written_to_the_pty_reaches_the_process() {
         // `cat` echoes whatever it is given, which proves the write path works.

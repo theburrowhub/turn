@@ -4236,10 +4236,14 @@ fn an_image_scrolled_partly_off_the_top_shows_the_part_that_is_left() {
 
 /// A payload Turn refuses, and what the user is told about it.
 ///
-/// What to look for: no picture at all, and a line of text reading
-/// `[turn: image not shown — payload over 8 MB]` where the picture would have been, between
-/// the command that produced it and the prompt that follows. The notice is the whole point:
-/// a picture that silently did not appear is a bug report nobody can write.
+/// What to look for: no picture, the command and the prompt on consecutive lines with nothing
+/// wedged between them, and `[turn: image not shown — payload over 8 MB]` across the bottom of
+/// the pane in Turn's own strip, with a dismiss button at its right.
+///
+/// The two halves of that are both the point. A picture that silently did not appear is a bug
+/// report nobody can write — so the sentence is shown. And the program's screen is the
+/// program's: the sentence used to be written into it at the cursor, which cut a line of real
+/// output in half and shifted every row below it, so the sentence is *not* shown there.
 #[test]
 fn a_refused_payload_tells_the_user_why_nothing_appeared() {
     // Nine mebibytes of base64, over the eight-mebibyte payload limit.
@@ -4257,12 +4261,34 @@ fn a_refused_payload_tells_the_user_why_nothing_appeared() {
     );
     assert!(payloads.is_empty(), "nothing was decoded");
     assert!(!grid.has_images(), "and nothing was placed");
+    // The pane says so, beside the cells.
+    let notice = turn_gui::terminal::notices::summary(&grid.notices);
     assert!(
-        grid.text().contains("image not shown"),
-        "the pane must say so: {:?}",
-        grid.text()
+        notice.contains("payload over 8 MB"),
+        "the pane must say why: {:?}",
+        grid.notices
     );
-    let mut harness = image_pane_harness(grid, payloads, None);
+    // And the program's own output is exactly what the program wrote. This is the regression:
+    // the notice landed at the cursor, between the command and the prompt.
+    let text = grid.text();
+    assert!(
+        !text.contains("image not shown"),
+        "Turn's sentence must not be in the program's screen: {text:?}"
+    );
+    assert!(
+        text.starts_with("~/turn on main $ imgcat enormous.png\n~/turn on main $"),
+        "the command and the prompt must be consecutive: {text:?}"
+    );
+    // Through `show_pane` rather than the painter, because the strip is chrome: a harness that
+    // only painted cells would render a snapshot of a refusal with the refusal missing.
+    let mut harness = interactive_pane(
+        grid,
+        PaneInteraction::default(),
+        PaneOptions {
+            now_ms: cursor_on(),
+            ..Default::default()
+        },
+    );
     harness.snapshot("terminal_image_refused");
 }
 

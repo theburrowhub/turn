@@ -834,6 +834,7 @@ mod tests {
             alternate_screen: false,
             scrollback_len: 0,
             images: None,
+            notices: None,
             rows,
         }
     }

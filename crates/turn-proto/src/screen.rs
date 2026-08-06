@@ -152,6 +152,11 @@ pub enum ScreenUpdate {
         /// `Some(vec![])`, and an empty list must not be mistaken for silence.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Vec<crate::images::GridImage>>,
+        /// What the pane refused to draw, when that changed. Same `None`-is-silence rule as
+        /// `images`, and for the same reason: a pane that has refused nothing sends nothing,
+        /// and a pane whose refusals were cleared sends `Some(vec![])`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notices: Option<Vec<crate::images::ImageNotice>>,
         rows: Vec<GridRow>,
     },
 }
@@ -240,6 +245,11 @@ impl ScreenUpdate {
             } else {
                 Some(next.images.clone())
             },
+            notices: if next.notices == previous.notices {
+                None
+            } else {
+                Some(next.notices.clone())
+            },
             rows: changed
                 .into_iter()
                 .map(|row| GridRow::of(next, row))
@@ -264,6 +274,7 @@ impl ScreenUpdate {
                 alternate_screen,
                 scrollback_len,
                 images,
+                notices,
                 rows,
             } => {
                 if target.rows != size.rows || target.cols != size.cols {
@@ -296,6 +307,10 @@ impl ScreenUpdate {
                 if let Some(images) = images {
                     crate::images::check_table(images).map_err(GridError::Image)?;
                     target.images = images.clone();
+                }
+                if let Some(notices) = notices {
+                    crate::images::check_notices(notices).map_err(GridError::Image)?;
+                    target.notices = notices.clone();
                 }
                 target.cursor = *cursor;
                 target.alternate_screen = *alternate_screen;
@@ -458,6 +473,7 @@ mod tests {
             alternate_screen: false,
             scrollback_len: 0,
             images: None,
+            notices: None,
             rows: vec![GridRow {
                 row: 9,
                 runs: vec![CellRun {
@@ -572,6 +588,7 @@ mod tests {
             alternate_screen: false,
             scrollback_len: 0,
             images: None,
+            notices: None,
             rows: Vec::new(),
         };
         let json = serde_json::to_string(&rows).expect("an update serialises");
@@ -644,6 +661,7 @@ mod tests {
             alternate_screen: false,
             scrollback_len: 0,
             images: None,
+            notices: None,
             rows: vec![GridRow {
                 row: 1,
                 runs: vec![CellRun {
@@ -778,6 +796,7 @@ mod tests {
                 8,
                 8,
             )]),
+            notices: None,
             rows: Vec::new(),
         };
         assert!(matches!(
