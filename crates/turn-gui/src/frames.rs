@@ -22,6 +22,20 @@ pub fn measure(context: &egui::Context, build: impl FnMut(&mut egui::Ui)) -> egu
     output
 }
 
+/// Runs one frame with input of the caller's choosing.
+///
+/// The same texture-delta discipline as [`measure`], for a test that has to deliver a keystroke
+/// or a composed character rather than an empty frame.
+pub fn measure_with(
+    context: &egui::Context,
+    input: egui::RawInput,
+    build: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut output = context.run_ui(input, build);
+    output.textures_delta.clear();
+    output
+}
+
 /// Runs one frame for its side effects, discarding everything it produced.
 pub fn run(context: &egui::Context, build: impl FnMut(&mut egui::Ui)) {
     let _ = measure(context, build);

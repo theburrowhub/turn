@@ -834,6 +834,93 @@ fn a_restored_layout_explains_that_nothing_was_restarted_and_offers_recovery() {
     ));
 }
 
+/// Coming back to a Session is one decision, not one per pane.
+///
+/// Reported as unusable, and it was: every stopped pane showed a "Start pane" button in the
+/// middle of itself, so a four-pane Session read as four separate decisions. There *was* a
+/// "Start all" — small, in the bottom status bar, at the other end of the window from the panes
+/// it acts on. The collective action now sits beside the per-pane one, where the hand already is,
+/// and one click asks for every pane.
+#[test]
+fn coming_back_to_a_session_starts_every_pane_in_one_click() {
+    // No write confirmation pending, so every stopped pane is one this click can start. The
+    // case where one is *not* is asserted at the end.
+    let mut fixture = restored_desk();
+    fixture.recovery_lease = None;
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    // The offer names how many it covers, so the click is not a guess.
+    let labels = button_labels(&h);
+    let collective = labels
+        .iter()
+        .find(|label| label.starts_with("Start all "))
+        .unwrap_or_else(|| {
+            panic!("the pane's own offer must include the collective one: {labels:?}")
+        });
+    let collective = collective.clone();
+
+    h.state_mut().actions.clear();
+    h.query_by_label(&collective)
+        .expect("the collective offer is a real button")
+        .click();
+    h.run_steps(1);
+
+    let asked: Vec<&ViewAction> = h
+        .state()
+        .actions
+        .iter()
+        .filter(|action| matches!(action, ViewAction::RelaunchNode { .. }))
+        .collect();
+    assert!(
+        asked.len() > 1,
+        "one click must ask for every stopped pane, got {asked:?}"
+    );
+    // Every one of them is a different pane: asking twice for the same node would start one
+    // process and look like it started two.
+    let mut nodes: Vec<String> = asked
+        .iter()
+        .filter_map(|action| match action {
+            ViewAction::RelaunchNode { node_id, .. } => Some(node_id.to_string()),
+            _ => None,
+        })
+        .collect();
+    let before = nodes.len();
+    nodes.sort();
+    nodes.dedup();
+    assert_eq!(
+        nodes.len(),
+        before,
+        "the same pane must not be asked for twice"
+    );
+
+    // With a write confirmation pending, the offer covers only what it can really start — a
+    // pane that would use the checkout is held back by the confirmation, so a button claiming
+    // to start it would be lying about a number the user can count on screen.
+    let mut h = harness(restored_desk());
+    h.run();
+    h.run();
+    let pending = button_labels(&h);
+    let claimed: Vec<&String> = pending
+        .iter()
+        .filter(|label| label.starts_with("Start all "))
+        .collect();
+    assert!(
+        claimed.len() <= 1,
+        "the collective offer appears at most once: {claimed:?}"
+    );
+    if let Some(label) = claimed.first() {
+        assert!(
+            !label.contains(&format!(
+                "{} panes",
+                pending.iter().filter(|l| *l == "Start pane").count() + 1
+            )),
+            "the number must not count panes the confirmation is holding back: {label:?}"
+        );
+    }
+}
+
 /// The other half of the recovery rule, in the window: a pending write confirmation holds
 /// back what would use the checkout, not the whole Session.
 ///

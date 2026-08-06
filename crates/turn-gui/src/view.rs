@@ -4922,6 +4922,64 @@ impl<'a> TurnView<'a> {
                                     resume: false,
                                 });
                             }
+                            // And the same act for the whole Session, beside it.
+                            //
+                            // There has always been a "Start all" — in the bottom status bar,
+                            // small, at the other end of the window from the panes it acts on.
+                            // Every stopped pane meanwhile shows this button in the middle of
+                            // itself, so coming back to a four-pane Session read as four
+                            // separate decisions and was reported as unusable. The collective
+                            // action belongs where the hand already is.
+                            //
+                            // Offered only when there is more than one, because "Start all" on a
+                            // single pane is the same click with a vaguer name.
+                            // The panes this click could actually start, *now*. Not simply the
+                            // stopped ones: while a write confirmation is pending, a pane that
+                            // would open the user's own shell can start and one that would use
+                            // the checkout cannot, so a button offering both would either be
+                            // disabled for all of them or claim more than it does. The number in
+                            // the label is the number it will start.
+                            let lease_pending =
+                                self.recovery_lease.is_some() || self.reclaiming_write_access;
+                            let startable: Vec<&PaneRestoreOutcome> = restore
+                                .panes
+                                .iter()
+                                .filter(|pane| {
+                                    pane.can_relaunch
+                                        && !self.relaunching.contains(&pane.node_id)
+                                        && !(lease_pending && pane.needs_checkout_write)
+                                })
+                                .collect();
+                            // Once on screen, not once per pane: three stopped panes each showing
+                            // "Start all 3 panes" is three buttons for one act, which is noise
+                            // where the point was to remove a decision. It goes on the first one
+                            // it would start — a stable choice, the same pane every frame.
+                            let is_host = startable
+                                .first()
+                                .is_some_and(|pane| pane.node_id == outcome.node_id);
+                            if startable.len() > 1
+                                && is_host
+                                && ui
+                                    .add_enabled(
+                                        !unreachable_blocked && !selected_archived,
+                                        egui::Button::new(format!(
+                                            "Start all {} panes",
+                                            startable.len()
+                                        )),
+                                    )
+                                    .on_hover_text(
+                                        "Starts every stopped pane this Session can start, in one go",
+                                    )
+                                    .clicked()
+                            {
+                                for pane in &startable {
+                                    actions.push(ViewAction::RelaunchNode {
+                                        session_id: restore.session_id.clone(),
+                                        node_id: pane.node_id.clone(),
+                                        resume: false,
+                                    });
+                                }
+                            }
                             if lease_blocked && outcome.can_relaunch {
                                 ui.label(
                                     RichText::new("Confirm write access in the status bar first.")
@@ -7240,17 +7298,17 @@ fn pane_header_controls(
     ui.scope_builder(
         keyed_region(close_slot, "pane-close", placed.pane_id.as_str()),
         |ui| {
-            let close = ui.add(
-                egui::Button::new(
-                    RichText::new(icons::CLOSE)
-                        .font(icons::font(12.0))
-                        .color(theme.text_dim),
-                )
-                // No frame while it is idle, so a header with three panes is not three
-                // boxes; a frame the moment the pointer is on it, so it is visibly a
-                // control and not a character somebody painted in the corner.
-                .frame_when_inactive(false)
-                .min_size(close_slot.size()),
+            // Through the shared placement, which is what keeps it inside its slot: added to
+            // this region directly it was sized from the style's interaction floor — 28 points
+            // tall in a 16-point header — so the hover frame overflowed the header and was
+            // clipped, which is what "the close button does not draw properly" was.
+            let close = icons::glyph_button(
+                ui,
+                close_slot,
+                icons::CLOSE,
+                12.0,
+                true,
+                Some(theme.text_dim),
             );
             icons::describe(&close, &close_name);
             let hint = match &close_shortcut {

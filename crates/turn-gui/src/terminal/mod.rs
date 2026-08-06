@@ -1160,6 +1160,34 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // to the program as well would type the query into whatever is running.
     let field_has_keyboard = searching && ui.ctx().memory(|m| m.focused().is_some());
     if options.focused && options.accepts_input && !field_has_keyboard {
+        // Ask the platform to allow composition, and tell it where the text is going.
+        //
+        // Not optional and not cosmetic: on macOS an accent is composed — the dead key and the
+        // vowel are one input-method sequence — and the platform only starts a composition for a
+        // surface that has declared itself a text input. Without this, `Ime(Commit)` never
+        // arrives, and a Spanish keyboard cannot type á or ñ into a pane at all.
+        //
+        // The rectangle is the *cell the cursor is in*, so the candidate window opens where the
+        // characters will land rather than in the corner of the window. `rect` is the pane and
+        // `cursor_rect` the cell, which is exactly what the two fields mean.
+        let cursor_cell = grid
+            .cursor
+            .map(|(row, col)| {
+                geometry::CellGrid::new(rect.min, cell, ui.ctx().pixels_per_point())
+                    .cell_rect(row, col)
+            })
+            .unwrap_or(rect);
+        ui.ctx().output_mut(|out| {
+            out.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect,
+                cursor_rect: cursor_cell,
+                // Nothing here interrupts a composition. The pane is a terminal: whatever the
+                // user is part-way through composing is theirs to finish, and cancelling it
+                // because output arrived would lose characters they had already typed.
+                should_interrupt_composition: false,
+            });
+        });
         collect_keys(ui, grid, state, chrome, &mut outcome);
     }
     if let Some(chrome) = chrome {
@@ -1815,6 +1843,25 @@ fn collect_keys(
             egui::Event::Text(text) => {
                 // Swallowed in selection mode: typing while making a selection would send
                 // characters to the program the user is only trying to read.
+                if !text.is_empty() && state.keyboard_cursor().is_none() {
+                    outcome
+                        .actions
+                        .push(PaneAction::Write(keys::encode_text(&text)));
+                }
+            }
+            // A composed character. On macOS this is how every accent arrives: pressing the
+            // dead key and then the vowel is an *input method composition*, and the result is
+            // delivered as `Ime(Commit)` rather than as `Text`. Handling only `Text` meant a
+            // Spanish keyboard could not type á, é, ñ or ü into any pane — the keystrokes went
+            // nowhere and nothing said why.
+            //
+            // `Preedit` is deliberately not written. It is the candidate still being composed,
+            // it is replaced or withdrawn as the user keeps typing, and sending it would put
+            // characters into the program that the user has not committed to. Until the pane
+            // can draw a preedit over its own cursor, showing nothing is the honest option:
+            // the platform draws its own candidate window at the cursor position reported
+            // below.
+            egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
                 if !text.is_empty() && state.keyboard_cursor().is_none() {
                     outcome
                         .actions
@@ -3038,6 +3085,58 @@ mod tests {
             perform(ui, command, grid, state, chosen, false, &mut outcome);
         });
         outcome
+    }
+
+    /// Feeds one input event to a focused pane and returns what it decided to do.
+    fn input_event(event: egui::Event) -> PaneOutcome {
+        let grid = Grid::from_lines(&["$ "], 20);
+        let mut state = PaneInteraction::default();
+        let mut outcome = PaneOutcome::default();
+        let context = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.events.push(event);
+        let _ = crate::frames::measure_with(&context, raw, |ui| {
+            collect_keys(ui, &grid, &mut state, None, &mut outcome);
+        });
+        outcome
+    }
+
+    /// An accent has to reach the program.
+    ///
+    /// On macOS every accented character is *composed*: the dead key and the vowel are one
+    /// input-method sequence, and the result arrives as `Ime(Commit)` rather than as `Text`. The
+    /// pane handled only `Text`, so a Spanish keyboard could not type á, é, í, ó, ú, ñ or ü into
+    /// any pane at all — the keystrokes went nowhere and nothing said why.
+    #[test]
+    fn a_composed_accent_reaches_the_program() {
+        for composed in ["á", "é", "ñ", "ü", "ó"] {
+            let outcome = input_event(egui::Event::Ime(egui::ImeEvent::Commit(
+                composed.to_string(),
+            )));
+            assert_eq!(
+                outcome.actions,
+                vec![PaneAction::Write(composed.as_bytes().to_vec())],
+                "{composed:?} must reach the program"
+            );
+        }
+    }
+
+    /// What is still being composed is not sent.
+    ///
+    /// A preedit is a candidate: it is replaced or withdrawn as the user keeps typing, so
+    /// writing it would put characters into the program that the user never committed to —
+    /// pressing the dead key would type a stray `´` before the vowel arrived.
+    #[test]
+    fn a_composition_in_progress_is_not_sent_to_the_program() {
+        let outcome = input_event(egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "´".to_string(),
+            active_range_chars: None,
+        }));
+        assert!(
+            outcome.actions.is_empty(),
+            "a candidate must not reach the program: {:?}",
+            outcome.actions
+        );
     }
 
     /// Paste never reads the clipboard: it asks the platform, which hands the text back

@@ -177,33 +177,58 @@ pub fn row_button(
         tooltip.push_str(" · ");
         tooltip.push_str(shortcut);
     }
-    let response = ui
-        .scope_builder(
-            egui::UiBuilder::new().max_rect(at).layout(
-                // Centred on both axes and justified to the rectangle. This is the line that
-                // puts the glyph in the middle of its box and makes every box the same size
-                // whatever glyph it carries — the two halves of the reported defect.
-                egui::Layout::centered_and_justified(egui::Direction::TopDown),
-            ),
-            |ui| {
-                // Zero padding: the box is [`ROW_SIZE`] and the glyph is centred in it, so
-                // padding would only shrink the glyph. `interact_size` because a button is
-                // floored at it, and the style's is wider *and* taller than a row can hold.
-                ui.spacing_mut().button_padding = Vec2::ZERO;
-                ui.spacing_mut().interact_size = ROW_SIZE;
-                let button = egui::Button::new(RichText::new(icon).font(font(ROW_GLYPH)))
-                    .min_size(ROW_SIZE)
-                    // Ink at rest, a box under the pointer. Three framed boxes on every
-                    // Workspace row competed with the name and the state for a row whose job
-                    // is to be scanned; the frame still appears the moment the control is
-                    // hovered or focused, so nothing is hidden and nothing moves when it does.
-                    .frame_when_inactive(false);
-                ui.add_enabled(enabled, button)
-            },
-        )
-        .inner;
+    let response = glyph_button(ui, at, icon, ROW_GLYPH, enabled, None);
     describe(&response, label);
     response.on_hover_text(tooltip)
+}
+
+/// A glyph drawn as a control that fills exactly the rectangle it is given.
+///
+/// The one place that knows how to do this, because getting it wrong looks like two different
+/// bugs and both were reported. `egui`'s `Button` sizes itself from its content plus the style's
+/// button padding, floored at the style's *interaction size* — 44 x 28 for Turn — and it takes
+/// its alignment from the `Ui` it is added to. Added to a plain region at an 18 x 16 slot, it
+/// therefore came out 32 x 28 with the glyph against the left edge: a rounded box overflowing a
+/// pane header and clipped at the bottom, and a row of icons that looked out of line.
+///
+/// So the rectangle is not a suggestion. The layout is centred *and justified*, the padding is
+/// zeroed — the box is already the size it should be, and padding would only shrink the glyph —
+/// and the interaction floor is lowered to the slot.
+///
+/// `tint` is for a control whose colour carries meaning; `None` leaves it to the style, which is
+/// what makes a disabled control look disabled.
+pub fn glyph_button(
+    ui: &mut Ui,
+    at: egui::Rect,
+    icon: &str,
+    points: f32,
+    enabled: bool,
+    tint: Option<egui::Color32>,
+) -> Response {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(at)
+            .layout(egui::Layout::centered_and_justified(
+                egui::Direction::TopDown,
+            )),
+        |ui| {
+            ui.spacing_mut().button_padding = Vec2::ZERO;
+            ui.spacing_mut().interact_size = at.size();
+            let mut text = RichText::new(icon).font(font(points));
+            if let Some(tint) = tint {
+                text = text.color(tint);
+            }
+            let button = egui::Button::new(text)
+                .min_size(at.size())
+                // Ink at rest, a box under the pointer. Three framed boxes on a row — or on a
+                // pane header with three panes — compete with the words for a surface whose job
+                // is to be scanned; the frame appears the moment the control is reached, so
+                // nothing is hidden and nothing moves when it does.
+                .frame_when_inactive(false);
+            ui.add_enabled(enabled, button)
+        },
+    )
+    .inner
 }
 
 /// Names a control whose visible content is a glyph.
