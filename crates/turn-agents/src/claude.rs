@@ -347,6 +347,22 @@ impl AgentAdapter for ClaudeCodeAdapter {
         })
     }
 
+    /// `claude --resume <session_id>` continues the conversation that id names.
+    ///
+    /// The id is the `session_id` every hook payload carries, which is why the
+    /// adapter records it on `SessionStart`: without it a restore can only start a
+    /// new conversation, and the user loses the context they were mid-way through.
+    fn resume_args(&self, external_id: &str) -> Option<Vec<String>> {
+        let id = external_id.trim();
+        // A blank or malformed id would turn into `--resume` with no value, which
+        // makes Claude Code open its own session picker — an interactive prompt
+        // nobody asked for, in a pane that was supposed to come back as it was.
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(vec!["--resume".to_string(), id.to_string()])
+    }
+
     fn normalise(&self, payload: &Value, ctx: &EventContext) -> Vec<TurnEvent> {
         let Some(event_name) = payload.get("hook_event_name").and_then(Value::as_str) else {
             return Vec::new();
@@ -782,6 +798,50 @@ mod tests {
 
     fn normalise(payload: Value) -> Vec<TurnEvent> {
         ClaudeCodeAdapter::new().normalise(&payload, &ctx())
+    }
+
+    /// The point of recording the agent's own session id: a restore can offer to
+    /// continue the conversation instead of starting a new one.
+    #[test]
+    fn a_recorded_session_id_becomes_a_resume_launch() {
+        let adapter = ClaudeCodeAdapter::new();
+        assert_eq!(
+            adapter.resume_args("84cde77e-f54f-41e7-bb05-2716cb61b6bf"),
+            Some(vec![
+                "--resume".to_string(),
+                "84cde77e-f54f-41e7-bb05-2716cb61b6bf".to_string()
+            ])
+        );
+        assert!(
+            adapter.capabilities().resumable,
+            "the capability and the mechanism must agree, or the UI offers what the \
+             adapter cannot do"
+        );
+    }
+
+    /// A blank or malformed id must not become a bare `--resume`, which makes Claude
+    /// Code open its interactive session picker — a prompt nobody asked for, in a
+    /// pane that was supposed to come back the way it was left.
+    #[test]
+    fn an_unusable_session_id_yields_no_resume_rather_than_a_bare_flag() {
+        let adapter = ClaudeCodeAdapter::new();
+        for id in ["", "   ", "two words", "id\twith\ttabs"] {
+            assert_eq!(
+                adapter.resume_args(id),
+                None,
+                "{id:?} must not produce a resume launch"
+            );
+        }
+        // Surrounding whitespace alone is recoverable, so it is trimmed rather than
+        // refused: the id itself is intact. A trailing newline is the common case,
+        // since ids reach Turn through JSON payloads and log lines.
+        for id in ["  abc-123  ", "abc-123\n"] {
+            assert_eq!(
+                adapter.resume_args(id),
+                Some(vec!["--resume".to_string(), "abc-123".to_string()]),
+                "{id:?} names a usable id"
+            );
+        }
     }
 
     #[test]
