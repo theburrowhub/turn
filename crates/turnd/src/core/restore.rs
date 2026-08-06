@@ -451,6 +451,11 @@ impl Core {
                 node_id,
                 lifecycle: node.lifecycle.clone(),
                 can_relaunch: relaunchable,
+                // `Relaunch` has always meant "running this again is harmless". Turn now acts on
+                // it instead of only offering it: a Session that comes back stopped, with a
+                // button under every pane, is a form rather than a session. `ReattachOnly` keeps
+                // the button and now means what it says — do not run this one by itself.
+                auto_start: relaunchable && pane.restore == RestoreBehaviour::Relaunch,
                 // Descriptive only; relaunch authority is the durable node id.
                 command: pane.command.clone(),
                 // Absent means "assume it does", which is also the honest answer for a
@@ -690,6 +695,7 @@ mod migration_tests {
                     lifecycle: Lifecycle::Orphaned,
                     can_relaunch: false,
                     command: Some("sh".into()),
+                    auto_start: false,
                     needs_checkout_write: false,
                 }],
             });
@@ -768,6 +774,7 @@ mod migration_tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("sh".into()),
+                    auto_start: false,
                     needs_checkout_write: false,
                 }],
             });

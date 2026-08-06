@@ -958,6 +958,7 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("turn-command-that-definitely-does-not-exist".into()),
+                    auto_start: false,
                     needs_checkout_write: true,
                 }],
             });

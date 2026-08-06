@@ -35,10 +35,27 @@ pub struct PaneRestoreOutcome {
     /// out of reach) or `Lost` (cannot be found). `Reconnected` is reserved for a
     /// backend that can prove PTY reattachment; the MVP does not claim it.
     pub lifecycle: Lifecycle,
-    /// Set when Turn could offer to start this pane again. It is an offer: the
-    /// user answers it with [`Request::RelaunchNode`](crate::Request::RelaunchNode)
-    /// or does not, and nothing happens until they do.
+    /// Set when this pane *can* be started again: it is not running, it has something to run,
+    /// and its `RestoreBehaviour` is not `Skip`.
+    ///
+    /// Whether it *should* be started without being asked is the separate question below.
     pub can_relaunch: bool,
+    /// Whether Turn may start this pane again on its own.
+    ///
+    /// True for a pane whose `RestoreBehaviour` is `Relaunch` — the value that has always meant
+    /// "running this again is harmless", and which every built-in template sets for its shells,
+    /// its agent panes and its file browsers. Coming back to a Session and finding it stopped,
+    /// with a button per pane, is not a session; it is a form to fill in. So the client starts
+    /// these without asking.
+    ///
+    /// False for `ReattachOnly`, which now means what it says: *this one is not to be run by
+    /// itself*. A pane naming a command with a consequence — a deploy, a migration, anything
+    /// that is not idempotent — belongs there, and it keeps the button.
+    ///
+    /// Defaults to false when absent, so an older peer's payload is read as "ask" rather than as
+    /// permission to run something.
+    #[serde(default)]
+    pub auto_start: bool,
     /// What the pane would run if the user accepted. It is descriptive; the
     /// authoritative relaunch target remains `node_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

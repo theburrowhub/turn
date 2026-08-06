@@ -1318,11 +1318,16 @@ async fn a_session_that_had_nothing_to_lose_does_not_claim_turn_lost_something()
     daemon.shutdown().await;
 }
 
-/// The fourth product rule, executable: **Turn never relaunches on restore.** It is
-/// structurally true — `RelaunchNode` is the only request that starts anything — and this
-/// is the test that keeps it true, including for the panes that say they are safe to
-/// restart. `RestoreBehaviour::Relaunch` marks a pane Turn *may offer* to start again; a
-/// daemon that read it as permission would be running the user's commands for them.
+/// The fourth product rule, executable: **the daemon never relaunches on restore.** It is
+/// structurally true — `RelaunchNode` is the only request that starts anything, and the daemon
+/// does not send itself requests — and this is the test that keeps it true, including for the
+/// panes that say they are safe to restart.
+///
+/// Still true after auto-start, and worth being precise about why. A window that has received the
+/// restore report *does* start the panes marked `auto_start`, because a person is there and asked
+/// for that Session; the daemon restoring on its own — after a crash, at boot, with nothing
+/// attached — starts nothing, which is the case this test covers. The two are different moments
+/// and only one of them has somebody watching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_relaunches_nothing_even_for_a_pane_that_says_it_is_safe_to() {
     let daemon = TestDaemon::start().await;

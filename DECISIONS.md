@@ -62,6 +62,7 @@ Status values:
 | [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
 | [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
 | [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Accepted, implemented |
+| [049](#adr-049) | Coming back to a Session starts it; the daemon still starts nothing on its own | Accepted, implemented; overturns the restore half of the never-relaunch rule |
 
 ---
 
@@ -2998,3 +2999,75 @@ menu, because that is a decision about the pane.
 - **Downside:** none of this reaches a Session whose agent Turn did not launch. Without hooks there
   are no reported subagents, only the OS children the scan finds, so a hand-started `claude` shows
   its processes and not its workers. That is the launch path's problem, not this one's.
+
+---
+
+<a id="adr-049"></a>
+## ADR-049 — Coming back to a Session starts it; the daemon still starts nothing on its own
+
+**Status:** Accepted, implemented. Overturns the restore half of "Turn never relaunches", which was
+a product rule of this project from its brief onwards.
+
+### Context
+
+Turn restored a Session's layout and started nothing. Every pane came back empty with a button in
+the middle of it, and the user's Session — four panes — was four buttons. It was reported three
+times: as "one click per pane, unusable", then again after the collective "Start all N panes" was
+added, and finally as *"I don't want this, it has to start on its own"*.
+
+The rule it came from is a good rule, and I defended it three times: **Turn never runs the user's
+commands for them.** A restore that relaunched could re-run a deploy, a migration, a script with a
+side effect, and the user would find out afterwards.
+
+What the rule got wrong was treating every pane the same. A Session assembled from a template is
+made of shells, agent panes and file browsers — things whose whole content is "run this again" —
+and the layout model has said so since it was written: `RestoreBehaviour::Relaunch` means *running
+this again is harmless*, and every built-in template sets it. The rule was being applied as though
+that value did not exist.
+
+### Alternatives considered
+
+**Fewer clicks.** Tried, shipped, and rejected by the owner within the hour: the collective offer
+made four clicks into one, and one was still one too many. The complaint was never about the count.
+
+**Start everything with `can_relaunch`.** Rejected. That flag means "this *could* be started" — it
+is true for a pane naming `npm run deploy` — and using it as permission is the failure mode the
+original rule existed to prevent.
+
+**Start in the daemon, at restore.** Rejected, and this is the substantive half of the decision.
+The daemon restores when it starts, which includes after a crash and at boot with no window
+attached. Relaunching thirty panes with nobody watching is how a person discovers that Turn ran
+something.
+
+### Decision
+
+The daemon marks each pane `auto_start` when its `RestoreBehaviour` is `Relaunch` and it could be
+started at all. It does not act on it: `RelaunchNode` remains the only request that starts
+anything, and the daemon does not send itself requests. The executable form of that is unchanged
+and still passing.
+
+The **window** acts on it, when it receives the restore report — which is the moment a person has
+opened Turn and asked for that Session. It starts every `auto_start` pane, once, without asking,
+and holds back exactly two cases: a pane that would use the checkout while a write confirmation is
+pending, and any pane at all while a process from the previous daemon is still alive and out of
+reach, because a replacement running beside it would do the work twice.
+
+`ReattachOnly` now means what it says: **do not run this one by itself.** That is where a pane
+naming a command with a consequence belongs, and it keeps its button.
+
+### Consequences
+
+- Coming back to a Session is coming back to the Session. Nothing to click.
+- The safety the original rule protected is now expressed where it can be reasoned about — per
+  pane, in a value the template author or the user sets — rather than as a blanket refusal.
+- The two moments are separated: a daemon restoring alone starts nothing; a window that a person
+  is looking at starts what is safe.
+- **Downside:** a pane left on the default `ReattachOnly` does not start automatically, so a
+  hand-built pane behaves differently from a template's. The default is the cautious one, which is
+  the right way round, but it means the feature is invisible until somebody notices the setting.
+- **Downside:** two windows attached to the same Session both act on the report. The second
+  request arrives after the first has started the node and is refused, so the outcome is right and
+  the log carries a refusal nobody asked about.
+- **Downside:** this is a product rule reversed under pressure from its owner, on the third
+  report. The rule was defensible and the way it was applied was not, and the record should say
+  that the owner was right and I was slow.

@@ -1561,12 +1561,67 @@ impl Desk {
                     self.restores.remove(&session_id);
                     return Vec::new();
                 }
-                // Merely receiving this event never starts a process. The structured
-                // outcomes become neutral, per-pane actions in the selected Session.
                 for outcome in &panes {
                     self.feeds.remove(&outcome.pane_id);
                     self.attaching.remove(&outcome.pane_id);
                     self.pty_sizes.remove(&outcome.pane_id);
+                }
+                // Coming back to a Session starts it.
+                //
+                // This used to say "merely receiving this event never starts a process", and the
+                // Session came back as a grid of empty panes with a button under each one. That
+                // is not a Session, it is a form — and it was reported three times before it was
+                // fixed, the last time as unusable.
+                //
+                // What starts is what the daemon marked `auto_start`: a pane whose
+                // `RestoreBehaviour` is `Relaunch`, the value that has always meant "running this
+                // again is harmless" and that every built-in template sets. `ReattachOnly` now
+                // means what it says and keeps its button, which is where a pane naming a deploy
+                // or a migration belongs.
+                //
+                // Here rather than in the daemon, deliberately. The daemon restores when it
+                // starts, including after a crash with no window open — and relaunching thirty
+                // panes with nobody watching is how a user finds out Turn ran something. This
+                // fires when a window has actually received the report, which is when somebody
+                // is there.
+                let held_back = self.write_recovery_pending(&session_id);
+                let start: Vec<Reaction> = panes
+                    .iter()
+                    .filter(|outcome| outcome.auto_start)
+                    // A pane that would use the checkout waits for the write confirmation, and
+                    // only that pane: the shell the user needs in order to go and deal with
+                    // whatever the confirmation is about starts now, as it always did.
+                    .filter(|outcome| !(held_back && outcome.needs_checkout_write))
+                    // Something from the previous daemon is still alive and out of reach.
+                    // Starting a replacement beside it would run the work twice.
+                    .filter(|_| !self.has_unreachable_processes(&session_id))
+                    .map(|outcome| Reaction::Send {
+                        ask: Ask::RelaunchNode {
+                            session_id: session_id.clone(),
+                            node_id: outcome.node_id.clone(),
+                        },
+                        request: Request::RelaunchNode {
+                            session_id: session_id.clone(),
+                            node_id: outcome.node_id.clone(),
+                            resume: false,
+                        },
+                    })
+                    .collect();
+                for reaction in &start {
+                    if let Reaction::Send {
+                        request: Request::RelaunchNode { node_id, .. },
+                        ..
+                    } = reaction
+                    {
+                        self.relaunching.insert(node_id.clone());
+                    }
+                }
+                if !start.is_empty() {
+                    tracing::info!(
+                        session = %session_id,
+                        panes = start.len(),
+                        "starting the panes this Session came back with"
+                    );
                 }
                 self.restores.insert(
                     session_id.clone(),
@@ -1576,7 +1631,7 @@ impl Desk {
                         panes,
                     },
                 );
-                Vec::new()
+                start
             }
             E::NodeStateChanged {
                 session_id,
@@ -1703,6 +1758,43 @@ impl Desk {
         ancestors.reverse();
         keys.extend(ancestors.into_iter().map(HierarchyKey::process));
         keys
+    }
+
+    /// Whether this Session is waiting for the user to confirm write access to the checkout.
+    ///
+    /// Asked per Session rather than only for the selected one: a restore report arrives for a
+    /// Session the window may not be looking at, and starting its agent because the *other*
+    /// Session had no pending confirmation would be the wrong answer to the right question.
+    fn write_recovery_pending(&self, session_id: &SessionId) -> bool {
+        let recovering = self.hierarchy.as_ref().is_some_and(|snapshot| {
+            snapshot.workspaces.iter().any(|workspace| {
+                workspace.write_lease.as_ref().is_some_and(|lease| {
+                    &lease.session_id == session_id && lease.state == LeaseState::RecoveryRequired
+                })
+            })
+        });
+        let reclaiming = self.hierarchy.as_ref().is_some_and(|snapshot| {
+            snapshot.workspaces.iter().any(|workspace| {
+                self.reclaiming_leases.contains(&workspace.workspace.id)
+                    && workspace
+                        .sessions
+                        .iter()
+                        .any(|session| &session.session.id == session_id)
+            })
+        });
+        recovering || reclaiming
+    }
+
+    /// Whether something from a previous daemon is still alive in this Session and out of reach.
+    ///
+    /// Nothing is started while one is: a replacement running beside a process Turn cannot
+    /// control would do the work twice, and the second copy is the one nobody asked for.
+    fn has_unreachable_processes(&self, session_id: &SessionId) -> bool {
+        self.trees.get(session_id).is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|node| node.lifecycle == turn_core::state::Lifecycle::Orphaned)
+        })
     }
 
     fn update_hierarchy_node(
@@ -4846,6 +4938,7 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("cargo watch -x test".into()),
+                    auto_start: false,
                     needs_checkout_write: true,
                 }],
             })),
@@ -4972,6 +5065,74 @@ mod tests {
 
     /// While write access is pending, the Session is still usable. A pane that would only
     /// open the user's own shell starts; the one that would run an agent against the
+    /// Coming back to a Session starts it.
+    ///
+    /// Reported three times: Turn restored the layout and left every pane empty with a button
+    /// under it, so a Session came back as a form to fill in. The rule it came from — that Turn
+    /// never runs anything by itself — is right for a command with a consequence and wrong for
+    /// the shells and agent panes every template is made of, which is what
+    /// `RestoreBehaviour::Relaunch` has always meant. The daemon marks those `auto_start`; this
+    /// is the window acting on them.
+    #[test]
+    fn a_restore_report_starts_the_panes_it_says_are_safe_to_start() {
+        let (session, pane_id, node_id) = session_with_agent("Restarting");
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        let reactions = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::RestoreResult {
+                session_id: session.id.clone(),
+                state: turn_core::model::RestoreState::LayoutOnly,
+                needs_explanation: true,
+                panes: vec![
+                    turn_proto::PaneRestoreOutcome {
+                        pane_id: pane_id.clone(),
+                        node_id: node_id.clone(),
+                        lifecycle: Lifecycle::Lost,
+                        can_relaunch: true,
+                        command: Some("zsh".into()),
+                        auto_start: true,
+                        needs_checkout_write: false,
+                    },
+                    // Marked `ReattachOnly` by whoever built the pane: it can be started, and not
+                    // without being asked. This is where a deploy or a migration belongs.
+                    turn_proto::PaneRestoreOutcome {
+                        pane_id: PaneId::from_stored("pane_careful"),
+                        node_id: NodeId::from_stored("node_careful"),
+                        lifecycle: Lifecycle::Lost,
+                        can_relaunch: true,
+                        command: Some("npm run deploy".into()),
+                        auto_start: false,
+                        needs_checkout_write: false,
+                    },
+                ],
+            })),
+            T0,
+        );
+
+        let started: Vec<Request> = sent(&reactions)
+            .into_iter()
+            .filter(|request| matches!(request, Request::RelaunchNode { .. }))
+            .collect();
+        assert_eq!(
+            started.len(),
+            1,
+            "exactly the pane that said it was safe: {started:?}"
+        );
+        assert!(
+            matches!(
+                &started[0],
+                Request::RelaunchNode { node_id: asked, resume: false, .. } if *asked == node_id
+            ),
+            "and it is the one that said so, started fresh rather than resumed: {started:?}"
+        );
+    }
+
     /// shared checkout waits, and says so.
     #[test]
     fn pending_write_access_holds_back_only_the_panes_that_would_use_the_checkout() {
@@ -5028,6 +5189,7 @@ mod tests {
                         lifecycle: Lifecycle::Lost,
                         can_relaunch: true,
                         command: Some("claude".into()),
+                        auto_start: false,
                         needs_checkout_write: true,
                     },
                     turn_proto::PaneRestoreOutcome {
@@ -5036,6 +5198,7 @@ mod tests {
                         lifecycle: Lifecycle::Lost,
                         can_relaunch: true,
                         command: None,
+                        auto_start: false,
                         needs_checkout_write: false,
                     },
                 ],
@@ -5101,6 +5264,7 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("claude".into()),
+                    auto_start: false,
                     needs_checkout_write: true,
                 }],
             })),

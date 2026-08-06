@@ -763,6 +763,7 @@ fn restored_desk() -> Fixture {
                     command: Some(node.command.clone()),
                     // Every pane in this fixture is an agent or a named command, so all of
                     // them would use the Session's checkout write authority.
+                    auto_start: false,
                     needs_checkout_write: true,
                 })
         })

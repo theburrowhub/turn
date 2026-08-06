@@ -883,6 +883,7 @@ mod tests {
                 lifecycle: turn_core::state::Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("claude".into()),
+                auto_start: false,
                 needs_checkout_write: true,
             }],
         };
