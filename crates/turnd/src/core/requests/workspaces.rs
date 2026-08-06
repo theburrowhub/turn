@@ -180,6 +180,62 @@ impl Core {
         Ok(Response::Ack)
     }
 
+    /// Removes a Workspace and everything under it from Turn for good.
+    ///
+    /// Its Sessions cannot outlive it, so they are deleted one by one through
+    /// [`Self::delete_session`] rather than left to the database's cascade: each one has
+    /// processes to stop, clients to detach and a scratch directory to remove, and none of
+    /// that is the schema's job. The Workspace row goes last, once nothing depends on it.
+    ///
+    /// Validated whole before anything is touched, for the same reason `close_workspace` is: an
+    /// unreachable process in the fourth Session would otherwise leave the first three deleted
+    /// and the Workspace half gone, which is a state with no name in the UI.
+    ///
+    /// The checkout is not touched. It is a directory the user chose, Turn does not own it, and
+    /// no file, branch or worktree in it is removed. Every surface that offers this has to say
+    /// so, because "delete workspace" without that sentence sounds like a question about their
+    /// code rather than about Turn's record of it.
+    pub(super) fn delete_workspace(
+        &mut self,
+        id: &WorkspaceId,
+        disposition: CloseDisposition,
+        now_ms: i64,
+    ) -> Answer {
+        if matches!(disposition, CloseDisposition::KeepProcesses) {
+            return Err(ProtoError::refused(
+                "Deleting a Workspace cannot keep its processes running",
+            )
+            .with_detail(
+                "Nothing would name them afterwards. Stop them, or close the Workspace \
+                 instead of deleting it.",
+            ));
+        }
+        let Ok(workspace) = self.workspace(id) else {
+            tracing::info!(workspace = %id, "delete asked for a Workspace that is already gone");
+            return Ok(Response::Ack);
+        };
+        let name = workspace.name.clone();
+        let sessions: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|session| &session.workspace_id == id)
+            .map(|session| session.id.clone())
+            .collect();
+        for session in &sessions {
+            self.ensure_session_processes_stoppable(session, disposition)?;
+        }
+        for session in &sessions {
+            self.delete_session(session, disposition, now_ms)?;
+        }
+
+        self.store.workspaces().delete(id).map_err(store)?;
+        self.workspaces.remove(id);
+        tracing::info!(workspace = %id, %name, sessions = sessions.len(), "deleted");
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        Ok(Response::Ack)
+    }
+
     fn answer_workspace(&self, id: &WorkspaceId, now_ms: i64) -> Answer {
         let workspace = self
             .workspace_summary(id, now_ms)

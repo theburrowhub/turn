@@ -196,6 +196,28 @@ pub enum LifecycleConfirmation {
         running_sessions: usize,
         running_processes: usize,
     },
+    /// The one that does not come back.
+    ///
+    /// A separate variant from `EndSession` rather than a flag on it, because the two ask
+    /// different questions and the answer to one is not the answer to the other. Ending is
+    /// about the work; deleting is about the record.
+    DeleteSession {
+        session_id: SessionId,
+        name: String,
+        running_count: usize,
+    },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+        session_count: usize,
+        running_processes: usize,
+        /// The directory the Workspace points at, shown verbatim.
+        ///
+        /// The one thing a person needs to see before deleting a Workspace is the path that is
+        /// *not* being deleted. Naming it — rather than promising in the abstract that files
+        /// are safe — is what makes the promise checkable by the person reading it.
+        root: String,
+    },
 }
 
 /// Window-local review state. The body itself comes from the daemon and cannot be
@@ -283,6 +305,34 @@ impl LifecycleConfirmation {
             session_id: session.id.clone(),
             name: session.name.clone(),
             running_count: session.running_count,
+        }
+    }
+
+    /// The confirmation for deleting one Session, from the daemon's own summary of it.
+    pub fn delete_session(session: &SessionSummary) -> Self {
+        LifecycleConfirmation::DeleteSession {
+            session_id: session.id.clone(),
+            name: session.name.clone(),
+            running_count: session.running_count,
+        }
+    }
+
+    /// The confirmation for deleting a whole Workspace, counted from the tree branch.
+    ///
+    /// The root path comes from the Workspace's own summary rather than from anything the
+    /// caller assembles: the dialog's promise is about that exact directory, and a path the
+    /// window guessed would be a promise about the wrong one.
+    pub fn delete_workspace(workspace: &WorkspaceTreeView) -> Self {
+        LifecycleConfirmation::DeleteWorkspace {
+            workspace_id: workspace.workspace.id.clone(),
+            name: workspace.workspace.name.clone(),
+            session_count: workspace.sessions.len(),
+            running_processes: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.running_count)
+                .sum(),
+            root: workspace.workspace.root.clone(),
         }
     }
 
@@ -763,6 +813,16 @@ pub enum ViewAction {
         disposition: CloseDisposition,
     },
     CloseWorkspace {
+        workspace_id: WorkspaceId,
+        disposition: CloseDisposition,
+    },
+    /// Removes a Session from Turn for good. Only ever produced by the confirmation dialog.
+    DeleteSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
+    /// Removes a Workspace and its Sessions for good. Only ever produced by the dialog.
+    DeleteWorkspace {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
@@ -2262,7 +2322,8 @@ impl<'a> TurnView<'a> {
         // a panel sized for the longer of the two leaves the shorter one with a band of
         // empty space under its buttons.
         let wanted_height = match state.lifecycle_confirmation {
-            Some(LifecycleConfirmation::StopWorkspace { .. }) => 300.0_f32,
+            Some(LifecycleConfirmation::StopWorkspace { .. })
+            | Some(LifecycleConfirmation::DeleteWorkspace { .. }) => 300.0_f32,
             _ => 272.0_f32,
         };
         let panel = Rect::from_center_size(
@@ -2329,6 +2390,46 @@ impl<'a> TurnView<'a> {
                         if *running_processes == 1 { "" } else { "es" }
                     ),
                 ),
+                LifecycleConfirmation::DeleteSession {
+                    name,
+                    running_count,
+                    ..
+                } => (
+                    "Delete this session?",
+                    name.as_str(),
+                    // What is deleted, then what is not, in that order. A person reading
+                    // "delete" is asking about their work, and the answer is in the second
+                    // half of the sentence.
+                    "Turn will forget this Session: its layout, its history and its record. \
+                     Your files, branches and worktrees are not touched.",
+                    None,
+                    format!(
+                        "This cannot be undone. {} running process{} will be stopped first.",
+                        running_count,
+                        if *running_count == 1 { "" } else { "es" }
+                    ),
+                ),
+                LifecycleConfirmation::DeleteWorkspace {
+                    name,
+                    session_count,
+                    running_processes,
+                    root,
+                    ..
+                } => (
+                    "Delete this workspace?",
+                    name.as_str(),
+                    "Turn will forget this Workspace and every Session in it.",
+                    // The path, verbatim: the one thing worth reading twice is what stays.
+                    Some(format!("{root} stays exactly as it is.")),
+                    format!(
+                        "This cannot be undone. {} session{} and {} running process{} will \
+                         be stopped and deleted.",
+                        session_count,
+                        if *session_count == 1 { "" } else { "s" },
+                        running_processes,
+                        if *running_processes == 1 { "" } else { "es" }
+                    ),
+                ),
             };
             ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
             ui.label(RichText::new(subject).color(theme.text_dim).strong());
@@ -2337,7 +2438,11 @@ impl<'a> TurnView<'a> {
             if let Some(scope) = scope {
                 ui.label(RichText::new(scope).color(theme.text_dim));
             }
-            ui.label(RichText::new(terminating).color(theme.attention).small());
+            // At body size, not small. This is the line that says how much of the world the
+            // button reaches, and for a delete it is also the line that says it does not come
+            // back — it must not be the same weight as the hint underneath it, which is the
+            // way *out*.
+            ui.label(RichText::new(terminating).color(theme.attention));
             // The other door, named on the way through this one. Somebody who only wants
             // the row gone must be able to see that stopping the work is not the price of
             // a tidy tree.
@@ -2349,15 +2454,24 @@ impl<'a> TurnView<'a> {
                     LifecycleConfirmation::StopWorkspace { .. } => {
                         "Only tidying up? Archive it instead — the Workspace leaves the tree and nothing stops."
                     }
+                    LifecycleConfirmation::DeleteSession { .. } => {
+                        "Want it back later? Archive it instead — the row leaves the tree and the Session keeps everything."
+                    }
+                    LifecycleConfirmation::DeleteWorkspace { .. } => {
+                        "Want it back later? Archive it instead — the Workspace leaves the tree and keeps its Sessions."
+                    }
                 })
                 .color(theme.text_faint)
                 .small(),
             );
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Named for what it does, and the same word the control that opened it used.
                 let confirm_label = match confirmation {
                     LifecycleConfirmation::EndSession { .. } => "End session",
                     LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
+                    LifecycleConfirmation::DeleteSession { .. } => "Delete session",
+                    LifecycleConfirmation::DeleteWorkspace { .. } => "Delete workspace",
                 };
                 if ui
                     .add(
@@ -2375,6 +2489,18 @@ impl<'a> TurnView<'a> {
                         }
                         LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
                             actions.push(ViewAction::CloseWorkspace {
+                                workspace_id,
+                                disposition: CloseDisposition::Terminate,
+                            });
+                        }
+                        LifecycleConfirmation::DeleteSession { session_id, .. } => {
+                            actions.push(ViewAction::DeleteSession {
+                                session_id,
+                                disposition: CloseDisposition::Terminate,
+                            });
+                        }
+                        LifecycleConfirmation::DeleteWorkspace { workspace_id, .. } => {
+                            actions.push(ViewAction::DeleteWorkspace {
                                 workspace_id,
                                 disposition: CloseDisposition::Terminate,
                             });
@@ -2852,6 +2978,19 @@ impl<'a> TurnView<'a> {
                                     ui.close();
                                 }
                             }
+                            // Last, after a separator, and offered whether the Workspace is
+                            // archived or not: an archived row is exactly what somebody
+                            // tidying up wants to get rid of, and refusing there would leave
+                            // no way to remove it at all.
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Delete workspace…").color(theme.failure))
+                                .clicked()
+                            {
+                                state.lifecycle_confirmation =
+                                    Some(LifecycleConfirmation::delete_workspace(workspace));
+                                ui.close();
+                            }
                         }),
                         HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
                             if session.session.status == SessionStatus::Archived {
@@ -2869,6 +3008,16 @@ impl<'a> TurnView<'a> {
                                         session_id: session.session.id.clone(),
                                         archived: false,
                                     });
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(RichText::new("Delete session…").color(theme.failure))
+                                    .clicked()
+                                {
+                                    state.lifecycle_confirmation = Some(
+                                        LifecycleConfirmation::delete_session(&session.session),
+                                    );
                                     ui.close();
                                 }
                                 return;
@@ -2933,6 +3082,15 @@ impl<'a> TurnView<'a> {
                                     session_id: session.session.id.clone(),
                                     archived: true,
                                 });
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Delete session…").color(theme.failure))
+                                .clicked()
+                            {
+                                state.lifecycle_confirmation =
+                                    Some(LifecycleConfirmation::delete_session(&session.session));
                                 ui.close();
                             }
                         }),
@@ -3145,29 +3303,28 @@ impl<'a> TurnView<'a> {
                     .sum();
 
                 let label = format!("New session in {}", summary.name);
-                ui.scope_builder(
-                    keyed_region(row_action_slot(row_rect, 2), "workspace-new-session", key),
-                    |ui| {
-                        if icons::row_button(
-                            ui,
-                            icons::FILE_PLUS,
-                            &label,
-                            "its Workspace, layout preset and checkout are already chosen",
-                            shortcut(Command::NewSession).as_deref(),
-                            !summary.archived,
-                        )
-                        .on_disabled_hover_text(
-                            "Restore this Workspace before creating a Session in it.",
-                        )
-                        .clicked()
-                        {
-                            state.session_draft = Some(SessionDraft::new(
-                                summary.id.clone(),
-                                self.preferred_template_id(&summary.id),
-                            ));
-                        }
-                    },
-                );
+                let slot = row_action_slot(row_rect, 2);
+                ui.scope_builder(keyed_region(slot, "workspace-new-session", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::FILE_PLUS,
+                        &label,
+                        "its Workspace, layout preset and checkout are already chosen",
+                        shortcut(Command::NewSession).as_deref(),
+                        !summary.archived,
+                    )
+                    .on_disabled_hover_text(
+                        "Restore this Workspace before creating a Session in it.",
+                    )
+                    .clicked()
+                    {
+                        state.session_draft = Some(SessionDraft::new(
+                            summary.id.clone(),
+                            self.preferred_template_id(&summary.id),
+                        ));
+                    }
+                });
 
                 let archived = summary.archived;
                 let label = if archived {
@@ -3176,37 +3333,36 @@ impl<'a> TurnView<'a> {
                     format!("Archive workspace {}", summary.name)
                 };
                 let can_archive = archived || (running == 0 && workspace.write_lease.is_none());
-                ui.scope_builder(
-                    keyed_region(row_action_slot(row_rect, 1), "workspace-archive", key),
-                    |ui| {
-                        if icons::row_button(
-                            ui,
-                            if archived {
-                                icons::UNARCHIVE
-                            } else {
-                                icons::ARCHIVE
-                            },
-                            &label,
-                            if archived {
-                                "brings it back into the tree"
-                            } else {
-                                "takes it out of the tree · stops nothing · reversible"
-                            },
-                            shortcut(Command::ArchiveWorkspace).as_deref(),
-                            can_archive,
-                        )
-                        .on_disabled_hover_text(
-                            "End its Sessions and release the write lease before archiving.",
-                        )
-                        .clicked()
-                        {
-                            actions.push(ViewAction::ArchiveWorkspace {
-                                workspace_id: summary.id.clone(),
-                                archived: !archived,
-                            });
-                        }
-                    },
-                );
+                let slot = row_action_slot(row_rect, 1);
+                ui.scope_builder(keyed_region(slot, "workspace-archive", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        if archived {
+                            icons::UNARCHIVE
+                        } else {
+                            icons::ARCHIVE
+                        },
+                        &label,
+                        if archived {
+                            "brings it back into the tree"
+                        } else {
+                            "takes it out of the tree · stops nothing · reversible"
+                        },
+                        shortcut(Command::ArchiveWorkspace).as_deref(),
+                        can_archive,
+                    )
+                    .on_disabled_hover_text(
+                        "End its Sessions and release the write lease before archiving.",
+                    )
+                    .clicked()
+                    {
+                        actions.push(ViewAction::ArchiveWorkspace {
+                            workspace_id: summary.id.clone(),
+                            archived: !archived,
+                        });
+                    }
+                });
 
                 let label = format!("Close workspace {}", summary.name);
                 let detail = format!(
@@ -3218,30 +3374,29 @@ impl<'a> TurnView<'a> {
                         "s"
                     }
                 );
-                ui.scope_builder(
-                    keyed_region(row_action_slot(row_rect, 0), "workspace-close", key),
-                    |ui| {
-                        ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
-                        if icons::row_button(
-                            ui,
-                            icons::POWER,
-                            &label,
-                            &detail,
-                            shortcut(Command::CloseWorkspace).as_deref(),
-                            !archived,
-                        )
-                        .on_disabled_hover_text(
-                            "An archived Workspace has nothing running. Restore it first.",
-                        )
-                        .clicked()
-                        {
-                            // The control opens the question; the dialog is the only thing
-                            // that can answer it.
-                            state.lifecycle_confirmation =
-                                Some(LifecycleConfirmation::stop_workspace(workspace));
-                        }
-                    },
-                );
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(keyed_region(slot, "workspace-close", key), |ui| {
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::POWER,
+                        &label,
+                        &detail,
+                        shortcut(Command::CloseWorkspace).as_deref(),
+                        !archived,
+                    )
+                    .on_disabled_hover_text(
+                        "An archived Workspace has nothing running. Restore it first.",
+                    )
+                    .clicked()
+                    {
+                        // The control opens the question; the dialog is the only thing
+                        // that can answer it.
+                        state.lifecycle_confirmation =
+                            Some(LifecycleConfirmation::stop_workspace(workspace));
+                    }
+                });
             }
             HierarchyRow::Session { workspace, session } => {
                 let summary = &session.session;
@@ -3262,39 +3417,38 @@ impl<'a> TurnView<'a> {
                 } else {
                     summary.running_count == 0 && !owns_lease
                 };
-                ui.scope_builder(
-                    keyed_region(row_action_slot(row_rect, 1), "session-archive", key),
-                    |ui| {
-                        if icons::row_button(
-                            ui,
-                            if archived {
-                                icons::UNARCHIVE
-                            } else {
-                                icons::ARCHIVE
-                            },
-                            &label,
-                            if archived {
-                                "brings it back into the tree"
-                            } else {
-                                "takes it out of the tree · stops nothing · reversible"
-                            },
-                            shortcut(Command::ArchiveSession).as_deref(),
-                            enabled,
-                        )
-                        .on_disabled_hover_text(if archived {
-                            "Restore the Workspace before restoring this Session."
+                let slot = row_action_slot(row_rect, 1);
+                ui.scope_builder(keyed_region(slot, "session-archive", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        if archived {
+                            icons::UNARCHIVE
                         } else {
-                            "End it and release its write lease before archiving."
-                        })
-                        .clicked()
-                        {
-                            actions.push(ViewAction::ArchiveSession {
-                                session_id: summary.id.clone(),
-                                archived: !archived,
-                            });
-                        }
-                    },
-                );
+                            icons::ARCHIVE
+                        },
+                        &label,
+                        if archived {
+                            "brings it back into the tree"
+                        } else {
+                            "takes it out of the tree · stops nothing · reversible"
+                        },
+                        shortcut(Command::ArchiveSession).as_deref(),
+                        enabled,
+                    )
+                    .on_disabled_hover_text(if archived {
+                        "Restore the Workspace before restoring this Session."
+                    } else {
+                        "End it and release its write lease before archiving."
+                    })
+                    .clicked()
+                    {
+                        actions.push(ViewAction::ArchiveSession {
+                            session_id: summary.id.clone(),
+                            archived: !archived,
+                        });
+                    }
+                });
 
                 let label = format!("Close session {}", summary.name);
                 let detail = format!(
@@ -3302,28 +3456,27 @@ impl<'a> TurnView<'a> {
                     summary.running_count,
                     if summary.running_count == 1 { "" } else { "es" }
                 );
-                ui.scope_builder(
-                    keyed_region(row_action_slot(row_rect, 0), "session-close", key),
-                    |ui| {
-                        ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
-                        if icons::row_button(
-                            ui,
-                            icons::POWER,
-                            &label,
-                            &detail,
-                            shortcut(Command::CloseSession).as_deref(),
-                            !archived,
-                        )
-                        .on_disabled_hover_text(
-                            "An archived Session has nothing running. Restore it first.",
-                        )
-                        .clicked()
-                        {
-                            state.lifecycle_confirmation =
-                                Some(LifecycleConfirmation::end_session(summary));
-                        }
-                    },
-                );
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(keyed_region(slot, "session-close", key), |ui| {
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::POWER,
+                        &label,
+                        &detail,
+                        shortcut(Command::CloseSession).as_deref(),
+                        !archived,
+                    )
+                    .on_disabled_hover_text(
+                        "An archived Session has nothing running. Restore it first.",
+                    )
+                    .clicked()
+                    {
+                        state.lifecycle_confirmation =
+                            Some(LifecycleConfirmation::end_session(summary));
+                    }
+                });
             }
             HierarchyRow::Process { .. } => {}
         }

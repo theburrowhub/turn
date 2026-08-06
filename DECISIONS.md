@@ -59,6 +59,7 @@ Status values:
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 | [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
 | [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
+| [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
 
 ---
 
@@ -2770,3 +2771,84 @@ so a program in a loop cannot grow it.
 - **Downside:** Turn still shows nothing where the picture would have been, so a program whose layout
   assumed a picture occupies rows is laid out for a screen Turn did not draw. Honouring the box would need
   the size the sequence asked for, which a refused file transmission does not carry.
+
+---
+
+<a id="adr-046"></a>
+## ADR-046 — Archive, close and delete are three verbs, and delete forgets only Turn's record
+
+**Status:** Accepted, implemented for Sessions and Workspaces.
+
+### Context
+
+A Session could be archived, which hides it and stops nothing, or closed, which stops its
+processes and leaves it in the tree as `Paused`. Neither gets rid of it. The record stayed, the
+row came back the moment archived rows were shown, and there was no answer to "I am done with
+this, take it away" — reported, exactly, as *"no hay manera"*.
+
+The reason it had been left out is worth naming, because it is a real fear rather than an
+oversight: a Session names a checkout, a branch and sometimes a worktree, and a "delete" that
+was vague about which of those it meant would be a destructive action on somebody's work.
+
+### Alternatives considered
+
+**Hide archived rows harder.** Rejected. It answers "off my screen" and not "gone"; the record
+still accumulates, and a user who archived something to be rid of it has been told a small lie.
+
+**Delete the checkout too, or offer it as a checkbox.** Rejected outright. Turn does not own
+that directory — the user chose it, other tools use it, and it may hold work no one else has a
+copy of. A terminal multiplexer that can delete a repository is not a tool anybody should leave
+running.
+
+**One verb with flags** (`close(delete: true)`). Rejected. The two ask different questions and
+the answer to one is not the answer to the other. A flag on a dialog is also the shape most
+likely to be clicked through.
+
+### Decision
+
+A third verb, distinct from both, and its promise is stated in one line: **delete forgets
+Turn's record and nothing else.**
+
+| | Stops processes | Leaves the tree | Record kept | Reversible |
+| --- | --- | --- | --- | --- |
+| Archive | no | yes | yes | yes |
+| Close | yes | no | yes | the work is not |
+| Delete | yes | yes | **no** | **no** |
+
+What is deleted: the row, the layout, the process tree, the event log, the attention entries,
+the activity previews, the pane bindings, the write lease, the scratch directory, and the
+per-window tree state. A Workspace takes its Sessions with it, deleted one at a time rather
+than by database cascade, because each has processes to stop and clients to detach and neither
+is the schema's job.
+
+What is not deleted: anything on the user's disk. The dialog therefore **names the checkout
+path verbatim** — "/Users/x/personal-workspace/turn stays exactly as it is" — because a promise
+about "your files" is not checkable by the person reading it and a path is.
+
+`KeepProcesses` is refused. Forgetting a Session while its processes run would leave them alive
+with nothing left that names them: not in the tree, not in the store, not in a pane. That is a
+leak the user cannot see, let alone fix.
+
+Deleting something already gone answers `Ack`, so a client that lost a reply can retry.
+
+It is offered on the row's context menu and in the command palette, not as a fourth button on
+the row. A row that carries four controls, one of them irreversible and one click from the
+name, is worse than a row of three and a menu — and the palette is the surface where nothing is
+hidden.
+
+### Consequences
+
+- An archived Session can be deleted, and that is deliberate: a filed-away row is the likeliest
+  thing somebody clearing out their tree wants gone, and refusing there would leave it with no
+  way out at all.
+- `AttentionManager` gained `forget_session`, distinct from `engage_session`: engaging means a
+  demand was *met* and keeps the session's runtime, while forgetting means the subject is gone
+  and drops the mute deadline with it. Without it, `Next attention` could move focus to a
+  Session that is not in the tree.
+- The store's deletes now also clear `tree_ui_state`, which has no foreign key to cascade
+  through. A test walks the *schema* — every table with a `session_id` column — rather than a
+  list written by hand, so a table added later without a cascade fails the day it is added.
+- **Downside:** there is no undo and no trash. A deleted Session's history is gone, and the
+  only protection is the dialog. That is the cost of the promise being simple enough to state.
+- **Downside:** deleting a Workspace with many Sessions is a long operation that stops each
+  one's processes in turn, and the window has one acknowledgement to show for all of it.

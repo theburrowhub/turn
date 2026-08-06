@@ -168,6 +168,31 @@ pub enum Request {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// Removes a Workspace and its Sessions from Turn for good.
+    ///
+    /// The third and last of the three verbs a Workspace row offers, and the only one that
+    /// does not come back. `ArchiveWorkspace` hides it and stops nothing; `CloseWorkspace`
+    /// stops its work and leaves the record; this one stops its work, releases its write
+    /// lease and then **forgets** it: the Workspace row, every Session under it, their
+    /// layouts, their process trees, their event log, their attention entries and their
+    /// per-window tree state.
+    ///
+    /// What it does not do is touch the user's disk. The checkout is a directory they chose
+    /// and Turn does not own it: no file is removed, no branch and no worktree is deleted. A
+    /// caller must say so in the words it puts in front of the user, because "delete" without
+    /// that sentence is a question about their work rather than about Turn's record of it.
+    ///
+    /// Deleting something already gone answers `Ack` rather than `not_found`, so a retry after
+    /// a lost reply is not an error.
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        /// How to stop whatever is still running under it.
+        ///
+        /// Required rather than assumed: the difference between `Terminate` and `Kill` is the
+        /// difference between letting an agent finish writing a file and not, and a delete is
+        /// the last moment anyone can choose.
+        disposition: CloseDisposition,
+    },
 
     // ----------------------------------------------------------- unified tree
     /// The complete Workspace -> Session -> Process projection for one window.
@@ -326,6 +351,20 @@ pub enum Request {
         session_id: SessionId,
     },
     CloseSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
+    /// Removes a Session from Turn for good.
+    ///
+    /// `ArchiveSession` is the reversible one and `CloseSession` stops the work; this stops
+    /// the work, releases the write lease the Session holds and then forgets it — its layout,
+    /// its process tree, its history, its attention entries, its scratch directory and its
+    /// per-window tree state. Nothing on the user's disk is touched: the checkout, the branch
+    /// and any worktree are theirs, not Turn's.
+    ///
+    /// Deleting something already gone answers `Ack`, so a retry after a lost reply is not an
+    /// error.
+    DeleteSession {
         session_id: SessionId,
         disposition: CloseDisposition,
     },
@@ -697,6 +736,7 @@ impl Request {
             Request::ArchiveWorkspace { .. } => "archive_workspace",
             Request::DuplicateWorkspace { .. } => "duplicate_workspace",
             Request::CloseWorkspace { .. } => "close_workspace",
+            Request::DeleteWorkspace { .. } => "delete_workspace",
             Request::GetHierarchy { .. } => "get_hierarchy",
             Request::SetTreeExpanded { .. } => "set_tree_expanded",
             Request::SelectTreeNode { .. } => "select_tree_node",
@@ -718,6 +758,7 @@ impl Request {
             Request::ArchiveSession { .. } => "archive_session",
             Request::DuplicateSession { .. } => "duplicate_session",
             Request::CloseSession { .. } => "close_session",
+            Request::DeleteSession { .. } => "delete_session",
             Request::GetSession { .. } => "get_session",
             Request::GetProcessTree { .. } => "get_process_tree",
             Request::GetPreviewHistory { .. } => "get_preview_history",
@@ -776,7 +817,7 @@ impl Request {
             | Request::RenameWorkspace { .. }
             | Request::ArchiveWorkspace { .. }
             | Request::DuplicateWorkspace { .. } => "workspace",
-            Request::CloseWorkspace { .. } => "ack",
+            Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "ack",
 
             Request::GetHierarchy { .. } => "hierarchy",
             Request::SetTreeExpanded { .. } | Request::SelectTreeNode { .. } => "tree_state",
@@ -794,7 +835,7 @@ impl Request {
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }
             | Request::DuplicateSession { .. } => "session",
-            Request::CloseSession { .. } => "ack",
+            Request::CloseSession { .. } | Request::DeleteSession { .. } => "ack",
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
             Request::GetPreviewHistory { .. } => "preview_history",

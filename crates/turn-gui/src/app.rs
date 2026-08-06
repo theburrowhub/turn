@@ -579,6 +579,20 @@ impl TurnApp {
                 }
                 true
             }
+            Command::DeleteSession => {
+                match self.desk.delete_session_confirmation() {
+                    Ok(confirmation) => self.state.lifecycle_confirmation = Some(confirmation),
+                    Err(reason) => self.desk.show_notice(reason),
+                }
+                true
+            }
+            Command::DeleteWorkspace => {
+                match self.desk.delete_workspace_confirmation() {
+                    Ok(confirmation) => self.state.lifecycle_confirmation = Some(confirmation),
+                    Err(reason) => self.desk.show_notice(reason),
+                }
+                true
+            }
             Command::QuickNewSession if !self.desk.has_workspaces() => {
                 self.state.session_draft = None;
                 self.state.workspace_draft = Some(crate::view::WorkspaceDraft::new(true));

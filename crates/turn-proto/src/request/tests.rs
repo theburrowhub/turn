@@ -437,6 +437,10 @@ pub(crate) fn all_requests() -> Vec<Request> {
             workspace_id: workspace_id.clone(),
             disposition: CloseDisposition::KeepProcesses,
         },
+        Request::DeleteWorkspace {
+            workspace_id: workspace_id.clone(),
+            disposition: CloseDisposition::Terminate,
+        },
         Request::GetHierarchy {
             surface_id: "window-a".into(),
             include_archived: false,
@@ -530,6 +534,10 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
         },
         Request::CloseSession {
+            session_id: session_id.clone(),
+            disposition: CloseDisposition::Terminate,
+        },
+        Request::DeleteSession {
             session_id: session_id.clone(),
             disposition: CloseDisposition::Terminate,
         },
@@ -743,7 +751,13 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 66 operations. This number is asserted so that adding one without
-    // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 66, "the catalogue changed size: {names:?}");
+    // 68 operations. The number is asserted so that adding one without documenting it in
+    // docs/PROTOCOL.md becomes a deliberate act.
+    //
+    // What it does *not* do is notice a variant that was added to `Request` and never added
+    // to the fixture below — the set is built from the fixture, so an absent variant is
+    // absent from both sides of the comparison. The compile-time guards for that are
+    // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
+    // be left alone when a variant appears. This assertion guards the *documentation*.
+    assert_eq!(names.len(), 68, "the catalogue changed size: {names:?}");
 }

@@ -855,6 +855,80 @@ impl Core {
         Ok(Response::Ack)
     }
 
+    /// Removes a Session from Turn for good.
+    ///
+    /// The third verb, after archiving and closing, and the one the tree had no way to reach:
+    /// a Session could be hidden or stopped, and never got rid of. Its record stayed, its row
+    /// came back the next time archived rows were shown, and there was no answer to "I am done
+    /// with this, take it away".
+    ///
+    /// The order is the whole implementation, and every step is a precondition for the next:
+    ///
+    /// 1. **`KeepProcesses` is refused.** Forgetting a Session while its processes run would
+    ///    leave them alive with nothing left that names them — not in the tree, not in the
+    ///    store, not in any pane. That is a leak the user cannot even see, let alone fix.
+    /// 2. **Stop and detach**, through [`Self::close_session`], so there is one definition of
+    ///    what stopping a Session means. It also inherits its refusal: a Session with a child
+    ///    process Turn cannot reach is not deleted, and the error says which process.
+    /// 3. **Delete the record**, which cascades to the layout, the process nodes, the event
+    ///    log, the attention rows, the activity previews, the pane bindings, the write lease
+    ///    and the per-window tree state.
+    /// 4. **Drop what is only in memory**: the Session, its attention demands, its screens.
+    ///
+    /// Nothing on the user's disk is touched. The checkout, the branch and any worktree are
+    /// theirs; Turn deletes its own record and nothing else. The scratch directory is Turn's
+    /// and goes with it — `close_session` already removes it.
+    ///
+    /// Deleting a Session that is not here answers `Ack`. It has to: a client that lost the
+    /// reply and retried would otherwise be told the thing it asked to remove cannot be found,
+    /// which is the outcome it wanted.
+    pub(super) fn delete_session(
+        &mut self,
+        id: &SessionId,
+        disposition: CloseDisposition,
+        now_ms: i64,
+    ) -> Answer {
+        if matches!(disposition, CloseDisposition::KeepProcesses) {
+            return Err(ProtoError::refused(
+                "Deleting a Session cannot keep its processes running",
+            )
+            .with_detail(
+                "Nothing would name them afterwards. Stop them, or close the Session instead \
+                 of deleting it.",
+            ));
+        }
+        let Ok(session) = self.session(id) else {
+            // Already gone. Said plainly rather than as an error, so a retry is not a failure.
+            tracing::info!(session = %id, "delete asked for a Session that is already gone");
+            return Ok(Response::Ack);
+        };
+        let workspace_id = session.workspace_id.clone();
+        let name = session.name.clone();
+        let nodes: Vec<turn_core::ids::NodeId> =
+            session.tree.iter().map(|node| node.id.clone()).collect();
+
+        // Stops the processes, detaches every client and removes the scratch directory. It
+        // refuses if anything cannot be stopped, and that refusal is this one too.
+        self.close_session(id, disposition, now_ms)?;
+
+        self.store.sessions().delete(id).map_err(store)?;
+        self.sessions.remove(id);
+        self.attention.forget_session(id);
+        for node in &nodes {
+            self.screens.remove(node);
+            self.processes.remove(node);
+        }
+        tracing::info!(session = %id, %name, "deleted");
+
+        self.push_all(ServerEvent::SessionRemoved {
+            session_id: id.clone(),
+            workspace_id,
+        });
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        Ok(Response::Ack)
+    }
+
     /// Captures a session's current arrangement as a template.
     pub(super) fn create_layout_template(
         &mut self,

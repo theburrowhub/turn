@@ -917,6 +917,25 @@ fn tree_row_labels(h: &Harness<'static, Window>) -> Vec<String> {
         .collect()
 }
 
+/// Every piece of text the window is showing, as a screen reader would find it.
+///
+/// Used where the *wording* is the feature: a dialog that promises not to delete somebody's
+/// checkout has to name it, and a test that only looked at the image could not tell whether
+/// the sentence said so or merely looked as if it did.
+fn all_text(h: &Harness<'static, Window>) -> Vec<String> {
+    // Both, because a painted label reaches the tree as a `value` and a widget's name reaches
+    // it as a `label`, and the dialog's sentences are the first kind.
+    h.root()
+        .children_recursive()
+        .filter_map(|node| {
+            let node = node.accesskit_node();
+            node.value()
+                .map(|value| value.to_string())
+                .or_else(|| node.label())
+        })
+        .collect()
+}
+
 fn group_labels(h: &Harness<'static, Window>) -> Vec<String> {
     h.query_all_by_role(egui::accesskit::Role::Group)
         .filter_map(|node| node.accesskit_node().label())
@@ -1519,6 +1538,86 @@ fn a_three_pane_layout_before_and_after_a_relocation_that_changes_its_orientatio
     h.snapshot("relocation_after");
 }
 
+/// Every row control of the same kind sits in the same column, whatever else its row carries.
+///
+/// The reported defect: with a Workspace expanded, the Session's controls and the Workspace's
+/// did not line up, and neither did two Workspaces with each other. A column that moves from
+/// row to row means the user has to look for the button that ends work instead of knowing
+/// where it is — and a destructive control is the last one that should need looking for.
+///
+/// Measured rather than eyeballed: the buttons are found by name and their rectangles
+/// compared, so the property is checked at whatever size and depth the tree happens to draw.
+#[test]
+fn a_row_control_of_the_same_kind_is_always_in_the_same_column() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    // Expanded, which is the state the defect was reported in: a Workspace with its Sessions
+    // under it, so rows of both kinds — and of different depths — are on screen together.
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let column_of = |h: &Harness<'static, Window>, label: &str| -> f32 {
+        h.query_by_label(label)
+            .unwrap_or_else(|| panic!("no control named {label:?}"))
+            .rect()
+            .max
+            .x
+    };
+
+    // The rightmost column is the lifecycle one, on every row that has it.
+    let mut closers = vec![
+        column_of(&h, "Close workspace space-troopers"),
+        column_of(&h, "Close workspace turn"),
+    ];
+    closers.push(column_of(&h, "Close session Fix climbing bugs"));
+    let first = closers[0];
+    for edge in &closers {
+        assert!(
+            (edge - first).abs() < 0.5,
+            "the closing control must be in one column: {closers:?}"
+        );
+    }
+
+    // And the column beside it, which a Session row and a Workspace row both carry.
+    let archives = vec![
+        column_of(&h, "Archive workspace space-troopers"),
+        column_of(&h, "Archive session Fix climbing bugs"),
+    ];
+    assert!(
+        (archives[0] - archives[1]).abs() < 0.5,
+        "the archiving control must be in one column: {archives:?}"
+    );
+    assert!(
+        archives[0] < first,
+        "and it must be to the left of the destructive one"
+    );
+
+    // Every control occupies exactly the slot the row reserved for it, whatever glyph it
+    // carries. A button sized by its own glyph is what made the columns drift: a wider icon
+    // made a wider button, and every button after it moved.
+    for label in [
+        "Close workspace space-troopers",
+        "Archive workspace space-troopers",
+        "New session in space-troopers",
+        "Close session Fix climbing bugs",
+        "Archive session Fix climbing bugs",
+    ] {
+        let rect = h
+            .query_by_label(label)
+            .unwrap_or_else(|| panic!("no control named {label:?}"))
+            .rect();
+        assert!(
+            (rect.width() - turn_gui::icons::ROW_SIZE.x).abs() < 0.5
+                && (rect.height() - turn_gui::icons::ROW_SIZE.y).abs() < 0.5,
+            "{label} is {:?}, not the {:?} its slot reserved",
+            rect.size(),
+            turn_gui::icons::ROW_SIZE
+        );
+    }
+}
+
 /// A Session is created *in* a Workspace, and a global `+ Session` could not say which
 /// one. The control lives on the Workspace's row, and it says which Workspace in its name.
 /// Archiving and closing live beside it, because they are the same kind of thing — an act
@@ -1815,6 +1914,92 @@ fn closing_a_workspace_says_how_many_sessions_it_would_stop() {
             disposition: CloseDisposition::Terminate,
         }],
         "and only the accepted confirmation asks for the stop"
+    );
+}
+
+/// The third verb, and the one the tree had no way to reach: getting rid of something for good.
+///
+/// What to look for in the image: the word "Delete", the count of what will be stopped, and —
+/// the important one — the **path that is not being deleted**, spelled out. Somebody reading
+/// "delete workspace" is asking a question about their code, and the answer has to be on
+/// screen rather than implied. The way back out is named too: archiving keeps everything.
+#[test]
+fn deleting_a_workspace_names_the_directory_it_will_not_touch() {
+    let mut fixture = tree_of_session_rows();
+    fixture.include_archived = true;
+    let workspace = fixture.hierarchy.as_ref().expect("hierarchy").workspaces[1].clone();
+    let mut h = harness(fixture);
+    h.state_mut().state.lifecycle_confirmation =
+        Some(LifecycleConfirmation::delete_workspace(&workspace));
+    h.run();
+    h.run();
+    h.snapshot("workspace_delete_confirmation");
+
+    // The promise is checkable: the exact root is on screen, not a phrase about files.
+    let shown = all_text(&h);
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains(&workspace.workspace.root)),
+        "the dialog must name the directory it leaves alone; got {shown:?}"
+    );
+    assert!(
+        shown.iter().any(|line| line.contains("cannot be undone")),
+        "and it must say that this one does not come back: {shown:?}"
+    );
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Delete workspace")
+        .expect("the destructive action is a visible button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::DeleteWorkspace {
+            workspace_id: workspace.workspace.id.clone(),
+            disposition: CloseDisposition::Terminate,
+        }],
+        "and only the accepted confirmation asks for it"
+    );
+}
+
+/// The Session half of the same act.
+///
+/// What to look for: the same shape as the Workspace one, one line shorter, and the sentence
+/// that separates Turn's record from the user's work.
+#[test]
+fn deleting_a_session_says_what_goes_and_what_stays() {
+    let mut fixture = tree_of_session_rows();
+    fixture.include_archived = true;
+    let session = fixture.hierarchy.as_ref().expect("hierarchy").workspaces[1].sessions[0]
+        .session
+        .clone();
+    let mut h = harness(fixture);
+    h.state_mut().state.lifecycle_confirmation =
+        Some(LifecycleConfirmation::delete_session(&session));
+    h.run();
+    h.run();
+    h.snapshot("session_delete_confirmation");
+
+    let shown = all_text(&h);
+    assert!(
+        shown
+            .iter()
+            .any(|line| line.contains("files, branches and worktrees are not touched")),
+        "the dialog must separate Turn's record from the user's work: {shown:?}"
+    );
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Delete session")
+        .expect("the destructive action is a visible button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::DeleteSession {
+            session_id: session.id.clone(),
+            disposition: CloseDisposition::Terminate,
+        }],
     );
 }
 
@@ -4326,4 +4511,85 @@ fn an_image_whose_pixels_have_not_arrived_shows_a_frame_rather_than_a_hole() {
     // Deliberately no payloads: the window has the screen and not the pixels.
     let mut harness = image_pane_harness(grid, Vec::new(), None);
     harness.snapshot("terminal_image_placeholder");
+}
+
+/// Where the glyph actually lands inside a row control.
+///
+/// The reported defect, and the one the column test above cannot see: the boxes were the right
+/// size and in the right places, and the *icons inside them* were not centred. `egui`'s
+/// `Button` takes its alignment from the layout of the `Ui` it is added to and offers no knob
+/// of its own, so a button added to a plain region is laid out against that region's alignment
+/// — left, in a top-down `Ui`. Three buttons of three different glyph widths then each sat at
+/// a different offset inside its own box.
+///
+/// Measured from the pixels: the button is drawn alone in a known rectangle, and the ink is
+/// weighed against the rectangle's centre. An eyeballed screenshot is how this survived twice.
+#[test]
+fn the_glyph_of_a_row_control_is_centred_in_its_box() {
+    // Every glyph the rows use, because the failure was per-glyph: a wide icon and a narrow one
+    // were wrong by different amounts, which is what made a row look ragged.
+    for (name, glyph) in [
+        ("close", turn_gui::icons::CLOSE),
+        ("archive", turn_gui::icons::ARCHIVE),
+        ("new-session", turn_gui::icons::FILE_PLUS),
+        ("power", turn_gui::icons::POWER),
+    ] {
+        let offset = row_button_ink_offset(glyph);
+        assert!(
+            offset.x.abs() <= 1.0,
+            "the {name} glyph is {:.2}pt off centre horizontally in its box",
+            offset.x
+        );
+        assert!(
+            offset.y.abs() <= 1.0,
+            "the {name} glyph is {:.2}pt off centre vertically in its box",
+            offset.y
+        );
+    }
+}
+
+/// Renders one row control alone and returns how far the ink's centre is from the box's, in
+/// points. Positive x is to the right.
+fn row_button_ink_offset(glyph: &'static str) -> egui::Vec2 {
+    // A canvas larger than the button, so ink that escaped the box is still measured rather
+    // than clipped away — a glyph drawn outside its own frame is exactly what is being checked.
+    let pad = 6.0;
+    let size = turn_gui::icons::ROW_SIZE + egui::Vec2::splat(pad * 2.0);
+    let theme = Theme::dark();
+    let mut harness = Harness::builder()
+        .with_size(size)
+        .with_pixels_per_point(4.0)
+        .build_ui(move |ui| {
+            theme.install(ui.ctx());
+            let at = egui::Rect::from_min_size(egui::pos2(pad, pad), turn_gui::icons::ROW_SIZE);
+            turn_gui::icons::row_button(ui, at, glyph, "measured", "measured", None, true);
+        });
+    harness.run();
+    let image = harness.render().expect("the harness must render");
+    let scale = image.width() as f32 / size.x;
+
+    // The ink: anything brighter than the panel it is drawn on. The frame is not drawn for an
+    // idle control, so what is left is the glyph.
+    let (mut sum_x, mut sum_y, mut weight) = (0.0f64, 0.0f64, 0.0f64);
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let pixel = image.get_pixel(x, y);
+            let luma =
+                f64::from(pixel[0]) * 0.3 + f64::from(pixel[1]) * 0.6 + f64::from(pixel[2]) * 0.1;
+            // Well above the panel and the border, well below the glyph's own grey.
+            if luma > 60.0 {
+                sum_x += f64::from(x) * luma;
+                sum_y += f64::from(y) * luma;
+                weight += luma;
+            }
+        }
+    }
+    assert!(weight > 0.0, "the control drew no glyph at all");
+    let centre = egui::pos2(
+        (sum_x / weight) as f32 / scale,
+        (sum_y / weight) as f32 / scale,
+    );
+    let box_centre =
+        egui::Rect::from_min_size(egui::pos2(pad, pad), turn_gui::icons::ROW_SIZE).center();
+    centre - box_centre
 }

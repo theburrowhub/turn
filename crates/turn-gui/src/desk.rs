@@ -419,6 +419,27 @@ impl Desk {
         Ok(LifecycleConfirmation::stop_workspace(branch))
     }
 
+    /// The confirmation for deleting the Session the tree is pointing at.
+    ///
+    /// Unlike ending it, an archived Session is a valid target — it is the likeliest one. A
+    /// Session that has been filed away is exactly what somebody clearing out their tree wants
+    /// to be rid of, and refusing here would leave an archived row with no way out at all.
+    pub fn delete_session_confirmation(&self) -> Result<LifecycleConfirmation, &'static str> {
+        let Some(summary) = self.target_session() else {
+            return Err("select a Session in the tree before deleting it");
+        };
+        Ok(LifecycleConfirmation::delete_session(summary))
+    }
+
+    /// The same for a whole Workspace, built from the tree branch so the dialog can say how
+    /// many Sessions it reaches and which directory it leaves alone.
+    pub fn delete_workspace_confirmation(&self) -> Result<LifecycleConfirmation, &'static str> {
+        let Some(branch) = self.target_workspace_branch() else {
+            return Err("select a Workspace in the tree before deleting it");
+        };
+        Ok(LifecycleConfirmation::delete_workspace(branch))
+    }
+
     /// Whether starting a process for a Session would violate recovery or archival
     /// state. Every launch surface (toolbar, keymap and context action) uses the same
     /// guard so a shortcut cannot bypass a disabled button.
@@ -2334,7 +2355,12 @@ impl Desk {
             // [`Desk::end_session_confirmation`] and [`Desk::stop_workspace_confirmation`]
             // and delivers back as a [`ViewAction`]. A command that closed on the
             // keystroke would be a process stopped by surprise.
-            Command::CloseSession | Command::CloseWorkspace => Vec::new(),
+            // None of the four act on their own: each opens a question, and the dialog is the
+            // only thing that can answer it.
+            Command::CloseSession
+            | Command::CloseWorkspace
+            | Command::DeleteSession
+            | Command::DeleteWorkspace => Vec::new(),
             Command::SplitHorizontal | Command::SplitVertical => {
                 // A split opens a shell with no command in it, so it needs no write
                 // authority; only an archived Session refuses it.
@@ -2608,6 +2634,30 @@ impl Desk {
                     disposition,
                 },
                 request: Request::CloseWorkspace {
+                    workspace_id,
+                    disposition,
+                },
+            }],
+            ViewAction::DeleteSession {
+                session_id,
+                disposition,
+            } => vec![Reaction::Send {
+                ask: Ask::DeleteSession {
+                    session_id: session_id.clone(),
+                },
+                request: Request::DeleteSession {
+                    session_id,
+                    disposition,
+                },
+            }],
+            ViewAction::DeleteWorkspace {
+                workspace_id,
+                disposition,
+            } => vec![Reaction::Send {
+                ask: Ask::DeleteWorkspace {
+                    workspace_id: workspace_id.clone(),
+                },
+                request: Request::DeleteWorkspace {
                     workspace_id,
                     disposition,
                 },

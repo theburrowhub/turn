@@ -187,10 +187,30 @@ impl<'a> SessionRepo<'a> {
     }
 
     /// Deletes a session with its layout, nodes, events and attention entries.
+    ///
+    /// Most of that is the schema's work: every table that hangs off a session names it with
+    /// `ON DELETE CASCADE`, so one delete takes the layout, the process nodes, the event log,
+    /// the attention entries, the activity previews, the pane bindings and the write lease
+    /// with it. Two things are not the schema's work and are done here.
+    ///
+    /// `tree_ui_state` has no foreign key — it is keyed by `(surface, kind, id)` and is
+    /// per-window rather than per-session, which is why it was never given one. Left alone it
+    /// keeps the expanded and selected flags of a row that no longer exists, and a *reused*
+    /// id would inherit them. Ids are random, so that is theory rather than practice; the
+    /// stale row is not, and a store that leaks a row per deleted session is a store that
+    /// grows without bound.
+    ///
+    /// The whole thing is one transaction, so a session is either gone or still there. A
+    /// half-deleted session — record gone, tree state left, or the reverse — is the state
+    /// there would be no way to name in the UI.
     pub fn delete(&self, id: &SessionId) -> Result<bool> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "DELETE FROM tree_ui_state WHERE node_kind = 'session' AND node_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -445,6 +465,74 @@ mod tests {
         layout.active = Some(agent_id);
 
         Session::new(workspace.clone(), "Fix climbing bugs", "/repo", layout, T0)
+    }
+
+    /// Deleting a Session leaves nothing of it anywhere.
+    ///
+    /// The check walks the *schema* rather than a list written by hand: every table with a
+    /// `session_id` column is asked whether it still mentions the deleted session. A table
+    /// added later without a cascade fails this test the day it is added, which is the only
+    /// way a promise like "Turn forgets it" stays true.
+    #[test]
+    fn deleting_a_session_leaves_no_trace_of_it_in_any_table() {
+        let store = testing::store();
+        let ws = testing::saved_workspace(&store, "turn");
+        let session = session_with_three_panes(&ws.id);
+        store.sessions().save(&session).unwrap();
+        // Tree state is per-window and has no foreign key, so it is the row most likely to
+        // survive a delete — which is why it is set up here explicitly.
+        store
+            .hierarchy()
+            .save_tree_state(&turn_core::model::hierarchy::TreeUiState {
+                surface_id: "window-1".into(),
+                node_kind: turn_core::model::hierarchy::HierarchyNodeKind::Session,
+                node_id: session.id.to_string(),
+                expanded: true,
+                selected: true,
+                manual_order: None,
+                visibility_mode: None,
+                updated_ms: T0,
+            })
+            .unwrap();
+
+        assert!(store.sessions().delete(&session.id).unwrap());
+        assert!(store.sessions().get(&session.id).unwrap().is_none());
+
+        let leftovers = testing::rows_mentioning(&store, "session_id", session.id.as_str());
+        assert!(
+            leftovers.is_empty(),
+            "these tables still hold the deleted session: {leftovers:?}"
+        );
+        let tree_state = testing::rows_mentioning(&store, "node_id", session.id.as_str());
+        assert!(
+            tree_state.is_empty(),
+            "the per-window tree state outlived the session: {tree_state:?}"
+        );
+    }
+
+    /// Deleting is not archiving, and the difference is that it does not come back.
+    #[test]
+    fn deleting_a_session_is_not_reversible_the_way_archiving_is() {
+        let store = testing::store();
+        let ws = testing::saved_workspace(&store, "turn");
+        let session = session_with_three_panes(&ws.id);
+        store.sessions().save(&session).unwrap();
+
+        store
+            .sessions()
+            .set_status(&session.id, SessionStatus::Archived)
+            .unwrap();
+        assert!(
+            store.sessions().get(&session.id).unwrap().is_some(),
+            "archiving keeps the record, which is what makes it reversible"
+        );
+
+        store.sessions().delete(&session.id).unwrap();
+        assert!(store.sessions().get(&session.id).unwrap().is_none());
+        assert_eq!(store.sessions().count().unwrap(), 0);
+        // And deleting something already gone is not an error, so a retry after a lost reply
+        // does not turn into one.
+        assert!(!store.sessions().delete(&session.id).unwrap());
     }
 
     #[test]

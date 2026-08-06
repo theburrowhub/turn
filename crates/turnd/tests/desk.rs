@@ -1160,3 +1160,162 @@ async fn a_title_change_moves_nothing_and_raises_nothing() {
 
     daemon.shutdown().await;
 }
+
+/// The third verb the tree had no way to reach: getting rid of a Session for good.
+///
+/// Archiving hides it and stops nothing. Closing stops it and keeps the record — the Session
+/// comes back as `Paused`, and the next time archived rows are shown it is on screen again.
+/// Neither answers "I am done with this, take it away", which is what this checks: the
+/// processes stop, the record goes, the tree no longer lists it, and asking again is not an
+/// error. And the checkout it pointed at is still on disk, because that is the user's, not
+/// Turn's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_session_stops_its_work_and_removes_every_trace_of_it() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pids: Vec<u32> = details.tree.iter().filter_map(|node| node.pid).collect();
+    assert!(!pids.is_empty(), "the session must have real processes");
+    let checkout = daemon.data_dir().to_path_buf();
+    assert!(checkout.exists(), "the workspace root exists to begin with");
+
+    // Keeping the processes is refused, and the refusal says what to do instead: nothing
+    // would name those processes once the Session is gone.
+    let refusal = ui
+        .try_ask(Request::DeleteSession {
+            session_id: session.id.clone(),
+            disposition: CloseDisposition::KeepProcesses,
+        })
+        .await;
+    let error = refusal.expect_err("deleting while keeping the processes must be refused");
+    assert_eq!(error.code, turn_proto::ErrorCode::Refused, "{error:?}");
+
+    ui.ask(Request::DeleteSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // The work stopped. Generous, because this waits on the operating system reaping.
+    let mut stopped = false;
+    for _ in 0..200 {
+        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stopped, "deleting must actually stop the processes");
+
+    // The record is gone rather than parked. `close_session` leaves a Paused Session here.
+    let gone = ui
+        .try_ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await;
+    let error = gone.expect_err("the Session must no longer exist");
+    assert_eq!(error.code, turn_proto::ErrorCode::NotFound, "{error:?}");
+
+    // And it is not in the tree, including with archived rows shown — which is where a
+    // Session that had merely been archived would reappear.
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived: true,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    };
+    let listed: Vec<&str> = hierarchy
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .map(|session| session.session.name.as_str())
+        .collect();
+    assert!(
+        listed.is_empty(),
+        "the deleted Session is still in the tree: {listed:?}"
+    );
+
+    // Asking again is not an error, so a client that lost the reply can retry.
+    ui.ask(Request::DeleteSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // Turn deleted its own record. The directory the Workspace pointed at is untouched.
+    assert!(
+        checkout.exists(),
+        "deleting a Session must not remove anything from the user's disk"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A Workspace goes the same way, and takes its Sessions with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_workspace_takes_its_sessions_and_leaves_the_checkout_alone() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pids: Vec<u32> = details.tree.iter().filter_map(|node| node.pid).collect();
+    let workspace_id = session.workspace_id.clone();
+    let checkout = daemon.data_dir().to_path_buf();
+
+    ui.ask(Request::DeleteWorkspace {
+        workspace_id: workspace_id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    let mut stopped = false;
+    for _ in 0..200 {
+        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stopped, "the Sessions' processes must be stopped");
+
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived: true,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    };
+    assert!(
+        hierarchy.workspaces.is_empty(),
+        "the Workspace and its Sessions must be gone: {:?}",
+        hierarchy
+            .workspaces
+            .iter()
+            .map(|w| w.workspace.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        checkout.exists(),
+        "the checkout is the user's directory and must survive"
+    );
+
+    daemon.shutdown().await;
+}

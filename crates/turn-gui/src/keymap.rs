@@ -44,6 +44,7 @@ pub enum Command {
     NewWorkspace,
     ArchiveWorkspace,
     CloseWorkspace,
+    DeleteWorkspace,
     NewSession,
     QuickNewSession,
     SwitchSession,
@@ -52,6 +53,7 @@ pub enum Command {
     RenameSession,
     ArchiveSession,
     CloseSession,
+    DeleteSession,
     SaveLayoutAsTemplate,
 
     NextAttention,
@@ -123,8 +125,10 @@ impl Command {
         // Session in it, and the palette should not put that at the top of the list.
         Command::ArchiveSession,
         Command::CloseSession,
+        Command::DeleteSession,
         Command::ArchiveWorkspace,
         Command::CloseWorkspace,
+        Command::DeleteWorkspace,
         Command::InterruptProcess,
         Command::StopProcess,
         Command::FocusWorkspaceTree,
@@ -143,6 +147,7 @@ impl Command {
             Command::NewWorkspace => "workspace.new",
             Command::ArchiveWorkspace => "workspace.archive",
             Command::CloseWorkspace => "workspace.close",
+            Command::DeleteWorkspace => "workspace.delete",
             Command::NewSession => "session.new",
             Command::QuickNewSession => "session.quickNew",
             Command::SwitchSession => "session.switch",
@@ -151,6 +156,7 @@ impl Command {
             Command::RenameSession => "session.rename",
             Command::ArchiveSession => "session.archive",
             Command::CloseSession => "session.close",
+            Command::DeleteSession => "session.delete",
             Command::SaveLayoutAsTemplate => "layout.saveAsTemplate",
             Command::NextAttention => "attention.next",
             Command::ToggleAttentionPanel => "attention.togglePanel",
@@ -193,6 +199,9 @@ impl Command {
             Command::CloseWorkspace => {
                 "Close workspace — confirm before stopping every Session in it"
             }
+            Command::DeleteWorkspace => {
+                "Delete workspace — remove it and its Sessions for good, your checkout untouched"
+            }
             Command::NewSession => "New session — pick a template",
             Command::QuickNewSession => "Quick new session — the workspace default",
             Command::SwitchSession => "Switch session",
@@ -201,6 +210,9 @@ impl Command {
             Command::RenameSession => "Rename session",
             Command::ArchiveSession => "Archive session — take it out of the tree, stop nothing",
             Command::CloseSession => "Close session — confirm before stopping its processes",
+            Command::DeleteSession => {
+                "Delete session — remove it from Turn for good, your files untouched"
+            }
             Command::SaveLayoutAsTemplate => "Save this layout as a template",
             Command::NextAttention => "Go to the next session that needs you",
             Command::ToggleAttentionPanel => "Show or hide the attention queue",
@@ -237,9 +249,10 @@ impl Command {
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
             | Command::FocusWorkspaceTree => "View",
-            Command::NewWorkspace | Command::ArchiveWorkspace | Command::CloseWorkspace => {
-                "Workspace"
-            }
+            Command::NewWorkspace
+            | Command::ArchiveWorkspace
+            | Command::CloseWorkspace
+            | Command::DeleteWorkspace => "Workspace",
             Command::NewSession
             | Command::QuickNewSession
             | Command::SwitchSession
@@ -248,6 +261,7 @@ impl Command {
             | Command::RenameSession
             | Command::ArchiveSession
             | Command::CloseSession
+            | Command::DeleteSession
             | Command::SaveLayoutAsTemplate => "Session",
             Command::NextAttention | Command::ToggleAttentionPanel => "Attention",
             Command::SplitHorizontal

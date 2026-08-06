@@ -64,6 +64,10 @@ impl Core {
                 workspace_id,
                 disposition,
             } => self.close_workspace(&workspace_id, disposition, now_ms),
+            Request::DeleteWorkspace {
+                workspace_id,
+                disposition,
+            } => self.delete_workspace(&workspace_id, disposition, now_ms),
 
             // ------------------------------------------------------- unified tree
             Request::GetHierarchy {
@@ -213,6 +217,10 @@ impl Core {
                 session_id,
                 disposition,
             } => self.close_session(&session_id, disposition, now_ms),
+            Request::DeleteSession {
+                session_id,
+                disposition,
+            } => self.delete_session(&session_id, disposition, now_ms),
             Request::GetSession { session_id } => {
                 let details = self
                     .session_details(&session_id, now_ms)

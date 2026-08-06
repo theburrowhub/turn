@@ -509,6 +509,7 @@ resolved runtime Pane.
 | `archive_workspace` | `workspace_id`, `archived` | `workspace` |
 | `duplicate_workspace` | `workspace_id`, `name?` — settings only, no sessions | `workspace` |
 | `close_workspace` | `workspace_id`, `disposition` | `ack` |
+| `delete_workspace` | `workspace_id`, `disposition` | `ack` |
 | `get_workspace_write_lease` | `workspace_id` | `workspace_write_lease` |
 | `acquire_workspace_write_lease` | `workspace_id`, `session_id`, `checkout_id` | `workspace_write_lease` |
 | `release_workspace_write_lease` | `workspace_id`, `lease_id`, `expected_generation` | `workspace_write_lease` |
@@ -531,6 +532,7 @@ same code path as do.
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
 | `close_session` | `session_id`, `disposition` | `ack` |
+| `delete_session` | `session_id`, `disposition` | `ack` |
 | `get_session` | `session_id` | `session_details` |
 | `get_process_tree` | `session_id` | `tree` |
 
@@ -1377,6 +1379,28 @@ the program's cursor and corrupts a layout the program repaints without ever ove
 the text as-is. At most eight entries, each at most 160 characters, each
 with a `count` of at least 1; a peer sending otherwise is refused. Absent on the wire for
 every pane that refused nothing, which is nearly all of them.
+
+### Archiving, closing and deleting
+
+Three verbs, and the difference between them is what the client must put in front of the user:
+
+| | Stops processes | Leaves the tree | Record kept | Reversible |
+| --- | --- | --- | --- | --- |
+| `archive_*` | no | yes | yes | yes |
+| `close_*` | yes | no | yes | the work is not |
+| `delete_*` | yes | yes | **no** | **no** |
+
+`delete_session` and `delete_workspace` remove Turn's *record*: the Session or Workspace row,
+its layout, its process tree, its event log, its attention entries, its scratch directory and
+its per-window tree state. A Workspace takes its Sessions with it.
+
+They do **not** touch the user's disk. The checkout is a directory the user chose and Turn does
+not own it: no file is removed, no branch and no worktree is deleted. Every surface that offers
+a delete has to say so, and naming the exact path is better than promising in the abstract.
+
+`keep_processes` is refused for both: nothing would name those processes once the record is
+gone. Deleting something already gone answers `ack` rather than `not_found`, so a client that
+lost a reply can retry.
 
 ### `SessionDetails`
 

@@ -108,6 +108,15 @@ pub enum Ask {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// A Session removed from Turn for good. Its own variant rather than [`Ask::Action`]
+    /// because the acknowledgement has work to do — the row has to leave the tree — and
+    /// because an error here has to name the right verb.
+    DeleteSession {
+        session_id: SessionId,
+    },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+    },
     /// An archive or a restore. Distinct from [`Ask::Action`] because its
     /// acknowledgement has work to do: whether the row still belongs in the tree
     /// depends on the window's archived preference, and only the daemon can answer
@@ -155,6 +164,8 @@ impl Ask {
             Ask::RestoreLeaseAcquire { .. } => "acquiring restored write access",
             Ask::CloseSession { .. } => "ending the session",
             Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
+            Ask::DeleteSession { .. } => "deleting the session",
+            Ask::DeleteWorkspace { .. } => "deleting the workspace",
             Ask::ArchiveSession { archived: true } => "archiving the session",
             Ask::ArchiveSession { archived: false } => "restoring the session",
             Ask::ArchiveWorkspace { archived: true } => "archiving the workspace",

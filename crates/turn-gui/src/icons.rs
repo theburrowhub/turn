@@ -90,37 +90,68 @@ pub const ROW_SIZE: Vec2 = Vec2::new(20.0, 18.0);
 /// a name from running underneath a button — see `row_action_width` in the view.
 pub const ROW_PITCH: f32 = ROW_SIZE.x + 4.0;
 
+/// The size the glyph on a row control is drawn at.
+///
+/// 12.5 rather than the 11 it began as. Phosphor's strokes are one unit wide at any size, so
+/// at 11 points in a 20-point box the archive drawer and the page-with-a-plus were the same
+/// grey smudge in a screenshot — legible only if you already knew which was which.
+const ROW_GLYPH: f32 = 12.5;
+
 /// A control drawn on a row of the tree: an icon, named in words, teaching its chord.
 ///
-/// `label` is the accessible name and the first line of the tooltip, and it names the
-/// exact target — "Close session Fix climbing bugs", not "Close". `detail` says what the
-/// action will and will not do, because on these rows the difference between archiving
-/// and closing is the difference between tidying up and stopping work. `shortcut` is the
-/// chord for the keyboard in front of the user, so the row teaches it instead of hiding
-/// it in a sheet.
+/// `at` is the exact rectangle the row reserved — see `row_action_slot` in the view — and the
+/// control fills it. **It has to be given rather than allocated**, and that is the whole
+/// shape of this function. `egui`'s `Button` takes its alignment from the `Ui` it is added to
+/// and offers no knob of its own, so a button added to a region inherited that region's
+/// left-and-top alignment: the boxes landed in their columns, and the glyphs sat inside them
+/// at whatever offset each glyph's own width produced. A row came out visibly ragged, twice,
+/// and both times it read as "the buttons are misaligned" because that is what it looked
+/// like.
+///
+/// `label` is the accessible name and the first line of the tooltip, and it names the exact
+/// target — "Close session Fix climbing bugs", not "Close". `detail` says what the action
+/// will and will not do, because on these rows the difference between archiving and closing
+/// is the difference between tidying up and stopping work. `shortcut` is the chord for the
+/// keyboard in front of the user, so the row teaches it instead of hiding it in a sheet.
 pub fn row_button(
     ui: &mut Ui,
+    at: egui::Rect,
     icon: &str,
     label: &str,
     detail: &str,
     shortcut: Option<&str>,
     enabled: bool,
 ) -> Response {
-    // Exactly [`ROW_SIZE`], padding and minimum interaction size included. A button sizes
-    // itself as its glyph plus the style's button padding, floored at the style's
-    // interaction size — which for these is wider *and* taller than the row reserved. Three
-    // of them came out overlapping each other's frames, the last one overhung the edge of
-    // the tree, and all of them reached down over the second line of the row where the
-    // state text is.
-    ui.spacing_mut().button_padding = Vec2::ZERO;
-    ui.spacing_mut().interact_size = ROW_SIZE;
-    let button = egui::Button::new(RichText::new(icon).size(11.0)).min_size(ROW_SIZE);
-    let response = ui.add_enabled(enabled, button);
     let mut tooltip = format!("{label} — {detail}");
     if let Some(shortcut) = shortcut.filter(|shortcut| !shortcut.is_empty()) {
         tooltip.push_str(" · ");
         tooltip.push_str(shortcut);
     }
+    let response = ui
+        .scope_builder(
+            egui::UiBuilder::new().max_rect(at).layout(
+                // Centred on both axes and justified to the rectangle. This is the line that
+                // puts the glyph in the middle of its box and makes every box the same size
+                // whatever glyph it carries — the two halves of the reported defect.
+                egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            ),
+            |ui| {
+                // Zero padding: the box is [`ROW_SIZE`] and the glyph is centred in it, so
+                // padding would only shrink the glyph. `interact_size` because a button is
+                // floored at it, and the style's is wider *and* taller than a row can hold.
+                ui.spacing_mut().button_padding = Vec2::ZERO;
+                ui.spacing_mut().interact_size = ROW_SIZE;
+                let button = egui::Button::new(RichText::new(icon).size(ROW_GLYPH))
+                    .min_size(ROW_SIZE)
+                    // Ink at rest, a box under the pointer. Three framed boxes on every
+                    // Workspace row competed with the name and the state for a row whose job
+                    // is to be scanned; the frame still appears the moment the control is
+                    // hovered or focused, so nothing is hidden and nothing moves when it does.
+                    .frame_when_inactive(false);
+                ui.add_enabled(enabled, button)
+            },
+        )
+        .inner;
     describe(&response, label);
     response.on_hover_text(tooltip)
 }
