@@ -1568,8 +1568,8 @@ fn a_row_control_of_the_same_kind_is_always_in_the_same_column() {
 
     // The rightmost column is the lifecycle one, on every row that has it.
     let mut closers = vec![
-        column_of(&h, "Close workspace space-troopers"),
-        column_of(&h, "Close workspace turn"),
+        column_of(&h, "Stop all sessions in space-troopers"),
+        column_of(&h, "Stop all sessions in turn"),
     ];
     closers.push(column_of(&h, "Close session Fix climbing bugs"));
     let first = closers[0];
@@ -1598,7 +1598,7 @@ fn a_row_control_of_the_same_kind_is_always_in_the_same_column() {
     // carries. A button sized by its own glyph is what made the columns drift: a wider icon
     // made a wider button, and every button after it moved.
     for label in [
-        "Close workspace space-troopers",
+        "Stop all sessions in space-troopers",
         "Archive workspace space-troopers",
         "New session in space-troopers",
         "Close session Fix climbing bugs",
@@ -1653,7 +1653,7 @@ fn a_workspace_row_carries_creation_archiving_and_closing() {
         for control in [
             format!("New session in {workspace}"),
             format!("Archive workspace {workspace}"),
-            format!("Close workspace {workspace}"),
+            format!("Stop all sessions in {workspace}"),
         ] {
             assert!(
                 buttons.iter().any(|label| label == &control),
@@ -1694,7 +1694,7 @@ fn a_workspace_row_carries_creation_archiving_and_closing() {
     h.state_mut().state.session_draft = None;
     h.state_mut().actions.clear();
     h.run_steps(1);
-    h.query_by_label("Close workspace space-troopers")
+    h.query_by_label("Stop all sessions in space-troopers")
         .expect("the destructive control is a real button")
         .click();
     h.run_steps(1);
@@ -2954,8 +2954,8 @@ fn the_palette_offers_every_way_to_close_or_archive_with_its_chord() {
     h.run_steps(3);
     let rows = palette_rows(&h);
     for wanted in [
-        "Close session — confirm before stopping its processes — Session — Shift+Cmd+K",
-        "Close workspace — confirm before stopping every Session in it — Workspace — Opt+Shift+Cmd+K",
+        "End session — stop its processes and take its row out of the tree — Session — Shift+Cmd+K",
+        "Stop all sessions in workspace — the Workspace itself stays in the tree — Workspace — Opt+Shift+Cmd+K",
     ] {
         assert!(
             rows.iter().any(|row| row == wanted),

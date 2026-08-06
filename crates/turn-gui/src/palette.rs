@@ -495,11 +495,26 @@ mod tests {
                 command.title()
             );
         }
-        for command in [Command::CloseSession, Command::CloseWorkspace] {
-            let title = command.title();
+        // Every command that stops work says so, and — the part that was missing — says what
+        // happens to the *row*. "Close session" stopped the processes and left the row in the
+        // tree looking like work in progress, and the title said nothing either way, so the
+        // only way to find out was to try it and watch nothing appear to happen.
+        for command in [
+            Command::CloseSession,
+            Command::CloseWorkspace,
+            Command::DeleteSession,
+            Command::DeleteWorkspace,
+        ] {
+            let title = command.title().to_lowercase();
             assert!(
-                title.contains("confirm") && title.contains("stopping"),
-                "{command:?} reads as {title:?}"
+                title.contains("stop") || title.contains("end"),
+                "{command:?} must say that it stops work: {:?}",
+                command.title()
+            );
+            assert!(
+                title.contains("tree") || title.contains("for good"),
+                "{command:?} must say what becomes of the row: {:?}",
+                command.title()
             );
         }
     }

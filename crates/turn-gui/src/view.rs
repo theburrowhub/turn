@@ -2335,7 +2335,9 @@ impl<'a> TurnView<'a> {
             } => (
                 "End session?",
                 name.as_str(),
-                "Turn will politely stop every process in this Session. Its layout and history remain available.",
+                "Turn will politely stop every process in this Session, and its row leaves the \
+                 tree. Its layout and history are kept — restoring it brings the Session back, \
+                 stopped.",
                 None,
                 format!(
                     "{} running process{} will receive a termination request.",
@@ -2352,7 +2354,9 @@ impl<'a> TurnView<'a> {
             } => (
                 "Stop all sessions in this workspace?",
                 name.as_str(),
-                "Turn will politely stop processes in every Session. The project directory and all files stay untouched.",
+                "Turn will politely stop processes in every Session, and the Workspace leaves \
+                 the tree. The project directory and all files stay untouched, and restoring it \
+                 brings the Workspace and its Sessions back, stopped.",
                 // The blast radius, in numbers, because "this workspace" is not a
                 // quantity and the user is about to stop everything in it.
                 Some(format!(
@@ -2411,11 +2415,13 @@ impl<'a> TurnView<'a> {
         // The other door, named on the way through this one. Somebody who only wants the row
         // gone must be able to see that stopping the work is not the price of a tidy tree.
         let alternative = match &confirmation {
+            // Not "archive instead": ending *is* archiving now, with the work stopped first.
+            // The alternative worth naming is the one that keeps the work running.
             LifecycleConfirmation::EndSession { .. } => {
-                "Only tidying up? Archive it instead — the row leaves the tree and nothing stops."
+                "Only clearing your screen? Detach its views instead — the panes close, the row stays and the work carries on."
             }
             LifecycleConfirmation::StopWorkspace { .. } => {
-                "Only tidying up? Archive it instead — the Workspace leaves the tree and nothing stops."
+                "Only clearing your screen? Archive it instead — the Workspace leaves the tree and nothing stops."
             }
             LifecycleConfirmation::DeleteSession { .. } => {
                 "Want it back later? Archive it instead — the row leaves the tree and the Session keeps everything."
@@ -3399,9 +3405,14 @@ impl<'a> TurnView<'a> {
                     }
                 });
 
-                let label = format!("Close workspace {}", summary.name);
+                // "Stop all sessions", not "Close workspace". The control stops the *work*: it
+                // ends every Session in the Workspace, and each ended Session's row leaves the
+                // tree. The Workspace's own row stays, because a Workspace is a project rather
+                // than a task. Calling it "close" promised the project would go, which it does
+                // not — and the two controls that really do that are on this same row.
+                let label = format!("Stop all sessions in {}", summary.name);
                 let detail = format!(
-                    "stops every process in its {} session{} · asks first",
+                    "ends its {} session{} · the Workspace stays · asks first",
                     workspace.sessions.len(),
                     if workspace.sessions.len() == 1 {
                         ""

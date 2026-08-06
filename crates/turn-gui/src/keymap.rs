@@ -197,10 +197,11 @@ impl Command {
                 "Archive workspace — take it out of the tree, stop nothing"
             }
             Command::CloseWorkspace => {
-                "Close workspace — confirm before stopping every Session in it"
+                "Stop all sessions in workspace — the Workspace itself stays in the tree"
             }
             Command::DeleteWorkspace => {
-                "Delete workspace — remove it and its Sessions for good, your checkout untouched"
+                "Delete workspace — stop it and remove it and its Sessions for good, your \
+                 checkout untouched"
             }
             Command::NewSession => "New session — pick a template",
             Command::QuickNewSession => "Quick new session — the workspace default",
@@ -209,9 +210,11 @@ impl Command {
             Command::PreviousSession => "Previous session",
             Command::RenameSession => "Rename session",
             Command::ArchiveSession => "Archive session — take it out of the tree, stop nothing",
-            Command::CloseSession => "Close session — confirm before stopping its processes",
+            Command::CloseSession => {
+                "End session — stop its processes and take its row out of the tree"
+            }
             Command::DeleteSession => {
-                "Delete session — remove it from Turn for good, your files untouched"
+                "Delete session — stop it and remove it from Turn for good, your files untouched"
             }
             Command::SaveLayoutAsTemplate => "Save this layout as a template",
             Command::NextAttention => "Go to the next session that needs you",

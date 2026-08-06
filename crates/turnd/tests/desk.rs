@@ -506,31 +506,31 @@ async fn a_saved_layout_makes_a_second_session_of_the_same_shape_with_its_own_pa
     assert_eq!(template.pane_count, 3);
     assert!(!template.built_in);
 
-    // Reusing a Layout does not waive checkout exclusivity. End the owning run
-    // explicitly before asking for another main-checkout Session from the Template.
-    // The original details above remain available for the shape comparison.
+    // Reusing a Layout does not waive checkout exclusivity: the owning run has to be finished
+    // before another main-checkout Session can be made from the same Template. The original
+    // details above remain available for the shape comparison.
     ui.ask(Request::CloseSession {
         session_id: session.id.clone(),
         disposition: CloseDisposition::Terminate,
     })
     .await;
+    // Ending it is the whole of finishing it. It used to leave the write lease held, so the
+    // user had to find "Release write lease" in a menu before they could start work in their
+    // own Workspace again — a second step for a Session that had already stopped and left the
+    // tree, and one nothing was writing through.
     let lease = match ui
         .ask(Request::GetWorkspaceWriteLease {
             workspace_id: session.workspace_id.clone(),
         })
         .await
     {
-        Response::WorkspaceWriteLease {
-            lease: Some(lease), ..
-        } => lease,
-        other => panic!("expected the stopped Session's lease, got {other:?}"),
+        Response::WorkspaceWriteLease { lease, .. } => lease,
+        other => panic!("expected a lease answer, got {other:?}"),
     };
-    ui.ask(Request::ReleaseWorkspaceWriteLease {
-        workspace_id: session.workspace_id.clone(),
-        lease_id: lease.id,
-        expected_generation: lease.generation,
-    })
-    .await;
+    assert!(
+        lease.is_none(),
+        "ending a Session lets go of the checkout it was holding: {lease:?}"
+    );
 
     let second = session_of(
         ui.ask(Request::CreateSessionFromTemplate {
@@ -737,9 +737,11 @@ async fn closing_a_session_does_exactly_what_the_disposition_says() {
         })
         .await,
     );
+    // Archived, not paused: ending takes the row out of the tree. Leaving it listed as though
+    // it were still work in progress is what made the verb look like it did nothing.
     assert_eq!(
         after.summary.status,
-        turn_core::model::SessionStatus::Paused
+        turn_core::model::SessionStatus::Archived
     );
 
     daemon.shutdown().await;
@@ -1315,6 +1317,137 @@ async fn deleting_a_workspace_takes_its_sessions_and_leaves_the_checkout_alone()
     assert!(
         checkout.exists(),
         "the checkout is the user's directory and must survive"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The tree as one surface sees it, with or without archived rows.
+async fn hierarchy_now(ui: &mut Client, include_archived: bool) -> turn_proto::HierarchySnapshot {
+    match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    }
+}
+
+/// The reported defect, in the words it was reported in: the Sessions were "there laughing at
+/// me every time I end them".
+///
+/// Ending a Session stopped its processes and left the row in the tree as `Paused` — stopped,
+/// but still listed exactly like work in progress. So the verb looked like it had done nothing,
+/// and the tree filled up with rows the user had already finished with. Ending something has to
+/// look like ending it.
+///
+/// What this checks is the whole of that: the row leaves the tree, it is *archived* rather than
+/// deleted so it can be brought back, and the same holds one level up for a Workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_a_session_takes_its_row_out_of_the_tree() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let workspace_id = session.workspace_id.clone();
+
+    let listed = |snapshot: &turn_proto::HierarchySnapshot| -> Vec<String> {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .map(|session| session.session.name.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        listed(&hierarchy_now(&mut ui, false).await),
+        vec!["Fix the flaky test".to_string()],
+        "the Session is in the tree while it is being worked on"
+    );
+
+    ui.ask(Request::CloseSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // The row is gone from the tree the user is looking at.
+    assert!(
+        listed(&hierarchy_now(&mut ui, false).await).is_empty(),
+        "an ended Session must not still be listed: {:?}",
+        listed(&hierarchy_now(&mut ui, false).await)
+    );
+    // And it is archived rather than deleted, so it can be brought back — turning archived rows
+    // on shows it, stopped.
+    let with_archived = hierarchy_now(&mut ui, true).await;
+    assert_eq!(
+        listed(&with_archived),
+        vec!["Fix the flaky test".to_string()],
+        "ending is reversible: the row is archived, not forgotten"
+    );
+    let ended = with_archived
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .next()
+        .expect("the archived Session");
+    assert_eq!(
+        ended.session.running_count, 0,
+        "and nothing is running in it"
+    );
+
+    // One level up the answer is deliberately different, and the difference is the point.
+    //
+    // Stopping every Session in a Workspace takes every *Session* row out of the tree and leaves
+    // the Workspace's own row where it is. A Session is a task: finishing it means it is over. A
+    // Workspace is a project — a directory the user comes back to — and filing the project away
+    // because its last task stopped would mean restoring it before starting the next one. Which
+    // is why the control is called "Stop all sessions" and not "Close workspace": getting the
+    // project itself out of the tree is Archive, or Delete.
+    // The template the first Session was made from is already saved; a second Session of the
+    // same shape reuses it rather than saving it twice.
+    let template = match ui.ask(Request::ListTemplates).await {
+        Response::Templates { templates } => templates
+            .into_iter()
+            .find(|template| !template.built_in)
+            .expect("the custom template saved at the start"),
+        other => panic!("expected templates, got {other:?}"),
+    };
+    session_of(
+        ui.ask(Request::CreateSessionFromTemplate {
+            workspace_id: workspace_id.clone(),
+            template_id: template.id.clone(),
+            name: Some("Another task".to_string()),
+            cwd: None,
+            branch: None,
+            task: None,
+        })
+        .await,
+    );
+    assert_eq!(
+        listed(&hierarchy_now(&mut ui, false).await),
+        vec!["Another task".to_string()],
+        "the ended Session stays out of the tree and the new one is in it"
+    );
+
+    ui.ask(Request::CloseWorkspace {
+        workspace_id: workspace_id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+    let after = hierarchy_now(&mut ui, false).await;
+    assert!(
+        listed(&after).is_empty(),
+        "every Session in the Workspace has ended, so no Session row is left: {:?}",
+        listed(&after)
+    );
+    assert_eq!(
+        after.workspaces.len(),
+        1,
+        "and the Workspace is still there, because stopping its work is not closing the project"
     );
 
     daemon.shutdown().await;

@@ -174,9 +174,20 @@ impl Core {
         for session in &sessions {
             self.ensure_session_processes_stoppable(session, disposition)?;
         }
-        for session in sessions {
-            self.close_session(&session, disposition, now_ms)?;
+        for session in &sessions {
+            self.close_session(session, disposition, now_ms)?;
         }
+        // The Sessions' rows leave the tree — that is what ending each one does — and the
+        // Workspace's row stays.
+        //
+        // That asymmetry is deliberate. A Session is a *task*: finishing it means it is over, so
+        // its row goes. A Workspace is a *project* — a directory the user will come back to —
+        // and filing the project away because its last task stopped would mean restoring it
+        // before starting the next one. The ways to get a Workspace out of the tree are its own:
+        // `ArchiveWorkspace` reversibly, `DeleteWorkspace` for good. This request stops work,
+        // which is why what it is called in the window is "Stop all sessions".
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
         Ok(Response::Ack)
     }
 

@@ -845,7 +845,29 @@ impl Core {
                 // written for. Nothing will read it again, and a settings file naming a
                 // hook URL that no longer answers is worse than no file.
                 paths::remove_session_scratch(&self.data_dir, id);
+                // Ending a Session means being done with it, so it lets go of the write lease it
+                // was holding. A stopped Session that still owns the primary checkout locks
+                // every other Session out of it for no reason, and it is also what would stop
+                // the row from leaving the tree below.
+                self.release_lease_held_by(id, now_ms);
+                // And the row leaves the tree.
+                //
+                // This is the point of the whole verb, and for a long time it did not happen:
+                // "End session" stopped the processes and left the row sitting in the tree as
+                // `Paused`, which reads as a Session that is still a thing you are working on.
+                // Ending something has to look like ending it. Archived rather than deleted, so
+                // it is recoverable — the row comes back, stopped, when archived rows are shown
+                // or when it is restored — and `DeleteSession` is still the one that forgets.
+                if let Ok(session) = self.session_mut(id) {
+                    session.archive();
+                }
+                let workspace_id = self.session(id)?.workspace_id.clone();
+                self.clear_session_temporary_bindings(id, now_ms)?;
                 self.persist_session(id)?;
+                self.push_all(ServerEvent::SessionRemoved {
+                    session_id: id.clone(),
+                    workspace_id,
+                });
                 self.push_session_state(id, now_ms);
                 if let Some(update) = restore_update {
                     self.push_all(update);
@@ -853,6 +875,48 @@ impl Core {
             }
         }
         Ok(Response::Ack)
+    }
+
+    /// Releases the primary-checkout write lease this Session holds, if it holds one.
+    ///
+    /// Called when a Session ends or is deleted, and deliberately quiet: by this point its
+    /// processes are stopped, so nothing can be writing to the checkout, and a lease left behind
+    /// would lock every other Session out of a directory nobody is using. A failure is logged
+    /// rather than returned — the Session has already ended, and refusing the whole operation
+    /// because the lease row would not update would leave the user with neither.
+    fn release_lease_held_by(&mut self, id: &SessionId, now_ms: i64) {
+        let Ok(workspace_id) = self.session(id).map(|session| session.workspace_id.clone()) else {
+            return;
+        };
+        let held = match self.store.hierarchy().active_lease(&workspace_id) {
+            Ok(Some(lease)) if lease.session_id == *id => lease,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, session = %id, "could not read the write lease while ending");
+                return;
+            }
+        };
+        match self
+            .store
+            .hierarchy()
+            .release_write_lease_and_assign_read_only(&held.id, held.generation, now_ms)
+        {
+            Ok(true) => {
+                if let Ok(session) = self.session_mut(id) {
+                    session.mode = SessionMode::ReadOnly;
+                    session.worktree_path = None;
+                    session.read_only_enforced = false;
+                }
+                self.push_workspace_lease(&workspace_id, None, now_ms);
+                tracing::info!(session = %id, lease = %held.id, "write lease released as the session ended");
+            }
+            Ok(false) => {
+                tracing::info!(session = %id, "the write lease was no longer active");
+            }
+            Err(error) => {
+                tracing::warn!(%error, session = %id, "could not release the write lease while ending");
+            }
+        }
     }
 
     /// Removes a Session from Turn for good.
@@ -1494,7 +1558,10 @@ mod tests {
         assert_eq!(answer, Response::Ack);
         assert!(!harness.core.processes.contains_key(&parent_id));
         let session = &harness.core.sessions[&session_id];
-        assert_eq!(session.status, SessionStatus::Paused);
+        // Ending takes the row out of the tree. It used to leave it `Paused` — stopped, but
+        // still listed as though it were work in progress — which is the whole reason the
+        // verb was reported as not doing anything.
+        assert_eq!(session.status, SessionStatus::Archived);
         assert!(session
             .tree
             .get(&parent_id)

@@ -60,6 +60,7 @@ Status values:
 | [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
 | [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
 | [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
+| [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
 
 ---
 
@@ -2852,3 +2853,72 @@ hidden.
   only protection is the dialog. That is the cost of the promise being simple enough to state.
 - **Downside:** deleting a Workspace with many Sessions is a long operation that stops each
   one's processes in turn, and the window has one acknowledgement to show for all of it.
+
+---
+
+<a id="adr-047"></a>
+## ADR-047 — Ending a Session takes its row out of the tree; a Workspace is a project and stays
+
+**Status:** Accepted, implemented. Narrows ADR-046's middle verb.
+
+### Context
+
+"End session" stopped every process and set the Session to `Paused`, leaving its row in the tree.
+Reported as the Sessions "sitting there laughing at me every time I end them", and that is a fair
+description: the row stayed, in the same place, with the same shape, next to rows that were live.
+The only signal was a count going to zero. So the verb looked like it had done nothing, and a
+tree in daily use filled with rows its owner had already finished with.
+
+ADR-046 added `delete` and answered a different question — how to get rid of something for
+good — while leaving the visible button doing the thing that was reported. The user asked twice
+for Sessions to leave the interface, and got a third verb in a context menu.
+
+### Alternatives considered
+
+**Leave it and rely on Delete.** Rejected. Delete is for "forget this ever existed"; ending a
+task is ordinary and happens many times a day. Making the ordinary act reach for the irreversible
+one is not a design, it is a workaround.
+
+**Keep the row and make it look ended** — greyed out, or in a collapsed "Ended" group. Rejected
+for now: it is more interface, and the request was for fewer rows rather than better-labelled
+ones. It stays available if the archived list turns out to be a poor home.
+
+**Delete on end.** Rejected. A Session that has just ended is exactly the one most likely to be
+wanted back — the branch is still there, the task may not be finished.
+
+### Decision
+
+**Ending a Session archives it.** The processes stop, the write lease it held is released, and the
+row leaves the tree. Reversible in the way archiving always was: it comes back, stopped, when
+archived rows are shown or when it is restored. `DeleteSession` is still the one that forgets.
+
+Releasing the lease is part of it. A Session whose processes have stopped is not writing to the
+checkout, and leaving the lease held meant the user had to find "Release write lease" in a menu
+before they could start work in their own Workspace again — a second, obscure step for something
+already finished. The release is quiet: a failure is logged, not returned, because the Session has
+already ended and refusing the whole operation would leave the user with neither outcome.
+
+**A Workspace does not follow.** Stopping every Session in a Workspace takes every *Session* row
+out of the tree and leaves the Workspace's own row where it is. A Session is a task and finishing
+it means it is over; a Workspace is a *project* — a directory the user comes back to — and filing
+the project away because its last task stopped would mean restoring it before starting the next
+one. The control is therefore renamed to what it does: **"Stop all sessions in X"**, not "Close
+workspace". Getting the project itself out of the tree is `ArchiveWorkspace`, or
+`DeleteWorkspace`, both on the same row.
+
+Every lifecycle command's title now says two things, and a test enforces both: what happens to
+the work, and what happens to the row. The absence of the second is what made this defect
+invisible until it was used.
+
+### Consequences
+
+- Ending a Session does what the word says. The tree holds what is being worked on.
+- A Session can be brought back from the archived list, stopped, with its layout and history.
+- The write lease follows the work rather than the record, so finishing a Session in the primary
+  checkout leaves the checkout free for the next one without a second step.
+- **Downside:** a Session ended by mistake is in the archived list, which is off by default. It is
+  one preference away, and this is the reason ending archives rather than deletes.
+- **Downside:** `close_session` now has two jobs — stopping and filing — where before it had one.
+  They are one act from the user's side, which is the side that decides.
+- **Downside:** the asymmetry between a Session and a Workspace has to be learnt. It is carried by
+  the control's name rather than by documentation, which is the only place it can be learnt from.
