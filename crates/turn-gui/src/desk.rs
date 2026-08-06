@@ -2638,6 +2638,16 @@ impl Desk {
                     disposition,
                 },
             }],
+            ViewAction::ZoomPane {
+                session_id,
+                pane_id,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("showing the pane"),
+                request: Request::ZoomPane {
+                    session_id,
+                    pane_id,
+                },
+            }],
             ViewAction::DeleteSession {
                 session_id,
                 disposition,

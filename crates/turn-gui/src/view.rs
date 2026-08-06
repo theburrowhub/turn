@@ -816,6 +816,16 @@ pub enum ViewAction {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// Maximises a pane, or puts the layout back when it is already the maximised one.
+    ///
+    /// The daemon's `zoom_pane` *toggles*, which is right for the keyboard chord and wrong for
+    /// the tree: clicking two different subagents that share a pane would maximise and then
+    /// un-maximise it. So the window sends this only when the toggle would land on the state it
+    /// wants, worked out from the layout the daemon last gave it.
+    ZoomPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
     /// Removes a Session from Turn for good. Only ever produced by the confirmation dialog.
     DeleteSession {
         session_id: SessionId,
@@ -1055,9 +1065,21 @@ fn row_action_count(row: HierarchyRow<'_>) -> usize {
     match row {
         HierarchyRow::Workspace(_) => 3,
         HierarchyRow::Session { .. } => 2,
-        // A Process row's lifecycle is the "Stop Agent" action in its context menu, which
-        // is narrower than either of these and belongs to the Agent, not to the tree.
-        HierarchyRow::Process { .. } => 0,
+        // A worker an agent is managing carries one: the way to stop it.
+        //
+        // Every other Process row carries none, and that difference is the point rather than an
+        // inconsistency. An agent can be managing a dozen subagents and processes at once, and
+        // the row is where the user finds out one of them has gone quiet — so it is also where
+        // they should be able to do something about it, without a right-click and a menu. A shell
+        // or the agent itself is not in that position: stopping either is a decision about the
+        // pane, and it stays in the context menu where it always was.
+        //
+        // Decided by kind rather than by state: the control is there whether the worker is busy
+        // or idle, because a control that appeared only when Turn thought something was wrong
+        // would make its absence a claim Turn cannot support.
+        HierarchyRow::Process { session, node } => {
+            usize::from(crate::spotlight::is_managed(session, node))
+        }
     }
 }
 
@@ -2310,6 +2332,58 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    /// What a click on a row does to the layout, as at most one request.
+    ///
+    /// Clicking a subagent — or a process an agent started — maximises the pane it is running
+    /// inside; clicking the agent, the Session or the Workspace that owns it puts the layout
+    /// back. Which pane, and which of the two, is [`spotlight`]'s decision; this turns it into a
+    /// request, and its whole remaining job is *not sending one when nothing would change*.
+    ///
+    /// That matters because `zoom_pane` toggles. Asking to show a pane that is already maximised
+    /// would un-maximise it, so clicking through four subagents that share a pane would flicker
+    /// the layout in and out instead of leaving it maximised. The state the daemon last reported
+    /// is what the comparison is against — the window does not keep its own idea of it.
+    fn spotlight_for(&self, row: HierarchyRow<'_>) -> Vec<ViewAction> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        let zoomed = layout.zoomed.clone();
+        let restore = |zoomed: Option<PaneId>, session_id: SessionId| match zoomed {
+            // Toggling the pane that *is* maximised is how the layout comes back.
+            Some(pane) => vec![ViewAction::ZoomPane {
+                session_id,
+                pane_id: pane,
+            }],
+            None => Vec::new(),
+        };
+        match row {
+            // A Session or a Workspace owns everything under it, so picking one is asking to see
+            // the whole layout again.
+            HierarchyRow::Session { session, .. } => restore(zoomed, session.session.id.clone()),
+            HierarchyRow::Workspace(workspace) => workspace
+                .sessions
+                .iter()
+                .find(|session| Some(&session.session.id) == self.selected.as_ref())
+                .map(|session| restore(zoomed, session.session.id.clone()))
+                .unwrap_or_default(),
+            HierarchyRow::Process { session, node } => {
+                match crate::spotlight::for_node(session, node) {
+                    crate::spotlight::Spotlight::Show(pane) if zoomed.as_ref() != Some(&pane) => {
+                        vec![ViewAction::ZoomPane {
+                            session_id: session.session.id.clone(),
+                            pane_id: pane,
+                        }]
+                    }
+                    crate::spotlight::Spotlight::Show(_) => Vec::new(),
+                    crate::spotlight::Spotlight::Restore => {
+                        restore(zoomed, session.session.id.clone())
+                    }
+                    crate::spotlight::Spotlight::Leave => Vec::new(),
+                }
+            }
+        }
+    }
+
     fn lifecycle_confirmation_overlay(
         &self,
         ui: &mut Ui,
@@ -2912,6 +2986,12 @@ impl<'a> TurnView<'a> {
                             expanded,
                             focused_pane,
                             active_session,
+                            idle: match row {
+                                HierarchyRow::Process { session, node } => {
+                                    crate::spotlight::idleness(session, node, self.now_ms)
+                                }
+                                _ => None,
+                            },
                         },
                     );
                     if state.scroll_tree_to.as_ref() == Some(&key) {
@@ -2964,6 +3044,7 @@ impl<'a> TurnView<'a> {
                             set_hierarchy_expanded(state, snapshot, key.clone(), !expanded);
                         } else {
                             actions.extend(select_hierarchy_row(state, snapshot, *row));
+                            actions.extend(self.spotlight_for(*row));
                         }
                     }
                     if response.double_clicked() && !caret_clicked {
@@ -3524,7 +3605,51 @@ impl<'a> TurnView<'a> {
                     }
                 });
             }
-            HierarchyRow::Process { .. } => {}
+            HierarchyRow::Process { session, node } => {
+                // Only a worker an agent is managing, which is what reserved the room above.
+                if !crate::spotlight::is_managed(session, node) || node.lifecycle.is_terminal() {
+                    return actions;
+                }
+                let what = if node.is_agentic { "agent" } else { "process" };
+                let label = format!("Stop {what} {}", process_title(node));
+                let idle = crate::spotlight::idleness(session, node, self.now_ms)
+                    .filter(|idle| idle.worth_saying);
+                let detail = match &idle {
+                    // The reason the control is being looked at, in the tooltip that names it.
+                    Some(idle) => format!(
+                        "it has said nothing for {} · asks nothing first",
+                        crate::spotlight::describe_silence(idle.silent_ms)
+                    ),
+                    None => "signals it to stop · asks nothing first".to_string(),
+                };
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(
+                    keyed_region(slot, "process-stop", node.node_id.as_str()),
+                    |ui| {
+                        ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                        if icons::row_button(
+                            ui,
+                            slot,
+                            icons::POWER,
+                            &label,
+                            &detail,
+                            None,
+                            node.lifecycle != Lifecycle::Orphaned,
+                        )
+                        .on_disabled_hover_text(
+                            "This process survived the previous daemon and is not controllable. \
+                             Stop it outside Turn, then confirm recovery.",
+                        )
+                        .clicked()
+                        {
+                            actions.push(ViewAction::TerminateNode {
+                                session_id: node.session_id.clone(),
+                                node_id: node.node_id.clone(),
+                            });
+                        }
+                    },
+                );
+            }
         }
         // Back to the bottom of the row. Placing a widget moves the parent's cursor to the
         // bottom of *that* widget, and these sit on the row's first line — so without this
@@ -6248,6 +6373,11 @@ struct RowState {
     focused_pane: bool,
     /// This row's Session is the one whose layout the window is drawing.
     active_session: bool,
+    /// How long a worker an agent is managing has had nothing to say.
+    ///
+    /// Computed by the caller rather than in the row, because it needs the whole Session to know
+    /// whether this node is being managed at all, and a row only has itself.
+    idle: Option<crate::spotlight::Idleness>,
 }
 
 fn hierarchy_row(
@@ -6262,6 +6392,7 @@ fn hierarchy_row(
         expanded,
         focused_pane,
         active_session,
+        idle: idle_note,
     } = state;
     // The width is passed in rather than read from the `Ui`, so every row in the tree is
     // the same width and the column its controls occupy is in the same place on all of
@@ -6488,15 +6619,32 @@ fn hierarchy_row(
                     colour
                 },
             );
+            // The third line is what the node last said. For a worker an agent is managing,
+            // a long silence replaces it: "nothing for six minutes" is the fact worth having
+            // there, and the preview it would otherwise repeat is six minutes old anyway.
+            let idle = idle_note.filter(|idle| idle.worth_saying);
+            let (preview_text, preview_colour) = match &idle {
+                Some(idle) => (
+                    format!(
+                        "nothing for {} — click to see its pane",
+                        crate::spotlight::describe_silence(idle.silent_ms)
+                    ),
+                    theme.attention,
+                ),
+                None => (
+                    visible_preview(node)
+                        .map(|preview| preview.normalized_text.clone())
+                        .unwrap_or_else(|| "no activity preview".into()),
+                    theme.text_faint,
+                ),
+            };
             paint_line(
                 &painter,
                 egui::pos2(text_x, rect.min.y + 39.0),
                 detail_width,
-                visible_preview(node)
-                    .map(|preview| preview.normalized_text.as_str())
-                    .unwrap_or("no activity preview"),
+                &preview_text,
                 FontId::new(10.0, egui::FontFamily::Proportional),
-                theme.text_faint,
+                preview_colour,
             );
         }
     }

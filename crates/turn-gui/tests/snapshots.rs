@@ -921,6 +921,98 @@ fn coming_back_to_a_session_starts_every_pane_in_one_click() {
     }
 }
 
+/// Pointing at one worker among many, and getting the layout back.
+///
+/// An agent managing four subagents runs all of them inside one pane, so the tree could list them
+/// and not show them: finding the one you cared about meant reading output from four. Clicking a
+/// subagent now maximises the pane it runs in, and clicking what owns it — its agent, its Session
+/// — puts the layout back.
+#[test]
+fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout() {
+    let fixture = busy_desk();
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    // A subagent, which has no pane of its own.
+    let rows = tree_row_labels(&h);
+    let subagent = rows
+        .iter()
+        .find(|label| label.contains("Reviewer"))
+        .unwrap_or_else(|| panic!("the fixture has a subagent row: {rows:?}"))
+        .clone();
+
+    h.state_mut().actions.clear();
+    h.get_by_label_contains(&subagent).click();
+    h.run_steps(1);
+    let zoomed: Vec<&ViewAction> = h
+        .state()
+        .actions
+        .iter()
+        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
+        .collect();
+    assert_eq!(
+        zoomed.len(),
+        1,
+        "clicking a subagent asks for exactly one pane to be shown: {:?}",
+        h.state().actions
+    );
+
+    // The layout the daemon answers with, so the window's next decision is made against the
+    // state the daemon reports rather than against a guess.
+    let pane = match zoomed[0] {
+        ViewAction::ZoomPane { pane_id, .. } => pane_id.clone(),
+        _ => unreachable!(),
+    };
+    let mut layout = h.state().fixture.layout.clone().expect("a layout");
+    assert!(layout.toggle_zoom(&pane), "the pane the click named exists");
+    assert_eq!(layout.zoomed.as_ref(), Some(&pane));
+    h.state_mut().fixture.layout = Some(layout);
+    h.run();
+    h.run();
+
+    // Clicking the same subagent again does *not* toggle it back off. `zoom_pane` toggles, so a
+    // second click on a row already being shown would un-maximise the pane and the tree would
+    // flicker instead of holding still.
+    h.state_mut().actions.clear();
+    h.get_by_label_contains(&subagent).click();
+    h.run_steps(1);
+    assert!(
+        !h.state()
+            .actions
+            .iter()
+            .any(|action| matches!(action, ViewAction::ZoomPane { .. })),
+        "a pane already being shown must not be un-maximised by pointing at it again: {:?}",
+        h.state().actions
+    );
+
+    // And clicking the agent that owns it puts the layout back.
+    let owner = rows
+        .iter()
+        .find(|label| label.contains("Claude Code"))
+        .expect("the fixture has the owning agent")
+        .clone();
+    h.state_mut().actions.clear();
+    h.get_by_label_contains(&owner).click();
+    h.run_steps(1);
+    let restored: Vec<&ViewAction> = h
+        .state()
+        .actions
+        .iter()
+        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
+        .collect();
+    assert_eq!(
+        restored.len(),
+        1,
+        "clicking the owner asks for the maximised pane to be released: {:?}",
+        h.state().actions
+    );
+    assert!(
+        matches!(restored[0], ViewAction::ZoomPane { pane_id, .. } if *pane_id == pane),
+        "and it names the pane that is maximised, which is what un-toggles it"
+    );
+}
+
 /// The other half of the recovery rule, in the window: a pending write confirmation holds
 /// back what would use the checkout, not the whole Session.
 ///

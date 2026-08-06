@@ -61,6 +61,7 @@ Status values:
 | [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
 | [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
 | [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
+| [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Accepted, implemented |
 
 ---
 
@@ -2922,3 +2923,78 @@ invisible until it was used.
   They are one act from the user's side, which is the side that decides.
 - **Downside:** the asymmetry between a Session and a Workspace has to be learnt. It is carried by
   the control's name rather than by documentation, which is the only place it can be learnt from.
+
+---
+
+<a id="adr-048"></a>
+## ADR-048 — The tree points at one worker: click a managed node to show its pane, its owner to restore
+
+**Status:** Accepted, implemented.
+
+### Context
+
+An agent managing work has children in the tree: the subagents it reported through its hooks, and
+the processes it started that ADR-019's scan found. Listing them is what makes it possible to see
+what an agent is *doing*. What the tree could not do was **show** you one. A subagent has no pane:
+it runs inside its parent's, four of them share one screen, and finding the one that mattered meant
+reading output from all four.
+
+The request was precise: an entry per subagent or process the agent is managing, clicking one
+maximises it, clicking the parent or the Session restores the layout, and Turn should notice when
+one has gone quiet and offer a quick way to stop it.
+
+### Alternatives considered
+
+**Give each subagent its own pane.** Rejected. A subagent is not a process with a terminal — it is
+a conversation inside the agent's. There is no pty to attach, and inventing a pane for one would
+mean inventing its output.
+
+**Open a temporary pane per subagent** (`OpenNodeAsTemporaryPane` already exists). Rejected as the
+default: it is the right answer for *inspecting* a node's details, and the wrong one for "show me
+this worker" — it adds a surface rather than picking one of the ones already there.
+
+**A separate maximise control on each row.** Rejected. The row already means "this worker", and a
+control beside it that means "this worker, but bigger" is a second way to say the same thing. The
+click is the gesture.
+
+### Decision
+
+Clicking a node an agent is **managing** maximises the pane it runs inside; clicking the thing that
+**owns** it — its agent, its shell, its Session, its Workspace — puts the layout back.
+
+*Managed* is decided by ancestry, not by kind: a hook-reported subagent is agentic and a `gh` the
+agent started is not, and both are things the agent is managing. The pane is the nearest ancestor's,
+walking up until one is bound to a pane, because the binding may be on the agent or on the shell and
+assuming which would be wrong for one of them.
+
+The whole decision is a value in `spotlight`, testable without a window, because the part worth
+getting right is *which* pane.
+
+`zoom_pane` toggles, which is right for the keyboard chord and wrong here: clicking two subagents
+that share a pane would maximise and then un-maximise it. So the window sends the request only when
+the toggle would land on the state it wants, compared against the layout **the daemon last
+reported** rather than against an idea the window keeps for itself.
+
+**Silence is reported, not acted on.** A managed node that has produced nothing for two minutes says
+so on its own row, in place of the activity preview it would otherwise repeat — a preview two
+minutes old is not news. It is a word on a row: nothing is stopped, nothing steals focus, and being
+wrong about it costs a line of text. A *shell* is never called idle; it is waiting for the person at
+the keyboard. Neither is a node that has ended: it is finished, not idle.
+
+**One control on the row: stop.** Managed nodes carry it and nothing else does, decided by kind
+rather than by state — a control that appeared only when Turn thought something was wrong would make
+its absence a claim Turn cannot support. Stopping a shell or the agent itself stays in the context
+menu, because that is a decision about the pane.
+
+### Consequences
+
+- The tree becomes the way to point at one worker among many, which is the job it was closest to.
+- A maximised pane always has a way back: every ancestor of the row that maximised it restores.
+- **Downside:** clicking a managed row now changes the layout, so a user selecting rows to read
+  their state will see panes maximise. Clicking the owner is one click back, and the alternative —
+  a modifier or a second control — would hide the feature behind something to learn.
+- **Downside:** the idle threshold is a constant. Two minutes is defensible and not derived from
+  anything about the agent; a worker that thinks for three minutes will be called quiet once.
+- **Downside:** none of this reaches a Session whose agent Turn did not launch. Without hooks there
+  are no reported subagents, only the OS children the scan finds, so a hand-started `claude` shows
+  its processes and not its workers. That is the launch path's problem, not this one's.
