@@ -2,7 +2,7 @@
 
 use crate::error::{DaemonError, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -160,10 +160,13 @@ impl IpcAuthenticator {
     /// a late shutdown from deleting a newer generation's replacement.
     pub(super) fn revoke(&self) {
         self.active.store(false, Ordering::Release);
-        let Ok(current) = read_bounded(&self.path) else {
+        let Ok(current) = turn_proto::read_ipc_auth_token_file(&self.path) else {
             return;
         };
-        if constant_time_eq(&current, self.token.expose_secret().as_bytes()) {
+        if constant_time_eq(
+            current.expose_secret().as_bytes(),
+            self.token.expose_secret().as_bytes(),
+        ) {
             if let Err(error) = std::fs::remove_file(&self.path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(path = %self.path.display(), %error, "could not remove IPC token");
@@ -201,6 +204,9 @@ impl RequestLimiter {
 }
 
 fn constant_time_eq(expected: &[u8], candidate: &[u8]) -> bool {
+    // Work is fixed by the daemon-owned expected secret, not by attacker input.
+    // Folding the lengths into the accumulator rejects a longer matching prefix
+    // without letting that input force an arbitrarily long pre-authentication loop.
     let mut difference = expected.len() ^ candidate.len();
     for (index, expected_byte) in expected.iter().copied().enumerate() {
         difference |= usize::from(expected_byte ^ candidate.get(index).copied().unwrap_or(0));
@@ -239,34 +245,6 @@ fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
-}
-
-fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "IPC token path is not a regular file",
-        ));
-    }
-    let mut contents = Vec::with_capacity(64);
-    Read::by_ref(&mut file)
-        .take(129)
-        .read_to_end(&mut contents)?;
-    if contents.len() != 64 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "IPC token must be exactly 64 bytes",
-        ));
-    }
-    Ok(contents)
 }
 
 #[cfg(unix)]
@@ -328,6 +306,11 @@ mod tests {
     fn token_formatting_never_exposes_the_capability() {
         let token = AuthToken::new("a".repeat(64));
         assert!(!format!("{token:?}").contains(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn a_longer_candidate_with_the_right_prefix_is_still_rejected() {
+        assert!(!constant_time_eq(b"abcd", b"abcd-extra"));
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //! is strictly better than a UI that half works.
 
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::cells::MAX_SCREEN_CELLS;
@@ -70,10 +72,56 @@ pub const MIN_PROTOCOL_VERSION: u32 = 4;
 /// every client without also sharing daemon implementation code.
 pub const IPC_AUTH_TOKEN_SUFFIX: &str = ".token";
 
+/// Encoded size of a published daemon capability.
+pub const IPC_AUTH_TOKEN_HEX_BYTES: usize = 64;
+
 pub fn ipc_auth_token_path(socket: &Path) -> PathBuf {
     let mut name = socket.as_os_str().to_os_string();
     name.push(IPC_AUTH_TOKEN_SUFFIX);
     PathBuf::from(name)
+}
+
+/// Safely reads and validates the capability published beside `socket`.
+///
+/// This lives with the path contract so the daemon probe and every UI enforce the
+/// same no-symlink, regular-file and exact-format rules.
+pub fn read_ipc_auth_token(socket: &Path) -> std::io::Result<AuthToken> {
+    read_ipc_auth_token_file(&ipc_auth_token_path(socket))
+}
+
+/// Safely reads and validates an already-derived capability-file path.
+///
+/// Daemon shutdown uses this form to compare a sidecar with its own generation
+/// before removing it.
+pub fn read_ipc_auth_token_file(path: &Path) -> std::io::Result<AuthToken> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability is not a regular file",
+        ));
+    }
+
+    let mut secret = String::with_capacity(IPC_AUTH_TOKEN_HEX_BYTES);
+    Read::by_ref(&mut file)
+        .take((IPC_AUTH_TOKEN_HEX_BYTES + 1) as u64)
+        .read_to_string(&mut secret)?;
+    if secret.len() != IPC_AUTH_TOKEN_HEX_BYTES
+        || !secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability has an invalid format",
+        ));
+    }
+    Ok(AuthToken::new(secret))
 }
 
 /// The ephemeral capability presented in the opening handshake.

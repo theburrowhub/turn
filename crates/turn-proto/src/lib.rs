@@ -6,8 +6,9 @@
 //! renders and forwards keystrokes. That division is what makes processes survive a
 //! UI restart — the pty never belonged to the window — and it only holds if the
 //! boundary is described precisely enough that a second frontend could be written
-//! against it. This crate is that description: types, framing and nothing else. It
-//! has no I/O, no tokio, no socket.
+//! against it. This crate is that description: types, framing and the small
+//! owner-only capability-file reader every client must implement identically. It
+//! has no async I/O, no tokio and no socket ownership.
 //!
 //! ## The shape of a connection
 //!
@@ -97,8 +98,9 @@ pub use cells::{
     MAX_SCREEN_CELLS, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
 };
 pub use envelope::{
-    ipc_auth_token_path, negotiate, negotiate_within, peek_version, version_refusal, AuthToken,
-    ClientFrame, ClientMessage, Hello, Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome,
+    ipc_auth_token_path, negotiate, negotiate_within, peek_version, read_ipc_auth_token,
+    read_ipc_auth_token_file, version_refusal, AuthToken, ClientFrame, ClientMessage, Hello,
+    Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome, IPC_AUTH_TOKEN_HEX_BYTES,
     IPC_AUTH_TOKEN_SUFFIX, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 pub use error::{

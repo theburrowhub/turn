@@ -9,16 +9,14 @@
 //!   flight is failed rather than forgotten, because a request that never settles
 //!   presents to the user as a frozen window.
 
-use std::fs::OpenOptions;
-use std::io::Read;
 use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use turn_proto::{
-    encode_checked, AuthToken, ClientFrame, ClientMessage, ErrorCode, Hello, LineDecoder,
-    ProtoError, Request, RequestId, ServerFrame, ServerMessage, Welcome,
+    encode_checked, ClientFrame, ClientMessage, ErrorCode, Hello, LineDecoder, ProtoError, Request,
+    RequestId, ServerFrame, ServerMessage, Welcome,
 };
 
 /// Why a connection could not be made, or could not continue.
@@ -107,7 +105,7 @@ pub async fn connect(
 ) -> Result<(Connection, Welcome), LinkError> {
     // Re-read on every attempt. A daemon restart rotates the capability, and a UI
     // that cached it would turn a healthy restart into a permanent auth failure.
-    let auth_token = read_auth_token(socket)
+    let auth_token = turn_proto::read_ipc_auth_token(socket)
         .map_err(|cause| LinkError::io("could not read the daemon capability", cause))?;
     let mut stream = UnixStream::connect(socket)
         .await
@@ -138,35 +136,6 @@ pub async fn connect(
         },
         welcome,
     ))
-}
-
-fn read_auth_token(socket: &Path) -> std::io::Result<AuthToken> {
-    let path = turn_proto::ipc_auth_token_path(socket);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the daemon capability is not a regular file",
-        ));
-    }
-    let mut secret = String::with_capacity(64);
-    Read::by_ref(&mut file)
-        .take(65)
-        .read_to_string(&mut secret)?;
-    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the daemon capability has an invalid format",
-        ));
-    }
-    Ok(AuthToken::new(secret))
 }
 
 /// Reads until the daemon has accepted or refused us.

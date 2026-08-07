@@ -293,25 +293,7 @@ async fn handshake(stream: UnixStream, socket: &Path) -> Option<Occupant> {
 /// Absence or an unsafe/malformed file falls back to an unauthenticated probe, which
 /// can still identify a `rejected` response without gaining any daemon authority.
 fn probe_auth_token(socket: &Path) -> Option<turn_proto::AuthToken> {
-    let path = turn_proto::ipc_auth_token_path(socket);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    let mut file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut secret = String::with_capacity(64);
-    Read::by_ref(&mut file)
-        .take(65)
-        .read_to_string(&mut secret)
-        .ok()?;
-    (secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| turn_proto::AuthToken::new(secret))
+    turn_proto::read_ipc_auth_token(socket).ok()
 }
 
 /// Binds the socket, refusing to displace a live daemon.

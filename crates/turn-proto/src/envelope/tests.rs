@@ -37,6 +37,37 @@ fn the_token_path_is_derived_from_the_exact_socket_path() {
     );
 }
 
+#[test]
+fn the_shared_token_reader_enforces_the_published_file_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("turnd.sock");
+    let path = ipc_auth_token_path(&socket);
+    std::fs::write(&path, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)).unwrap();
+    assert_eq!(
+        read_ipc_auth_token(&socket).unwrap().expose_secret(),
+        "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)
+    );
+
+    std::fs::write(&path, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES + 1)).unwrap();
+    assert_eq!(
+        read_ipc_auth_token(&socket).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_shared_token_reader_never_follows_a_sidecar_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("turnd.sock");
+    let target = temp.path().join("elsewhere");
+    std::fs::write(&target, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)).unwrap();
+    symlink(&target, ipc_auth_token_path(&socket)).unwrap();
+    assert!(read_ipc_auth_token(&socket).is_err());
+}
+
 /// The limits a client has to respect are announced rather than assumed, including
 /// the largest screen `attach_pane` will accept.
 #[test]
