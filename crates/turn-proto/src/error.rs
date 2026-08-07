@@ -74,6 +74,9 @@ pub enum ErrorCode {
     /// The client speaks a protocol version this daemon cannot serve. The client
     /// must not retry; one of the two binaries has to be updated.
     UnsupportedVersion,
+    /// The peer did not present the current daemon capability. Reconnect only
+    /// after re-reading the token file; repeating the same credential is refused.
+    Unauthorized,
     /// A request arrived before the handshake completed.
     HandshakeRequired,
     /// A second `Hello` on a connection that already completed one.
@@ -83,6 +86,9 @@ pub enum ErrorCode {
     /// The line exceeded the frame limit and was discarded. The connection
     /// survives; whatever was being sent did not.
     LineTooLong,
+    /// This authenticated client exceeded its request budget. Other clients and
+    /// the daemon remain healthy; the caller may retry after backing off.
+    RateLimited,
     /// The id in the request does not exist (or no longer does).
     NotFound,
     /// The request is well-formed but its arguments make no sense — a resize
@@ -114,14 +120,17 @@ impl ErrorCode {
     /// The UI uses this to decide between offering a retry and reporting a
     /// failure the user has to act on.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, ErrorCode::Unavailable | ErrorCode::Internal)
+        matches!(
+            self,
+            ErrorCode::RateLimited | ErrorCode::Unavailable | ErrorCode::Internal
+        )
     }
 
     /// Whether the connection itself is unusable and must be re-established.
     pub fn is_fatal_to_connection(&self) -> bool {
         matches!(
             self,
-            ErrorCode::UnsupportedVersion | ErrorCode::HandshakeRequired
+            ErrorCode::UnsupportedVersion | ErrorCode::Unauthorized | ErrorCode::HandshakeRequired
         )
     }
 
@@ -130,10 +139,12 @@ impl ErrorCode {
     pub fn as_str(&self) -> &'static str {
         match self {
             ErrorCode::UnsupportedVersion => "unsupported_version",
+            ErrorCode::Unauthorized => "unauthorized",
             ErrorCode::HandshakeRequired => "handshake_required",
             ErrorCode::AlreadyHandshaked => "already_handshaked",
             ErrorCode::MalformedMessage => "malformed_message",
             ErrorCode::LineTooLong => "line_too_long",
+            ErrorCode::RateLimited => "rate_limited",
             ErrorCode::NotFound => "not_found",
             ErrorCode::InvalidArgument => "invalid_argument",
             ErrorCode::Conflict => "conflict",
@@ -261,13 +272,15 @@ mod tests {
     }
 
     /// One of each code, checked for completeness by the count assertion below.
-    fn all_codes() -> [ErrorCode; 13] {
+    fn all_codes() -> [ErrorCode; 15] {
         [
             ErrorCode::UnsupportedVersion,
+            ErrorCode::Unauthorized,
             ErrorCode::HandshakeRequired,
             ErrorCode::AlreadyHandshaked,
             ErrorCode::MalformedMessage,
             ErrorCode::LineTooLong,
+            ErrorCode::RateLimited,
             ErrorCode::NotFound,
             ErrorCode::InvalidArgument,
             ErrorCode::Conflict,
@@ -297,7 +310,7 @@ mod tests {
             all_codes().iter().map(|c| c.as_str()).collect();
         assert_eq!(
             unique.len(),
-            13,
+            15,
             "the error catalogue changed size: {unique:?}"
         );
     }

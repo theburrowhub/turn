@@ -313,8 +313,9 @@ impl DaemonLink {
 
 /// Connects, serves the connection until it ends, and does it again.
 ///
-/// Returns only when the daemon refuses this build, because that is the one failure a
-/// retry cannot fix and looping on it would bury the message the user needs to read.
+/// Returns only when the daemon refuses this build for a non-authentication reason,
+/// because that is the failure a retry cannot fix. An auth refusal re-reads the
+/// generation token and follows normal backoff.
 async fn supervise(
     socket: PathBuf,
     client_version: String,
@@ -345,7 +346,7 @@ async fn supervise(
 
         let (mut connection, welcome) = match link::connect(&socket, &client_version).await {
             Ok(parts) => parts,
-            Err(LinkError::Refused(error)) => {
+            Err(LinkError::Refused(error)) if error.code != turn_proto::ErrorCode::Unauthorized => {
                 tracing::error!(message = %error.message, "the daemon refused this build");
                 publish(
                     &inbound,
@@ -574,6 +575,9 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+        let token_path = turn_proto::ipc_auth_token_path(&path);
+        let _ = std::fs::remove_file(&token_path);
+        std::fs::write(token_path, "b".repeat(64)).unwrap();
         path
     }
 

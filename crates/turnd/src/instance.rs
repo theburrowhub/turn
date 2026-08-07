@@ -251,7 +251,7 @@ pub async fn probe(socket: &Path) -> Occupant {
         // gone. This is the ordinary case after a crash or a hard reboot.
         return Occupant::Stale;
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, handshake(stream)).await {
+    match tokio::time::timeout(PROBE_TIMEOUT, handshake(stream, socket)).await {
         Ok(Some(occupant)) => occupant,
         // A connection that accepts and then says nothing is a socket held by
         // something that is not going to talk to us.
@@ -260,9 +260,13 @@ pub async fn probe(socket: &Path) -> Occupant {
 }
 
 /// Completes a handshake far enough to identify the peer.
-async fn handshake(stream: UnixStream) -> Option<Occupant> {
+async fn handshake(stream: UnixStream, socket: &Path) -> Option<Occupant> {
     let (read_half, mut write_half) = stream.into_split();
-    let hello = ClientFrame::hello(Hello::new("turnd-probe", crate::DAEMON_VERSION));
+    let hello = match probe_auth_token(socket) {
+        Some(token) => Hello::new("turnd-probe", crate::DAEMON_VERSION, token),
+        None => Hello::unauthenticated("turnd-probe", crate::DAEMON_VERSION),
+    };
+    let hello = ClientFrame::hello(hello);
     let frame = turn_proto::framing::encode(&hello).ok()?;
     write_half.write_all(&frame).await.ok()?;
     write_half.flush().await.ok()?;
@@ -283,6 +287,31 @@ async fn handshake(stream: UnixStream) -> Option<Occupant> {
         }),
         _ => Some(Occupant::Foreign),
     }
+}
+
+/// Reads just enough of the sidecar to let a probe obtain a current daemon's PID.
+/// Absence or an unsafe/malformed file falls back to an unauthenticated probe, which
+/// can still identify a `rejected` response without gaining any daemon authority.
+fn probe_auth_token(socket: &Path) -> Option<turn_proto::AuthToken> {
+    let path = turn_proto::ipc_auth_token_path(socket);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut secret = String::with_capacity(64);
+    Read::by_ref(&mut file)
+        .take(65)
+        .read_to_string(&mut secret)
+        .ok()?;
+    (secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| turn_proto::AuthToken::new(secret))
 }
 
 /// Binds the socket, refusing to displace a live daemon.

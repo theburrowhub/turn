@@ -4039,6 +4039,7 @@ dependencies = [
  "turn-proto",
  "turn-pty",
  "turn-store",
+ "uuid",
 ]
 
 [[package]]

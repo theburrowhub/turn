@@ -59,6 +59,16 @@ pub enum DaemonError {
         cause: std::io::Error,
     },
 
+    /// The per-generation IPC capability must exist before the socket is exposed
+    /// to clients. Continuing without it would turn an authentication failure into
+    /// an unauthenticated daemon.
+    #[error("could not install IPC authentication token at {path}: {cause}")]
+    IpcAuthToken {
+        path: PathBuf,
+        #[source]
+        cause: std::io::Error,
+    },
+
     /// Unix socket paths are limited by the kernel (104 bytes on macOS, 108 on
     /// Linux) and the failure mode when they are too long is an opaque
     /// `EINVAL`. Caught here with the escape hatch named.

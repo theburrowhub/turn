@@ -1,6 +1,7 @@
 //! Starting the daemon, and accepting connections.
 
 mod client;
+mod security;
 
 use crate::config::Config;
 use crate::core::{ClientId, Command, Core, COMMAND_CAPACITY};
@@ -10,10 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::task::JoinHandle;
 use turn_agents::HookServer;
 use turn_store::Store;
+
+use security::{IpcAuthenticator, IpcCounters};
+pub use security::{IpcStats, MAX_IPC_CONNECTIONS, REQUESTS_PER_SECOND, REQUEST_BURST};
 
 /// Facts about this daemon that every handshake repeats.
 ///
@@ -38,6 +42,8 @@ pub struct DaemonHandle {
     data_dir: PathBuf,
     info: DaemonInfo,
     commands: mpsc::Sender<Command>,
+    authenticator: Arc<IpcAuthenticator>,
+    ipc_stats: Arc<IpcCounters>,
     accept: JoinHandle<()>,
     core: JoinHandle<()>,
     /// Shared with the core task. Keeping it here makes ownership visible in the
@@ -74,8 +80,24 @@ impl DaemonHandle {
         self.hooks.stats()
     }
 
+    /// Owner-only capability file a local client must read for its handshake.
+    pub fn ipc_auth_token_path(&self) -> &Path {
+        self.authenticator.path()
+    }
+
+    /// Aggregate IPC rejection/load counters. Secrets and request payloads are
+    /// deliberately absent.
+    pub fn ipc_stats(&self) -> IpcStats {
+        self.ipc_stats.snapshot()
+    }
+
     /// Flushes state, stops the tasks and removes the socket.
     pub async fn shutdown(self) {
+        // Close the admission boundary before waiting for persistence. No new
+        // connection may authenticate into a daemon that is already shutting down.
+        self.authenticator.revoke();
+        self.accept.abort();
+        let _ = self.accept.await;
         let (done, wait) = oneshot::channel();
         if self.commands.send(Command::Shutdown { done }).await.is_ok() {
             // The core flushes before answering. This timeout only bounds the graceful
@@ -83,8 +105,6 @@ impl DaemonHandle {
             // returns while it still owns the data-directory lock.
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), wait).await;
         }
-        self.accept.abort();
-        let _ = self.accept.await;
         let mut core = self.core;
         if tokio::time::timeout(std::time::Duration::from_secs(5), &mut core)
             .await
@@ -146,14 +166,31 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
     let listener = instance::bind_exclusive(&config.socket_path).await?;
 
     let (commands, inbox) = mpsc::channel(COMMAND_CAPACITY);
-    let core = Core::new(
+    let core = match Core::new(
         Arc::clone(&data_dir_lock),
         store,
         Arc::clone(&hooks),
         config.registry,
         data_dir.clone(),
         commands.clone(),
-    )?;
+    ) {
+        Ok(core) => core,
+        Err(error) => {
+            instance::remove_socket(&config.socket_path);
+            hooks.shutdown();
+            return Err(error);
+        }
+    };
+
+    let authenticator = match IpcAuthenticator::install(&config.socket_path) {
+        Ok(authenticator) => Arc::new(authenticator),
+        Err(error) => {
+            instance::remove_socket(&config.socket_path);
+            hooks.shutdown();
+            return Err(error);
+        }
+    };
+    let ipc_stats = Arc::new(IpcCounters::default());
 
     let info = DaemonInfo {
         version: crate::DAEMON_VERSION.to_string(),
@@ -162,7 +199,13 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
     };
 
     let core_task = tokio::spawn(core.run(inbox, hook_events));
-    let accept_task = tokio::spawn(accept_loop(listener, commands.clone(), info.clone()));
+    let accept_task = tokio::spawn(accept_loop(
+        listener,
+        commands.clone(),
+        info.clone(),
+        Arc::clone(&authenticator),
+        Arc::clone(&ipc_stats),
+    ));
 
     tracing::info!(
         socket = %config.socket_path.display(),
@@ -180,6 +223,8 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
         data_dir,
         info,
         commands,
+        authenticator,
+        ipc_stats,
         accept: accept_task,
         core: core_task,
         _data_dir_lock: data_dir_lock,
@@ -188,13 +233,62 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
 }
 
 /// Accepts connections until the task is aborted.
-async fn accept_loop(listener: UnixListener, commands: mpsc::Sender<Command>, info: DaemonInfo) {
+async fn accept_loop(
+    listener: UnixListener,
+    commands: mpsc::Sender<Command>,
+    info: DaemonInfo,
+    authenticator: Arc<IpcAuthenticator>,
+    stats: Arc<IpcCounters>,
+) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
+    let expected_uid = effective_uid();
+    let capacity = Arc::new(Semaphore::new(MAX_IPC_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let peer_uid = match stream.peer_cred() {
+                    Ok(credentials) => credentials.uid(),
+                    Err(error) => {
+                        stats.reject_uid();
+                        tracing::warn!(%error, "refused IPC peer whose credentials could not be read");
+                        continue;
+                    }
+                };
+                if !peer_is_authorized(peer_uid, expected_uid) {
+                    stats.reject_uid();
+                    tracing::warn!(
+                        peer_uid,
+                        expected_uid,
+                        "refused IPC peer with a different UID"
+                    );
+                    continue;
+                }
+                let permit = match Arc::clone(&capacity).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        stats.reject_capacity();
+                        tracing::warn!(
+                            limit = MAX_IPC_CONNECTIONS,
+                            "refused IPC connection at capacity"
+                        );
+                        continue;
+                    }
+                };
                 let id = ClientId(NEXT.fetch_add(1, Ordering::Relaxed));
-                tokio::spawn(client::serve(stream, id, commands.clone(), info.clone()));
+                let active = stats.connection_opened();
+                let admission = client::ClientAdmission::new(
+                    Arc::clone(&authenticator),
+                    Arc::clone(&stats),
+                    permit,
+                    active,
+                );
+                tokio::spawn(client::serve(
+                    stream,
+                    id,
+                    commands.clone(),
+                    info.clone(),
+                    admission,
+                ));
             }
             Err(error) => {
                 // Per-connection failures are normal — a client that vanished between
@@ -209,6 +303,16 @@ async fn accept_loop(listener: UnixListener, commands: mpsc::Sender<Command>, in
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no pointers and has no failure mode.
+    unsafe { libc::geteuid() }
+}
+
+fn peer_is_authorized(peer_uid: u32, expected_uid: u32) -> bool {
+    peer_uid == expected_uid
 }
 
 /// Waits for `SIGINT` or `SIGTERM`.
@@ -232,4 +336,20 @@ async fn wait_for_signal() {
 #[cfg(not(unix))]
 async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn peer_credentials_are_read_from_the_socket_and_a_wrong_uid_is_refused() {
+        let (_client, server) = tokio::net::UnixStream::pair().unwrap();
+        let actual = server.peer_cred().unwrap().uid();
+        assert!(peer_is_authorized(actual, effective_uid()));
+        assert!(
+            !peer_is_authorized(actual, actual.wrapping_add(1)),
+            "the credential gate must fail closed for a different expected owner"
+        );
+    }
 }

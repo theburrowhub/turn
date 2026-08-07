@@ -58,6 +58,7 @@ Status values:
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 | [044](#adr-044) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
+| [045](#adr-045) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
 
 ---
 
@@ -2660,3 +2661,72 @@ security boundary.
   that boundary rather than offering infinite retention.
 - **Downside:** writes add local disk I/O on the PTY reader thread. The bounded format favours simple crash
   recovery over maximum throughput; batching/sync policy should be changed only with durability benchmarks.
+
+---
+
+<a id="adr-045"></a>
+## ADR-045 — The control socket admits only the owner with a per-generation capability and bounded load
+
+**Status:** Accepted, implemented. `turnd::server::security`, protocol v4 and the native GUI transport.
+
+### Context
+
+The daemon control socket can read terminal history, write to every live PTY and terminate processes. File
+mode `0600` and bounded frames were useful but incomplete: the accept loop did not verify kernel peer
+credentials, distinguish Turn clients from any other local connector, cap open connections or limit request
+frequency. A process could therefore exhaust descriptors or hold tasks, and an accidentally compatible
+client could gain full terminal authority.
+
+The hook HTTP listener is a different boundary. It accepts untrusted agent events on loopback under per-node
+tokens and can never issue terminal commands. Sharing its listener, tokens or admission policy with the
+control socket would turn a narrow event capability into daemon authority.
+
+### Alternatives considered
+
+**Rely on socket mode and UID alone.** Rejected. Kernel credentials are still checked because modes can be
+misconfigured, but UID identifies an account, not an authorised client or daemon generation.
+
+**Use one static token in the data directory.** Rejected. A copied token would never expire and could be
+replayed after restart. It would also become another durable credential to migrate and back up.
+
+**Put authentication on the hook HTTP server and route control through it.** Rejected. HTTP parsing and
+agent-visible per-node tokens belong to a deliberately write-only semantic event surface, not to PTY control.
+
+**Use an ephemeral capability plus kernel credentials and bounded per-client admission.** Chosen.
+
+### Decision
+
+Every accepted Unix stream is checked with `peer_cred`; only the daemon effective UID proceeds. The socket
+remains `0600`. After binding, each daemon generation atomically publishes a fresh 244-bit capability as the
+owner-only regular file `<socket>.token`. Creation is symlink-refusing, `0600`, synced and atomically renamed.
+Shutdown revokes it before persistence and removes only a file whose contents still belong to that generation.
+
+Protocol v4 adds `auth_token` to the opening `hello`. Missing, stale or invalid capabilities receive the same
+fatal `unauthorized` rejection before the client is registered or any request reaches Core. Comparison is
+constant-work over the expected secret, token-bearing types redact `Debug`, and rejection logs contain only
+client labels/counters. The GUI re-reads the token for every connection attempt, so daemon restart rotates the
+credential without application restart. The unauthenticated instance probe may identify a `rejected` peer as
+Turn but cannot read or mutate state.
+
+Admission is hard-bounded at 32 concurrent control connections with a five-second pre-authentication timeout.
+Each authenticated connection has a token bucket of 256 frames and 128 frames/second; over-budget frames get
+`rate_limited`, and 16 consecutive violations close the stream. Per-client output and Core queues remain
+bounded. A writer that cannot finish after its reader closes is aborted after one second, so a non-reading
+peer cannot retain its descriptor and permit indefinitely. Aggregate counters expose UID, capacity, auth,
+timeout and rate-limit rejection counts without payloads or secrets.
+
+The hook server remains a separate `127.0.0.1` HTTP listener with independent per-node tokens, limits and
+statistics. No IPC capability is placed in a hook URL or agent configuration.
+
+### Consequences
+
+- Wrong-account peers fail at the kernel-credential boundary; missing or replayed generation tokens fail the
+  protocol handshake before gaining PTY authority.
+- Two valid windows can connect concurrently, while connection and request storms have calculable descriptor,
+  task and queue bounds.
+- Restart is explicit revocation: an old capability cannot authenticate to the replacement daemon.
+- Authentication changes existing handshake authority, so the supported protocol window is v4 only.
+- **Downside:** this is not a sandbox against malicious code running as the same user. Such code can read the
+  owner-only token just as it can read the user's credentials; process isolation needs a separate OS sandbox.
+- **Downside:** a same-user process can still deny service by repeatedly occupying bounded slots. Integrity and
+  resource bounds are preserved, but availability against the account owner is not promised.

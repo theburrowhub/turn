@@ -13,15 +13,15 @@
 //!
 //! ```text
 //! UI                                             turnd
-//!  │  {"v":3,"type":"hello",…}                      │
+//!  │  {"v":4,"type":"hello",…}                      │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                    {"v":3,"type":"welcome",…}  │   negotiate()
+//!  │                    {"v":4,"type":"welcome",…}  │   negotiate()
 //!  │ ◄───────────────────────────────────────────── │
-//!  │  {"v":3,"type":"request","id":"r-1",…}         │
+//!  │  {"v":4,"type":"request","id":"r-1",…}         │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                   {"v":3,"type":"response",…}  │   correlated by id
+//!  │                   {"v":4,"type":"response",…}  │   correlated by id
 //!  │ ◄───────────────────────────────────────────── │
-//!  │                      {"v":3,"type":"event",…}  │   unsolicited, any time
+//!  │                      {"v":4,"type":"event",…}  │   unsolicited, any time
 //!  │ ◄───────────────────────────────────────────── │
 //! ```
 //!
@@ -97,9 +97,9 @@ pub use cells::{
     MAX_SCREEN_CELLS, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
 };
 pub use envelope::{
-    negotiate, negotiate_within, peek_version, version_refusal, ClientFrame, ClientMessage, Hello,
-    Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    ipc_auth_token_path, negotiate, negotiate_within, peek_version, version_refusal, AuthToken,
+    ClientFrame, ClientMessage, Hello, Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome,
+    IPC_AUTH_TOKEN_SUFFIX, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 pub use error::{
     ErrorCode, ProtoError, ProtoErrorContext, SessionConflictAlternative, WriteLeaseOwnerView,

@@ -9,14 +9,16 @@
 //!   flight is failed rather than forgotten, because a request that never settles
 //!   presents to the user as a frozen window.
 
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::path::Path;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use turn_proto::{
-    encode_checked, ClientFrame, ClientMessage, ErrorCode, Hello, LineDecoder, ProtoError, Request,
-    RequestId, ServerFrame, ServerMessage, Welcome,
+    encode_checked, AuthToken, ClientFrame, ClientMessage, ErrorCode, Hello, LineDecoder,
+    ProtoError, Request, RequestId, ServerFrame, ServerMessage, Welcome,
 };
 
 /// Why a connection could not be made, or could not continue.
@@ -29,7 +31,8 @@ pub enum LinkError {
         #[source]
         cause: std::io::Error,
     },
-    /// The daemon refused this build. Retrying cannot help.
+    /// The daemon refused the handshake. Authentication may recover after token
+    /// rotation; a protocol-version refusal cannot.
     #[error("{0}")]
     Refused(ProtoError),
     /// Something is listening on the socket but it is not a daemon.
@@ -48,6 +51,7 @@ impl LinkError {
     /// Whether trying again could plausibly work.
     pub fn is_retryable(&self) -> bool {
         matches!(self, LinkError::Io { .. } | LinkError::NotADaemon(_))
+            || matches!(self, LinkError::Refused(error) if error.code == ErrorCode::Unauthorized)
     }
 
     /// The failure in the protocol's own error shape, for the status line.
@@ -101,11 +105,15 @@ pub async fn connect(
     socket: &Path,
     client_version: &str,
 ) -> Result<(Connection, Welcome), LinkError> {
+    // Re-read on every attempt. A daemon restart rotates the capability, and a UI
+    // that cached it would turn a healthy restart into a permanent auth failure.
+    let auth_token = read_auth_token(socket)
+        .map_err(|cause| LinkError::io("could not read the daemon capability", cause))?;
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|cause| LinkError::io("no Turn daemon is listening", cause))?;
 
-    let hello = ClientFrame::hello(Hello::new("turn-gui", client_version));
+    let hello = ClientFrame::hello(Hello::new("turn-gui", client_version, auth_token));
     let frame = encode_checked(&hello, turn_proto::MAX_LINE_BYTES)
         .map_err(|error| LinkError::Unsendable(error.to_string()))?;
     stream
@@ -130,6 +138,35 @@ pub async fn connect(
         },
         welcome,
     ))
+}
+
+fn read_auth_token(socket: &Path) -> std::io::Result<AuthToken> {
+    let path = turn_proto::ipc_auth_token_path(socket);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability is not a regular file",
+        ));
+    }
+    let mut secret = String::with_capacity(64);
+    Read::by_ref(&mut file)
+        .take(65)
+        .read_to_string(&mut secret)?;
+    if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability has an invalid format",
+        ));
+    }
+    Ok(AuthToken::new(secret))
 }
 
 /// Reads until the daemon has accepted or refused us.
@@ -304,6 +341,9 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
+        let token_path = turn_proto::ipc_auth_token_path(&path);
+        let _ = std::fs::remove_file(&token_path);
+        std::fs::write(token_path, "a".repeat(64)).unwrap();
         path
     }
 
@@ -545,6 +585,21 @@ mod tests {
 
         daemon.abort();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_auth_refusal_retries_only_after_the_caller_can_reread_the_rotated_token() {
+        let auth = LinkError::Refused(ProtoError::new(
+            ErrorCode::Unauthorized,
+            "the daemon capability rotated",
+        ));
+        assert!(auth.is_retryable());
+
+        let version = LinkError::Refused(ProtoError::new(
+            ErrorCode::UnsupportedVersion,
+            "the protocol is incompatible",
+        ));
+        assert!(!version.is_retryable());
     }
 
     #[tokio::test]

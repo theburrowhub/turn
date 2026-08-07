@@ -6,7 +6,35 @@ use crate::framing::{encode, LineDecoder};
 use crate::response::Response;
 
 fn hello_frame() -> ClientFrame {
-    ClientFrame::hello(Hello::new("turn-ui", "0.1.0"))
+    ClientFrame::hello(Hello::new("turn-ui", "0.1.0", AuthToken::new("test-token")))
+}
+
+#[test]
+fn auth_tokens_cross_the_wire_but_debug_output_is_redacted() {
+    let token = AuthToken::new("secret-capability");
+    let hello = Hello::new("turn-ui", "0.1.0", token.clone());
+    let json = serde_json::to_string(&hello).unwrap();
+    assert!(
+        json.contains("secret-capability"),
+        "the peer needs the secret"
+    );
+    assert!(!format!("{hello:?}").contains("secret-capability"));
+    assert_eq!(
+        serde_json::from_str::<Hello>(&json)
+            .unwrap()
+            .auth_token
+            .unwrap()
+            .expose_secret(),
+        token.expose_secret()
+    );
+}
+
+#[test]
+fn the_token_path_is_derived_from_the_exact_socket_path() {
+    assert_eq!(
+        ipc_auth_token_path(Path::new("/run/turn/alternate.sock")),
+        PathBuf::from("/run/turn/alternate.sock.token")
+    );
 }
 
 /// The limits a client has to respect are announced rather than assumed, including
