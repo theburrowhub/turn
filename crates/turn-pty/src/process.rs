@@ -272,6 +272,14 @@ impl PtyProcess {
         self.buffer.lock().ok().map(|b| b.snapshot())
     }
 
+    /// Current sanitised OSC 0/2 title without constructing a screen snapshot.
+    pub fn title(&self) -> Result<Option<String>, PtyError> {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.title())
+            .map_err(|_| PtyError::Unavailable)
+    }
+
     /// Shared access to the buffer, for the heuristic adapters.
     pub fn buffer(&self) -> Arc<Mutex<TerminalBuffer>> {
         Arc::clone(&self.buffer)
@@ -614,16 +622,25 @@ mod tests {
     /// fell behind instead of growing an unbounded queue.
     #[test]
     fn a_slow_subscriber_is_told_it_fell_behind_rather_than_buffering_forever() {
-        let process = spawn(
-            ProcessSpec::new("sh", "/")
-                .arg("-c")
-                .arg("i=0; while [ $i -lt 4000 ]; do echo \"line $i padding padding padding\"; i=$((i+1)); done"),
-        );
+        let process = spawn(ProcessSpec::new("cat", "/"));
         let mut lazy = process.subscribe();
 
-        // Never read until the flood is over.
-        wait_until("the flood to finish", || !process.is_running());
-        std::thread::sleep(Duration::from_millis(200));
+        process.write(b"authoritative buffer\n").unwrap();
+        wait_until("output to reach the buffer", || {
+            process
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.text().contains("authoritative buffer"))
+        });
+
+        // A PTY is allowed to coalesce thousands of printed lines into only a few
+        // large reads. Overflow the exact production sender instead, so the test
+        // produces more channel messages than its capacity on every kernel.
+        for index in 0..=OUTPUT_CHANNEL_CAPACITY {
+            process
+                .output_tx
+                .send(Arc::new(format!("synthetic chunk {index}").into_bytes()))
+                .expect("the deliberately idle subscriber is still attached");
+        }
 
         let mut lagged = false;
         loop {
@@ -644,8 +661,9 @@ mod tests {
 
         // And the authoritative buffer is still correct and bounded.
         let snapshot = process.snapshot().unwrap();
-        assert!(snapshot.text().contains("line 3999"));
+        assert!(snapshot.text().contains("authoritative buffer"));
         assert_eq!(snapshot.lines.len(), 24);
+        let _ = process.kill();
     }
 
     #[test]

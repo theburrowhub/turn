@@ -1183,6 +1183,10 @@ fn default_shell_pane() -> Pane {
 pub(super) fn pane_from_spec(spec: &NewPane) -> Pane {
     let mut pane = Pane::new(spec.kind);
     pane.title = spec.title.clone();
+    // A title supplied in an API request is an explicit user choice. Built-in and
+    // saved templates construct Panes directly and retain their lower-priority
+    // fallback titles.
+    pane.title_is_user_set = spec.title.is_some();
     pane.command = spec.command.clone();
     pane.args = spec.args.clone();
     pane.cwd = spec.cwd.clone();
@@ -1827,6 +1831,10 @@ mod tests {
             restore: turn_core::model::RestoreBehaviour::Relaunch,
         };
         let pane = pane_from_spec(&spec);
+        assert!(
+            pane.title_is_user_set,
+            "an explicitly requested title must outrank a later OSC title"
+        );
         assert_eq!(pane.command.as_deref(), Some("cargo run"));
         assert_eq!(pane.args, vec!["--release".to_string()]);
         assert_eq!(pane.cwd.as_deref(), Some("api"));

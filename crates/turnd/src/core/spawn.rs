@@ -310,6 +310,14 @@ impl Core {
             )
         };
         node.title = title;
+        if let Some(agent) = node.agent.as_mut() {
+            // `ProcessNode::agent` starts from the command as its fallback. The
+            // Pane's configured label is the better fallback until the PTY emits
+            // a process title.
+            if matches!(agent.name.source, turn_core::model::NameSource::Fallback) {
+                agent.name.display_name = node.title.clone();
+            }
+        }
         node.args = user_args.clone();
         if let Some(agent) = node.agent.as_mut() {
             agent.agent = AgentRef {
@@ -405,10 +413,15 @@ impl Core {
         // adapter's name: anything that ends up inferring from output needs the
         // observer, and nothing above that tier should have one.
         let heuristic = (plan.level == IntegrationLevel::Heuristic).then(OutputHeuristic::new);
+        let fallback_title = node.title.clone();
+        let fallback_agent_name = node.agent.as_ref().map(|agent| agent.name.clone());
         self.processes.insert(
             node_id.clone(),
             Process {
                 pty,
+                process_title: None,
+                fallback_title,
+                fallback_agent_name,
                 adapter_id: selection.adapter.id().to_string(),
                 level: plan.level,
                 hook_token: token,
@@ -516,10 +529,15 @@ impl Core {
         let pid = pty.pid();
 
         self.watch_exit(&node_id, &pty);
+        let fallback_title = node.title.clone();
+        let fallback_agent_name = node.agent.as_ref().map(|agent| agent.name.clone());
         self.processes.insert(
             node_id.clone(),
             Process {
                 pty,
+                process_title: None,
+                fallback_title,
+                fallback_agent_name,
                 adapter_id: "generic-terminal".to_string(),
                 level: IntegrationLevel::GenericTerminal,
                 hook_token: None,

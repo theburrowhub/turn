@@ -78,6 +78,13 @@ pub struct Pane {
     pub id: PaneId,
     pub kind: PaneKind,
     pub title: Option<String>,
+    /// Whether `title` was explicitly chosen by the user.
+    ///
+    /// Template and command-derived titles are fallbacks: a process may replace
+    /// them at runtime with OSC 0/2. A user title is identity the process is not
+    /// allowed to rewrite, so renderers keep it ahead of the runtime title.
+    #[serde(default)]
+    pub title_is_user_set: bool,
     /// The command to run when this pane is materialised.
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -111,6 +118,7 @@ impl Pane {
             id: PaneId::new(),
             kind,
             title: None,
+            title_is_user_set: false,
             command: None,
             args: Vec::new(),
             cwd: None,
@@ -127,6 +135,13 @@ impl Pane {
 
     pub fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = Some(title.into());
+        self
+    }
+
+    /// Gives the pane a title whose priority is above process-supplied OSC titles.
+    pub fn with_user_title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self.title_is_user_set = true;
         self
     }
 

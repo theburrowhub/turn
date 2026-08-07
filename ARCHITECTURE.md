@@ -1347,6 +1347,14 @@ Two details matter more than they look:
 - **The same sanitisation applies to screen rows** (`sanitise_row`), not only titles, because anything the
   UI renders as text can carry the same trick.
 
+The daemon projects a changed OSC 0/2 title onto the exact PTY-backed `ProcessNode`, persists it, and
+pushes the refreshed tree/hierarchy. It observes titles even when no window is attached, so reopening the
+UI starts from the title the process last set. The node title is deliberately a low-priority
+`NameSource::ProcessTitle`: declared, integration, structured-task and user-renamed Agent names remain
+authoritative. Pane chrome uses the bound node's title unless the Pane carries `title_is_user_set`; no
+title update mutates Layout, focus or Attention. The real-PTY acceptance path is
+`core::titles::tests::real_ptys_keep_dynamic_titles_isolated_and_preserve_stronger_names`.
+
 Invalid UTF-8 in a title is replaced rather than fatal, and a single enormous line is bounded by the
 terminal geometry.
 

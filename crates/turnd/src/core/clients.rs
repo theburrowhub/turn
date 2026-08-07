@@ -572,7 +572,20 @@ impl Core {
     /// cells attachment never has a grid built for it, and a pane with no byte
     /// attachment never pays for base64.
     pub(crate) fn deliver_output(&mut self, node: &NodeId, data: Vec<u8>, dropped: u64) {
-        self.deliver_screen(node);
+        let could_change_title = output_may_change_title(&data);
+        match self.deliver_screen(node) {
+            // A cells renderer already locked the authoritative buffer to build its
+            // grid, so reuse the title read under that same lock.
+            Some(observed) => {
+                self.apply_observed_process_title(node, observed, turn_core::now_ms());
+            }
+            // Bytes-only panes need a separate read for low-latency title updates,
+            // but ordinary output can wait for the periodic all-process observer.
+            None if could_change_title => {
+                self.observe_process_title(node, turn_core::now_ms());
+            }
+            None => {}
+        }
         self.deliver_bytes(node, data, dropped);
     }
 
@@ -648,6 +661,21 @@ impl Core {
     }
 }
 
+/// Whether a coalesced output batch could have completed an OSC title change.
+///
+/// BEL, ESC-ST and the C1 OSC/ST forms are the relevant boundaries. Checking for
+/// those few bytes avoids taking the terminal buffer lock for every plain-text batch
+/// in a bytes-only pane. A boundary split across reads may wait for the daemon tick,
+/// which is the deliberate fallback rather than maintaining a second escape parser.
+fn output_may_change_title(data: &[u8]) -> bool {
+    data.contains(&0x07)
+        || data.contains(&0x9c)
+        || data.contains(&0x9d)
+        || data
+            .windows(2)
+            .any(|pair| pair == b"\x1b]" || pair == b"\x1b\\")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::testing::Harness;
@@ -655,6 +683,15 @@ mod tests {
     use turn_proto::{PtySize, Request, ServerEvent, ServerMessage};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[test]
+    fn only_title_control_batches_need_an_immediate_extra_buffer_read() {
+        assert!(!super::output_may_change_title(b"a large plain build log"));
+        assert!(!super::output_may_change_title(b"\x1b[31mcoloured text"));
+        assert!(super::output_may_change_title(b"\x1b]2;new title\x07"));
+        assert!(super::output_may_change_title(b"\x1b]0;new title\x1b\\"));
+        assert!(super::output_may_change_title(b"\x9d2;new title\x9c"));
+    }
 
     /// Drains whatever a client has already been sent.
     fn drain(

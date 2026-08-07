@@ -605,6 +605,12 @@ document. Unchecked items say what evidence or implementation is still missing, 
   `buffer::tests::a_title_cannot_reverse_its_own_rendering_with_a_direction_override`,
   `a_title_cannot_smuggle_invisible_tag_characters_into_a_label`. The same rule holds for screen content
   the UI renders: `screen_rows_never_carry_invisible_or_direction_changing_characters`.
+- [x] **OSC 0/2 titles are scoped to the PTY that emitted them and survive UI detach.** The daemon updates
+  only that Pane's bound process projection, keeps declared/integration/user Agent names above the process
+  title, and never changes Layout, focus or Attention. A title explicitly chosen by the user remains above
+  the OSC title. Two real PTYs, detached observation, durable projection and hostile title input are covered
+  by `core::titles::tests::real_ptys_keep_dynamic_titles_isolated_and_preserve_stronger_names`; Pane chrome
+  priority is covered by `desk::tests::pane_headers_prefer_user_titles_then_their_own_bound_process_title`.
 - [x] **Every hierarchy label is safe at the daemon boundary, even when an adapter or OS source is not.**
   Workspace, Session and Template names reject C0/C1/ANSI/bidi/zero-width input rather than silently
   rewriting identity. Discovered Agent and process metadata is sanitised and bounded before reducer, push,
