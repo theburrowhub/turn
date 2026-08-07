@@ -26,7 +26,7 @@ shell-words = { workspace = true }
 # at another application, which is the entire product. Reaching the OS notification
 # centre needs a platform binding; everything that *decides* whether to notify lives
 # in `announce.rs` and is tested without it.
-notify-rust = { version = "4.11", default-features = false }
+notify-rust = { version = "4.11", default-features = false, features = ["z"] }
 # Native project-folder selection. The dialog is created on the UI thread, then its
 # async result is awaited by a short-lived worker so the egui event loop stays idle.
 rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
