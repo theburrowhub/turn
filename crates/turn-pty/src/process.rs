@@ -400,7 +400,19 @@ pub struct PtyProcess {
 impl PtyProcess {
     /// Opens a pty, launches the command on it and starts pumping output.
     pub fn spawn(node_id: NodeId, spec: ProcessSpec, now_ms: i64) -> Result<Self, PtyError> {
-        Self::spawn_internal(node_id, spec, now_ms, None)
+        Self::spawn_with_preserved_fds(node_id, spec, now_ms, &[])
+    }
+
+    /// Opens a pty while retaining only the explicitly selected Unix descriptors in
+    /// the child. Other daemon descriptors keep portable-pty's close-before-exec
+    /// behaviour.
+    pub fn spawn_with_preserved_fds(
+        node_id: NodeId,
+        spec: ProcessSpec,
+        now_ms: i64,
+        preserved_fds: &[i32],
+    ) -> Result<Self, PtyError> {
+        Self::spawn_internal(node_id, spec, now_ms, None, preserved_fds)
     }
 
     /// Spawns a process whose authoritative output is also written to a durable,
@@ -411,11 +423,22 @@ impl PtyProcess {
         now_ms: i64,
         journal_dir: impl AsRef<Path>,
     ) -> Result<Self, PtyError> {
+        Self::spawn_persisted_with_preserved_fds(node_id, spec, now_ms, journal_dir, &[])
+    }
+
+    pub fn spawn_persisted_with_preserved_fds(
+        node_id: NodeId,
+        spec: ProcessSpec,
+        now_ms: i64,
+        journal_dir: impl AsRef<Path>,
+        preserved_fds: &[i32],
+    ) -> Result<Self, PtyError> {
         Self::spawn_internal(
             node_id,
             spec,
             now_ms,
             Some((journal_dir.as_ref().to_path_buf(), JournalConfig::default())),
+            preserved_fds,
         )
     }
 
@@ -424,10 +447,17 @@ impl PtyProcess {
         spec: ProcessSpec,
         now_ms: i64,
         journal_spec: Option<(PathBuf, JournalConfig)>,
+        preserved_fds: &[i32],
     ) -> Result<Self, PtyError> {
         let pair = open_pty_with_retry(spec.size)?;
 
-        let builder = build_command(&spec, &node_id);
+        let mut builder = build_command(&spec, &node_id);
+        #[cfg(unix)]
+        for fd in preserved_fds {
+            builder.preserve_fd(*fd);
+        }
+        #[cfg(not(unix))]
+        let _ = preserved_fds;
         let mut child = pair
             .slave
             .spawn_command(builder)

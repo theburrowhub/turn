@@ -58,7 +58,8 @@ impl Core {
             SessionMode::ReadOnly if !session.read_only_enforced => Err(ProtoError::refused(
                 "This read-only Session has no technical write guard, so Turn will not launch a process in it",
             )),
-            SessionMode::MainCheckout => self
+            SessionMode::MainCheckout => {
+                let lease = self
                 .store
                 .hierarchy()
                 .verify_active_write_lease(
@@ -66,7 +67,6 @@ impl Core {
                     session_id,
                     &session.checkout_id,
                 )
-                .map(|_| ())
                 .map_err(|error| {
                     // Relaunch/AddPane is not a lease acquisition flow. Missing,
                     // recovery, stale, drifted, or unprovable authority all fail
@@ -75,7 +75,9 @@ impl Core {
                         "This Session does not have a verified active write lease for the primary checkout",
                     )
                     .with_detail(error.to_string())
-                }),
+                })?;
+                self.require_checkout_write_lock(session, &lease)
+            }
             SessionMode::ReadOnly | SessionMode::IsolatedWorktree => Ok(()),
         }
     }
@@ -175,7 +177,7 @@ impl Core {
         Ok(())
     }
 
-    fn checkout_for_session(
+    pub(crate) fn checkout_for_session(
         &self,
         session: &Session,
     ) -> std::result::Result<WorkspaceCheckout, ProtoError> {
@@ -441,10 +443,27 @@ impl Core {
         let journal_dir = self
             .terminal_history_enabled(session_id)
             .then(|| paths::node_terminal_history(&self.data_dir, session_id, &node_id));
+        let checkout_lock_inheritance = self.checkout_lock_inheritance(session_id)?;
+        #[cfg(unix)]
+        let preserved_fds: Vec<_> = checkout_lock_inheritance
+            .iter()
+            .map(|lock| lock.raw_fd())
+            .collect();
+        #[cfg(not(unix))]
+        let preserved_fds = Vec::new();
         let pty_result = match &journal_dir {
-            Some(dir) => PtyProcess::spawn_persisted(node_id.clone(), spec, now_ms, dir),
-            None => PtyProcess::spawn(node_id.clone(), spec, now_ms),
+            Some(dir) => PtyProcess::spawn_persisted_with_preserved_fds(
+                node_id.clone(),
+                spec,
+                now_ms,
+                dir,
+                &preserved_fds,
+            ),
+            None => {
+                PtyProcess::spawn_with_preserved_fds(node_id.clone(), spec, now_ms, &preserved_fds)
+            }
         };
+        drop(checkout_lock_inheritance);
         let pty = match pty_result {
             Ok(pty) => pty,
             Err(error) => {
@@ -532,6 +551,7 @@ impl Core {
         )
         .with_node(node_id.clone());
         self.ingest(started, now_ms);
+        self.refresh_checkout_lock_owner(session_id);
 
         Ok(Some(node_id))
     }
@@ -588,10 +608,27 @@ impl Core {
         let journal_dir = self
             .terminal_history_enabled(session_id)
             .then(|| paths::node_terminal_history(&self.data_dir, session_id, &node_id));
+        let checkout_lock_inheritance = self.checkout_lock_inheritance(session_id)?;
+        #[cfg(unix)]
+        let preserved_fds: Vec<_> = checkout_lock_inheritance
+            .iter()
+            .map(|lock| lock.raw_fd())
+            .collect();
+        #[cfg(not(unix))]
+        let preserved_fds = Vec::new();
         let pty_result = match &journal_dir {
-            Some(dir) => PtyProcess::spawn_persisted(node_id.clone(), spec, now_ms, dir),
-            None => PtyProcess::spawn(node_id.clone(), spec, now_ms),
+            Some(dir) => PtyProcess::spawn_persisted_with_preserved_fds(
+                node_id.clone(),
+                spec,
+                now_ms,
+                dir,
+                &preserved_fds,
+            ),
+            None => {
+                PtyProcess::spawn_with_preserved_fds(node_id.clone(), spec, now_ms, &preserved_fds)
+            }
         };
+        drop(checkout_lock_inheritance);
         let pty = pty_result.map_err(|error| {
             if journal_dir.is_some() {
                 paths::remove_node_terminal_history(&self.data_dir, session_id, &node_id);
@@ -638,6 +675,7 @@ impl Core {
         )
         .with_node(node_id.clone());
         self.ingest(started, now_ms);
+        self.refresh_checkout_lock_owner(session_id);
         Ok(node_id)
     }
 
@@ -976,10 +1014,20 @@ mod tests {
             .create_session(&session, 1)
             .unwrap()
             .unwrap();
+        let checkout_lock = harness.core.checkout_lock_claim(&session, &lease).unwrap();
         harness
             .core
             .sessions
             .insert(session.id.clone(), session.clone());
+        let missing_host_lock = harness
+            .core
+            .require_session_launch_allowed(&session.id)
+            .expect_err("SQLite authority alone must never launch a writer");
+        assert_eq!(missing_host_lock.code, ErrorCode::Refused);
+        assert!(missing_host_lock.message.contains("host-wide"));
+        harness
+            .core
+            .install_checkout_write_lock(&session.id, &lease, checkout_lock);
         harness
             .core
             .require_session_launch_allowed(&session.id)

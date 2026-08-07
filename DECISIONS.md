@@ -59,6 +59,8 @@ Status values:
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 | [044](#adr-044) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
 | [045](#adr-045) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
+| [046](#adr-046) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
+| [047](#adr-047) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
 
 ---
 
@@ -2795,3 +2797,73 @@ atomically changes the Session to `main_checkout`; a failed write never changes 
   set enforcement true.
 - **Downside:** this is path-scoped write protection, not full process isolation. Credentials, network,
   services and unprotected filesystem paths remain accessible, and the UI/docs must say so.
+
+---
+
+<a id="adr-047"></a>
+## ADR-047 — Checkout write authority is a host-global inode lock inherited by every writer
+
+**Status:** Accepted, implemented on Unix. `turnd::checkout_lock`, joined SQLite/lock acquisition and
+recovery, explicit PTY descriptor preservation, and cross-daemon integration coverage.
+
+### Context
+
+ADR-040's canonical-path fence was global only inside one SQLite database. Two otherwise correct Turn
+daemons configured with different data directories could each create a lease for the same checkout. A lock
+held only by the daemon would close one split-brain path but reopen it after a daemon crash even when a shell
+or descendant survived and could still write the checkout. Git worktrees also share a common Git directory,
+so repository identity is too broad: different worktree directories must remain independent write domains.
+
+### Alternatives considered
+
+**Put every installation in one registry database.** Rejected. It introduces another durable authority and
+migration lifecycle merely to join stores, and still needs a crash-safe kernel boundary.
+
+**Key a lock by canonical path text or Git common directory.** Rejected. Path aliases and renames can split
+text identity, while a common Git directory falsely merges distinct worktrees.
+
+**Hold an advisory lock only in the daemon.** Rejected. A surviving descendant would lose its exclusion at
+exactly the moment Turn lost the PTY handle and had least evidence that writing had stopped.
+
+**Use a uid-scoped filesystem-identity lock and inherit its descriptor into writers.** Chosen.
+
+### Decision
+
+Turn canonicalises the checkout directory and identifies it by Unix device/inode. Under the real,
+uid-owned 0700 `/tmp/turn-checkout-locks-<uid>` directory it opens a retained 0600 lock inode with
+`O_NOFOLLOW`, verifies type, owner and named/open inode identity, takes non-blocking exclusive `flock`, then
+re-resolves the checkout to reject replacement during acquisition. Lock files are never unlinked. Owner
+metadata is an atomically replaced sidecar containing daemon/data-dir identity, the lease and its typed owner.
+
+The host lock is acquired before SQLite. The daemon preallocates one `LeaseId`, publishes it in the host
+owner record and supplies it to the atomic Session/lease transaction. A local SQLite owner still returns the
+existing focus/read-only/worktree/cancel choices. An owner from another daemon returns the same typed conflict
+without `focus_owner`, because the current socket cannot focus it. Heartbeat, init, Pane launch, split and
+relaunch require both the active SQLite generation and the matching host lock.
+
+For each main-checkout spawn the daemon duplicates only that lock descriptor and clears `FD_CLOEXEC` on the
+duplicate. portable-pty normally closes every descriptor above stderr in `pre_exec`; Turn carries a small
+vendored extension that preserves an explicit descriptor allowlist while retaining that cleanup for all
+others. The launched process and its descendants therefore share the same locked open-file description.
+Neither the lock type nor Drop calls `LOCK_UN`: explicit release first demotes SQLite and then closes the
+daemon copy, while daemon loss leaves a surviving writer's copy authoritative until the kernel closes the
+last descriptor.
+
+On restart, SQLite remains `recovery_required`. Reclaim first reconciles the old process evidence and must
+then reacquire the host lock with the existing lease id; time alone never permits takeover. Symlink aliases
+collide, whereas distinct checkout/worktree directory inodes may write concurrently.
+
+### Consequences
+
+- Cooperating daemons for the same uid cannot both own one checkout even with separate data directories.
+- Contention returns the remote Session/lease owner and locally actionable alternatives without partial
+  Session, init-command or process side effects.
+- A daemon crash cannot release authority while a descendant that inherited it is still alive; the final
+  process exit makes recovery possible without a stale-file deletion protocol.
+- Stable lock inodes and atomic owner sidecars avoid unlink races and partial heartbeat metadata.
+- **Downside:** portable-pty is vendored for a narrow descriptor-preservation API until upstream provides it.
+- **Downside:** `flock` is an advisory boundary between cooperating same-user processes. Code running as the
+  account owner can close its inherited descriptor or tamper with owner-owned lock state; this is not a
+  sandbox against malicious same-user code.
+- **Downside:** unsupported platforms fail closed for main-checkout authority rather than silently falling
+  back to SQLite-only exclusion.

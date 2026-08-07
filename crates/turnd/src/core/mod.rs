@@ -19,6 +19,7 @@
 //! and a single writer makes every rule in `turn-core` mean what it says.
 
 pub mod attention;
+mod checkout_authority;
 pub mod clients;
 pub mod command;
 pub mod events;
@@ -34,6 +35,7 @@ pub mod views;
 
 pub use command::{ClientId, Command};
 
+use crate::checkout_lock::CheckoutWriteLock;
 use crate::error::Result;
 use crate::instance::DataDirLock;
 use clients::Client;
@@ -46,7 +48,7 @@ use tokio::task::JoinHandle;
 use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic};
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
-use turn_core::ids::{HandoffId, NodeId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{HandoffId, LeaseId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
@@ -258,6 +260,10 @@ pub struct Core {
     /// workload. The core tick uses this timestamp to coalesce writes.
     pub(crate) last_lease_heartbeat_ms: i64,
 
+    /// Kernel ownership independent of the configured SQLite data directory. Each
+    /// active durable lease must have exactly one matching host-wide checkout lock.
+    pub(crate) checkout_write_locks: HashMap<LeaseId, CheckoutWriteLock>,
+
     /// Nodes whose next exit was asked for, against the moment the request stops
     /// applying — see [`EXPECTED_EXIT_GRACE_MS`] for why it has to stop.
     ///
@@ -316,6 +322,7 @@ impl Core {
             finished_context_handoffs: HashMap::new(),
             hierarchy_revision: 1,
             last_lease_heartbeat_ms: 0,
+            checkout_write_locks: HashMap::new(),
             expected_exits: HashMap::new(),
             restore_reports: Vec::new(),
             supervisor: ProcessSupervisor::new(),

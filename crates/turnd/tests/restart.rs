@@ -6,10 +6,13 @@ use common::*;
 use turn_core::attention::{AttentionEntry, EntryState};
 use turn_core::event::EventKind;
 use turn_core::ids::{AttentionId, CheckoutId};
-use turn_core::model::{LeaseState, PaneKind, RestoreState, Template};
+use turn_core::model::{LeaseState, PaneKind, RestoreState, SessionMode, Template};
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_core::Confidence;
-use turn_proto::{ErrorCode, NewPane, Request, Response, ServerEvent};
+use turn_proto::{
+    ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent,
+    SessionConflictAlternative,
+};
 
 /// Verifies the portable shipped preset, then persists Coding as a user-owned fixture.
 async fn save_custom_coding_template(ui: &mut Client) -> turn_proto::TemplateSummary {
@@ -1028,6 +1031,256 @@ async fn data_directory_and_socket_ownership_are_independent_and_recoverable() {
     let mut ui = daemon.connect().await;
     ui.ask(Request::ListTemplates).await;
     daemon.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkout_write_authority_is_global_across_data_dirs_aliases_and_daemon_loss() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempfile::tempdir().expect("a repository fixture");
+    let repository = fixture.path().join("repository");
+    let worktree = fixture.path().join("independent-worktree");
+    let alias = fixture.path().join("repository-alias");
+    std::fs::create_dir(&repository).unwrap();
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(args)
+            .output()
+            .expect("Git must run");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "turn@example.invalid"]);
+    run_git(&["config", "user.name", "Turn Test"]);
+    std::fs::write(repository.join("README.md"), "turn\n").unwrap();
+    run_git(&["add", "README.md"]);
+    run_git(&["commit", "-m", "initial"]);
+    run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "global-lock-independent",
+        worktree.to_str().unwrap(),
+    ]);
+    symlink(&repository, &alias).unwrap();
+
+    let first = TestDaemon::start_plain().await;
+    let second = TestDaemon::start_plain().await;
+    assert_ne!(first.data_dir(), second.data_dir());
+    let mut first_ui = first.connect().await;
+    let mut second_ui = second.connect().await;
+
+    let first_workspace = workspace_of(
+        first_ui
+            .ask(Request::CreateWorkspace {
+                name: "first checkout owner".into(),
+                root: repository.to_string_lossy().into_owned(),
+            })
+            .await,
+    );
+    let survivor_pid_file = fixture.path().join("surviving-writer.pid");
+    let mut sleeper = NewPane::new(PaneKind::Terminal).with_command("/bin/sh");
+    sleeper.args = vec![
+        "-c".into(),
+        "trap '' HUP; sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; wait".into(),
+        "turn-checkout-lock-test".into(),
+        survivor_pid_file.to_string_lossy().into_owned(),
+    ];
+    let first_session = session_of(
+        first_ui
+            .ask(Request::CreateSession {
+                workspace_id: first_workspace.id.clone(),
+                name: "global owner".into(),
+                cwd: None,
+                panes: Some(vec![sleeper]),
+                note: None,
+                tags: Vec::new(),
+            })
+            .await,
+    );
+    let mut writer_pid = None;
+    for _ in 0..100 {
+        if let Ok(encoded) = std::fs::read_to_string(&survivor_pid_file) {
+            writer_pid = encoded.trim().parse().ok();
+            if writer_pid.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let writer_pid = writer_pid.expect("the detached writer must publish its pid");
+    assert!(pid_is_alive(writer_pid));
+
+    let aliased_workspace = workspace_of(
+        second_ui
+            .ask(Request::CreateWorkspace {
+                name: "same checkout through alias".into(),
+                root: alias.to_string_lossy().into_owned(),
+            })
+            .await,
+    );
+    let conflict = second_ui
+        .try_ask(Request::CreateSession {
+            workspace_id: aliased_workspace.id.clone(),
+            name: "must not become a second writer".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await
+        .expect_err("another data directory must still see the kernel owner");
+    assert_eq!(conflict.code, ErrorCode::Conflict);
+    let Some(ProtoErrorContext::WorkspaceWriteLeaseConflict {
+        lease,
+        owner,
+        alternatives,
+        ..
+    }) = conflict.context.as_deref()
+    else {
+        panic!("the global conflict lost its typed owner: {conflict:?}");
+    };
+    assert_eq!(owner.session_id, first_session.id);
+    assert_eq!(owner.session_name, "global owner");
+    assert_eq!(lease.session_id, first_session.id);
+    assert_eq!(
+        alternatives,
+        &[
+            SessionConflictAlternative::CreateReadOnly,
+            SessionConflictAlternative::CreateIsolatedWorktree,
+            SessionConflictAlternative::Cancel,
+        ]
+    );
+
+    // A real Git worktree has a different directory inode and therefore an
+    // independent write domain even while the main checkout remains locked.
+    let worktree_workspace = workspace_of(
+        second_ui
+            .ask(Request::CreateWorkspace {
+                name: "independent worktree".into(),
+                root: worktree.to_string_lossy().into_owned(),
+            })
+            .await,
+    );
+    let concurrent = session_of(
+        second_ui
+            .ask(Request::CreateSession {
+                workspace_id: worktree_workspace.id,
+                name: "parallel worktree writer".into(),
+                cwd: None,
+                panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                note: None,
+                tags: Vec::new(),
+            })
+            .await,
+    );
+    assert_eq!(concurrent.mode, SessionMode::MainCheckout);
+
+    // Losing the daemon descriptor is not enough while a process it launched can
+    // still write: that process inherited the same lock open-file description.
+    drop(first_ui);
+    first.shutdown().await;
+    assert!(
+        pid_is_alive(writer_pid),
+        "the HUP-ignoring writer must survive daemon shutdown"
+    );
+    let after_daemon_loss = second_ui
+        .try_ask(Request::CreateSession {
+            workspace_id: aliased_workspace.id.clone(),
+            name: "still fenced by orphan".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await
+        .expect_err("a surviving writer must retain the global lock");
+    assert!(matches!(
+        after_daemon_loss.context.as_deref(),
+        Some(ProtoErrorContext::WorkspaceWriteLeaseConflict { .. })
+    ));
+
+    assert_eq!(unsafe { libc::kill(writer_pid as i32, libc::SIGKILL) }, 0);
+    let mut recovered = None;
+    for _ in 0..100 {
+        match second_ui
+            .try_ask(Request::CreateSession {
+                workspace_id: aliased_workspace.id.clone(),
+                name: "writer after orphan exit".into(),
+                cwd: None,
+                panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                note: None,
+                tags: Vec::new(),
+            })
+            .await
+        {
+            Ok(response) => {
+                recovered = Some(session_of(response));
+                break;
+            }
+            Err(error) if error.code == ErrorCode::Conflict => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("unexpected recovery error: {error}"),
+        }
+    }
+    let recovered = recovered.expect("the lock must clear after the orphan exits");
+    assert_eq!(recovered.mode, SessionMode::MainCheckout);
+
+    // Explicit release drops this checkout's host lock without disturbing the
+    // concurrent worktree lock, so a fresh data directory can become the next owner.
+    let recovered_lease = match second_ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: aliased_workspace.id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the recovered lease, got {other:?}"),
+    };
+    second_ui
+        .ask(Request::ReleaseWorkspaceWriteLease {
+            workspace_id: aliased_workspace.id,
+            lease_id: recovered_lease.id,
+            expected_generation: recovered_lease.generation,
+        })
+        .await;
+
+    let third = TestDaemon::start_plain().await;
+    let mut third_ui = third.connect().await;
+    let third_workspace = workspace_of(
+        third_ui
+            .ask(Request::CreateWorkspace {
+                name: "owner after explicit release".into(),
+                root: repository.to_string_lossy().into_owned(),
+            })
+            .await,
+    );
+    let third_session = session_of(
+        third_ui
+            .ask(Request::CreateSession {
+                workspace_id: third_workspace.id,
+                name: "new global owner".into(),
+                cwd: None,
+                panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                note: None,
+                tags: Vec::new(),
+            })
+            .await,
+    );
+    assert_eq!(third_session.mode, SessionMode::MainCheckout);
+
+    second.shutdown().await;
+    third.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

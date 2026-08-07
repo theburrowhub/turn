@@ -39,7 +39,7 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 | Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |
 | Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, bounded durable scrollback, shells, and TUIs |
 | Stable layouts | Nested splits, reusable presets, drag-to-reorder, resize, balance, zoom, and per-session persistence |
-| Checkout safety | One write lease for the main checkout; extra sessions are read-only or isolated in worktrees |
+| Checkout safety | One host-global write owner per checkout across data dirs; extra sessions are read-only or isolated in worktrees |
 | Honest recovery | Restore layout and metadata without silently rerunning saved commands or destructive work |
 | Integration without forks | Structured hooks where available, wrappers and heuristics where useful, generic terminal otherwise |
 
@@ -158,7 +158,7 @@ relationships, permissions, or write authority.
 - A heuristic can badge a Session, but it can never move focus.
 - Agent output is never interpreted as a command for Turn to execute.
 - Closing a pane never terminates the process behind it.
-- A main checkout has at most one active writing Session.
+- A checkout has at most one active writing Session across every cooperating Turn daemon for the same host user, even when daemons use different data directories or path aliases.
 - Permission prompts show the exact Session, process, command, and working directory available to Turn.
 - Restore never relaunches a process until the user explicitly asks.
 

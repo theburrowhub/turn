@@ -276,6 +276,11 @@ atomic and precedes Session insertion, init commands and process/Pane materialis
 evidence for reconciliation, never authority to steal. Closing a UI, archiving while processes live or
 `KeepProcesses` does not release it.
 
+SQLite is only the durable half of that authority. On Unix, every active lease also owns a uid-scoped host
+lock keyed by the checkout directory's device/inode identity. Symlink aliases and renames converge; distinct
+Git worktree directories do not. The daemon takes that lock before the SQLite transaction and preallocates
+one `LeaseId` for both records. Heartbeat and process launch require both halves.
+
 **`ProcessNode` / `SessionTree`** — the process hierarchy. Stored **flat with parent pointers**, not as
 nested structs: processes arrive out of order (a child's hook can land before the parent's spawn
 notification), and re-parenting a flat map is trivial where re-parenting a tree is not.
@@ -879,9 +884,10 @@ through to a different unique child. Node-less Attention is durably scoped by au
 optional external worker id, so a prompt submission resolves only that exact provisional flow and cannot
 clear a sibling or another parent in the same Session.
 
-Creating a `main_checkout` Session is one daemon transaction boundary: canonicalise and validate the
-checkout plus the effective Session/Pane working directories, persist the Session/assignment and acquire its
-exclusive lease atomically, then run init commands and materialise processes/Panes. Working-directory
+Creating a `main_checkout` Session is one authority boundary: canonicalise and validate the checkout plus
+the effective Session/Pane working directories, acquire its host-global checkout lock, then atomically
+persist the Session/assignment and matching SQLite lease before running init commands or materialising
+processes/Panes. Working-directory
 validation is repeated immediately before every PTY launch because symlinks and stored Layouts can change
 after creation. The canonical cwd must be contained by the Session's registered primary or worktree checkout;
 this constrains where a process starts, not which files same-user code can later access. A conflict rolls the
@@ -906,10 +912,12 @@ Agents keep running. Reconnecting re-attaches — for each visible Pane, the UI 
 runtime node, receives the daemon-owned screen/replay and subscribes to the live stream. The Pane is a view;
 the runtime node, not that view, owns the PTY buffer.
 
-**It does not buy:** survival of the daemon exiting. The pty master lives in the daemon's file table,
-and `PtyProcess::drop` deliberately terminates the process it owns — `terminate()` then `kill()` —
-because closing a Session must not leave strays holding ptys, which are a finite kernel resource. When
-the daemon goes, the ptys close and the children get SIGHUP.
+**It does not buy:** general survival or reattachment after the daemon exits. The pty master lives in the
+daemon's file table, and `PtyProcess::drop` deliberately terminates the direct process it owns —
+`terminate()` then `kill()` — because closing a Session must not leave strays holding ptys, which are a
+finite kernel resource. Descendants can nevertheless ignore terminal loss or outlive that direct process. A
+main-checkout descendant inherits the checkout lock descriptor, so it remains a safety owner even though
+Turn can no longer reattach to its PTY.
 
 This is stated plainly rather than papered over, because the honest boundary is what `Lifecycle` is
 shaped around. `Orphaned` (stored runtime may still exist, handle lost) and `Lost` (the recorded runtime
@@ -933,6 +941,15 @@ queue is loaded without replay: id, age, confidence, priority, snooze and acknow
 its exact node or unresolved parent/external-id correlation scope survives as well. Interaction demands
 whose exact node/parent no longer runs are removed; postmortem evidence explicitly marked
 `survives_owner_exit` (for example failure/completion facts) remains.
+
+Separate data directories share a second kernel boundary for checkout writes. The uid-owned
+`/tmp/turn-checkout-locks-<uid>` directory contains retained stable lock inodes keyed by checkout device and
+inode plus atomically replaced owner metadata. A contender takes `LOCK_EX|LOCK_NB`; failure returns the
+other daemon's typed lease owner and only locally actionable read-only/worktree/cancel alternatives. A
+successful main-checkout spawn preserves only a duplicate of that descriptor through portable-pty's
+pre-exec close pass. The daemon and every descendant therefore share one open-file description; no code
+calls `LOCK_UN`, and the kernel releases authority only after the final daemon/process copy closes. Explicit
+release first demotes SQLite, then drops the descriptor, so its only gap is conservative contention.
 
 #### Event flow
 
@@ -1180,7 +1197,8 @@ The schema additions are Session mode/checkout/enforcement fields and
 `workspace_checkouts`, `checkout_write_fences`, `workspace_write_leases`, `activity_previews`,
 `pane_node_bindings` and `tree_ui_state`. `checkout_write_fences` is keyed by canonical path and survives
 Workspace/lease recreation, so generation is monotonic for that filesystem identity inside one canonical
-data directory. Separate data directories do not yet share a checkout-scoped OS lock.
+data directory. The host lock joins those per-store fences across deliberately separate data directories;
+the preallocated lease id keeps owner diagnostics stable across both boundaries.
 Partial uniqueness treats every non-released lease state — including stale/recovery-required — as blocking.
 
 **Codec.** Two column shapes, chosen per column. `tag` for payload-free enums, which land as a bare
@@ -1456,10 +1474,11 @@ succeeded — but it is a trade, not a free win.
 
 ### 7.10 Checkouts, leases and previews — **implemented for the first vertical and guarded read-only on macOS**
 
-Write exclusivity is enforced on canonical checkout identity, not a user-supplied path string. Session,
+Write exclusivity is enforced on checkout filesystem identity, not a user-supplied path string. Session,
 Workspace and checkout ownership must agree before acquisition. Symlink/path aliases cannot create a second
-lease, and worktree creation must stay below an approved parent and report shared resources it does not
-isolate. Read-only mode exposes whether its OS guard is enforced; an agent prompt saying “do not write” is
+lease even across data directories, while distinct worktree directory inodes retain independent locks.
+Worktree creation must stay below an approved parent and report shared resources it does not isolate.
+Read-only mode exposes whether its OS guard is enforced; an agent prompt saying “do not write” is
 not a security boundary. On macOS the guard denies checkout and external-Git-metadata writes for the whole
 process tree. Other platforms fail closed by leaving the Session visible but its commands stopped.
 
@@ -1467,8 +1486,11 @@ Lease acquisition happens before any init command or process spawn. Heartbeats a
 prevent a stale daemon/client from releasing a newer owner's lease, but time alone never proves the old
 writer is dead. Separately, the daemon acquires an advisory exclusive lock on the canonical data directory
 before SQLite, migrations or restore; socket aliases therefore cannot create two cooperating store owners.
-The lock file is never removed, uses a stable inode and is released by the kernel on process death. Unsupported
-or unsafe filesystems fail closed. Migration 003 grants no lease and changes no filesystem permissions.
+The data-dir and checkout lock files are never removed, use stable inodes and are released by the kernel
+when their final owning descriptor closes. Main-checkout processes inherit only their checkout descriptor,
+so a daemon crash cannot admit a second writer while a descendant survives. Heartbeats and launches fail
+closed unless SQLite and the host lock agree. Unsupported or unsafe filesystems fail closed. Migration 003
+grants no lease and changes no filesystem permissions.
 
 Activity Preview and agent names cross an untrusted-text boundary before entering navigation chrome. They
 use the same control/bidi sanitisation as titles, known-secret redaction, strict character/history limits

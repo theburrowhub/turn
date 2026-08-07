@@ -34,6 +34,7 @@
 //! 4. **Turn never relaunches on restore.** Startup *reports* what it found and
 //!    marks what could be started again. Nothing runs until the user asks.
 
+pub(crate) mod checkout_lock;
 pub mod config;
 pub mod core;
 pub mod error;

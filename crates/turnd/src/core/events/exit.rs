@@ -37,6 +37,7 @@ impl Core {
         }
 
         self.record_exit(&session_id, node, info, now_ms);
+        self.refresh_checkout_lock_owner(&session_id);
     }
 
     /// Lets go of the ptys of processes that have ended and nobody is watching.
