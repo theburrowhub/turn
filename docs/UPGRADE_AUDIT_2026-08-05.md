@@ -211,7 +211,8 @@ restart tests restore durable metadata as `Orphaned`/`Lost` and prove that nothi
   checkout-scoped OS lock and can each claim the same path. Host-global exclusivity remains a hardening gate.
 - **Opaque credentials:** every durable free-text class is covered by sensitive-key and known-shape
   redaction, but an unlabelled credential with no distinctive shape cannot be identified reliably without
-  unacceptable false positives. Raw terminal streams remain ephemeral; arbitrary diagnostic persistence
+  unacceptable false positives. At the time of this audit raw terminal streams were ephemeral; ADR-044
+  later added a separate private bounded terminal archive. Arbitrary diagnostic persistence
   requires a separate opt-in threat review.
 - **Recovered Preview marker:** timestamps and confidence survive, but the UI still needs a distinct stale /
   recovered marker instead of merely showing the old timestamp.

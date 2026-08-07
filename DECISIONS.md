@@ -49,7 +49,7 @@ Status values:
 | [033](#adr-033) | Schema version in SQLite's `user_version`, append-only migrations, no downgrades | Accepted, implemented |
 | [034](#adr-034) | `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE` | Accepted, implemented |
 | [035](#adr-035) | Redact durable secrets, preserve structural identity | Accepted, implemented |
-| [036](#adr-036) | Persist node metadata, never terminal history | Implemented; narrowly amended by ADR-040 |
+| [036](#adr-036) | Persist node metadata, never terminal history | Superseded by ADR-044 |
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
@@ -57,6 +57,7 @@ Status values:
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
+| [044](#adr-044) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
 
 ---
 
@@ -1809,8 +1810,8 @@ pattern redaction is not permission to persist arbitrary source/prompt content.
 <a id="adr-036"></a>
 ## ADR-036 — Persist node metadata, never terminal history
 
-**Status:** Accepted, implemented for terminal persistence; narrowly amended by ADR-040 for bounded
-Activity Preview. `turn-store::repo::node`; reproduce the current store suite.
+**Status:** Superseded by ADR-044. The lifecycle distinction established here remains in force;
+the prohibition on durable terminal history does not.
 
 ### Context
 
@@ -2325,11 +2326,12 @@ The full normative model, migration, events, API and wireframe are in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`.
 
 Activity Preview is not restored scrollback or a conversation summary: it is short, provenance-labelled
-navigation status. Turn persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
+navigation status. The preview store persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
 most 20 snapshots per node and 2,000 globally. A recovered preview retains its original timestamp; a
 separate recovered/stale visual marker remains planned and clients must not reinterpret it as fresh.
 High-frequency preview updates are snapshot state and coalesced pushes, not append-only domain events.
-ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
+ADR-044 later supersedes the terminal/scrollback prohibition while retaining this preview boundary:
+raw history is a separate private terminal archive, never Activity Preview or semantic context.
 
 Hook callbacks are hostile ingress, not event-log content. The Claude adapter reduces a callback directly
 to typed `EventKind`, `EventSource`, confidence and node/session identity; it does not attach the callback
@@ -2592,3 +2594,69 @@ tree selection, focus and layout are not part of the operation.
 - **Downside:** the destination must support bracketed paste and be at a safe input boundary.
 - **Downside:** delivery proves a PTY submission, not semantic receipt. End-to-end acknowledgement would need
   an adapter-level protocol rather than a terminal heuristic.
+
+---
+
+<a id="adr-044"></a>
+## ADR-044 — Terminal history is a private bounded journal, never proof of liveness
+
+**Status:** Accepted, implemented. Supersedes ADR-036's persistence prohibition while preserving its
+lifecycle honesty. `turn-pty::journal`, `turnd::core::restore`, `turn-proto::cells::Scrollback`.
+
+### Context
+
+Reopening the UI against a live daemon already restores a Pane, but restarting the daemon discarded the
+terminal even though Session and process metadata survived. That loses the visible result of long-running
+work, colours, cursor, modes and scrollback precisely when recovery matters most. The old answer in ADR-036
+avoided a misleading transcript by deleting it; the product now requires retaining the display while making
+the independent process-lifecycle truth unmistakable.
+
+Terminal output is also hostile and sensitive. It may contain credentials, source, prompts, OSC sequences
+and arbitrary binary fragments. Redaction cannot safely transform a VT byte stream while preserving its
+meaning, and an unbounded transcript would turn a chatty build into a disk-exhaustion primitive.
+
+### Decision
+
+Each persistent Pane process has a private directory at
+`<data-dir>/terminal-history/<session-id>/<node-id>`. `turn-pty` writes the authoritative PTY read before
+broadcasting it to clients. The directory hierarchy is `0700`, files are `0600`, and creation/recovery
+refuses symlinked components or files.
+
+The durable representation is an atomic checkpoint plus an append-only binary journal. Output and resize
+records carry a monotonic sequence, length and CRC32. Recovery applies only complete, ordered, valid records
+and truncates a partial or corrupt tail to the last valid boundary. A checkpoint rename may race a crash
+before journal reset; sequence numbers make the old prefix idempotent.
+
+The journal is capped at 8 MiB and the checkpoint payload at 4 MiB per Pane. Rotation checkpoints the
+visible grid, cursor, alternate-screen flag and input modes, resets the journal and marks older scrollback as
+truncated. Before rotation, replay reconstructs the parser's bounded 5,000-row scrollback exactly; after
+rotation it reconstructs the retained terminal state and says that earlier rows were discarded. The steady
+state is therefore bounded and never silently presents a partial record as complete.
+
+Cell attachments carry the newest validated scrollback as the same compact styled cell runs used by the
+screen. Transport is capped at 5,000 rows and 3 MiB inside the protocol's 8 MiB frame; the UI seeds its
+Transcript from those rows and continues extending it from live updates.
+
+Recovered terminal state is display-only. The process remains `Orphaned` or `Lost`; history never produces
+`Alive`, `Reconnected` or a writable PTY. Relaunch creates a new node and deletes the retired node's archive.
+Unknown session/node directories are pruned on restore. Archiving or closing without deletion retains the
+archive with the Session.
+
+Raw terminal history is enabled for persistent Sessions by default because it is the feature being promised.
+A sensitive Workspace/Session can set `TURN_TERMINAL_HISTORY=disabled` (also `0`, `false`, `off` or `no`)
+before launch; then no archive is created and any old Session archive is removed at restore. `--no-persist`
+also disables it. There is no content redaction: opt-out, owner-only permissions and hard byte limits are the
+security boundary.
+
+### Consequences
+
+- Closing and reopening the UI or restarting `turnd` can reconstruct the terminal's visible state and
+  retained scrollback without claiming that the old process survived.
+- A torn final write, checkpoint/reset crash window and journal rotation have reproducible tests.
+- Disk use is calculably bounded per Pane, and terminal files are not mixed into SQLite/WAL or semantic logs.
+- **Downside:** terminal archives intentionally contain unredacted output and can contain secrets. Users must
+  opt sensitive Sessions out before launch; retrospective redaction is not meaningful for VT bytes.
+- **Downside:** rotation compacts to the current terminal state and discards older scrollback. The UI marks
+  that boundary rather than offering infinite retention.
+- **Downside:** writes add local disk I/O on the PTY reader thread. The bounded format favours simple crash
+  recovery over maximum throughput; batching/sync policy should be changed only with durability benchmarks.

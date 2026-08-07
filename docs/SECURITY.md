@@ -194,6 +194,20 @@ than state — `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`,
 is capped, and misleading Unicode/control content is stripped. That transform does not turn the result into
 durable product state.
 
+### 3.5.1 Raw terminal archives
+
+Terminal output is the exception that cannot be made safe by field redaction: it is an ordered VT byte
+stream whose text, escape sequences and binary fragments may all be meaningful. Persistent Sessions keep a
+bounded checkpoint and append-only journal under `terminal-history/<session>/<node>` so a restart can
+reconstruct the display. Directories are owner-only (`0700`), files are `0600`, symlinked paths are refused,
+records are CRC-checked, and journal/checkpoint size is capped per Pane.
+
+The archive may contain secrets exactly as they appeared on screen. A sensitive Workspace or Session must
+set `TURN_TERMINAL_HISTORY=disabled` before launching its processes; `0`, `false`, `off` and `no` are also
+accepted. `--no-persist` disables archives globally. Opt-out deletes any retained Session archive during
+restore. A recovered archive is never a process capability: its node remains `Orphaned` or `Lost`, cannot
+accept input and is replaced/deleted when the user explicitly relaunches that Pane.
+
 ### 3.6 `turn-hook`
 
 - Only `http://`, and **only a loopback destination**. The helper's environment is

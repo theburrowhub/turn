@@ -17,7 +17,7 @@ use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Layout, WorkspaceWriteLease};
 
 use crate::bytes::TerminalBytes;
-use crate::cells::Grid;
+use crate::cells::{Grid, Scrollback};
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
 use crate::view::{
@@ -55,6 +55,9 @@ pub struct PaneAttachment {
     /// and `Response` is moved through the daemon's channels for every keystroke.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<Box<Grid>>,
+    /// Durable rows above the cell screen, oldest first. Empty for byte attachments.
+    #[serde(default, skip_serializing_if = "Scrollback::is_empty")]
+    pub scrollback: Scrollback,
     /// Bytes to feed a terminal emulator, for a [`PaneStream::Bytes`] attachment.
     /// Empty otherwise.
     ///
@@ -308,6 +311,7 @@ pub(crate) mod tests {
                 node_id: Some(NodeId::from_stored("proc_a")),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(screen.clone())),
+                scrollback: Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(24, 80),
                 scrollback_truncated: true,
@@ -348,6 +352,7 @@ pub(crate) mod tests {
             node_id: Some(NodeId::from_stored("proc_a")),
             stream: PaneStream::Bytes,
             screen: None,
+            scrollback: Scrollback::default(),
             replay: TerminalBytes::new(replay.clone()),
             size: PtySize::new(24, 80),
             scrollback_truncated: false,
@@ -389,6 +394,7 @@ pub(crate) mod tests {
             // An empty pane still has a screen: a blank one at the client's size,
             // which is better than a renderer with nothing to draw.
             screen: Some(Box::new(Grid::blank(24, 80))),
+            scrollback: Scrollback::default(),
             replay: TerminalBytes::default(),
             size: PtySize::default(),
             scrollback_truncated: false,
@@ -562,6 +568,7 @@ pub(crate) mod tests {
                     node_id: Some(NodeId::from_stored("proc_a")),
                     stream: PaneStream::Cells,
                     screen: Some(Box::new(Grid::from_lines(&["ready"], 80))),
+                    scrollback: Scrollback::default(),
                     replay: TerminalBytes::default(),
                     size: PtySize::new(24, 80),
                     scrollback_truncated: false,

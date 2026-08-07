@@ -59,6 +59,7 @@
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::VecDeque;
 
 /// Most cells a single grid may describe, in either direction.
 ///
@@ -70,6 +71,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// Enforced on the way *in*, before anything is allocated, so a peer cannot ask a
 /// receiver for gigabytes with a short line.
 pub const MAX_SCREEN_CELLS: usize = 65_536;
+
+/// Most durable history rows carried by one attachment.
+pub const MAX_SCROLLBACK_ROWS: usize = 5_000;
+/// Serialized row budget reserved for history inside the 8 MiB protocol frame.
+pub const MAX_SCROLLBACK_WIRE_BYTES: usize = 3 * 1024 * 1024;
 
 /// A colour, already resolved. The daemon maps the terminal's palette indices to
 /// concrete values so the client never has to know which of the sixteen
@@ -444,6 +450,129 @@ impl Grid {
             .filter(|row| self.row(*row) != previous.row(*row))
             .collect()
     }
+}
+
+/// Compact terminal history, oldest row first.
+///
+/// History uses the same validated cell runs as a [`Grid`], so colours, Unicode,
+/// attributes and wide-cell trailers survive a UI restart without inventing a second
+/// terminal representation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Scrollback {
+    cols: u16,
+    rows: Vec<Vec<CellRun>>,
+}
+
+impl Scrollback {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    /// Expands the compact rows after the wire representation has been validated.
+    pub fn decode_rows(&self) -> Result<Vec<Vec<Cell>>, GridError> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(row, runs)| decode_runs(runs, self.cols, row as u16))
+            .collect()
+    }
+
+    #[cfg(feature = "vt100")]
+    fn from_screen_with_limits(
+        screen: &vt100::Screen,
+        max_rows: usize,
+        max_wire_bytes: usize,
+    ) -> (Self, bool) {
+        let (_, cols) = screen.size();
+        if screen.alternate_screen() || max_rows == 0 || max_wire_bytes == 0 {
+            return (Self::default(), screen.scrollback() > 0);
+        }
+
+        let mut source = screen.clone();
+        source.set_scrollback(usize::MAX);
+        let available = source.scrollback();
+        let mut offset = available.min(max_rows);
+        let mut truncated = available > offset;
+        let mut rows: VecDeque<(Vec<CellRun>, usize)> = VecDeque::new();
+        let mut encoded_bytes = 0usize;
+
+        // At offset N the top min(N, screen-height) rows are the next oldest
+        // retained history. Reading a viewport at a time keeps this O(history).
+        while offset > 0 {
+            source.set_scrollback(offset);
+            let grid = from_screen(&source);
+            let take = offset.min(grid.rows as usize);
+            for row in 0..take {
+                let runs = grid.row_runs(row as u16);
+                let bytes = serde_json::to_vec(&runs).map_or(max_wire_bytes + 1, |row| row.len());
+                if bytes > max_wire_bytes {
+                    truncated = true;
+                    continue;
+                }
+                while encoded_bytes.saturating_add(bytes) > max_wire_bytes {
+                    let Some((_, removed)) = rows.pop_front() else {
+                        break;
+                    };
+                    encoded_bytes = encoded_bytes.saturating_sub(removed);
+                    truncated = true;
+                }
+                encoded_bytes = encoded_bytes.saturating_add(bytes);
+                rows.push_back((runs, bytes));
+            }
+            offset -= take;
+        }
+
+        (
+            Self {
+                cols,
+                rows: rows.into_iter().map(|(row, _)| row).collect(),
+            },
+            truncated,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct ScrollbackWire {
+    cols: u16,
+    rows: Vec<Vec<CellRun>>,
+}
+
+impl<'de> Deserialize<'de> for Scrollback {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ScrollbackWire::deserialize(deserializer)?;
+        if wire.cols == 0 && !wire.rows.is_empty() {
+            return Err(D::Error::custom("scrollback has zero columns"));
+        }
+        if wire.rows.len() > MAX_SCROLLBACK_ROWS {
+            return Err(D::Error::custom(format!(
+                "scrollback has {} rows, over the limit of {}",
+                wire.rows.len(),
+                MAX_SCROLLBACK_ROWS
+            )));
+        }
+        for (row, runs) in wire.rows.iter().enumerate() {
+            decode_runs(runs, wire.cols, row as u16).map_err(D::Error::custom)?;
+        }
+        Ok(Self {
+            cols: wire.cols,
+            rows: wire.rows,
+        })
+    }
+}
+
+/// Extracts the newest bounded scrollback from a parsed terminal.
+#[cfg(feature = "vt100")]
+pub fn scrollback_from_screen(screen: &vt100::Screen) -> (Scrollback, bool) {
+    Scrollback::from_screen_with_limits(screen, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES)
 }
 
 /// Why a grid or a row could not be read off the wire.
@@ -870,6 +999,76 @@ mod tests {
         assert!(grid.cell(23, 79).is_some());
         assert!(grid.cell(24, 0).is_none(), "out of range must not wrap");
         assert!(grid.cell(0, 80).is_none());
+    }
+
+    #[test]
+    fn scrollback_keeps_unicode_colours_and_the_newest_bounded_rows() {
+        let mut parser = vt100::Parser::new(3, 16, 20);
+        parser
+            .process(b"\x1b[31mRED\x1b[0m\r\ncaf\xc3\xa9\r\nline-2\r\nline-3\r\nline-4\r\nline-5");
+        let mut measured = parser.screen().clone();
+        measured.set_scrollback(usize::MAX);
+        let available = measured.scrollback();
+        assert!(available >= 3, "fixture did not create scrollback");
+
+        let (history, truncated) =
+            Scrollback::from_screen_with_limits(parser.screen(), 3, 64 * 1024);
+        assert_eq!(history.len(), 3);
+        assert_eq!(truncated, available > 3);
+        let rows = history.decode_rows().unwrap();
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+            .collect();
+        assert_eq!(text, vec!["RED", "café", "line-2"]);
+        assert!(rows[0]
+            .iter()
+            .filter(|cell| !cell.text.is_empty())
+            .all(|cell| cell.fg == Some(indexed_rgb(1))));
+    }
+
+    #[test]
+    fn scrollback_wire_budget_drops_oldest_rows_and_admits_truncation() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(b"oldest\r\nmiddle\r\nnewest\r\nlive");
+        let one_row_budget = serde_json::to_vec(&Grid::from_lines(&["newest"], 20).row_runs(0))
+            .unwrap()
+            .len();
+        let (history, truncated) =
+            Scrollback::from_screen_with_limits(parser.screen(), 20, one_row_budget);
+        assert!(truncated);
+        assert_eq!(history.len(), 1);
+        let rows = history.decode_rows().unwrap();
+        let text: String = rows[0].iter().map(|cell| cell.text.as_str()).collect();
+        assert_eq!(text, "middle");
+    }
+
+    #[test]
+    fn an_oversized_row_does_not_discard_an_earlier_row_that_fits() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(
+            b"plain\r\n\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md\x1b[35me\x1b[36mf\x1b[0m\r\nlive-1\r\nlive-2",
+        );
+        let plain_budget = serde_json::to_vec(&Grid::from_lines(&["plain"], 20).row_runs(0))
+            .unwrap()
+            .len();
+        let (history, truncated) =
+            Scrollback::from_screen_with_limits(parser.screen(), 20, plain_budget);
+
+        assert!(truncated);
+        let rows = history.decode_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        let text: String = rows[0].iter().map(|cell| cell.text.as_str()).collect();
+        assert_eq!(text, "plain");
+    }
+
+    #[test]
+    fn empty_scrollback_round_trips_when_serialized_explicitly() {
+        let serialized = serde_json::to_string(&Scrollback::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Scrollback>(&serialized).unwrap(),
+            Scrollback::default()
+        );
     }
 
     #[test]

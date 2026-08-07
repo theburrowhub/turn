@@ -3273,6 +3273,7 @@ mod tests {
                     node_id: Some(node_id.clone()),
                     stream: PaneStream::Cells,
                     screen: Some(Box::new(grid)),
+                    scrollback: turn_proto::Scrollback::default(),
                     replay: TerminalBytes::new(Vec::new()),
                     size: PtySize::new(24, 80),
                     scrollback_truncated: false,

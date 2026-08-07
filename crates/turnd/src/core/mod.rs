@@ -50,7 +50,7 @@ use turn_core::ids::{HandoffId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
-use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize};
+use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize, TerminalBuffer};
 use turn_store::Store;
 
 /// How often the loop wakes up when nothing is happening.
@@ -191,6 +191,9 @@ pub struct Core {
     pub(crate) sessions: HashMap<SessionId, Session>,
     pub(crate) templates: HashMap<TemplateId, Template>,
     pub(crate) processes: HashMap<NodeId, Process>,
+    /// Parsed terminal history recovered after the daemon restart. These buffers are
+    /// display-only: their nodes remain Orphaned/Lost and never pretend a PTY survived.
+    pub(crate) recovered_terminals: HashMap<NodeId, TerminalBuffer>,
     pub(crate) pumps: HashMap<NodeId, JoinHandle<()>>,
     pub(crate) clients: HashMap<ClientId, Client>,
 
@@ -298,6 +301,7 @@ impl Core {
             sessions: HashMap::new(),
             templates: HashMap::new(),
             processes: HashMap::new(),
+            recovered_terminals: HashMap::new(),
             pumps: HashMap::new(),
             clients: HashMap::new(),
             screens: HashMap::new(),
@@ -519,6 +523,23 @@ impl Core {
         self.sessions
             .get(id)
             .ok_or_else(|| ProtoError::not_found("session", id.as_str()))
+    }
+
+    /// Whether this durable session opts into raw terminal history.
+    pub(crate) fn terminal_history_enabled(&self, id: &SessionId) -> bool {
+        if self.store.path().is_none() {
+            return false;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return false;
+        };
+        !session.env.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("TURN_TERMINAL_HISTORY")
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+        })
     }
 
     pub(crate) fn session_mut(

@@ -32,9 +32,8 @@ use turn_proto::{Grid, PtySize, ScreenUpdate, ServerEvent};
 impl Core {
     /// Reads the pane's current screen as cells.
     ///
-    /// A node with no live pty — orphaned or lost after a restart — reads as a blank
-    /// screen at the client's own size rather than as nothing: the pane is real, and a
-    /// renderer with no grid at all has nothing to draw.
+    /// A node with no live pty uses its recovered display-only terminal when one was
+    /// journalled. Lifecycle remains Orphaned/Lost; history is never proof of liveness.
     pub(crate) fn build_grid(&self, node: &NodeId, size: PtySize) -> Grid {
         self.build_grid_with_title(node, size).0
     }
@@ -48,23 +47,28 @@ impl Core {
         node: &NodeId,
         size: PtySize,
     ) -> (Grid, Option<Option<String>>) {
-        let Some(process) = self.processes.get(node) else {
-            return (Grid::blank(size.rows, size.cols), None);
-        };
-        let shared = process.pty.buffer();
-        let built = match shared.lock() {
-            // The one reading of what a parsed screen means as cells, shared with the
-            // client — see `turn_proto::cells::from_screen`. Palette indices are
-            // resolved and reversed video is applied there.
-            Ok(buffer) => (
+        if let Some(process) = self.processes.get(node) {
+            let shared = process.pty.buffer();
+            return match shared.lock() {
+                // The one reading of what a parsed screen means as cells, shared with the
+                // client — see `turn_proto::cells::from_screen`. Palette indices are
+                // resolved and reversed video is applied there.
+                Ok(buffer) => (
+                    turn_proto::from_screen(buffer.screen()),
+                    Some(buffer.title()),
+                ),
+                // The mutex is only poisoned if a pty reader thread panicked while holding
+                // it. The pane is still real, so a blank screen is the honest answer.
+                Err(_) => (Grid::blank(size.rows, size.cols), None),
+            };
+        }
+        match self.recovered_terminals.get(node) {
+            Some(buffer) => (
                 turn_proto::from_screen(buffer.screen()),
                 Some(buffer.title()),
             ),
-            // The mutex is only poisoned if a pty reader thread panicked while holding
-            // it. The pane is still real, so a blank screen is the honest answer.
-            Err(_) => (Grid::blank(size.rows, size.cols), None),
-        };
-        built
+            None => (Grid::blank(size.rows, size.cols), None),
+        }
     }
 
     /// The geometry a node's screen is currently drawn at.
@@ -72,7 +76,28 @@ impl Core {
         self.processes
             .get(node)
             .map(|process| PtySize::new(process.size.rows, process.size.cols))
+            .or_else(|| {
+                self.recovered_terminals
+                    .get(node)
+                    .map(|buffer| PtySize::new(buffer.size().rows, buffer.size().cols))
+            })
             .unwrap_or(fallback)
+    }
+
+    /// Durable rows above a node's live/recovered screen and whether transport bounds
+    /// omitted any older rows.
+    pub(crate) fn scrollback_for_attach(&self, node: &NodeId) -> (turn_proto::Scrollback, bool) {
+        if let Some(process) = self.processes.get(node) {
+            let shared = process.pty.buffer();
+            return shared
+                .lock()
+                .map(|buffer| turn_proto::scrollback_from_screen(buffer.screen()))
+                .unwrap_or_default();
+        }
+        self.recovered_terminals
+            .get(node)
+            .map(|buffer| turn_proto::scrollback_from_screen(buffer.screen()))
+            .unwrap_or_default()
     }
 
     /// The grid every cells attachment on this node is in step with, building it if

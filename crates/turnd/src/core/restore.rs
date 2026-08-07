@@ -21,7 +21,7 @@
 use super::Core;
 use crate::error::Result;
 use crate::paths;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
@@ -72,6 +72,9 @@ impl Core {
             }
         }
 
+        let (terminal_histories_restored, terminal_histories_pruned) =
+            self.restore_terminal_histories();
+
         // One refresh for every decision below. Deciding a process is gone requires
         // looking at the process table, which the store rightly refuses to guess at.
         if !self.sessions.is_empty() {
@@ -104,9 +107,61 @@ impl Core {
             leases_requiring_recovery,
             temporary_bindings_pruned,
             scratch_pruned = pruned,
+            terminal_histories_restored,
+            terminal_histories_pruned,
             "restored"
         );
         Ok(())
+    }
+
+    /// Loads display-only terminal models without changing any process lifecycle.
+    fn restore_terminal_histories(&mut self) -> (usize, usize) {
+        let sessions: Vec<(SessionId, bool, Vec<NodeId>)> = self
+            .sessions
+            .iter()
+            .map(|(session_id, session)| {
+                (
+                    session_id.clone(),
+                    self.terminal_history_enabled(session_id),
+                    session.tree.iter().map(|node| node.id.clone()).collect(),
+                )
+            })
+            .collect();
+        let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut restored = 0usize;
+
+        for (session_id, enabled, nodes) in sessions {
+            if !enabled {
+                paths::remove_session_terminal_history(&self.data_dir, &session_id);
+                continue;
+            }
+            known.insert(
+                session_id.to_string(),
+                nodes.iter().map(ToString::to_string).collect(),
+            );
+            for node_id in nodes {
+                let dir = paths::node_terminal_history(&self.data_dir, &session_id, &node_id);
+                match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+                    Ok(Some(recovered)) => {
+                        self.recovered_terminals
+                            .insert(node_id.clone(), recovered.buffer);
+                        restored += 1;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            node = %node_id,
+                            path = %dir.display(),
+                            %error,
+                            "could not recover terminal history"
+                        );
+                    }
+                }
+            }
+        }
+        let pruned = paths::prune_terminal_history(&self.data_dir, &known);
+        (restored, pruned)
     }
 
     /// Retires one recovery offer after its pane process was explicitly relaunched.
