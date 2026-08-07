@@ -284,8 +284,9 @@ explicit migration-reconciliation flow, advanced management API surface (rename/
 order), performance measurement and the live CLI smoke test; “types exist” is still not an exit criterion.
 Template-origin conflicts now retain the Template id and inputs through typed read-only/worktree requests;
 the daemon, not `TemplateSummary`, re-instantiates the complete Layout/env/Attention/tmux/naming contract.
-Read-only keeps commands stopped whenever no technical guard is available; worktree maps primary absolute
-cwd values repository-relatively.
+Read-only now launches shells, Agent panes, init commands and descendants under an inherited macOS Seatbelt
+write guard; it keeps commands stopped whenever that technical guard is unavailable. Worktree maps primary
+absolute cwd values repository-relatively.
 
 ---
 
@@ -515,8 +516,10 @@ Migration 003 grants no lease; migration 006 trusts no pre-existing one.
 those stores are independent authority domains and can each claim the same path.
 
 *Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
-old writer stopped. Cwd containment is not an OS sandbox: same-user code can still open another path after
-launch, so stronger isolation remains a separate security feature. The local-filesystem `flock` is an
+old writer stopped. Main-checkout/worktree cwd containment is not an OS sandbox. Read-only processes now add
+a macOS path-scoped Seatbelt guard for the checkout and external Git metadata, while Linux remains fail-closed
+with process launch disabled; broader credential/network/service isolation remains separate. The
+local-filesystem `flock` is an
 advisory boundary between cooperating Turn daemons, not protection from the same user deliberately replacing
 the lock inode.
 

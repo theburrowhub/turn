@@ -44,6 +44,235 @@ pub enum PtyError {
     Journal { path: PathBuf, cause: String },
 }
 
+/// Why a platform read-only process sandbox could not be constructed safely.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadOnlySandboxError {
+    #[error("could not resolve protected path `{path}`: {cause}")]
+    Resolve {
+        path: PathBuf,
+        #[source]
+        cause: std::io::Error,
+    },
+    #[error("unsafe Git metadata at `{path}`: {reason}")]
+    InvalidGitMetadata { path: PathBuf, reason: String },
+    #[error("protected path `{path}` is not valid UTF-8 and cannot be passed to Seatbelt safely")]
+    NonUtf8Path { path: PathBuf },
+}
+
+/// An inherited OS guard for a process and every child it creates.
+///
+/// macOS Seatbelt receives canonical paths as profile parameters rather than
+/// interpolated source, so unusual checkout names cannot change the policy. Other
+/// platforms return `None` until an equivalent kernel boundary is implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlySandbox {
+    protected_paths: Vec<PathBuf>,
+}
+
+impl ReadOnlySandbox {
+    /// Builds the strongest guard available for `checkout`, including Git metadata
+    /// that a gitfile or symlink places outside the working tree.
+    pub fn for_checkout(checkout: &Path) -> Result<Option<Self>, ReadOnlySandboxError> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = checkout;
+            Ok(None)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+            let available = std::fs::metadata(SANDBOX_EXEC)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false);
+            if !available {
+                return Ok(None);
+            }
+
+            let root = canonical(checkout)?;
+            if !root.is_dir() {
+                return Err(ReadOnlySandboxError::InvalidGitMetadata {
+                    path: root,
+                    reason: "the checkout root is not a directory".to_string(),
+                });
+            }
+            let mut protected_paths = vec![root.clone()];
+            if let Some(git_dir) = git_directory(&root)? {
+                push_distinct_outside(&mut protected_paths, &root, git_dir.clone());
+                if let Some(common_dir) = git_common_directory(&git_dir)? {
+                    push_distinct_outside(&mut protected_paths, &root, common_dir);
+                }
+            }
+            validate_seatbelt_paths(&protected_paths)?;
+            Ok(Some(Self { protected_paths }))
+        }
+    }
+
+    pub fn checkout_root(&self) -> &Path {
+        &self.protected_paths[0]
+    }
+
+    #[cfg(target_os = "macos")]
+    fn command_builder(&self, command: &str, args: &[String]) -> CommandBuilder {
+        const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+        let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*\n");
+        for index in 0..self.protected_paths.len() {
+            profile.push_str(&format!(
+                "  (literal (param \"TURN_PROTECTED_{index}\"))\n  (subpath (param \"TURN_PROTECTED_{index}\"))\n"
+            ));
+        }
+        profile.push_str(")\n");
+
+        let mut builder = CommandBuilder::new(SANDBOX_EXEC);
+        for (index, path) in self.protected_paths.iter().enumerate() {
+            builder.arg("-D");
+            builder.arg(format!(
+                "TURN_PROTECTED_{index}={}",
+                path.to_str()
+                    .expect("sandbox paths were validated as UTF-8")
+            ));
+        }
+        builder.arg("-p");
+        builder.arg(profile);
+        builder.arg(command);
+        for arg in args {
+            builder.arg(arg);
+        }
+        builder
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected_paths
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn canonical(path: &Path) -> Result<PathBuf, ReadOnlySandboxError> {
+    std::fs::canonicalize(path).map_err(|cause| ReadOnlySandboxError::Resolve {
+        path: path.to_path_buf(),
+        cause,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn git_directory(root: &Path) -> Result<Option<PathBuf>, ReadOnlySandboxError> {
+    let dot_git = root.join(".git");
+    let metadata = match std::fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(cause) => {
+            return Err(ReadOnlySandboxError::Resolve {
+                path: dot_git,
+                cause,
+            })
+        }
+    };
+    if metadata.is_dir() {
+        return canonical(&dot_git).map(Some);
+    }
+    if !metadata.is_file() {
+        return Err(ReadOnlySandboxError::InvalidGitMetadata {
+            path: dot_git,
+            reason: ".git is neither a directory nor a gitfile".to_string(),
+        });
+    }
+    let pointer = read_small_text(&dot_git)?;
+    let target = pointer
+        .lines()
+        .next()
+        .and_then(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| ReadOnlySandboxError::InvalidGitMetadata {
+            path: dot_git.clone(),
+            reason: "gitfile does not contain a gitdir pointer".to_string(),
+        })?;
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        root.join(target)
+    };
+    canonical(&target).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn git_common_directory(git_dir: &Path) -> Result<Option<PathBuf>, ReadOnlySandboxError> {
+    let pointer = git_dir.join("commondir");
+    let metadata = match std::fs::metadata(&pointer) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(cause) => {
+            return Err(ReadOnlySandboxError::Resolve {
+                path: pointer,
+                cause,
+            })
+        }
+    };
+    if !metadata.is_file() {
+        return Err(ReadOnlySandboxError::InvalidGitMetadata {
+            path: pointer,
+            reason: "commondir is not a regular file".to_string(),
+        });
+    }
+    let common = read_small_text(&pointer)?;
+    let common = common.trim();
+    if common.is_empty() {
+        return Err(ReadOnlySandboxError::InvalidGitMetadata {
+            path: pointer,
+            reason: "commondir is empty".to_string(),
+        });
+    }
+    let common = Path::new(common);
+    let common = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        git_dir.join(common)
+    };
+    canonical(&common).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn read_small_text(path: &Path) -> Result<String, ReadOnlySandboxError> {
+    const MAX_GIT_POINTER_BYTES: u64 = 16 * 1024;
+    let file = std::fs::File::open(path).map_err(|cause| ReadOnlySandboxError::Resolve {
+        path: path.to_path_buf(),
+        cause,
+    })?;
+    let mut text = String::new();
+    file.take(MAX_GIT_POINTER_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|cause| ReadOnlySandboxError::Resolve {
+            path: path.to_path_buf(),
+            cause,
+        })?;
+    if text.len() as u64 > MAX_GIT_POINTER_BYTES {
+        return Err(ReadOnlySandboxError::InvalidGitMetadata {
+            path: path.to_path_buf(),
+            reason: "metadata pointer is unexpectedly large".to_string(),
+        });
+    }
+    Ok(text)
+}
+
+#[cfg(target_os = "macos")]
+fn push_distinct_outside(paths: &mut Vec<PathBuf>, root: &Path, candidate: PathBuf) {
+    if !candidate.starts_with(root) && !paths.contains(&candidate) {
+        paths.push(candidate);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn validate_seatbelt_paths(paths: &[PathBuf]) -> Result<(), ReadOnlySandboxError> {
+    if let Some(path) = paths.iter().find(|path| path.to_str().is_none()) {
+        return Err(ReadOnlySandboxError::NonUtf8Path { path: path.clone() });
+    }
+    Ok(())
+}
+
 /// What to launch.
 #[derive(Debug, Clone)]
 pub struct ProcessSpec {
@@ -57,6 +286,8 @@ pub struct ProcessSpec {
     /// Start from an empty environment. Off by default: agents need the user's
     /// PATH and credential helpers to work at all.
     pub clean_env: bool,
+    /// OS-enforced write protection inherited by every child process.
+    pub read_only_sandbox: Option<ReadOnlySandbox>,
 }
 
 impl ProcessSpec {
@@ -68,6 +299,7 @@ impl ProcessSpec {
             env: Vec::new(),
             size: ScreenSize::default(),
             clean_env: false,
+            read_only_sandbox: None,
         }
     }
 
@@ -92,6 +324,11 @@ impl ProcessSpec {
 
     pub fn size(mut self, size: ScreenSize) -> Self {
         self.size = size;
+        self
+    }
+
+    pub fn read_only_sandbox(mut self, sandbox: ReadOnlySandbox) -> Self {
+        self.read_only_sandbox = Some(sandbox);
         self
     }
 
@@ -491,12 +728,27 @@ fn open_pty_with_retry(size: ScreenSize) -> Result<portable_pty::PtyPair, PtyErr
 
 /// Builds the command, inheriting the environment unless asked not to.
 fn build_command(spec: &ProcessSpec, node_id: &NodeId) -> CommandBuilder {
-    let mut builder = CommandBuilder::new(&spec.command);
+    #[cfg(target_os = "macos")]
+    let mut builder = match &spec.read_only_sandbox {
+        Some(sandbox) => sandbox.command_builder(&spec.command, &spec.args),
+        None => {
+            let mut builder = CommandBuilder::new(&spec.command);
+            for arg in &spec.args {
+                builder.arg(arg);
+            }
+            builder
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut builder = {
+        let mut builder = CommandBuilder::new(&spec.command);
+        for arg in &spec.args {
+            builder.arg(arg);
+        }
+        builder
+    };
     if spec.clean_env {
         builder.env_clear();
-    }
-    for arg in &spec.args {
-        builder.arg(arg);
     }
     builder.cwd(&spec.cwd);
     for (key, value) in &spec.env {
@@ -522,6 +774,12 @@ fn build_command(spec: &ProcessSpec, node_id: &NodeId) -> CommandBuilder {
     // Marks the process as ours, so the supervisor can attribute strays and
     // adapters can tell they are running under Turn.
     builder.env("TURN_NODE_ID", node_id.as_str());
+    if let Some(sandbox) = &spec.read_only_sandbox {
+        builder.env("TURN_READ_ONLY", "1");
+        builder.env("TURN_READ_ONLY_ROOT", sandbox.checkout_root());
+        // Read-only Git commands should never refresh the index opportunistically.
+        builder.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     builder
 }
 
@@ -627,6 +885,128 @@ mod tests {
 
     fn spawn(spec: ProcessSpec) -> PtyProcess {
         PtyProcess::spawn(NodeId::new(), spec, T0).expect("spawning the process")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_guard_blocks_checkout_writes_from_aliases_cwds_and_children() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let alternate_cwd = checkout.join("nested");
+        let outside = temp.path().join("outside");
+        let alias = temp.path().join("checkout-alias");
+        std::fs::create_dir_all(&alternate_cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(checkout.join("existing"), "original\n").unwrap();
+        std::fs::write(checkout.join("delete-me"), "keep\n").unwrap();
+        std::fs::write(checkout.join("rename-me"), "keep\n").unwrap();
+        symlink(&checkout, &alias).unwrap();
+
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .expect("git must be available for the read-only acceptance test");
+        assert!(git.success());
+
+        let checkout = std::fs::canonicalize(checkout).unwrap();
+        let alternate_cwd = std::fs::canonicalize(alternate_cwd).unwrap();
+        let outside = std::fs::canonicalize(outside).unwrap();
+        let sandbox = ReadOnlySandbox::for_checkout(&checkout)
+            .unwrap()
+            .expect("macOS must expose sandbox-exec");
+        let script = r#"
+            touch "$1/created" 2>/dev/null || true
+            printf 'changed\n' > "$1/existing" 2>/dev/null || true
+            rm -f "$1/delete-me" 2>/dev/null || true
+            mv -f "$1/rename-me" "$1/renamed" 2>/dev/null || true
+            TURN_CHILD_ROOT="$1" sh -c 'touch "$TURN_CHILD_ROOT/child-created"' 2>/dev/null || true
+            touch "$3/alias-created" 2>/dev/null || true
+            git -C "$1" status --porcelain >/dev/null || exit 41
+            touch "$2/outside-write" || exit 42
+            [ "$PWD" = "$1/nested" ] || exit 43
+            [ "$TURN_READ_ONLY" = 1 ] || exit 44
+            [ "$TURN_READ_ONLY_ROOT" = "$1" ] || exit 45
+            [ "$GIT_OPTIONAL_LOCKS" = 0 ] || exit 46
+            printf 'TURN_READ_ONLY_GUARD_OK\n'
+        "#;
+        let process = spawn(
+            ProcessSpec::new("sh", alternate_cwd.to_string_lossy())
+                .args([
+                    "-c".to_string(),
+                    script.to_string(),
+                    "turn-read-only-test".to_string(),
+                    checkout.to_string_lossy().into_owned(),
+                    outside.to_string_lossy().into_owned(),
+                    alias.to_string_lossy().into_owned(),
+                ])
+                .read_only_sandbox(sandbox),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && !process
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.text().contains("TURN_READ_ONLY_GUARD_OK"))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = process.snapshot().unwrap().text();
+        assert!(
+            output.contains("TURN_READ_ONLY_GUARD_OK"),
+            "guarded probe failed: {output}"
+        );
+        wait_until("the guarded process to exit", || !process.is_running());
+        assert_eq!(process.exit_info().unwrap().code, 0);
+        assert!(!checkout.join("created").exists());
+        assert!(!checkout.join("child-created").exists());
+        assert!(!checkout.join("alias-created").exists());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("existing")).unwrap(),
+            "original\n"
+        );
+        assert!(checkout.join("delete-me").exists());
+        assert!(checkout.join("rename-me").exists());
+        assert!(!checkout.join("renamed").exists());
+        assert!(outside.join("outside-write").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_guard_includes_external_git_and_common_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let git_dir = temp.path().join("git-dir");
+        let common_dir = temp.path().join("common-dir");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::create_dir(&common_dir).unwrap();
+        std::fs::write(checkout.join(".git"), "gitdir: ../git-dir\n").unwrap();
+        std::fs::write(git_dir.join("commondir"), "../common-dir\n").unwrap();
+
+        let sandbox = ReadOnlySandbox::for_checkout(&checkout)
+            .unwrap()
+            .expect("macOS must expose sandbox-exec");
+        assert_eq!(
+            sandbox.protected_paths(),
+            &[
+                std::fs::canonicalize(checkout).unwrap(),
+                std::fs::canonicalize(git_dir).unwrap(),
+                std::fs::canonicalize(common_dir).unwrap(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_guard_rejects_a_protected_path_seatbelt_cannot_name_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let protected = PathBuf::from(std::ffi::OsString::from_vec(b"git-dir-\xff".to_vec()));
+        let error = validate_seatbelt_paths(&[protected])
+            .expect_err("a lossy Seatbelt parameter would leave the real path writable");
+        assert!(matches!(error, ReadOnlySandboxError::NonUtf8Path { .. }));
     }
 
     #[test]

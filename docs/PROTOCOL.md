@@ -493,13 +493,16 @@ assignment and acquires the lease in one atomic store
 transaction, before init commands, processes or Panes exist. A conflict rolls the transaction back, returns
 the typed context in §5 and leaves no partial Session. Duplicate never inherits an active lease; it must
 choose/reconcile a mode. Read-only replies include `read_only_enforced`, because metadata and agent guidance
-are not enforcement. Worktree replies include the new checkout and declared shared resources.
+are not enforcement. True means the daemon constructed the platform process guard and may launch the
+configured Layout; false means commands remain stopped. Worktree replies include the new checkout and
+declared shared resources.
 
 When the failed request was `create_session_from_template`, the client retains only its original Template
 identity and interpolation inputs, then uses the matching `*_from_template` alternative. The daemon reloads
 the authoritative Template and applies the same Layout, commands, relative cwd, environment, Attention,
 tmux and name-pattern rules inside the selected safe checkout. A read-only alternative preserves that
-configuration but launches no process while enforcement is unavailable; a worktree alternative remaps
+configuration and launches it only after enforcement is active; while enforcement is unavailable it starts
+no process. A worktree alternative remaps
 absolute primary-checkout Session/Pane cwd values to the same repository-relative location in the isolated
 checkout. Clients must not reconstruct a Template from `TemplateSummary`. The non-Template alternatives
 remain the explicit blank/shell path.
@@ -690,7 +693,9 @@ lease. A fenced explicit release is valid only after no runtime node owned by th
 the same atomic operation demotes the Session to `read_only`. Before restoring Sessions or emitting any
 heartbeat, a new daemon changes every non-`released` lease
 to `recovery_required` while preserving its id, generation and previous heartbeat. Loading the former owner
-never auto-adopts that authority; release/reacquisition remains explicit.
+never auto-adopts that authority. An explicit `acquire_workspace_write_lease` may promote a read-only
+Session only after all of its runtime nodes have ended; success acquires the lease and changes the Session to
+`main_checkout` in the same durable transition.
 
 ### Examples
 
@@ -1109,8 +1114,8 @@ Identity: `id`, `workspace_id`, `name`, `note`, `cwd`, `status`
 (`active`\|`paused`\|`archived`).
 
 Checkout safety: `mode` (`main_checkout`\|`read_only`\|`isolated_worktree`), `checkout_id?`,
-`worktree_path?`, `read_only_enforced`. A read-only badge must not imply technical enforcement when the last
-field is false.
+`worktree_path?`, `read_only_enforced`. A read-only badge must say whether the guard is enforced; when the
+last field is false it must also explain that process launch is disabled.
 
 Derived state — **the client renders these, it never computes them**:
 

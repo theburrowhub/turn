@@ -142,7 +142,7 @@ impl Ask {
             Ask::CreateTemplate => "saving the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::RelaunchNode { .. } => "starting the restored pane",
-            Ask::RestoreLeaseAcquire { .. } => "acquiring restored write access",
+            Ask::RestoreLeaseAcquire { .. } => "acquiring exclusive write access",
             Ask::CloseSession { .. } => "ending the session",
             Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
             Ask::Action(label) => label,

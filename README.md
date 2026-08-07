@@ -69,6 +69,8 @@ Implemented today:
 - Claude Code and Codex adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
 - SQLite persistence, write leases, safe restart recovery, and explicit process relaunch.
+- macOS-enforced read-only Sessions: shells, Agents and child processes can inspect a checkout while
+  Seatbelt blocks writes to it and its external Git metadata; unsupported platforms keep processes stopped.
 - Automated macOS and Linux builds plus native UI snapshot coverage.
 
 Still before a release-quality build:
