@@ -293,9 +293,8 @@ fn write_checkpoint(
     file.write_all(&replay)?;
     file.sync_all()?;
     std::fs::rename(&tmp, &final_path)?;
-    secure_file_permissions(&final_path)?;
-    if let Ok(parent) = File::open(dir) {
-        let _ = parent.sync_all();
+    if let Err(error) = File::open(dir).and_then(|parent| parent.sync_all()) {
+        tracing::warn!(path = %dir.display(), %error, "could not sync terminal checkpoint directory");
     }
     Ok(())
 }
@@ -412,16 +411,24 @@ fn secure_create(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).read(true).write(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    {
+        // The metadata check gives a useful error, while O_NOFOLLOW makes the actual
+        // open atomic against a same-user replacement between check and open.
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     let file = options.open(path)?;
-    secure_file_permissions(path)?;
+    secure_file_permissions(&file)?;
     Ok(file)
 }
 
 fn secure_open_read(path: &Path) -> io::Result<File> {
     reject_symlink(path)?;
-    let file = OpenOptions::new().read(true).open(path)?;
-    secure_file_permissions(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    secure_file_permissions(&file)?;
     Ok(file)
 }
 
@@ -430,15 +437,17 @@ fn secure_open_read_write(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
-    options.mode(0o600);
+    {
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     let file = options.open(path)?;
-    secure_file_permissions(path)?;
+    secure_file_permissions(&file)?;
     Ok(file)
 }
 
-fn secure_file_permissions(path: &Path) -> io::Result<()> {
+fn secure_file_permissions(_file: &File) -> io::Result<()> {
     #[cfg(unix)]
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    _file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 

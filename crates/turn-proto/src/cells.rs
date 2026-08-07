@@ -513,6 +513,10 @@ impl Scrollback {
             for row in 0..take {
                 let runs = grid.row_runs(row as u16);
                 let bytes = serde_json::to_vec(&runs).map_or(max_wire_bytes + 1, |row| row.len());
+                if bytes > max_wire_bytes {
+                    truncated = true;
+                    continue;
+                }
                 while encoded_bytes.saturating_add(bytes) > max_wire_bytes {
                     let Some((_, removed)) = rows.pop_front() else {
                         break;
@@ -520,12 +524,8 @@ impl Scrollback {
                     encoded_bytes = encoded_bytes.saturating_sub(removed);
                     truncated = true;
                 }
-                if bytes <= max_wire_bytes {
-                    encoded_bytes = encoded_bytes.saturating_add(bytes);
-                    rows.push_back((runs, bytes));
-                } else {
-                    truncated = true;
-                }
+                encoded_bytes = encoded_bytes.saturating_add(bytes);
+                rows.push_back((runs, bytes));
             }
             offset -= take;
         }
@@ -549,7 +549,7 @@ struct ScrollbackWire {
 impl<'de> Deserialize<'de> for Scrollback {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = ScrollbackWire::deserialize(deserializer)?;
-        if wire.cols == 0 {
+        if wire.cols == 0 && !wire.rows.is_empty() {
             return Err(D::Error::custom("scrollback has zero columns"));
         }
         if wire.rows.len() > MAX_SCROLLBACK_ROWS {
@@ -1041,6 +1041,34 @@ mod tests {
         let rows = history.decode_rows().unwrap();
         let text: String = rows[0].iter().map(|cell| cell.text.as_str()).collect();
         assert_eq!(text, "middle");
+    }
+
+    #[test]
+    fn an_oversized_row_does_not_discard_an_earlier_row_that_fits() {
+        let mut parser = vt100::Parser::new(2, 20, 20);
+        parser.process(
+            b"plain\r\n\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md\x1b[35me\x1b[36mf\x1b[0m\r\nlive-1\r\nlive-2",
+        );
+        let plain_budget = serde_json::to_vec(&Grid::from_lines(&["plain"], 20).row_runs(0))
+            .unwrap()
+            .len();
+        let (history, truncated) =
+            Scrollback::from_screen_with_limits(parser.screen(), 20, plain_budget);
+
+        assert!(truncated);
+        let rows = history.decode_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        let text: String = rows[0].iter().map(|cell| cell.text.as_str()).collect();
+        assert_eq!(text, "plain");
+    }
+
+    #[test]
+    fn empty_scrollback_round_trips_when_serialized_explicitly() {
+        let serialized = serde_json::to_string(&Scrollback::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Scrollback>(&serialized).unwrap(),
+            Scrollback::default()
+        );
     }
 
     #[test]
