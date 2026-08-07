@@ -79,6 +79,12 @@ release: ## Release build of the three binaries
 	$(CARGO) build --release --bin turnd --bin turn --bin turn-hook
 	@ls -la target/release/turnd target/release/turn target/release/turn-hook
 
+MACOS_APP ?= $(CURDIR)/dist/Turn.app
+
+.PHONY: macos-app
+macos-app: ## Build an ad-hoc signed local Turn.app for macOS acceptance
+	./scripts/package-macos-app.sh "$(MACOS_APP)"
+
 # --- running it ---------------------------------------------------------------
 
 .PHONY: run run-ready

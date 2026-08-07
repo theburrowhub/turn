@@ -188,6 +188,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
 - [ROADMAP.md](ROADMAP.md) — milestones, open risks, technical debt, and release work.
 - [Unified hierarchy upgrade](docs/UNIFIED_HIERARCHY_UPGRADE.md) — tree, Agent/Pane separation,
   write leases, previews, and persistence contracts.
+- [Authenticated Reviewer acceptance](docs/REVIEWER_ACCEPTANCE.md) — local macOS bundle,
+  opt-in live-Claude harness, manual checklist, and honest run record.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 
