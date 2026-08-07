@@ -264,6 +264,18 @@ impl TerminalBuffer {
         self.bytes.len()
     }
 
+    /// Current process-supplied OSC 0/2 title, already safe for product chrome.
+    ///
+    /// Kept separate from [`Self::snapshot`] so a daemon that only needs to detect
+    /// a title change does not allocate and sanitise every visible terminal row.
+    pub fn title(&self) -> Option<String> {
+        self.parser
+            .callbacks()
+            .title
+            .as_deref()
+            .and_then(sanitise_title)
+    }
+
     /// A snapshot for on-demand previews and heuristics.
     pub fn snapshot(&self) -> ScreenSnapshot {
         let screen = self.parser.screen();
@@ -279,12 +291,7 @@ impl TerminalBuffer {
             alternate_screen: screen.alternate_screen(),
             // Sanitised again on the way out, cheaply, so a future callback that
             // forgets to do it at ingest cannot leak into the sidebar.
-            title: self
-                .parser
-                .callbacks()
-                .title
-                .as_deref()
-                .and_then(sanitise_title),
+            title: self.title(),
             bytes_seen: self.bytes_seen,
         }
     }

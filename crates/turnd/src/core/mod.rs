@@ -29,6 +29,7 @@ pub mod restore;
 pub mod screens;
 pub mod spawn;
 pub mod supervise;
+pub mod titles;
 pub mod views;
 
 pub use command::{ClientId, Command};
@@ -97,6 +98,12 @@ pub const EXPECTED_EXIT_GRACE_MS: i64 = 30 * 1_000;
 /// A live process and what Turn knows about how it was launched.
 pub struct Process {
     pub pty: PtyProcess,
+    /// Last sanitised OSC 0/2 title observed from this exact PTY.
+    pub process_title: Option<String>,
+    /// Title to restore when the process clears its OSC title.
+    pub fallback_title: String,
+    /// Agent name to restore when a low-priority process title is cleared.
+    pub fallback_agent_name: Option<turn_core::model::AgentName>,
     /// The adapter that prepared this launch, for relaunching and for reporting.
     pub adapter_id: String,
     /// The integration the launch actually achieved, which may be lower than the
@@ -410,6 +417,7 @@ impl Core {
         let effects = self.attention.tick(&self.user.clone(), now_ms);
         self.emit_effects(effects, now_ms);
         self.observe_heuristics(now_ms);
+        self.observe_process_titles(now_ms);
         self.observe_activity_previews(now_ms);
         self.heartbeat_workspace_leases(now_ms);
         self.resync_clients(now_ms);
@@ -712,6 +720,9 @@ pub(crate) mod testing {
                 node_id.clone(),
                 Process {
                     pty,
+                    process_title: None,
+                    fallback_title: node.title.clone(),
+                    fallback_agent_name: node.agent.as_ref().map(|agent| agent.name.clone()),
                     adapter_id: "terminal".to_string(),
                     level: IntegrationLevel::GenericTerminal,
                     hook_token: None,

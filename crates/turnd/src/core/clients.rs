@@ -572,6 +572,7 @@ impl Core {
     /// cells attachment never has a grid built for it, and a pane with no byte
     /// attachment never pays for base64.
     pub(crate) fn deliver_output(&mut self, node: &NodeId, data: Vec<u8>, dropped: u64) {
+        self.observe_process_title(node, turn_core::now_ms());
         self.deliver_screen(node);
         self.deliver_bytes(node, data, dropped);
     }

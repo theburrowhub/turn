@@ -272,6 +272,14 @@ impl PtyProcess {
         self.buffer.lock().ok().map(|b| b.snapshot())
     }
 
+    /// Current sanitised OSC 0/2 title without constructing a screen snapshot.
+    pub fn title(&self) -> Result<Option<String>, PtyError> {
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.title())
+            .map_err(|_| PtyError::Unavailable)
+    }
+
     /// Shared access to the buffer, for the heuristic adapters.
     pub fn buffer(&self) -> Arc<Mutex<TerminalBuffer>> {
         Arc::clone(&self.buffer)
