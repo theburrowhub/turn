@@ -2830,7 +2830,8 @@ exactly the moment Turn lost the PTY handle and had least evidence that writing 
 ### Decision
 
 Turn canonicalises the checkout directory and identifies it by Unix device/inode. Under the real,
-uid-owned 0700 `/tmp/turn-checkout-locks-<uid>` directory it opens a retained 0600 lock inode with
+uid-owned 0700 `checkout-locks` directory below Turn's stable platform data directory (independent of
+`TURN_DATA_DIR`) it opens a retained 0600 lock inode with
 `O_NOFOLLOW`, verifies type, owner and named/open inode identity, takes non-blocking exclusive `flock`, then
 re-resolves the checkout to reject replacement during acquisition. Lock files are never unlinked. Owner
 metadata is an atomically replaced sidecar containing daemon/data-dir identity, the lease and its typed owner.
@@ -2841,10 +2842,11 @@ existing focus/read-only/worktree/cancel choices. An owner from another daemon r
 without `focus_owner`, because the current socket cannot focus it. Heartbeat, init, Pane launch, split and
 relaunch require both the active SQLite generation and the matching host lock.
 
-For each main-checkout spawn the daemon duplicates only that lock descriptor and clears `FD_CLOEXEC` on the
-duplicate. portable-pty normally closes every descriptor above stderr in `pre_exec`; Turn carries a small
-vendored extension that preserves an explicit descriptor allowlist while retaining that cleanup for all
-others. The launched process and its descendants therefore share the same locked open-file description.
+For each main-checkout spawn the daemon duplicates only that lock descriptor with `FD_CLOEXEC` still set.
+portable-pty normally closes every descriptor above stderr in `pre_exec`; Turn carries a small vendored
+extension that preserves an explicit descriptor allowlist, clears `FD_CLOEXEC` only in the already-forked
+child, and retains cleanup for all others. This avoids a cross-thread inheritance window in the daemon. The
+launched process and its descendants therefore share the same locked open-file description.
 Neither the lock type nor Drop calls `LOCK_UN`: explicit release first demotes SQLite and then closes the
 daemon copy, while daemon loss leaves a surviving writer's copy authoritative until the kernel closes the
 last descriptor.
@@ -2861,6 +2863,8 @@ collide, whereas distinct checkout/worktree directory inodes may write concurren
 - A daemon crash cannot release authority while a descendant that inherited it is still alive; the final
   process exit makes recovery possible without a stale-file deletion protocol.
 - Stable lock inodes and atomic owner sidecars avoid unlink races and partial heartbeat metadata.
+- The stable data location is not subject to normal `/tmp` or runtime-directory cleanup; deliberately
+  removing owner-owned lock files remains outside the cooperative same-user boundary.
 - **Downside:** portable-pty is vendored for a narrow descriptor-preservation API until upstream provides it.
 - **Downside:** `flock` is an advisory boundary between cooperating same-user processes. Code running as the
   account owner can close its inherited descriptor or tamper with owner-owned lock state; this is not a

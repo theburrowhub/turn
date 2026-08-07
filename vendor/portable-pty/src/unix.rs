@@ -281,6 +281,9 @@ impl PtyFd {
                     }
 
                     close_random_fds_except(&preserved_fds);
+                    for fd in &preserved_fds {
+                        clear_cloexec(*fd)?;
+                    }
 
                     if let Some(mask) = configured_umask {
                         libc::umask(mask);
@@ -334,6 +337,20 @@ fn cloexec(fd: RawFd) -> Result<(), Error> {
             "fcntl to set CLOEXEC failed: {:?}",
             io::Error::last_os_error()
         );
+    }
+    Ok(())
+}
+
+/// Clear close-on-exec in the already-forked child, after unrelated descriptors
+/// have been closed. Keeping the flag set in the parent prevents a concurrent
+/// spawn on another daemon thread from inheriting an allowlisted descriptor.
+fn clear_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

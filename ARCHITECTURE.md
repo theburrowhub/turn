@@ -942,12 +942,14 @@ its exact node or unresolved parent/external-id correlation scope survives as we
 whose exact node/parent no longer runs are removed; postmortem evidence explicitly marked
 `survives_owner_exit` (for example failure/completion facts) remains.
 
-Separate data directories share a second kernel boundary for checkout writes. The uid-owned
-`/tmp/turn-checkout-locks-<uid>` directory contains retained stable lock inodes keyed by checkout device and
+Separate data directories share a second kernel boundary for checkout writes. The uid-owned stable
+platform-data `checkout-locks` directory (independent of `TURN_DATA_DIR`) contains retained lock inodes
+keyed by checkout device and
 inode plus atomically replaced owner metadata. A contender takes `LOCK_EX|LOCK_NB`; failure returns the
 other daemon's typed lease owner and only locally actionable read-only/worktree/cancel alternatives. A
-successful main-checkout spawn preserves only a duplicate of that descriptor through portable-pty's
-pre-exec close pass. The daemon and every descendant therefore share one open-file description; no code
+successful main-checkout spawn preserves only a CLOEXEC duplicate of that descriptor through
+portable-pty's pre-exec close pass and clears CLOEXEC in the forked child. The daemon and every descendant
+therefore share one open-file description; no code
 calls `LOCK_UN`, and the kernel releases authority only after the final daemon/process copy closes. Explicit
 release first demotes SQLite, then drops the descriptor, so its only gap is conservative contention.
 

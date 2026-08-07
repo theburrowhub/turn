@@ -264,6 +264,9 @@ pub struct Core {
     /// active durable lease must have exactly one matching host-wide checkout lock.
     pub(crate) checkout_write_locks: HashMap<LeaseId, CheckoutWriteLock>,
 
+    /// Stable per-user lock root shared by daemons with different SQLite stores.
+    pub(crate) checkout_lock_dir: PathBuf,
+
     /// Nodes whose next exit was asked for, against the moment the request stops
     /// applying — see [`EXPECTED_EXIT_GRACE_MS`] for why it has to stop.
     ///
@@ -294,6 +297,7 @@ impl Core {
         hooks: Arc<HookServer>,
         registry: AdapterRegistry,
         data_dir: PathBuf,
+        checkout_lock_dir: PathBuf,
         commands: mpsc::Sender<Command>,
     ) -> Result<Self> {
         let mut core = Self {
@@ -323,6 +327,7 @@ impl Core {
             hierarchy_revision: 1,
             last_lease_heartbeat_ms: 0,
             checkout_write_locks: HashMap::new(),
+            checkout_lock_dir,
             expected_exits: HashMap::new(),
             restore_reports: Vec::new(),
             supervisor: ProcessSupervisor::new(),
@@ -643,6 +648,7 @@ pub(crate) mod testing {
                 Arc::new(hooks),
                 AdapterRegistry::bare(),
                 dir.path().to_path_buf(),
+                dir.path().join(crate::paths::CHECKOUT_LOCKS_DIR),
                 commands,
             )
             .expect("the core must build");

@@ -257,8 +257,10 @@ impl CommandBuilder {
     }
 
     /// Preserve one already-open descriptor across the Unix pre-exec descriptor
-    /// cleanup. The caller remains responsible for clearing `FD_CLOEXEC` and for the
-    /// descriptor's lifetime through `spawn_command`.
+    /// cleanup. The descriptor may and should remain `FD_CLOEXEC` in the parent;
+    /// portable-pty clears that flag only in the forked child immediately before
+    /// exec. The caller remains responsible for its lifetime through
+    /// `spawn_command`.
     #[cfg(unix)]
     pub fn preserve_fd(&mut self, fd: libc::c_int) {
         assert!(fd > 2, "stdio descriptors are already preserved");

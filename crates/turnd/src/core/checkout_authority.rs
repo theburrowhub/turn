@@ -21,9 +21,11 @@ impl Core {
         let owner = owner_view(session);
         let data_dir = self.data_dir.clone();
         let claim = lease.clone();
-        CheckoutWriteLock::acquire(Path::new(&checkout.path), move |identity| {
-            CheckoutLockOwner::new(&data_dir, identity, claim, owner)
-        })
+        CheckoutWriteLock::acquire(
+            Path::new(&checkout.path),
+            &self.checkout_lock_dir,
+            move |identity| CheckoutLockOwner::new(&data_dir, identity, claim, owner),
+        )
         .map_err(|error| {
             self.map_checkout_lock_error(
                 &session.workspace_id,
@@ -177,6 +179,15 @@ impl Core {
         } = error
         {
             let held = *held;
+            if held.daemon_pid == std::process::id()
+                && Path::new(&held.data_dir) == self.data_dir.as_path()
+            {
+                return self.local_lease_conflict(
+                    workspace_id,
+                    Some(requesting_session_id),
+                    held.lease,
+                );
+            }
             return ProtoError::workspace_write_lease_conflict(
                 ProtoErrorContext::WorkspaceWriteLeaseConflict {
                     workspace_id: workspace_id.clone(),
@@ -217,5 +228,75 @@ fn owner_view(session: &Session) -> WriteLeaseOwnerView {
         cwd: session.cwd.clone(),
         branch: session.git_branch.clone(),
         last_activity_ms: session.last_activity_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+    use crate::core::ClientId;
+    use turn_core::model::PaneKind;
+    use turn_proto::{NewPane, ProtoErrorContext, Request, Response};
+
+    #[tokio::test]
+    async fn same_daemon_host_contention_keeps_the_focus_alternative() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .dispatch(
+                ClientId(1),
+                Request::CreateWorkspace {
+                    name: "local owner".into(),
+                    root: harness._dir.path().to_string_lossy().into_owned(),
+                },
+                10,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .dispatch(
+                ClientId(1),
+                Request::CreateSession {
+                    workspace_id: workspace_id.clone(),
+                    name: "writer".into(),
+                    cwd: None,
+                    panes: Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                    note: None,
+                    tags: Vec::new(),
+                },
+                11,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session = harness.core.sessions[&session_id].clone();
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .unwrap();
+
+        let error = harness
+            .core
+            .checkout_lock_claim(&session, &lease)
+            .expect_err("the same daemon already holds this host lock");
+        let Some(ProtoErrorContext::WorkspaceWriteLeaseConflict { alternatives, .. }) =
+            error.context.as_deref()
+        else {
+            panic!("local contention lost its typed context: {error:?}");
+        };
+        assert_eq!(
+            alternatives.first(),
+            Some(&SessionConflictAlternative::FocusOwner)
+        );
     }
 }

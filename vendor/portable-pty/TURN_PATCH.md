@@ -5,6 +5,8 @@ extension:
 
 - `CommandBuilder::preserve_fd` adds an explicit descriptor allowlist.
 - Unix pre-exec cleanup continues closing every descriptor above stderr except that allowlist.
+- Allowlisted descriptors remain `FD_CLOEXEC` in the parent; the forked child clears
+  the flag only after cleanup, eliminating cross-thread spawn inheritance.
 
 Turn uses the API only to carry a checkout lock into a main-checkout process. Remove the patch and return to
 the crates.io release when upstream offers an equivalent preservation API.

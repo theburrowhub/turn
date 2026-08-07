@@ -257,15 +257,18 @@ non-blocking.
 
 That SQLite fence is joined to a host-global Unix lock independent of `data_dir`. Turn resolves the checkout
 directory to `(device, inode)` and uses one retained 0600 lock inode under the real, uid-owned 0700
-`/tmp/turn-checkout-locks-<uid>` directory. Symlink aliases and directory renames therefore collide while
+`checkout-locks` directory below Turn's stable platform data directory, independent of `TURN_DATA_DIR`.
+Unlike `/tmp` or a runtime directory, normal OS cleanup does not unlink live authority. Symlink aliases and
+directory renames therefore collide while
 distinct Git worktree directories do not. The file is opened with `O_NOFOLLOW`, its owner/type and named
 inode are verified, and the checkout identity is re-resolved after locking. Owner metadata is published by
 atomic sidecar rename so contention can return the other daemon's typed lease/session details.
 
 The daemon acquires the host lock before SQLite and supplies the same preallocated `LeaseId` to both halves.
 Every heartbeat and main-checkout launch requires the active SQLite generation and matching kernel lock.
-portable-pty still closes every unrelated descriptor, but explicitly preserves one non-`CLOEXEC` duplicate
-of the checkout lock in the launched process. Descendants inherit the same open-file description. Turn never
+portable-pty still closes every unrelated descriptor, but explicitly preserves one duplicate of the
+checkout lock and clears `FD_CLOEXEC` only in the already-forked child. The parent copy remains CLOEXEC, so
+concurrent unrelated spawns cannot inherit it. Descendants inherit the same open-file description. Turn never
 calls `LOCK_UN`: explicit release first demotes SQLite and then closes the daemon descriptor; after a daemon
 crash the kernel releases authority only when the final surviving writer closes its copy. A replacement
 daemon therefore reconciles stale process state and reacquires the kernel lock before it can reclaim SQLite.

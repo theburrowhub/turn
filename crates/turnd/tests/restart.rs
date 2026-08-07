@@ -1042,6 +1042,7 @@ async fn checkout_write_authority_is_global_across_data_dirs_aliases_and_daemon_
     let repository = fixture.path().join("repository");
     let worktree = fixture.path().join("independent-worktree");
     let alias = fixture.path().join("repository-alias");
+    let checkout_lock_dir = fixture.path().join("host-checkout-locks");
     std::fs::create_dir(&repository).unwrap();
     let run_git = |args: &[&str]| {
         let output = std::process::Command::new("git")
@@ -1071,8 +1072,8 @@ async fn checkout_write_authority_is_global_across_data_dirs_aliases_and_daemon_
     ]);
     symlink(&repository, &alias).unwrap();
 
-    let first = TestDaemon::start_plain().await;
-    let second = TestDaemon::start_plain().await;
+    let first = TestDaemon::start_plain_with_checkout_lock_dir(&checkout_lock_dir).await;
+    let second = TestDaemon::start_plain_with_checkout_lock_dir(&checkout_lock_dir).await;
     assert_ne!(first.data_dir(), second.data_dir());
     let mut first_ui = first.connect().await;
     let mut second_ui = second.connect().await;
@@ -1255,7 +1256,7 @@ async fn checkout_write_authority_is_global_across_data_dirs_aliases_and_daemon_
         })
         .await;
 
-    let third = TestDaemon::start_plain().await;
+    let third = TestDaemon::start_plain_with_checkout_lock_dir(&checkout_lock_dir).await;
     let mut third_ui = third.connect().await;
     let third_workspace = workspace_of(
         third_ui

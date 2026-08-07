@@ -136,10 +136,11 @@ impl std::fmt::Debug for CheckoutWriteLock {
 impl CheckoutWriteLock {
     pub(crate) fn acquire(
         checkout: &Path,
+        lock_root: &Path,
         build_owner: impl FnOnce(&CheckoutIdentity) -> CheckoutLockOwner,
     ) -> Result<Self, CheckoutLockError> {
         let identity = CheckoutIdentity::resolve(checkout)?;
-        let root = ensure_lock_root()?;
+        let root = ensure_lock_root(lock_root)?;
         let path = root.join(identity.file_name());
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
@@ -312,20 +313,17 @@ pub(crate) enum CheckoutLockError {
 }
 
 #[cfg(not(unix))]
-fn ensure_lock_root() -> Result<PathBuf, CheckoutLockError> {
+fn ensure_lock_root(_root: &Path) -> Result<PathBuf, CheckoutLockError> {
     Err(CheckoutLockError::Unsupported)
 }
 
 #[cfg(unix)]
-fn ensure_lock_root() -> Result<PathBuf, CheckoutLockError> {
-    let root = PathBuf::from("/tmp").join(format!("turn-checkout-locks-{}", unsafe {
-        libc::geteuid()
-    }));
-
+fn ensure_lock_root(root: &Path) -> Result<PathBuf, CheckoutLockError> {
+    let root = root.to_path_buf();
     let mut builder = DirBuilder::new();
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        builder.mode(0o700).recursive(true);
     }
     match builder.create(&root) {
         Ok(()) => {}
@@ -490,15 +488,10 @@ fn inheritable_clone(file: &File, path: &Path) -> Result<File, CheckoutLockError
             cause: std::io::Error::last_os_error(),
         });
     }
-    let clone = unsafe { File::from_raw_fd(fd) };
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
-        return Err(CheckoutLockError::LockFile {
-            path: path.to_path_buf(),
-            cause: std::io::Error::last_os_error(),
-        });
-    }
-    Ok(clone)
+    // Keep CLOEXEC set in the multithreaded daemon. portable-pty clears it only in
+    // the forked child after closing unrelated descriptors, so a concurrent
+    // std::process::Command can never accidentally inherit checkout authority.
+    Ok(unsafe { File::from_raw_fd(fd) })
 }
 
 #[cfg(not(unix))]
@@ -545,14 +538,17 @@ mod tests {
         let checkout = temp.path().join("checkout");
         let other = temp.path().join("other-worktree");
         let alias = temp.path().join("alias");
+        let locks = temp.path().join("locks");
         std::fs::create_dir(&checkout).unwrap();
         std::fs::create_dir(&other).unwrap();
         symlink(&checkout, &alias).unwrap();
 
-        let first = CheckoutWriteLock::acquire(&checkout, |identity| owner(identity, temp.path()))
-            .expect("the first writer");
-        let conflict = CheckoutWriteLock::acquire(&alias, |identity| owner(identity, temp.path()))
-            .expect_err("a symlink alias must reach the same lock");
+        let first =
+            CheckoutWriteLock::acquire(&checkout, &locks, |identity| owner(identity, temp.path()))
+                .expect("the first writer");
+        let conflict =
+            CheckoutWriteLock::acquire(&alias, &locks, |identity| owner(identity, temp.path()))
+                .expect_err("a symlink alias must reach the same lock");
         let CheckoutLockError::Contended {
             owner: Some(held), ..
         } = conflict
@@ -561,32 +557,41 @@ mod tests {
         };
         assert_eq!(held.lease.id, first.owner.lease.id);
 
-        CheckoutWriteLock::acquire(&other, |identity| owner(identity, temp.path()))
+        CheckoutWriteLock::acquire(&other, &locks, |identity| owner(identity, temp.path()))
             .expect("an independent worktree has independent authority");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_spawned_writer_keeps_the_lock_after_the_daemon_descriptor_closes() {
+    fn an_unrelated_spawn_cannot_inherit_checkout_authority() {
+        use std::os::fd::AsRawFd;
+
         let temp = tempfile::tempdir().unwrap();
         let checkout = temp.path().join("checkout");
+        let locks = temp.path().join("locks");
         std::fs::create_dir(&checkout).unwrap();
-        let lock = CheckoutWriteLock::acquire(&checkout, |identity| owner(identity, temp.path()))
-            .expect("the daemon lock");
+        let lock =
+            CheckoutWriteLock::acquire(&checkout, &locks, |identity| owner(identity, temp.path()))
+                .expect("the daemon lock");
         let inherited = lock.inherit_for_spawn().expect("an inheritable duplicate");
+        let flags = unsafe { libc::fcntl(inherited._file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "the inherited descriptor must be valid");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the parent copy must stay CLOEXEC"
+        );
         let mut child = Command::new("/bin/sh")
             .args(["-c", "trap '' HUP; exec sleep 30"])
             .spawn()
-            .expect("a simulated writer");
+            .expect("an unrelated concurrent spawn");
         drop(inherited);
         drop(lock);
 
-        CheckoutWriteLock::acquire(&checkout, |identity| owner(identity, temp.path()))
-            .expect_err("the surviving writer must retain authority after daemon loss");
+        CheckoutWriteLock::acquire(&checkout, &locks, |identity| owner(identity, temp.path()))
+            .expect("an unrelated exec must not retain checkout authority");
 
         child.kill().unwrap();
         child.wait().unwrap();
-        CheckoutWriteLock::acquire(&checkout, |identity| owner(identity, temp.path()))
-            .expect("the kernel releases authority after the final writer exits");
     }
 }

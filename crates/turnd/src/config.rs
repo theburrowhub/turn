@@ -13,6 +13,8 @@ use turn_agents::AdapterRegistry;
 pub struct Config {
     /// Where the database and the scratch space live.
     pub data_dir: PathBuf,
+    /// Stable per-user authority root shared by every configured data directory.
+    pub checkout_lock_dir: PathBuf,
     /// The unix socket clients connect to.
     pub socket_path: PathBuf,
     /// Whether state is written to disk at all. `false` gives an in-memory store,
@@ -33,6 +35,7 @@ impl std::fmt::Debug for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("data_dir", &self.data_dir)
+            .field("checkout_lock_dir", &self.checkout_lock_dir)
             .field("socket_path", &self.socket_path)
             .field("persist", &self.persist)
             .field("adapters", &self.registry.adapters().len())
@@ -51,8 +54,10 @@ impl Config {
         };
         let socket_dir = paths::socket_dir(&data_dir);
         let socket_path = paths::socket_path_from_env(options.socket.as_deref(), &socket_dir);
+        let checkout_lock_dir = paths::checkout_lock_dir()?;
         Ok(Self {
             data_dir,
+            checkout_lock_dir,
             socket_path,
             persist: !options.no_persist,
             registry: AdapterRegistry::with_builtin(),
@@ -66,6 +71,7 @@ impl Config {
         let dir = dir.as_ref().to_path_buf();
         Self {
             socket_path: dir.join(paths::SOCKET_FILE),
+            checkout_lock_dir: dir.join(paths::CHECKOUT_LOCKS_DIR),
             data_dir: dir,
             persist: true,
             registry: AdapterRegistry::with_builtin(),
@@ -76,6 +82,13 @@ impl Config {
     /// Replaces the adapter registry.
     pub fn with_registry(mut self, registry: AdapterRegistry) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Overrides the host checkout-lock root for an isolated test fixture.
+    /// Production start-up always resolves the stable platform path instead.
+    pub fn with_checkout_lock_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.checkout_lock_dir = dir.as_ref().to_path_buf();
         self
     }
 
@@ -106,6 +119,10 @@ mod tests {
         let config = Config::in_dir("/tmp/turn-test");
         assert_eq!(config.data_dir, PathBuf::from("/tmp/turn-test"));
         assert_eq!(
+            config.checkout_lock_dir,
+            PathBuf::from("/tmp/turn-test/checkout-locks")
+        );
+        assert_eq!(
             config.socket_path,
             PathBuf::from("/tmp/turn-test/turnd.sock")
         );
@@ -123,6 +140,20 @@ mod tests {
         assert_eq!(
             config.registry.select("zsh").adapter.id(),
             "generic-terminal"
+        );
+    }
+
+    #[test]
+    fn a_custom_data_directory_does_not_move_host_checkout_authority() {
+        let options = crate::options::Options {
+            data_dir: Some(PathBuf::from("/tmp/turn-custom-data")),
+            ..crate::options::Options::default()
+        };
+        let config = Config::from_options(&options).unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/tmp/turn-custom-data"));
+        assert_eq!(
+            config.checkout_lock_dir,
+            paths::checkout_lock_dir().unwrap()
         );
     }
 }

@@ -26,6 +26,14 @@ pub const WORKTREES_DIR: &str = "worktrees";
 /// Private per-pane terminal checkpoints and journals.
 pub const TERMINAL_HISTORY_DIR: &str = "terminal-history";
 
+/// Stable, installation-wide home for checkout lock inodes.
+///
+/// This deliberately lives below the platform data directory rather than a
+/// configured daemon data directory or a temporary/runtime directory. Separate
+/// `--data-dir` daemons must converge here, and an OS temp cleaner must never be
+/// able to unlink a live lock's directory entry.
+pub const CHECKOUT_LOCKS_DIR: &str = "checkout-locks";
+
 /// Longest socket path we will attempt.
 ///
 /// `sun_path` is 104 bytes on macOS and 108 on Linux, and the byte after the path
@@ -70,6 +78,13 @@ pub fn socket_dir(data_dir: &Path) -> PathBuf {
     directories::ProjectDirs::from("dev", "turn", "turn")
         .and_then(|dirs| dirs.runtime_dir().map(Path::to_path_buf))
         .unwrap_or_else(|| data_dir.to_path_buf())
+}
+
+/// The host-global checkout-lock root, independent of `TURN_DATA_DIR`.
+pub fn checkout_lock_dir() -> Result<PathBuf> {
+    turn_store::location::platform_data_dir()
+        .map(|dir| dir.join(CHECKOUT_LOCKS_DIR))
+        .map_err(DaemonError::Store)
 }
 
 /// Rejects a path the kernel would refuse for a reason that is hard to read.
