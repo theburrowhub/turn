@@ -8,5 +8,7 @@ pub use buffer::{
     is_display_safe, sanitise_label, ScreenSize, ScreenSnapshot, TerminalBuffer, MAX_TITLE_CHARS,
 };
 pub use journal::{JournalConfig, RecoveredTerminal, TerminalJournal};
-pub use process::{ExitInfo, OutputChunk, ProcessSpec, PtyError, PtyProcess};
+pub use process::{
+    ExitInfo, OutputChunk, ProcessSpec, PtyError, PtyProcess, ReadOnlySandbox, ReadOnlySandboxError,
+};
 pub use supervisor::{classify, ObservedProcess, ProcessSupervisor};

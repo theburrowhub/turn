@@ -2730,3 +2730,68 @@ statistics. No IPC capability is placed in a hook URL or agent configuration.
   owner-only token just as it can read the user's credentials; process isolation needs a separate OS sandbox.
 - **Downside:** a same-user process can still deny service by repeatedly occupying bounded slots. Integrity and
   resource bounds are preserved, but availability against the account owner is not promised.
+
+---
+
+<a id="adr-046"></a>
+## ADR-046 — Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere
+
+**Status:** Accepted, implemented macOS-first. `turn-pty::ReadOnlySandbox`, guarded Session creation and
+explicit lease promotion.
+
+### Context
+
+The safe alternative to a busy primary checkout was honest but inert: Turn persisted a read-only Session
+with `read_only_enforced=false` and refused to launch its shell or Agents. Telling a model not to edit files
+cannot turn that metadata into enforcement. A usable reviewer needs Git reads, searches and ordinary terminal
+execution while the existing writer keeps the sole checkout lease, and the same boundary must reach child
+processes, alternate working directories and pathname aliases.
+
+### Alternatives considered
+
+**Rely on prompts, read-only tool lists or command classification.** Rejected. A shell, Agent or child can
+open files directly, and command spelling is not authority.
+
+**Change checkout permissions while a read-only Session runs.** Rejected. Permissions are shared with the
+legitimate writer and changing them is itself a race-prone global side effect.
+
+**Copy or create a worktree for every reviewer.** Rejected as the meaning of read-only mode. It gives a
+different filesystem snapshot and Git index, while `isolated_worktree` already exists for that trade-off.
+
+**Wrap every process in a parameterised macOS Seatbelt policy and fail closed without it.** Chosen.
+
+### Decision
+
+`ReadOnlySandbox::for_checkout` first requires the fixed system `sandbox-exec`, then canonicalises the
+checkout and resolves its Git directory and common directory. Git metadata outside the checkout is protected
+too. The Seatbelt source allows normal execution and denies `file-write*` for a literal and subpath matcher
+for every protected root. Canonical paths are passed as `-D` parameters rather than interpolated into policy
+source.
+
+The sandbox wraps the original command inside `ProcessSpec`; it therefore covers shells, recognised or
+generic Agents, init commands, relaunches, splits and every descendant they create. Guarded processes receive
+`TURN_READ_ONLY=1`, the canonical root and `GIT_OPTIONAL_LOCKS=0`. Cwd containment is still checked
+independently. Every launch reconstructs the guard instead of trusting persisted `read_only_enforced`.
+
+Creation persists `read_only_enforced=true` and materialises the Layout only when that construction succeeds.
+On another platform or with a missing launcher, the Session remains visible and launches nothing; unsafe or
+unresolvable protected metadata rejects creation rather than persisting an ambiguous boundary. It never takes
+the primary write lease. The hierarchy, Session header, status bar and accessibility label state whether the
+guard is enforced or unavailable, and Seatbelt denials remain visible in the terminal.
+
+Write escalation reuses the durable lease arbiter but is a separate explicit action. It is refused while any
+read-only runtime node remains alive. Once they have all ended and no other writer exists, acquisition
+atomically changes the Session to `main_checkout`; a failed write never changes mode.
+
+### Consequences
+
+- A reviewer shell or Agent can run against the current checkout while another Session owns its write lease.
+- Reproducible macOS tests block create, modify, delete and rename attempts from an alternate cwd, a symlink
+  alias and a child process, while preserving Git reads and writes outside the protected roots.
+- External gitfile/worktree metadata is covered instead of assuming `.git` lives below the checkout.
+- Unsupported platforms keep the previous fail-closed behaviour and expose it instead of pretending that
+  read-only metadata confines a process.
+- **Downside:** Seatbelt is macOS-specific; Linux needs a separately audited inherited boundary before it may
+  set enforcement true.
+- **Downside:** this is path-scoped write protection, not full process isolation. Credentials, network,
+  services and unprotected filesystem paths remain accessible, and the UI/docs must say so.

@@ -874,6 +874,7 @@ impl<'a> HierarchyRepo<'a> {
         &self,
         id: &LeaseId,
         generation: u64,
+        read_only_enforced: bool,
         now_ms: i64,
     ) -> Result<bool> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
@@ -901,8 +902,8 @@ impl<'a> HierarchyRepo<'a> {
         }
         let session_changed = tx.execute(
             "UPDATE sessions SET mode = 'read_only', worktree_path = NULL, \
-                    read_only_enforced = 0 WHERE id = ?1",
-            params![&owner],
+                    read_only_enforced = ?2 WHERE id = ?1",
+            params![&owner, read_only_enforced],
         )?;
         if session_changed != 1 {
             return Err(StoreError::UnknownReference {
@@ -1190,17 +1191,22 @@ mod tests {
         assert!(matches!(error, StoreError::WriteLeaseHeld { .. }));
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 2)
             .unwrap());
         let second_lease = store
             .hierarchy()
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+        let demoted = store.sessions().get(&first.id).unwrap().unwrap();
         assert_eq!(
-            store.sessions().get(&first.id).unwrap().unwrap().mode,
+            demoted.mode,
             SessionMode::ReadOnly,
             "release and Session demotion are one durable transition"
+        );
+        assert!(
+            demoted.read_only_enforced,
+            "the precomputed guard state belongs to the same transition"
         );
     }
 
@@ -1230,7 +1236,7 @@ mod tests {
             .unwrap();
         let error = store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 1)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 1)
             .expect_err("the injected second write must abort the whole transaction");
         assert!(matches!(error, StoreError::Sqlite(_)));
         assert_eq!(
@@ -1253,7 +1259,7 @@ mod tests {
             .unwrap();
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 2)
             .unwrap());
         assert!(store
             .hierarchy()
@@ -2022,7 +2028,7 @@ mod tests {
             .unwrap();
         assert!(!store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&old.id, old.generation + 1, T0 + 1)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation + 1, false, T0 + 1)
             .unwrap());
         assert_eq!(
             store
@@ -2036,7 +2042,7 @@ mod tests {
 
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&old.id, old.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation, false, T0 + 2)
             .unwrap());
         let current = store
             .hierarchy()
@@ -2046,7 +2052,7 @@ mod tests {
 
         assert!(!store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&current.id, old.generation, T0 + 4)
+            .release_write_lease_and_assign_read_only(&current.id, old.generation, false, T0 + 4)
             .unwrap());
         assert_eq!(
             store

@@ -24,7 +24,7 @@ use crate::paths;
 use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
+use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session, SessionMode};
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
 
@@ -62,10 +62,34 @@ impl Core {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
             if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
-                if migrate_obsolete_navigation_panes(&mut session) {
+                let navigation_migrated = migrate_obsolete_navigation_panes(&mut session);
+                let guard_downgraded =
+                    if session.mode == SessionMode::ReadOnly && session.read_only_enforced {
+                        match self.read_only_sandbox(&session) {
+                            Ok(Some(_)) => false,
+                            Ok(None) => {
+                                session.read_only_enforced = false;
+                                true
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %session.id,
+                                    %error,
+                                    "restored read-only Session lost its process guard"
+                                );
+                                session.read_only_enforced = false;
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                if navigation_migrated || guard_downgraded {
                     // The old central AgentTree cannot coexist with the unified
-                    // sidebar. Persist the structural migration immediately, but
-                    // never materialise the replacement Shell during restore.
+                    // sidebar. Persist structural/guard truth immediately, but never
+                    // materialise the replacement Shell during restore. False is not
+                    // upgraded here: legacy/orphaned processes may never have been
+                    // sandboxed even when this platform can guard a future launch.
                     self.store.sessions().save(&session)?;
                 }
                 self.sessions.insert(session.id.clone(), session);

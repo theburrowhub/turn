@@ -270,22 +270,40 @@ aliases are all judged by the resolved directory; the PTY receives that canonica
 caller's spelling. Isolated-worktree Sessions are checked against their worktree checkout, so a Pane cannot
 silently start in the primary checkout.
 
-This is **launch-directory containment, not a process sandbox**. Once running, same-user code may call
-`chdir`, open arbitrary absolute paths, follow a path component replaced after validation, or access network,
-Docker, credentials and other shared resources. Preventing those actions and eliminating filesystem TOCTOU
-requires an OS sandbox/container or an fd-based launcher; the cwd check must never be presented as that
-guarantee.
+For `main_checkout` and `isolated_worktree` this is **launch-directory containment, not a process sandbox**.
+Once running, same-user code may call `chdir`, open arbitrary absolute paths, follow a path component replaced
+after validation, or access network, Docker, credentials and other shared resources. The cwd check must never
+be presented as broader containment.
+
+`read_only` adds a separate process boundary on macOS. Before persisting enforcement, the daemon requires the
+fixed `/usr/bin/sandbox-exec` launcher, canonicalises the checkout and resolves `.git`, gitfile/symlink and
+`commondir` pointers. External Git metadata roots join the protected set. Each Pane, relaunch and init command
+is wrapped in a Seatbelt profile that allows normal execution but denies `file-write*` to each protected
+literal/subpath. Paths travel through `-D` parameters instead of profile-source interpolation. The policy is
+inherited by child processes; `TURN_READ_ONLY=1`, `TURN_READ_ONLY_ROOT` and `GIT_OPTIONAL_LOCKS=0` make the
+boundary visible to tools and prevent opportunistic Git index refreshes. Every spawn reconstructs the guard,
+so a stale persisted bit cannot authorise an unguarded process.
+
+The target is the resolved protected path. A symlink alias into the checkout remains blocked by Seatbelt;
+paths whose resolved target is outside the protected set remain writable. Like other pathname sandboxes, a
+pre-existing hard-link alias outside the protected set is not separately enumerated. The guard does not
+isolate credentials, network, Docker, ports, databases or services. Those limits are shown/documented rather
+than being called full process isolation.
 
 A heartbeat timeout is evidence, never proof that the writer died. Daemon restart enters reconciliation,
 checks process ownership and otherwise asks the user. Closing the UI, archiving a live Session and
 `keep_processes` are not release events. Migration 003 creates no lease, changes no permissions and performs
 no filesystem/process action.
 
-`read_only` always exposes `read_only_enforced`. A false value is a warning, not a security guarantee; agent
-instructions do not enforce it. `isolated_worktree` isolates files/Git index, not necessarily ports,
-containers, databases, credential helpers, caches or services, so those shared resources are declared and
-shown before launch. Worktree paths must be canonicalised, constrained to an approved parent and checked for
-alias/collision immediately before use.
+`read_only` always exposes `read_only_enforced`. On macOS true means the inherited write guard above is active.
+If the platform launcher or safe canonical metadata resolution is unavailable, the Session persists with
+false and launches no process; agent instructions never substitute for it. The UI names both states and an OS
+denial remains visible in the terminal. A read-only Session never acquires the primary lease. Explicit
+promotion is refused while any guarded process is running, then atomically acquires the exclusive lease and
+changes mode; no write attempt silently escalates. `isolated_worktree` isolates files/Git index, not
+necessarily ports, containers, databases, credential helpers, caches or services, so those shared resources
+are declared and shown before launch. Worktree paths must be canonicalised, constrained to an approved parent
+and checked for alias/collision immediately before use.
 
 ### 3.9 Hierarchy identity and Activity Preview
 
@@ -351,7 +369,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
 | A launch cwd stays in its assigned checkout | adversarial daemon tests cover Workspace A→B absolute paths, `../../`, symlink escapes, worktree Pane→primary and a stored Layout rechecked at the final PTY boundary |
-| Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
+| Read-only never overclaims | macOS create/modify/delete/rename, child, alternate-cwd and symlink probes are denied while Git reads and outside writes succeed; unsupported platforms remain visibly unenforced and launch nothing |
 | Preview/event stores no source/secret | `turn-store/tests/secrets_never_reach_the_disk.rs::no_secret_value_is_present_anywhere_in_the_files_on_disk` scans the database and WAL for seeded preview credentials and non-redactable Claude-hook free text; `upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal` proves migration 005 scrubs older files too |
 | Ambiguous worker Attention never broadens on restart | an unknown explicit worker id remains node-less under its authenticated parent; two parent runtimes resolve only their own durable parent/external-id scope |
 | Permission detail never crosses subjects | scoped node-less and stale exact queue entries cannot borrow the primary Agent's command/cwd/risk; Sessions-before-tree resolves the primary only by matching node id |
@@ -508,9 +526,11 @@ containers, databases, caches or external services. Turn accepts those collision
 Workspace declares them and the conflict choice shows them. Calling the mode “isolated” must never imply
 process or credential isolation.
 
-**Read-only enforcement varies by platform/tool.** When Turn cannot install a technical guard, the Session
-remains explicit `read_only_enforced=false`, cannot acquire the primary write lease and cannot launch a
-process; a future write-capable escalation must be explicit. Hiding that limitation is not accepted.
+**Read-only enforcement is macOS-first and path-scoped.** When Turn cannot install the Seatbelt guard, the
+Session remains explicit `read_only_enforced=false`, cannot acquire the primary write lease and cannot launch
+a process. The guard blocks checkout and resolved Git-metadata writes for descendants, not access to every
+same-user resource. Write-capable escalation is explicit and requires every guarded process to end first.
+Hiding either limitation is not accepted.
 
 ## 8. Remaining audit follow-ups
 

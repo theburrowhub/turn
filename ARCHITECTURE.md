@@ -265,6 +265,9 @@ linked PR reference, pin/favourite, `parent_session` for duplicates, checkout as
 for an empty tree — a Session whose processes have not started is not a mystery — and otherwise the
 tree's aggregate. `sidebar_rank()` returns `(pinned, demands_user, severity, last_activity_ms)` as a
 tuple rather than an `Ord` impl, because ordering is a presentation concern that may differ per view.
+`read_only_enforced` is launcher evidence, not a user preference: on macOS it means every Session process
+is wrapped in the checkout write guard; false means the platform guard is unavailable and no process may
+start.
 
 **`WorkspaceWriteLease`** — daemon-owned exclusivity for the primary checkout, not for a window or focus.
 The semantic record carries Workspace, Session and checkout identity, `ExclusiveWrite`, state, acquisition
@@ -887,6 +890,15 @@ effect. Duplicating a Session never copies an active lease. Release is fenced an
 runtime node owned by the Session remains running; that same atomic operation demotes the Session to
 `ReadOnly`. UI close, archive and `KeepProcesses` are not release signals.
 
+A `read_only` Session takes the same final cwd-validation path but never takes the primary write lease. On
+macOS `turn-pty` wraps every Pane, relaunch and init process with one inherited Seatbelt profile that denies
+`file-write*` for the canonical checkout and any external Git directory/common directory. The original
+command and arguments remain inside that wrapper, so descendants inherit the same boundary. Creation sets
+`read_only_enforced=true` only after constructing the profile; every later spawn reconstructs it rather than
+trusting the stored bit. If `/usr/bin/sandbox-exec` or a safe canonical target is unavailable, the Session
+persists visibly unenforced and launches nothing. Promotion is a separate lease request and is refused until
+all guarded processes have ended.
+
 #### Why the daemon exists from day one, and exactly what it buys
 
 **It buys:** the UI can crash, be quit, be hot-reloaded during development, or be updated, and the
@@ -1442,13 +1454,14 @@ So the net position is: one injection vector removed, one containment layer remo
 than the second in this specific product, because the containment only ever mattered if the injection
 succeeded — but it is a trade, not a free win.
 
-### 7.10 Checkouts, leases and previews — **implemented for the first vertical**
+### 7.10 Checkouts, leases and previews — **implemented for the first vertical and guarded read-only on macOS**
 
 Write exclusivity is enforced on canonical checkout identity, not a user-supplied path string. Session,
 Workspace and checkout ownership must agree before acquisition. Symlink/path aliases cannot create a second
 lease, and worktree creation must stay below an approved parent and report shared resources it does not
-isolate. Read-only mode exposes whether the guard is enforced; an agent prompt saying “do not write” is not
-a security boundary.
+isolate. Read-only mode exposes whether its OS guard is enforced; an agent prompt saying “do not write” is
+not a security boundary. On macOS the guard denies checkout and external-Git-metadata writes for the whole
+process tree. Other platforms fail closed by leaving the Session visible but its commands stopped.
 
 Lease acquisition happens before any init command or process spawn. Heartbeats and fencing generations
 prevent a stale daemon/client from releasing a newer owner's lease, but time alone never proves the old

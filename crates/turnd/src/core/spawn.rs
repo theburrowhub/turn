@@ -26,7 +26,7 @@ use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{NodeKind, PaneKind, ProcessNode, Session, SessionMode, WorkspaceCheckout};
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
-use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
+use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ReadOnlySandbox, ScreenSize};
 
 /// The size a pane starts at before a client tells us what it is rendering.
 ///
@@ -201,6 +201,57 @@ impl Core {
         Ok(checkout)
     }
 
+    /// Constructs the platform guard for a read-only Session without trusting its
+    /// persisted enforcement flag. Creation uses this to decide that flag; every
+    /// later spawn reconstructs the guard so stale metadata fails closed.
+    pub(crate) fn read_only_sandbox(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<Option<ReadOnlySandbox>, ProtoError> {
+        if session.mode != SessionMode::ReadOnly {
+            return Ok(None);
+        }
+        let checkout = self.checkout_for_session(session)?;
+        let checkout_root = verified_checkout_root(&checkout)?;
+        ReadOnlySandbox::for_checkout(&checkout_root).map_err(|error| {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Turn could not construct the read-only process guard",
+            )
+            .with_detail(error.to_string())
+        })
+    }
+
+    fn process_sandbox(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<Option<ReadOnlySandbox>, ProtoError> {
+        let sandbox = self.read_only_sandbox(session)?;
+        if session.mode != SessionMode::ReadOnly {
+            return Ok(None);
+        }
+        if !session.read_only_enforced {
+            return Err(ProtoError::refused(
+                "This read-only Session has no technical write guard, so Turn will not launch a process in it",
+            ));
+        }
+        if sandbox.is_some() {
+            return Ok(sandbox);
+        }
+        // Old unit-test harnesses mark synthetic read-only Sessions as guarded so
+        // unrelated PTY lifecycle tests can cross the production launch boundary.
+        #[cfg(test)]
+        {
+            Ok(None)
+        }
+        #[cfg(not(test))]
+        {
+            Err(ProtoError::refused(
+                "The read-only process guard is unavailable on this platform; no process was started",
+            ))
+        }
+    }
+
     /// Starts a process for every pane of a session that describes one.
     ///
     /// A pane whose command cannot be launched is left empty and logged rather than
@@ -268,6 +319,7 @@ impl Core {
             return Ok(None);
         };
         let cwd = self.resolve_authorized_launch_cwd(session_id, pane.cwd.as_deref())?;
+        let read_only_sandbox = self.process_sandbox(session)?;
         let title = pane
             .title
             .clone()
@@ -383,6 +435,7 @@ impl Core {
             env,
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
 
         let journal_dir = self
@@ -500,6 +553,7 @@ impl Core {
     ) -> std::result::Result<NodeId, ProtoError> {
         let session = self.session(session_id)?;
         let cwd = self.resolve_authorized_launch_cwd(session_id, None)?;
+        let read_only_sandbox = self.process_sandbox(session)?;
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(workspace) = self.workspaces.get(&session.workspace_id) {
             env.extend(workspace.env.iter().cloned());
@@ -529,6 +583,7 @@ impl Core {
             env,
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
         let journal_dir = self
             .terminal_history_enabled(session_id)

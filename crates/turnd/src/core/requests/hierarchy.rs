@@ -246,6 +246,14 @@ impl Core {
                 "The Session is not assigned to the requested checkout",
             ));
         }
+        if session.mode == SessionMode::ReadOnly
+            && session.tree.iter().any(|node| node.is_running())
+        {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "End every read-only process before acquiring exclusive write access",
+            ));
+        }
         let current = self
             .store
             .hierarchy()
@@ -361,25 +369,48 @@ impl Core {
                 actual_generation: current.generation,
             }));
         }
-        let owner = self.sessions.get(&current.session_id).ok_or_else(|| {
-            // Another daemon may have created the owner after this Core loaded.
-            // Absence from this process is uncertainty, never proof that it is
-            // safe to revoke a live/recovery claim.
-            ProtoError::new(
-                ErrorCode::Conflict,
-                "The lease owner is not loaded here; refresh before releasing it",
-            )
-        })?;
+        let owner = self
+            .sessions
+            .get(&current.session_id)
+            .cloned()
+            .ok_or_else(|| {
+                // Another daemon may have created the owner after this Core loaded.
+                // Absence from this process is uncertainty, never proof that it is
+                // safe to revoke a live/recovery claim.
+                ProtoError::new(
+                    ErrorCode::Conflict,
+                    "The lease owner is not loaded here; refresh before releasing it",
+                )
+            })?;
         if owner.tree.iter().any(|node| node.is_running()) {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
                 "Stop the Session processes before releasing its write lease",
             ));
         }
+        let mut read_only_owner = owner;
+        read_only_owner.mode = SessionMode::ReadOnly;
+        read_only_owner.worktree_path = None;
+        let read_only_enforced = match self.read_only_sandbox(&read_only_owner) {
+            Ok(sandbox) => sandbox.is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %read_only_owner.id,
+                    %error,
+                    "released Session will remain read-only with process launch disabled"
+                );
+                false
+            }
+        };
         let released = self
             .store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(lease_id, expected_generation, now_ms)
+            .release_write_lease_and_assign_read_only(
+                lease_id,
+                expected_generation,
+                read_only_enforced,
+                now_ms,
+            )
             .map_err(store)?;
         if !released {
             return Err(ProtoError::new(
@@ -390,7 +421,7 @@ impl Core {
         if let Some(session) = self.sessions.get_mut(&current.session_id) {
             session.mode = SessionMode::ReadOnly;
             session.worktree_path = None;
-            session.read_only_enforced = false;
+            session.read_only_enforced = read_only_enforced;
         }
         self.bump_hierarchy();
         self.push_workspace_lease(workspace_id, None, now_ms);
@@ -1228,6 +1259,97 @@ mod tests {
             harness.core.sessions[&session_id].mode,
             SessionMode::ReadOnly
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_processes_must_end_before_explicit_write_escalation() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "promotion-boundary".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_read_only_session(
+                &workspace_id,
+                "reader".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let checkout = CheckoutId::primary_for(&workspace_id);
+        let mut reader = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            harness._dir.path().to_string_lossy(),
+            NOW + 2,
+        );
+        reader.lifecycle = Lifecycle::Alive;
+        let reader_id = reader.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(reader);
+
+        let error = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 3)
+            .expect_err("a live guarded process must not cross the authority boundary");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("End every read-only process"));
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::ReadOnly
+        );
+
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&reader_id)
+            .unwrap()
+            .lifecycle = Lifecycle::Exited { code: 0 };
+        let promoted = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 4)
+            .expect("an ended read-only Session may be promoted explicitly");
+        assert!(matches!(
+            promoted,
+            Response::WorkspaceWriteLease { lease: Some(_), .. }
+        ));
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::MainCheckout
+        );
+        assert!(!harness.core.sessions[&session_id].read_only_enforced);
     }
 
     #[tokio::test]
