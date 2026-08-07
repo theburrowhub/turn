@@ -37,7 +37,7 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 | Background subagents | Discovered under their parent without opening panes, changing layout, or stealing focus |
 | Agent handoffs | Review a bounded, redacted context packet and explicitly pass it to another Agent in the same Session |
 | Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |
-| Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, scrollback, shells, and TUIs |
+| Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, bounded durable scrollback, shells, and TUIs |
 | Stable layouts | Nested splits, reusable presets, drag-to-reorder, resize, balance, zoom, and per-session persistence |
 | Checkout safety | One write lease for the main checkout; extra sessions are read-only or isolated in worktrees |
 | Honest recovery | Restore layout and metadata without silently rerunning saved commands or destructive work |
@@ -141,7 +141,7 @@ Turn is one Rust workspace with a daemon-owned runtime and a thin native client.
 | --- | --- |
 | `turn-gui` | Native `eframe`/`egui` desktop interface rendered through `wgpu` |
 | `turnd` | Authoritative owner of PTYs, Sessions, hierarchy, write leases, and Attention |
-| `turn-pty` | PTY processes, bounded terminal state, replay, resize, signals, and supervision |
+| `turn-pty` | PTY processes, private bounded journals/checkpoints, replay, resize, signals, and supervision |
 | `turn-agents` | Claude Code, Codex, heuristic, and generic terminal adapters |
 | `turn-store` | SQLite persistence, migrations, hierarchy records, and secret redaction |
 | `turn-proto` | Versioned daemon/client protocol, requests, events, terminal cells, and view models |

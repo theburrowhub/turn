@@ -151,7 +151,8 @@ Updates are coalesced rather than byte-driven. The current daemon samples watche
 immediately; byte traffic never maps one-for-one to UI updates. Expansion-aware suppression for collapsed
 nodes and the wider semantic source ladder remain planned. The persisted last preview lets the tree return
 immediately after a UI restart. Preview history is bounded to 20 entries per node and 2,000 globally,
-pruned on write; no raw PTY bytes, terminal grid or scrollback are stored. The product requires global,
+pruned on write; this semantic preview store contains no raw PTY bytes, terminal grid or scrollback.
+ADR-044's separate private bounded terminal archive does not feed hierarchy previews. The product requires global,
 per-Session and per-Agent visibility controls; protocol v3 currently enforces the per-node Agent control,
 while the broader scopes remain planned rather than client-local guesses.
 

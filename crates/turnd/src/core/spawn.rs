@@ -385,10 +385,20 @@ impl Core {
             clean_env: false,
         };
 
-        let pty = match PtyProcess::spawn(node_id.clone(), spec, now_ms) {
+        let journal_dir = self
+            .terminal_history_enabled(session_id)
+            .then(|| paths::node_terminal_history(&self.data_dir, session_id, &node_id));
+        let pty_result = match &journal_dir {
+            Some(dir) => PtyProcess::spawn_persisted(node_id.clone(), spec, now_ms, dir),
+            None => PtyProcess::spawn(node_id.clone(), spec, now_ms),
+        };
+        let pty = match pty_result {
             Ok(pty) => pty,
             Err(error) => {
                 self.revoke(token.as_deref());
+                if journal_dir.is_some() {
+                    paths::remove_node_terminal_history(&self.data_dir, session_id, &node_id);
+                }
                 return Err(ProtoError::new(
                     ErrorCode::Unavailable,
                     format!("Could not start `{command}`"),
@@ -396,6 +406,7 @@ impl Core {
                 .with_detail(error.to_string()));
             }
         };
+        self.recovered_terminals.remove(&node_id);
 
         let pid = pty.pid();
         // What actually runs, which is not always what the user typed: an adapter may
@@ -519,13 +530,24 @@ impl Core {
             size: INITIAL_SIZE,
             clean_env: false,
         };
-        let pty = PtyProcess::spawn(node_id.clone(), spec, now_ms).map_err(|error| {
+        let journal_dir = self
+            .terminal_history_enabled(session_id)
+            .then(|| paths::node_terminal_history(&self.data_dir, session_id, &node_id));
+        let pty_result = match &journal_dir {
+            Some(dir) => PtyProcess::spawn_persisted(node_id.clone(), spec, now_ms, dir),
+            None => PtyProcess::spawn(node_id.clone(), spec, now_ms),
+        };
+        let pty = pty_result.map_err(|error| {
+            if journal_dir.is_some() {
+                paths::remove_node_terminal_history(&self.data_dir, session_id, &node_id);
+            }
             ProtoError::new(
                 ErrorCode::Unavailable,
                 format!("Could not run the start-up command `{command}`"),
             )
             .with_detail(error.to_string())
         })?;
+        self.recovered_terminals.remove(&node_id);
         let pid = pty.pid();
 
         self.watch_exit(&node_id, &pty);
@@ -600,12 +622,26 @@ impl Core {
             pump.abort();
         }
         let process = self.processes.remove(node)?;
+        let session_id = process.session_id.clone();
         // The screen was a view of this pty. With the pty gone there is nothing for it
         // to be a view of, and a stale grid would be diffed against on the next attach.
         self.forget_screen(node);
         self.revoke(process.hook_token.as_deref());
         let info = process.pty.exit_info();
         drop(process);
+        if self.terminal_history_enabled(&session_id) {
+            let dir = paths::node_terminal_history(&self.data_dir, &session_id, node);
+            match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+                Ok(Some(recovered)) => {
+                    self.recovered_terminals
+                        .insert(node.clone(), recovered.buffer);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%node, %error, "could not retain terminal after releasing its PTY");
+                }
+            }
+        }
         info
     }
 }

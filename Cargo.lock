@@ -3991,11 +3991,13 @@ dependencies = [
 name = "turn-pty"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "libc",
  "portable-pty",
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

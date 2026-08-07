@@ -43,6 +43,7 @@ axum = "0.8"
 directories = "6.0"
 regex = "1.11"
 shell-words = "1.1"
+crc32fast = "1.5"
 
 [profile.release]
 lto = "thin"

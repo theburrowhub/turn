@@ -6,7 +6,7 @@
 //! in the binary can see.
 
 use crate::error::{DaemonError, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use turn_core::ids::{NodeId, SessionId};
@@ -22,6 +22,9 @@ pub const SCRATCH_DIR: &str = "scratch";
 
 /// Daemon-owned default root for isolated Git worktrees.
 pub const WORKTREES_DIR: &str = "worktrees";
+
+/// Private per-pane terminal checkpoints and journals.
+pub const TERMINAL_HISTORY_DIR: &str = "terminal-history";
 
 /// Longest socket path we will attempt.
 ///
@@ -91,6 +94,18 @@ pub fn worktree_root(data_dir: &Path, workspace: &turn_core::ids::WorkspaceId) -
     data_dir.join(WORKTREES_DIR).join(workspace.as_str())
 }
 
+pub fn terminal_history_root(data_dir: &Path) -> PathBuf {
+    data_dir.join(TERMINAL_HISTORY_DIR)
+}
+
+pub fn session_terminal_history(data_dir: &Path, session: &SessionId) -> PathBuf {
+    terminal_history_root(data_dir).join(session.as_str())
+}
+
+pub fn node_terminal_history(data_dir: &Path, session: &SessionId, node: &NodeId) -> PathBuf {
+    session_terminal_history(data_dir, session).join(node.as_str())
+}
+
 /// Where a session's injected agent configuration lives.
 ///
 /// Keyed by session so closing one takes its configuration with it, and inside
@@ -134,6 +149,66 @@ pub fn remove_node_scratch(data_dir: &Path, session: &SessionId, node: &NodeId) 
     }
 }
 
+/// Deletes one retired node's terminal history without following a symlink planted
+/// inside the data directory.
+pub fn remove_node_terminal_history(data_dir: &Path, session: &SessionId, node: &NodeId) {
+    let root = terminal_history_root(data_dir);
+    if !private_directory_or_remove(&root, "terminal history root") {
+        return;
+    }
+    let session_dir = session_terminal_history(data_dir, session);
+    if !private_directory_or_remove(&session_dir, "session terminal history") {
+        return;
+    }
+    remove_private_entry(
+        &node_terminal_history(data_dir, session, node),
+        "node terminal history",
+    );
+}
+
+/// Deletes all terminal history for a session that opted out of persistence.
+pub fn remove_session_terminal_history(data_dir: &Path, session: &SessionId) {
+    let root = terminal_history_root(data_dir);
+    if !private_directory_or_remove(&root, "terminal history root") {
+        return;
+    }
+    remove_private_entry(
+        &session_terminal_history(data_dir, session),
+        "session terminal history",
+    );
+}
+
+/// Returns true only for a real directory. Unexpected files and symlinks are removed
+/// as entries themselves, never followed, so callers can safely inspect below it.
+fn private_directory_or_remove(path: &Path, label: &str) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => {
+            remove_private_entry(path, label);
+            false
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not inspect {label}");
+            false
+        }
+    }
+}
+
+fn remove_private_entry(path: &Path, label: &str) {
+    let result = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => std::fs::remove_dir_all(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::warn!(path = %path.display(), %error, "could not remove {label}");
+    }
+}
+
 /// Removes scratch directories belonging to sessions that no longer exist.
 ///
 /// A daemon killed with `SIGKILL` leaves these behind. They are small, but they
@@ -152,6 +227,45 @@ pub fn prune_scratch(data_dir: &Path, known: &HashSet<String>) -> usize {
         }
         if std::fs::remove_dir_all(entry.path()).is_ok() {
             removed += 1;
+        }
+    }
+    removed
+}
+
+/// Removes journals for sessions and nodes no longer present in the durable model.
+///
+/// Directory entries are treated as hostile filesystem input: symlinks are unlinked,
+/// never traversed.
+pub fn prune_terminal_history(data_dir: &Path, known: &HashMap<String, HashSet<String>>) -> usize {
+    let root = terminal_history_root(data_dir);
+    if !private_directory_or_remove(&root, "terminal history root") {
+        return 0;
+    }
+    let Ok(sessions) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for session in sessions.flatten() {
+        let session_name = session.file_name().to_string_lossy().to_string();
+        if !private_directory_or_remove(&session.path(), "terminal history session") {
+            removed += 1;
+            continue;
+        }
+        let Some(nodes) = known.get(&session_name) else {
+            remove_private_entry(&session.path(), "stale terminal history");
+            removed += 1;
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for node in entries.flatten() {
+            let node_name = node.file_name().to_string_lossy().to_string();
+            let is_directory = node.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_directory || !nodes.contains(&node_name) {
+                remove_private_entry(&node.path(), "stale node terminal history");
+                removed += 1;
+            }
         }
     }
     removed
@@ -251,5 +365,65 @@ mod tests {
         assert_eq!(prune_scratch(data, &known), 1);
         assert!(session_scratch(data, &live).exists());
         assert!(!session_scratch(data, &gone).exists());
+    }
+
+    #[test]
+    fn pruning_terminal_history_keeps_only_durable_sessions_and_nodes() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let live = SessionId::from_stored("sess_live");
+        let keep = NodeId::from_stored("proc_keep");
+        let retired = NodeId::from_stored("proc_retired");
+        let gone = SessionId::from_stored("sess_gone");
+        ensure_dir(&node_terminal_history(data, &live, &keep)).unwrap();
+        ensure_dir(&node_terminal_history(data, &live, &retired)).unwrap();
+        ensure_dir(&node_terminal_history(data, &gone, &NodeId::new())).unwrap();
+
+        let known = HashMap::from([(live.to_string(), HashSet::from([keep.to_string()]))]);
+        assert_eq!(prune_terminal_history(data, &known), 2);
+        assert!(node_terminal_history(data, &live, &keep).exists());
+        assert!(!node_terminal_history(data, &live, &retired).exists());
+        assert!(!session_terminal_history(data, &gone).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_terminal_history_unlinks_a_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let session = SessionId::from_stored("sess_live");
+        let node = NodeId::from_stored("proc_link");
+        let outside = temp.path().join("outside");
+        ensure_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"safe").unwrap();
+        ensure_dir(&session_terminal_history(data, &session)).unwrap();
+        symlink(&outside, node_terminal_history(data, &session, &node)).unwrap();
+
+        remove_node_terminal_history(data, &session, &node);
+        assert!(outside.join("keep").exists());
+        assert!(!node_terminal_history(data, &session, &node).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_unlinks_a_known_session_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path();
+        let session = SessionId::from_stored("sess_live");
+        let node = NodeId::from_stored("proc_keep");
+        let outside = temp.path().join("outside");
+        ensure_dir(&terminal_history_root(data)).unwrap();
+        ensure_dir(&outside).unwrap();
+        std::fs::write(outside.join(node.as_str()), b"safe").unwrap();
+        symlink(&outside, session_terminal_history(data, &session)).unwrap();
+
+        let known = HashMap::from([(session.to_string(), HashSet::from([node.to_string()]))]);
+        assert_eq!(prune_terminal_history(data, &known), 1);
+        assert_eq!(std::fs::read(outside.join(node.as_str())).unwrap(), b"safe");
+        assert!(!session_terminal_history(data, &session).exists());
     }
 }

@@ -91,9 +91,10 @@ pub mod view;
 
 pub use bytes::{decode_base64, encode_base64, Base64Error, TerminalBytes};
 #[cfg(feature = "vt100")]
-pub use cells::from_screen;
+pub use cells::{from_screen, scrollback_from_screen};
 pub use cells::{
-    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, MAX_SCREEN_CELLS,
+    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, Scrollback,
+    MAX_SCREEN_CELLS, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
 };
 pub use envelope::{
     negotiate, negotiate_within, peek_version, version_refusal, ClientFrame, ClientMessage, Hello,

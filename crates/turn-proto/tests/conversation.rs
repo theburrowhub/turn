@@ -159,6 +159,7 @@ fn a_full_working_conversation_completes_over_the_real_framing() {
                 node_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(screen.clone())),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(40, 120),
                 scrollback_truncated: false,
@@ -299,6 +300,7 @@ fn a_ui_restart_rebuilds_its_terminals_without_touching_the_processes() {
                 node_id: Some(node_id),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(Grid::from_lines(&["still waiting"], 80))),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(24, 80),
                 // A long-running build overflowed the daemon's ring, and the
@@ -367,6 +369,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
                 node_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(daemon_screen.clone())),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(2, 40),
                 scrollback_truncated: false,

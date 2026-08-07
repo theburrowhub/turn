@@ -198,6 +198,8 @@ impl Core {
             self.expected_exits.remove(retired);
             self.discard_process(retired);
             crate::paths::remove_node_scratch(&self.data_dir, session_id, retired);
+            self.recovered_terminals.remove(retired);
+            crate::paths::remove_node_terminal_history(&self.data_dir, session_id, retired);
         }
         let restore_update = self.resolve_restore_node(session_id, node_id);
         if let Ok(session) = self.session_mut(session_id) {

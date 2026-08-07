@@ -763,6 +763,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
   "screen":{"rows":40,"cols":120,"cursor":[1,0],
             "runs":[[{"t":"ready","n":5,"f":[0,205,0]},{"n":115}],
                     [{"n":120}],"…"]},
+  "scrollback":{"cols":120,"rows":[[{"t":"previous output","n":15},{"n":105}]]},
   "size":{"rows":40,"cols":120},
   "scrollback_truncated":false,"bytes_seen":12,"next_seq":0}}}
 ```
@@ -773,18 +774,22 @@ pane exactly as the user left it.
 
 Exactly one payload is present, decided by `stream`:
 
-- **`screen`** for a cells attachment — a `Grid` (§2.2). `replay` is absent.
+- **`screen`** for a cells attachment — a `Grid` (§2.2), plus bounded styled
+  `scrollback` rows when history exists. `replay` is absent.
 - **`replay`** for a byte attachment — the **parsed screen re-emitted**, not the raw
   scrollback, because a truncated raw ring can begin mid-escape-sequence and corrupt the
   receiving terminal. `screen` is absent.
 
 Sending both would double the cost of every attach to serve a client that asked for one.
 
-- `size` is the size the client asked for, applied to the pty *before* the screen or
-  replay was taken.
-- `scrollback_truncated` means output was dropped from the daemon's ring before this
-  point. The screen is still correct; the history above it is incomplete, and the UI
-  should say so rather than let the user scroll up into a lie.
+- `size` is the applied live PTY size. For a display-only terminal recovered after a
+  daemon restart it is the historical size the archived grid was recorded at.
+- `scrollback` is oldest-first compact `CellRun` rows, validated against its `cols`.
+  It is capped at 5,000 rows and a 3 MiB serialized budget so the whole attachment
+  stays inside the frame limit.
+- `scrollback_truncated` means output was discarded by memory/disk rotation or the
+  attachment budget. The screen is still correct; the history above it is incomplete,
+  and the UI must mark the boundary rather than let the user scroll into a lie.
 - `next_seq` is the `seq` the next update for this attachment will carry — a
   `pane_screen` for cells, a `pane_output` for bytes — so a client can detect a gap
   between what it was handed and the live stream.
@@ -1173,9 +1178,10 @@ from typing, and `mouse` (`none` \| `press` \| `button_motion` \| `any_motion`) 
 whether a wheel notch is a mouse report or Turn's own scrollback. Getting any of them
 wrong breaks arrow keys inside `vim`.
 
-`scrollback_offset` and `scrollback_len` are reported as 0 today: the daemon serves the
-live screen only, and there is no request that asks for history. A client should treat
-them as "no history offered" rather than as "no history exists".
+The attached live `Grid` starts with `scrollback_offset = 0`; `PaneAttachment.scrollback`
+seeds the client's transcript. The client then reports that transcript's length in
+`scrollback_len` and changes `scrollback_offset` as the user scrolls. A resync replaces
+the live grid, while a fresh attach is the operation that re-seeds durable history.
 
 ### `SessionDetails`
 

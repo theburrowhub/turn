@@ -8,8 +8,10 @@
 //! an unbounded queue and take the daemon down with it.
 
 use crate::buffer::{ScreenSize, ScreenSnapshot, TerminalBuffer};
+use crate::journal::{JournalConfig, TerminalJournal};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, watch};
@@ -38,6 +40,8 @@ pub enum PtyError {
     Io(#[from] std::io::Error),
     #[error("could not determine the process id")]
     NoPid,
+    #[error("could not open terminal history at `{path}`: {cause}")]
+    Journal { path: PathBuf, cause: String },
 }
 
 /// What to launch.
@@ -134,6 +138,7 @@ impl ExitInfo {
 pub type OutputChunk = Arc<Vec<u8>>;
 
 type SharedChild = Arc<Mutex<Box<dyn Child + Send + Sync>>>;
+type SharedJournal = Arc<Mutex<Option<TerminalJournal>>>;
 
 /// A live process attached to a pty.
 pub struct PtyProcess {
@@ -144,6 +149,7 @@ pub struct PtyProcess {
     writer: Mutex<Box<dyn Write + Send>>,
     child: SharedChild,
     buffer: Arc<Mutex<TerminalBuffer>>,
+    journal: Option<SharedJournal>,
     output_tx: broadcast::Sender<OutputChunk>,
     exit_rx: watch::Receiver<Option<ExitInfo>>,
     /// Set when the reader thread sees EOF, which happens before the exit status
@@ -156,10 +162,35 @@ pub struct PtyProcess {
 impl PtyProcess {
     /// Opens a pty, launches the command on it and starts pumping output.
     pub fn spawn(node_id: NodeId, spec: ProcessSpec, now_ms: i64) -> Result<Self, PtyError> {
+        Self::spawn_internal(node_id, spec, now_ms, None)
+    }
+
+    /// Spawns a process whose authoritative output is also written to a durable,
+    /// bounded terminal journal.
+    pub fn spawn_persisted(
+        node_id: NodeId,
+        spec: ProcessSpec,
+        now_ms: i64,
+        journal_dir: impl AsRef<Path>,
+    ) -> Result<Self, PtyError> {
+        Self::spawn_internal(
+            node_id,
+            spec,
+            now_ms,
+            Some((journal_dir.as_ref().to_path_buf(), JournalConfig::default())),
+        )
+    }
+
+    fn spawn_internal(
+        node_id: NodeId,
+        spec: ProcessSpec,
+        now_ms: i64,
+        journal_spec: Option<(PathBuf, JournalConfig)>,
+    ) -> Result<Self, PtyError> {
         let pair = open_pty_with_retry(spec.size)?;
 
         let builder = build_command(&spec, &node_id);
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(builder)
             .map_err(|e| PtyError::Spawn {
@@ -180,6 +211,29 @@ impl PtyProcess {
             .map_err(|e| PtyError::OpenPty(e.to_string()))?;
 
         let buffer = Arc::new(Mutex::new(TerminalBuffer::new(spec.size)));
+        let journal = match journal_spec {
+            Some((path, config)) => {
+                let opened = buffer
+                    .lock()
+                    .map_err(|_| PtyError::Unavailable)
+                    .and_then(|buffer| {
+                        TerminalJournal::create(&path, &buffer, config).map_err(|error| {
+                            PtyError::Journal {
+                                path: path.clone(),
+                                cause: error.to_string(),
+                            }
+                        })
+                    });
+                match opened {
+                    Ok(journal) => Some(Arc::new(Mutex::new(Some(journal)))),
+                    Err(error) => {
+                        let _ = child.kill();
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
         let (output_tx, _) = broadcast::channel(OUTPUT_CHANNEL_CAPACITY);
         let (exit_tx, exit_rx) = watch::channel(None);
         let reader_finished = Arc::new(AtomicBool::new(false));
@@ -191,6 +245,7 @@ impl PtyProcess {
             output_tx.clone(),
             Arc::clone(&reader_finished),
             node_id.clone(),
+            journal.clone(),
         );
         spawn_waiter(Arc::clone(&child), exit_tx, pid, node_id.clone());
 
@@ -202,6 +257,7 @@ impl PtyProcess {
             writer: Mutex::new(writer),
             child,
             buffer,
+            journal,
             output_tx,
             exit_rx,
             reader_finished,
@@ -252,6 +308,17 @@ impl PtyProcess {
             .map_err(|e| PtyError::OpenPty(e.to_string()))?;
         if let Ok(mut buffer) = self.buffer.lock() {
             buffer.resize(size);
+            if let Some(shared) = &self.journal {
+                if let Ok(mut journal) = shared.lock() {
+                    if let Some(writer) = journal.as_mut() {
+                        if let Err(error) = writer.record_resize(size, &mut buffer) {
+                            tracing::error!(%self.node_id, %error, "terminal journal failed; persistence disabled for this process");
+                            buffer.mark_truncated();
+                            *journal = None;
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -370,6 +437,14 @@ impl Drop for PtyProcess {
         if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
         }
+        // The reader thread is detached and may take a moment to observe EOF. Close its
+        // journal synchronously before the daemon releases data-dir ownership, so a new
+        // daemon generation can never race an old writer over the same files.
+        if let Some(shared) = &self.journal {
+            if let Ok(mut journal) = shared.lock() {
+                journal.take();
+            }
+        }
     }
 }
 
@@ -457,6 +532,7 @@ fn spawn_reader(
     output_tx: broadcast::Sender<OutputChunk>,
     finished: Arc<AtomicBool>,
     node: NodeId,
+    journal: Option<SharedJournal>,
 ) {
     std::thread::Builder::new()
         .name(format!("turn-pty-{node}"))
@@ -471,6 +547,17 @@ fn spawn_reader(
                         // so it is written before the broadcast.
                         if let Ok(mut buffer) = buffer.lock() {
                             buffer.write(&data);
+                            if let Some(shared) = &journal {
+                                if let Ok(mut journal) = shared.lock() {
+                                    if let Some(writer) = journal.as_mut() {
+                                        if let Err(error) = writer.record_output(&data, &mut buffer) {
+                                            tracing::error!(%node, %error, "terminal journal failed; persistence disabled for this process");
+                                            buffer.mark_truncated();
+                                            *journal = None;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // A send failure only means nobody is listening right
                         // now; the buffer still holds the bytes.

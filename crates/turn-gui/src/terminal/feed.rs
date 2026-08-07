@@ -19,9 +19,9 @@
 //!
 //! ## Scrollback, and what it can honestly be
 //!
-//! The protocol has no request for history: the daemon sends the *screen*, and
-//! `attach_pane` hands over the screen rather than the scrollback. So the window's
-//! history is what the window has watched go past, kept in [`Transcript`].
+//! `attach_pane` hands over the daemon's bounded durable scrollback with the screen.
+//! The window seeds [`Transcript`] from it, then extends that history with rows it
+//! watches leave the live screen.
 //!
 //! It is recorded only when it can be proved. When a screen arrives, the feed looks
 //! for the shift that exactly explains it — every row of the new screen equal to the
@@ -69,6 +69,14 @@ pub struct Transcript {
 }
 
 impl Transcript {
+    fn from_rows(rows: Vec<Vec<Cell>>) -> Self {
+        let mut transcript = Self::default();
+        for row in rows {
+            transcript.push(row);
+        }
+        transcript
+    }
+
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -129,12 +137,19 @@ impl PaneFeed {
             Some(grid) => (**grid).clone(),
             None => Grid::blank(attachment.size.rows, attachment.size.cols),
         };
+        let decoded =
+            if attachment.scrollback.is_empty() || attachment.scrollback.cols() == screen.cols {
+                attachment.scrollback.decode_rows().ok()
+            } else {
+                None
+            };
+        let malformed_history = decoded.is_none() && !attachment.scrollback.is_empty();
         PaneFeed {
             screen,
-            transcript: Transcript::default(),
+            transcript: Transcript::from_rows(decoded.unwrap_or_default()),
             offset: 0,
             next_seq: attachment.next_seq,
-            daemon_truncated: attachment.scrollback_truncated,
+            daemon_truncated: attachment.scrollback_truncated || malformed_history,
             view: None,
         }
     }
@@ -370,12 +385,21 @@ mod tests {
             node_id: None,
             stream: PaneStream::Cells,
             screen: screen.map(Box::new),
+            scrollback: turn_proto::Scrollback::default(),
             replay: TerminalBytes::new(Vec::new()),
             size,
             scrollback_truncated: false,
             bytes_seen: 0,
             next_seq,
         }
+    }
+
+    fn scrollback(lines: &[&str], cols: u16) -> turn_proto::Scrollback {
+        let grid = screen(lines, lines.len().max(1) as u16, cols);
+        let rows: Vec<Vec<CellRun>> = (0..lines.len())
+            .map(|row| grid.row_runs(row as u16))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "cols": cols, "rows": rows })).unwrap()
     }
 
     /// A screen of a fixed height, padded like a real terminal's.
@@ -417,6 +441,26 @@ mod tests {
         assert_eq!(feed.grid().row_text(1), "running 3 tests");
         assert_eq!(feed.next_seq(), 1);
         assert_eq!(feed.size(), PtySize::new(6, 20));
+    }
+
+    #[test]
+    fn attaching_seeds_the_transcript_from_durable_scrollback() {
+        let live = screen(&["live-1", "live-2", "live-3"], 3, 12);
+        let mut attached = attachment(Some(live), 0);
+        attached.scrollback = scrollback(&["old-1", "old-2"], 12);
+        let mut feed = PaneFeed::attach(&attached);
+
+        assert_eq!(feed.history_rows(), 2);
+        assert!(feed.history_complete());
+        assert!(feed.scroll_by(2));
+        assert_eq!(
+            feed.grid()
+                .text()
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "live-1"]
+        );
     }
 
     #[test]
