@@ -36,20 +36,35 @@ impl Core {
     /// screen at the client's own size rather than as nothing: the pane is real, and a
     /// renderer with no grid at all has nothing to draw.
     pub(crate) fn build_grid(&self, node: &NodeId, size: PtySize) -> Grid {
+        self.build_grid_with_title(node, size).0
+    }
+
+    /// Builds cells and reads the process title under the same buffer lock.
+    ///
+    /// The outer `Option` distinguishes a successful observation of no title from a
+    /// missing or poisoned PTY, where title state must be left alone.
+    fn build_grid_with_title(
+        &self,
+        node: &NodeId,
+        size: PtySize,
+    ) -> (Grid, Option<Option<String>>) {
         let Some(process) = self.processes.get(node) else {
-            return Grid::blank(size.rows, size.cols);
+            return (Grid::blank(size.rows, size.cols), None);
         };
         let shared = process.pty.buffer();
-        let grid = match shared.lock() {
+        let built = match shared.lock() {
             // The one reading of what a parsed screen means as cells, shared with the
             // client — see `turn_proto::cells::from_screen`. Palette indices are
             // resolved and reversed video is applied there.
-            Ok(buffer) => turn_proto::from_screen(buffer.screen()),
+            Ok(buffer) => (
+                turn_proto::from_screen(buffer.screen()),
+                Some(buffer.title()),
+            ),
             // The mutex is only poisoned if a pty reader thread panicked while holding
             // it. The pane is still real, so a blank screen is the honest answer.
-            Err(_) => Grid::blank(size.rows, size.cols),
+            Err(_) => (Grid::blank(size.rows, size.cols), None),
         };
-        grid
+        built
     }
 
     /// The geometry a node's screen is currently drawn at.
@@ -100,14 +115,14 @@ impl Core {
     ///
     /// Called once per coalesced read, so a pane producing a flood produces one update
     /// per batching window rather than one per write.
-    pub(crate) fn deliver_screen(&mut self, node: &NodeId) {
+    pub(crate) fn deliver_screen(&mut self, node: &NodeId) -> Option<Option<String>> {
         let targets = self.cells_targets(node);
         if targets.is_empty() {
-            return;
+            return None;
         }
 
         let size = self.node_size(node, PtySize::default());
-        let grid = self.build_grid(node, size);
+        let (grid, observed_title) = self.build_grid_with_title(node, size);
         let update = match self.screens.get(node) {
             Some(previous) if previous == &grid => None,
             Some(previous) => Some(ScreenUpdate::between(previous, &grid)),
@@ -134,6 +149,8 @@ impl Core {
             };
             self.send_screen(client_id, &key, node, payload);
         }
+
+        observed_title
     }
 
     /// Rebuilds the baseline and sends the whole screen to everyone rendering it.

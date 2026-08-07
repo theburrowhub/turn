@@ -30,6 +30,20 @@ impl Core {
             return;
         };
 
+        // Keep the PTY read and registry mutation as two lookups. The first lookup
+        // immutably borrows `self.processes` while the buffer mutex is held; ending
+        // that borrow before the mutable lookup below is what keeps the lock out of
+        // the state projection and satisfies the borrow checker.
+        self.apply_observed_process_title(node_id, observed, now_ms);
+    }
+
+    /// Projects a title already read while another terminal operation held the lock.
+    pub(crate) fn apply_observed_process_title(
+        &mut self,
+        node_id: &NodeId,
+        observed: Option<String>,
+        now_ms: i64,
+    ) {
         let Some(process) = self.processes.get_mut(node_id) else {
             return;
         };
