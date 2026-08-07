@@ -91,6 +91,10 @@ impl ReadOnlySandbox {
                 return Ok(None);
             }
 
+            // Seatbelt accepts pathnames rather than directory capabilities. There is
+            // therefore an accepted TOCTOU window between resolving these names and
+            // `sandbox-exec` applying them; callers must treat this as a pathname
+            // boundary, not as protection against same-user namespace mutation.
             let root = canonical(checkout)?;
             if !root.is_dir() {
                 return Err(ReadOnlySandboxError::InvalidGitMetadata {
@@ -115,7 +119,7 @@ impl ReadOnlySandbox {
     }
 
     #[cfg(target_os = "macos")]
-    fn command_builder(&self, command: &str, args: &[String]) -> CommandBuilder {
+    fn command_builder(&self, command: &str) -> CommandBuilder {
         const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
         let mut profile = String::from("(version 1)\n(allow default)\n(deny file-write*\n");
         for index in 0..self.protected_paths.len() {
@@ -137,9 +141,6 @@ impl ReadOnlySandbox {
         builder.arg("-p");
         builder.arg(profile);
         builder.arg(command);
-        for arg in args {
-            builder.arg(arg);
-        }
         builder
     }
 
@@ -730,23 +731,20 @@ fn open_pty_with_retry(size: ScreenSize) -> Result<portable_pty::PtyPair, PtyErr
 fn build_command(spec: &ProcessSpec, node_id: &NodeId) -> CommandBuilder {
     #[cfg(target_os = "macos")]
     let mut builder = match &spec.read_only_sandbox {
-        Some(sandbox) => sandbox.command_builder(&spec.command, &spec.args),
-        None => {
-            let mut builder = CommandBuilder::new(&spec.command);
-            for arg in &spec.args {
-                builder.arg(arg);
-            }
-            builder
-        }
+        Some(sandbox) => sandbox.command_builder(&spec.command),
+        None => CommandBuilder::new(&spec.command),
     };
     #[cfg(not(target_os = "macos"))]
     let mut builder = {
-        let mut builder = CommandBuilder::new(&spec.command);
-        for arg in &spec.args {
-            builder.arg(arg);
-        }
-        builder
+        debug_assert!(
+            spec.read_only_sandbox.is_none(),
+            "a read-only sandbox must never be carried onto an unsupported platform"
+        );
+        CommandBuilder::new(&spec.command)
     };
+    for arg in &spec.args {
+        builder.arg(arg);
+    }
     if spec.clean_env {
         builder.env_clear();
     }

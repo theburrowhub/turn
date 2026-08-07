@@ -2614,6 +2614,10 @@ impl<'a> TurnView<'a> {
                             let pending = self
                                 .reclaiming_workspaces
                                 .contains(&workspace.workspace.id);
+                            // An unenforced read-only Session launches no processes, so
+                            // explicit promotion is its safe recovery path rather than an
+                            // action to hide. The daemon still performs the atomic mode and
+                            // lease transition and rejects any live runtime.
                             let available = summary.running_count == 0
                                 && workspace.write_lease.is_none()
                                 && !pending;
