@@ -163,7 +163,7 @@ impl Drop for DataDirLock {
 /// the kernel on process death. Any unsupported-filesystem error is propagated: a
 /// best-effort ownership guard is not an ownership guard.
 #[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     loop {
         // SAFETY: `file` owns a valid descriptor for the duration of the call. The
@@ -180,7 +180,7 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "data-directory process locking is unavailable on this platform",
@@ -191,7 +191,7 @@ fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
 /// inode other contenders will no longer open. This is an acquisition check; the
 /// lock file must never be removed during daemon operation or clean shutdown.
 #[cfg(unix)]
-fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let opened = file.metadata()?;
     let named = std::fs::symlink_metadata(path)?;
@@ -205,7 +205,7 @@ fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn verify_lock_identity(_file: &File, _path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_lock_identity(_file: &File, _path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

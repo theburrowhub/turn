@@ -697,6 +697,14 @@ never auto-adopts that authority. An explicit `acquire_workspace_write_lease` ma
 Session only after all of its runtime nodes have ended; success acquires the lease and changes the Session to
 `main_checkout` in the same durable transition.
 
+The wire lease is also the owner record for a uid-scoped host checkout lock independent of the daemon's
+data directory. Acquisition takes that lock before committing SQLite; heartbeat and launch require both.
+Symlink aliases collide and distinct checkout/worktree directory identities do not. If contention comes from
+another daemon, `workspace_write_lease_conflict` carries that daemon's owner but omits `focus_owner`, because
+the current socket cannot focus a Session owned by another daemon; the remaining alternatives are
+`create_read_only`, `create_isolated_worktree`, and `cancel`. A surviving writer process can retain this lock
+after daemon loss, so timeout or daemon death alone never authorises takeover.
+
 ### Examples
 
 ```jsonc

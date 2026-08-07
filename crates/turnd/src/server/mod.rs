@@ -172,6 +172,7 @@ pub async fn start(config: Config) -> Result<DaemonHandle> {
         Arc::clone(&hooks),
         config.registry,
         data_dir.clone(),
+        config.checkout_lock_dir,
         commands.clone(),
     ) {
         Ok(core) => core,

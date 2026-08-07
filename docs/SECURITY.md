@@ -255,6 +255,24 @@ or using a symlink alias cannot reset generation and resurrect a stale owner. Ac
 `recovery_required` claims all block a new writer until explicit fenced reconciliation; only `released` is
 non-blocking.
 
+That SQLite fence is joined to a host-global Unix lock independent of `data_dir`. Turn resolves the checkout
+directory to `(device, inode)` and uses one retained 0600 lock inode under the real, uid-owned 0700
+`checkout-locks` directory below Turn's stable platform data directory, independent of `TURN_DATA_DIR`.
+Unlike `/tmp` or a runtime directory, normal OS cleanup does not unlink live authority. Symlink aliases and
+directory renames therefore collide while
+distinct Git worktree directories do not. The file is opened with `O_NOFOLLOW`, its owner/type and named
+inode are verified, and the checkout identity is re-resolved after locking. Owner metadata is published by
+atomic sidecar rename so contention can return the other daemon's typed lease/session details.
+
+The daemon acquires the host lock before SQLite and supplies the same preallocated `LeaseId` to both halves.
+Every heartbeat and main-checkout launch requires the active SQLite generation and matching kernel lock.
+portable-pty still closes every unrelated descriptor, but explicitly preserves one duplicate of the
+checkout lock and clears `FD_CLOEXEC` only in the already-forked child. The parent copy remains CLOEXEC, so
+concurrent unrelated spawns cannot inherit it. Descendants inherit the same open-file description. Turn never
+calls `LOCK_UN`: explicit release first demotes SQLite and then closes the daemon descriptor; after a daemon
+crash the kernel releases authority only when the final surviving writer closes its copy. A replacement
+daemon therefore reconciles stale process state and reacquires the kernel lock before it can reclaim SQLite.
+
 Acquisition validates that Workspace, Session and checkout agree and that the checkout is the Workspace's
 primary one. Session assignment and acquisition commit atomically; init commands, process spawn and Pane
 materialisation occur only afterwards. A conflict rolls back all Session records and returns typed owner and
@@ -364,7 +382,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Required invariant | Required proof |
 | --- | --- |
 | One canonical data directory has one daemon owner | different sockets and symlink aliases are rejected before Store/restore; a real `SIGKILL` releases the kernel lock and stale socket recovery succeeds |
-| One canonical checkout has one blocking write claim per canonical data directory | concurrent acquisition through path aliases and recreated Workspaces in that store yields exactly one owner |
+| One canonical checkout has one host-global write owner | separate data dirs through a symlink alias return the first daemon's typed owner; a surviving descendant retains authority after daemon loss; its exit permits recovery; distinct real Git worktrees write concurrently |
 | Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |

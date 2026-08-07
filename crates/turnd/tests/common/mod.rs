@@ -56,6 +56,21 @@ impl TestDaemon {
         Self::start_with(AdapterRegistry::with_builtin).await
     }
 
+    /// Starts a plain daemon that shares a host-lock fixture with otherwise
+    /// independent data directories.
+    pub async fn start_plain_with_checkout_lock_dir(lock_dir: impl AsRef<Path>) -> Self {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let config = Config::in_dir(dir.path())
+            .with_registry(AdapterRegistry::with_builtin())
+            .with_checkout_lock_dir(lock_dir);
+        let handle = turnd::start(config).await.expect("the daemon must start");
+        Self {
+            dir,
+            handle: Some(handle),
+            registry: AdapterRegistry::with_builtin,
+        }
+    }
+
     pub async fn start_with(registry: fn() -> AdapterRegistry) -> Self {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let config = Config::in_dir(dir.path()).with_registry(registry());

@@ -10,7 +10,7 @@ use std::process::Command as SystemCommand;
 use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
     Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template, Workspace,
-    WorkspaceCheckout,
+    WorkspaceCheckout, WorkspaceWriteLease,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{
@@ -185,14 +185,32 @@ impl Core {
         // init command, or PTY behind.
         session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
+        if let Some(held) = self
+            .store
+            .hierarchy()
+            .active_lease(workspace_id)
+            .map_err(store)?
+        {
+            return Err(self.local_lease_conflict(workspace_id, Some(&id), held));
+        }
+        let claim = WorkspaceWriteLease::active(
+            workspace_id.clone(),
+            id.clone(),
+            session.checkout_id.clone(),
+            now_ms,
+        );
+        let checkout_lock = self.checkout_lock_claim(&session, &claim)?;
         // The store arbitrates and persists this Session in one IMMEDIATE
         // transaction. Nothing user-configured is executed before the exclusive
         // primary-checkout lease exists.
-        self.store
+        let lease = self
+            .store
             .hierarchy()
-            .create_session(&session, now_ms)
-            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
+            .create_session_with_lease_id(&session, Some(&claim.id), now_ms)
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?
+            .ok_or_else(|| ProtoError::internal("a main-checkout Session acquired no lease"))?;
         self.sessions.insert(id.clone(), session);
+        self.install_checkout_write_lock(&id, &lease, checkout_lock);
 
         self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
         self.materialise_session(&id, now_ms);
@@ -654,11 +672,29 @@ impl Core {
         // every one before a lease or a template init command has side effects.
         session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
-        self.store
+        if let Some(held) = self
+            .store
             .hierarchy()
-            .create_session(&session, now_ms)
-            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
+            .active_lease(workspace_id)
+            .map_err(store)?
+        {
+            return Err(self.local_lease_conflict(workspace_id, Some(&id), held));
+        }
+        let claim = WorkspaceWriteLease::active(
+            workspace_id.clone(),
+            id.clone(),
+            session.checkout_id.clone(),
+            now_ms,
+        );
+        let checkout_lock = self.checkout_lock_claim(&session, &claim)?;
+        let lease = self
+            .store
+            .hierarchy()
+            .create_session_with_lease_id(&session, Some(&claim.id), now_ms)
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?
+            .ok_or_else(|| ProtoError::internal("a main-checkout Session acquired no lease"))?;
         self.sessions.insert(id.clone(), session);
+        self.install_checkout_write_lock(&id, &lease, checkout_lock);
 
         let init: Vec<String> = workspace
             .init_commands

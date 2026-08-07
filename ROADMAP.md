@@ -504,16 +504,15 @@ strings alias through symlinks and spelling; a daemon can crash between side eff
 client can release a newer claim; deleting/recreating a Workspace can reset locally scoped generation.
 
 *Mitigated by:* canonical-path uniqueness across Workspaces and one monotonic fence per canonical path
-inside the canonical data directory,
+inside the canonical data directory, plus a uid-scoped host lock keyed by checkout device/inode across
+deliberately separate data directories,
 `BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release,
 blocking `recovery_required`, a canonical-data-directory process lock established before SQLite/restore, and
 canonical Session/Pane cwd containment repeated at the final PTY boundary. Adversarial tests cover concurrent
 aliases, delete/recreate generations, stale release, transaction rollback, same-data/different-socket daemons,
-symlink data-dir aliases, crash recovery, absolute/`..`/symlink cwd escapes and worktree→primary launches.
+symlink data-dir aliases, cross-data-dir checkout aliases, daemon loss with a surviving writer, independent
+Git worktrees, explicit release, absolute/`..`/symlink cwd escapes and worktree→primary launches.
 Migration 003 grants no lease; migration 006 trusts no pre-existing one.
-
-*Still missing:* a checkout-scoped OS lock across deliberately separate `--data-dir` installations. Today
-those stores are independent authority domains and can each claim the same path.
 
 *Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
 old writer stopped. Main-checkout/worktree cwd containment is not an OS sandbox. Read-only processes now add
