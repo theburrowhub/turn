@@ -19,7 +19,7 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | Crate | Status | Tests | Notes |
 | --- | --- | --- | --- |
 | `turn-core` | Built | reproduce | Domain, state, attention and ADR-040 hierarchy/lease/preview values. |
-| `turn-proto` | Built | reproduce | Framing, terminal cells and implemented protocol-v3 hierarchy operations. |
+| `turn-proto` | Built | reproduce | Framing, terminal cells, protocol-v3 hierarchy and protocol-v4 authenticated handshakes. |
 | `turn-store` | Built | reproduce | Append-only migrations, store-wide fences, hierarchy and secure hook cleanup. |
 | `turn-pty` | Built | reproduce | Ptys, buffers, supervision. |
 | `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
@@ -979,10 +979,11 @@ daemon vertical. Planned operations are labelled as such in `docs/PROTOCOL.md`; 
 
 ### 6.1 turn-proto — the daemon↔UI protocol
 
-**Status: protocol v3 hierarchy vertical built.** Framing, terminal cell transport,
+**Status: protocol v4 authenticated hierarchy vertical built.** Framing, terminal cell transport,
 request correlation and the safety omissions remain unchanged. Version 3 replaces independent navigation
 bootstrap with one revisioned hierarchy projection and adds structured checkout conflict, Preview, binding
-and per-surface tree-state operations. It is still types only — no I/O, tokio or socket — so the contract can
+and per-surface tree-state operations. Version 4 makes the opening `hello` carry the daemon generation's
+ephemeral capability. The protocol crate is still types only — no I/O, tokio or socket — so the contract can
 be tested without either process existing.
 
 **The connection.** A versioned envelope (`ClientFrame` / `ServerFrame`) carries four things: a
@@ -991,15 +992,15 @@ unsolicited `event` pushes at any time.
 
 ```text
 UI                                             turnd
- │  {"v":3,"type":"hello",…}                      │
+ │  {"v":4,"type":"hello","auth_token":…}       │
  │ ─────────────────────────────────────────────► │
- │                    {"v":3,"type":"welcome",…}  │   negotiate()
+ │                    {"v":4,"type":"welcome",…}  │   authenticate + negotiate()
  │ ◄───────────────────────────────────────────── │
- │  {"v":3,"type":"request","id":"r-1",…}         │
+ │  {"v":4,"type":"request","id":"r-1",…}         │
  │ ─────────────────────────────────────────────► │
- │                   {"v":3,"type":"response",…}  │   correlated by id
+ │                   {"v":4,"type":"response",…}  │   correlated by id
  │ ◄───────────────────────────────────────────── │
- │                      {"v":3,"type":"event",…}  │   unsolicited, any time
+ │                      {"v":4,"type":"event",…}  │   unsolicited, any time
  │ ◄───────────────────────────────────────────── │
 ```
 

@@ -21,6 +21,9 @@
 //! is strictly better than a UI that half works.
 
 use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use crate::cells::MAX_SCREEN_CELLS;
 use crate::error::{ErrorCode, ProtoError};
@@ -37,6 +40,10 @@ use crate::response::Response;
 /// bump it — nothing here uses `deny_unknown_fields`, so an older client ignores
 /// what it does not know and a newer client tolerates a daemon that omits it.
 ///
+/// **4** requires an ephemeral capability in the opening `Hello`. Authentication
+/// changes whether a previously valid request is accepted, so allowing a v3 client
+/// to connect would silently leave it unable to control its panes.
+///
 /// **3** replaces the singular reverse Pane pointer with authoritative
 /// `pane_bindings` and adds the unified Workspace hierarchy/lease contracts. A
 /// v2 client would silently misread a live node's view bindings, so this is
@@ -48,16 +55,98 @@ use crate::response::Response;
 /// expects `pane_output` bytes — would attach and then be sent `pane_screen` frames
 /// it has no code for. That is a change of meaning for an existing request rather
 /// than an addition, which is exactly what this constant is for.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest version this build still accepts from a peer.
 ///
 /// Kept separate from [`PROTOCOL_VERSION`] so a daemon can support a window of
 /// versions during a rollout rather than requiring both sides to move at once. The
-/// window is a single version at the moment because both v1→v2 and v2→v3 changed
-/// the meaning of existing fields. Half-compatible supervision is less safe than a
-/// loud upgrade requirement.
-pub const MIN_PROTOCOL_VERSION: u32 = 3;
+/// window is a single version at the moment because the previous upgrades changed
+/// either the meaning or the authority of existing fields. Half-compatible
+/// supervision is less safe than a loud upgrade requirement.
+pub const MIN_PROTOCOL_VERSION: u32 = 4;
+
+/// Suffix for the owner-only capability file next to a daemon socket.
+///
+/// Keeping this derivation in the wire crate makes alternate socket paths work for
+/// every client without also sharing daemon implementation code.
+pub const IPC_AUTH_TOKEN_SUFFIX: &str = ".token";
+
+/// Encoded size of a published daemon capability.
+pub const IPC_AUTH_TOKEN_HEX_BYTES: usize = 64;
+
+pub fn ipc_auth_token_path(socket: &Path) -> PathBuf {
+    let mut name = socket.as_os_str().to_os_string();
+    name.push(IPC_AUTH_TOKEN_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Safely reads and validates the capability published beside `socket`.
+///
+/// This lives with the path contract so the daemon probe and every UI enforce the
+/// same no-symlink, regular-file and exact-format rules.
+pub fn read_ipc_auth_token(socket: &Path) -> std::io::Result<AuthToken> {
+    read_ipc_auth_token_file(&ipc_auth_token_path(socket))
+}
+
+/// Safely reads and validates an already-derived capability-file path.
+///
+/// Daemon shutdown uses this form to compare a sidecar with its own generation
+/// before removing it.
+pub fn read_ipc_auth_token_file(path: &Path) -> std::io::Result<AuthToken> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability is not a regular file",
+        ));
+    }
+
+    let mut secret = String::with_capacity(IPC_AUTH_TOKEN_HEX_BYTES);
+    Read::by_ref(&mut file)
+        .take((IPC_AUTH_TOKEN_HEX_BYTES + 1) as u64)
+        .read_to_string(&mut secret)?;
+    if secret.len() != IPC_AUTH_TOKEN_HEX_BYTES
+        || !secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the daemon capability has an invalid format",
+        ));
+    }
+    Ok(AuthToken::new(secret))
+}
+
+/// The ephemeral capability presented in the opening handshake.
+///
+/// Serialisation intentionally exposes the value because it has to cross the local
+/// socket. Formatting never does, so a debug or error log cannot disclose it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AuthToken(String);
+
+impl AuthToken {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthToken([REDACTED])")
+    }
+}
 
 /// How binary payloads are carried.
 ///
@@ -84,16 +173,37 @@ pub struct Hello {
     pub client: String,
     /// The client's own release version, which is what a support message quotes.
     pub client_version: String,
+    /// Per-daemon capability read from the owner-only file beside the socket.
+    /// Optional on the wire so the daemon can return a precise authentication
+    /// refusal to old, probing or hand-written clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<AuthToken>,
     /// Encodings the client can decode, best first. An empty list means base64.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepts_encoding: Vec<OutputEncoding>,
 }
 
 impl Hello {
-    pub fn new(client: impl Into<String>, client_version: impl Into<String>) -> Self {
+    pub fn new(
+        client: impl Into<String>,
+        client_version: impl Into<String>,
+        auth_token: AuthToken,
+    ) -> Self {
         Self {
             client: client.into(),
             client_version: client_version.into(),
+            auth_token: Some(auth_token),
+            accepts_encoding: Vec::new(),
+        }
+    }
+
+    /// A hello used only to identify an occupant or exercise protocol framing. A
+    /// serving daemon refuses it before registering the client.
+    pub fn unauthenticated(client: impl Into<String>, client_version: impl Into<String>) -> Self {
+        Self {
+            client: client.into(),
+            client_version: client_version.into(),
+            auth_token: None,
             accepts_encoding: Vec::new(),
         }
     }

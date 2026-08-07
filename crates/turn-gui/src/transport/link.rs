@@ -29,7 +29,8 @@ pub enum LinkError {
         #[source]
         cause: std::io::Error,
     },
-    /// The daemon refused this build. Retrying cannot help.
+    /// The daemon refused the handshake. Authentication may recover after token
+    /// rotation; a protocol-version refusal cannot.
     #[error("{0}")]
     Refused(ProtoError),
     /// Something is listening on the socket but it is not a daemon.
@@ -48,6 +49,7 @@ impl LinkError {
     /// Whether trying again could plausibly work.
     pub fn is_retryable(&self) -> bool {
         matches!(self, LinkError::Io { .. } | LinkError::NotADaemon(_))
+            || matches!(self, LinkError::Refused(error) if error.code == ErrorCode::Unauthorized)
     }
 
     /// The failure in the protocol's own error shape, for the status line.
@@ -101,11 +103,15 @@ pub async fn connect(
     socket: &Path,
     client_version: &str,
 ) -> Result<(Connection, Welcome), LinkError> {
+    // Re-read on every attempt. A daemon restart rotates the capability, and a UI
+    // that cached it would turn a healthy restart into a permanent auth failure.
+    let auth_token = turn_proto::read_ipc_auth_token(socket)
+        .map_err(|cause| LinkError::io("could not read the daemon capability", cause))?;
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|cause| LinkError::io("no Turn daemon is listening", cause))?;
 
-    let hello = ClientFrame::hello(Hello::new("turn-gui", client_version));
+    let hello = ClientFrame::hello(Hello::new("turn-gui", client_version, auth_token));
     let frame = encode_checked(&hello, turn_proto::MAX_LINE_BYTES)
         .map_err(|error| LinkError::Unsendable(error.to_string()))?;
     stream
@@ -296,6 +302,11 @@ mod tests {
     use tokio::net::UnixListener;
     use turn_proto::{Response, ServerEvent};
 
+    fn remove_socket_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(turn_proto::ipc_auth_token_path(path));
+    }
+
     fn socket_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -303,7 +314,8 @@ mod tests {
             name,
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
+        std::fs::write(turn_proto::ipc_auth_token_path(&path), "a".repeat(64)).unwrap();
         path
     }
 
@@ -392,7 +404,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// The protocol's ordering rule over a real socket: the daemon answers the second
@@ -436,7 +448,7 @@ mod tests {
         );
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -467,7 +479,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// One bad line costs one line, exactly as the protocol says. A multiplexer that
@@ -517,7 +529,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// A refused handshake must surface as a refusal and not as "no daemon", because
@@ -544,7 +556,22 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
+    }
+
+    #[test]
+    fn an_auth_refusal_retries_only_after_the_caller_can_reread_the_rotated_token() {
+        let auth = LinkError::Refused(ProtoError::new(
+            ErrorCode::Unauthorized,
+            "the daemon capability rotated",
+        ));
+        assert!(auth.is_retryable());
+
+        let version = LinkError::Refused(ProtoError::new(
+            ErrorCode::UnsupportedVersion,
+            "the protocol is incompatible",
+        ));
+        assert!(!version.is_retryable());
     }
 
     #[tokio::test]
@@ -558,6 +585,7 @@ mod tests {
             "a missing daemon is worth waiting for"
         );
         assert_eq!(error.to_proto_error().code, ErrorCode::Unavailable);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -583,7 +611,7 @@ mod tests {
         assert_eq!(error.to_proto_error().code, ErrorCode::HandshakeRequired);
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -603,6 +631,6 @@ mod tests {
                 .await
                 .expect("the stream must end rather than hang");
         assert!(ended.is_none(), "got {ended:?}");
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 }

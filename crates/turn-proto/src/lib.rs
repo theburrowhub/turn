@@ -6,22 +6,23 @@
 //! renders and forwards keystrokes. That division is what makes processes survive a
 //! UI restart — the pty never belonged to the window — and it only holds if the
 //! boundary is described precisely enough that a second frontend could be written
-//! against it. This crate is that description: types, framing and nothing else. It
-//! has no I/O, no tokio, no socket.
+//! against it. This crate is that description: types, framing and the small
+//! owner-only capability-file reader every client must implement identically. It
+//! has no async I/O, no tokio and no socket ownership.
 //!
 //! ## The shape of a connection
 //!
 //! ```text
 //! UI                                             turnd
-//!  │  {"v":3,"type":"hello",…}                      │
+//!  │  {"v":4,"type":"hello",…}                      │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                    {"v":3,"type":"welcome",…}  │   negotiate()
+//!  │                    {"v":4,"type":"welcome",…}  │   negotiate()
 //!  │ ◄───────────────────────────────────────────── │
-//!  │  {"v":3,"type":"request","id":"r-1",…}         │
+//!  │  {"v":4,"type":"request","id":"r-1",…}         │
 //!  │ ─────────────────────────────────────────────► │
-//!  │                   {"v":3,"type":"response",…}  │   correlated by id
+//!  │                   {"v":4,"type":"response",…}  │   correlated by id
 //!  │ ◄───────────────────────────────────────────── │
-//!  │                      {"v":3,"type":"event",…}  │   unsolicited, any time
+//!  │                      {"v":4,"type":"event",…}  │   unsolicited, any time
 //!  │ ◄───────────────────────────────────────────── │
 //! ```
 //!
@@ -97,9 +98,10 @@ pub use cells::{
     MAX_SCREEN_CELLS, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
 };
 pub use envelope::{
-    negotiate, negotiate_within, peek_version, version_refusal, ClientFrame, ClientMessage, Hello,
-    Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION,
+    ipc_auth_token_path, negotiate, negotiate_within, peek_version, read_ipc_auth_token,
+    read_ipc_auth_token_file, version_refusal, AuthToken, ClientFrame, ClientMessage, Hello,
+    Limits, OutputEncoding, ServerFrame, ServerMessage, Welcome, IPC_AUTH_TOKEN_HEX_BYTES,
+    IPC_AUTH_TOKEN_SUFFIX, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 pub use error::{
     ErrorCode, ProtoError, ProtoErrorContext, SessionConflictAlternative, WriteLeaseOwnerView,

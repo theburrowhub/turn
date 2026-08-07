@@ -6,11 +6,17 @@
 //! is what keeps a client that has stopped reading from costing the daemon memory: its
 //! own requests stall, and nobody else's do.
 
+use super::security::{
+    ConnectionGuard, IpcAuthenticator, IpcCounters, RequestLimiter, HANDSHAKE_TIMEOUT,
+    MAX_CONSECUTIVE_MALFORMED_FRAMES, MAX_CONSECUTIVE_RATE_LIMITS, MAX_PREAUTH_FRAME_ERRORS,
+};
 use super::DaemonInfo;
 use crate::core::{ClientId, Command, CLIENT_FRAME_CAPACITY};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit};
 use turn_proto::envelope::{ClientMessage, Welcome};
 use turn_proto::{ClientFrame, ErrorCode, LineDecoder, ProtoError, ServerFrame};
 
@@ -23,23 +29,65 @@ const READ_CHUNK: usize = 64 * 1024;
 /// and one syscall per frame is a measurable share of the daemon's work for no benefit.
 const MAX_FRAMES_PER_WRITE: usize = 64;
 
+/// Resources granted by the accept loop for exactly one client lifetime.
+pub(super) struct ClientAdmission {
+    authenticator: Arc<IpcAuthenticator>,
+    stats: Arc<IpcCounters>,
+    _permit: OwnedSemaphorePermit,
+    _active: ConnectionGuard,
+}
+
+impl ClientAdmission {
+    pub(super) fn new(
+        authenticator: Arc<IpcAuthenticator>,
+        stats: Arc<IpcCounters>,
+        permit: OwnedSemaphorePermit,
+        active: ConnectionGuard,
+    ) -> Self {
+        Self {
+            authenticator,
+            stats,
+            _permit: permit,
+            _active: active,
+        }
+    }
+}
+
 /// Serves one connection from the handshake to the socket closing.
 pub(super) async fn serve(
     stream: UnixStream,
     id: ClientId,
     commands: mpsc::Sender<Command>,
     info: DaemonInfo,
+    admission: ClientAdmission,
 ) {
     let (mut read_half, write_half) = stream.into_split();
     let (frames, outbox) = mpsc::channel::<ServerFrame>(CLIENT_FRAME_CAPACITY);
-    let writer = tokio::spawn(write_frames(write_half, outbox));
+    let mut writer = tokio::spawn(write_frames(write_half, outbox));
 
     let mut decoder = LineDecoder::new();
     let mut buffer = vec![0u8; READ_CHUNK];
     let mut agreed: Option<u32> = None;
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut limiter = RequestLimiter::new(Instant::now());
+    let mut consecutive_rate_limits = 0u32;
+    let mut consecutive_bad_frames = 0u32;
+    let mut preauth_frame_errors = 0u32;
 
     'connection: loop {
-        let read = match read_half.read(&mut buffer).await {
+        let read_result = if agreed.is_none() {
+            match tokio::time::timeout_at(handshake_deadline, read_half.read(&mut buffer)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    admission.stats.reject_handshake_timeout();
+                    tracing::info!(%id, "refused IPC peer that did not complete its handshake");
+                    break;
+                }
+            }
+        } else {
+            read_half.read(&mut buffer).await
+        };
+        let read = match read_result {
             Ok(0) => break,
             Ok(read) => read,
             Err(error) => {
@@ -57,6 +105,15 @@ pub(super) async fn serve(
                     // would take every pane this UI is rendering with it.
                     tracing::debug!(%id, %error, "bad frame");
                     if send(&frames, ServerFrame::error(None, error.to_proto_error())).await {
+                        consecutive_bad_frames += 1;
+                        if agreed.is_none() {
+                            preauth_frame_errors += 1;
+                        }
+                        if consecutive_bad_frames >= MAX_CONSECUTIVE_MALFORMED_FRAMES
+                            || preauth_frame_errors >= MAX_PREAUTH_FRAME_ERRORS
+                        {
+                            break 'connection;
+                        }
                         continue;
                     }
                     break 'connection;
@@ -68,16 +125,53 @@ pub(super) async fn serve(
                 Err(error) => {
                     let fatal = error.code.is_fatal_to_connection();
                     let _ = send(&frames, ServerFrame::error(None, error)).await;
+                    consecutive_bad_frames += 1;
+                    if agreed.is_none() {
+                        preauth_frame_errors += 1;
+                    }
                     if fatal {
+                        break 'connection;
+                    }
+                    if consecutive_bad_frames >= MAX_CONSECUTIVE_MALFORMED_FRAMES
+                        || preauth_frame_errors >= MAX_PREAUTH_FRAME_ERRORS
+                    {
                         break 'connection;
                     }
                     continue;
                 }
             };
+            consecutive_bad_frames = 0;
+
+            if agreed.is_some() && !limiter.allow(Instant::now()) {
+                admission.stats.rate_limited();
+                consecutive_rate_limits += 1;
+                let error = ProtoError::new(
+                    ErrorCode::RateLimited,
+                    "This client is sending requests too quickly; back off before retrying",
+                );
+                let request_id = frame.request_id().cloned();
+                let _ = send(&frames, ServerFrame::error(request_id, error)).await;
+                if consecutive_rate_limits >= MAX_CONSECUTIVE_RATE_LIMITS {
+                    tracing::warn!(%id, "closed an IPC client after a sustained request flood");
+                    break 'connection;
+                }
+                continue;
+            }
+            consecutive_rate_limits = 0;
 
             match (&agreed, frame.message) {
                 // ------------------------------------------------------- handshake
                 (None, ClientMessage::Hello(hello)) => {
+                    if !admission.authenticator.verify(hello.auth_token.as_ref()) {
+                        admission.stats.reject_auth();
+                        let error = ProtoError::new(
+                            ErrorCode::Unauthorized,
+                            "This client did not present the current daemon capability",
+                        );
+                        tracing::warn!(%id, client = %hello.client, "refused an unauthenticated IPC handshake");
+                        let _ = send(&frames, ServerFrame::rejected(error)).await;
+                        break 'connection;
+                    }
                     match turn_proto::negotiate(frame.v) {
                         Ok(version) => {
                             let welcome =
@@ -176,7 +270,15 @@ pub(super) async fn serve(
         let _ = commands.send(Command::ClientClosed { client: id }).await;
     }
     drop(frames);
-    let _ = writer.await;
+    if tokio::time::timeout(std::time::Duration::from_secs(1), &mut writer)
+        .await
+        .is_err()
+    {
+        // A peer that never reads must not retain its descriptor, connection permit
+        // and writer task after the reader has decided the connection is over.
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 /// Parses a line into a frame, reporting a version problem as one.
@@ -290,8 +392,11 @@ mod tests {
         assert!(error.code.is_fatal_to_connection());
 
         // The same broken shape at a version this build does serve is simply broken.
-        let current = br#"{"v":3,"type":"request","id":"r-1","request":{"op":"resize_pane"}}"#;
-        let error = parse(current).expect_err("must be refused");
+        let current = format!(
+            r#"{{"v":{},"type":"request","id":"r-1","request":{{"op":"resize_pane"}}}}"#,
+            turn_proto::PROTOCOL_VERSION
+        );
+        let error = parse(current.as_bytes()).expect_err("must be refused");
         assert_eq!(error.code, ErrorCode::MalformedMessage);
     }
 
@@ -309,8 +414,11 @@ mod tests {
 
     #[test]
     fn a_frame_that_is_merely_wrong_is_reported_as_malformed() {
-        let line = br#"{"v":3,"type":"request","id":"r-1","request":{"op":"fly_to_the_moon"}}"#;
-        let error = parse(line).expect_err("must be refused");
+        let line = format!(
+            r#"{{"v":{},"type":"request","id":"r-1","request":{{"op":"fly_to_the_moon"}}}}"#,
+            turn_proto::PROTOCOL_VERSION
+        );
+        let error = parse(line.as_bytes()).expect_err("must be refused");
         assert_eq!(error.code, ErrorCode::MalformedMessage);
         assert!(
             !error.code.is_fatal_to_connection(),
@@ -320,8 +428,11 @@ mod tests {
 
     #[test]
     fn a_valid_frame_parses_at_the_current_version() {
-        let line = br#"{"v":3,"type":"hello","client":"turn-ui","client_version":"0.1.0"}"#;
-        let frame = parse(line).expect("must parse");
+        let line = format!(
+            r#"{{"v":{},"type":"hello","client":"turn-ui","client_version":"0.1.0"}}"#,
+            turn_proto::PROTOCOL_VERSION
+        );
+        let frame = parse(line.as_bytes()).expect("must parse");
         assert_eq!(frame.v, turn_proto::PROTOCOL_VERSION);
         assert!(matches!(frame.message, ClientMessage::Hello(_)));
     }

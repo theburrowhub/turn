@@ -46,7 +46,7 @@ restart instead of being attributed or resolved session-wide.
 | M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented and audited for the first vertical**; broader hardening remains |
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
-| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing and durable projections are built, measurement/packaging remain |
+| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing, durable projections and bounded authenticated IPC are built; measurement/packaging remain |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick

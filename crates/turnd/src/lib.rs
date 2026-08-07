@@ -46,7 +46,9 @@ pub mod server;
 pub use config::Config;
 pub use error::{DaemonError, Result};
 pub use options::Options;
-pub use server::{start, DaemonHandle};
+pub use server::{
+    start, DaemonHandle, IpcStats, MAX_IPC_CONNECTIONS, REQUESTS_PER_SECOND, REQUEST_BURST,
+};
 
 /// The daemon's own version, reported in the handshake.
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");

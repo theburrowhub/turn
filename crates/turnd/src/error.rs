@@ -40,6 +40,14 @@ pub enum DaemonError {
     )]
     AlreadyRunning { socket: PathBuf, pid: u32 },
 
+    /// A daemon-shaped peer rejected the probe before revealing its pid. It still
+    /// owns the socket and cannot safely be displaced.
+    #[error(
+        "a Turn daemon is already running on {socket} (pid unavailable); \
+         stop it before starting another"
+    )]
+    AlreadyRunningUnidentified { socket: PathBuf },
+
     /// Something is listening but it is not a Turn daemon, so the path cannot be
     /// taken over: removing it might break whatever owns it.
     #[error("{socket} is in use by something that is not a Turn daemon")]
@@ -55,6 +63,16 @@ pub enum DaemonError {
     #[error("could not listen on {socket}: {cause}")]
     Bind {
         socket: PathBuf,
+        #[source]
+        cause: std::io::Error,
+    },
+
+    /// The per-generation IPC capability must exist before the socket is exposed
+    /// to clients. Continuing without it would turn an authentication failure into
+    /// an unauthenticated daemon.
+    #[error("could not install IPC authentication token at {path}: {cause}")]
+    IpcAuthToken {
+        path: PathBuf,
         #[source]
         cause: std::io::Error,
     },
@@ -113,6 +131,7 @@ impl DaemonError {
             self,
             DaemonError::DataDirInUse { .. }
                 | DaemonError::AlreadyRunning { .. }
+                | DaemonError::AlreadyRunningUnidentified { .. }
                 | DaemonError::SocketNotOurs { .. }
         )
     }

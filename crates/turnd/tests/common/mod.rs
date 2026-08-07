@@ -23,8 +23,8 @@ use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_proto::envelope::{Hello, ServerMessage, Welcome};
 use turn_proto::{
-    ClientFrame, Grid, LineDecoder, PaneAttachment, PaneStream, ProtoError, PtySize, Request,
-    RequestId, Response, ServerEvent, ServerFrame, TreeNodeView,
+    AuthToken, ClientFrame, Grid, LineDecoder, PaneAttachment, PaneStream, ProtoError, PtySize,
+    Request, RequestId, Response, ServerEvent, ServerFrame, TreeNodeView,
 };
 use turnd::{Config, DaemonHandle};
 
@@ -150,11 +150,29 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(socket: &Path) -> Self {
+        let token_path = turn_proto::ipc_auth_token_path(socket);
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let token = loop {
+            match std::fs::read_to_string(&token_path) {
+                Ok(token) => break token,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!(
+                    "could not read auth token for {}: {error}",
+                    socket.display()
+                ),
+            }
+        };
+        Self::connect_with_token(socket, AuthToken::new(token)).await
+    }
+
+    pub async fn connect_with_token(socket: &Path, token: AuthToken) -> Self {
         let mut stream = UnixStream::connect(socket)
             .await
             .unwrap_or_else(|error| panic!("could not connect to {}: {error}", socket.display()));
 
-        let hello = ClientFrame::hello(Hello::new("turn-test", "0.1.0"));
+        let hello = ClientFrame::hello(Hello::new("turn-test", "0.1.0", token));
         write_frame(&mut stream, &hello).await;
 
         let mut client = Self {
