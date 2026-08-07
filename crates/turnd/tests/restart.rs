@@ -1165,12 +1165,15 @@ async fn a_restart_relaunches_nothing_even_for_a_pane_that_says_it_is_safe_to() 
     let session_id = before.summary.id.clone();
 
     // The custom Coding fixture's shell pane asks to be relaunched on restore; the agent pane
-    // does not. Both must be left alone.
+    // does not. Fang is optional and may never have launched, so only panes that actually had
+    // a process can produce a process-restoration outcome. Every such pane must be left alone.
     let eager: Vec<_> = before
         .layout
         .panes()
         .into_iter()
-        .filter(|pane| pane.restore == turn_core::model::RestoreBehaviour::Relaunch)
+        .filter(|pane| {
+            pane.restore == turn_core::model::RestoreBehaviour::Relaunch && pane.node_id.is_some()
+        })
         .map(|pane| pane.id.clone())
         .collect();
     assert!(
