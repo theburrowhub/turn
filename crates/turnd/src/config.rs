@@ -65,13 +65,26 @@ impl Config {
         })
     }
 
-    /// A self-contained daemon whose socket, database and scratch space all live in
-    /// one directory. This is what a test wants: no environment, no shared state.
+    /// A daemon whose socket, database and scratch space all live in one directory.
+    ///
+    /// Checkout authority deliberately remains in Turn's stable platform data
+    /// directory. Direct embedders must converge with command-line daemons even
+    /// when their state directories differ. Tests that need complete isolation can
+    /// explicitly replace that root with [`Config::with_checkout_lock_dir`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when this host has no platform data directory. Starting without one
+    /// would otherwise require a private fallback and silently weaken host-global
+    /// checkout exclusion.
     pub fn in_dir(dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref().to_path_buf();
+        let checkout_lock_dir = paths::checkout_lock_dir().unwrap_or_else(|error| {
+            panic!("Turn needs a platform data directory for checkout authority: {error}")
+        });
         Self {
             socket_path: dir.join(paths::SOCKET_FILE),
-            checkout_lock_dir: dir.join(paths::CHECKOUT_LOCKS_DIR),
+            checkout_lock_dir,
             data_dir: dir,
             persist: true,
             registry: AdapterRegistry::with_builtin(),
@@ -115,18 +128,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_directory_config_keeps_everything_inside_that_directory() {
+    fn a_directory_config_keeps_state_local_but_checkout_authority_global() {
         let config = Config::in_dir("/tmp/turn-test");
         assert_eq!(config.data_dir, PathBuf::from("/tmp/turn-test"));
         assert_eq!(
             config.checkout_lock_dir,
-            PathBuf::from("/tmp/turn-test/checkout-locks")
+            paths::checkout_lock_dir().unwrap()
         );
         assert_eq!(
             config.socket_path,
             PathBuf::from("/tmp/turn-test/turnd.sock")
         );
         assert!(config.persist);
+    }
+
+    #[test]
+    fn directory_configs_share_checkout_authority_until_a_test_overrides_it() {
+        let first = Config::in_dir("/tmp/turn-first");
+        let second = Config::in_dir("/tmp/turn-second");
+        assert_eq!(first.checkout_lock_dir, second.checkout_lock_dir);
+
+        let isolated = second.with_checkout_lock_dir("/tmp/turn-fixture-locks");
+        assert_eq!(
+            isolated.checkout_lock_dir,
+            PathBuf::from("/tmp/turn-fixture-locks")
+        );
     }
 
     #[test]
