@@ -156,8 +156,10 @@ impl IpcAuthenticator {
         &self.path
     }
 
-    /// Revokes this generation before deleting its file. Content comparison keeps
-    /// a late shutdown from deleting a newer generation's replacement.
+    /// Revokes this generation before deleting its file. The process-level data-dir
+    /// lock remains held across this call, so a replacement generation cannot
+    /// publish between the comparison and deletion. Comparing contents additionally
+    /// avoids deleting a sidecar independently replaced within this generation.
     pub(super) fn revoke(&self) {
         self.active.store(false, Ordering::Release);
         let Ok(current) = turn_proto::read_ipc_auth_token_file(&self.path) else {

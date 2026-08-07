@@ -302,6 +302,11 @@ mod tests {
     use tokio::net::UnixListener;
     use turn_proto::{Response, ServerEvent};
 
+    fn remove_socket_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(turn_proto::ipc_auth_token_path(path));
+    }
+
     fn socket_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -309,10 +314,8 @@ mod tests {
             name,
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&path);
-        let token_path = turn_proto::ipc_auth_token_path(&path);
-        let _ = std::fs::remove_file(&token_path);
-        std::fs::write(token_path, "a".repeat(64)).unwrap();
+        remove_socket_files(&path);
+        std::fs::write(turn_proto::ipc_auth_token_path(&path), "a".repeat(64)).unwrap();
         path
     }
 
@@ -401,7 +404,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// The protocol's ordering rule over a real socket: the daemon answers the second
@@ -445,7 +448,7 @@ mod tests {
         );
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -476,7 +479,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// One bad line costs one line, exactly as the protocol says. A multiplexer that
@@ -526,7 +529,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// A refused handshake must surface as a refusal and not as "no daemon", because
@@ -553,7 +556,7 @@ mod tests {
         }
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[test]
@@ -582,6 +585,7 @@ mod tests {
             "a missing daemon is worth waiting for"
         );
         assert_eq!(error.to_proto_error().code, ErrorCode::Unavailable);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -607,7 +611,7 @@ mod tests {
         assert_eq!(error.to_proto_error().code, ErrorCode::HandshakeRequired);
 
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[tokio::test]
@@ -627,6 +631,6 @@ mod tests {
                 .await
                 .expect("the stream must end rather than hang");
         assert!(ended.is_none(), "got {ended:?}");
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 }

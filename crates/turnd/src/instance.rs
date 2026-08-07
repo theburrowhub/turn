@@ -235,8 +235,11 @@ pub enum Occupant {
     Absent,
     /// A file is there but nothing answers. Safe to remove.
     Stale,
-    /// A Turn daemon answered.
+    /// A Turn daemon completed an authenticated handshake.
     Live { pid: u32, version: String },
+    /// A Turn daemon rejected the probe before identifying its process. The socket
+    /// is still live and must not be taken over; no sentinel pid is invented.
+    LiveUnidentified,
     /// Something answered, but not with Turn's handshake. Not ours to remove.
     Foreign,
 }
@@ -279,12 +282,10 @@ async fn handshake(stream: UnixStream, socket: &Path) -> Option<Occupant> {
             pid: welcome.daemon_pid,
             version: welcome.daemon_version,
         }),
-        // A refusal is still a Turn daemon: it just speaks a different protocol
-        // version. Taking its socket would be worse than telling the user.
-        ServerMessage::Rejected { .. } => Some(Occupant::Live {
-            pid: 0,
-            version: "unknown".to_string(),
-        }),
+        // Authentication and version refusals are both daemon-shaped answers.
+        // Taking the socket would be worse than admitting the peer did not disclose
+        // a pid to this probe.
+        ServerMessage::Rejected { .. } => Some(Occupant::LiveUnidentified),
         _ => Some(Occupant::Foreign),
     }
 }
@@ -310,6 +311,12 @@ pub async fn bind_exclusive(socket: &Path) -> Result<UnixListener> {
             return Err(DaemonError::AlreadyRunning {
                 socket: socket.to_path_buf(),
                 pid,
+            });
+        }
+        Occupant::LiveUnidentified => {
+            tracing::info!(socket = %socket.display(), "an unidentified Turn daemon is already running");
+            return Err(DaemonError::AlreadyRunningUnidentified {
+                socket: socket.to_path_buf(),
             });
         }
         Occupant::Foreign => {
@@ -427,6 +434,32 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("turnd.sock");
         assert_eq!(probe(&socket).await, Occupant::Absent);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_probe_is_live_without_inventing_pid_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("turnd.sock");
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let (read, mut write) = server.into_split();
+            let mut lines = BufReader::new(read).lines();
+            assert!(lines.next_line().await.unwrap().is_some());
+            let error = turn_proto::ProtoError::new(
+                turn_proto::ErrorCode::Unauthorized,
+                "the probe has no current capability",
+            );
+            write
+                .write_all(&turn_proto::encode(&ServerFrame::rejected(error)).unwrap())
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            handshake(client, &socket).await,
+            Some(Occupant::LiveUnidentified)
+        );
+        peer.await.unwrap();
     }
 
     #[tokio::test]
