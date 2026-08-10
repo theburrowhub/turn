@@ -261,6 +261,8 @@ pub struct ImageStore {
     next_order: u64,
     /// Kitty's `a=t`: transmitted, waiting for an `a=p`. `(kitty id, payload id)`.
     held: VecDeque<(u32, ImageId)>,
+    /// A direct Kitty transmission split over contiguous `m=1` sequences.
+    kitty_chunks: Option<kitty::Chunked>,
     /// Pixels this pane may still decode.
     budget: u64,
     cell_pixels: (u16, u16),
@@ -283,6 +285,7 @@ impl ImageStore {
             slots: [None; MAX_PLACED_IMAGES],
             next_order: 0,
             held: VecDeque::new(),
+            kitty_chunks: None,
             // Enough for one picture before a byte has been read, so the first thing a
             // process prints can be an image.
             budget: turn_proto::MAX_IMAGE_PIXELS as u64,
@@ -566,14 +569,19 @@ fn apply_kitty<CB: vt100::Callbacks>(
     control: &str,
     payload: Vec<u8>,
 ) -> Option<RefusalReason> {
-    let parsed = kitty::parse_control(control);
+    let mut parsed = kitty::parse_control(control);
     match parsed.action {
-        kitty::Action::Query | kitty::Action::Animation => return None,
+        kitty::Action::Query | kitty::Action::Animation => {
+            store.kitty_chunks = None;
+            return None;
+        }
         kitty::Action::Delete => {
+            store.kitty_chunks = None;
             delete(parser, store, &parsed);
             return None;
         }
         kitty::Action::Place => {
+            store.kitty_chunks = None;
             let Some(id) = store.held_image(parsed.id) else {
                 return Some(RefusalReason::UnknownImage);
             };
@@ -585,10 +593,70 @@ fn apply_kitty<CB: vt100::Callbacks>(
         kitty::Action::Transmit | kitty::Action::TransmitAndPlace => {}
     }
 
+    // The scanner bounds and decodes base64 for each APC sequence. Kitty's `m=1` is a
+    // second layer above that framing: the decoded bytes of all contiguous chunks are one
+    // picture and must not be decoded until the final `m=0` arrives.
+    if let Some(mut chunks) = store.kitty_chunks.take() {
+        if kitty::is_chunk_continuation(control) {
+            chunks.push(&payload);
+            if chunks.failed() {
+                return Some(RefusalReason::PayloadTooLarge {
+                    limit: scan::MAX_IMAGE_PAYLOAD_BYTES,
+                });
+            }
+            if parsed.more {
+                store.kitty_chunks = Some(chunks);
+                return None;
+            }
+            parsed = chunks.control;
+            parsed.more = false;
+            let Some(payload) = chunks.finish() else {
+                return Some(RefusalReason::PayloadTooLarge {
+                    limit: scan::MAX_IMAGE_PAYLOAD_BYTES,
+                });
+            };
+            return decode_kitty_transmission(parser, store, parsed, payload);
+        }
+        // A full transmission header starts a new picture and abandons an incomplete one.
+    }
+
     if !parsed.medium.is_accepted() {
         return Some(RefusalReason::RefusedMedium {
             medium: parsed.medium.describe(),
         });
+    }
+    if parsed.more {
+        let mut chunks = kitty::Chunked::new(parsed, scan::MAX_IMAGE_PAYLOAD_BYTES);
+        chunks.push(&payload);
+        if chunks.failed() {
+            return Some(RefusalReason::PayloadTooLarge {
+                limit: scan::MAX_IMAGE_PAYLOAD_BYTES,
+            });
+        }
+        store.kitty_chunks = Some(chunks);
+        return None;
+    }
+    decode_kitty_transmission(parser, store, parsed, payload)
+}
+
+fn decode_kitty_transmission<CB: vt100::Callbacks>(
+    parser: &mut vt100::Parser<CB>,
+    store: &mut ImageStore,
+    parsed: kitty::Control,
+    payload: Vec<u8>,
+) -> Option<RefusalReason> {
+    if !parsed.medium.is_accepted() {
+        return Some(RefusalReason::RefusedMedium {
+            medium: parsed.medium.describe(),
+        });
+    }
+    // Raw Kitty formats declare their geometry outside the compressed payload. Check that
+    // geometry before zlib sees even one byte, both for the hard pixel cap and for this
+    // pane's amortised decode budget.
+    if matches!(parsed.format, kitty::Format::Rgb | kitty::Format::Rgba) {
+        if let Err(error) = decode::check_pixels(parsed.width, parsed.height, store.budget) {
+            return Some(refusal_for_decode(error));
+        }
     }
     let payload = if parsed.compressed {
         match kitty::inflate(&payload, kitty::MAX_EXPANDED_BYTES) {
@@ -877,6 +945,23 @@ mod tests {
         out.into_inner()
     }
 
+    fn patterned_png(width: u32, height: u32) -> Vec<u8> {
+        let mut buffer = image::RgbaImage::new(width, height);
+        for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+            *pixel = image::Rgba([
+                x.wrapping_mul(31) as u8,
+                y.wrapping_mul(17) as u8,
+                x.wrapping_mul(13).wrapping_add(y.wrapping_mul(29)) as u8,
+                255,
+            ]);
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("the encoder produces a PNG");
+        out.into_inner()
+    }
+
     fn iterm_sequence(args: &str, payload: &[u8]) -> Sequence {
         Sequence::ITerm {
             args: args.to_string(),
@@ -1011,6 +1096,81 @@ mod tests {
                 },
             ),
             Some(RefusalReason::UnknownImage)
+        );
+    }
+
+    #[test]
+    fn a_real_kitty_picture_is_assembled_across_multiple_apc_chunks() {
+        let mut parser = parser(20, 80);
+        let mut store = ImageStore::new();
+        let picture = patterned_png(256, 256);
+        assert!(
+            picture.len() > 4_096,
+            "fixture was only {} bytes",
+            picture.len()
+        );
+        let first = picture.len() / 3;
+        let second = first * 2;
+
+        assert_eq!(
+            apply(
+                &mut parser,
+                &mut store,
+                Sequence::Kitty {
+                    control: "a=T,f=100,m=1".into(),
+                    payload: picture[..first].to_vec(),
+                },
+            ),
+            None
+        );
+        assert!(placed(&parser).is_empty());
+        assert_eq!(
+            apply(
+                &mut parser,
+                &mut store,
+                Sequence::Kitty {
+                    control: "m=1".into(),
+                    payload: picture[first..second].to_vec(),
+                },
+            ),
+            None
+        );
+        assert!(placed(&parser).is_empty());
+        assert_eq!(
+            apply(
+                &mut parser,
+                &mut store,
+                Sequence::Kitty {
+                    control: "m=0".into(),
+                    payload: picture[second..].to_vec(),
+                },
+            ),
+            None
+        );
+        assert!(!placed(&parser).is_empty());
+        assert_eq!(store.stored_images(), 1);
+    }
+
+    #[test]
+    fn compressed_raw_kitty_geometry_is_refused_before_inflation() {
+        let mut parser = parser(6, 20);
+        let mut store = ImageStore::new();
+        let refusal = apply(
+            &mut parser,
+            &mut store,
+            Sequence::Kitty {
+                control: "a=T,f=32,s=60000,v=60000,o=z".into(),
+                // Deliberately invalid zlib. Seeing TooManyPixels instead of Malformed
+                // proves the declared geometry was checked before inflation.
+                payload: b"not zlib".to_vec(),
+            },
+        );
+        assert_eq!(
+            refusal,
+            Some(RefusalReason::TooManyPixels {
+                width: 60_000,
+                height: 60_000,
+            })
         );
     }
 

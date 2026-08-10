@@ -130,12 +130,15 @@ pub struct Pane {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RestoreBehaviour {
-    /// Re-attach if the process survived; otherwise leave the pane empty and
-    /// offer a button. The safe default: never re-runs anything by itself.
+    /// Re-attach if the process survived; otherwise leave a consequential command stopped.
+    /// Commandless terminal panes are the exception: they are always restored as the user's
+    /// shell, because an empty terminal is not useful and opening a shell has no automated
+    /// side effect against the checkout.
     #[default]
     ReattachOnly,
-    /// Eligible to offer for an explicit relaunch (a shell, a file browser).
-    /// The restore path never treats this metadata as launch authority.
+    /// Start the pane again when a window returns to the Session (a shell, an agent pane, a
+    /// file browser). The daemon still does not launch it unattended at boot; the connected
+    /// window performs the relaunch while the Session is present on screen.
     Relaunch,
     /// Do not restore at all.
     Skip,

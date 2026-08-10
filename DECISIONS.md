@@ -3052,8 +3052,11 @@ and holds back exactly two cases: a pane that would use the checkout while a wri
 pending, and any pane at all while a process from the previous daemon is still alive and out of
 reach, because a replacement running beside it would do the work twice.
 
-`ReattachOnly` now means what it says: **do not run this one by itself.** That is where a pane
-naming a command with a consequence belongs, and it keeps its button.
+`ReattachOnly` now means what it says for a pane naming a command: **do not run this one by
+itself.** A commandless terminal is always restored as the user's configured shell, including
+legacy layouts that predate `Relaunch`; an empty panel is not a useful safety property. No pane
+shows an inline start button. A consequential stopped command remains available from the Process
+row's contextual `Start again` action without turning every recovered layout into a form.
 
 ### Consequences
 
@@ -3062,9 +3065,9 @@ naming a command with a consequence belongs, and it keeps its button.
   pane, in a value the template author or the user sets — rather than as a blanket refusal.
 - The two moments are separated: a daemon restoring alone starts nothing; a window that a person
   is looking at starts what is safe.
-- **Downside:** a pane left on the default `ReattachOnly` does not start automatically, so a
-  hand-built pane behaves differently from a template's. The default is the cautious one, which is
-  the right way round, but it means the feature is invisible until somebody notices the setting.
+- **Downside:** a command-bearing pane left on the default `ReattachOnly` does not start
+  automatically, so a hand-built job behaves differently from a template's. The default is the
+  cautious one; commandless terminal panes are exempt because their fallback is only a shell.
 - **Downside:** two windows attached to the same Session both act on the report. The second
   request arrives after the first has started the node and is refused, so the outcome is right and
   the log carries a refusal nobody asked about.

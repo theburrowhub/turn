@@ -1536,8 +1536,10 @@ descriptions has to argue with a test first.
 3. **Turn never runs a command it inferred from agent output.** There is no "run
    this" verb. Processes start from a template, a pane definition, or
    `relaunch_node`, all of which the user chose.
-4. **Turn never relaunches on its own.** `relaunch_node` is the only path back, and
-   it always originates with a human. `restore_result` reports and offers.
+4. **Restore safe panes without making the user operate them.** `relaunch_node` remains the only
+   path back. The daemon never invokes it unattended during boot; a connected window invokes it
+   automatically for panes marked `Relaunch` and for commandless terminals. Consequential
+   `ReattachOnly` commands remain stopped.
 5. **A client cannot request an unarbitrated primary-checkout writer.** Session mode is closed, creation
    goes through daemon lease arbitration, and conflict recovery is one of the typed alternatives. There is
    no force/steal flag; generation mismatch is a conflict, not a retry loop.

@@ -14,9 +14,9 @@
 //! no restore at all — the session was never gone. Reporting it after a daemon restart
 //! would be the most convenient lie available.
 //!
-//! **Nothing is relaunched.** Panes that could be started again are marked
-//! `can_relaunch` with the command shown verbatim, and that is an offer. The user
-//! answers it with [`turn_proto::Request::RelaunchNode`] or does not.
+//! **Nothing is relaunched unattended.** The daemon reports what can be started again; a
+//! connected window immediately restores panes marked `Relaunch` and every commandless terminal
+//! as the user's shell. Booting a daemon with no window still runs no user process.
 //!
 //! Checkout write authority is decided in the same pass, by [`super::authority`]: every
 //! unreleased lease is fenced before a single Session is loaded, and only evidence — the
@@ -443,19 +443,24 @@ impl Core {
             let Some(node) = session.tree.get(&node_id) else {
                 continue;
             };
+            let shell_fallback = pane.kind.is_terminal()
+                && pane
+                    .command
+                    .as_deref()
+                    .is_none_or(|command| command.trim().is_empty());
             let relaunchable = pane.restore != RestoreBehaviour::Skip
                 && !node.lifecycle.is_running()
-                && (pane.command.is_some() || pane.kind == turn_core::model::PaneKind::Shell);
+                && (pane.command.is_some() || shell_fallback);
             panes.push(PaneRestoreOutcome {
                 pane_id: pane.id.clone(),
                 node_id,
                 lifecycle: node.lifecycle.clone(),
                 can_relaunch: relaunchable,
-                // `Relaunch` has always meant "running this again is harmless". Turn now acts on
-                // it instead of only offering it: a Session that comes back stopped, with a
-                // button under every pane, is a form rather than a session. `ReattachOnly` keeps
-                // the button and now means what it says — do not run this one by itself.
-                auto_start: relaunchable && pane.restore == RestoreBehaviour::Relaunch,
+                // `Relaunch` means running this again is harmless. A commandless terminal is
+                // harmless too, including legacy layouts that predate that metadata: it becomes
+                // the configured shell rather than a dead panel requiring a click.
+                auto_start: relaunchable
+                    && (pane.restore == RestoreBehaviour::Relaunch || shell_fallback),
                 // Descriptive only; relaunch authority is the durable node id.
                 command: pane.command.clone(),
                 // Absent means "assume it does", which is also the honest answer for a
@@ -486,7 +491,7 @@ impl Core {
 
         tracing::info!(
             session = %id, orphaned, lost, eager_offers = eager, state = ?state,
-            "restored a session; nothing was relaunched"
+            "restored a session; waiting for a connected window to start safe panes"
         );
         ServerEvent::RestoreResult {
             session_id: id.clone(),

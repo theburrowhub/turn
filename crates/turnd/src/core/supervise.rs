@@ -14,7 +14,7 @@
 use super::Core;
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::Relation;
+use turn_core::model::{ProcessNode, Relation};
 use turn_core::state::Lifecycle;
 use turn_pty::ObservedProcess;
 
@@ -27,6 +27,41 @@ use turn_pty::ObservedProcess;
 fn names_command(observed: &ObservedProcess, executable: &str) -> bool {
     !executable.is_empty()
         && (observed.name.contains(executable) || observed.command_line.contains(executable))
+}
+
+/// Allowance around the launch timestamp when corroborating a hosted process.
+///
+/// Process tables report whole seconds and Turn records the node around the write to the
+/// shell. A process outside this interval is either older than the command or a later
+/// process wearing a recycled pid.
+const HOSTED_START_SKEW_MS: i64 = 2_000;
+
+/// How long a shell-hosted command may take to appear in the process table.
+///
+/// This is deliberately much longer than a normal shell fork because an interactive shell
+/// can still be reading startup files before it consumes the command Turn queued. It is
+/// still bounded: an agent that starts and exits before the first sweep must not remain
+/// `Alive` forever merely because Turn never learned its pid.
+pub const HOSTED_IDENTIFICATION_TIMEOUT_MS: i64 = 30_000;
+
+/// Whether this observed process can still be the hosted node Turn launched.
+pub(super) fn corroborates_hosted_process(node: &ProcessNode, observed: &ObservedProcess) -> bool {
+    let wanted = crate::core::spawn::executable_name(&node.command);
+    if !names_command(observed, wanted) {
+        return false;
+    }
+    observed.start_time_ms.is_none_or(|started_ms| {
+        started_ms + HOSTED_START_SKEW_MS >= node.started_ms
+            && started_ms
+                <= node
+                    .started_ms
+                    .saturating_add(HOSTED_IDENTIFICATION_TIMEOUT_MS)
+                    .saturating_add(HOSTED_START_SKEW_MS)
+    })
+}
+
+fn hosted_identification_expired(started_ms: i64, now_ms: i64) -> bool {
+    now_ms.saturating_sub(started_ms) >= HOSTED_IDENTIFICATION_TIMEOUT_MS
 }
 
 /// Shortest gap between two sweeps, however much has happened.
@@ -142,12 +177,33 @@ impl Core {
             return;
         }
         let wanted = crate::core::spawn::executable_name(&node.command).to_string();
+        let started_ms = node.started_ms;
         let Some(found) = self
             .supervisor
-            .descendants(shell_pid)
+            .children(shell_pid)
             .into_iter()
-            .find(|observed| observed.ppid == Some(shell_pid) && names_command(observed, &wanted))
+            .filter(|observed| corroborates_hosted_process(node, observed))
+            .min_by_key(|observed| {
+                (
+                    observed
+                        .start_time_ms
+                        .map_or(i64::MAX, |started| started.abs_diff(started_ms) as i64),
+                    observed.pid,
+                )
+            })
         else {
+            if hosted_identification_expired(started_ms, now_ms) {
+                tracing::warn!(
+                    %session_id, %hosted, executable = %wanted,
+                    "the hosted command never appeared in the process table"
+                );
+                self.publish_hosted_loss(session_id, &hosted, now_ms);
+            } else {
+                // Keep looking until the bounded identification window closes. Without
+                // this follow-up, one early sweep that raced a short-lived process was the
+                // only sweep and its node remained Alive indefinitely.
+                self.request_sweep(now_ms);
+            }
             return;
         };
 
@@ -163,6 +219,20 @@ impl Core {
         );
         self.persist_session_quietly(session_id);
         self.push_tree(session_id, now_ms);
+    }
+
+    /// Publishes a hosted loss through all views that carry lifecycle state.
+    pub(crate) fn publish_hosted_loss(
+        &mut self,
+        session_id: &SessionId,
+        hosted: &NodeId,
+        now_ms: i64,
+    ) {
+        self.record_hosted_loss(session_id, hosted, now_ms);
+        self.persist_session_quietly(session_id);
+        self.push_tree(session_id, now_ms);
+        self.push_node_state(session_id, hosted, None, now_ms);
+        self.push_session_state(session_id, now_ms);
     }
 
     /// Adds children of one node that are not in the tree yet.
@@ -339,6 +409,51 @@ mod tests {
     use turn_core::state::Turn;
 
     const NOW: i64 = 1_775_000_000_000;
+
+    fn observed(command: &str, started_ms: Option<i64>) -> ObservedProcess {
+        ObservedProcess {
+            pid: 42,
+            ppid: Some(7),
+            name: command.to_string(),
+            command_line: command.to_string(),
+            args: vec![command.to_string()],
+            cwd: Some("/tmp".into()),
+            start_time_ms: started_ms,
+            kind: NodeKind::Agent,
+        }
+    }
+
+    #[test]
+    fn a_hosted_pid_is_corroborated_by_command_and_launch_time() {
+        let node = ProcessNode::agent(SessionId::new(), "claude", "/tmp", NOW);
+        assert!(corroborates_hosted_process(
+            &node,
+            &observed("node /usr/local/bin/claude", Some(NOW + 1_000))
+        ));
+        assert!(!corroborates_hosted_process(
+            &node,
+            &observed("unrelated", Some(NOW + 1_000))
+        ));
+        assert!(!corroborates_hosted_process(
+            &node,
+            &observed(
+                "claude",
+                Some(NOW + HOSTED_IDENTIFICATION_TIMEOUT_MS + 3_000)
+            )
+        ));
+    }
+
+    #[test]
+    fn an_unidentified_hosted_process_gets_a_bounded_grace_period() {
+        assert!(!hosted_identification_expired(
+            NOW,
+            NOW + HOSTED_IDENTIFICATION_TIMEOUT_MS - 1
+        ));
+        assert!(hosted_identification_expired(
+            NOW,
+            NOW + HOSTED_IDENTIFICATION_TIMEOUT_MS
+        ));
+    }
 
     #[tokio::test]
     async fn a_vanished_inferred_runtime_retires_virtual_descendants_and_their_attention() {

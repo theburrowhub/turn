@@ -131,7 +131,7 @@ impl Core {
             // reported, or one lost to a restart. `running_process` says so precisely.
             self.running_process(node_id)?;
         }
-        let node = self.node_of(session_id, node_id)?;
+        let node = self.node_of(session_id, node_id)?.clone();
         if !node.is_running() {
             return Err(ProtoError::new(
                 ErrorCode::ProcessNotRunning,
@@ -148,6 +148,21 @@ impl Core {
                  try again once the process table has been swept",
             ));
         };
+        // A pid is only an address in the process table, not an identity. Refresh and
+        // corroborate the command and launch time immediately before signalling so a
+        // recycled pid can never make Stop kill an unrelated process.
+        self.supervisor.refresh();
+        let observed = self.supervisor.observe(pid);
+        if !observed.as_ref().is_some_and(|observed| {
+            crate::core::supervise::corroborates_hosted_process(&node, observed)
+        }) {
+            self.publish_hosted_loss(session_id, node_id, now_ms);
+            return Err(ProtoError::new(
+                ErrorCode::ProcessNotRunning,
+                "That agent's process has ended or changed",
+            )
+            .with_detail("Turn refused to signal a pid it could no longer identify"));
+        }
         signal_pid(pid, hard).map_err(|error| {
             ProtoError::new(
                 ErrorCode::Unavailable,
@@ -176,10 +191,9 @@ impl Core {
             .unwrap_or_else(|| node_id.clone())
     }
 
-    /// Starts a pane's process again, because the user asked.
-    ///
-    /// Turn never relaunches on its own — not on restore, not after a crash — so this
-    /// is the only path back into a running process, and it always begins with a human.
+    /// Starts a pane's process again, because the user asked or a connected window is restoring
+    /// a pane explicitly marked safe to relaunch. The daemon never calls this unattended during
+    /// boot: automatic recovery begins only while a window is present to show the Session.
     ///
     /// The old node record leaves the tree. Two nodes cannot both claim one pane, and
     /// the event log keeps the whole history of the one that ended.

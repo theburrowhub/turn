@@ -623,17 +623,18 @@ pub fn host_in_text(text: &str) -> Option<String> {
     if let Some(host) = host_of(text) {
         return Some(host);
     }
-    let token = text.split_whitespace().next()?;
-    let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
-    let authority = token.split(['/', '?', '#']).next()?;
-    if !authority.contains('.') || authority.starts_with('.') || authority.ends_with('.') {
-        return None;
-    }
-    let tld = authority.rsplit('.').next()?;
-    if tld.len() < 2 || !tld.chars().all(|c| c.is_alphabetic()) {
-        return None;
-    }
-    to_ascii_host(authority)
+    text.split_whitespace().find_map(|token| {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '.' && c != '-');
+        let authority = token.split(['/', '?', '#']).next()?;
+        if !authority.contains('.') || authority.starts_with('.') || authority.ends_with('.') {
+            return None;
+        }
+        let tld = authority.rsplit('.').next()?;
+        if tld.len() < 2 || !tld.chars().all(|c| c.is_alphabetic()) {
+            return None;
+        }
+        to_ascii_host(authority)
+    })
 }
 
 /// Turns a path a program printed into one that exists.
@@ -1271,6 +1272,12 @@ pub fn declared_links(grid: &Grid) -> Vec<Link> {
             }
         }
     }
+    // A hard wrap is not whitespace. Trim once after all of a link's spans have been
+    // joined; trimming every physical row would silently remove a real separating space at
+    // the margin and change the label the user is being asked to trust.
+    for link in &mut links {
+        link.text = link.text.trim().to_string();
+    }
     links
 }
 
@@ -1299,7 +1306,7 @@ fn span_text(grid: &Grid, row: u16, span: &RowLink) -> String {
             _ => out.push(' '),
         }
     }
-    out.trim().to_string()
+    out
 }
 
 /// Whether the target of a hovered link should be shown yet.
@@ -1726,6 +1733,7 @@ mod tests {
             ("https://github.com/turn/turn", "https://evil.example/steal"),
             ("github.com", "https://evil.example/steal"),
             ("  https://GITHUB.com/a  ", "https://evil.example"),
+            ("Visit github.com now", "https://evil.example/steal"),
         ];
         for (text, target) in cases {
             let mut grid = Grid::blank(1, 80);
@@ -1858,7 +1866,7 @@ mod tests {
         let map = LinkMap::find(&grid, &mut NoPaths);
         assert_eq!(map.len(), 1, "got {:?}", map.links());
         assert_eq!(map.links()[0].spans.len(), 2);
-        assert!(map.links()[0].text.contains("the whole"));
+        assert_eq!(map.links()[0].text, "the whole label");
     }
 
     /// A Unicode confusable must not be able to misrepresent the host. This is the reason the

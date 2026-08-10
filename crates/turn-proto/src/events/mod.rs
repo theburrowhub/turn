@@ -48,12 +48,12 @@ pub struct PaneRestoreOutcome {
     /// with a button per pane, is not a session; it is a form to fill in. So the client starts
     /// these without asking.
     ///
-    /// False for `ReattachOnly`, which now means what it says: *this one is not to be run by
-    /// itself*. A pane naming a command with a consequence — a deploy, a migration, anything
-    /// that is not idempotent — belongs there, and it keeps the button.
+    /// False for a command-bearing `ReattachOnly` pane, which means *this one is not to be run by
+    /// itself*. A deploy or migration belongs there and stays stopped without an inline start
+    /// prompt. Commandless terminals remain safe shell fallbacks even in legacy layouts.
     ///
-    /// Defaults to false when absent, so an older peer's payload is read as "ask" rather than as
-    /// permission to run something.
+    /// Defaults to false when absent, so an older peer's payload stays stopped rather than being
+    /// read as permission to run a consequential command.
     #[serde(default)]
     pub auto_start: bool,
     /// What the pane would run if the user accepted. It is descriptive; the

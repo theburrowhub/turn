@@ -466,6 +466,22 @@ impl Chord {
             && self.shift == modifiers.shift
     }
 
+    /// The physical chord this value represents on one platform.
+    ///
+    /// On PCs `Mod` and explicit `Ctrl` both match the same Control key. Conflict detection
+    /// must use that behavioural identity too, or it can claim two commands are distinct
+    /// even though pressing either chord invokes both.
+    fn physical(self, platform: Platform) -> Chord {
+        if platform.uses_command_key {
+            return self;
+        }
+        Chord {
+            command: false,
+            ctrl: self.command || self.ctrl,
+            ..self
+        }
+    }
+
     /// The chord written out, in the canonical order, for a settings file.
     pub fn canonical(&self) -> String {
         let mut out = String::new();
@@ -963,7 +979,10 @@ impl Keymap {
     pub fn conflicts(&self) -> Vec<(Chord, Vec<Command>)> {
         let mut by_chord: BTreeMap<Chord, Vec<Command>> = BTreeMap::new();
         for bound in &self.bindings {
-            by_chord.entry(bound.chord).or_default().push(bound.command);
+            by_chord
+                .entry(bound.chord.physical(self.platform))
+                .or_default()
+                .push(bound.command);
         }
         by_chord
             .into_iter()
@@ -1218,6 +1237,28 @@ mod tests {
             None,
             "Control+K is kill-line and is not the palette"
         );
+    }
+
+    #[test]
+    fn mod_and_explicit_control_conflict_on_a_pc_but_not_on_a_mac() {
+        let ctrl_shift_v = Chord {
+            ctrl: true,
+            shift: true,
+            ..Chord::plain(Key::V)
+        };
+        let overrides = Overrides::new()
+            .bind(Command::OpenPalette, Chord::cmd_shift(Key::V))
+            .bind(Command::OpenSettings, ctrl_shift_v);
+
+        let pc = Keymap::build(&overrides, Platform::PC);
+        assert!(pc.conflicts().iter().any(|(_, commands)| {
+            commands.contains(&Command::OpenPalette) && commands.contains(&Command::OpenSettings)
+        }));
+
+        let mac = Keymap::build(&overrides, Platform::MAC);
+        assert!(!mac.conflicts().iter().any(|(_, commands)| {
+            commands.contains(&Command::OpenPalette) && commands.contains(&Command::OpenSettings)
+        }));
     }
 
     #[test]

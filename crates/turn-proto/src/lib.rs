@@ -68,8 +68,10 @@
 //!    typing. A context handoff can target only an idle or done Agent.
 //! 3. **Turn never runs a command it inferred.** Processes start from a template, a
 //!    pane definition, or [`Request::RelaunchNode`]. There is no "run this" verb.
-//! 4. **Turn never relaunches on its own.** A restore *reports* what it found and
-//!    marks what could be started again; the client turns that into an offer.
+//! 4. **Restore safe panes without making the user operate them.** A daemon boot reports what it
+//!    found and runs nothing unattended. Once a window is connected, panes marked `Relaunch` and
+//!    commandless terminals are started automatically; consequential `ReattachOnly` commands
+//!    remain stopped.
 //!
 //! ## Compatibility
 //!

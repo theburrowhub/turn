@@ -23,7 +23,7 @@
 use super::Answer;
 use crate::core::Core;
 use serde_json::Value;
-use turn_core::ids::SessionId;
+use turn_core::ids::{SessionId, TemplateId, WorkspaceId};
 use turn_core::settings::{Catalogue, Layer, Refusal, Resolution, Scope, Settings};
 use turn_proto::{ErrorCode, ProtoError, Response, SettingsEntry, SettingsLevel, SettingsView};
 
@@ -187,10 +187,57 @@ impl Core {
     /// is showing; what it must never do is patch its own copy, because one write can move
     /// several keys at once.
     fn answer_settings_for_owner(&mut self, scope: Scope, owner: &str) -> Answer {
-        let session_id = (scope == Scope::Session)
-            .then(|| SessionId::from_stored(owner))
-            .filter(|id| self.sessions.contains_key(id));
-        self.get_settings(session_id)
+        let one_session = match scope {
+            Scope::Workspace => {
+                let workspace_id = WorkspaceId::from_stored(owner);
+                exactly_one(
+                    self.sessions
+                        .values()
+                        .filter(|session| session.workspace_id == workspace_id)
+                        .map(|session| session.id.clone()),
+                )
+            }
+            Scope::Template => {
+                let template_id = TemplateId::from_stored(owner);
+                exactly_one(
+                    self.sessions
+                        .values()
+                        .filter(|session| session.template_id.as_ref() == Some(&template_id))
+                        .map(|session| session.id.clone()),
+                )
+            }
+            Scope::Session => {
+                let session_id = SessionId::from_stored(owner);
+                self.sessions
+                    .contains_key(&session_id)
+                    .then_some(session_id)
+            }
+            Scope::Global | Scope::Temporary => None,
+        };
+        if let Some(session_id) = one_session {
+            return self.get_settings(Some(session_id));
+        }
+
+        let mut levels = vec![SettingsLevel::global()];
+        match scope {
+            Scope::Workspace => {
+                let id = WorkspaceId::from_stored(owner);
+                if let Some(workspace) = self.workspaces.get(&id) {
+                    levels.push(SettingsLevel::workspace(&workspace.id, &workspace.name));
+                }
+            }
+            Scope::Template => {
+                let id = TemplateId::from_stored(owner);
+                if let Some(template) = self.templates.get(&id) {
+                    levels.push(SettingsLevel::template(&template.id, &template.name));
+                }
+            }
+            Scope::Global | Scope::Session | Scope::Temporary => {}
+        }
+        let layers = self.settings_layers(&levels)?;
+        Ok(Response::Settings {
+            settings: Box::new(self.resolve_settings(None, levels, &layers)),
+        })
     }
 
     /// Refuses a write to a level whose owner does not exist.
@@ -228,6 +275,11 @@ impl Core {
             ))
         }
     }
+}
+
+fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
+    let first = values.next()?;
+    values.next().is_none().then_some(first)
 }
 
 /// One resolved preference, dressed for the window.
@@ -352,6 +404,39 @@ mod tests {
             .map(|level| level.scope)
             .collect();
         assert_eq!(scopes, vec![Scope::Global]);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_write_with_multiple_sessions_returns_that_owner_not_global_alone() {
+        let mut harness = Harness::new().await;
+        let first = SessionId::from_stored("sess_settings_workspace_first");
+        let second = SessionId::from_stored("sess_settings_workspace_second");
+        harness.add_session(first.clone(), PaneId::new(), T0);
+        harness.add_session(second, PaneId::new(), T0 + 1);
+        let workspace_id = harness.core.sessions[&first]
+            .workspace_id
+            .as_str()
+            .to_string();
+
+        let settings = view(harness.core.set_setting(
+            Scope::Workspace,
+            Some(workspace_id.clone()),
+            "appearance.font_size".into(),
+            json!(15),
+            T0 + 2,
+        ));
+        assert_eq!(settings.session_id, None);
+        assert_eq!(
+            settings
+                .levels
+                .iter()
+                .map(|level| (level.scope, level.owner_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Scope::Global, ""),
+                (Scope::Workspace, workspace_id.as_str())
+            ]
+        );
     }
 
     /// A write at one level is visible as the origin of the value, and the level below is

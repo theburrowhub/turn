@@ -147,8 +147,8 @@ pub struct Desk {
     ///
     /// Separate from [`Self::relaunching`], which is cleared when a request finishes — including
     /// when it *fails*. Without a second record a failing relaunch would be asked for again on
-    /// the next sweep, and again, for as long as the window stayed open. A node is tried once;
-    /// after that the pane's own button is the way, and it is the user asking rather than Turn.
+    /// the next sweep, and again, for as long as the window stayed open. A node is tried once per
+    /// connection; reconnecting clears this set and gives transient failures another safe chance.
     auto_started: HashSet<NodeId>,
     /// A link from a pane whose visible text disagreed with its target, waiting to be
     /// confirmed. Window-local: nothing outside this window is affected by a question.
@@ -767,6 +767,7 @@ impl Desk {
         self.preview_history.clear();
         self.restores.clear();
         self.relaunching.clear();
+        self.auto_started.clear();
         self.reclaiming_leases.clear();
         self.temporary_pane = None;
         self.write_conflict = None;
@@ -977,6 +978,58 @@ impl Desk {
                 }
                 reactions
             }
+            (Ask::DeleteSession { session_id }, Response::Closed { escaped }) => {
+                let mut reactions = self.report_escaped(&escaped);
+                let selected_removed = self.selected.as_ref() == Some(&session_id);
+                self.remove_session_state(&session_id);
+                if selected_removed {
+                    reactions.extend(self.select_after_removal());
+                }
+                // The row leaves immediately from the local projection above. Refetch as well so
+                // Workspace counts, selection and every other surface-owned field come from the
+                // same authoritative revision as the deletion.
+                reactions.push(self.hierarchy_request());
+                reactions
+            }
+            (Ask::DeleteWorkspace { workspace_id }, Response::Closed { escaped }) => {
+                let mut reactions = self.report_escaped(&escaped);
+                let sessions: Vec<SessionId> = self
+                    .hierarchy
+                    .as_ref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .find(|branch| branch.workspace.id == workspace_id)
+                    })
+                    .map(|branch| {
+                        branch
+                            .sessions
+                            .iter()
+                            .map(|session| session.session.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let selected_removed = self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| sessions.contains(selected));
+                for session_id in &sessions {
+                    self.remove_session_state(session_id);
+                }
+                self.workspaces
+                    .retain(|workspace| workspace.id != workspace_id);
+                if let Some(snapshot) = self.hierarchy.as_mut() {
+                    snapshot
+                        .workspaces
+                        .retain(|branch| branch.workspace.id != workspace_id);
+                }
+                if selected_removed {
+                    reactions.extend(self.select_after_removal());
+                }
+                reactions.push(self.hierarchy_request());
+                reactions
+            }
             (Ask::ArchiveSession { .. } | Ask::ArchiveWorkspace { .. }, Response::Ack) => {
                 // The tree is refetched rather than edited in place. Whether an archived
                 // row still belongs in it is a question about the archived preference and
@@ -1056,9 +1109,18 @@ impl Desk {
                 self.templates = templates;
                 Vec::new()
             }
-            // Whole, from every answer including a write's. A write can move what is in force
-            // for keys other than the one written — a Session override removed reveals the
-            // Workspace's value — so there is nothing to patch and nothing to reconcile.
+            // A Workspace or Template write can affect several Sessions, so its immediate
+            // response may intentionally contain only Global plus that owner. Never replace
+            // the selected Session's complete sheet with that narrower view: ask the daemon
+            // for the selected Session again and render only its authoritative answer.
+            (Ask::WriteSetting { .. }, Response::Settings { .. }) => vec![Reaction::Send {
+                ask: Ask::Settings,
+                request: Request::GetSettings {
+                    session_id: self.selected.clone(),
+                },
+            }],
+            // Whole settings answers replace the sheet. A reset can move several keys at
+            // once, so there is nothing safe for the window to patch locally.
             (_, Response::Settings { settings }) => {
                 self.settings = Some(settings);
                 Vec::new()
@@ -1510,42 +1572,13 @@ impl Desk {
                 Vec::new()
             }
             E::SessionRemoved { session_id, .. } => {
-                self.relaunching.retain(|node| {
-                    self.trees.iter().any(|(owner, nodes)| {
-                        owner != &session_id && nodes.iter().any(|row| &row.node_id == node)
-                    })
-                });
-                self.sessions.retain(|summary| summary.id != session_id);
-                if let Some(hierarchy) = self.hierarchy.as_mut() {
-                    for workspace in &mut hierarchy.workspaces {
-                        workspace
-                            .sessions
-                            .retain(|session| session.session.id != session_id);
-                    }
+                let selected_removed = self.selected.as_ref() == Some(&session_id);
+                self.remove_session_state(&session_id);
+                if selected_removed {
+                    self.select_after_removal()
+                } else {
+                    Vec::new()
                 }
-                self.layouts.remove(&session_id);
-                self.trees.remove(&session_id);
-                self.policies.remove(&session_id);
-                self.drop_session_feeds(&session_id);
-                let gone: Vec<PaneId> = self
-                    .pane_owner
-                    .iter()
-                    .filter(|(_, owner)| *owner == &session_id)
-                    .map(|(pane, _)| pane.clone())
-                    .collect();
-                for pane in gone {
-                    self.pane_owner.remove(&pane);
-                    self.feeds.remove(&pane);
-                    self.pty_sizes.remove(&pane);
-                    self.attaching.remove(&pane);
-                }
-                if self.selected.as_ref() == Some(&session_id) {
-                    self.selected = None;
-                    if let Some(next) = self.sessions.first().map(|s| s.id.clone()) {
-                        return self.select(next);
-                    }
-                }
-                Vec::new()
             }
             E::LayoutChanged { session_id, layout } => self.apply_layout(&session_id, layout),
             E::TreeChanged { session_id, nodes } => {
@@ -1843,7 +1876,8 @@ impl Desk {
     /// What it needs is in the window already: the layout says each pane's `RestoreBehaviour` and
     /// the tree says whether its process has ended. `Relaunch` means running it again is harmless,
     /// which every built-in template sets for its shells, its agent panes and its file browsers.
-    /// `ReattachOnly` keeps its button, and is where a pane naming a deploy or a migration belongs.
+    /// A commandless terminal is also a safe shell fallback, including in legacy layouts.
+    /// `ReattachOnly` keeps a consequential command stopped without putting an action in the pane.
     ///
     /// Held back in the two cases where starting would be wrong rather than merely eager: a pane
     /// that would use the checkout while a write confirmation is pending, and every pane in a
@@ -1864,7 +1898,12 @@ impl Desk {
             };
             let mut wanted: Vec<NodeId> = Vec::new();
             for pane in layout.panes() {
-                if pane.restore != turn_core::model::RestoreBehaviour::Relaunch {
+                let shell_fallback = pane.kind.is_terminal()
+                    && pane
+                        .command
+                        .as_deref()
+                        .is_none_or(|command| command.trim().is_empty());
+                if pane.restore != turn_core::model::RestoreBehaviour::Relaunch && !shell_fallback {
                     continue;
                 }
                 let Some(node_id) = pane.node_id.clone() else {
@@ -2010,6 +2049,55 @@ impl Desk {
             self.attaching.remove(&pane);
             self.pty_sizes.remove(&pane);
         }
+    }
+
+    /// Removes every window-local trace of a Session whose daemon-side lifecycle already
+    /// succeeded. Used both for the push and for the correlated delete answer, because the
+    /// answer may be painted before the push and a successful deletion must never leave a dead
+    /// row in the tree for even one frame.
+    fn remove_session_state(&mut self, session_id: &SessionId) {
+        let removed_nodes: HashSet<NodeId> = self
+            .trees
+            .get(session_id)
+            .into_iter()
+            .flat_map(|nodes| nodes.iter().map(|node| node.node_id.clone()))
+            .collect();
+        self.relaunching
+            .retain(|node| !removed_nodes.contains(node));
+        self.auto_started
+            .retain(|node| !removed_nodes.contains(node));
+        self.preview_history
+            .retain(|node, _| !removed_nodes.contains(node));
+        self.sessions.retain(|summary| &summary.id != session_id);
+        if let Some(hierarchy) = self.hierarchy.as_mut() {
+            for workspace in &mut hierarchy.workspaces {
+                workspace
+                    .sessions
+                    .retain(|session| &session.session.id != session_id);
+            }
+        }
+        self.layouts.remove(session_id);
+        self.trees.remove(session_id);
+        self.policies.remove(session_id);
+        self.restores.remove(session_id);
+        self.drop_session_feeds(session_id);
+        self.pane_owner.retain(|_, owner| owner != session_id);
+        if self.selected.as_ref() == Some(session_id) {
+            self.selected = None;
+        }
+    }
+
+    fn select_after_removal(&mut self) -> Vec<Reaction> {
+        if let Some(next) = self.sessions.first().map(|session| session.id.clone()) {
+            return self.select(next);
+        }
+        vec![Reaction::Send {
+            ask: Ask::Action("clearing selection after removal"),
+            request: Request::SelectTreeNode {
+                surface_id: self.surface_id.clone(),
+                selected: None,
+            },
+        }]
     }
 
     fn forget_hidden_session_views(&mut self, session_id: &SessionId) -> Vec<Reaction> {
@@ -4415,6 +4503,86 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_session_answer_removes_the_row_before_any_push_arrives() {
+        let (deleted, _, _) = session_with_agent("Delete me");
+        let (remaining, _, _) = session_with_agent("Keep me");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(
+                &[&deleted, &remaining],
+                Some(HierarchyKey::session(deleted.id.clone())),
+            ),
+            T0,
+        );
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::DeleteSession {
+                    session_id: deleted.id.clone(),
+                },
+                response: Box::new(Response::Closed {
+                    escaped: Vec::new(),
+                }),
+            },
+            T0 + 1,
+        );
+
+        assert!(
+            desk.sessions.iter().all(|session| session.id != deleted.id),
+            "a successful delete cannot leave a stopped row behind"
+        );
+        assert!(desk.hierarchy.as_ref().is_some_and(|snapshot| snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .all(|session| session.session.id != deleted.id)));
+        assert_eq!(desk.selected.as_ref(), Some(&remaining.id));
+        assert!(sent(&reactions)
+            .iter()
+            .any(|request| matches!(request, Request::GetHierarchy { .. })));
+    }
+
+    #[test]
+    fn a_delete_workspace_answer_removes_its_whole_branch_before_any_push_arrives() {
+        let (deleted, _, _) = session_with_agent("Delete my Workspace");
+        let deleted_workspace = deleted.workspace_id.clone();
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&deleted], Some(HierarchyKey::session(deleted.id.clone()))),
+            T0,
+        );
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::DeleteWorkspace {
+                    workspace_id: deleted_workspace.clone(),
+                },
+                response: Box::new(Response::Closed {
+                    escaped: Vec::new(),
+                }),
+            },
+            T0 + 1,
+        );
+
+        assert!(desk
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != deleted_workspace));
+        assert!(desk.hierarchy.as_ref().is_some_and(|snapshot| snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.workspace.id != deleted_workspace)));
+        assert!(desk.selected.is_none());
+        let requests = sent(&reactions);
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request, Request::GetHierarchy { .. })));
+        assert!(requests
+            .iter()
+            .any(|request| matches!(request, Request::SelectTreeNode { selected: None, .. })));
+    }
+
+    #[test]
     fn hiding_an_archived_session_closes_its_surface_scoped_temporary_pane() {
         let (session, _, node_id) = session_with_agent("Archived task");
         let mut project = Workspace::new("project", "/repo", T0);
@@ -5297,9 +5465,9 @@ mod tests {
         );
     }
 
-    /// Nothing relaunches on its own: no push and no command produces one.
+    /// A restore report that explicitly withholds automatic authority starts nothing.
     #[test]
-    fn nothing_ever_relaunches_without_being_asked() {
+    fn a_non_auto_restore_outcome_does_not_relaunch_a_consequential_command() {
         let (session, _, _) = session_with_agent("Restored");
         let mut desk = Desk::new();
         desk.apply_inbound(
@@ -5518,7 +5686,42 @@ mod tests {
         );
     }
 
-    /// A pane whose command has a consequence keeps its button.
+    /// Old layouts often recorded a generic terminal with neither a command nor the newer
+    /// `Relaunch` marker. That is the exact shape which used to become "No command recorded" and
+    /// an inline start button. It is a shell fallback, so it starts without either.
+    #[test]
+    fn a_legacy_commandless_terminal_starts_as_a_shell_without_a_click() {
+        let (mut session, pane_id, node_id) = session_with_agent("Legacy shell");
+        if let Some(pane) = session.layout.get_mut(&pane_id) {
+            pane.kind = PaneKind::Terminal;
+            pane.command = None;
+            pane.restore = turn_core::model::RestoreBehaviour::ReattachOnly;
+        }
+        if let Some(node) = session.tree.get_mut(&node_id) {
+            node.lifecycle = Lifecycle::Lost;
+            node.turn = None;
+        }
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        let reactions = desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+
+        assert!(sent(&reactions).iter().any(|request| matches!(
+            request,
+            Request::RelaunchNode {
+                node_id: requested,
+                resume: false,
+                ..
+            } if requested == &node_id
+        )));
+    }
+
+    /// A pane whose command has a consequence stays stopped when it was not marked safe.
     ///
     /// `ReattachOnly` is the default and now means what it says. This is the half of the original
     /// rule that was worth keeping: Turn does not run somebody's deploy because their window
@@ -7462,6 +7665,38 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_setting_write_refetches_the_selected_sessions_complete_hierarchy() {
+        let mut desk = Desk::new();
+        let session_id = SessionId::from_stored("sess_setting_refetch");
+        desk.selected = Some(session_id.clone());
+        let original = settings_with_bindings(serde_json::json!({"pane.zoom": "Mod+Z"}));
+        desk.settings = Some(Box::new(original.clone()));
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::WriteSetting {
+                    key: "appearance.font_size".into(),
+                },
+                response: Box::new(Response::Settings {
+                    settings: Box::new(turn_proto::SettingsView {
+                        session_id: None,
+                        levels: vec![turn_proto::SettingsLevel::global()],
+                        entries: Vec::new(),
+                    }),
+                }),
+            },
+            T0,
+        );
+        assert_eq!(desk.settings(), Some(&original));
+        assert_eq!(
+            sent(&reactions),
+            vec![Request::GetSettings {
+                session_id: Some(session_id)
+            }]
+        );
     }
 
     /// Going back to Turn's own chord removes the entry rather than writing the default into

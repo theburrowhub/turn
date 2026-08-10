@@ -839,91 +839,33 @@ fn a_restored_layout_explains_that_nothing_was_restarted_and_offers_recovery() {
     ));
 }
 
-/// Coming back to a Session is one decision, not one per pane.
+/// Returning to a Session is not a form the user has to submit.
 ///
-/// Reported as unusable, and it was: every stopped pane showed a "Start pane" button in the
-/// middle of itself, so a four-pane Session read as four separate decisions. There *was* a
-/// "Start all" — small, in the bottom status bar, at the other end of the window from the panes
-/// it acts on. The collective action now sits beside the per-pane one, where the hand already is,
-/// and one click asks for every pane.
+/// The Desk owns automatic recovery; the view's half of that contract is equally important: it
+/// must never regress to one button per pane, nor hide the same interaction in a collective
+/// button elsewhere in the window.
 #[test]
-fn coming_back_to_a_session_starts_every_pane_in_one_click() {
-    // No write confirmation pending, so every stopped pane is one this click can start. The
-    // case where one is *not* is asserted at the end.
+fn coming_back_to_a_session_has_no_manual_start_actions() {
     let mut fixture = restored_desk();
     fixture.recovery_lease = None;
     let mut h = harness(fixture);
     h.run();
     h.run();
 
-    // The offer names how many it covers, so the click is not a guess.
     let labels = button_labels(&h);
-    let collective = labels
-        .iter()
-        .find(|label| label.starts_with("Start all "))
-        .unwrap_or_else(|| {
-            panic!("the pane's own offer must include the collective one: {labels:?}")
-        });
-    let collective = collective.clone();
-
-    h.state_mut().actions.clear();
-    h.query_by_label(&collective)
-        .expect("the collective offer is a real button")
-        .click();
-    h.run_steps(1);
-
-    let asked: Vec<&ViewAction> = h
-        .state()
-        .actions
-        .iter()
-        .filter(|action| matches!(action, ViewAction::RelaunchNode { .. }))
-        .collect();
     assert!(
-        asked.len() > 1,
-        "one click must ask for every stopped pane, got {asked:?}"
+        labels
+            .iter()
+            .all(|label| !label.starts_with("Start pane") && !label.starts_with("Start all")),
+        "recovery must require no start click: {labels:?}"
     );
-    // Every one of them is a different pane: asking twice for the same node would start one
-    // process and look like it started two.
-    let mut nodes: Vec<String> = asked
-        .iter()
-        .filter_map(|action| match action {
-            ViewAction::RelaunchNode { node_id, .. } => Some(node_id.to_string()),
-            _ => None,
-        })
-        .collect();
-    let before = nodes.len();
-    nodes.sort();
-    nodes.dedup();
-    assert_eq!(
-        nodes.len(),
-        before,
-        "the same pane must not be asked for twice"
-    );
-
-    // With a write confirmation pending, the offer covers only what it can really start — a
-    // pane that would use the checkout is held back by the confirmation, so a button claiming
-    // to start it would be lying about a number the user can count on screen.
-    let mut h = harness(restored_desk());
-    h.run();
-    h.run();
-    let pending = button_labels(&h);
-    let claimed: Vec<&String> = pending
-        .iter()
-        .filter(|label| label.starts_with("Start all "))
-        .collect();
     assert!(
-        claimed.len() <= 1,
-        "the collective offer appears at most once: {claimed:?}"
+        h.state()
+            .actions
+            .iter()
+            .all(|action| !matches!(action, ViewAction::RelaunchNode { .. })),
+        "drawing the UI emits no process action; the Desk performs automatic recovery"
     );
-    if let Some(label) = claimed.first() {
-        assert!(
-            !label.contains(&format!(
-                "{} panes",
-                pending.iter().filter(|l| *l == "Start pane").count() + 1
-            )),
-            "the number must not count panes the confirmation is holding back: {label:?}"
-        );
-    }
 }
 
 /// Pointing at one worker among many, and getting the layout back.
@@ -1031,16 +973,14 @@ fn a_restored_pane_that_writes_nothing_is_still_startable_while_write_access_is_
     gated.run();
     gated.run();
     assert!(
-        gated
-            .query_all_by_label("Confirm write access in the status bar first.")
-            .count()
-            > 0,
-        "an agent pane must say what it is waiting for: {:?}",
-        button_labels(&gated)
+        all_text(&gated)
+            .iter()
+            .any(|label| label == "Waiting for write access"),
+        "an agent pane must say what it is waiting for"
     );
 
     let mut fixture = restored_desk();
-    let shell_pane = fixture
+    fixture
         .restore
         .as_mut()
         .map(|restore| {
@@ -1050,32 +990,24 @@ fn a_restored_pane_that_writes_nothing_is_still_startable_while_write_access_is_
                 outcome.needs_checkout_write = false;
                 outcome.command = None;
             }
-            restore.panes[0].node_id.clone()
         })
         .expect("the restored fixture offers panes");
     let mut h = harness(fixture);
     h.run();
     h.run();
     assert_eq!(
-        h.query_all_by_label("Confirm write access in the status bar first.")
+        all_text(&h)
+            .iter()
+            .filter(|label| label.as_str() == "Waiting for write access")
             .count(),
         0,
         "a terminal is not gated, so nothing may tell the user it is"
     );
-
-    h.state_mut().actions.clear();
-    h.query_all_by_label("Start pane")
-        .next()
-        .expect("the offer for a pane that writes nothing remains a real button")
-        .click();
-    h.run_steps(1);
     assert!(
-        matches!(
-            h.state().actions.as_slice(),
-            [ViewAction::RelaunchNode { node_id, .. }] if node_id == &shell_pane
-        ),
-        "{:?}",
-        h.state().actions
+        button_labels(&h)
+            .iter()
+            .all(|label| !label.starts_with("Start")),
+        "a shell is restored automatically and offers no manual start action"
     );
 }
 
@@ -1145,7 +1077,6 @@ fn the_top_bar_carries_a_toolbar_of_named_actions_and_the_version() {
     for label in [
         "New pane",
         "Layout",
-        "New session",
         "New workspace",
         "Command palette",
         "Attention queue",
@@ -1157,6 +1088,16 @@ fn the_top_bar_carries_a_toolbar_of_named_actions_and_the_version() {
             "the toolbar must offer {label:?} by name; found {buttons:?}"
         );
     }
+    assert!(
+        !buttons.iter().any(|found| found == "New session"),
+        "Session creation belongs to its Workspace row, not the global toolbar"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|found| found.starts_with("New session in ")),
+        "a Workspace row still owns its contextual Session action: {buttons:?}"
+    );
     // `Archived` was a third button beside two that create things. It is gone from the
     // Workspaces bar entirely.
     assert!(
@@ -1165,17 +1106,43 @@ fn the_top_bar_carries_a_toolbar_of_named_actions_and_the_version() {
     );
 
     let groups = group_labels(&h);
-    assert!(
-        groups
-            .iter()
-            .any(|group| group.starts_with("Turn ") && group.contains("connected")),
-        "the version and the connection are announced, not only painted: {groups:?}"
+    let top_status = groups
+        .iter()
+        .find(|group| group.starts_with("Turn ") && group.contains("connected"))
+        .unwrap_or_else(|| {
+            panic!("the version and connection are announced, not only painted: {groups:?}")
+        });
+    assert_eq!(
+        top_status.matches(env!("CARGO_PKG_VERSION")).count(),
+        1,
+        "the same version must not be shown twice: {top_status:?}"
     );
     h.snapshot("chrome_toolbar");
 }
 
+#[test]
+fn operational_messages_use_the_existing_bottom_status_bar() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.notice =
+        Some("starting the restored pane: restore the Session before starting a process".into());
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let groups = group_labels(&h);
+    assert!(
+        groups.iter().any(|group| {
+            group.starts_with("Status: starting the restored pane:")
+                && group.contains("restore the Session")
+        }),
+        "the notice belongs to the bottom status group: {groups:?}"
+    );
+    h.snapshot("notice_in_status_bar");
+}
+
 /// The toolbar has to give way rather than draw over what is beside it. At 520 points
-/// there is no room for eight buttons, and the version and the connection must both
+/// there is no room for every button, and the version and the connection must both
 /// survive.
 #[test]
 fn a_narrow_window_drops_toolbar_buttons_rather_than_overlapping_the_version() {
@@ -1205,7 +1172,6 @@ fn a_narrow_window_drops_toolbar_buttons_rather_than_overlapping_the_version() {
     let toolbar_present = [
         "New pane",
         "Layout",
-        "New session",
         "New workspace",
         "Command palette",
         "Attention queue",
@@ -1216,7 +1182,7 @@ fn a_narrow_window_drops_toolbar_buttons_rather_than_overlapping_the_version() {
     .filter(|label| buttons.iter().any(|found| found == label))
     .count();
     assert!(
-        toolbar_present < 8,
+        toolbar_present < 7,
         "a 520-point window cannot hold the whole toolbar; it kept {toolbar_present}"
     );
     assert!(

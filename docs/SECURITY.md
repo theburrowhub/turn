@@ -336,9 +336,11 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Durable free text cannot retain a recognisable credential | the byte-level DB/WAL suite plants one token in every durable free-text field and verifies redaction across direct saves, the atomic runtime checkpoint, restart and pruning; structural filesystem identities fail rather than mutate |
 | Legacy durable bytes receive the same boundary | a v8 fixture seeds every classified `TEXT` route, migration 009 redacts it transactionally, `secure_delete`/`VACUUM` plus checked WAL truncation remove physical remnants, and real busy-WAL/reopen tests prove the marker retries; structural credentials and correlation collisions fail closed |
 
-Turn never relaunches automatically during restore: `SessionRepo::load_for_restore` downgrades every
-stored `Alive` to `Orphaned`, and the UI offers rather than acts. Only the user's explicit node-addressed
-`RelaunchNode` request may cross that boundary.
+The daemon never relaunches unattended during restore: `SessionRepo::load_for_restore` downgrades
+every stored `Alive` to `Orphaned` and only reports recovery state. A connected window may issue a
+node-addressed `RelaunchNode` automatically for panes explicitly marked `Relaunch` and for
+commandless terminals, whose resolved launch is only the user's interactive shell. Consequential
+`ReattachOnly` commands never cross that automatic boundary.
 
 ## 5. Fixed in this audit
 

@@ -292,9 +292,9 @@ impl Core {
 
     /// Starts the process a pane describes, if it describes one.
     ///
-    /// Returns `None` for a pane that is deliberately empty: one of Turn's own views,
-    /// or a terminal pane with no command, which is a placeholder until something is
-    /// put in it.
+    /// Returns `None` only for one of Turn's own non-terminal views. A terminal pane with no
+    /// command opens the user's configured shell: presenting an empty terminal and asking the
+    /// user to start it is not a useful state.
     pub(crate) fn materialise_pane(
         &mut self,
         session_id: &SessionId,
@@ -1109,15 +1109,14 @@ enum PaneLaunch {
 ///   of pane it was asked for. The adapter decides what an agent is — `claude` typed
 ///   into a plain terminal pane is one — and an agent is a program you run in a
 ///   terminal, not the terminal itself.
-/// * A shell pane with no command is the shell, run directly. It already is a
-///   terminal; there is nothing to host.
+/// * Any terminal-backed pane with no command is the shell, run directly. It already is a
+///   terminal; there is nothing to host, and an empty panel would only turn recovery into a
+///   user action.
 /// * An agent pane with no command has to resolve one, and always resolves to
 ///   *something*: the workspace's configured agent, else the first agent CLI on the
 ///   user's PATH, else a shell that says why it is only a shell. `+ Pane Agent`
 ///   opening an empty pane with no explanation is the failure this rules out.
 ///
-/// Any other terminal pane with no command stays empty. Guessing what a pane labelled
-/// "server" should run would start something the user did not ask for.
 /// `shell` is resolved by the caller rather than here, because the answer depends on
 /// settings the caller has the Session for — a Session-level `shell.command` beats its
 /// Workspace's, and this function is given only the Workspace.
@@ -1144,7 +1143,6 @@ fn pane_launch(
         });
     }
     match kind {
-        PaneKind::Shell => Some(PaneLaunch::Direct { command: shell }),
         PaneKind::Agent => Some(match workspace.and_then(default_agent) {
             Some(agent) if registry.select(&agent).is_installed() => PaneLaunch::Hosted {
                 shell,
@@ -1174,6 +1172,7 @@ fn pane_launch(
                 },
             },
         }),
+        kind if kind.is_terminal() => Some(PaneLaunch::Direct { command: shell }),
         _ => None,
     }
 }
@@ -1201,7 +1200,7 @@ fn launch_authority(launch: &PaneLaunch, kind: PaneKind, args: &[String]) -> Lau
         PaneLaunch::Unhosted { shell, .. } if bare_shell(shell) => {
             LaunchAuthority::InteractiveShell
         }
-        PaneLaunch::Direct { command } if kind == PaneKind::Shell && bare_shell(command) => {
+        PaneLaunch::Direct { command } if kind.is_terminal() && bare_shell(command) => {
             LaunchAuthority::InteractiveShell
         }
         _ => LaunchAuthority::CheckoutWrite,
@@ -1531,16 +1530,36 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_that_names_no_job_and_is_not_a_terminal_starts_nothing() {
-        // The failure this prevents: a pane labelled "server" quietly running
-        // something Turn guessed at.
+    fn every_commandless_terminal_opens_the_configured_shell() {
         let registry = AdapterRegistry::bare();
         for kind in [
             PaneKind::Terminal,
+            PaneKind::Shell,
             PaneKind::Server,
             PaneKind::Logs,
             PaneKind::TestOutput,
             PaneKind::Tui,
+            PaneKind::TmuxTerminal,
+        ] {
+            assert_eq!(
+                pane_launch(kind, None, None, default_shell(None), &registry),
+                Some(PaneLaunch::Direct {
+                    command: default_shell(None),
+                }),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_terminal_view_with_no_command_starts_nothing() {
+        let registry = AdapterRegistry::bare();
+        for kind in [
+            PaneKind::EventLog,
+            PaneKind::AgentTree,
+            PaneKind::ProcessDetails,
+            PaneKind::Preview,
+            PaneKind::Placeholder,
         ] {
             assert_eq!(
                 pane_launch(kind, None, None, default_shell(None), &registry),

@@ -397,7 +397,8 @@ pub struct TurnView<'a> {
     /// At most one explicit temporary Pane for this window. Rendering it must never
     /// insert its PaneId into `layout`.
     pub temporary_pane: Option<TemporaryPaneContent<'a>>,
-    /// Actionable recovery for the selected Session. It never relaunches by itself.
+    /// Recovery state for the selected Session. Safe panes relaunch automatically in the Desk;
+    /// this remains here to explain any safety gate while that happens.
     pub restore: Option<&'a SessionRestoreView>,
     /// A previous daemon owned this Session's checkout. Starting anything remains
     /// blocked until the user explicitly confirms a new fenced lease.
@@ -405,7 +406,7 @@ pub struct TurnView<'a> {
     /// Processes from the previous daemon that are still alive but cannot be controlled.
     /// They block recovery/relaunch so Turn never creates a second writer beside them.
     pub unreachable_processes: usize,
-    /// Nodes whose explicit relaunch request is currently in flight.
+    /// Nodes whose relaunch request is currently in flight, normally from automatic recovery.
     pub relaunching: Vec<NodeId>,
     pub reclaiming_workspaces: Vec<WorkspaceId>,
     pub reclaiming_write_access: bool,
@@ -434,10 +435,25 @@ pub struct TurnView<'a> {
 
 /// The window's own mutable state: what is typed in the palette, and what is selected
 /// in each pane.
+#[derive(Default)]
+struct LogoTexture(Option<egui::TextureHandle>);
+
+impl std::fmt::Debug for LogoTexture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LogoTexture")
+            .field(&self.0.as_ref().map(egui::TextureHandle::id))
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
+    /// The checked-in product mark, decoded and uploaded once for the lifetime of the window.
+    /// Keeping the handle here avoids allocating a GPU texture on every immediate-mode frame.
+    logo_texture: LogoTexture,
     /// The pane whose header is being dragged, if any.
     ///
     /// The gesture itself belongs to `egui`, which also abandons it when Escape is
@@ -1023,7 +1039,6 @@ pub enum ViewAction {
 pub enum ToolbarIntent {
     Run(Command),
     NewWorkspace,
-    NewSession,
     /// The layout presets, as a menu: there are five of them and a toolbar button
     /// cannot mean five things.
     LayoutMenu,
@@ -1055,11 +1070,6 @@ pub const TOOLBAR: &[ToolbarButton] = &[
         icon: icons::LAYOUT,
         label: "Layout",
         intent: ToolbarIntent::LayoutMenu,
-    },
-    ToolbarButton {
-        icon: icons::FILE_PLUS,
-        label: "New session",
-        intent: ToolbarIntent::NewSession,
     },
     ToolbarButton {
         icon: icons::FOLDER_PLUS,
@@ -1272,6 +1282,7 @@ fn row_action_slot(row: Rect, index: usize) -> Rect {
 /// connection sentence a few characters to the left, and the two disagreeing is exactly
 /// the thing a user needs to be able to see.
 const WINDOW_VERSION: &str = env!("CARGO_PKG_VERSION");
+const TURN_LOGO_PNG: &[u8] = include_bytes!("../assets/turn-icon.png");
 
 #[derive(Clone, Copy)]
 enum HierarchyRow<'a> {
@@ -1710,10 +1721,6 @@ impl<'a> TurnView<'a> {
         if let Some(permission) = &self.permission {
             actions.extend(self.permission_banner(ui, theme, permission));
         }
-        if let Some(notice) = &self.notice {
-            self.notice_bar(ui, theme, notice);
-        }
-
         if state.quick_preview.is_some()
             && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
         {
@@ -1964,31 +1971,80 @@ impl<'a> TurnView<'a> {
             },
         );
 
-        // The version, right-aligned, and the anchor everything to its left is measured
-        // against.
-        let version = format!("v{WINDOW_VERSION}");
-        let version_rect = ui.painter().text(
-            rect.right_center() - Vec2::new(10.0, 0.0),
-            Align2::RIGHT_CENTER,
-            &version,
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme.text_faint,
+        let (version_value, connection_detail) = match &connection {
+            ConnectionState::Connected {
+                daemon_version,
+                daemon_pid,
+                ..
+            } => (daemon_version.as_str(), format!("pid {daemon_pid}")),
+            _ => (WINDOW_VERSION, connection.detail()),
+        };
+        let version = format!("v{version_value}");
+
+        // Identity and controls are one left-aligned cluster. The product mark is the same
+        // checked-in artwork used by the Dock/window icon, so the app does not acquire a second
+        // improvised logo in its own chrome.
+        let texture_id = state
+            .logo_texture
+            .0
+            .get_or_insert_with(|| {
+                let icon = eframe::icon_data::from_png_bytes(TURN_LOGO_PNG)
+                    .expect("the embedded Turn logo must be a valid PNG");
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
+                );
+                ui.ctx()
+                    .load_texture("turn-product-mark", image, egui::TextureOptions::LINEAR)
+            })
+            .id();
+        let logo = Rect::from_center_size(
+            egui::pos2(rect.min.x + 19.0, rect.center().y),
+            Vec2::splat(22.0),
+        );
+        ui.painter().image(
+            texture_id,
+            logo,
+            Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let brand = ui.painter().text(
+            egui::pos2(logo.max.x + 6.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            "TURN",
+            FontId::new(12.0, egui::FontFamily::Monospace),
+            theme.text,
         );
 
-        // The attention affordance keeps the right-hand end, because being needed is the
-        // product's whole message and it must not be the thing that scrolls away.
-        let attention_width = if waiting > 0 { 244.0 } else { 106.0 };
-        let attention_right = version_rect.min.x - 10.0;
-        let attention = Rect::from_min_max(
-            egui::pos2(
-                (attention_right - attention_width).max(rect.min.x),
-                rect.min.y + 4.0,
-            ),
-            egui::pos2(attention_right, rect.max.y - 4.0),
+        // Connection, process identity, attention and the single visible version are metadata,
+        // so they live together at the right edge. The daemon's version is the visible version
+        // while connected; showing the identical window version again conveyed no information.
+        let metadata_wanted: f32 = if waiting > 0 { 450.0 } else { 330.0 };
+        let metadata_width = metadata_wanted.min((rect.width() - 92.0).max(0.0));
+        let metadata = Rect::from_min_max(
+            egui::pos2(rect.max.x - metadata_width, rect.min.y + 4.0),
+            egui::pos2(rect.max.x - 8.0, rect.max.y - 4.0),
         );
-        if attention.width() > 40.0 {
-            ui.scope_builder(region(attention, "status-attention"), |ui| {
+        if metadata.width() > 40.0 {
+            ui.scope_builder(region(metadata, "status-metadata"), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(&version)
+                            .monospace()
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(&connection_detail)
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(format!("{glyph} {}", connection.word()))
+                            .color(colour)
+                            .small(),
+                    );
                     if waiting > 0 {
                         let shortcut = keymap
                             .chord_for(Command::NextAttention)
@@ -2019,66 +2075,12 @@ impl<'a> TurnView<'a> {
             });
         }
 
-        // The left-hand identity, painted rather than laid out so its width is known and
-        // its overflow is clipped instead of shoving the toolbar sideways. The limit is a
-        // fixed column rather than "wherever the sentence ended", so the toolbar does not
-        // shuffle every time the daemon reconnects and the sentence changes length, and it
-        // is capped so a very wide window does not push the buttons into its middle.
-        let identity_limit = rect.min.x + (rect.width() * 0.42).clamp(0.0, 560.0);
-        let mut cursor = rect.min.x + 10.0;
-        let identity = ui.painter().with_clip_rect(Rect::from_min_max(
-            rect.min,
-            egui::pos2(identity_limit, rect.max.y),
-        ));
-        cursor = identity
-            .text(
-                egui::pos2(cursor, rect.center().y),
-                Align2::LEFT_CENTER,
-                "TURN",
-                FontId::new(12.0, egui::FontFamily::Monospace),
-                theme.text,
-            )
-            .max
-            .x
-            + 8.0;
-        // Monospace, deliberately: the proportional face the body text uses has no glyph
-        // for these and draws a missing-glyph box, which would leave the connection state
-        // signalled by colour alone.
-        cursor = identity
-            .text(
-                egui::pos2(cursor, rect.center().y),
-                Align2::LEFT_CENTER,
-                glyph,
-                FontId::new(11.0, egui::FontFamily::Monospace),
-                colour,
-            )
-            .max
-            .x
-            + 5.0;
-        cursor = identity
-            .text(
-                egui::pos2(cursor, rect.center().y),
-                Align2::LEFT_CENTER,
-                connection.word(),
-                FontId::new(11.0, egui::FontFamily::Proportional),
-                colour,
-            )
-            .max
-            .x
-            + 8.0;
-        identity.text(
-            egui::pos2(cursor, rect.center().y),
-            Align2::LEFT_CENTER,
-            connection.detail(),
-            FontId::new(10.0, egui::FontFamily::Proportional),
-            theme.text_faint,
-        );
-
-        // Whatever is left in the middle belongs to the toolbar.
-        let toolbar_left = identity_limit + 12.0;
+        // Every global control begins immediately after the mark and product name. Contextual
+        // Session creation deliberately does not live here; each Workspace row owns that action.
+        let toolbar_left = brand.max.x + 12.0;
         let toolbar = Rect::from_min_max(
             egui::pos2(toolbar_left, rect.min.y + 5.0),
-            egui::pos2(attention.min.x - 10.0, rect.max.y - 5.0),
+            egui::pos2(metadata.min.x - 10.0, rect.max.y - 5.0),
         );
         let capacity = if toolbar.width() > 0.0 {
             toolbar_capacity(toolbar.width())
@@ -2090,7 +2092,7 @@ impl<'a> TurnView<'a> {
                 ui.spacing_mut().item_spacing.x = icons::PITCH - icons::SIZE.x;
                 ui.horizontal(|ui| {
                     for button in &TOOLBAR[..capacity] {
-                        actions.extend(self.toolbar_button(ui, keymap, state, hierarchy, *button));
+                        actions.extend(self.toolbar_button(ui, keymap, state, *button));
                     }
                 });
             });
@@ -2100,9 +2102,9 @@ impl<'a> TurnView<'a> {
         // four unrelated fragments — and hears the version, which is painted.
         let status_id = ui.id().with("window-top-status");
         let announced = format!(
-            "Turn {WINDOW_VERSION}, {}, {}, {}",
+            "Turn {version_value}, {}, {}, {}",
             connection.word(),
-            connection.detail(),
+            connection_detail,
             if waiting == 1 {
                 "1 session needs you".to_string()
             } else if waiting > 0 {
@@ -2125,7 +2127,6 @@ impl<'a> TurnView<'a> {
         ui: &mut Ui,
         keymap: &Keymap,
         state: &mut ViewState,
-        hierarchy: Option<&HierarchySnapshot>,
         button: ToolbarButton,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
@@ -2153,19 +2154,6 @@ impl<'a> TurnView<'a> {
                     .clicked()
                 {
                     state.workspace_draft = Some(WorkspaceDraft::new(false));
-                }
-            }
-            ToolbarIntent::NewSession => {
-                let enabled = hierarchy.is_some_and(|snapshot| !snapshot.workspaces.is_empty());
-                let shortcut = keymap
-                    .chord_for(Command::NewSession)
-                    .map(|chord| chord.describe(keymap.platform()));
-                if icons::icon_button(ui, button.icon, button.label, shortcut.as_deref(), enabled)
-                    .clicked()
-                {
-                    if let Some(snapshot) = hierarchy {
-                        state.session_draft = self.new_session_draft(snapshot, state);
-                    }
                 }
             }
             ToolbarIntent::LayoutMenu => {
@@ -2212,24 +2200,6 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    fn notice_bar(&self, ui: &mut Ui, theme: &Theme, notice: &str) {
-        let rect = Rect::from_min_size(
-            ui.available_rect_before_wrap().min,
-            Vec2::new(ui.available_width(), 22.0),
-        );
-        ui.painter().rect_filled(rect, 0.0, theme.raised);
-        ui.painter()
-            .hline(rect.x_range(), rect.max.y, Stroke::new(1.0, theme.border));
-        ui.painter().text(
-            rect.left_center() + Vec2::new(10.0, 0.0),
-            Align2::LEFT_CENTER,
-            notice,
-            FontId::new(11.0, egui::FontFamily::Proportional),
-            theme.failure,
-        );
-        ui.advance_cursor_after_rect(rect);
-    }
-
     /// The bar along the bottom of the window.
     ///
     /// This is where the `RESTORED SAFELY` strip went. It used to be a band pushed in
@@ -2258,11 +2228,12 @@ impl<'a> TurnView<'a> {
             self.recovery_lease.is_some() || self.reclaiming_write_access;
         let recovering =
             restore.is_some() || needs_write_confirmation || self.unreachable_processes > 0;
+        let status_alert = recovering || self.notice.is_some();
 
         ui.painter().rect_filled(
             rect,
             0.0,
-            if recovering {
+            if status_alert {
                 theme.raised
             } else {
                 theme.panel
@@ -2274,7 +2245,8 @@ impl<'a> TurnView<'a> {
         // The right-hand end first: its controls are laid out as widgets, and the
         // sentence on the left has to be clipped to whatever is left over rather than
         // painted straight through them.
-        let controls_width = if recovering { 250.0 } else { 0.0 };
+        let recovery_has_controls = self.recovery_lease.is_some() || self.reclaiming_write_access;
+        let controls_width = if recovery_has_controls { 250.0 } else { 0.0 };
         let controls = Rect::from_min_max(
             egui::pos2(
                 (rect.max.x - controls_width).max(rect.min.x),
@@ -2282,7 +2254,7 @@ impl<'a> TurnView<'a> {
             ),
             egui::pos2(rect.max.x - 8.0, rect.max.y - 2.0),
         );
-        if recovering && controls.width() > 60.0 {
+        if recovery_has_controls && controls.width() > 60.0 {
             ui.scope_builder(region(controls, "recovery-actions"), |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(lease) = self.recovery_lease {
@@ -2312,29 +2284,6 @@ impl<'a> TurnView<'a> {
                         }
                     } else if self.reclaiming_write_access {
                         ui.add_enabled(false, egui::Button::new("Confirming…").small());
-                    } else if ui
-                        .add_enabled(
-                            available > 0 && self.unreachable_processes == 0,
-                            egui::Button::new("Start all").small(),
-                        )
-                        .on_disabled_hover_text(if self.unreachable_processes > 0 {
-                            "Stop surviving processes outside Turn before starting replacement panes."
-                        } else {
-                            "No stopped pane can be started again."
-                        })
-                        .clicked()
-                    {
-                        if let Some(restore) = restore {
-                            for pane in restore.panes.iter().filter(|pane| pane.can_relaunch) {
-                                if !self.relaunching.contains(&pane.node_id) {
-                                    actions.push(ViewAction::RelaunchNode {
-                                        session_id: restore.session_id.clone(),
-                                        node_id: pane.node_id.clone(),
-                                        resume: false,
-                                    });
-                                }
-                            }
-                        }
                     }
                 });
             });
@@ -2342,7 +2291,9 @@ impl<'a> TurnView<'a> {
 
         let focused = self.panes.iter().find(|pane| pane.focused);
         let (sentence, colour) =
-            if self.unreachable_processes > 0 {
+            if let Some(notice) = self.notice.as_deref() {
+                (notice.to_string(), theme.failure)
+            } else if self.unreachable_processes > 0 {
                 (
                     format!(
                     "RESTORED SAFELY · {} surviving process{} cannot be controlled by this daemon",
@@ -2377,8 +2328,10 @@ impl<'a> TurnView<'a> {
                     None => ("FOCUS · no pane focused".to_string(), theme.text_faint),
                 }
             };
-        let sentence_limit = if recovering {
+        let sentence_limit = if recovery_has_controls {
             controls.min.x - 10.0
+        } else if status_alert {
+            rect.max.x - 10.0
         } else {
             rect.max.x - 220.0
         };
@@ -2397,7 +2350,7 @@ impl<'a> TurnView<'a> {
 
         // The session's own counts sit at the right when there is nothing to recover, so
         // the space the recovery controls need is never shared with them.
-        let counts = session.filter(|_| !recovering).map(|session| {
+        let counts = session.filter(|_| !status_alert).map(|session| {
             format!(
                 "{} · {} running · {} panes",
                 session.session.mode.label(),
@@ -5282,7 +5235,7 @@ impl<'a> TurnView<'a> {
                     .map(|outcome| (restore, outcome))
             });
             match (restore, content) {
-                (Some((restore, outcome)), _) => {
+                (Some((_restore, outcome)), _) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
                     let content_rect = Rect::from_center_size(
                         body.center(),
@@ -5291,32 +5244,6 @@ impl<'a> TurnView<'a> {
                     ui.scope_builder(region(content_rect, "restored-pane-action"), |ui| {
                         ui.vertical_centered(|ui| {
                             let orphaned = outcome.lifecycle.is_running();
-                            ui.label(
-                                RichText::new(if orphaned {
-                                    "Process is still running"
-                                } else {
-                                    "Process is stopped"
-                                })
-                                .color(theme.text)
-                                .strong(),
-                            );
-                            ui.label(
-                                RichText::new(
-                                    outcome.command.as_deref().unwrap_or("No command recorded"),
-                                )
-                                .monospace()
-                                .color(theme.text_dim),
-                            );
-                            ui.label(
-                                RichText::new(if orphaned {
-                                    "Its terminal belonged to the previous daemon and cannot be reattached."
-                                } else {
-                                    "Turn restored the layout without running this command."
-                                })
-                                .color(theme.text_faint)
-                                .small(),
-                            );
-                            ui.add_space(7.0);
                             let pending = self.relaunching.contains(&outcome.node_id);
                             // Only what would actually use the checkout waits for the
                             // confirmation. A pane that opens the user's own shell starts
@@ -5326,110 +5253,50 @@ impl<'a> TurnView<'a> {
                                 || self.reclaiming_write_access)
                                 && outcome.needs_checkout_write;
                             let unreachable_blocked = self.unreachable_processes > 0;
-                            if ui
-                                .add_enabled(
-                                    outcome.can_relaunch
-                                        && !pending
-                                        && !lease_blocked
-                                        && !unreachable_blocked
-                                        && !selected_archived,
-                                    egui::Button::new(if pending {
-                                        "Starting…"
-                                    } else if orphaned {
-                                        "Still running"
-                                    } else {
-                                        "Start pane"
-                                    }),
+                            let heading = if orphaned {
+                                "Process survived outside Turn"
+                            } else if pending {
+                                "Starting automatically…"
+                            } else if lease_blocked {
+                                "Waiting for write access"
+                            } else if unreachable_blocked {
+                                "Waiting for the surviving process"
+                            } else if selected_archived {
+                                "Session is archived"
+                            } else if outcome.can_relaunch {
+                                "Restarting automatically…"
+                            } else {
+                                "Process is stopped"
+                            };
+                            ui.label(RichText::new(heading).color(theme.text).strong());
+                            ui.label(
+                                RichText::new(
+                                    outcome
+                                        .command
+                                        .as_deref()
+                                        .unwrap_or("Opening your configured shell"),
                                 )
-                                .clicked()
-                            {
-                                actions.push(ViewAction::RelaunchNode {
-                                    session_id: restore.session_id.clone(),
-                                    node_id: outcome.node_id.clone(),
-                                    resume: false,
-                                });
-                            }
-                            // And the same act for the whole Session, beside it.
-                            //
-                            // There has always been a "Start all" — in the bottom status bar,
-                            // small, at the other end of the window from the panes it acts on.
-                            // Every stopped pane meanwhile shows this button in the middle of
-                            // itself, so coming back to a four-pane Session read as four
-                            // separate decisions and was reported as unusable. The collective
-                            // action belongs where the hand already is.
-                            //
-                            // Offered only when there is more than one, because "Start all" on a
-                            // single pane is the same click with a vaguer name.
-                            // The panes this click could actually start, *now*. Not simply the
-                            // stopped ones: while a write confirmation is pending, a pane that
-                            // would open the user's own shell can start and one that would use
-                            // the checkout cannot, so a button offering both would either be
-                            // disabled for all of them or claim more than it does. The number in
-                            // the label is the number it will start.
-                            let lease_pending =
-                                self.recovery_lease.is_some() || self.reclaiming_write_access;
-                            let startable: Vec<&PaneRestoreOutcome> = restore
-                                .panes
-                                .iter()
-                                .filter(|pane| {
-                                    pane.can_relaunch
-                                        && !self.relaunching.contains(&pane.node_id)
-                                        && !(lease_pending && pane.needs_checkout_write)
-                                })
-                                .collect();
-                            // Once on screen, not once per pane: three stopped panes each showing
-                            // "Start all 3 panes" is three buttons for one act, which is noise
-                            // where the point was to remove a decision. It goes on the first one
-                            // it would start — a stable choice, the same pane every frame.
-                            let is_host = startable
-                                .first()
-                                .is_some_and(|pane| pane.node_id == outcome.node_id);
-                            if startable.len() > 1
-                                && is_host
-                                && ui
-                                    .add_enabled(
-                                        !unreachable_blocked && !selected_archived,
-                                        egui::Button::new(format!(
-                                            "Start all {} panes",
-                                            startable.len()
-                                        )),
-                                    )
-                                    .on_hover_text(
-                                        "Starts every stopped pane this Session can start, in one go",
-                                    )
-                                    .clicked()
-                            {
-                                for pane in &startable {
-                                    actions.push(ViewAction::RelaunchNode {
-                                        session_id: restore.session_id.clone(),
-                                        node_id: pane.node_id.clone(),
-                                        resume: false,
-                                    });
-                                }
-                            }
-                            if lease_blocked && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new("Confirm write access in the status bar first.")
-                                        .color(theme.attention)
-                                        .small(),
-                                );
-                            } else if unreachable_blocked && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new(
-                                        "Stop surviving processes outside Turn before starting.",
-                                    )
-                                    .color(theme.attention)
+                                .monospace()
+                                .color(theme.text_dim),
+                            );
+                            let explanation = if orphaned {
+                                "Its terminal belonged to the previous daemon and cannot be reattached."
+                            } else if pending || outcome.can_relaunch && !lease_blocked && !unreachable_blocked {
+                                "Turn is restoring this pane; no action is required."
+                            } else if lease_blocked {
+                                "Automatic recovery will continue after write access is confirmed."
+                            } else if unreachable_blocked {
+                                "Turn will continue automatically when it is safe to avoid a duplicate process."
+                            } else if selected_archived {
+                                "Archived work stays stopped."
+                            } else {
+                                "This consequential command is not configured for automatic restart."
+                            };
+                            ui.label(
+                                RichText::new(explanation)
+                                    .color(theme.text_faint)
                                     .small(),
-                                );
-                            } else if selected_archived && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new(
-                                        "Restore the Session and Workspace before starting.",
-                                    )
-                                    .color(theme.attention)
-                                    .small(),
-                                );
-                            }
+                            );
                         });
                     });
                 }
@@ -5501,31 +5368,20 @@ impl<'a> TurnView<'a> {
                                         .monospace()
                                         .color(theme.text_dim),
                                 );
-                                ui.add_space(7.0);
                                 let pending = self.relaunching.contains(&node.node_id);
-                                let lease_blocked =
-                                    self.recovery_lease.is_some() || self.reclaiming_write_access;
-                                let unreachable_blocked = self.unreachable_processes > 0;
-                                if ui
-                                    .add_enabled(
-                                        !pending
-                                            && !lease_blocked
-                                            && !unreachable_blocked
-                                            && !selected_archived,
-                                        egui::Button::new(if pending {
-                                            "Starting…"
-                                        } else {
-                                            "Start pane"
-                                        }),
-                                    )
-                                    .clicked()
-                                {
-                                    actions.push(ViewAction::RelaunchNode {
-                                        session_id: node.session_id.clone(),
-                                        node_id: node.node_id.clone(),
-                                        resume: false,
-                                    });
-                                }
+                                ui.label(
+                                    RichText::new(if pending {
+                                        "Starting automatically…"
+                                    } else {
+                                        "Turn could not restart this process automatically."
+                                    })
+                                    .color(if pending {
+                                        theme.running
+                                    } else {
+                                        theme.text_faint
+                                    })
+                                    .small(),
+                                );
                             });
                         });
                     } else {
@@ -6751,13 +6607,23 @@ impl<'a> TurnView<'a> {
                     });
                 });
                 if entry.hidden {
-                    ui.label(
-                        RichText::new(
-                            "Not shown, and not editable here: Turn does not display a value                              that may be a credential.",
-                        )
-                        .color(theme.text_faint)
-                        .small(),
-                    );
+                    if entry.known {
+                        ui.label(
+                            RichText::new(
+                                "Not shown, and not editable here: Turn does not display a value that may be a credential.",
+                            )
+                            .color(theme.text_faint)
+                            .small(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Written by a newer version of Turn. Its sensitivity is unknown, so the value stays hidden and can only be reset.",
+                            )
+                            .color(theme.attention)
+                            .small(),
+                        );
+                    }
                 } else if !settable {
                     ui.label(
                         RichText::new(format!(
@@ -6771,14 +6637,6 @@ impl<'a> TurnView<'a> {
                                 .join(", ")
                         ))
                         .color(theme.text_faint)
-                        .small(),
-                    );
-                } else if !entry.known {
-                    ui.label(
-                        RichText::new(
-                            "Written by a newer version of Turn. This build cannot say what it                              does, so it can only be reset.",
-                        )
-                        .color(theme.attention)
                         .small(),
                     );
                 }

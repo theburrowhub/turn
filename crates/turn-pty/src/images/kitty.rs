@@ -31,8 +31,6 @@
 
 use std::io::Read as _;
 
-use super::base64::Base64Stream;
-
 /// What a program asked the graphics protocol to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
@@ -340,29 +338,65 @@ pub fn crop(
 #[derive(Debug)]
 pub struct Chunked {
     pub control: Control,
-    payload: Base64Stream,
+    payload: Vec<u8>,
+    limit: usize,
+    failed: bool,
 }
 
 impl Chunked {
     pub fn new(control: Control, limit: usize) -> Self {
         Self {
             control,
-            payload: Base64Stream::with_limit(limit),
+            payload: Vec::new(),
+            limit,
+            failed: false,
         }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        self.payload.push(bytes);
+        if self.failed {
+            return;
+        }
+        let Some(size) = self.payload.len().checked_add(bytes.len()) else {
+            self.failed = true;
+            self.payload.clear();
+            return;
+        };
+        if size > self.limit {
+            self.failed = true;
+            self.payload.clear();
+            return;
+        }
+        self.payload.extend_from_slice(bytes);
     }
 
     /// Whether the payload has already been refused, so a caller can stop early.
     pub fn failed(&self) -> bool {
-        self.payload.failed().is_some()
+        self.failed
     }
 
-    pub fn finish(self) -> Result<Vec<u8>, super::base64::Base64Error> {
-        self.payload.finish()
+    pub fn finish(self) -> Option<Vec<u8>> {
+        (!self.failed).then_some(self.payload)
     }
+}
+
+/// Whether this control data is a continuation of the payload already in flight.
+///
+/// Kitty requires continuation chunks to contain only `m`. Treating a full transmission
+/// header as a continuation would combine two unrelated pictures; it instead replaces the
+/// abandoned transfer, as the protocol specifies.
+pub fn is_chunk_continuation(text: &str) -> bool {
+    let mut saw_more = false;
+    for field in text.split(',').filter(|field| !field.trim().is_empty()) {
+        let Some((key, _)) = field.split_once('=') else {
+            return false;
+        };
+        if key.trim() != "m" {
+            return false;
+        }
+        saw_more = true;
+    }
+    saw_more
 }
 
 #[cfg(test)]
@@ -533,10 +567,10 @@ mod tests {
     #[test]
     fn a_chunked_payload_is_assembled_across_sequences() {
         let mut chunked = Chunked::new(parse_control("a=T,f=100,m=1"), 1_000);
-        chunked.push(b"Zm9v");
-        chunked.push(b"YmFy");
+        chunked.push(b"foo");
+        chunked.push(b"bar");
         assert!(!chunked.failed());
-        assert_eq!(chunked.finish().expect("it decodes"), b"foobar");
+        assert_eq!(chunked.finish().expect("it fits"), b"foobar");
     }
 
     #[test]
@@ -547,9 +581,17 @@ mod tests {
         }
         assert!(
             chunked.failed(),
-            "a caller must be able to stop scanning a doomed payload"
+            "a caller must be able to discard a doomed payload"
         );
-        assert!(chunked.finish().is_err());
+        assert!(chunked.finish().is_none());
+    }
+
+    #[test]
+    fn only_a_bare_more_flag_is_a_continuation() {
+        assert!(is_chunk_continuation("m=1"));
+        assert!(is_chunk_continuation(" m=0 "));
+        assert!(!is_chunk_continuation("a=T,f=100,m=1"));
+        assert!(!is_chunk_continuation(""));
     }
 
     #[test]
