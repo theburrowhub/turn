@@ -301,6 +301,12 @@ impl Store {
         SettingsRepo::new(&self.conn)
     }
 
+    /// The user's layered preferences. Separate from [`Self::settings`], which holds Turn's
+    /// own singletons: a preference's identity includes the level it was set at.
+    pub fn setting_layers(&self) -> crate::repo::setting_layer::SettingLayerRepo<'_> {
+        crate::repo::setting_layer::SettingLayerRepo::new(&self.conn)
+    }
+
     /// Atomically records everything one accepted runtime event changed.
     ///
     /// Ordering is part of the contract: an out-of-order stop can materialise a

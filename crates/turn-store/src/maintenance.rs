@@ -129,6 +129,12 @@ const REDACTABLE_COLUMNS: &[RedactableColumn] = &[
     RedactableColumn::new("events", "raw", RedactionKind::Json),
     RedactableColumn::new("settings", "value_json", RedactionKind::Json),
     RedactableColumn::new("settings", "key", RedactionKind::SettingsKey),
+    // The layered preferences, classified exactly like the flat table they sit beside. A
+    // preference's value is user text and may be an environment variable, so it is scrubbed
+    // on the same terms as `workspaces.env_json`: Turn does not hold a credential in the
+    // clear on disk, and a settings sheet is not a way around that.
+    RedactableColumn::new("setting_layers", "value_json", RedactionKind::Json),
+    RedactableColumn::new("setting_layers", "key", RedactionKind::SettingsKey),
     RedactableColumn::new(
         "attention_entries",
         "subject_external_id",
@@ -164,6 +170,8 @@ const REDACTABLE_COLUMNS: &[RedactableColumn] = &[
 /// Those values are scanned, but never rewritten: changing one could break a
 /// foreign key, a checkout fence, a process relationship, or decoding semantics.
 const INVARIANT_COLUMNS: &[InvariantColumn] = &[
+    InvariantColumn::new("setting_layers", "scope", "settings level"),
+    InvariantColumn::new("setting_layers", "owner_id", "settings level owner id"),
     InvariantColumn::new("workspaces", "id", "Workspace id"),
     InvariantColumn::new("workspaces", "root", "workspace root"),
     InvariantColumn::new("workspaces", "default_template", "Template id"),

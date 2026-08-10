@@ -73,6 +73,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "purge_legacy_durable_secrets",
         statements: MIGRATION_009_PURGE_LEGACY_DURABLE_SECRETS,
     },
+    Migration {
+        version: 10,
+        name: "setting_layers",
+        statements: MIGRATION_010_SETTING_LAYERS,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -846,6 +851,38 @@ VALUES ('security.legacy_free_text_purge_pending', 'true', 0)
 ON CONFLICT(key) DO UPDATE SET value_json = 'true', updated_ms = 0;
 "#;
 
+/// One row per preference *per level*, which is the whole point.
+///
+/// A new table rather than columns on `settings`: the flat table holds Turn's own
+/// singletons — the attention policy, a purge flag — read by key with no notion of a
+/// level, and widening it would have made every one of those reads specify a scope it
+/// does not have.
+///
+/// The primary key is (scope, owner_id, key), so a Workspace and a Session may hold the
+/// same key with different values and neither can overwrite the other. That is not an
+/// optimisation; it is the acceptance criterion "changing one level does not destroy
+/// overrides below it", enforced by the schema rather than by the code above it.
+///
+/// `owner_id` is the empty string for the Global level rather than NULL. SQLite compares
+/// NULLs as distinct in a UNIQUE index, so a nullable owner would let two Global rows
+/// exist for one key and the resolver would see whichever it read first.
+///
+/// No `Temporary` rows are ever written. That level lives in a window and dies with it,
+/// and the column is deliberately not constrained against it: a stray row from a future
+/// build is inert here rather than a foreign-key failure on somebody's machine.
+const MIGRATION_010_SETTING_LAYERS: &str = r#"
+CREATE TABLE setting_layers (
+    scope      TEXT    NOT NULL,
+    owner_id   TEXT    NOT NULL,
+    key        TEXT    NOT NULL,
+    value_json TEXT    NOT NULL,
+    updated_ms INTEGER NOT NULL,
+    PRIMARY KEY (scope, owner_id, key)
+) STRICT;
+
+CREATE INDEX idx_setting_layers_owner ON setting_layers (scope, owner_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,7 +947,8 @@ mod tests {
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
                 "postmortem_attention",
-                "purge_legacy_durable_secrets"
+                "purge_legacy_durable_secrets",
+                "setting_layers"
             ]
         );
 
@@ -1044,8 +1082,20 @@ mod tests {
             .collect();
 
         let applied = apply(&conn).unwrap();
-        assert_eq!(applied.names, vec!["purge_legacy_durable_secrets"]);
-        assert_eq!(table_names(&conn), before_tables);
+        assert_eq!(
+            applied.names,
+            vec!["purge_legacy_durable_secrets", "setting_layers"]
+        );
+        // What this test is about is that v9 schedules work rather than rebuilding anything,
+        // so the assertion is that **no existing table changed**. Later migrations may add
+        // tables — v10 adds `setting_layers` — and comparing the whole list would turn this
+        // into a test that fails every time the schema grows, which is not what it is for.
+        for table in &before_tables {
+            assert!(
+                table_names(&conn).contains(table),
+                "v9 must not remove {table}"
+            );
+        }
         for (table, columns) in before_columns {
             assert_eq!(column_names(&conn, &table), columns, "changed {table}");
         }
@@ -1092,7 +1142,8 @@ mod tests {
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
                 "postmortem_attention",
-                "purge_legacy_durable_secrets"
+                "purge_legacy_durable_secrets",
+                "setting_layers"
             ]
         );
 
@@ -1139,7 +1190,8 @@ mod tests {
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
                 "postmortem_attention",
-                "purge_legacy_durable_secrets"
+                "purge_legacy_durable_secrets",
+                "setting_layers"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1279,7 +1331,8 @@ mod tests {
                 "require_explicit_legacy_lease_reconciliation",
                 "attention_correlation_scope",
                 "postmortem_attention",
-                "purge_legacy_durable_secrets"
+                "purge_legacy_durable_secrets",
+                "setting_layers"
             ]
         );
         let (required, state): (bool, String) = conn
