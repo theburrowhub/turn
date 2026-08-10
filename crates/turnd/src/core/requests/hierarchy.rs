@@ -784,13 +784,46 @@ impl Core {
     }
 
     pub(crate) fn node_pane_capability(&self, node_id: &NodeId) -> NodePaneCapability {
-        if self.processes.contains_key(node_id) {
+        if self.terminal_node(node_id).is_some() {
             NodePaneCapability::Terminal {
                 streams: vec![PaneStream::Cells, PaneStream::Bytes],
             }
         } else {
             NodePaneCapability::PreviewDetails
         }
+    }
+
+    /// The agent this node's process is running, if it is a shell hosting one.
+    pub(crate) fn hosted_agent_of(&self, node_id: &NodeId) -> Option<NodeId> {
+        self.processes.get(node_id)?.hosted.clone()
+    }
+
+    /// Whether this node is a command Turn started inside a terminal it still owns.
+    ///
+    /// It is the answer to "can Turn end this?" for a node with no pty of its own:
+    /// closing the terminal it runs in ends it, so it is not a process that has escaped
+    /// Turn's reach the way a survivor of a previous daemon has.
+    pub(crate) fn is_hosted(&self, node_id: &NodeId) -> bool {
+        self.processes
+            .values()
+            .any(|process| process.hosted.as_ref() == Some(node_id))
+    }
+
+    /// The node whose terminal shows this node's work, if there is one.
+    ///
+    /// Itself, when Turn holds its pty. Otherwise the shell it was started in: an agent
+    /// hosted in a pane's shell draws on that shell's screen, and that screen is the
+    /// agent's terminal in every sense a user cares about. Resolving it here is what
+    /// keeps "open this agent in a pane" working now that the pty belongs to the shell
+    /// around the agent rather than to the agent itself.
+    pub(crate) fn terminal_node(&self, node_id: &NodeId) -> Option<NodeId> {
+        if self.processes.contains_key(node_id) {
+            return Some(node_id.clone());
+        }
+        self.processes
+            .iter()
+            .find(|(_, process)| process.hosted.as_ref() == Some(node_id))
+            .map(|(shell, _)| shell.clone())
     }
 
     pub(crate) fn heartbeat_workspace_leases(&mut self, now_ms: i64) {
@@ -980,8 +1013,18 @@ fn visible_binding_for_node(
         .cloned()
 }
 
+/// Whether this node is its own input boundary.
+///
+/// Owning a pty makes it one. An agent Turn started inside a pane's shell does not: it
+/// has a pid of its own but reads from the shell's tty, so the shell is where typing
+/// goes and routing has to continue to it. Answering "yes" for a shared runtime would
+/// look for a Pane the agent does not have and give up, leaving a demand nothing can
+/// take the user to.
 fn node_has_distinct_runtime(core: &Core, node: &ProcessNode) -> bool {
-    node.pid.is_some() || core.processes.contains_key(&node.id)
+    match core.terminal_node(&node.id) {
+        Some(terminal) => terminal == node.id,
+        None => node.pid.is_some(),
+    }
 }
 
 fn relationship_routes_to_runtime_owner(node: &ProcessNode) -> bool {

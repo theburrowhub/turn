@@ -33,6 +33,8 @@ in §2.
 | `max_line_bytes` | 8 MiB | Longest line either side accepts. Announced in `welcome`. |
 | `max_output_chunk_bytes` | 256 KiB | Raw bytes per `pane_output` frame before the daemon splits it. |
 | `max_screen_cells` | 65,536 | Largest `rows * cols` `attach_pane` accepts, and the most cells any grid may describe. |
+| `max_image_pixels` | 1,048,576 | Most pixels one inline image may carry — 4 MiB of RGBA, so one image is always one frame. |
+| `max_placed_images` | 8 | Most inline images one screen may place at a time. |
 
 Nothing legitimate approaches 8 MiB — the largest message is a pane's screen, a few
 kilobytes (§2.2). The limit exists so a peer cannot exhaust memory by opening a socket
@@ -180,7 +182,60 @@ costs a few bytes per style change and keeps the frame readable. The daemon also
 one `String` per non-blank cell when it builds a grid; that is the price of a cell that
 can hold a grapheme cluster, and it is paid only for panes somebody is actually watching.
 
-### 2.3 What is *not* sanitised
+### 2.3 Inline images
+
+A pane may hold pictures. Three protocols put them there — iTerm2's `OSC 1337 File=`,
+Sixel, and the Kitty graphics protocol — and the daemon decodes all three, because it has to:
+the number of *cells* a picture occupies depends on its pixel dimensions, and the cells are
+what the terminal parser scrolls, clears and overwrites.
+
+**Placement travels in the cells.** Every cell a picture covers carries an *image marker*
+as its text — a character in private-use plane 16 encoding which of the screen's
+`max_placed_images` slots the picture is in, and which tile of it that cell shows — and the
+`image` attribute bit (`0x80`). A grid also carries a small `images` table mapping slots to
+payload ids:
+
+```jsonc
+"images":[{"slot":0,"id":6023794128384115081,"rows":8,"cols":30,
+           "width":240,"height":160,"preserve_aspect":true}]
+```
+
+`rows`/`cols` are the **cell box** the daemon gave the picture; `width`/`height` are the
+payload's own pixel size. Both are needed, and the split is deliberate: only the client knows
+how many pixels a cell is, so only the client can fit the picture inside the box without
+distorting it. `preserve_aspect` is absent when true, which is the usual case.
+
+Doing it this way is what makes a picture behave like text without a second implementation of
+a terminal. Scrolling moves it because rows move. `clear` drops it because cells are cleared.
+A program printing over the middle of one punches a hole in it and the surviving tiles still
+say which part of the picture they are. A client re-attaching gets the pictures still on
+screen because they are *in* the screen the daemon has been keeping.
+
+**Pixels do not travel in the grid.** A grid crosses the socket many times a second and a
+megabyte of picture must not, so `pane_image` fetches a payload once per id and a client
+caches it (§5). Ids are derived from the contents. On a `rows` update the `images` field is
+absent when the table has not changed — which is every update for a picture that is merely
+scrolling — and `[]` when the screen has lost its last picture. An empty list is not the same
+as silence.
+
+**A receiver must treat all of it as hostile.** Every bound is enforced on the way in, before
+anything is indexed or allocated: `max_placed_images` on the table's length, one placement per
+slot, the cell box against the marker alphabet, and `max_image_pixels` on the declared pixel
+size. A grid that breaks any of them is refused whole, exactly like a row whose runs do not
+account for its cells.
+
+**What the client renders for a cell it cannot resolve.** A marker whose slot the table does
+not fill, or a payload not yet fetched, is a framed placeholder rather than a blank. A picture
+that silently did not appear is indistinguishable from a defect.
+
+**Anything Turn refuses to show is said in the pane.** A payload over the limit, a
+decompression bomb, a format Turn does not read, iTerm2 without `inline=1` (which is a request
+to write a file to the user's disk), or Kitty's `t=f`/`t=t`/`t=s` (which are requests to read
+one) all produce a line of ordinary text in the pane reading
+`[turn: image not shown — …]`. Turn also never writes the Kitty protocol's
+acknowledgement back to the pty: nothing types into a pane except a human.
+
+### 2.4 What is *not* sanitised
 
 Screen cells are the terminal's own contents, passed through as the program wrote them.
 That is the opposite of the rule for **labels** — a pane title or Activity Preview line is
@@ -245,6 +300,13 @@ Version 3 adds:
   bindings;
 - revisioned `hierarchy_changed` full replacements and bounded preview/binding/lease pushes.
 
+Additive since v3, so the version does not move: `pane_image` and the `pane_image` result
+(§2.3), the `images` table on a grid and the `image` attribute bit on a cell, and
+`max_image_pixels` and `max_placed_images` in `limits`. An older client ignores the table, and
+because an image cell's *text* is a private-use marker with the `image` bit set it draws as
+nothing recognisable rather than as somebody else's character — which is the reason the marker
+alphabet is in plane 16 rather than in the private-use area real fonts use.
+
 The cell protocol introduced in v2 and hierarchy introduced in v3 are retained unchanged.
 
 ### What changed in version 4
@@ -290,7 +352,8 @@ base64.
  "agreed_version":4,"daemon_version":"0.1.0","daemon_pid":51234,
  "daemon_started_ms":1700000000000,
  "limits":{"max_line_bytes":8388608,"max_output_chunk_bytes":262144,
-           "max_screen_cells":65536},
+           "max_screen_cells":65536,"max_image_pixels":1048576,
+           "max_placed_images":8},
  "output_encoding":"base64"}
 ```
 
@@ -458,13 +521,22 @@ resolved runtime Pane.
 | `rename_workspace` | `workspace_id`, `name` | `workspace` |
 | `archive_workspace` | `workspace_id`, `archived` | `workspace` |
 | `duplicate_workspace` | `workspace_id`, `name?` — settings only, no sessions | `workspace` |
-| `close_workspace` | `workspace_id`, `disposition` | `ack` |
+| `close_workspace` | `workspace_id`, `disposition` | `closed` |
+| `delete_workspace` | `workspace_id`, `disposition` | `closed` |
 | `get_workspace_write_lease` | `workspace_id` | `workspace_write_lease` |
 | `acquire_workspace_write_lease` | `workspace_id`, `session_id`, `checkout_id` | `workspace_write_lease` |
 | `release_workspace_write_lease` | `workspace_id`, `lease_id`, `expected_generation` | `workspace_write_lease` |
 
 `archive_*` takes a flag rather than existing as two operations, so undo is the
 same code path as do.
+
+The four destructive operations answer `closed` rather than `ack`, and the difference is the point:
+`closed` carries `escaped`, the processes Turn could not stop. A destructive act is authoritative — it
+does not fail because a process survived the daemon that started it, since refusing would leave that
+process running anyway and the user holding a Session they had finished with (ADR-050). `escaped` is
+empty in the ordinary case; each entry names `node_id`, `session_id`, `title` and the last observed
+`pid`, which is what a user needs in order to find it in a process list. Nothing in that path claims
+the process exited: its `Lifecycle` stays `orphaned`.
 
 ### Sessions
 
@@ -480,9 +552,48 @@ same code path as do.
 | `rename_session` | `session_id`, `name` | `session` |
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
-| `close_session` | `session_id`, `disposition` | `ack` |
+| `close_session` | `session_id`, `disposition` | `closed` |
+| `delete_session` | `session_id`, `disposition` | `closed` |
 | `get_session` | `session_id` | `session_details` |
 | `get_process_tree` | `session_id` | `tree` |
+
+### Settings
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `get_settings` | `session_id?` (absent = the Global level alone) | `settings` |
+| `set_setting` | `scope`, `owner_id?`, `key`, `value` | `settings` |
+| `reset_setting` | `scope`, `owner_id?`, `key` | `settings` |
+
+`scope` is one of `global`, `workspace`, `template`, `session`, `temporary`, in that precedence order:
+later beats earlier. `owner_id` names the Workspace, Template or Session; it is ignored for `global`,
+which has one owner.
+
+All three answer with the whole resolved set rather than an ack, for the same reason a pane operation
+answers with the layout: one write can move what is in force for more than the key that was written —
+removing a Session override reveals the Workspace's value — and a client that patched its own copy
+would be a second resolver able to disagree with the daemon's. **The daemon is the only resolver**
+(ADR-051): the window receives resolved values with their origin and never applies the precedence
+order itself.
+
+`set_setting` refuses an unknown key (`not_found`), a level the key does not belong to (`refused`,
+with the levels it does belong to in the detail), a value of the wrong shape (`invalid_argument`,
+naming what would be accepted), an owner that does not exist (`not_found`), and the `temporary` level,
+which lives in the window and is never persisted. `reset_setting` refuses none of those: resetting a
+key this build does not define is how a user removes a value a newer Turn wrote.
+
+A `settings` response carries `levels` — the levels that exist for this Session, each with the
+`owner_id` a write quotes back — and one `entries` row per preference, with the resolved value, the
+level it came from (`null` for Turn's own default, which is distinguishable from a level having set
+the same value), every level it shadowed, and the levels it may be set at. A secret arrives already
+replaced with `<redacted>` and `hidden: true`; the daemon keeps the real value because it needs it,
+and this is the boundary past which nothing does.
+
+The `keyboard.bindings` preference is the one the **window** applies rather than the daemon: it is a
+map from command id to chord, and the daemon never sees a keystroke. An empty chord unbinds a command;
+an absent entry inherits, which is why resetting a binding removes its entry rather than writing the
+default into it. `keymap.json` still loads at startup and the stored preference wins over it per
+command, so a command the preference does not mention keeps what the file said.
 
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
@@ -531,11 +642,15 @@ draft identity only, and every Session instantiation mints a fresh set.
 | `equalize_divider` | `session_id`, `before`, `after` | `layout` |
 | `apply_layout_preset` | `session_id`, `preset` | `layout` |
 | `focus_pane` | `session_id`, `target` | `layout` |
-| `swap_panes` | `session_id`, `a`, `b` | `layout` |
+| `relocate_pane` | `session_id`, `moved`, `target`, `zone` | `layout` |
+| `swap_panes` | `session_id`, `a`, `b` — superseded by `relocate_pane` | `layout` |
 | `zoom_pane` | `session_id`, `pane_id` — **toggles** | `layout` |
 | `attach_pane` | `session_id`, `pane_id`, `size`, `stream?` | `attached` |
 | `resync_pane` | `session_id`, `pane_id` | `screen` |
+| `pane_image` | `session_id`, `pane_id`, `image_id` | `pane_image` |
 | `detach_pane` | `session_id`, `pane_id` | `ack` |
+| `get_pane_history` | `session_id`, `pane_id`, `offset?` | `pane_history` |
+| `search_pane` | `session_id`, `pane_id`, `query` | `pane_matches` |
 
 Every Layout-mutating pane operation above answers with the resulting `layout` rather than an ack, so
 the UI renders the daemon's arrangement instead of its own optimistic guess at what
@@ -557,8 +672,27 @@ dispositions apply only where process-control rules allow them, and an Agent req
 - `equalize_divider` is the double-click operation and gives every sibling in that split an equal
   share. `preset` is one of `balanced`, `columns`, `rows`, `main_left`, `grid`; presets preserve Pane
   and Process identity and change geometry only.
+- `relocate_pane` **moves** a pane: it leaves where it was and arrives beside `target`,
+  so the layout changes shape. `zone` is `"left"` \| `"right"` \| `"above"` \| `"below"` \|
+  `"centre"`. The four edges make `moved` a sibling of `target` on that side —
+  left/right in a horizontal split, above/below in a vertical one — and `centre`
+  exchanges the two panes in place. A pane relocated next to a target that already sits
+  in a split of the required direction **joins** that split as a sibling rather than
+  nesting a new two-way split inside it, so repeated rearrangement cannot turn a flat row
+  into a staircase of nested splits and the dividers keep lining up. The space the moved
+  pane vacates goes to its former siblings, a split left with one child collapses, and no
+  pane is left below the minimum visible share. `moved == target`, an unknown pane and a
+  single-pane layout are refused (`conflict`/`not_found`) rather than approximated.
+- A relocation **starts and stops no process.** The pane keeps its id and its node
+  binding, so a session full of running agents can be rearranged freely; only the Layout
+  is written back, and only `layout_changed` is pushed.
+- `swap_panes` is the older spelling of `relocate_pane` with `zone: "centre"`. It remains
+  on the wire because a shipped client already sends it, and the daemon serves it through
+  the same relocation — one behaviour with two names, not two implementations. New clients
+  should send `relocate_pane`; nothing else it can express is missing from `relocate_pane`.
 - `zoom_pane` leaves the layout tree untouched, so un-zooming restores the exact
-  previous geometry.
+  previous geometry. Zoom and focus both survive a relocation: moving a pane must not
+  change what the user is looking at or typing into.
 - `pane` (a `NewPane`): `kind` plus optional `title`, `command`, `args`, `cwd`,
   `env`, `restore`. The daemon mints the `PaneId` — it is the only writer of state,
   and a client minting its own would collide with a second client on the same
@@ -571,6 +705,38 @@ dispositions apply only where process-control rules allow them, and an Agent req
   read-only, it requires an attachment (`pane_not_attached` otherwise), and on a `bytes`
   attachment it answers `conflict`: what that client lost was bytes, and its way back is
   to attach again for the replay.
+- `pane_image` fetches the pixels of one inline image the pane's screen refers to (§2.3). It
+  is read-only, and `not_found` is a normal answer: an image that has scrolled out of the
+  daemon's bounded store is gone, and saying so is better than handing back a different
+  picture.
+- `get_pane_history` reads a screen-shaped window of the pane's **scrollback**, as cells.
+  The scrollback belongs to the daemon because the daemon is the only thing that has it: a
+  client is sent the screen, and a pane that printed five hundred lines between two
+  coalesced updates never sent the four hundred and eighty in the middle. `offset` is rows
+  above the top of the live screen and is **clamped** to what the daemon still holds, so
+  scrolling past the beginning answers with the oldest window rather than an error. The
+  answer says which offset it actually is (`scrollback_offset`) and how deep the record goes
+  (`scrollback_len`). Read-only: the daemon borrows its parser's viewport and puts it back,
+  so one client's history read cannot move another client's screen. A `bytes` attachment
+  answers `conflict` — history as cells is not what that client is rendering.
+- `search_pane` searches everything the daemon retains for the pane: the history, then the
+  live screen. `query` is `{"text":…,"mode":"literal"|"regex","case_sensitive":bool}`, where
+  absent `mode` is `literal` and absent `case_sensitive` is false — case-insensitive is what
+  a user means by default. Every part of it is bounded, and the bounds are the reason a
+  pattern from a text field is safe to accept:
+
+  | Bound | Value | Why |
+  | --- | --- | --- |
+  | `text` length | 256 characters | a search box is not a program; longer is `invalid_argument` |
+  | compiled pattern | 1 MiB of automaton, same cap on its lazy DFA | a generated pattern cannot make the daemon allocate |
+  | match time | linear in the row | a finite automaton, so `(a+)+$` cannot be made to backtrack |
+  | rows read | 8,192 | above the 5,000-row scrollback, so a real search is never cut short |
+  | matches returned | 1,000, and 64 from any one row | `a` against a row of `a`s is a real thing a user types |
+
+  A pattern that will not compile is `invalid_argument` **with the reason in the message**,
+  because "invalid regular expression" with nothing else is a dead end. When a cap stops the
+  scan the answer sets `truncated`, so a UI says "1000+" rather than implying it counted them
+  all. Read-only, and it moves nobody's viewport.
 
 ### PTY
 
@@ -839,6 +1005,68 @@ screen its next diff is computed against, not with a fresher read of the pty. A 
 one would look more helpful and be wrong: a row that changed and changed back in between
 would never be corrected.
 
+### `pane_image` — the answer to `pane_image`
+
+```jsonc
+{"v":3,"type":"response","id":"r-7","response":{"result":"pane_image",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
+  "image":{"id":6023794128384115081,"width":240,"height":160,"pixels":"<base64 RGBA>"}}}
+```
+
+`pixels` is `width * height * 4` bytes of RGBA — unassociated alpha, sRGB, row-major, no
+padding — and it is by a wide margin the largest thing this protocol carries. `id` is derived
+from the contents, so the same picture printed twice is one payload and a client's cache
+survives a re-attach.
+
+A receiver **must** check the three things before trusting it, and
+`turn_proto::ImagePayload`'s decoder does: `width * height` against `max_image_pixels`, the
+byte length against those dimensions, and the id against the hash of the pixels. The last
+one matters because a cache keyed by id would otherwise be poisonable by a payload arriving
+under somebody else's name.
+
+### `pane_history` — the answer to `get_pane_history`
+
+```jsonc
+{"v":3,"type":"response","id":"r-8","response":{"result":"pane_history",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
+  "grid":{"rows":40,"cols":120,"scrollback_offset":1240,"scrollback_len":5000,"…":"…"}}}
+```
+
+The same `Grid` shape a live screen arrives in, so a client paints history with the code it
+already has rather than with a second renderer. It carries no cursor: the cursor is on the
+live screen, and drawing it at the same coordinates over history would put it on an
+unrelated character. `scrollback_offset` is the offset actually served after clamping, and
+`scrollback_len` is the depth of the record — together they say which absolute rows the
+window holds, so a client can file them and know when it has reached the beginning.
+
+### `pane_matches` — the answer to `search_pane`
+
+```jsonc
+{"v":3,"type":"response","id":"r-9","response":{"result":"pane_matches",
+  "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
+  "outcome":{"matches":[{"line":1240,"col":4,"cols":5},{"line":4812,"col":0,"cols":5}],
+    "scanned_lines":5040,"total_lines":5040,"screen_rows":40,"scrollback_len":5000}}}
+```
+
+A match is a **line index** and a **column range**:
+
+- `line` `0` is the oldest row the daemon still holds; `scrollback_len` is the line index of
+  the live screen's top row, and `scrollback_len + screen_rows - 1` is the bottom of it. That
+  is the only coordinate both ends can compute. `offset = scrollback_len - line` is the
+  `get_pane_history` offset that puts the match on the top row; centring it is
+  `scrollback_len - (line - screen_rows/2)`, clamped — `turn_proto::search::viewport_offset`.
+- `col`/`cols` are **columns, not characters**. A wide glyph is one character of text and two
+  columns of screen, so a character offset would highlight the wrong cells on every row
+  containing an ideograph or an emoji.
+- Matches are ordered oldest first, so "next" moves towards the live screen.
+- `scrollback_len` is the depth the search was taken at. A client that later sees a different
+  one knows the line indices may have moved — rows drop off the top once the ring is full —
+  and re-runs the query rather than scrolling to a line that has since shifted.
+- `truncated` (absent when false) means a cap stopped the scan and the count is a floor.
+- While a full-screen application is in front there is no history to search: the alternate
+  screen has no scrollback of its own, so `scrollback_len` is `0` and the search covers what
+  is on screen. Turn stands down from scrolling for the same reason.
+
 ### `effects`
 
 `turn_core::attention::Effect`, passed through unchanged. The manager already
@@ -912,9 +1140,20 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 ```
 
 **Applying a `rows` update**: replace each named row's cells outright, then take
-`cursor` and `alternate_screen` from the update. Rows are whole — there is no partial-row
-addressing, so a client can never leave a row half written. A row is `runs` in exactly
-the grid encoding of §2.2.
+`cursor`, `alternate_screen` and `scrollback_len` from the update. Rows are whole — there is
+no partial-row addressing, so a client can never leave a row half written. A row is `runs` in
+exactly the grid encoding of §2.2.
+
+`scrollback_len` — absent when zero, which is every update for a pane that has not scrolled
+yet — is how much history now sits above the screen. It is on every update rather than only
+on the `full` ones because a client needs two things from it that it cannot work out for
+itself: that there is history to scroll into at all, and **how many rows just left the top**.
+The second is what keeps a scrolled viewport still. A client's scroll offset is measured from
+the live screen, so when rows scroll off, an unchanged offset would show newer content and
+the line the user was reading would slide away a row at a time. The increase in
+`scrollback_len` is exactly the number of rows that left, however many screens' worth arrived
+at once — which is the case a client cannot prove for itself, since a burst bigger than the
+screen leaves no overlap to compare.
 
 `size` is carried so a client can **refuse** an update meant for a geometry it is no
 longer rendering, rather than writing rows into the wrong shape. That happens if it
@@ -1134,9 +1373,12 @@ Derived state — **the client renders these, it never computes them**:
 | `severity` | Ranking weight, so a client sorting locally sorts as the daemon would |
 | `needs_user` | Whether the runtime tree itself is blocked on the human; `badge_count` independently exposes exact or scoped Attention |
 
-Counts: `subagent_count`, `running_count`, `node_count`, `pane_count`. Subagents
+Counts: `subagent_count`, `running_count`, `orphaned_count`, `node_count`, `pane_count`. Subagents
 and running processes are counted separately because "the agent finished its turn"
-and "nothing is running any more" are different claims.
+and "nothing is running any more" are different claims. `orphaned_count` is the subset of
+`running_count` that survived a previous daemon and that Turn cannot stop; it travels with the summary
+so a confirmation dialog for any row can say what ending it will not achieve without holding that
+Session's whole tree.
 
 Timing: `idle_ms` (never negative, even under clock skew), `last_activity_ms`,
 `created_ms`.
@@ -1208,6 +1450,38 @@ The attached live `Grid` starts with `scrollback_offset = 0`; `PaneAttachment.sc
 seeds the client's transcript. The client then reports that transcript's length in
 `scrollback_len` and changes `scrollback_offset` as the user scrolls. A resync replaces
 the live grid, while a fresh attach is the operation that re-seeds durable history.
+
+`notices` is what the pane **refused to draw**, and it is the one field that is not the
+program's: a list of `{text, count}` where each `text` is a complete sentence Turn
+generated, already bracketed and containing nothing the process supplied. It travels here,
+beside the cells, rather than as cells, because a sentence written into the grid lands at
+the program's cursor and corrupts a layout the program repaints without ever overwriting it
+(ADR-045). A client shows it in its own furniture — never in the screen — and may render
+the text as-is. At most eight entries, each at most 160 characters, each
+with a `count` of at least 1; a peer sending otherwise is refused. Absent on the wire for
+every pane that refused nothing, which is nearly all of them.
+
+### Archiving, closing and deleting
+
+Three verbs, and the difference between them is what the client must put in front of the user:
+
+| | Stops processes | Leaves the tree | Record kept | Reversible |
+| --- | --- | --- | --- | --- |
+| `archive_*` | no | yes | yes | yes |
+| `close_*` | yes | no | yes | the work is not |
+| `delete_*` | yes | yes | **no** | **no** |
+
+`delete_session` and `delete_workspace` remove Turn's *record*: the Session or Workspace row,
+its layout, its process tree, its event log, its attention entries, its scratch directory and
+its per-window tree state. A Workspace takes its Sessions with it.
+
+They do **not** touch the user's disk. The checkout is a directory the user chose and Turn does
+not own it: no file is removed, no branch and no worktree is deleted. Every surface that offers
+a delete has to say so, and naming the exact path is better than promising in the abstract.
+
+`keep_processes` is refused for both: nothing would name those processes once the record is
+gone. Deleting something already gone answers `ack` rather than `not_found`, so a client that
+lost a reply can retry.
 
 ### `SessionDetails`
 
@@ -1294,8 +1568,10 @@ descriptions has to argue with a test first.
 3. **Turn never runs a command it inferred from agent output.** There is no "run
    this" verb. Processes start from a template, a pane definition, or
    `relaunch_node`, all of which the user chose.
-4. **Turn never relaunches on its own.** `relaunch_node` is the only path back, and
-   it always originates with a human. `restore_result` reports and offers.
+4. **Restore safe panes without making the user operate them.** `relaunch_node` remains the only
+   path back. The daemon never invokes it unattended during boot; a connected window invokes it
+   automatically for panes marked `Relaunch` and for commandless terminals. Consequential
+   `ReattachOnly` commands remain stopped.
 5. **A client cannot request an unarbitrated primary-checkout writer.** Session mode is closed, creation
    goes through daemon lease arbitration, and conflict recovery is one of the typed alternatives. There is
    no force/steal flag; generation mismatch is a conflict, not a retry loop.

@@ -112,9 +112,10 @@ async fn a_session_from_a_custom_coding_template_has_real_processes_behind_its_p
         "the persistent left tree must never be duplicated as a Pane"
     );
 
-    // Not "the daemon says it is running": the kernel says so.
+    // Not "the daemon says it is running": the kernel says so. Every pane's own process
+    // has a pid from the moment it is spawned.
     assert!(details.tree.len() >= 2);
-    for node in &details.tree {
+    for node in details.tree.iter().filter(|node| !node.is_agentic) {
         let pid = node.pid.expect("a spawned process has a pid");
         assert!(
             pid_is_alive(pid),
@@ -132,6 +133,11 @@ async fn a_session_from_a_custom_coding_template_has_real_processes_behind_its_p
         .find(|node| node.is_agentic)
         .expect("the agent pane's node");
     assert!(agent.turn.is_some(), "an agent carries the turn axis");
+    // The agent's process was forked by its pane's shell, so Turn learns its pid from
+    // the process table rather than from the launch. It is never claimed before it is
+    // known, and once it is known the kernel agrees with it too.
+    let agent_pid = common::agent::wait_for_agent_pid(&mut ui, &session.id, &agent.node_id).await;
+    assert!(pid_is_alive(agent_pid));
     let shell = details
         .tree
         .iter()
@@ -515,31 +521,31 @@ async fn a_saved_layout_makes_a_second_session_of_the_same_shape_with_its_own_pa
     assert_eq!(template.pane_count, 3);
     assert!(!template.built_in);
 
-    // Reusing a Layout does not waive checkout exclusivity. End the owning run
-    // explicitly before asking for another main-checkout Session from the Template.
-    // The original details above remain available for the shape comparison.
+    // Reusing a Layout does not waive checkout exclusivity: the owning run has to be finished
+    // before another main-checkout Session can be made from the same Template. The original
+    // details above remain available for the shape comparison.
     ui.ask(Request::CloseSession {
         session_id: session.id.clone(),
         disposition: CloseDisposition::Terminate,
     })
     .await;
+    // Ending it is the whole of finishing it. It used to leave the write lease held, so the
+    // user had to find "Release write lease" in a menu before they could start work in their
+    // own Workspace again — a second step for a Session that had already stopped and left the
+    // tree, and one nothing was writing through.
     let lease = match ui
         .ask(Request::GetWorkspaceWriteLease {
             workspace_id: session.workspace_id.clone(),
         })
         .await
     {
-        Response::WorkspaceWriteLease {
-            lease: Some(lease), ..
-        } => lease,
-        other => panic!("expected the stopped Session's lease, got {other:?}"),
+        Response::WorkspaceWriteLease { lease, .. } => lease,
+        other => panic!("expected a lease answer, got {other:?}"),
     };
-    ui.ask(Request::ReleaseWorkspaceWriteLease {
-        workspace_id: session.workspace_id.clone(),
-        lease_id: lease.id,
-        expected_generation: lease.generation,
-    })
-    .await;
+    assert!(
+        lease.is_none(),
+        "ending a Session lets go of the checkout it was holding: {lease:?}"
+    );
 
     let second = session_of(
         ui.ask(Request::CreateSessionFromTemplate {
@@ -746,9 +752,11 @@ async fn closing_a_session_does_exactly_what_the_disposition_says() {
         })
         .await,
     );
+    // Archived, not paused: ending takes the row out of the tree. Leaving it listed as though
+    // it were still work in progress is what made the verb look like it did nothing.
     assert_eq!(
         after.summary.status,
-        turn_core::model::SessionStatus::Paused
+        turn_core::model::SessionStatus::Archived
     );
 
     daemon.shutdown().await;
@@ -965,6 +973,497 @@ async fn a_child_process_nothing_announced_is_adopted_as_an_inferred_link() {
     assert_eq!(child.parent.as_ref(), Some(&nodes[0].node_id));
     assert!(child.command.contains("sleep"));
     assert!(pid_is_alive(child.pid.expect("an observed pid")));
+
+    daemon.shutdown().await;
+}
+
+/// A process sets its own pane title through a real pty, and the daemon reports it.
+///
+/// This is the reproducible test the issue asks for: no fixture, no injected event —
+/// a shell emits `ESC ] 2 ; … BEL` and the title arrives in the tree projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_sets_its_own_pane_title_through_a_real_pty() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let shell = details
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the shell pane");
+    let node = shell.node_id.clone().expect("the shell has a process");
+
+    // Attach first: the title is noticed when output arrives, and attaching is what
+    // makes the pump run.
+    ui.attach_cells(&session.id, &shell.id, PtySize::new(30, 100))
+        .await;
+
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: node.clone(),
+        data: turn_proto::TerminalBytes::new(
+            // `sleep` after the title, on one line: a shell rewrites its title from
+            // its prompt, so a test that returns to the prompt races its own set-up.
+            // An agent mid-task does not return to a prompt either.
+            b"printf '\\033]2;fixing the climbing bug\\007'; sleep 10\n".to_vec(),
+        ),
+    })
+    .await;
+
+    let title = ui
+        .wait_for_node_title(&session.id, &node, "fixing the climbing bug")
+        .await;
+    assert_eq!(title.title, "fixing the climbing bug");
+    assert!(
+        title.title_is_provisional,
+        "a title the process printed is the program's word about itself, \
+         and must never be presented with the authority of a reported name"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// Two shells in one session keep separate titles, and neither disturbs the other.
+///
+/// The isolation is structural — each pty has its own buffer — but a test is what
+/// keeps a future change from routing titles through anything shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_processes_in_one_session_keep_independent_titles() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "turn".to_string(),
+            root: daemon.data_dir().display().to_string(),
+        })
+        .await,
+    );
+
+    // Two shells of its own: the shipped templates carry one, and an agent pane is
+    // named by its adapter, which deliberately outranks a process title.
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "two titled shells".into(),
+            cwd: None,
+            panes: Some(vec![
+                NewPane::new(PaneKind::Shell).with_command("sh"),
+                NewPane::new(PaneKind::Shell).with_command("sh"),
+            ]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let panes: Vec<_> = details
+        .layout
+        .panes()
+        .into_iter()
+        .filter(|pane| pane.node_id.is_some())
+        .cloned()
+        .collect();
+    assert_eq!(panes.len(), 2, "two shells were asked for");
+
+    for (index, pane) in panes.iter().enumerate() {
+        let node = pane.node_id.clone().unwrap();
+        ui.attach_cells(&session.id, &pane.id, PtySize::new(24, 80))
+            .await;
+        ui.ask(Request::WritePty {
+            session_id: session.id.clone(),
+            node_id: node,
+            data: turn_proto::TerminalBytes::new(
+                format!("printf '\\033]2;instance {index}\\007'; sleep 10\n").into_bytes(),
+            ),
+        })
+        .await;
+    }
+
+    for (index, pane) in panes.iter().enumerate() {
+        let node = pane.node_id.clone().unwrap();
+        let expected = format!("instance {index}");
+        let view = ui.wait_for_node_title(&session.id, &node, &expected).await;
+        assert_eq!(view.title, expected, "titles must not bleed between panes");
+        assert!(view.title_is_provisional);
+    }
+
+    daemon.shutdown().await;
+}
+
+/// A title never opens a pane, moves focus, changes the layout or raises attention.
+///
+/// The issue asks for this explicitly, and it is the difference between a label and
+/// an event: a shell rewriting its title on every prompt must not be able to pull the
+/// user anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_title_change_moves_nothing_and_raises_nothing() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let shell = before
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the shell pane");
+    let node = shell.node_id.clone().expect("the shell has a process");
+    let panes_before = before.layout.panes().len();
+
+    ui.attach_cells(&session.id, &shell.id, PtySize::new(24, 80))
+        .await;
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: node.clone(),
+        data: turn_proto::TerminalBytes::new(b"printf '\\033]2;busy\\007'; sleep 10\n".to_vec()),
+    })
+    .await;
+    ui.wait_for_node_title(&session.id, &node, "busy").await;
+
+    let after = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        after.layout.panes().len(),
+        panes_before,
+        "a title opened or closed a pane"
+    );
+    assert_eq!(
+        after.layout.active, before.layout.active,
+        "a title moved the focused pane"
+    );
+    assert!(
+        !after.summary.needs_user,
+        "a title raised an attention demand"
+    );
+    assert_eq!(after.summary.badge_count, 0, "a title produced a badge");
+
+    match ui
+        .ask(Request::ListAttention {
+            session_id: Some(session.id.clone()),
+        })
+        .await
+    {
+        Response::AttentionList { entries } => {
+            assert!(entries.is_empty(), "a title queued something: {entries:?}");
+        }
+        other => panic!("expected the attention list, got {other:?}"),
+    }
+
+    daemon.shutdown().await;
+}
+
+/// The third verb the tree had no way to reach: getting rid of a Session for good.
+///
+/// Archiving hides it and stops nothing. Closing stops it and keeps the record — the Session
+/// comes back as `Paused`, and the next time archived rows are shown it is on screen again.
+/// Neither answers "I am done with this, take it away", which is what this checks: the
+/// processes stop, the record goes, the tree no longer lists it, and asking again is not an
+/// error. And the checkout it pointed at is still on disk, because that is the user's, not
+/// Turn's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_session_stops_its_work_and_removes_every_trace_of_it() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pids: Vec<u32> = details.tree.iter().filter_map(|node| node.pid).collect();
+    assert!(!pids.is_empty(), "the session must have real processes");
+    let checkout = daemon.data_dir().to_path_buf();
+    assert!(checkout.exists(), "the workspace root exists to begin with");
+
+    // Keeping the processes is refused, and the refusal says what to do instead: nothing
+    // would name those processes once the Session is gone.
+    let refusal = ui
+        .try_ask(Request::DeleteSession {
+            session_id: session.id.clone(),
+            disposition: CloseDisposition::KeepProcesses,
+        })
+        .await;
+    let error = refusal.expect_err("deleting while keeping the processes must be refused");
+    assert_eq!(error.code, turn_proto::ErrorCode::Refused, "{error:?}");
+
+    ui.ask(Request::DeleteSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // The work stopped. Generous, because this waits on the operating system reaping.
+    let mut stopped = false;
+    for _ in 0..200 {
+        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stopped, "deleting must actually stop the processes");
+
+    // The record is gone rather than parked. `close_session` leaves a Paused Session here.
+    let gone = ui
+        .try_ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await;
+    let error = gone.expect_err("the Session must no longer exist");
+    assert_eq!(error.code, turn_proto::ErrorCode::NotFound, "{error:?}");
+
+    // And it is not in the tree, including with archived rows shown — which is where a
+    // Session that had merely been archived would reappear.
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived: true,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    };
+    let listed: Vec<&str> = hierarchy
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .map(|session| session.session.name.as_str())
+        .collect();
+    assert!(
+        listed.is_empty(),
+        "the deleted Session is still in the tree: {listed:?}"
+    );
+
+    // Asking again is not an error, so a client that lost the reply can retry.
+    ui.ask(Request::DeleteSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // Turn deleted its own record. The directory the Workspace pointed at is untouched.
+    assert!(
+        checkout.exists(),
+        "deleting a Session must not remove anything from the user's disk"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A Workspace goes the same way, and takes its Sessions with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_workspace_takes_its_sessions_and_leaves_the_checkout_alone() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pids: Vec<u32> = details.tree.iter().filter_map(|node| node.pid).collect();
+    let workspace_id = session.workspace_id.clone();
+    let checkout = daemon.data_dir().to_path_buf();
+
+    ui.ask(Request::DeleteWorkspace {
+        workspace_id: workspace_id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    let mut stopped = false;
+    for _ in 0..200 {
+        if pids.iter().all(|pid| !pid_is_alive(*pid)) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(stopped, "the Sessions' processes must be stopped");
+
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived: true,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    };
+    assert!(
+        hierarchy.workspaces.is_empty(),
+        "the Workspace and its Sessions must be gone: {:?}",
+        hierarchy
+            .workspaces
+            .iter()
+            .map(|w| w.workspace.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        checkout.exists(),
+        "the checkout is the user's directory and must survive"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The tree as one surface sees it, with or without archived rows.
+async fn hierarchy_now(ui: &mut Client, include_archived: bool) -> turn_proto::HierarchySnapshot {
+    match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "window-1".to_string(),
+            include_archived,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected the tree, got {other:?}"),
+    }
+}
+
+/// The reported defect, in the words it was reported in: the Sessions were "there laughing at
+/// me every time I end them".
+///
+/// Ending a Session stopped its processes and left the row in the tree as `Paused` — stopped,
+/// but still listed exactly like work in progress. So the verb looked like it had done nothing,
+/// and the tree filled up with rows the user had already finished with. Ending something has to
+/// look like ending it.
+///
+/// What this checks is the whole of that: the row leaves the tree, it is *archived* rather than
+/// deleted so it can be brought back, and the same holds one level up for a Workspace.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_a_session_takes_its_row_out_of_the_tree() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let session = custom_coding_session(&daemon, &mut ui).await;
+    let workspace_id = session.workspace_id.clone();
+
+    let listed = |snapshot: &turn_proto::HierarchySnapshot| -> Vec<String> {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .map(|session| session.session.name.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        listed(&hierarchy_now(&mut ui, false).await),
+        vec!["Fix the flaky test".to_string()],
+        "the Session is in the tree while it is being worked on"
+    );
+
+    ui.ask(Request::CloseSession {
+        session_id: session.id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+
+    // The row is gone from the tree the user is looking at.
+    assert!(
+        listed(&hierarchy_now(&mut ui, false).await).is_empty(),
+        "an ended Session must not still be listed: {:?}",
+        listed(&hierarchy_now(&mut ui, false).await)
+    );
+    // And it is archived rather than deleted, so it can be brought back — turning archived rows
+    // on shows it, stopped.
+    let with_archived = hierarchy_now(&mut ui, true).await;
+    assert_eq!(
+        listed(&with_archived),
+        vec!["Fix the flaky test".to_string()],
+        "ending is reversible: the row is archived, not forgotten"
+    );
+    let ended = with_archived
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .next()
+        .expect("the archived Session");
+    assert_eq!(
+        ended.session.running_count, 0,
+        "and nothing is running in it"
+    );
+
+    // One level up the answer is deliberately different, and the difference is the point.
+    //
+    // Stopping every Session in a Workspace takes every *Session* row out of the tree and leaves
+    // the Workspace's own row where it is. A Session is a task: finishing it means it is over. A
+    // Workspace is a project — a directory the user comes back to — and filing the project away
+    // because its last task stopped would mean restoring it before starting the next one. Which
+    // is why the control is called "Stop all sessions" and not "Close workspace": getting the
+    // project itself out of the tree is Archive, or Delete.
+    // The template the first Session was made from is already saved; a second Session of the
+    // same shape reuses it rather than saving it twice.
+    let template = match ui.ask(Request::ListTemplates).await {
+        Response::Templates { templates } => templates
+            .into_iter()
+            .find(|template| !template.built_in)
+            .expect("the custom template saved at the start"),
+        other => panic!("expected templates, got {other:?}"),
+    };
+    session_of(
+        ui.ask(Request::CreateSessionFromTemplate {
+            workspace_id: workspace_id.clone(),
+            template_id: template.id.clone(),
+            name: Some("Another task".to_string()),
+            cwd: None,
+            branch: None,
+            task: None,
+        })
+        .await,
+    );
+    assert_eq!(
+        listed(&hierarchy_now(&mut ui, false).await),
+        vec!["Another task".to_string()],
+        "the ended Session stays out of the tree and the new one is in it"
+    );
+
+    ui.ask(Request::CloseWorkspace {
+        workspace_id: workspace_id.clone(),
+        disposition: CloseDisposition::Terminate,
+    })
+    .await;
+    let after = hierarchy_now(&mut ui, false).await;
+    assert!(
+        listed(&after).is_empty(),
+        "every Session in the Workspace has ended, so no Session row is left: {:?}",
+        listed(&after)
+    );
+    assert_eq!(
+        after.workspaces.len(),
+        1,
+        "and the Workspace is still there, because stopping its work is not closing the project"
+    );
 
     daemon.shutdown().await;
 }

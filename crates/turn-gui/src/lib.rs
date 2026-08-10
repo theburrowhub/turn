@@ -17,11 +17,17 @@ pub mod announce;
 pub mod app;
 pub mod companion;
 pub mod desk;
+/// Running one frame without a window. Test support, and public because the snapshot tests are
+/// a separate crate; see the module docs for why it exists at all.
+pub mod frames;
+pub mod icons;
 pub mod keymap;
 pub mod logging;
 pub mod palette;
 pub mod panes;
 pub mod repaint;
+/// Picking one subagent out of a crowded layout, and putting the layout back.
+pub mod spotlight;
 pub mod terminal;
 pub mod theme;
 pub mod transport;

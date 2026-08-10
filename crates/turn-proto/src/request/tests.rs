@@ -42,6 +42,56 @@ fn attention_focus_names_the_semantic_subject_not_a_guessed_pane_owner() {
     assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
 }
 
+/// The five zones are the whole vocabulary of a pane drag, so their wire names are
+/// part of the contract a second frontend would be written against.
+#[test]
+fn a_relocation_names_the_drop_zone_it_was_dropped_on() {
+    for (zone, wire) in [
+        (DropZone::Left, "left"),
+        (DropZone::Right, "right"),
+        (DropZone::Above, "above"),
+        (DropZone::Below, "below"),
+        (DropZone::Centre, "centre"),
+    ] {
+        let request = Request::RelocatePane {
+            session_id: session(),
+            moved: PaneId::from_stored("pane_req0001"),
+            target: PaneId::from_stored("pane_req0002"),
+            zone,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"op\":\"relocate_pane\""), "got {json}");
+        assert!(json.contains(&format!("\"zone\":\"{wire}\"")), "got {json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+        assert_eq!(request.op(), "relocate_pane");
+        assert_eq!(request.expected_result(), "layout");
+        assert!(request.is_mutating());
+        assert_eq!(request.session_id(), Some(&session()));
+    }
+}
+
+/// `swap_panes` is the older spelling of a `centre` relocation. It stays on the wire
+/// for the clients that already send it, and it answers with the same result — so a
+/// client can migrate one call at a time rather than all at once.
+#[test]
+fn swapping_panes_is_the_older_spelling_of_a_centre_relocation() {
+    let swap = Request::SwapPanes {
+        session_id: session(),
+        a: PaneId::from_stored("pane_req0001"),
+        b: PaneId::from_stored("pane_req0002"),
+    };
+    let relocate = Request::RelocatePane {
+        session_id: session(),
+        moved: PaneId::from_stored("pane_req0001"),
+        target: PaneId::from_stored("pane_req0002"),
+        zone: DropZone::Centre,
+    };
+    assert_ne!(swap.op(), relocate.op(), "two wire names, not one");
+    assert_eq!(swap.expected_result(), relocate.expected_result());
+    assert_eq!(swap.session_id(), relocate.session_id());
+    assert_eq!(swap.is_mutating(), relocate.is_mutating());
+}
+
 #[test]
 fn keystrokes_survive_the_wire_byte_for_byte() {
     // A control character, a paste with a newline, and a non-UTF-8 byte.
@@ -156,6 +206,20 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
     assert!(!Request::ResyncPane {
         session_id: session(),
         pane_id: PaneId::from_stored("pane_a"),
+    }
+    .is_mutating());
+    // Reading history and searching it are reads. A search borrows the parser's
+    // scrollback offset and puts it back, so it changes nothing another client can see.
+    assert!(!Request::GetPaneHistory {
+        session_id: session(),
+        pane_id: PaneId::from_stored("pane_a"),
+        offset: 40,
+    }
+    .is_mutating());
+    assert!(!Request::SearchPane {
+        session_id: session(),
+        pane_id: PaneId::from_stored("pane_a"),
+        query: crate::search::SearchQuery::literal("error"),
     }
     .is_mutating());
     assert!(!Request::GetHierarchy {
@@ -373,6 +437,10 @@ pub(crate) fn all_requests() -> Vec<Request> {
             workspace_id: workspace_id.clone(),
             disposition: CloseDisposition::KeepProcesses,
         },
+        Request::DeleteWorkspace {
+            workspace_id: workspace_id.clone(),
+            disposition: CloseDisposition::Terminate,
+        },
         Request::GetHierarchy {
             surface_id: "window-a".into(),
             include_archived: false,
@@ -469,6 +537,10 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             disposition: CloseDisposition::Terminate,
         },
+        Request::DeleteSession {
+            session_id: session_id.clone(),
+            disposition: CloseDisposition::Terminate,
+        },
         Request::GetSession {
             session_id: session_id.clone(),
         },
@@ -546,6 +618,12 @@ pub(crate) fn all_requests() -> Vec<Request> {
                 pane_id: pane_id.clone(),
             },
         },
+        Request::RelocatePane {
+            session_id: session_id.clone(),
+            moved: pane_id.clone(),
+            target: PaneId::from_stored("pane_req0002"),
+            zone: DropZone::Below,
+        },
         Request::SwapPanes {
             session_id: session_id.clone(),
             a: pane_id.clone(),
@@ -580,9 +658,24 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
         },
+        Request::PaneImage {
+            session_id: session_id.clone(),
+            pane_id: pane_id.clone(),
+            image_id: crate::images::ImageId(0x1234_5678_9abc_def0),
+        },
         Request::DetachPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+        },
+        Request::GetPaneHistory {
+            session_id: session_id.clone(),
+            pane_id: pane_id.clone(),
+            offset: 1_240,
+        },
+        Request::SearchPane {
+            session_id: session_id.clone(),
+            pane_id: pane_id.clone(),
+            query: crate::search::SearchQuery::regex("error\\[E\\d+\\]"),
         },
         Request::WritePty {
             session_id: session_id.clone(),
@@ -641,9 +734,23 @@ pub(crate) fn all_requests() -> Vec<Request> {
             context: UserContext {
                 last_keystroke_ms: Some(1_700_000_000_000),
                 app_foreground: true,
-                active_session: Some(session_id),
+                active_session: Some(session_id.clone()),
                 sensitive_operation: false,
             },
+        },
+        Request::GetSettings {
+            session_id: Some(session_id),
+        },
+        Request::SetSetting {
+            scope: turn_core::settings::Scope::Workspace,
+            owner_id: Some("ws_req00001".into()),
+            key: "appearance.font_size".into(),
+            value: serde_json::json!(15),
+        },
+        Request::ResetSetting {
+            scope: turn_core::settings::Scope::Session,
+            owner_id: Some("sess_req00001".into()),
+            key: "appearance.font_size".into(),
         },
     ]
 }
@@ -658,7 +765,13 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 62 operations. This number is asserted so that adding one without
-    // documenting it in docs/PROTOCOL.md becomes a deliberate act.
-    assert_eq!(names.len(), 62, "the catalogue changed size: {names:?}");
+    // 71 operations. The number is asserted so that adding one without documenting it in
+    // docs/PROTOCOL.md becomes a deliberate act.
+    //
+    // What it does *not* do is notice a variant that was added to `Request` and never added
+    // to the fixture below — the set is built from the fixture, so an absent variant is
+    // absent from both sides of the comparison. The compile-time guards for that are
+    // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
+    // be left alone when a variant appears. This assertion guards the *documentation*.
+    assert_eq!(names.len(), 71, "the catalogue changed size: {names:?}");
 }

@@ -12,8 +12,15 @@ path = "src/main.rs"
 [dependencies]
 turn-core = { workspace = true }
 turn-proto = { workspace = true }
-eframe = { version = "0.35", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
-egui = "0.35"
+# For `is_display_safe`: the one definition of which characters can make a string render as
+# something other than itself. A link target is process-controlled text the user is asked to
+# trust, so it goes through the same rule as a title rather than a second copy of it.
+turn-pty = { workspace = true }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "accesskit"] }
+egui = "0.36"
+# Icons as a font rather than hand-drawn glyphs. The bundled proportional face has no
+# pictographs, so a toolbar drawn from its characters would be missing-glyph boxes; a
+# real icon font is one file and renders identically on both platforms.
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -39,7 +46,7 @@ libc = "0.2"
 [dev-dependencies]
 # `eframe` lets the harness run the real `TurnApp` rather than only its view, which is
 # what makes the idle-repaint measurement a test of the application.
-egui_kittest = { version = "0.35", features = ["wgpu", "snapshot", "eframe"] }
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }
 # `start_paused` lets the reconnect backoff be tested in microseconds rather than by
 # waiting out a real thirty seconds.
 tokio = { workspace = true, features = ["test-util"] }
@@ -48,3 +55,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # can prove restart persistence without reading or writing the developer's Turn state.
 turnd = { path = "../turnd" }
 tempfile = "3"
+# The copy rules are checked against a screen a real terminal parsed rather than a grid built
+# by hand. A hand-built grid can be made to satisfy any rule — including a wrap flag set where
+# no wrap happened — so the emulator has to be the one that decides where the line broke.
+vt100 = { workspace = true }

@@ -6,7 +6,7 @@ use super::Answer;
 use crate::core::clients::Attachment;
 use crate::core::{ClientId, Core};
 use turn_core::ids::{PaneId, SessionId};
-use turn_core::model::{Direction, LayoutPreset};
+use turn_core::model::{Direction, DropZone, LayoutPreset};
 use turn_proto::{
     CloseDisposition, ErrorCode, FocusTarget, NewPane, PaneAttachment, PaneStream, ProtoError,
     PtySize, Response, ServerEvent,
@@ -89,7 +89,12 @@ impl Core {
                 .hierarchy()
                 .unbind_pane(session_id, pane_id)
                 .map_err(store)?;
-            self.stop_pump_if_unwatched(&binding.node_id);
+            // The pump belongs to whichever node owns the terminal this view was fed
+            // from, which for a hosted agent is the shell it runs in.
+            let watched = self
+                .terminal_node(&binding.node_id)
+                .unwrap_or_else(|| binding.node_id.clone());
+            self.stop_pump_if_unwatched(&watched);
             self.bump_hierarchy();
             self.push_pane_bindings(session_id, &binding.node_id, now_ms);
             return self.answer_layout(session_id);
@@ -101,14 +106,22 @@ impl Core {
             .get(pane_id)
             .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
         let node = pane.node_id.clone();
-        if disposition != CloseDisposition::KeepProcesses
-            && node.as_ref().is_some_and(|node_id| {
-                session
-                    .tree
-                    .get(node_id)
-                    .is_some_and(|node| node.kind.is_agentic())
-            })
-        {
+        // Either shape counts: the pane's own process being an agent, or the pane's shell
+        // running one. Closing a view must not end an agent's work whichever of the two
+        // it is, and the hosted shape is now the ordinary one.
+        let closes_an_agent = node.as_ref().is_some_and(|node_id| {
+            session
+                .tree
+                .get(node_id)
+                .is_some_and(|node| node.kind.is_agentic())
+                || self.hosted_agent_of(node_id).is_some_and(|hosted| {
+                    session
+                        .tree
+                        .get(&hosted)
+                        .is_some_and(|node| node.kind.is_agentic() && node.is_running())
+                })
+        });
+        if disposition != CloseDisposition::KeepProcesses && closes_an_agent {
             return Err(ProtoError::refused(
                 "Closing an Agent pane cannot stop its process; use Stop Agent explicitly",
             ));
@@ -286,23 +299,33 @@ impl Core {
         self.answer_layout(session_id)
     }
 
-    pub(super) fn swap_panes(
+    /// Moves a pane next to another one, which is a Layout change and nothing else.
+    ///
+    /// No process is started, stopped or re-parented: the pane keeps its id and its
+    /// node binding, so the runtime behind it never learns it was moved. That is what
+    /// makes rearranging a session full of running agents a safe thing to do, and it
+    /// is why only the Layout is written back.
+    ///
+    /// Also serves the older `swap_panes`, which is this operation with
+    /// [`DropZone::Centre`].
+    pub(super) fn relocate_pane(
         &mut self,
         client: ClientId,
         session_id: &SessionId,
-        a: &PaneId,
-        b: &PaneId,
+        moved: &PaneId,
+        target: &PaneId,
+        zone: DropZone,
     ) -> Answer {
         let session = self.session_mut(session_id)?;
-        for pane in [a, b] {
+        for pane in [moved, target] {
             if session.layout.get(pane).is_none() {
                 return Err(ProtoError::not_found("pane", pane.as_str()));
             }
         }
-        if !session.layout.swap(a, b) {
+        if !session.layout.relocate(moved, target, zone) {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
-                "Those panes could not be swapped",
+                "That pane could not be moved there",
             ));
         }
         self.save_layout(session_id)?;
@@ -377,9 +400,12 @@ impl Core {
                             && binding.surface_id.as_deref() == surface_id
                     })
                     .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
-                match self.node_pane_capability(&binding.node_id) {
-                    turn_proto::NodePaneCapability::Terminal { .. } => Some(binding.node_id),
-                    turn_proto::NodePaneCapability::PreviewDetails => {
+                // Resolved rather than taken literally: an agent hosted in a pane's
+                // shell has a terminal — the shell's — and that is the screen this
+                // attachment has to be fed from.
+                match self.terminal_node(&binding.node_id) {
+                    Some(node) => Some(node),
+                    None => {
                         return Err(ProtoError::new(
                             ErrorCode::Conflict,
                             "This Agent has semantic preview details but no attachable terminal",
@@ -640,7 +666,7 @@ fn validate_resize_delta(delta: f32) -> Result<(), ProtoError> {
 mod tests {
     use super::*;
     use crate::core::testing::Harness;
-    use turn_core::model::{Pane, PaneKind, ProcessNode};
+    use turn_core::model::{LayoutNode, Pane, PaneKind, ProcessNode};
     use turn_core::state::Lifecycle;
 
     #[tokio::test]
@@ -691,5 +717,124 @@ mod tests {
             session.tree.get(&orphan_id).unwrap().lifecycle,
             Lifecycle::Orphaned
         );
+    }
+
+    /// A relocation is written through immediately, not left to the next flush.
+    ///
+    /// Asserted against the store rather than across a restart on purpose: a clean
+    /// shutdown flushes every session anyway, so a restart would still show the new
+    /// arrangement even if the request had persisted nothing — and the arrangement
+    /// would then be lost by a daemon that died instead of exiting.
+    #[tokio::test]
+    async fn relocating_a_pane_writes_the_new_arrangement_through_to_the_store() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_relocate_store");
+        let left = PaneId::from_stored("pane_relocate_left");
+        harness.add_session(session_id.clone(), left.clone(), 10);
+        let right = Pane::new(PaneKind::Shell);
+        let right_id = right.id.clone();
+        assert!(harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .split(&left, Direction::Horizontal, right));
+
+        let answer = harness
+            .core
+            .relocate_pane(ClientId(3), &session_id, &right_id, &left, DropZone::Below)
+            .expect("a pane may be moved under its sibling");
+        let returned = match answer {
+            Response::Layout { layout, .. } => layout,
+            other => panic!("expected the resulting layout, got {other:?}"),
+        };
+        let LayoutNode::Split(split) = &returned.root else {
+            panic!("expected a split, got {:?}", returned.root);
+        };
+        assert_eq!(split.direction, Direction::Vertical);
+
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .layout(&session_id)
+            .expect("the store must answer")
+            .expect("the session must have a stored layout");
+        assert_eq!(
+            stored, returned,
+            "the client was shown an arrangement the daemon had not written down"
+        );
+        assert!(stored.sizes_are_normalised());
+    }
+
+    /// Moving a pane is a view change: the process behind it is not touched, so
+    /// nothing about the node — least of all its pid — may change.
+    #[tokio::test]
+    async fn relocating_a_pane_leaves_its_process_exactly_where_it_was() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_relocate_pids");
+        let first = PaneId::from_stored("pane_relocate_first");
+        harness.add_session(session_id.clone(), first.clone(), 10);
+        let second = Pane::new(PaneKind::Shell);
+        let second_id = second.id.clone();
+        assert!(harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .split(&first, Direction::Horizontal, second));
+
+        let mut node = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            "/tmp",
+            10,
+        );
+        node.lifecycle = Lifecycle::Alive;
+        node.pid = Some(31_337);
+        let node_id = node.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(node);
+            session.layout.get_mut(&first).unwrap().node_id = Some(node_id.clone());
+        }
+        let nodes_before: Vec<(turn_core::ids::NodeId, Option<u32>, Lifecycle)> =
+            harness.core.sessions[&session_id]
+                .tree
+                .iter()
+                .map(|node| (node.id.clone(), node.pid, node.lifecycle.clone()))
+                .collect();
+
+        harness
+            .core
+            .relocate_pane(
+                ClientId(3),
+                &session_id,
+                &first,
+                &second_id,
+                DropZone::Right,
+            )
+            .expect("a pane may be moved beside its sibling");
+
+        let session = &harness.core.sessions[&session_id];
+        let nodes_after: Vec<(turn_core::ids::NodeId, Option<u32>, Lifecycle)> = session
+            .tree
+            .iter()
+            .map(|node| (node.id.clone(), node.pid, node.lifecycle.clone()))
+            .collect();
+        assert_eq!(
+            nodes_after, nodes_before,
+            "a relocation must not start, stop or re-identify a process"
+        );
+        assert_eq!(session.tree.get(&node_id).unwrap().pid, Some(31_337));
+        assert_eq!(
+            session.layout.get(&first).unwrap().node_id.as_ref(),
+            Some(&node_id),
+            "the moved pane kept showing the same process"
+        );
+        assert_eq!(session.layout.pane_count(), 2);
     }
 }

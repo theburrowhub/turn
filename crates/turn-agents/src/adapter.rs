@@ -178,6 +178,24 @@ pub trait AgentAdapter: Send + Sync {
     /// a `Notification` both marks the agent as waiting and identifies which
     /// session it came from.
     fn normalise(&self, payload: &serde_json::Value, ctx: &EventContext) -> Vec<TurnEvent>;
+
+    /// The arguments that resume the agent's own earlier conversation, given the
+    /// identifier it reported for it.
+    ///
+    /// This is what makes a Session worth having across a machine restart. A pty
+    /// cannot outlive the daemon that owns it, so after a reboot the process is
+    /// genuinely gone — but the *conversation* is not: Claude Code and Codex both
+    /// keep their own transcript and can be told to continue it. Turn records that
+    /// identifier the moment the agent reports it, precisely so a restore can offer
+    /// to carry on rather than start again from nothing.
+    ///
+    /// `None` means this tool cannot resume, and the honest offer is a fresh launch.
+    /// The default returns `None` so an adapter that has no such mechanism does not
+    /// have to pretend otherwise — and so a new adapter cannot accidentally claim
+    /// one by inheriting it.
+    fn resume_args(&self, _external_id: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Finds an executable on `PATH`.

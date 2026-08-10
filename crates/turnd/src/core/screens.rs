@@ -55,7 +55,7 @@ impl Core {
                 // resolved and reversed video is applied there.
                 Ok(buffer) => (
                     turn_proto::from_screen(buffer.screen()),
-                    Some(buffer.title()),
+                    Some(buffer.title().map(str::to_string)),
                 ),
                 // The mutex is only poisoned if a pty reader thread panicked while holding
                 // it. The pane is still real, so a blank screen is the honest answer.
@@ -65,7 +65,7 @@ impl Core {
         match self.recovered_terminals.get(node) {
             Some(buffer) => (
                 turn_proto::from_screen(buffer.screen()),
-                Some(buffer.title()),
+                Some(buffer.title().map(str::to_string)),
             ),
             None => (Grid::blank(size.rows, size.cols), None),
         }

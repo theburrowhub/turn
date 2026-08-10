@@ -20,9 +20,10 @@ use crate::bytes::TerminalBytes;
 use crate::cells::{Grid, Scrollback};
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
+use crate::search::SearchOutcome;
 use crate::view::{
     AttentionView, ContextHandoffView, HierarchySnapshot, NodePaneView, PaneFocusView,
-    SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    SessionDetails, SessionSummary, SettingsView, TemplateSummary, TreeNodeView, TreeSurfaceState,
     WorkspaceSummary,
 };
 
@@ -82,12 +83,44 @@ pub struct PaneAttachment {
     pub next_seq: u64,
 }
 
+/// A process Turn stopped short of and that may still be alive.
+///
+/// Ending a Session is authoritative: it does not fail because one of its processes
+/// escaped the daemon that started it. But it must not pretend either. A survivor of a
+/// previous daemon has a PID-shaped observation and no owned handle, so Turn can neither
+/// signal it safely — PID reuse makes that a coin flip on somebody else's process — nor
+/// claim it exited. What it can do is name it, and let the user go and look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EscapedProcess {
+    pub node_id: NodeId,
+    pub session_id: SessionId,
+    /// What the row was called in the tree, so the sentence the user reads names the
+    /// same thing they were looking at.
+    pub title: String,
+    /// The last PID observed for it, when one was. `None` for a node whose runtime was
+    /// only ever known through a pty the previous daemon owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
 /// A successful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     /// The request succeeded and has nothing to report.
     Ack,
+
+    /// Something was closed, ended or deleted, and it happened.
+    ///
+    /// Separate from [`Response::Ack`] because ending is destructive and authoritative,
+    /// and the honest report of it has two halves: it is done, *and* these processes may
+    /// still be running. Turn used to refuse the whole act when it could not guarantee
+    /// the second half was empty, which left the user holding a Session they had already
+    /// finished with and no way to be rid of it. `escaped` is empty in the ordinary case.
+    Closed {
+        escaped: Vec<EscapedProcess>,
+    },
 
     Workspaces {
         workspaces: Vec<WorkspaceSummary>,
@@ -124,6 +157,19 @@ pub enum Response {
         details: Box<SessionDetails>,
     },
 
+    /// Every preference in force, with where each value came from.
+    ///
+    /// Sent whole after a write as well as on a read, for the same reason a pane operation
+    /// answers with the resulting layout: one change can move what is in force for more than
+    /// the key that was written — removing a Session override reveals the Workspace's value —
+    /// and a client that patched its own copy would be a second resolver, able to disagree
+    /// with the daemon's. `scopes` says which levels this answer was assembled from, so a
+    /// surface can offer "set at the Workspace level" only when there is a Workspace to set
+    /// it on.
+    Settings {
+        settings: Box<SettingsView>,
+    },
+
     Templates {
         templates: Vec<TemplateSummary>,
     },
@@ -155,6 +201,44 @@ pub enum Response {
         /// next without wondering whether it has already been applied.
         next_seq: u64,
         grid: Box<Grid>,
+    },
+
+    /// A screen-shaped window of a pane's history.
+    ///
+    /// The same [`Grid`] shape a live screen arrives in, so a client paints history with
+    /// the code it already has rather than with a second renderer. `scrollback_offset` is
+    /// the offset actually served — clamped to what the daemon still holds — and
+    /// `scrollback_len` is how deep the record goes, so a client never has to guess
+    /// whether it has reached the beginning.
+    PaneHistory {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<NodeId>,
+        grid: Box<Grid>,
+    },
+    /// What a search found in a pane's retained output.
+    ///
+    /// Boxed for the same reason as the other large payloads: the hot response is an ack
+    /// per keystroke, and an enum sized for a thousand matches would widen every one of
+    /// them.
+    PaneMatches {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<NodeId>,
+        outcome: Box<SearchOutcome>,
+    },
+
+    /// The pixels of one inline image, RGBA, for a client to upload as a texture.
+    ///
+    /// Boxed for the same reason as every other large payload here, and for a stronger
+    /// one: this is by a wide margin the biggest thing the protocol carries, and an enum
+    /// sized for it would widen the ack sent for every keystroke.
+    PaneImage {
+        session_id: SessionId,
+        pane_id: PaneId,
+        image: Box<crate::images::ImagePayload>,
     },
 
     Tree {
@@ -211,6 +295,7 @@ impl Response {
     pub fn result_name(&self) -> &'static str {
         match self {
             Response::Ack => "ack",
+            Response::Closed { .. } => "closed",
             Response::Workspaces { .. } => "workspaces",
             Response::Workspace { .. } => "workspace",
             Response::Hierarchy { .. } => "hierarchy",
@@ -219,11 +304,15 @@ impl Response {
             Response::Sessions { .. } => "sessions",
             Response::Session { .. } => "session",
             Response::SessionDetails { .. } => "session_details",
+            Response::Settings { .. } => "settings",
             Response::Templates { .. } => "templates",
             Response::Template { .. } => "template",
             Response::Layout { .. } => "layout",
             Response::Attached { .. } => "attached",
             Response::Screen { .. } => "screen",
+            Response::PaneHistory { .. } => "pane_history",
+            Response::PaneMatches { .. } => "pane_matches",
+            Response::PaneImage { .. } => "pane_image",
             Response::Tree { .. } => "tree",
             Response::Node { .. } => "node",
             Response::PreviewHistory { .. } => "preview_history",
@@ -240,6 +329,7 @@ impl Response {
     /// mapping is complete.
     pub const RESULT_NAMES: &'static [&'static str] = &[
         "ack",
+        "closed",
         "workspaces",
         "workspace",
         "hierarchy",
@@ -248,11 +338,15 @@ impl Response {
         "sessions",
         "session",
         "session_details",
+        "settings",
         "templates",
         "template",
         "layout",
         "attached",
         "screen",
+        "pane_history",
+        "pane_matches",
+        "pane_image",
         "tree",
         "node",
         "preview_history",
@@ -482,9 +576,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 23 result shapes. Asserted so adding one without documenting it in
+        // 28 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 23, "the response catalogue changed size");
+        assert_eq!(declared.len(), 28, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -526,6 +620,14 @@ pub(crate) mod tests {
 
         vec![
             Response::Ack,
+            Response::Closed {
+                escaped: vec![EscapedProcess {
+                    node_id: node_id.clone(),
+                    session_id: s.id.clone(),
+                    title: "npm run dev".into(),
+                    pid: Some(4821),
+                }],
+            },
             Response::Workspaces {
                 workspaces: vec![workspace.clone()],
             },
@@ -583,6 +685,33 @@ pub(crate) mod tests {
                 next_seq: 12,
                 grid: Box::new(Grid::blank(24, 80)),
             },
+            Response::PaneHistory {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                grid: Box::new(Grid::from_lines(&["scrolled off the top"], 40)),
+            },
+            Response::PaneMatches {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                node_id: Some(NodeId::from_stored("proc_a")),
+                outcome: Box::new(crate::search::SearchOutcome {
+                    matches: vec![crate::search::PaneMatch::new(1_240, 4, 5)],
+                    truncated: false,
+                    scanned_lines: 5_040,
+                    total_lines: 5_040,
+                    screen_rows: 40,
+                    scrollback_len: 5_000,
+                }),
+            },
+            Response::PaneImage {
+                session_id: s.id.clone(),
+                pane_id: s.layout.panes()[0].id.clone(),
+                image: Box::new(
+                    crate::images::ImagePayload::new(2, 2, vec![0x40; 16])
+                        .expect("a 2x2 image is a valid payload"),
+                ),
+            },
             Response::Tree {
                 session_id: s.id.clone(),
                 nodes: Vec::new(),
@@ -633,7 +762,16 @@ pub(crate) mod tests {
                 entries: Vec::new(),
             },
             Response::Effects {
-                effects: vec![Effect::Cleared { session_id: s.id }],
+                effects: vec![Effect::Cleared {
+                    session_id: s.id.clone(),
+                }],
+            },
+            Response::Settings {
+                settings: Box::new(crate::view::SettingsView {
+                    session_id: Some(s.id),
+                    levels: vec![crate::view::SettingsLevel::global()],
+                    entries: Vec::new(),
+                }),
             },
         ]
     }

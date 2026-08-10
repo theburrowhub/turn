@@ -555,8 +555,15 @@ fn detach(_command: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    /// How long a test waits for the monitor to report a child's exit.
+    ///
+    /// Generous on purpose. What these tests assert is *which* event arrives, not how quickly:
+    /// the work in between is spawning a shell script and reaping it, and on a machine that is
+    /// also building something the difference between two seconds and ten is the difference
+    /// between a suite that passes and a suite that passes when the machine is idle.
+    const EVENT_WAIT: Duration = Duration::from_secs(20);
 
     fn context(root: &Path) -> LaunchContext {
         LaunchContext {
@@ -715,8 +722,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         let events = launch.monitor.watch(Arc::new(|| {}));
-        let CompanionEvent::Failed(message) = events.recv_timeout(Duration::from_secs(2)).unwrap()
-        else {
+        let CompanionEvent::Failed(message) = events.recv_timeout(EVENT_WAIT).unwrap() else {
             panic!("a non-contention exit must be a failure")
         };
         assert!(message.contains("exit status: 7"), "{message}");
@@ -772,19 +778,23 @@ mod tests {
             EnsureOutcome::Started(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        let wake_count = Arc::new(AtomicUsize::new(0));
-        let wake_counter = Arc::clone(&wake_count);
+        let (wake_send, wake_events) = mpsc::channel();
         let events = launch.monitor.watch(Arc::new(move || {
-            wake_counter.fetch_add(1, Ordering::SeqCst);
+            let _ = wake_send.send(());
         }));
 
-        let CompanionEvent::Failed(message) = events.recv_timeout(Duration::from_secs(2)).unwrap()
-        else {
+        let CompanionEvent::Failed(message) = events.recv_timeout(EVENT_WAIT).unwrap() else {
             panic!("a non-contention exit must be a failure")
         };
         assert!(message.contains("exit status: 7"), "{message}");
         assert!(message.contains(&context.log_path.display().to_string()));
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        wake_events
+            .recv_timeout(EVENT_WAIT)
+            .expect("the companion event must wake the window");
+        assert!(
+            wake_events.try_recv().is_err(),
+            "one companion event must request exactly one wake"
+        );
         assert!(std::fs::read_to_string(context.log_path)
             .unwrap()
             .contains("late failure"));
@@ -804,7 +814,7 @@ mod tests {
             other => panic!("expected a launch, got {other:?}"),
         };
         let events = launch.monitor.watch(Arc::new(|| {}));
-        let event = events.recv_timeout(Duration::from_secs(2)).unwrap();
+        let event = events.recv_timeout(EVENT_WAIT).unwrap();
         assert!(matches!(event, CompanionEvent::Contended(_)));
     }
 

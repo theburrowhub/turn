@@ -26,13 +26,15 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
+    Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
 };
+use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
+use crate::search::SearchQuery;
 use crate::view::{ContextHandoffText, HierarchyKey};
 
 /// A client-supplied correlation id.
@@ -165,6 +167,31 @@ pub enum Request {
     },
     CloseWorkspace {
         workspace_id: WorkspaceId,
+        disposition: CloseDisposition,
+    },
+    /// Removes a Workspace and its Sessions from Turn for good.
+    ///
+    /// The third and last of the three verbs a Workspace row offers, and the only one that
+    /// does not come back. `ArchiveWorkspace` hides it and stops nothing; `CloseWorkspace`
+    /// stops its work and leaves the record; this one stops its work, releases its write
+    /// lease and then **forgets** it: the Workspace row, every Session under it, their
+    /// layouts, their process trees, their event log, their attention entries and their
+    /// per-window tree state.
+    ///
+    /// What it does not do is touch the user's disk. The checkout is a directory they chose
+    /// and Turn does not own it: no file is removed, no branch and no worktree is deleted. A
+    /// caller must say so in the words it puts in front of the user, because "delete" without
+    /// that sentence is a question about their work rather than about Turn's record of it.
+    ///
+    /// Deleting something already gone answers `Ack` rather than `not_found`, so a retry after
+    /// a lost reply is not an error.
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        /// How to stop whatever is still running under it.
+        ///
+        /// Required rather than assumed: the difference between `Terminate` and `Kill` is the
+        /// difference between letting an agent finish writing a file and not, and a delete is
+        /// the last moment anyone can choose.
         disposition: CloseDisposition,
     },
 
@@ -328,6 +355,20 @@ pub enum Request {
         session_id: SessionId,
         disposition: CloseDisposition,
     },
+    /// Removes a Session from Turn for good.
+    ///
+    /// `ArchiveSession` is the reversible one and `CloseSession` stops the work; this stops
+    /// the work, releases the write lease the Session holds and then forgets it — its layout,
+    /// its process tree, its history, its attention entries, its scratch directory and its
+    /// per-window tree state. Nothing on the user's disk is touched: the checkout, the branch
+    /// and any worktree are theirs, not Turn's.
+    ///
+    /// Deleting something already gone answers `Ack`, so a retry after a lost reply is not an
+    /// error.
+    DeleteSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
     /// Full detail: summary, layout, process tree and policy.
     GetSession {
         session_id: SessionId,
@@ -436,6 +477,30 @@ pub enum Request {
         session_id: SessionId,
         target: FocusTarget,
     },
+    /// Moves an existing pane so that it sits beside another one.
+    ///
+    /// The operation behind dragging a pane onto a drop zone, and the one that lets a
+    /// layout change *shape*: a row can become a column, and a pane can leave one
+    /// split for another. `zone` says which side of `target` the moved pane lands on,
+    /// or `centre` to exchange the two.
+    ///
+    /// It starts and stops nothing. A pane moving is a view change, and the runtime
+    /// behind it never learns it happened — which is what makes rearranging a session
+    /// full of running agents safe.
+    RelocatePane {
+        session_id: SessionId,
+        moved: PaneId,
+        target: PaneId,
+        zone: DropZone,
+    },
+    /// The exchange-in-place case of [`Request::RelocatePane`], which is
+    /// `zone: "centre"`.
+    ///
+    /// Kept because it is a shipped wire name and removing it would break a client
+    /// that already speaks it for no gain. It is not a second implementation: the
+    /// daemon answers it through the same relocation, so there is one behaviour with
+    /// two spellings rather than two behaviours that can drift apart. New clients
+    /// should send `relocate_pane`.
     SwapPanes {
         session_id: SessionId,
         a: PaneId,
@@ -504,10 +569,56 @@ pub enum Request {
         session_id: SessionId,
         pane_id: PaneId,
     },
+    /// Fetches the pixels of one inline image a pane's screen refers to.
+    ///
+    /// Images are the one thing in this protocol that is *pulled* rather than pushed, and
+    /// the reason is bandwidth. A screen carries only the small table saying which slot
+    /// holds which [`ImageId`](crate::ImageId); a payload is up to four mebibytes of RGBA
+    /// and would otherwise be resent every time the picture scrolled. So a client fetches
+    /// each id once, caches it, and a re-attaching client asks only for the ids it does
+    /// not already hold.
+    ///
+    /// Answered with `not_found` when the pane's store no longer has that id: an image
+    /// that scrolled out of the daemon's bounded store is gone, and the honest answer is
+    /// to say so rather than to hand back a different picture.
+    PaneImage {
+        session_id: SessionId,
+        pane_id: PaneId,
+        image_id: crate::images::ImageId,
+    },
     /// Stops the output stream for a pane. The process keeps running.
     DetachPane {
         session_id: SessionId,
         pane_id: PaneId,
+    },
+    /// A screen-shaped window of a pane's history, as cells.
+    ///
+    /// The scrollback belongs to the daemon, because the daemon is the only thing that
+    /// has it: a client is sent the *screen*, and a pane that printed five hundred lines
+    /// between two coalesced updates never sent the four hundred and eighty in the
+    /// middle. Reading history is therefore a request rather than something a client
+    /// reconstructs from what it happened to watch.
+    ///
+    /// `offset` is rows above the top of the live screen and is clamped to what the
+    /// daemon still holds, so scrolling past the beginning shows the oldest window rather
+    /// than failing. The answer says which offset it actually is and how deep the record
+    /// goes.
+    GetPaneHistory {
+        session_id: SessionId,
+        pane_id: PaneId,
+        #[serde(default)]
+        offset: usize,
+    },
+    /// Searches everything the daemon retains for a pane: the history, then the live
+    /// screen.
+    ///
+    /// Answered by the daemon for the same reason as [`Request::GetPaneHistory`]. The
+    /// query is bounded ([`SearchQuery`]) and so is the answer, which says when a cap
+    /// stopped it rather than implying it counted every match.
+    SearchPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+        query: SearchQuery,
     },
 
     // ----------------------------------------------------------------------- pty
@@ -614,6 +725,44 @@ pub enum Request {
     UpdateUserActivity {
         context: UserContext,
     },
+
+    // ------------------------------------------------------------------- settings
+    /// Every preference in force for one Session, with where each value came from.
+    ///
+    /// Asked per Session rather than globally because that is the question a settings
+    /// surface has: the answer for a Session in one Workspace is not the answer for a
+    /// Session in another, and the levels that make the difference are the daemon's to
+    /// assemble. `session_id` absent means "the Global level alone", which is what the
+    /// preferences sheet shows before any Session is selected.
+    GetSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
+    /// Records one preference at one level.
+    ///
+    /// The level is explicit and never inferred from what is selected. "Set the font size"
+    /// is four different acts depending on whether it means this Session, this Workspace,
+    /// this Template or everywhere, and a request that guessed would be the one that
+    /// silently edited the wrong one.
+    SetSetting {
+        scope: SettingsScope,
+        /// The Workspace, Template or Session the level belongs to. Ignored for the Global
+        /// level, which has exactly one owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_id: Option<String>,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Removes one level's opinion, so the level below is in force again.
+    ///
+    /// "Reset to inherited". A removal rather than a write of the inherited value: writing it
+    /// would freeze today's inherited answer as tomorrow's override.
+    ResetSetting {
+        scope: SettingsScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_id: Option<String>,
+        key: String,
+    },
 }
 
 impl Request {
@@ -626,6 +775,7 @@ impl Request {
             Request::ArchiveWorkspace { .. } => "archive_workspace",
             Request::DuplicateWorkspace { .. } => "duplicate_workspace",
             Request::CloseWorkspace { .. } => "close_workspace",
+            Request::DeleteWorkspace { .. } => "delete_workspace",
             Request::GetHierarchy { .. } => "get_hierarchy",
             Request::SetTreeExpanded { .. } => "set_tree_expanded",
             Request::SelectTreeNode { .. } => "select_tree_node",
@@ -647,6 +797,7 @@ impl Request {
             Request::ArchiveSession { .. } => "archive_session",
             Request::DuplicateSession { .. } => "duplicate_session",
             Request::CloseSession { .. } => "close_session",
+            Request::DeleteSession { .. } => "delete_session",
             Request::GetSession { .. } => "get_session",
             Request::GetProcessTree { .. } => "get_process_tree",
             Request::GetPreviewHistory { .. } => "get_preview_history",
@@ -663,6 +814,7 @@ impl Request {
             Request::EqualizeDivider { .. } => "equalize_divider",
             Request::ApplyLayoutPreset { .. } => "apply_layout_preset",
             Request::FocusPane { .. } => "focus_pane",
+            Request::RelocatePane { .. } => "relocate_pane",
             Request::SwapPanes { .. } => "swap_panes",
             Request::ZoomPane { .. } => "zoom_pane",
             Request::OpenNodeAsTemporaryPane { .. } => "open_node_as_temporary_pane",
@@ -670,7 +822,10 @@ impl Request {
             Request::FocusPaneForAttention { .. } => "focus_pane_for_attention",
             Request::AttachPane { .. } => "attach_pane",
             Request::ResyncPane { .. } => "resync_pane",
+            Request::PaneImage { .. } => "pane_image",
             Request::DetachPane { .. } => "detach_pane",
+            Request::GetPaneHistory { .. } => "get_pane_history",
+            Request::SearchPane { .. } => "search_pane",
             Request::WritePty { .. } => "write_pty",
             Request::ResizePty { .. } => "resize_pty",
             Request::InterruptNode { .. } => "interrupt_node",
@@ -686,6 +841,9 @@ impl Request {
             Request::MuteSession { .. } => "mute_session",
             Request::CorrectState { .. } => "correct_state",
             Request::UpdateUserActivity { .. } => "update_user_activity",
+            Request::GetSettings { .. } => "get_settings",
+            Request::SetSetting { .. } => "set_setting",
+            Request::ResetSetting { .. } => "reset_setting",
         }
     }
 
@@ -701,7 +859,7 @@ impl Request {
             | Request::RenameWorkspace { .. }
             | Request::ArchiveWorkspace { .. }
             | Request::DuplicateWorkspace { .. } => "workspace",
-            Request::CloseWorkspace { .. } => "ack",
+            Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "closed",
 
             Request::GetHierarchy { .. } => "hierarchy",
             Request::SetTreeExpanded { .. } | Request::SelectTreeNode { .. } => "tree_state",
@@ -719,7 +877,7 @@ impl Request {
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }
             | Request::DuplicateSession { .. } => "session",
-            Request::CloseSession { .. } => "ack",
+            Request::CloseSession { .. } | Request::DeleteSession { .. } => "closed",
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
             Request::GetPreviewHistory { .. } => "preview_history",
@@ -742,6 +900,7 @@ impl Request {
             | Request::EqualizeDivider { .. }
             | Request::ApplyLayoutPreset { .. }
             | Request::FocusPane { .. }
+            | Request::RelocatePane { .. }
             | Request::SwapPanes { .. }
             | Request::ZoomPane { .. } => "layout",
             Request::OpenNodeAsTemporaryPane { .. } => "node_pane",
@@ -750,7 +909,10 @@ impl Request {
             }
             Request::AttachPane { .. } => "attached",
             Request::ResyncPane { .. } => "screen",
+            Request::PaneImage { .. } => "pane_image",
             Request::DetachPane { .. } => "ack",
+            Request::GetPaneHistory { .. } => "pane_history",
+            Request::SearchPane { .. } => "pane_matches",
 
             Request::WritePty { .. } | Request::ResizePty { .. } => "ack",
 
@@ -771,6 +933,15 @@ impl Request {
             // The governor may release a deferred focus jump the moment the user
             // stops typing, so even this returns effects rather than an ack.
             Request::UpdateUserActivity { .. } => "effects",
+
+            // A write answers with the whole resolved set rather than an ack, for the same
+            // reason a pane operation answers with the layout: one change can move what is
+            // in force for several keys at once — a Session override removed reveals a
+            // Workspace value — and a client that patched its own copy would be a second
+            // resolver able to disagree with the daemon's.
+            Request::GetSettings { .. }
+            | Request::SetSetting { .. }
+            | Request::ResetSetting { .. } => "settings",
         }
     }
 
@@ -794,6 +965,14 @@ impl Request {
                 // Asking for the screen again changes nothing about it: the daemon
                 // hands over what it already has.
                 | Request::ResyncPane { .. }
+                // Nor does asking for the pixels of a picture already on that screen.
+                | Request::PaneImage { .. }
+                // Reading history and searching it are reads. Neither moves the pane's
+                // own viewport: the daemon restores the offset it borrowed, so one
+                // client's search cannot scroll another client's screen.
+                | Request::GetPaneHistory { .. }
+                | Request::SearchPane { .. }
+                | Request::GetSettings { .. }
         )
     }
 
@@ -821,6 +1000,7 @@ impl Request {
             | Request::EqualizeDivider { session_id, .. }
             | Request::ApplyLayoutPreset { session_id, .. }
             | Request::FocusPane { session_id, .. }
+            | Request::RelocatePane { session_id, .. }
             | Request::SwapPanes { session_id, .. }
             | Request::ZoomPane { session_id, .. }
             | Request::OpenNodeAsTemporaryPane { session_id, .. }
@@ -828,7 +1008,10 @@ impl Request {
             | Request::FocusPaneForAttention { session_id, .. }
             | Request::AttachPane { session_id, .. }
             | Request::ResyncPane { session_id, .. }
+            | Request::PaneImage { session_id, .. }
             | Request::DetachPane { session_id, .. }
+            | Request::GetPaneHistory { session_id, .. }
+            | Request::SearchPane { session_id, .. }
             | Request::WritePty { session_id, .. }
             | Request::ResizePty { session_id, .. }
             | Request::InterruptNode { session_id, .. }

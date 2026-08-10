@@ -311,6 +311,20 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
+    /// `codex resume <thread-id>` continues an earlier thread.
+    ///
+    /// A subcommand rather than a flag, unlike Claude Code — and the id is the
+    /// `thread-id` from `notify`, which this adapter established is byte-identical
+    /// to the `session_id` its hooks report, so Turn has one identifier whichever
+    /// mechanism delivered it.
+    fn resume_args(&self, external_id: &str) -> Option<Vec<String>> {
+        let id = external_id.trim();
+        if id.is_empty() || id.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(vec!["resume".to_string(), id.to_string()])
+    }
+
     fn normalise(&self, payload: &Value, ctx: &EventContext) -> Vec<TurnEvent> {
         let Some(raw_name) = event_name(payload) else {
             return Vec::new();
@@ -705,6 +719,28 @@ mod tests {
 
     fn normalise(payload: Value) -> Vec<TurnEvent> {
         CodexAdapter::new().normalise(&payload, &ctx())
+    }
+
+    /// Codex resumes with a subcommand, not a flag, and the id is the same one its
+    /// hooks and its `notify` payload agree on.
+    #[test]
+    fn a_recorded_thread_id_becomes_a_resume_launch() {
+        let adapter = CodexAdapter::new();
+        assert_eq!(
+            adapter.resume_args("019fcdc4-5f91-7980-b743-11575462cd61"),
+            Some(vec![
+                "resume".to_string(),
+                "019fcdc4-5f91-7980-b743-11575462cd61".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn an_unusable_thread_id_yields_no_resume() {
+        let adapter = CodexAdapter::new();
+        for id in ["", "  ", "two words"] {
+            assert_eq!(adapter.resume_args(id), None, "{id:?}");
+        }
     }
 
     #[test]

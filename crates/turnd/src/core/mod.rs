@@ -7,10 +7,11 @@
 //! 2. **Hook callbacks** from agents, over the loopback HTTP server in
 //!    [`turn_agents::HookServer`].
 //! 3. **Pty exits**, one watcher task per process.
-//! 4. **A modest timer**, which releases deferred focus jumps, observes output for
-//!    the panes that have a heuristic, repeats state to any client that fell behind,
-//!    lets go of the terminals of processes that have finished, and — only when
-//!    something has changed — sweeps the process table.
+//! 4. **A modest timer**, which releases deferred focus jumps, asks the kernel about the
+//!    agents running in panes' shells, observes output for the panes that have a
+//!    heuristic, repeats state to any client that fell behind, lets go of the terminals
+//!    of processes that have finished, and — only when something has changed — sweeps
+//!    the process table.
 //!
 //! Everything the loop does is synchronous. The store is synchronous, the domain is
 //! synchronous, and a handler that cannot await cannot interleave with another
@@ -19,10 +20,12 @@
 //! and a single writer makes every rule in `turn-core` mean what it says.
 
 pub mod attention;
+pub mod authority;
 mod checkout_authority;
 pub mod clients;
 pub mod command;
 pub mod events;
+pub mod hosting;
 pub mod output;
 pub mod preview;
 pub mod requests;
@@ -118,6 +121,12 @@ pub struct Process {
     pub heuristic: Option<OutputHeuristic>,
     pub size: ScreenSize,
     pub session_id: SessionId,
+    /// The last title generation this node was seen at.
+    ///
+    /// Compared as an integer on every coalesced read, so the common case — a shell
+    /// re-sending the same title on every prompt, `vim` on every file — costs a
+    /// comparison and produces no push.
+    pub title_generation: u64,
     /// When this process's exit was recorded, if it has ended.
     ///
     /// The pty handle outlives the process on purpose — its buffer still holds what
@@ -125,6 +134,16 @@ pub struct Process {
     /// error — so this is what says when "a while" started. See
     /// [`FINISHED_PTY_RETENTION_MS`].
     pub exited_ms: Option<i64>,
+    /// The node of the command Turn started *inside* this process, when this process
+    /// is a shell hosting one.
+    ///
+    /// This is the whole of Turn's claim about the parent/child link: the launch was
+    /// Turn's own, so the edge is knowledge rather than something inferred from the
+    /// process table, and the agent's adapter, integration level, hook token and turn
+    /// state all belong to this node rather than to the shell. It is also what tells
+    /// the supervisor which process in the table is the one Turn typed, so a sweep
+    /// identifies it instead of adopting it a second time as an anonymous child.
+    pub hosted: Option<NodeId>,
 }
 
 /// Sensitive handoff material is ephemeral: it is never put in SQLite or an event.
@@ -373,7 +392,7 @@ impl Core {
             }
         }
 
-        self.shutdown();
+        self.shutdown(turn_core::now_ms());
         // A clean-shutdown acknowledgement is a durability boundary. Sending it from
         // `handle` used to happen before the run loop's final flush and before Core
         // dropped its data-directory lock, so an immediate restart could race the old
@@ -414,7 +433,7 @@ impl Core {
                 node,
                 data,
                 dropped,
-            } => self.deliver_output(&node, data, dropped),
+            } => self.deliver_output(&node, data, dropped, now),
             Command::Exited { node, info } => self.node_exited(&node, info, now),
             Command::Shutdown { .. } => unreachable!("shutdown is handled by the run loop"),
         }
@@ -432,6 +451,7 @@ impl Core {
         }
         let effects = self.attention.tick(&self.user.clone(), now_ms);
         self.emit_effects(effects, now_ms);
+        self.observe_hosted_agents(now_ms);
         self.observe_heuristics(now_ms);
         self.observe_process_titles(now_ms);
         self.observe_activity_previews(now_ms);
@@ -463,14 +483,20 @@ impl Core {
         });
     }
 
-    /// Flushes everything worth keeping.
+    /// Flushes everything worth keeping and gives the checkout back.
     ///
     /// Node lifecycles are left exactly as they are: a session whose processes were
     /// alive when the daemon stopped is stored as alive, so the next start reads it
     /// as "was running", checks the process table and reports honestly. Rewriting
     /// them to `exited` here would erase the difference between a process that ended
     /// and one we lost.
-    fn shutdown(&mut self) {
+    ///
+    /// The write lease is the one thing that *is* rewritten, and it has to be: a lease
+    /// left `active` by a daemon that stopped on purpose is indistinguishable from one
+    /// left by a daemon that crashed, and the next start can only respond to that by
+    /// asking the user to confirm write access they never gave up. See
+    /// [`authority`](super::authority).
+    fn shutdown(&mut self, now_ms: i64) {
         tracing::info!(
             sessions = self.sessions.len(),
             processes = self.processes.len(),
@@ -481,6 +507,7 @@ impl Core {
         }
         self.pumps.clear();
         self.flush();
+        self.release_write_authority(now_ms);
     }
 
     /// Writes in-memory state through to the store.
@@ -764,6 +791,8 @@ pub(crate) mod testing {
                     size,
                     session_id: session_id.clone(),
                     exited_ms: None,
+                    title_generation: 0,
+                    hosted: None,
                 },
             );
             if let Some(session) = self.core.sessions.get_mut(session_id) {
@@ -814,7 +843,8 @@ pub(crate) mod testing {
             while let Ok(chunk) = receiver.try_recv() {
                 batch.extend_from_slice(&chunk);
             }
-            self.core.deliver_output(node, batch, 0);
+            self.core
+                .deliver_output(node, batch, 0, turn_core::now_ms());
         }
 
         /// Waits until a node's screen contains some text, so a test never races a

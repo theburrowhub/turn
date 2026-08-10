@@ -56,13 +56,14 @@ const SECRETS: [&str; 9] = [
 /// existence. A table added to a migration lands in neither list and fails
 /// [`every_table_in_the_schema_is_accounted_for`] until someone decides which side
 /// it belongs on.
-const TABLES_THIS_TEST_WRITES: [&str; 10] = [
+const TABLES_THIS_TEST_WRITES: [&str; 11] = [
     "activity_previews",
     "attention_entries",
     "events",
     "process_nodes",
     "session_layouts",
     "sessions",
+    "setting_layers",
     "settings",
     "templates",
     "workspaces",
@@ -236,6 +237,27 @@ fn write_everything(store: &Store) -> (WorkspaceId, Session) {
         .settings()
         .set("test.durable-secret", &tainted("global default"), T0)
         .unwrap();
+
+    // And the layered preferences, at every level that persists. A preference's value is
+    // user text — an environment variable, a shell command — so it crosses the same
+    // redaction boundary as the Workspace environment it can hold.
+    for (scope, owner) in [
+        (turn_core::settings::Scope::Global, ""),
+        (turn_core::settings::Scope::Workspace, "ws_settings"),
+        (turn_core::settings::Scope::Template, "tpl_settings"),
+        (turn_core::settings::Scope::Session, "sess_settings"),
+    ] {
+        store
+            .setting_layers()
+            .set(
+                scope,
+                owner,
+                "shell.command",
+                &serde_json::Value::String(tainted("zsh")),
+                T0,
+            )
+            .unwrap();
+    }
 
     // Isolated checkout labels are Workspace metadata too. Paths are operational
     // fencing identities and stay clean; branch/resource labels cross the same
@@ -851,11 +873,16 @@ fn historical_v8_fixture(
 
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
+        // Built with the current schema and then walked back, so what is here has to be
+        // walked back too: a real v8 database predates `setting_layers`, and leaving the
+        // table behind while claiming to be v8 would make the migration under test fail on
+        // "table already exists" — a fixture bug that would read as a broken migration.
         "PRAGMA journal_mode = WAL; \
          DELETE FROM settings WHERE key IN ( \
              'security.hook_raw_purge_pending', \
              'security.legacy_free_text_purge_pending' \
          ); \
+         DROP TABLE IF EXISTS setting_layers; \
          PRAGMA user_version = 8;",
     )
     .unwrap();
@@ -1269,6 +1296,14 @@ fn every_table_this_test_claims_to_cover_actually_has_rows_in_it() {
         "activity_previews"
     );
     assert!(store.attention().count().unwrap() > 0, "attention_entries");
+    assert!(
+        !store
+            .setting_layers()
+            .layer(turn_core::settings::Scope::Workspace, "ws_settings")
+            .unwrap()
+            .is_empty(),
+        "setting_layers"
+    );
     assert!(store.events().count().unwrap() > 0, "events");
     assert!(
         store.nodes().count_for_session(&session.id).unwrap() > 0,

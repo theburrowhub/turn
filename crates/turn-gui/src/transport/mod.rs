@@ -56,6 +56,15 @@ pub enum Ask {
     Sessions,
     Details(SessionId),
     Templates,
+    /// Reading the preferences in force. Carries no id: the answer names the Session it was
+    /// resolved for, and a reply that arrived after the selection moved is recognised by that
+    /// rather than by remembering what was asked.
+    Settings,
+    /// Writing one preference at one level, named so a refusal can say which act failed —
+    /// "setting the font size at the Workspace level" rather than "a request failed".
+    WriteSetting {
+        key: String,
+    },
     AttentionQueue,
     Preview {
         session_id: SessionId,
@@ -108,6 +117,25 @@ pub enum Ask {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// A Session removed from Turn for good. Its own variant rather than [`Ask::Action`]
+    /// because the acknowledgement has work to do — the row has to leave the tree — and
+    /// because an error here has to name the right verb.
+    DeleteSession {
+        session_id: SessionId,
+    },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+    },
+    /// An archive or a restore. Distinct from [`Ask::Action`] because its
+    /// acknowledgement has work to do: whether the row still belongs in the tree
+    /// depends on the window's archived preference, and only the daemon can answer
+    /// what the tree contains under that preference.
+    ArchiveSession {
+        archived: bool,
+    },
+    ArchiveWorkspace {
+        archived: bool,
+    },
     /// A change the user asked for. The label is what an error message names.
     Action(&'static str),
     /// Activity reporting. Its answer is a list of effects; a failure is not worth
@@ -131,6 +159,8 @@ impl Ask {
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",
             Ask::Templates => "loading templates",
+            Ask::Settings => "loading preferences",
+            Ask::WriteSetting { .. } => "saving the preference",
             Ask::AttentionQueue => "loading the attention queue",
             Ask::Preview { .. } => "loading an activity preview",
             Ask::PrepareContextHandoff { .. } => "preparing an Agent context handoff",
@@ -145,6 +175,12 @@ impl Ask {
             Ask::RestoreLeaseAcquire { .. } => "acquiring exclusive write access",
             Ask::CloseSession { .. } => "ending the session",
             Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
+            Ask::DeleteSession { .. } => "deleting the session",
+            Ask::DeleteWorkspace { .. } => "deleting the workspace",
+            Ask::ArchiveSession { archived: true } => "archiving the session",
+            Ask::ArchiveSession { archived: false } => "restoring the session",
+            Ask::ArchiveWorkspace { archived: true } => "archiving the workspace",
+            Ask::ArchiveWorkspace { archived: false } => "restoring the workspace",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",
             Ask::Stream => "sending to the terminal",

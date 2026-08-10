@@ -179,7 +179,10 @@ async fn a_session_can_be_renamed_duplicated_and_filed_away() {
         .await,
     );
     assert_eq!(session.pane_count, 2);
-    assert_eq!(session.running_count, 2);
+    assert_eq!(
+        session.running_count, 3,
+        "the agent pane's shell, the agent running in it, and the shell pane"
+    );
 
     let renamed = session_of(
         ui.ask(Request::RenameSession {
@@ -530,7 +533,9 @@ async fn acknowledging_a_demand_keeps_it_in_the_queue_but_ranks_it_below_a_new_o
         })
         .await,
     );
-    let node = details.tree[0].node_id.clone();
+    // The agent, not the pane's process: the pane runs the user's shell and the agent
+    // runs inside it, so the hook token was issued to the agent's own node.
+    let node = agent_row(&details).node_id.clone();
     let hook = hook_url(daemon.data_dir(), &session.id, &node);
 
     post_hook(&hook, &notification("idle_prompt", "Anything?")).await;
@@ -775,10 +780,15 @@ async fn relaunching_a_pane_takes_the_old_launchs_configuration_with_it() {
         })
         .await,
     );
-    let old_node = details.tree[0].node_id.clone();
+    // The agent's node, which is where the injected configuration was written: the
+    // pane's own process is the shell the agent runs in, and a shell needs none.
+    let old_node = agent_row(&details).node_id.clone();
     let old_scratch = turnd::paths::node_scratch(daemon.data_dir(), &session.id, &old_node);
     wait_for_path(&old_scratch).await;
 
+    // Stopping the agent is a signal to its own process, which Turn identifies from the
+    // launch it made in the pane's shell.
+    common::agent::wait_for_agent_pid(&mut ui, &session.id, &old_node).await;
     ui.ask(Request::TerminateNode {
         session_id: session.id.clone(),
         node_id: old_node.clone(),

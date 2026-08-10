@@ -168,16 +168,109 @@ impl Core {
             .filter(|session| &session.workspace_id == id)
             .map(|session| session.id.clone())
             .collect();
-        // Validate the whole Workspace before touching the first Session. Otherwise an
-        // unreachable restored process halfway through would leave a partially stopped
-        // Workspace after returning an error.
+        // No pre-validation pass. There used to be one, and its reason was sound for the
+        // behaviour it guarded: stopping halfway through leaves a partially stopped
+        // Workspace, so better to refuse before touching the first Session. Ending no
+        // longer stops halfway — an unreachable process is reported, not an obstacle — so
+        // the only thing a pre-pass could still do is refuse the whole act because of a
+        // process in the fourth Session that nobody can stop anyway.
+        let mut escaped = Vec::new();
         for session in &sessions {
-            self.ensure_session_processes_stoppable(session, disposition)?;
+            match self.close_session(session, disposition, now_ms) {
+                Ok(Response::Closed { escaped: from_one }) => {
+                    super::sessions::merge_escaped(&mut escaped, from_one)
+                }
+                Ok(_) => {}
+                // One Session failing is not the rest of them keeping their processes.
+                // `KeepProcesses` is the strict disposition and may still refuse; the
+                // destructive ones no longer return an error for anything but a Session
+                // that is not there.
+                Err(error) if disposition == CloseDisposition::KeepProcesses => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, session = %session, "could not end this Session with its Workspace");
+                }
+            }
         }
-        for session in sessions {
-            self.close_session(&session, disposition, now_ms)?;
+        // The Sessions' rows leave the tree — that is what ending each one does — and the
+        // Workspace's row stays.
+        //
+        // That asymmetry is deliberate. A Session is a *task*: finishing it means it is over, so
+        // its row goes. A Workspace is a *project* — a directory the user will come back to —
+        // and filing the project away because its last task stopped would mean restoring it
+        // before starting the next one. The ways to get a Workspace out of the tree are its own:
+        // `ArchiveWorkspace` reversibly, `DeleteWorkspace` for good. This request stops work,
+        // which is why what it is called in the window is "Stop all sessions".
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        Ok(Response::Closed { escaped })
+    }
+
+    /// Removes a Workspace and everything under it from Turn for good.
+    ///
+    /// Its Sessions cannot outlive it, so they are deleted one by one through
+    /// [`Self::delete_session`] rather than left to the database's cascade: each one has
+    /// processes to stop, clients to detach and a scratch directory to remove, and none of
+    /// that is the schema's job. The Workspace row goes last, once nothing depends on it.
+    ///
+    /// A process Turn cannot stop does not stop this either, for the same reason it no longer
+    /// stops `close_workspace`. Deleting is the most authoritative thing in the protocol; if
+    /// ending a Session cannot be vetoed by a survivor of a previous daemon, forgetting one
+    /// certainly cannot. The survivors come back in the answer so the user knows to go and look.
+    ///
+    /// The checkout is not touched. It is a directory the user chose, Turn does not own it, and
+    /// no file, branch or worktree in it is removed. Every surface that offers this has to say
+    /// so, because "delete workspace" without that sentence sounds like a question about their
+    /// code rather than about Turn's record of it.
+    pub(super) fn delete_workspace(
+        &mut self,
+        id: &WorkspaceId,
+        disposition: CloseDisposition,
+        now_ms: i64,
+    ) -> Answer {
+        if matches!(disposition, CloseDisposition::KeepProcesses) {
+            return Err(ProtoError::refused(
+                "Deleting a Workspace cannot keep its processes running",
+            )
+            .with_detail(
+                "Nothing would name them afterwards. Stop them, or close the Workspace \
+                 instead of deleting it.",
+            ));
         }
-        Ok(Response::Ack)
+        let Ok(workspace) = self.workspace(id) else {
+            tracing::info!(workspace = %id, "delete asked for a Workspace that is already gone");
+            return Ok(Response::Closed {
+                escaped: Vec::new(),
+            });
+        };
+        let name = workspace.name.clone();
+        let sessions: Vec<SessionId> = self
+            .sessions
+            .values()
+            .filter(|session| &session.workspace_id == id)
+            .map(|session| session.id.clone())
+            .collect();
+        let mut escaped = Vec::new();
+        for session in &sessions {
+            match self.delete_session(session, disposition, now_ms) {
+                Ok(Response::Closed { escaped: from_one }) => {
+                    super::sessions::merge_escaped(&mut escaped, from_one)
+                }
+                Ok(_) => {}
+                // The Workspace row is going regardless. A Session that would not delete
+                // is a row in a table, and leaving the Workspace half gone because of it
+                // is the state with no name in the UI that this used to guard against.
+                Err(error) => {
+                    tracing::error!(%error, session = %session, "could not delete this Session with its Workspace");
+                }
+            }
+        }
+
+        self.store.workspaces().delete(id).map_err(store)?;
+        self.workspaces.remove(id);
+        tracing::info!(workspace = %id, %name, sessions = sessions.len(), "deleted");
+        self.bump_hierarchy();
+        self.push_hierarchy_all(now_ms);
+        Ok(Response::Closed { escaped })
     }
 
     fn answer_workspace(&self, id: &WorkspaceId, now_ms: i64) -> Answer {

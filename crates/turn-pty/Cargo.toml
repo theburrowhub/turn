@@ -7,6 +7,26 @@ license.workspace = true
 
 [dependencies]
 turn-core = { workspace = true }
+# The inline-image marker alphabet and the payload shape have exactly one writer (this
+# crate) and one reader (a client), and both must agree byte for byte. They are therefore
+# defined once, next to the grid types, rather than twice — the same rule that puts
+# `from_screen` in the protocol crate instead of here.
+turn-proto = { workspace = true }
+# Raster decoding for the three inline-image protocols. Default features are off on
+# purpose: what is enabled is exactly the formats a terminal is asked to show, and every
+# extra decoder is extra attack surface for bytes a process chose. `image` can be given
+# hard limits before it allocates, which is the property this whole feature depends on.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+] }
+# Kitty's `o=z` sends a zlib-compressed payload. Already in the tree behind `image`, so
+# depending on it directly costs nothing and lets the expansion be bounded here rather than
+# refused outright.
+flate2 = "1.1"
 portable-pty = { workspace = true }
 vt100 = { workspace = true }
 sysinfo = { workspace = true }

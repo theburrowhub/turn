@@ -210,10 +210,38 @@ impl<'a> WorkspaceRepo<'a> {
 
     /// Deletes a workspace and, by cascade, its sessions and everything hanging
     /// off them. Archiving is the reversible option; this one is not.
+    ///
+    /// It deletes Turn's *record* of the workspace. The checkout it pointed at is a directory
+    /// the user chose and Turn does not own: nothing on disk is removed, no branch and no
+    /// worktree is touched, and that promise is what makes this action safe to offer at all.
+    ///
+    /// The per-window tree state of the workspace and of every session under it is cleared
+    /// here, because `tree_ui_state` has no foreign key to cascade through — see
+    /// [`super::session::SessionRepo::delete`]. The session rows are read before the delete,
+    /// since after it there is nothing left to ask.
     pub fn delete(&self, id: &WorkspaceId) -> Result<bool> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
+        let tx = self.conn.unchecked_transaction()?;
+        let sessions: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE workspace_id = ?1")?;
+            let mut rows = stmt.query(params![id.as_str()])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(row.get(0)?);
+            }
+            out
+        };
+        let changed = tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "DELETE FROM tree_ui_state WHERE node_kind = 'workspace' AND node_id = ?1",
+            params![id.as_str()],
+        )?;
+        for session in &sessions {
+            tx.execute(
+                "DELETE FROM tree_ui_state WHERE node_kind = 'session' AND node_id = ?1",
+                params![session],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 

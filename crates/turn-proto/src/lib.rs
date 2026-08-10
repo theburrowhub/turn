@@ -33,7 +33,10 @@
 //! * [`ServerEvent`] — what the daemon pushes without being asked ([`events`]).
 //! * [`view`] — projections that keep product rules out of the client.
 //! * [`cells`] — a pane's screen as cells, and the compact form it travels in.
+//! * [`images`] — inline images: how a picture is anchored to cells and how its pixels
+//!   are fetched.
 //! * [`screen`] — screen diffs, the sequence rule, and which stream a pane carries.
+//! * [`search`] — searching a pane's scrollback, and the bounds that keep it cheap.
 //! * [`framing`] — newline-delimited JSON, robust to partial reads and bad lines.
 //! * [`bytes`] — binary payloads, and an honest note about what base64 costs.
 //!
@@ -66,8 +69,10 @@
 //!    typing. A context handoff can target only an idle or done Agent.
 //! 3. **Turn never runs a command it inferred.** Processes start from a template, a
 //!    pane definition, or [`Request::RelaunchNode`]. There is no "run this" verb.
-//! 4. **Turn never relaunches on its own.** A restore *reports* what it found and
-//!    marks what could be started again; the client turns that into an offer.
+//! 4. **Restore safe panes without making the user operate them.** A daemon boot reports what it
+//!    found and runs nothing unattended. Once a window is connected, panes marked `Relaunch` and
+//!    commandless terminals are started automatically; consequential `ReattachOnly` commands
+//!    remain stopped.
 //!
 //! ## Compatibility
 //!
@@ -85,17 +90,23 @@ pub mod error;
 pub mod events;
 pub mod framing;
 pub mod geometry;
+pub mod images;
 pub mod request;
 pub mod response;
 pub mod screen;
+pub mod search;
 pub mod view;
 
 pub use bytes::{decode_base64, encode_base64, Base64Error, TerminalBytes};
 #[cfg(feature = "vt100")]
-pub use cells::{from_screen, scrollback_from_screen};
 pub use cells::{
-    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, Scrollback,
-    MAX_SCREEN_CELLS, MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
+    from_screen, from_screen_with_images, from_screen_with_links, scrollback_from_screen,
+    ScreenLink,
+};
+pub use cells::{
+    indexed_rgb, Cell, CellAttrs, CellRun, Grid, GridError, Modes, MouseMode, Rgb, RowLink,
+    RowMeta, Scrollback, MAX_LINK_URI_CHARS, MAX_SCREEN_CELLS, MAX_SCREEN_LINKS,
+    MAX_SCROLLBACK_ROWS, MAX_SCROLLBACK_WIRE_BYTES,
 };
 pub use envelope::{
     ipc_auth_token_path, negotiate, negotiate_within, peek_version, read_ipc_auth_token,
@@ -112,12 +123,22 @@ pub use framing::{
     MAX_OUTPUT_CHUNK_BYTES,
 };
 pub use geometry::PtySize;
+pub use images::{
+    is_marker, GridImage, ImageCell, ImageError, ImageId, ImagePayload, MAX_IMAGE_CELL_COLS,
+    MAX_IMAGE_CELL_ROWS, MAX_IMAGE_PIXELS, MAX_PLACED_IMAGES,
+};
 pub use request::{CloseDisposition, FocusTarget, NewPane, Request, RequestId};
-pub use response::{PaneAttachment, Response};
+pub use response::{EscapedProcess, PaneAttachment, Response};
 pub use screen::{GridRow, PaneStream, ScreenUpdate};
+#[cfg(feature = "vt100")]
+pub use search::{history_grid, history_len, search_screen};
+pub use search::{
+    search_grid, viewport_offset, viewport_row, PaneMatch, SearchError, SearchMode, SearchOutcome,
+    SearchQuery, MAX_MATCHES, MAX_MATCHES_PER_ROW, MAX_QUERY_CHARS, MAX_SEARCH_ROWS,
+};
 pub use view::{
     AgentSummary, AttentionView, ContextHandoffText, ContextHandoffView, HierarchyKey,
     HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView, SessionDetails,
-    SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
-    WorkspaceSummary, WorkspaceTreeView,
+    SessionSummary, SessionTreeView, SettingsControl, SettingsEntry, SettingsLevel, SettingsView,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };

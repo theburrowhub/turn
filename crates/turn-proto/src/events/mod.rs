@@ -35,14 +35,50 @@ pub struct PaneRestoreOutcome {
     /// out of reach) or `Lost` (cannot be found). `Reconnected` is reserved for a
     /// backend that can prove PTY reattachment; the MVP does not claim it.
     pub lifecycle: Lifecycle,
-    /// Set when Turn could offer to start this pane again. It is an offer: the
-    /// user answers it with [`Request::RelaunchNode`](crate::Request::RelaunchNode)
-    /// or does not, and nothing happens until they do.
+    /// Set when this pane *can* be started again: it is not running, it has something to run,
+    /// and its `RestoreBehaviour` is not `Skip`.
+    ///
+    /// Whether it *should* be started without being asked is the separate question below.
     pub can_relaunch: bool,
+    /// Whether Turn may start this pane again on its own.
+    ///
+    /// True for a pane whose `RestoreBehaviour` is `Relaunch` — the value that has always meant
+    /// "running this again is harmless", and which every built-in template sets for its shells,
+    /// its agent panes and its file browsers. Coming back to a Session and finding it stopped,
+    /// with a button per pane, is not a session; it is a form to fill in. So the client starts
+    /// these without asking.
+    ///
+    /// False for a command-bearing `ReattachOnly` pane, which means *this one is not to be run by
+    /// itself*. A deploy or migration belongs there and stays stopped without an inline start
+    /// prompt. Commandless terminals remain safe shell fallbacks even in legacy layouts.
+    ///
+    /// Defaults to false when absent, so an older peer's payload stays stopped rather than being
+    /// read as permission to run a consequential command.
+    #[serde(default)]
+    pub auto_start: bool,
     /// What the pane would run if the user accepted. It is descriptive; the
     /// authoritative relaunch target remains `node_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Whether starting this pane again would use the Session's checkout write
+    /// authority.
+    ///
+    /// An agent, or any command the pane names, would; opening the user's own shell
+    /// would not. A UI that is waiting for the user to confirm write access can
+    /// therefore keep offering the panes that write nothing instead of blocking the
+    /// whole Session — including the terminal they need in order to go and stop the
+    /// process the confirmation is about.
+    ///
+    /// Defaults to `true` when absent, so an older peer's payload is read as the
+    /// gated case rather than as permission.
+    #[serde(default = "crate::events::needs_checkout_write_default")]
+    pub needs_checkout_write: bool,
+}
+
+/// A missing `needs_checkout_write` means "assume it does": the field only ever
+/// unlocks something, so its absence must not.
+fn needs_checkout_write_default() -> bool {
+    true
 }
 
 /// A push from the daemon.

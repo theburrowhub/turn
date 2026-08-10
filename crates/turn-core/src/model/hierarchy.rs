@@ -150,6 +150,46 @@ pub enum NameSource {
     Fallback,
 }
 
+impl NameSource {
+    /// How much authority this source has. Lower wins.
+    ///
+    /// The order is the one the product cares about: what a tool told us about
+    /// itself outranks what we read off its terminal, because a title is free text
+    /// the process writes and a hook payload is a documented contract. Written as
+    /// a number rather than relying on the declaration order so that adding a
+    /// variant cannot silently re-rank the existing ones.
+    pub fn rank(&self) -> u8 {
+        match self {
+            NameSource::ExplicitParentEvent => 0,
+            NameSource::Integration => 1,
+            NameSource::StructuredTask => 2,
+            NameSource::ProcessTitle => 3,
+            NameSource::Inferred => 4,
+            NameSource::Fallback => 5,
+        }
+    }
+
+    /// Whether a name from this source outranks one from `other`.
+    pub fn outranks(&self, other: NameSource) -> bool {
+        self.rank() < other.rank()
+    }
+
+    /// Whether the UI should mark a name from this source as something Turn read
+    /// rather than was told.
+    ///
+    /// A process title is the interesting case. It cannot be sanitised into
+    /// trustworthiness: `✓ tests passed` or the name of another of the user's
+    /// sessions are both perfectly valid text. The defence is not filtering, it is
+    /// never presenting such a name with the same authority as one a tool reported
+    /// through a contract.
+    pub fn is_provisional(&self) -> bool {
+        matches!(
+            self,
+            NameSource::ProcessTitle | NameSource::Inferred | NameSource::Fallback
+        )
+    }
+}
+
 /// Lossless agent naming: a user rename never destroys what the parent declared.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentName {
@@ -194,6 +234,70 @@ impl AgentName {
     pub fn rename(&mut self, name: impl Into<String>) {
         self.display_name = name.into();
         self.user_renamed = true;
+    }
+
+    /// Offers a title the process wrote about itself, and reports whether it was
+    /// taken.
+    ///
+    /// Refused in two cases, both deliberate:
+    ///
+    /// * The user renamed this node. Their choice is the one thing nothing else
+    ///   may override — a shell that rewrites its title on every prompt would
+    ///   otherwise erase a name someone typed on purpose.
+    /// * Something with more authority already named it. A `SubagentStart` hook
+    ///   that said "Reviewer" is worth more than whatever the program prints, so a
+    ///   later title cannot demote it.
+    ///
+    /// `declared_name` is never touched, so a title can never destroy what a
+    /// parent reported even while it is being displayed.
+    pub fn apply_process_title(&mut self, title: impl Into<String>) -> bool {
+        if self.user_renamed {
+            return false;
+        }
+        if self.source.outranks(NameSource::ProcessTitle) {
+            return false;
+        }
+        let title = title.into();
+        if title.is_empty() || self.display_name == title {
+            return false;
+        }
+        self.display_name = title;
+        self.source = NameSource::ProcessTitle;
+        // A title is read, not reported. `InferredHigh` rather than `Explicit`:
+        // the sequence really did arrive, but what it claims is the process's word
+        // about itself and nothing corroborates it.
+        self.confidence = Confidence::InferredHigh;
+        true
+    }
+
+    /// Drops a name that came from a process title, falling back to whatever was
+    /// declared or to `fallback`.
+    ///
+    /// Called when a process ends. Without it a dead process leaves its last words
+    /// on screen — a header still announcing "compiling…" for something that
+    /// exited ten minutes ago is worse than no title at all.
+    pub fn clear_process_title(&mut self, fallback: impl Into<String>) -> bool {
+        if self.source != NameSource::ProcessTitle {
+            return false;
+        }
+        match &self.declared_name {
+            Some(declared) => {
+                self.display_name = declared.clone();
+                self.source = NameSource::ExplicitParentEvent;
+                self.confidence = Confidence::Explicit;
+            }
+            None => {
+                self.display_name = fallback.into();
+                self.source = NameSource::Fallback;
+                self.confidence = Confidence::Unknown;
+            }
+        }
+        true
+    }
+
+    /// Whether the displayed name should be rendered as provisional.
+    pub fn is_provisional(&self) -> bool {
+        !self.user_renamed && self.source.is_provisional()
     }
 }
 

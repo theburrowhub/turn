@@ -16,6 +16,7 @@ pub mod attention;
 pub mod event;
 pub mod ids;
 pub mod model;
+pub mod settings;
 pub mod state;
 
 pub use attention::{AttentionManager, AttentionPolicy, Effect, UserContext};
@@ -27,6 +28,7 @@ pub use model::{
     AgentInfo, Layout, LayoutNode, Pane, PaneKind, ProcessNode, Session, SessionTree, Split,
     Template, Workspace,
 };
+pub use settings::{Layer as SettingsLayer, Resolution, Scope as SettingsScope, Settings};
 pub use state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 
 /// Wall-clock milliseconds since the Unix epoch.
