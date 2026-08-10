@@ -8,11 +8,15 @@ fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+invocation_dir="$PWD"
 output="${1:-$repo_root/dist/Turn.app}"
 
 if [[ "$output" != *.app ]]; then
     echo "package-macos-app: output must end in .app: $output" >&2
     exit 1
+fi
+if [[ "$output" != /* ]]; then
+    output="$invocation_dir/$output"
 fi
 if [[ -e "$output" ]]; then
     echo "package-macos-app: refusing to replace existing output: $output" >&2
@@ -22,7 +26,7 @@ fi
 cargo_bin="${CARGO:-cargo}"
 target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 if [[ "$target_dir" != /* ]]; then
-    target_dir="$repo_root/$target_dir"
+    target_dir="$invocation_dir/$target_dir"
 fi
 
 "$cargo_bin" build \
@@ -40,22 +44,28 @@ for binary in turn turnd turn-hook; do
     fi
 done
 
-version="$($cargo_bin metadata \
+package_id="$($cargo_bin pkgid \
     --manifest-path "$repo_root/Cargo.toml" \
     --locked \
-    --no-deps \
-    --format-version 1 \
-    | sed -n 's/.*"name":"turn-gui","version":"\([^"]*\)".*/\1/p')"
-if [[ -z "$version" ]]; then
-    version="$(sed -n '/^\[workspace\.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$repo_root/Cargo.toml")"
-fi
-if [[ -z "$version" ]]; then
+    -p turn-gui)"
+version="${package_id##*#}"
+version="${version##*@}"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
     echo "package-macos-app: could not resolve the workspace version" >&2
     exit 1
 fi
 
-stage="$(mktemp -d "${TMPDIR:-/tmp}/turn-app.XXXXXX")"
-trap 'rm -rf "$stage"' EXIT
+output_parent="$(dirname "$output")"
+mkdir -p "$output_parent"
+stage="$(mktemp -d "$output_parent/.turn-app.XXXXXX")"
+reserved_output=false
+cleanup() {
+    rm -rf "$stage"
+    if [[ "$reserved_output" == true ]]; then
+        rmdir "$output" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 app="$stage/Turn.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
@@ -78,8 +88,13 @@ done
 codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
-mkdir -p "$(dirname "$output")"
-mv "$app" "$output"
+if ! mkdir "$output"; then
+    echo "package-macos-app: refusing to replace existing output: $output" >&2
+    exit 1
+fi
+reserved_output=true
+mv "$app/Contents" "$output/Contents"
+reserved_output=false
 trap - EXIT
 rm -rf "$stage"
 

@@ -24,9 +24,10 @@ codesign --verify --deep --strict --verbose=2 dist/Turn.app
 
 The opt-in test connects to the daemon already launched by the packaged app. It never
 runs in normal CI and refuses to use an account unless `TURN_LIVE_CLAUDE=1` is present.
-Use a disposable Git repository: the test grants Claude bypass permissions only inside
-that explicit root so an unattended permission prompt cannot make the result
-ambiguous.
+Use a disposable Git repository so the run leaves no project history behind. The test
+keeps Claude in `plan` permission mode, never bypasses its permission system, and
+enables experimental Agent Teams only in the launched Pane's environment. The project
+root is test-data isolation, not a host security boundary.
 
 ```sh
 acceptance_root="$(mktemp -d /tmp/turn-reviewer.XXXXXX)"
@@ -61,6 +62,7 @@ same `turnd` and Claude PIDs still own the socket/PTY, reopen the same bundle an
 ```sh
 TURN_LIVE_CLAUDE=1 \
 TURN_LIVE_CLAUDE_SOCKET="$acceptance_root/turn.sock" \
+TURN_LIVE_CLAUDE_EVIDENCE="$acceptance_root/live-evidence.json" \
 cargo test -p turnd --test live_claude \
   reopened_packaged_app_restores_live_claude_reviewer_vertical \
   -- --ignored --exact --nocapture --test-threads=1

@@ -22,7 +22,11 @@ use turn_proto::{
 };
 
 const LIVE_WAIT: Duration = Duration::from_secs(240);
+const CLAUDE_STARTUP_WAIT: Duration = Duration::from_secs(45);
 const SURFACE: &str = "live-claude-reviewer-acceptance";
+const TRUST_PROMPT_HEADING: &str =
+    "quick safety check: is this a project you created or one you trust?";
+const TRUST_PROMPT_CONFIRM: &str = "yes, i trust this folder";
 
 fn required_path(name: &str) -> PathBuf {
     let value = std::env::var_os(name)
@@ -61,6 +65,46 @@ async fn session_details(
         })
         .await,
     )
+}
+
+async fn wait_for_claude_editor(
+    ui: &mut Client,
+    session_id: &turn_core::ids::SessionId,
+    node_id: &turn_core::ids::NodeId,
+    pane_id: &turn_core::ids::PaneId,
+) {
+    let deadline = tokio::time::Instant::now() + CLAUDE_STARTUP_WAIT;
+    let mut accepted_trust = false;
+    loop {
+        ui.poll_screens().await;
+        let (text, interactive) = {
+            let screen = ui.screen(session_id, pane_id);
+            (
+                screen.text().to_ascii_lowercase(),
+                screen.alternate_screen && screen.modes.bracketed_paste,
+            )
+        };
+        let trust_prompt =
+            text.contains(TRUST_PROMPT_HEADING) && text.contains(TRUST_PROMPT_CONFIRM);
+        if trust_prompt {
+            if !accepted_trust {
+                ui.ask(Request::WritePty {
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                    data: TerminalBytes::new(b"\r".to_vec()),
+                })
+                .await;
+                accepted_trust = true;
+            }
+        } else if interactive {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Claude did not reach its interactive editor within {CLAUDE_STARTUP_WAIT:?}; screen={text:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 async fn wait_for_reviewer(
@@ -117,8 +161,12 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     let socket = required_path("TURN_LIVE_CLAUDE_SOCKET");
     let project = std::fs::canonicalize(required_path("TURN_LIVE_CLAUDE_PROJECT"))
         .expect("the isolated live project must exist");
-    let binary = std::fs::canonicalize(required_path("TURN_LIVE_CLAUDE_BIN"))
-        .expect("the Claude binary must exist");
+    let binary = required_path("TURN_LIVE_CLAUDE_BIN");
+    assert!(
+        std::fs::metadata(&binary).is_ok_and(|metadata| metadata.is_file()),
+        "the Claude binary must resolve to a file: {}",
+        binary.display()
+    );
     let evidence_path = required_path("TURN_LIVE_CLAUDE_EVIDENCE");
     let debug_path = required_path("TURN_LIVE_CLAUDE_DEBUG");
     let version = claude_version(&binary);
@@ -135,7 +183,8 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     let mut pane = NewPane::new(PaneKind::Agent);
     pane.command = Some(binary.display().to_string());
     pane.args = vec![
-        "--dangerously-skip-permissions".into(),
+        "--permission-mode".into(),
+        "plan".into(),
         "--model".into(),
         "sonnet".into(),
         "--no-chrome".into(),
@@ -146,6 +195,8 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
         debug_path.display().to_string(),
     ];
     pane.cwd = Some(project.display().to_string());
+    pane.env
+        .push(("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".into(), "1".into()));
 
     let session = session_of(
         ui.ask(Request::CreateSession {
@@ -187,18 +238,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
 
     ui.attach_cells(&session.id, &pane_id, PtySize::new(40, 120))
         .await;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    ui.poll_screens().await;
-    let startup = ui.screen(&session.id, &pane_id).text();
-    if startup.to_ascii_lowercase().contains("trust") {
-        ui.ask(Request::WritePty {
-            session_id: session.id.clone(),
-            node_id: parent_node.clone(),
-            data: TerminalBytes::new(b"\r".to_vec()),
-        })
-        .await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    wait_for_claude_editor(&mut ui, &session.id, &parent_node, &pane_id).await;
 
     ui.ask(Request::ResizePty {
         session_id: session.id.clone(),
@@ -206,6 +246,8 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
         size: PtySize::new(44, 132),
     })
     .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    ui.poll_screens().await;
 
     let prompt = "In this isolated repository, create an agent team and spawn one in-process teammate named Reviewer. Ask Reviewer to inspect README.md and report one concise observation. Do not edit files and do not open any terminal, pane, window, or external application. Wait for Reviewer to report back.";
     let screen = ui.screen(&session.id, &pane_id);
@@ -240,7 +282,13 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     let reviewer = details
         .tree
         .iter()
-        .find(|node| node.kind == NodeKind::Subagent)
+        .find(|node| {
+            node.kind == NodeKind::Subagent
+                && node
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.name.declared_name.as_deref() == Some("Reviewer"))
+        })
         .expect("Reviewer is a background subagent");
     assert_eq!(reviewer.parent.as_ref(), Some(&parent_node));
     assert_eq!(reviewer.relationship.kind, RelationshipKind::SpawnedBy);
@@ -327,7 +375,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
             "protocol_version": ui.welcome.protocol_version,
             "workspace_root": project,
             "session": {
-                "id": session.id,
+                "id": session.id.to_string(),
                 "mode": format!("{:?}", session.mode),
                 "lease_state": format!("{:?}", lease.state),
                 "layout_panes": layout_before.pane_count(),
@@ -362,6 +410,15 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
 async fn reopened_packaged_app_restores_live_claude_reviewer_vertical() {
     assert_eq!(std::env::var("TURN_LIVE_CLAUDE").as_deref(), Ok("1"));
     let socket = required_path("TURN_LIVE_CLAUDE_SOCKET");
+    let evidence_path = required_path("TURN_LIVE_CLAUDE_EVIDENCE");
+    let evidence: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&evidence_path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", evidence_path.display())),
+    )
+    .expect("live evidence is valid JSON");
+    let expected_session_id = evidence["session"]["id"]
+        .as_str()
+        .expect("live evidence names the exact Session");
     let mut ui = Client::connect(&socket).await;
     let snapshot = match ui
         .ask(Request::GetHierarchy {
@@ -377,7 +434,7 @@ async fn reopened_packaged_app_restores_live_claude_reviewer_vertical() {
         .workspaces
         .iter()
         .flat_map(|workspace| &workspace.sessions)
-        .find(|session| session.session.name == "Live Claude → Reviewer")
+        .find(|session| session.session.id.to_string() == expected_session_id)
         .expect("the live acceptance Session survives the UI restart");
     let parent = branch
         .nodes
@@ -387,7 +444,13 @@ async fn reopened_packaged_app_restores_live_claude_reviewer_vertical() {
     let reviewer = branch
         .nodes
         .iter()
-        .find(|node| node.kind == NodeKind::Subagent)
+        .find(|node| {
+            node.kind == NodeKind::Subagent
+                && node
+                    .agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.name.declared_name.as_deref() == Some("Reviewer"))
+        })
         .expect("Reviewer remains in the tree");
     assert!(parent.lifecycle.is_running());
     assert_eq!(reviewer.parent.as_ref(), Some(&parent.node_id));
