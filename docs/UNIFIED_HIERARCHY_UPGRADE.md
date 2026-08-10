@@ -358,7 +358,7 @@ test in step 9 remains pending.
    bindings and live processes intact, without opening a new Pane; expire temporary bindings before a new
    surface bootstrap. On daemon restart, restore the same durable metadata but report runtimes as
    `Orphaned`/`Lost`; do not claim PTY reattachment.
-9. Demonstrate the vertical with a deterministic fixture adapter, then run a manual Claude Code smoke test when the CLI and credentials are available.
+9. Demonstrate the vertical with a deterministic fixture adapter, then run a manual Claude Code smoke test when the CLI and credentials are available. The reproducible packaged-app harness and latest honest run record live in [REVIEWER_ACCEPTANCE.md](REVIEWER_ACCEPTANCE.md).
 
 ## Reproducible vertical acceptance
 
