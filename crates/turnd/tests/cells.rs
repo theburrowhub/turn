@@ -74,6 +74,134 @@ async fn type_line(ui: &mut Client, session: &SessionSummary, pane: &PaneId, lin
     .await;
 }
 
+fn history_text(attachment: &turn_proto::PaneAttachment) -> String {
+    attachment
+        .scrollback
+        .decode_rows()
+        .expect("the daemon emits valid scrollback")
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restarting_reconstructs_the_visible_terminal_and_scrollback_without_claiming_it_is_alive()
+{
+    let daemon = TestDaemon::start_plain().await;
+    let mut ui = daemon.connect().await;
+    let (session, pane) = shell_session(&daemon, &mut ui).await;
+    ui.attach_cells(&session.id, &pane, PtySize::new(4, 32))
+        .await;
+
+    type_line(
+        &mut ui,
+        &session,
+        &pane,
+        "i=0; while [ $i -lt 12 ]; do printf 'JOURNAL-%02d\\n' $i; i=$((i+1)); done",
+    )
+    .await;
+    ui.wait_for_screen("JOURNAL-11").await;
+    let before_screen = ui.screen(&session.id, &pane).clone();
+    let before = ui
+        .attach_cells(&session.id, &pane, PtySize::new(4, 32))
+        .await;
+    assert!(history_text(&before).contains("JOURNAL-00"));
+    assert!(before.bytes_seen > 0);
+    drop(ui);
+
+    let daemon = daemon.restart().await;
+    let mut ui = daemon.connect().await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    assert!(details
+        .tree
+        .iter()
+        .all(|node| node.lifecycle == turn_core::state::Lifecycle::Lost));
+
+    let recovered = ui
+        .attach_cells(&session.id, &pane, PtySize::new(4, 32))
+        .await;
+    assert_eq!(
+        recovered.screen.as_deref(),
+        Some(&before_screen),
+        "the recovered grid is display history, not a blank replacement"
+    );
+    assert_eq!(history_text(&recovered), history_text(&before));
+    assert_eq!(recovered.bytes_seen, before.bytes_seen);
+    assert!(history_text(&recovered).contains("JOURNAL-00"));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sensitive_session_can_disable_terminal_history_before_launch() {
+    let daemon = TestDaemon::start_plain().await;
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "private terminal".to_string(),
+            root: daemon.data_dir().display().to_string(),
+        })
+        .await,
+    );
+    drop(ui);
+    let dir = daemon.stop().await;
+
+    let store = turn_store::Store::open_in(dir.path()).unwrap();
+    let mut stored = store
+        .workspaces()
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.id == workspace.id)
+        .unwrap();
+    stored
+        .env
+        .push(("TURN_TERMINAL_HISTORY".into(), "disabled".into()));
+    store.workspaces().save(&stored).unwrap();
+    drop(store);
+
+    let daemon = TestDaemon::adopt_with(dir, turn_agents::AdapterRegistry::with_builtin).await;
+    let mut ui = daemon.connect().await;
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "no terminal history".to_string(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Terminal).with_command("sh")]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pane = details.layout.panes()[0].id.clone();
+    ui.attach_cells(&session.id, &pane, PtySize::new(4, 32))
+        .await;
+    type_line(&mut ui, &session, &pane, "printf 'PRIVATE-OUTPUT\\n'").await;
+    ui.wait_for_screen("PRIVATE-OUTPUT").await;
+
+    assert!(
+        !turnd::paths::session_terminal_history(daemon.data_dir(), &session.id).exists(),
+        "an opted-out session must not create a raw terminal archive"
+    );
+    daemon.shutdown().await;
+}
+
 /// The headline: what the process printed arrives as cells, and an ANSI colour arrives
 /// as a concrete value rather than as an index the client would have to interpret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

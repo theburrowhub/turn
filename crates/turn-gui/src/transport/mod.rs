@@ -172,7 +172,7 @@ impl Ask {
             Ask::CreateTemplate => "saving the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::RelaunchNode { .. } => "starting the restored pane",
-            Ask::RestoreLeaseAcquire { .. } => "acquiring restored write access",
+            Ask::RestoreLeaseAcquire { .. } => "acquiring exclusive write access",
             Ask::CloseSession { .. } => "ending the session",
             Ask::CloseWorkspace { .. } => "stopping every session in the workspace",
             Ask::DeleteSession { .. } => "deleting the session",
@@ -349,8 +349,9 @@ impl DaemonLink {
 
 /// Connects, serves the connection until it ends, and does it again.
 ///
-/// Returns only when the daemon refuses this build, because that is the one failure a
-/// retry cannot fix and looping on it would bury the message the user needs to read.
+/// Returns only when the daemon refuses this build for a non-authentication reason,
+/// because that is the failure a retry cannot fix. An auth refusal re-reads the
+/// generation token and follows normal backoff.
 async fn supervise(
     socket: PathBuf,
     client_version: String,
@@ -361,6 +362,7 @@ async fn supervise(
 ) {
     let mut identity = DaemonIdentity::new();
     let mut attempt: u32 = 0;
+    let mut consecutive_auth_refusals: u32 = 0;
     let mut last_status = ConnectionState::Starting;
     let mut generation: u64 = 0;
 
@@ -381,7 +383,7 @@ async fn supervise(
 
         let (mut connection, welcome) = match link::connect(&socket, &client_version).await {
             Ok(parts) => parts,
-            Err(LinkError::Refused(error)) => {
+            Err(LinkError::Refused(error)) if error.code != turn_proto::ErrorCode::Unauthorized => {
                 tracing::error!(message = %error.message, "the daemon refused this build");
                 publish(
                     &inbound,
@@ -393,18 +395,35 @@ async fn supervise(
             }
             Err(error) => {
                 tracing::debug!(%error, "could not reach the daemon; will retry");
+                let authentication_refused = matches!(
+                    &error,
+                    LinkError::Refused(error)
+                        if error.code == turn_proto::ErrorCode::Unauthorized
+                );
+                if authentication_refused {
+                    consecutive_auth_refusals = consecutive_auth_refusals.saturating_add(1);
+                } else {
+                    consecutive_auth_refusals = 0;
+                }
                 // `retrying` is the error's own verdict rather than a constant: a
                 // socket that is not there yet is worth waiting for, and a frame this
                 // build could not encode is not.
                 let retrying = error.is_retryable();
+                let protocol_error = error.to_proto_error();
+                let message = if consecutive_auth_refusals >= 3 {
+                    format!(
+                        "Turn repeatedly reached the daemon but could not authenticate. \
+                         Its capability file may be stale or corrupt; retrying. Last response: {}",
+                        protocol_error.message
+                    )
+                } else {
+                    protocol_error.message
+                };
                 let published = publish(
                     &inbound,
                     &wake,
                     &mut last_status,
-                    ConnectionState::Disconnected {
-                        message: error.to_proto_error().message,
-                        retrying,
-                    },
+                    ConnectionState::Disconnected { message, retrying },
                 );
                 if !published || !retrying {
                     return;
@@ -412,6 +431,8 @@ async fn supervise(
                 continue;
             }
         };
+
+        consecutive_auth_refusals = 0;
 
         tracing::info!(
             daemon_pid = welcome.daemon_pid,
@@ -597,10 +618,16 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
     use turn_proto::{ClientMessage, ServerFrame, Welcome};
+
+    fn remove_socket_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(turn_proto::ipc_auth_token_path(path));
+    }
 
     fn socket_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -609,7 +636,8 @@ mod tests {
             name,
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
+        std::fs::write(turn_proto::ipc_auth_token_path(&path), "b".repeat(64)).unwrap();
         path
     }
 
@@ -647,7 +675,8 @@ mod tests {
     #[test]
     fn a_window_with_no_daemon_is_told_so_rather_than_left_blank() {
         let (wake, wakes) = counting_waker();
-        let link = DaemonLink::spawn(socket_path("absent"), "0.1.0", wake);
+        let path = socket_path("absent");
+        let link = DaemonLink::spawn(path.clone(), "0.1.0", wake);
         let seen = wait_for(&link, |message| {
             matches!(
                 message,
@@ -665,6 +694,8 @@ mod tests {
             wakes.load(Ordering::SeqCst) > 0,
             "a status change has to wake the window or nobody sees it"
         );
+        drop(link);
+        remove_socket_files(&path);
     }
 
     /// A daemon that appears late is the everyday case: the user opened Turn and the
@@ -720,7 +751,7 @@ mod tests {
 
         daemon.abort();
         drop(link);
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     /// A crash-looping daemon must not be reconnected to as fast as the kernel
@@ -773,7 +804,7 @@ mod tests {
             .collect();
         drop(link);
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
 
         let count = handshakes.load(Ordering::SeqCst);
         assert!(count >= 1, "it must have connected at all; saw {count}");
@@ -850,7 +881,61 @@ mod tests {
 
         drop(link);
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
+    }
+
+    #[test]
+    fn repeated_authentication_refusals_name_the_capability_problem() {
+        let path = socket_path("auth-refused");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the fake daemon");
+        let listener_path = path.clone();
+        let daemon = runtime.spawn(async move {
+            let Ok(listener) = UnixListener::bind(&listener_path) else {
+                return;
+            };
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                let _ = lines.next_line().await;
+                let error = ProtoError::new(
+                    turn_proto::ErrorCode::Unauthorized,
+                    "This client did not present the current daemon capability",
+                );
+                if let Ok(bytes) = turn_proto::encode(&ServerFrame::rejected(error)) {
+                    let _ = write.write_all(&bytes).await;
+                }
+            }
+        });
+
+        let (wake, _) = counting_waker();
+        let link = DaemonLink::spawn(path.clone(), "0.1.0", wake);
+        let seen = wait_for(&link, |message| {
+            matches!(
+                message,
+                Inbound::Status(ConnectionState::Disconnected { message, retrying: true })
+                    if message.contains("repeatedly reached the daemon")
+                        && message.contains("capability file")
+            )
+        });
+        assert!(
+            seen.iter().any(|message| matches!(
+                message,
+                Inbound::Status(ConnectionState::Disconnected { message, retrying: true })
+                    if message.contains("repeatedly reached the daemon")
+                        && message.contains("capability file")
+            )),
+            "persistent authentication failures need a specific diagnosis; saw {seen:?}"
+        );
+
+        drop(link);
+        daemon.abort();
+        remove_socket_files(&path);
     }
 
     /// A request the window sends must come back tagged with why it was sent, or a
@@ -920,7 +1005,7 @@ mod tests {
 
         drop(link);
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[test]
@@ -1020,7 +1105,7 @@ mod tests {
 
         drop(link);
         daemon.abort();
-        let _ = std::fs::remove_file(&path);
+        remove_socket_files(&path);
     }
 
     #[test]

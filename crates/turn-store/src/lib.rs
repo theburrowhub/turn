@@ -20,12 +20,11 @@
 //! if an adapter accidentally supplies it; arbitrary hook free text cannot be
 //! made safe by credential-pattern redaction.
 //!
-//! **Never persisted here** — the things that only mean something while a process
-//! is alive: the pty master, the terminal grid and its scrollback, the output
-//! broadcast channel, the vt100 parser state, live subscriptions. Those belong to
-//! `turn-pty` and die with the process. A restored scrollback would show a
-//! conversation the agent itself no longer remembers, and a restored pty handle
-//! would be a handle to nothing.
+//! **Never persisted in SQLite** — the pty master, output channels, parser objects and
+//! live subscriptions. `turn-pty` separately keeps an owner-only, bounded checkpoint
+//! and journal of terminal display history under the daemon data directory. That
+//! archive can reconstruct what was visible; it never reconstructs a live PTY or says
+//! the Agent remembers the displayed conversation.
 //!
 //! Process metadata is stored precisely so a fresh daemon can *try* to re-attach
 //! and can say what it failed to re-attach. [`SessionRepo::load_for_restore`]

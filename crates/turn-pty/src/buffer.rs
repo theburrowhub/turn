@@ -231,6 +231,19 @@ impl TerminalBuffer {
         }
     }
 
+    /// Rebuilds a buffer from a durable checkpoint before journal records are replayed.
+    ///
+    /// Checkpoint bytes describe terminal state, not process output, so parsing them must
+    /// not add to `bytes_seen`. The durable counter is restored separately and remains a
+    /// count of bytes the process actually produced.
+    pub fn from_replay(size: ScreenSize, replay: &[u8], bytes_seen: u64, truncated: bool) -> Self {
+        let mut buffer = Self::new(size);
+        buffer.parser.process(replay);
+        buffer.bytes_seen = bytes_seen;
+        buffer.truncated = truncated;
+        buffer
+    }
+
     /// How many clipboard writes this process has attempted and had refused.
     pub fn blocked_clipboard_writes(&self) -> u32 {
         self.parser.callbacks().blocked_clipboard_writes
@@ -439,7 +452,21 @@ impl TerminalBuffer {
     /// smaller and always self-consistent, where a truncated ring can start
     /// mid-escape-sequence and corrupt the receiving terminal.
     pub fn replay(&self) -> Vec<u8> {
-        strip_image_markers(self.parser.screen().contents_formatted())
+        self.state_replay()
+    }
+
+    /// The visible screen plus the input modes needed to make a restored terminal
+    /// behave like the original one.
+    pub fn state_replay(&self) -> Vec<u8> {
+        let screen = self.parser.screen();
+        let mut replay = Vec::new();
+        if screen.alternate_screen() {
+            // vt100's formatted state covers cells and input modes but deliberately
+            // omits which grid is active. A checkpoint must carry that bit explicitly.
+            replay.extend_from_slice(b"\x1b[?1049h");
+        }
+        replay.extend(strip_image_markers(screen.state_formatted()));
+        replay
     }
 
     /// The raw byte ring, for callers that want exactly what arrived.
@@ -493,6 +520,11 @@ impl TerminalBuffer {
         self.truncated
     }
 
+    /// Records that durable retention discarded older output.
+    pub fn mark_truncated(&mut self) {
+        self.truncated = true;
+    }
+
     pub fn bytes_seen(&self) -> u64 {
         self.bytes_seen
     }
@@ -516,12 +548,7 @@ impl TerminalBuffer {
             alternate_screen: screen.alternate_screen(),
             // Sanitised again on the way out, cheaply, so a future callback that
             // forgets to do it at ingest cannot leak into the sidebar.
-            title: self
-                .parser
-                .callbacks()
-                .title
-                .as_deref()
-                .and_then(sanitise_title),
+            title: self.title().map(str::to_string),
             bytes_seen: self.bytes_seen,
         }
     }
@@ -694,6 +721,7 @@ fn consume_control_string(chars: &mut Peekable<Chars<'_>>) {
 }
 
 /// A process-set window title, sanitised and capped.
+#[cfg(test)]
 fn sanitise_title(raw: &str) -> Option<String> {
     sanitise_label(raw, MAX_TITLE_CHARS)
 }

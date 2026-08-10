@@ -46,7 +46,7 @@ restart instead of being attributed or resolved session-wide.
 | M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented and audited for the first vertical**; broader hardening remains |
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
-| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing and durable projections are built, measurement/packaging remain |
+| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing, durable projections and bounded authenticated IPC are built; measurement/packaging remain |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -284,8 +284,9 @@ explicit migration-reconciliation flow, advanced management API surface (rename/
 order), performance measurement and the live CLI smoke test; “types exist” is still not an exit criterion.
 Template-origin conflicts now retain the Template id and inputs through typed read-only/worktree requests;
 the daemon, not `TemplateSummary`, re-instantiates the complete Layout/env/Attention/tmux/naming contract.
-Read-only keeps commands stopped whenever no technical guard is available; worktree maps primary absolute
-cwd values repository-relatively.
+Read-only now launches shells, Agent panes, init commands and descendants under an inherited macOS Seatbelt
+write guard; it keeps commands stopped whenever that technical guard is unavailable. Worktree maps primary
+absolute cwd values repository-relatively.
 
 ---
 
@@ -503,20 +504,21 @@ strings alias through symlinks and spelling; a daemon can crash between side eff
 client can release a newer claim; deleting/recreating a Workspace can reset locally scoped generation.
 
 *Mitigated by:* canonical-path uniqueness across Workspaces and one monotonic fence per canonical path
-inside the canonical data directory,
+inside the canonical data directory, plus a uid-scoped host lock keyed by checkout device/inode across
+deliberately separate data directories,
 `BEGIN IMMEDIATE` acquisition, ownership checks across Workspace/Session/checkout, fenced heartbeat/release,
 blocking `recovery_required`, a canonical-data-directory process lock established before SQLite/restore, and
 canonical Session/Pane cwd containment repeated at the final PTY boundary. Adversarial tests cover concurrent
 aliases, delete/recreate generations, stale release, transaction rollback, same-data/different-socket daemons,
-symlink data-dir aliases, crash recovery, absolute/`..`/symlink cwd escapes and worktree→primary launches.
+symlink data-dir aliases, cross-data-dir checkout aliases, daemon loss with a surviving writer, independent
+Git worktrees, explicit release, absolute/`..`/symlink cwd escapes and worktree→primary launches.
 Migration 003 grants no lease; migration 006 trusts no pre-existing one.
 
-*Still missing:* a checkout-scoped OS lock across deliberately separate `--data-dir` installations. Today
-those stores are independent authority domains and can each claim the same path.
-
 *Still missing:* the audited product flow that clears migration-006 reconciliation after the user proves the
-old writer stopped. Cwd containment is not an OS sandbox: same-user code can still open another path after
-launch, so stronger isolation remains a separate security feature. The local-filesystem `flock` is an
+old writer stopped. Main-checkout/worktree cwd containment is not an OS sandbox. Read-only processes now add
+a macOS path-scoped Seatbelt guard for the checkout and external Git metadata, while Linux remains fail-closed
+with process launch disabled; broader credential/network/service isolation remains separate. The
+local-filesystem `flock` is an
 advisory boundary between cooperating Turn daemons, not protection from the same user deliberately replacing
 the lock inode.
 

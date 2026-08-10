@@ -276,8 +276,8 @@ pub enum Request {
     },
     /// Resolves a primary-checkout lease conflict without flattening the
     /// original Template into client-supplied panes. The daemon reloads and
-    /// instantiates the authoritative Template, but keeps processes stopped
-    /// until read-only execution has a technical guard.
+    /// instantiates the authoritative Template and launches it only after the
+    /// platform read-only guard is active.
     CreateReadOnlySessionFromTemplate {
         workspace_id: WorkspaceId,
         template_id: TemplateId,

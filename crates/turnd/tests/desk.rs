@@ -242,7 +242,22 @@ async fn template_lease_conflict_alternatives_keep_a_custom_layout_authoritative
         Path::new(&read_only.summary.cwd),
         std::fs::canonicalize(&requested_cwd).unwrap()
     );
-    assert!(read_only.tree.is_empty(), "read-only commands stay guarded");
+    #[cfg(target_os = "macos")]
+    {
+        assert!(read_only.summary.read_only_enforced);
+        assert!(
+            !read_only.tree.is_empty(),
+            "read-only commands run under the macOS guard"
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(!read_only.summary.read_only_enforced);
+        assert!(
+            read_only.tree.is_empty(),
+            "read-only commands stay disabled without a guard"
+        );
+    }
 
     let isolated = session_of(
         ui.ask(Request::CreateWorktreeSessionFromTemplate {

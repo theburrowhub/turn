@@ -578,54 +578,21 @@ impl Core {
         dropped: u64,
         now_ms: i64,
     ) {
-        // Checked here rather than on a timer: output arriving is the only way a title
-        // can have changed, and this call is already coalesced by the pump. The check
-        // itself is an integer comparison, so a node whose title never moves — most of
-        // them — pays nothing.
-        self.observe_process_title(node, now_ms);
-        self.deliver_screen(node);
+        let could_change_title = output_may_change_title(&data);
+        match self.deliver_screen(node) {
+            // A cells renderer already locked the authoritative buffer to build its
+            // grid, so reuse the title read under that same lock.
+            Some(observed) => {
+                self.apply_observed_process_title(node, observed, now_ms);
+            }
+            // Bytes-only panes need a separate read for low-latency title updates,
+            // but ordinary output can wait for the periodic all-process observer.
+            None if could_change_title => {
+                self.observe_process_title(node, now_ms);
+            }
+            None => {}
+        }
         self.deliver_bytes(node, data, dropped);
-    }
-
-    /// Picks up a title the process set for itself and, if it wins the precedence,
-    /// tells everyone watching.
-    ///
-    /// The title arrives already sanitised from `turn_pty`: escape sequences, control
-    /// characters, bidi overrides and invisible tag characters are gone and the length
-    /// is capped. What sanitising cannot do is make the *content* trustworthy — a
-    /// process is free to print `✓ tests passed` or the name of another of the user's
-    /// sessions — so it is recorded as [`NameSource::ProcessTitle`], which the UI draws
-    /// as provisional rather than with the authority of a name a tool reported.
-    ///
-    /// A title never opens a pane, moves focus, changes the layout or touches
-    /// attention. It is a label.
-    pub(crate) fn observe_process_title(&mut self, node: &NodeId, now_ms: i64) {
-        let Some(process) = self.processes.get(node) else {
-            return;
-        };
-        let Some((generation, title)) = process.pty.title_if_changed(process.title_generation)
-        else {
-            return;
-        };
-        let session_id = process.session_id.clone();
-        if let Some(process) = self.processes.get_mut(node) {
-            process.title_generation = generation;
-        }
-
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            return;
-        };
-        let Some(target) = session.tree.get_mut(node) else {
-            return;
-        };
-        let changed = match title {
-            Some(title) => target.set_process_title(title),
-            // The process cleared its own title.
-            None => target.clear_process_title(),
-        };
-        if changed {
-            self.push_node_state(&session_id, node, None, now_ms);
-        }
     }
 
     /// The byte stream: raw output for the attachments that asked for it.
@@ -700,6 +667,21 @@ impl Core {
     }
 }
 
+/// Whether a coalesced output batch could have completed an OSC title change.
+///
+/// BEL, ESC-ST and the C1 OSC/ST forms are the relevant boundaries. Checking for
+/// those few bytes avoids taking the terminal buffer lock for every plain-text batch
+/// in a bytes-only pane. A boundary split across reads may wait for the daemon tick,
+/// which is the deliberate fallback rather than maintaining a second escape parser.
+fn output_may_change_title(data: &[u8]) -> bool {
+    data.contains(&0x07)
+        || data.contains(&0x9c)
+        || data.contains(&0x9d)
+        || data
+            .windows(2)
+            .any(|pair| pair == b"\x1b]" || pair == b"\x1b\\")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::core::testing::Harness;
@@ -707,6 +689,15 @@ mod tests {
     use turn_proto::{PtySize, Request, ServerEvent, ServerMessage};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[test]
+    fn only_title_control_batches_need_an_immediate_extra_buffer_read() {
+        assert!(!super::output_may_change_title(b"a large plain build log"));
+        assert!(!super::output_may_change_title(b"\x1b[31mcoloured text"));
+        assert!(super::output_may_change_title(b"\x1b]2;new title\x07"));
+        assert!(super::output_may_change_title(b"\x1b]0;new title\x1b\\"));
+        assert!(super::output_may_change_title(b"\x9d2;new title\x9c"));
+    }
 
     /// Drains whatever a client has already been sent.
     fn drain(

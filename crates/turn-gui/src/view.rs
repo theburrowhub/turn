@@ -31,8 +31,8 @@ use turn_core::ids::{
 };
 use turn_core::model::{
     ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
-    PaneKind, PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionStatus,
-    WorkspaceWriteLease,
+    PaneKind, PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionMode,
+    SessionStatus, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
@@ -1388,6 +1388,9 @@ impl HierarchyRow<'_> {
                 if summary.status == SessionStatus::Archived {
                     name.push_str(" — archived");
                 }
+                if let Some(guard) = read_only_guard_label(summary) {
+                    name.push_str(&format!(" — {guard}"));
+                }
                 name
             }
             Self::Process { node, .. } => {
@@ -1444,6 +1447,17 @@ fn node_kind_label(kind: NodeKind) -> &'static str {
 /// the UI applying its own precedence. `TreeNodeView::title` now arrives already
 /// resolved — user name, then declared name, then process title, then command — so
 /// there is one order and the window cannot disagree with the daemon about it.
+fn read_only_guard_label(summary: &SessionSummary) -> Option<&'static str> {
+    if summary.mode != SessionMode::ReadOnly {
+        return None;
+    }
+    Some(if summary.read_only_enforced {
+        "read-only guard enforced; checkout writes blocked"
+    } else {
+        "read-only guard unavailable; processes disabled"
+    })
+}
+
 fn process_title(node: &TreeNodeView) -> &str {
     &node.title
 }
@@ -2351,9 +2365,13 @@ impl<'a> TurnView<'a> {
         // The session's own counts sit at the right when there is nothing to recover, so
         // the space the recovery controls need is never shared with them.
         let counts = session.filter(|_| !status_alert).map(|session| {
+            let guard = read_only_guard_label(&session.session)
+                .map(|guard| format!(" · {guard}"))
+                .unwrap_or_default();
             format!(
-                "{} · {} running · {} panes",
+                "{}{} · {} running · {} panes",
                 session.session.mode.label(),
+                guard,
                 session.session.running_count,
                 session.session.pane_count
             )
@@ -3912,8 +3930,11 @@ impl<'a> TurnView<'a> {
             area.min + Vec2::new(12.0, 25.0),
             Align2::LEFT_TOP,
             format!(
-                "{} · {branch} · {glyph} {} · {}",
+                "{}{} · {branch} · {glyph} {} · {}",
                 summary.mode.label(),
+                read_only_guard_label(summary)
+                    .map(|guard| format!(" · {guard}"))
+                    .unwrap_or_default(),
                 summary.state_label,
                 summary.cwd
             ),
@@ -3999,6 +4020,48 @@ impl<'a> TurnView<'a> {
                             ui.close();
                         }
                     } else {
+                        if summary.mode == SessionMode::ReadOnly {
+                            let pending = self
+                                .reclaiming_workspaces
+                                .contains(&workspace.workspace.id);
+                            // An unenforced read-only Session launches no processes, so
+                            // explicit promotion is its safe recovery path rather than an
+                            // action to hide. The daemon still performs the atomic mode and
+                            // lease transition and rejects any live runtime.
+                            let available = summary.running_count == 0
+                                && workspace.write_lease.is_none()
+                                && !pending;
+                            let disabled_reason = if summary.running_count > 0 {
+                                "End every read-only process before changing this Session to write mode."
+                            } else if workspace.write_lease.is_some() {
+                                "Another Session currently owns this checkout's write lease."
+                            } else {
+                                "The write-access request is already in progress."
+                            };
+                            if ui
+                                .add_enabled(
+                                    available,
+                                    egui::Button::new(if pending {
+                                        "Acquiring write access…"
+                                    } else {
+                                        "Acquire exclusive write access"
+                                    }),
+                                )
+                                .on_disabled_hover_text(disabled_reason)
+                                .on_hover_text(
+                                    "Explicitly changes this read-only Session to main-checkout write mode and records the exclusive lease.",
+                                )
+                                .clicked()
+                            {
+                                actions.push(ViewAction::ReclaimWorkspaceWriteLease {
+                                    workspace_id: workspace.workspace.id.clone(),
+                                    session_id: summary.id.clone(),
+                                    checkout_id: summary.checkout_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            ui.separator();
+                        }
                         if ui.button("Detach all views · keep running").clicked() {
                             actions.push(ViewAction::CloseSession {
                                 session_id: summary.id.clone(),
@@ -7298,8 +7361,9 @@ fn hierarchy_row(
             if summary.status == SessionStatus::Archived {
                 detail.push_str(" · archived");
             }
-            if summary.read_only_enforced {
-                detail.push_str(" · enforced");
+            if let Some(guard) = read_only_guard_label(summary) {
+                detail.push_str(" · ");
+                detail.push_str(guard);
             }
             if summary.muted {
                 detail.push_str(" · muted");
@@ -8354,6 +8418,29 @@ mod tests {
             Some(&HierarchyKey::session(draft.session_id))
         )
         .is_none());
+    }
+
+    #[test]
+    fn read_only_guard_state_is_explicit_in_visual_and_accessibility_copy() {
+        let (mut snapshot, _, _, _) = hierarchy_fixture();
+        let summary = &mut snapshot.workspaces[0].sessions[0].session;
+        assert_eq!(
+            read_only_guard_label(summary),
+            Some("read-only guard enforced; checkout writes blocked")
+        );
+
+        summary.read_only_enforced = false;
+        assert_eq!(
+            read_only_guard_label(summary),
+            Some("read-only guard unavailable; processes disabled")
+        );
+        let row = HierarchyRow::Session {
+            workspace: &snapshot.workspaces[0],
+            session: &snapshot.workspaces[0].sessions[0],
+        };
+        assert!(row
+            .accessible_name(false)
+            .contains("read-only guard unavailable; processes disabled"));
     }
 
     #[test]

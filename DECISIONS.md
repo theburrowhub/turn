@@ -49,7 +49,7 @@ Status values:
 | [033](#adr-033) | Schema version in SQLite's `user_version`, append-only migrations, no downgrades | Accepted, implemented |
 | [034](#adr-034) | `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE` | Accepted, implemented |
 | [035](#adr-035) | Redact durable secrets, preserve structural identity | Accepted, implemented |
-| [036](#adr-036) | Persist node metadata, never terminal history | Implemented; narrowly amended by ADR-040 |
+| [036](#adr-036) | Persist node metadata, never terminal history | Superseded by ADR-044 |
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
@@ -63,6 +63,12 @@ Status values:
 | [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
 | [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Accepted, implemented |
 | [049](#adr-049) | Coming back to a Session starts it; the daemon still starts nothing on its own | Accepted, implemented; overturns the restore half of the never-relaunch rule |
+| [050](#adr-050) | Ending is authoritative: a process Turn cannot stop is reported, never a veto | Accepted, implemented |
+| [051](#adr-051) | Settings resolve in the daemon through one explicit hierarchy | Accepted, implemented |
+| [052](#adr-052) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
+| [053](#adr-053) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
+| [054](#adr-054) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
+| [055](#adr-055) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
 
 ---
 
@@ -1815,8 +1821,8 @@ pattern redaction is not permission to persist arbitrary source/prompt content.
 <a id="adr-036"></a>
 ## ADR-036 — Persist node metadata, never terminal history
 
-**Status:** Accepted, implemented for terminal persistence; narrowly amended by ADR-040 for bounded
-Activity Preview. `turn-store::repo::node`; reproduce the current store suite.
+**Status:** Superseded by ADR-044. The lifecycle distinction established here remains in force;
+the prohibition on durable terminal history does not.
 
 ### Context
 
@@ -2331,11 +2337,12 @@ The full normative model, migration, events, API and wireframe are in
 `docs/UNIFIED_HIERARCHY_UPGRADE.md`.
 
 Activity Preview is not restored scrollback or a conversation summary: it is short, provenance-labelled
-navigation status. Turn persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
+navigation status. The preview store persists no raw PTY bytes or grid, normalises and redacts before write, keeps at
 most 20 snapshots per node and 2,000 globally. A recovered preview retains its original timestamp; a
 separate recovered/stale visual marker remains planned and clients must not reinterpret it as fresh.
 High-frequency preview updates are snapshot state and coalesced pushes, not append-only domain events.
-ADR-036's rejection of terminal/scrollback persistence otherwise remains in force.
+ADR-044 later supersedes the terminal/scrollback prohibition while retaining this preview boundary:
+raw history is a separate private terminal archive, never Activity Preview or semantic context.
 
 Hook callbacks are hostile ingress, not event-log content. The Claude adapter reduces a callback directly
 to typed `EventKind`, `EventSource`, confidence and node/session identity; it does not attach the callback
@@ -2708,6 +2715,111 @@ that is missing is named rather than silently replaced by a different one.
 
 ---
 
+<a id="adr-051"></a>
+## ADR-051 — Settings resolve in the daemon through one explicit hierarchy
+
+**Status:** Accepted, implemented. `turn-core::settings`, the settings requests in `turn-proto`, and the
+native settings window.
+
+### Context
+
+Turn has defaults that apply globally, to a Workspace, to a Template, to one Session and temporarily to one
+window. Letting every client merge those layers independently would create multiple sources of truth, make a
+reset indistinguishable from writing a copied default, and leave headless clients unable to explain why a
+value is active.
+
+### Decision
+
+The daemon is the only settings resolver. Precedence is Global, Workspace, Template, Session, Temporary;
+later layers override earlier ones. A resolved entry carries its value, origin, shadowed layers and the
+levels where it may be written. Owner ids are explicit for Workspace, Template and Session operations.
+
+Writes and resets answer with the complete resolved settings document, not an acknowledgement. The GUI
+replaces its copy with that answer and fetches again after any write, so it never patches or reimplements the
+precedence table. Unknown values already stored by another Turn version remain visible and resettable, while
+new writes still require a key and value shape known to this daemon. Secret values are redacted before they
+cross the protocol boundary.
+
+Keyboard bindings are resolved through the same hierarchy, but applied in the window because the daemon does
+not receive physical key events. Conflict detection compares physical modifier equivalence on the current
+platform, including Command/Control aliases, rather than comparing display strings.
+
+### Consequences
+
+- Every client observes one resolved value and can explain where it came from.
+- Removing an override reveals the next layer without the client guessing what changed.
+- Settings from a newer build can be removed safely by an older build without pretending it understands them.
+- **Downside:** a write returns more data than the changed key, and every settings surface must treat that
+  response as authoritative.
+
+---
+
+<a id="adr-052"></a>
+## ADR-052 — Terminal history is a private bounded journal, never proof of liveness
+
+**Status:** Accepted, implemented. Supersedes ADR-036's persistence prohibition while preserving its
+lifecycle honesty. `turn-pty::journal`, `turnd::core::restore`, `turn-proto::cells::Scrollback`.
+
+### Context
+
+Reopening the UI against a live daemon already restores a Pane, but restarting the daemon discarded the
+terminal even though Session and process metadata survived. That loses the visible result of long-running
+work, colours, cursor, modes and scrollback precisely when recovery matters most. The old answer in ADR-036
+avoided a misleading transcript by deleting it; the product now requires retaining the display while making
+the independent process-lifecycle truth unmistakable.
+
+Terminal output is also hostile and sensitive. It may contain credentials, source, prompts, OSC sequences
+and arbitrary binary fragments. Redaction cannot safely transform a VT byte stream while preserving its
+meaning, and an unbounded transcript would turn a chatty build into a disk-exhaustion primitive.
+
+### Decision
+
+Each persistent Pane process has a private directory at
+`<data-dir>/terminal-history/<session-id>/<node-id>`. `turn-pty` writes the authoritative PTY read before
+broadcasting it to clients. The directory hierarchy is `0700`, files are `0600`, and creation/recovery
+refuses symlinked components or files.
+
+The durable representation is an atomic checkpoint plus an append-only binary journal. Output and resize
+records carry a monotonic sequence, length and CRC32. Recovery applies only complete, ordered, valid records
+and truncates a partial or corrupt tail to the last valid boundary. A checkpoint rename may race a crash
+before journal reset; sequence numbers make the old prefix idempotent.
+
+The journal is capped at 8 MiB and the checkpoint payload at 4 MiB per Pane. Rotation checkpoints the
+visible grid, cursor, alternate-screen flag and input modes, resets the journal and marks older scrollback as
+truncated. Before rotation, replay reconstructs the parser's bounded 5,000-row scrollback exactly; after
+rotation it reconstructs the retained terminal state and says that earlier rows were discarded. The steady
+state is therefore bounded and never silently presents a partial record as complete.
+
+Cell attachments carry the newest validated scrollback as the same compact styled cell runs used by the
+screen. Transport is capped at 5,000 rows and 3 MiB inside the protocol's 8 MiB frame; the UI seeds its
+Transcript from those rows and continues extending it from live updates.
+
+Recovered terminal state is display-only. The process remains `Orphaned` or `Lost`; history never produces
+`Alive`, `Reconnected` or a writable PTY. Relaunch creates a new node and deletes the retired node's archive.
+Unknown session/node directories are pruned on restore. Archiving or closing without deletion retains the
+archive with the Session.
+
+Raw terminal history is enabled for persistent Sessions by default because it is the feature being promised.
+A sensitive Workspace/Session can set `TURN_TERMINAL_HISTORY=disabled` (also `0`, `false`, `off` or `no`)
+before launch; then no archive is created and any old Session archive is removed at restore. `--no-persist`
+also disables it. There is no content redaction: opt-out, owner-only permissions and hard byte limits are the
+security boundary.
+
+### Consequences
+
+- Closing and reopening the UI or restarting `turnd` can reconstruct the terminal's visible state and
+  retained scrollback without claiming that the old process survived.
+- A torn final write, checkpoint/reset crash window and journal rotation have reproducible tests.
+- Disk use is calculably bounded per Pane, and terminal files are not mixed into SQLite/WAL or semantic logs.
+- **Downside:** terminal archives intentionally contain unredacted output and can contain secrets. Users must
+  opt sensitive Sessions out before launch; retrospective redaction is not meaningful for VT bytes.
+- **Downside:** rotation compacts to the current terminal state and discards older scrollback. The UI marks
+  that boundary rather than offering infinite retention.
+- **Downside:** writes add local disk I/O on the PTY reader thread. The bounded format favours simple crash
+  recovery over maximum throughput; batching/sync policy should be changed only with durability benchmarks.
+
+---
+
 <a id="adr-045"></a>
 ## ADR-045 — Turn never writes its own words into a program's screen
 
@@ -2774,6 +2886,75 @@ so a program in a loop cannot grow it.
 - **Downside:** Turn still shows nothing where the picture would have been, so a program whose layout
   assumed a picture occupies rows is laid out for a screen Turn did not draw. Honouring the box would need
   the size the sequence asked for, which a refused file transmission does not carry.
+
+---
+
+<a id="adr-053"></a>
+## ADR-053 — The control socket admits only the owner with a per-generation capability and bounded load
+
+**Status:** Accepted, implemented. `turnd::server::security`, protocol v4 and the native GUI transport.
+
+### Context
+
+The daemon control socket can read terminal history, write to every live PTY and terminate processes. File
+mode `0600` and bounded frames were useful but incomplete: the accept loop did not verify kernel peer
+credentials, distinguish Turn clients from any other local connector, cap open connections or limit request
+frequency. A process could therefore exhaust descriptors or hold tasks, and an accidentally compatible
+client could gain full terminal authority.
+
+The hook HTTP listener is a different boundary. It accepts untrusted agent events on loopback under per-node
+tokens and can never issue terminal commands. Sharing its listener, tokens or admission policy with the
+control socket would turn a narrow event capability into daemon authority.
+
+### Alternatives considered
+
+**Rely on socket mode and UID alone.** Rejected. Kernel credentials are still checked because modes can be
+misconfigured, but UID identifies an account, not an authorised client or daemon generation.
+
+**Use one static token in the data directory.** Rejected. A copied token would never expire and could be
+replayed after restart. It would also become another durable credential to migrate and back up.
+
+**Put authentication on the hook HTTP server and route control through it.** Rejected. HTTP parsing and
+agent-visible per-node tokens belong to a deliberately write-only semantic event surface, not to PTY control.
+
+**Use an ephemeral capability plus kernel credentials and bounded per-client admission.** Chosen.
+
+### Decision
+
+Every accepted Unix stream is checked with `peer_cred`; only the daemon effective UID proceeds. The socket
+remains `0600`. After binding, each daemon generation atomically publishes a fresh 244-bit capability as the
+owner-only regular file `<socket>.token`. Creation is symlink-refusing, `0600`, synced and atomically renamed.
+Shutdown revokes it before persistence and removes only a file whose contents still belong to that generation.
+
+Protocol v4 adds `auth_token` to the opening `hello`. Missing, stale or invalid capabilities receive the same
+fatal `unauthorized` rejection before the client is registered or any request reaches Core. Comparison is
+constant-work over the expected secret, token-bearing types redact `Debug`, and rejection logs contain only
+client labels/counters. The GUI re-reads the token for every connection attempt, so daemon restart rotates the
+credential without application restart. The unauthenticated instance probe may identify a `rejected` peer as
+Turn but cannot read or mutate state.
+
+Admission is hard-bounded at 32 concurrent control connections with a five-second pre-authentication timeout.
+Each authenticated connection has a token bucket of 256 frames and 128 frames/second; over-budget frames get
+`rate_limited`, and 16 consecutive violations close the stream. Per-client output and Core queues remain
+bounded. A writer that cannot finish after its reader closes is aborted after one second, so a non-reading
+peer cannot retain its descriptor and permit indefinitely. Aggregate counters expose UID, capacity, auth,
+timeout and rate-limit rejection counts without payloads or secrets.
+
+The hook server remains a separate `127.0.0.1` HTTP listener with independent per-node tokens, limits and
+statistics. No IPC capability is placed in a hook URL or agent configuration.
+
+### Consequences
+
+- Wrong-account peers fail at the kernel-credential boundary; missing or replayed generation tokens fail the
+  protocol handshake before gaining PTY authority.
+- Two valid windows can connect concurrently, while connection and request storms have calculable descriptor,
+  task and queue bounds.
+- Restart is explicit revocation: an old capability cannot authenticate to the replacement daemon.
+- Authentication changes existing handshake authority, so the supported protocol window is v4 only.
+- **Downside:** this is not a sandbox against malicious code running as the same user. Such code can read the
+  owner-only token just as it can read the user's credentials; process isolation needs a separate OS sandbox.
+- **Downside:** a same-user process can still deny service by repeatedly occupying bounded slots. Integrity and
+  resource bounds are preserved, but availability against the account owner is not promised.
 
 ---
 
@@ -2855,6 +3036,71 @@ hidden.
   only protection is the dialog. That is the cost of the promise being simple enough to state.
 - **Downside:** deleting a Workspace with many Sessions is a long operation that stops each
   one's processes in turn, and the window has one acknowledgement to show for all of it.
+
+---
+
+<a id="adr-054"></a>
+## ADR-054 — Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere
+
+**Status:** Accepted, implemented macOS-first. `turn-pty::ReadOnlySandbox`, guarded Session creation and
+explicit lease promotion.
+
+### Context
+
+The safe alternative to a busy primary checkout was honest but inert: Turn persisted a read-only Session
+with `read_only_enforced=false` and refused to launch its shell or Agents. Telling a model not to edit files
+cannot turn that metadata into enforcement. A usable reviewer needs Git reads, searches and ordinary terminal
+execution while the existing writer keeps the sole checkout lease, and the same boundary must reach child
+processes, alternate working directories and pathname aliases.
+
+### Alternatives considered
+
+**Rely on prompts, read-only tool lists or command classification.** Rejected. A shell, Agent or child can
+open files directly, and command spelling is not authority.
+
+**Change checkout permissions while a read-only Session runs.** Rejected. Permissions are shared with the
+legitimate writer and changing them is itself a race-prone global side effect.
+
+**Copy or create a worktree for every reviewer.** Rejected as the meaning of read-only mode. It gives a
+different filesystem snapshot and Git index, while `isolated_worktree` already exists for that trade-off.
+
+**Wrap every process in a parameterised macOS Seatbelt policy and fail closed without it.** Chosen.
+
+### Decision
+
+`ReadOnlySandbox::for_checkout` first requires the fixed system `sandbox-exec`, then canonicalises the
+checkout and resolves its Git directory and common directory. Git metadata outside the checkout is protected
+too. The Seatbelt source allows normal execution and denies `file-write*` for a literal and subpath matcher
+for every protected root. Canonical paths are passed as `-D` parameters rather than interpolated into policy
+source.
+
+The sandbox wraps the original command inside `ProcessSpec`; it therefore covers shells, recognised or
+generic Agents, init commands, relaunches, splits and every descendant they create. Guarded processes receive
+`TURN_READ_ONLY=1`, the canonical root and `GIT_OPTIONAL_LOCKS=0`. Cwd containment is still checked
+independently. Every launch reconstructs the guard instead of trusting persisted `read_only_enforced`.
+
+Creation persists `read_only_enforced=true` and materialises the Layout only when that construction succeeds.
+On another platform or with a missing launcher, the Session remains visible and launches nothing; unsafe or
+unresolvable protected metadata rejects creation rather than persisting an ambiguous boundary. It never takes
+the primary write lease. The hierarchy, Session header, status bar and accessibility label state whether the
+guard is enforced or unavailable, and Seatbelt denials remain visible in the terminal.
+
+Write escalation reuses the durable lease arbiter but is a separate explicit action. It is refused while any
+read-only runtime node remains alive. Once they have all ended and no other writer exists, acquisition
+atomically changes the Session to `main_checkout`; a failed write never changes mode.
+
+### Consequences
+
+- A reviewer shell or Agent can run against the current checkout while another Session owns its write lease.
+- Reproducible macOS tests block create, modify, delete and rename attempts from an alternate cwd, a symlink
+  alias and a child process, while preserving Git reads and writes outside the protected roots.
+- External gitfile/worktree metadata is covered instead of assuming `.git` lives below the checkout.
+- Unsupported platforms keep the previous fail-closed behaviour and expose it instead of pretending that
+  read-only metadata confines a process.
+- **Downside:** Seatbelt is macOS-specific; Linux needs a separately audited inherited boundary before it may
+  set enforcement true.
+- **Downside:** this is path-scoped write protection, not full process isolation. Credentials, network,
+  services and unprotected filesystem paths remain accessible, and the UI/docs must say so.
 
 ---
 
@@ -3150,3 +3396,77 @@ original reasoning that was never in question.
   locked out of its own checkout by a process nobody can stop.
 - **Downside:** `Response::Ack` no longer answers the close and delete requests, so any client
   matching on it for those four sees an unhandled shape rather than a compile error.
+
+---
+
+<a id="adr-055"></a>
+## ADR-055 — Checkout write authority is a host-global inode lock inherited by every writer
+
+**Status:** Accepted, implemented on Unix. `turnd::checkout_lock`, joined SQLite/lock acquisition and
+recovery, explicit PTY descriptor preservation, and cross-daemon integration coverage.
+
+### Context
+
+ADR-040's canonical-path fence was global only inside one SQLite database. Two otherwise correct Turn
+daemons configured with different data directories could each create a lease for the same checkout. A lock
+held only by the daemon would close one split-brain path but reopen it after a daemon crash even when a shell
+or descendant survived and could still write the checkout. Git worktrees also share a common Git directory,
+so repository identity is too broad: different worktree directories must remain independent write domains.
+
+### Alternatives considered
+
+**Put every installation in one registry database.** Rejected. It introduces another durable authority and
+migration lifecycle merely to join stores, and still needs a crash-safe kernel boundary.
+
+**Key a lock by canonical path text or Git common directory.** Rejected. Path aliases and renames can split
+text identity, while a common Git directory falsely merges distinct worktrees.
+
+**Hold an advisory lock only in the daemon.** Rejected. A surviving descendant would lose its exclusion at
+exactly the moment Turn lost the PTY handle and had least evidence that writing had stopped.
+
+**Use a uid-scoped filesystem-identity lock and inherit its descriptor into writers.** Chosen.
+
+### Decision
+
+Turn canonicalises the checkout directory and identifies it by Unix device/inode. Under the real,
+uid-owned 0700 `checkout-locks` directory below Turn's stable platform data directory (independent of
+`TURN_DATA_DIR`) it opens a retained 0600 lock inode with
+`O_NOFOLLOW`, verifies type, owner and named/open inode identity, takes non-blocking exclusive `flock`, then
+re-resolves the checkout to reject replacement during acquisition. Lock files are never unlinked. Owner
+metadata is an atomically replaced sidecar containing daemon/data-dir identity, the lease and its typed owner.
+
+The host lock is acquired before SQLite. The daemon preallocates one `LeaseId`, publishes it in the host
+owner record and supplies it to the atomic Session/lease transaction. A local SQLite owner still returns the
+existing focus/read-only/worktree/cancel choices. An owner from another daemon returns the same typed conflict
+without `focus_owner`, because the current socket cannot focus it. Heartbeat, init, Pane launch, split and
+relaunch require both the active SQLite generation and the matching host lock.
+
+For each main-checkout spawn the daemon duplicates only that lock descriptor with `FD_CLOEXEC` still set.
+portable-pty normally closes every descriptor above stderr in `pre_exec`; Turn carries a small vendored
+extension that preserves an explicit descriptor allowlist, clears `FD_CLOEXEC` only in the already-forked
+child, and retains cleanup for all others. This avoids a cross-thread inheritance window in the daemon. The
+launched process and its descendants therefore share the same locked open-file description.
+Neither the lock type nor Drop calls `LOCK_UN`: explicit release first demotes SQLite and then closes the
+daemon copy, while daemon loss leaves a surviving writer's copy authoritative until the kernel closes the
+last descriptor.
+
+On restart, SQLite remains `recovery_required`. Reclaim first reconciles the old process evidence and must
+then reacquire the host lock with the existing lease id; time alone never permits takeover. Symlink aliases
+collide, whereas distinct checkout/worktree directory inodes may write concurrently.
+
+### Consequences
+
+- Cooperating daemons for the same uid cannot both own one checkout even with separate data directories.
+- Contention returns the remote Session/lease owner and locally actionable alternatives without partial
+  Session, init-command or process side effects.
+- A daemon crash cannot release authority while a descendant that inherited it is still alive; the final
+  process exit makes recovery possible without a stale-file deletion protocol.
+- Stable lock inodes and atomic owner sidecars avoid unlink races and partial heartbeat metadata.
+- The stable data location is not subject to normal `/tmp` or runtime-directory cleanup; deliberately
+  removing owner-owned lock files remains outside the cooperative same-user boundary.
+- **Downside:** portable-pty is vendored for a narrow descriptor-preservation API until upstream provides it.
+- **Downside:** `flock` is an advisory boundary between cooperating same-user processes. Code running as the
+  account owner can close its inherited descriptor or tamper with owner-owned lock state; this is not a
+  sandbox against malicious same-user code.
+- **Downside:** unsupported platforms fail closed for main-checkout authority rather than silently falling
+  back to SQLite-only exclusion.

@@ -28,7 +28,7 @@ use crate::paths;
 use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session};
+use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session, SessionMode};
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
 
@@ -66,15 +66,42 @@ impl Core {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
             if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
-                if migrate_obsolete_navigation_panes(&mut session) {
+                let navigation_migrated = migrate_obsolete_navigation_panes(&mut session);
+                let guard_downgraded =
+                    if session.mode == SessionMode::ReadOnly && session.read_only_enforced {
+                        match self.read_only_sandbox(&session) {
+                            Ok(Some(_)) => false,
+                            Ok(None) => {
+                                session.read_only_enforced = false;
+                                true
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id = %session.id,
+                                    %error,
+                                    "restored read-only Session lost its process guard"
+                                );
+                                session.read_only_enforced = false;
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                if navigation_migrated || guard_downgraded {
                     // The old central AgentTree cannot coexist with the unified
-                    // sidebar. Persist the structural migration immediately, but
-                    // never materialise the replacement Shell during restore.
+                    // sidebar. Persist structural/guard truth immediately, but never
+                    // materialise the replacement Shell during restore. False is not
+                    // upgraded here: legacy/orphaned processes may never have been
+                    // sandboxed even when this platform can guard a future launch.
                     self.store.sessions().save(&session)?;
                 }
                 self.sessions.insert(session.id.clone(), session);
             }
         }
+
+        let (terminal_histories_restored, terminal_histories_pruned) =
+            self.restore_terminal_histories();
 
         // One refresh for every decision below. Deciding a process is gone requires
         // looking at the process table, which the store rightly refuses to guess at.
@@ -115,9 +142,61 @@ impl Core {
             leases_withheld = authority.withheld,
             temporary_bindings_pruned,
             scratch_pruned = pruned,
+            terminal_histories_restored,
+            terminal_histories_pruned,
             "restored"
         );
         Ok(())
+    }
+
+    /// Loads display-only terminal models without changing any process lifecycle.
+    fn restore_terminal_histories(&mut self) -> (usize, usize) {
+        let sessions: Vec<(SessionId, bool, Vec<NodeId>)> = self
+            .sessions
+            .iter()
+            .map(|(session_id, session)| {
+                (
+                    session_id.clone(),
+                    self.terminal_history_enabled(session_id),
+                    session.tree.iter().map(|node| node.id.clone()).collect(),
+                )
+            })
+            .collect();
+        let mut known: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut restored = 0usize;
+
+        for (session_id, enabled, nodes) in sessions {
+            if !enabled {
+                paths::remove_session_terminal_history(&self.data_dir, &session_id);
+                continue;
+            }
+            known.insert(
+                session_id.to_string(),
+                nodes.iter().map(ToString::to_string).collect(),
+            );
+            for node_id in nodes {
+                let dir = paths::node_terminal_history(&self.data_dir, &session_id, &node_id);
+                match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+                    Ok(Some(recovered)) => {
+                        self.recovered_terminals
+                            .insert(node_id.clone(), recovered.buffer);
+                        restored += 1;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            node = %node_id,
+                            path = %dir.display(),
+                            %error,
+                            "could not recover terminal history"
+                        );
+                    }
+                }
+            }
+        }
+        let pruned = paths::prune_terminal_history(&self.data_dir, &known);
+        (restored, pruned)
     }
 
     /// Retires one recovery offer after its pane process was explicitly relaunched.

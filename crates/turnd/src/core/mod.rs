@@ -21,6 +21,7 @@
 
 pub mod attention;
 pub mod authority;
+mod checkout_authority;
 pub mod clients;
 pub mod command;
 pub mod events;
@@ -32,10 +33,12 @@ pub mod restore;
 pub mod screens;
 pub mod spawn;
 pub mod supervise;
+pub mod titles;
 pub mod views;
 
 pub use command::{ClientId, Command};
 
+use crate::checkout_lock::CheckoutWriteLock;
 use crate::error::Result;
 use crate::instance::DataDirLock;
 use clients::Client;
@@ -48,11 +51,11 @@ use tokio::task::JoinHandle;
 use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic};
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
-use turn_core::ids::{HandoffId, NodeId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{HandoffId, LeaseId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
-use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize};
+use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize, TerminalBuffer};
 use turn_store::Store;
 
 /// How often the loop wakes up when nothing is happening.
@@ -100,6 +103,12 @@ pub const EXPECTED_EXIT_GRACE_MS: i64 = 30 * 1_000;
 /// A live process and what Turn knows about how it was launched.
 pub struct Process {
     pub pty: PtyProcess,
+    /// Last sanitised OSC 0/2 title observed from this exact PTY.
+    pub process_title: Option<String>,
+    /// Title to restore when the process clears its OSC title.
+    pub fallback_title: String,
+    /// Agent name to restore when a low-priority process title is cleared.
+    pub fallback_agent_name: Option<turn_core::model::AgentName>,
     /// The adapter that prepared this launch, for relaunching and for reporting.
     pub adapter_id: String,
     /// The integration the launch actually achieved, which may be lower than the
@@ -203,6 +212,9 @@ pub struct Core {
     pub(crate) sessions: HashMap<SessionId, Session>,
     pub(crate) templates: HashMap<TemplateId, Template>,
     pub(crate) processes: HashMap<NodeId, Process>,
+    /// Parsed terminal history recovered after the daemon restart. These buffers are
+    /// display-only: their nodes remain Orphaned/Lost and never pretend a PTY survived.
+    pub(crate) recovered_terminals: HashMap<NodeId, TerminalBuffer>,
     pub(crate) pumps: HashMap<NodeId, JoinHandle<()>>,
     pub(crate) clients: HashMap<ClientId, Client>,
 
@@ -267,6 +279,13 @@ pub struct Core {
     /// workload. The core tick uses this timestamp to coalesce writes.
     pub(crate) last_lease_heartbeat_ms: i64,
 
+    /// Kernel ownership independent of the configured SQLite data directory. Each
+    /// active durable lease must have exactly one matching host-wide checkout lock.
+    pub(crate) checkout_write_locks: HashMap<LeaseId, CheckoutWriteLock>,
+
+    /// Stable per-user lock root shared by daemons with different SQLite stores.
+    pub(crate) checkout_lock_dir: PathBuf,
+
     /// Nodes whose next exit was asked for, against the moment the request stops
     /// applying — see [`EXPECTED_EXIT_GRACE_MS`] for why it has to stop.
     ///
@@ -297,6 +316,7 @@ impl Core {
         hooks: Arc<HookServer>,
         registry: AdapterRegistry,
         data_dir: PathBuf,
+        checkout_lock_dir: PathBuf,
         commands: mpsc::Sender<Command>,
     ) -> Result<Self> {
         let mut core = Self {
@@ -310,6 +330,7 @@ impl Core {
             sessions: HashMap::new(),
             templates: HashMap::new(),
             processes: HashMap::new(),
+            recovered_terminals: HashMap::new(),
             pumps: HashMap::new(),
             clients: HashMap::new(),
             screens: HashMap::new(),
@@ -324,6 +345,8 @@ impl Core {
             finished_context_handoffs: HashMap::new(),
             hierarchy_revision: 1,
             last_lease_heartbeat_ms: 0,
+            checkout_write_locks: HashMap::new(),
+            checkout_lock_dir,
             expected_exits: HashMap::new(),
             restore_reports: Vec::new(),
             supervisor: ProcessSupervisor::new(),
@@ -430,6 +453,7 @@ impl Core {
         self.emit_effects(effects, now_ms);
         self.observe_hosted_agents(now_ms);
         self.observe_heuristics(now_ms);
+        self.observe_process_titles(now_ms);
         self.observe_activity_previews(now_ms);
         self.heartbeat_workspace_leases(now_ms);
         self.resync_clients(now_ms);
@@ -540,6 +564,23 @@ impl Core {
             .ok_or_else(|| ProtoError::not_found("session", id.as_str()))
     }
 
+    /// Whether this durable session opts into raw terminal history.
+    pub(crate) fn terminal_history_enabled(&self, id: &SessionId) -> bool {
+        if self.store.path().is_none() {
+            return false;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return false;
+        };
+        !session.env.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case("TURN_TERMINAL_HISTORY")
+                && matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no" | "disabled"
+                )
+        })
+    }
+
     pub(crate) fn session_mut(
         &mut self,
         id: &SessionId,
@@ -634,6 +675,7 @@ pub(crate) mod testing {
                 Arc::new(hooks),
                 AdapterRegistry::bare(),
                 dir.path().to_path_buf(),
+                dir.path().join(crate::paths::CHECKOUT_LOCKS_DIR),
                 commands,
             )
             .expect("the core must build");
@@ -739,6 +781,9 @@ pub(crate) mod testing {
                 node_id.clone(),
                 Process {
                     pty,
+                    process_title: None,
+                    fallback_title: node.title.clone(),
+                    fallback_agent_name: node.agent.as_ref().map(|agent| agent.name.clone()),
                     adapter_id: "terminal".to_string(),
                     level: IntegrationLevel::GenericTerminal,
                     hook_token: None,

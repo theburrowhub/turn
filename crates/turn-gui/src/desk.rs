@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, Direction, Layout, LeaseState, PaneKind, PreviewVisibility, SessionStatus,
+    ActivityPreview, Direction, Layout, LeaseState, Pane, PaneKind, PreviewVisibility,
+    SessionStatus,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
@@ -3570,6 +3571,11 @@ impl Desk {
             })
             .collect();
 
+        let pane_nodes = self
+            .selected
+            .as_ref()
+            .and_then(|session_id| self.trees.get(session_id))
+            .map(Vec::as_slice);
         let panes: Vec<PaneContent<'_>> = match self.layout() {
             None => Vec::new(),
             Some(layout) => layout
@@ -3580,11 +3586,7 @@ impl Desk {
                     let grid = feed.peek()?;
                     Some(PaneContent {
                         pane_id: pane.id.clone(),
-                        title: pane
-                            .title
-                            .clone()
-                            .or_else(|| pane.command.clone())
-                            .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase()),
+                        title: pane_display_title(pane, pane_nodes),
                         grid,
                         focused: layout.active.as_ref() == Some(&pane.id),
                         scrolled: feed.offset() > 0,
@@ -3827,6 +3829,27 @@ fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option
     }
 }
 
+/// Resolves pane chrome without changing the saved layout.
+///
+/// A user title is authoritative. Otherwise the bound process's OSC title (already
+/// sanitised by the daemon) wins over template and command fallbacks. Looking up by
+/// `node_id` is what keeps simultaneous agents isolated from each other.
+fn pane_display_title(pane: &Pane, nodes: Option<&[TreeNodeView]>) -> String {
+    if pane.title_is_user_set {
+        if let Some(title) = &pane.title {
+            return title.clone();
+        }
+    }
+
+    pane.node_id
+        .as_ref()
+        .and_then(|node_id| nodes?.iter().find(|node| &node.node_id == node_id))
+        .map(|node| node.title.clone())
+        .or_else(|| pane.title.clone())
+        .or_else(|| pane.command.clone())
+        .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase())
+}
+
 /// Whether a desync is worth telling the user about.
 ///
 /// A missed update is normal on a busy pane and repairs itself by resynchronising; a
@@ -3857,6 +3880,29 @@ mod tests {
 
     fn workspace() -> WorkspaceId {
         WorkspaceId::from_stored("ws_desk000001")
+    }
+
+    #[test]
+    fn pane_headers_prefer_user_titles_then_their_own_bound_process_title() {
+        let session_id = SessionId::from_stored("sess_pane_titles");
+        let mut first = Pane::new(PaneKind::Agent).with_title("claude");
+        let mut first_node = ProcessNode::agent(session_id.clone(), "claude", "/repo", T0);
+        first_node.title = "Claude Alpha".into();
+        first.node_id = Some(first_node.id.clone());
+
+        let unrelated = ProcessNode::agent(session_id, "claude", "/repo", T0);
+        let nodes = vec![
+            TreeNodeView::from_node(&unrelated, 0, 0, T0),
+            TreeNodeView::from_node(&first_node, 0, 0, T0),
+        ];
+        assert_eq!(pane_display_title(&first, Some(&nodes)), "Claude Alpha");
+
+        let custom = first.clone().with_user_title("My review agent");
+        assert_eq!(
+            pane_display_title(&custom, Some(&nodes)),
+            "My review agent",
+            "a process must not overwrite a title explicitly chosen by the user"
+        );
     }
 
     /// A session with one agent pane, and the node behind it.
@@ -3942,6 +3988,7 @@ mod tests {
                     node_id: Some(node_id.clone()),
                     stream: PaneStream::Cells,
                     screen: Some(Box::new(grid)),
+                    scrollback: turn_proto::Scrollback::default(),
                     replay: TerminalBytes::new(Vec::new()),
                     size: PtySize::new(24, 80),
                     scrollback_truncated: false,

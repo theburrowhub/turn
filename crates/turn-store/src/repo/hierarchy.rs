@@ -77,12 +77,26 @@ impl<'a> HierarchyRepo<'a> {
         checkout: &CheckoutId,
         now_ms: i64,
     ) -> Result<WorkspaceWriteLease> {
+        self.acquire_write_lease_with_id(workspace, session, checkout, None, now_ms)
+    }
+
+    /// Acquires the SQLite half of a lease whose id may already identify a
+    /// host-global checkout lock claim. Supplying the id lets the daemon publish one
+    /// stable owner across the kernel and durable fencing boundaries.
+    pub fn acquire_write_lease_with_id(
+        &self,
+        workspace: &WorkspaceId,
+        session: &SessionId,
+        checkout: &CheckoutId,
+        lease_id: Option<&LeaseId>,
+        now_ms: i64,
+    ) -> Result<WorkspaceWriteLease> {
         // `IMMEDIATE` serialises the read-check-generation-write sequence across
         // daemon processes. The global partial unique index remains the final
         // arbiter, but no contender can read a generation that another writer is
         // concurrently about to consume.
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
-        let lease = Self::acquire_in(&tx, workspace, session, checkout, now_ms)?;
+        let lease = Self::acquire_in(&tx, workspace, session, checkout, lease_id, now_ms)?;
         tx.commit()?;
         Ok(lease)
     }
@@ -145,6 +159,18 @@ impl<'a> HierarchyRepo<'a> {
         session: &Session,
         now_ms: i64,
     ) -> Result<Option<WorkspaceWriteLease>> {
+        self.create_session_with_lease_id(session, None, now_ms)
+    }
+
+    /// Creates a Session using the id already placed in its host-global checkout
+    /// lock claim. Read-only Sessions ignore `lease_id` because they acquire no
+    /// writing authority.
+    pub fn create_session_with_lease_id(
+        &self,
+        session: &Session,
+        lease_id: Option<&LeaseId>,
+        now_ms: i64,
+    ) -> Result<Option<WorkspaceWriteLease>> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
         Self::ensure_workspace_accepts_session(&tx, session)?;
         let lease = match session.mode {
@@ -156,6 +182,7 @@ impl<'a> HierarchyRepo<'a> {
                     &session.workspace_id,
                     &session.id,
                     &session.checkout_id,
+                    lease_id,
                     now_ms,
                 )?)
             }
@@ -537,6 +564,7 @@ impl<'a> HierarchyRepo<'a> {
         workspace: &WorkspaceId,
         session: &SessionId,
         checkout: &CheckoutId,
+        lease_id: Option<&LeaseId>,
         now_ms: i64,
     ) -> Result<WorkspaceWriteLease> {
         let (canonical, reconciliation_required) =
@@ -604,6 +632,9 @@ impl<'a> HierarchyRepo<'a> {
             checkout.clone(),
             now_ms,
         );
+        if let Some(lease_id) = lease_id {
+            lease.id = lease_id.clone();
+        }
         lease.generation = generation as u64;
         tx.execute(
             "INSERT INTO workspace_write_leases \
@@ -969,6 +1000,7 @@ impl<'a> HierarchyRepo<'a> {
         &self,
         id: &LeaseId,
         generation: u64,
+        read_only_enforced: bool,
         now_ms: i64,
     ) -> Result<bool> {
         let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Immediate)?;
@@ -996,8 +1028,8 @@ impl<'a> HierarchyRepo<'a> {
         }
         let session_changed = tx.execute(
             "UPDATE sessions SET mode = 'read_only', worktree_path = NULL, \
-                    read_only_enforced = 0 WHERE id = ?1",
-            params![&owner],
+                    read_only_enforced = ?2 WHERE id = ?1",
+            params![&owner, read_only_enforced],
         )?;
         if session_changed != 1 {
             return Err(StoreError::UnknownReference {
@@ -1285,17 +1317,22 @@ mod tests {
         assert!(matches!(error, StoreError::WriteLeaseHeld { .. }));
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 2)
             .unwrap());
         let second_lease = store
             .hierarchy()
             .acquire_write_lease(&workspace.id, &second.id, &checkout, T0 + 3)
             .unwrap();
         assert!(second_lease.generation > lease.generation);
+        let demoted = store.sessions().get(&first.id).unwrap().unwrap();
         assert_eq!(
-            store.sessions().get(&first.id).unwrap().unwrap().mode,
+            demoted.mode,
             SessionMode::ReadOnly,
             "release and Session demotion are one durable transition"
+        );
+        assert!(
+            demoted.read_only_enforced,
+            "the precomputed guard state belongs to the same transition"
         );
     }
 
@@ -1325,7 +1362,7 @@ mod tests {
             .unwrap();
         let error = store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 1)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 1)
             .expect_err("the injected second write must abort the whole transaction");
         assert!(matches!(error, StoreError::Sqlite(_)));
         assert_eq!(
@@ -1348,7 +1385,7 @@ mod tests {
             .unwrap();
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&lease.id, lease.generation, true, T0 + 2)
             .unwrap());
         assert!(store
             .hierarchy()
@@ -1985,6 +2022,45 @@ mod tests {
     }
 
     #[test]
+    fn a_preallocated_host_lock_id_is_preserved_across_sqlite_acquisition() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "joined authority");
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "writer",
+            workspace.root.clone(),
+            Layout::single(Pane::new(PaneKind::AgentTree)),
+            T0,
+        );
+        session.mode = SessionMode::MainCheckout;
+        let first_id = LeaseId::new();
+        let first = store
+            .hierarchy()
+            .create_session_with_lease_id(&session, Some(&first_id), T0)
+            .unwrap()
+            .expect("the main checkout lease");
+        assert_eq!(first.id, first_id);
+
+        assert!(store
+            .hierarchy()
+            .release_write_lease_and_assign_read_only(&first.id, first.generation, false, T0 + 1)
+            .unwrap());
+        let second_id = LeaseId::new();
+        let second = store
+            .hierarchy()
+            .acquire_write_lease_with_id(
+                &workspace.id,
+                &session.id,
+                &session.checkout_id,
+                Some(&second_id),
+                T0 + 2,
+            )
+            .unwrap();
+        assert_eq!(second.id, second_id);
+        assert!(second.generation > first.generation);
+    }
+
+    #[test]
     fn read_only_creation_uses_the_primary_without_claiming_its_lease() {
         let temp = tempfile::tempdir().unwrap();
         let primary = temp.path().join("primary");
@@ -2268,7 +2344,7 @@ mod tests {
             .unwrap();
         assert!(!store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&old.id, old.generation + 1, T0 + 1)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation + 1, false, T0 + 1)
             .unwrap());
         assert_eq!(
             store
@@ -2282,7 +2358,7 @@ mod tests {
 
         assert!(store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&old.id, old.generation, T0 + 2)
+            .release_write_lease_and_assign_read_only(&old.id, old.generation, false, T0 + 2)
             .unwrap());
         let current = store
             .hierarchy()
@@ -2292,7 +2368,7 @@ mod tests {
 
         assert!(!store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&current.id, old.generation, T0 + 4)
+            .release_write_lease_and_assign_read_only(&current.id, old.generation, false, T0 + 4)
             .unwrap());
         assert_eq!(
             store

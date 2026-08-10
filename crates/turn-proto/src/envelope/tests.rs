@@ -6,7 +6,66 @@ use crate::framing::{encode, LineDecoder};
 use crate::response::Response;
 
 fn hello_frame() -> ClientFrame {
-    ClientFrame::hello(Hello::new("turn-ui", "0.1.0"))
+    ClientFrame::hello(Hello::new("turn-ui", "0.1.0", AuthToken::new("test-token")))
+}
+
+#[test]
+fn auth_tokens_cross_the_wire_but_debug_output_is_redacted() {
+    let token = AuthToken::new("secret-capability");
+    let hello = Hello::new("turn-ui", "0.1.0", token.clone());
+    let json = serde_json::to_string(&hello).unwrap();
+    assert!(
+        json.contains("secret-capability"),
+        "the peer needs the secret"
+    );
+    assert!(!format!("{hello:?}").contains("secret-capability"));
+    assert_eq!(
+        serde_json::from_str::<Hello>(&json)
+            .unwrap()
+            .auth_token
+            .unwrap()
+            .expose_secret(),
+        token.expose_secret()
+    );
+}
+
+#[test]
+fn the_token_path_is_derived_from_the_exact_socket_path() {
+    assert_eq!(
+        ipc_auth_token_path(Path::new("/run/turn/alternate.sock")),
+        PathBuf::from("/run/turn/alternate.sock.token")
+    );
+}
+
+#[test]
+fn the_shared_token_reader_enforces_the_published_file_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("turnd.sock");
+    let path = ipc_auth_token_path(&socket);
+    std::fs::write(&path, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)).unwrap();
+    assert_eq!(
+        read_ipc_auth_token(&socket).unwrap().expose_secret(),
+        "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)
+    );
+
+    std::fs::write(&path, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES + 1)).unwrap();
+    assert_eq!(
+        read_ipc_auth_token(&socket).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_shared_token_reader_never_follows_a_sidecar_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("turnd.sock");
+    let target = temp.path().join("elsewhere");
+    std::fs::write(&target, "a".repeat(IPC_AUTH_TOKEN_HEX_BYTES)).unwrap();
+    symlink(&target, ipc_auth_token_path(&socket)).unwrap();
+    assert!(read_ipc_auth_token(&socket).is_err());
 }
 
 /// The limits a client has to respect are announced rather than assumed, including

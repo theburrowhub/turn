@@ -57,17 +57,32 @@ durable storage.
 6. **Agent names, relationship labels and Activity Preview source text.** They enter
    native navigation chrome even when they came from a hook or terminal line.
 
-**The boundary Turn does not defend, and cannot.** Anything running as the same
-user. The daemon's control socket is `0600`, which stops other accounts, but any
-process running as the user can connect to it and drive Turn completely — write to
-ptys, kill sessions, read scrollback. Given that, a same-user attacker does not
-need to forge hook events; they can ask the daemon directly. Defending against
-same-user code requires OS-level sandboxing of each agent, which is a product
-decision, not a patch. §7 says what follows from this.
+**The boundary Turn does not defend, and cannot.** Malicious code running as the
+same user. The control socket checks the peer UID and requires the current owner-only
+capability, which excludes other accounts and accidental/stale clients. It does not
+sandbox an agent: a process with the user's authority can read `<socket>.token` just
+as it can read the user's source and credentials, then write to PTYs, kill sessions
+or read scrollback. Defending against that requires OS-level sandboxing of each
+agent, which is a product decision, not an IPC patch. §7 says what follows from this.
 
 ## 3. Surfaces, and what defends them
 
-### 3.1 The hook server (`turn-agents/src/server.rs`)
+### 3.1 The daemon control socket (`turnd/src/server`)
+
+| Property | How |
+| --- | --- |
+| Only the account owner reaches the handshake | The socket is `0600` and every accepted stream's kernel `peer_cred` UID must equal the daemon's effective UID. Credential lookup failure is refusal. |
+| Only the current daemon generation grants authority | Startup atomically publishes a fresh 244-bit capability at `<socket>.token`, owner-only (`0600`) and symlink-refusing. Protocol v4 requires it in `hello`; missing, invalid and replayed old values receive the same fatal `unauthorized` response before registration or Core access. Shutdown revokes and removes it. |
+| Secrets stay out of diagnostics | `AuthToken` redacts `Debug`; comparison does not early-return on a matching prefix; logs and `IpcStats` name only rejection class, client label and counts. Raw handshakes are never logged. |
+| Connections and stalled handshakes are bounded | At most 32 connection tasks/permits exist. Excess streams are closed on accept. A peer has five seconds to authenticate, so an idle connector cannot retain a slot forever. |
+| Requests are bounded per client | A token bucket admits a burst of 256 frames and refills at 128/second. Excess frames return `rate_limited`; 16 consecutive violations close the stream. Malformed pre-authentication frames and sustained malformed streams also have finite close thresholds. |
+| Slow clients are isolated | Each client has its own bounded 1,024-frame outbox and task; Core's command queue is bounded at 2,048. When a reader ends, a blocked writer gets one second to finish and is then aborted, releasing its descriptor and connection permit. |
+| Hook authority is separate | This socket is newline-delimited control JSON. Agent hooks use an independent loopback HTTP listener and per-node tokens; an IPC token is never placed in a hook URL or agent configuration. |
+
+The capability is a defence against cross-account access, stale/replayed clients and accidental protocol
+participants. It is deliberately not claimed as isolation from malicious same-user code; see §7.
+
+### 3.2 The hook server (`turn-agents/src/server.rs`)
 
 | Property | How |
 | --- | --- |
@@ -82,7 +97,7 @@ decision, not a patch. §7 says what follows from this.
 | One slow client cannot stall another | Every connection is its own task, and the handler never awaits anything downstream: it does a hash lookup, a parse, and a `try_send`. |
 | A slow daemon costs events, not agents | The event channel is bounded at 1024 and `try_send` drops on a full channel, counted in `HookStats::dropped`. Blocking would apply backpressure to every agent on the machine. |
 
-### 3.2 Agent output rendered as UI (`turn-pty/src/buffer.rs`)
+### 3.3 Agent output rendered as UI (`turn-pty/src/buffer.rs`)
 
 An agent controls its own stdout, and parts of that reach native chrome: session
 titles, tree labels, Activity/Quick Previews, notifications and log lines.
@@ -116,7 +131,7 @@ titles, tree labels, Activity/Quick Previews, notifications and log lines.
   re-attaching a pane cannot re-emit the original OSC 52 or title sequences into
   the UI's terminal.
 
-### 3.3 Payload fields rendered as UI (`turn-agents/src/text.rs`)
+### 3.4 Payload fields rendered as UI (`turn-agents/src/text.rs`)
 
 The same filter, applied on the other input path. Every string an adapter lifts
 out of a payload goes through `text::excerpt` — whitespace collapsed first, as a
@@ -137,7 +152,7 @@ Two special cases:
   outright rather than repaired, because a partly rewritten id would resume the
   wrong conversation.
 
-### 3.4 The launch path
+### 3.5 The launch path
 
 - **No shell, anywhere.** `PtyProcess::spawn` builds a `CommandBuilder` with an
   explicit argv and never passes a command line to `sh`. Adapters pass the user's
@@ -154,7 +169,7 @@ Two special cases:
   never treated as an agent, even as `sh -c 'claude'`; an unrecognised command
   becomes a plain terminal that makes no claims.
 
-### 3.5 Secrets (`turn-store/src/redact.rs`)
+### 3.6 Secrets (`turn-store/src/redact.rs`)
 
 Two rules, because either alone leaks:
 
@@ -194,7 +209,21 @@ than state — `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`,
 is capped, and misleading Unicode/control content is stripped. That transform does not turn the result into
 durable product state.
 
-### 3.6 `turn-hook`
+### 3.6.1 Raw terminal archives
+
+Terminal output is the exception that cannot be made safe by field redaction: it is an ordered VT byte
+stream whose text, escape sequences and binary fragments may all be meaningful. Persistent Sessions keep a
+bounded checkpoint and append-only journal under `terminal-history/<session>/<node>` so a restart can
+reconstruct the display. Directories are owner-only (`0700`), files are `0600`, symlinked paths are refused,
+records are CRC-checked, and journal/checkpoint size is capped per Pane.
+
+The archive may contain secrets exactly as they appeared on screen. A sensitive Workspace or Session must
+set `TURN_TERMINAL_HISTORY=disabled` before launching its processes; `0`, `false`, `off` and `no` are also
+accepted. `--no-persist` disables archives globally. Opt-out deletes any retained Session archive during
+restore. A recovered archive is never a process capability: its node remains `Orphaned` or `Lost`, cannot
+accept input and is replaced/deleted when the user explicitly relaunches that Pane.
+
+### 3.7 `turn-hook`
 
 - Only `http://`, and **only a loopback destination**. The helper's environment is
   the agent's environment, so `TURN_HOOK_URL` is not entirely Turn's to control; a
@@ -208,7 +237,7 @@ durable product state.
   the agent's own transcript.
 - Reads are capped at 256 KiB from stdin and 64 bytes from the response.
 
-### 3.7 Checkouts and write leases
+### 3.8 Checkouts and write leases
 
 Before the store can enforce any checkout lease, the daemon must be the only process allowed to mutate that
 store. `turnd` canonicalises `data_dir` and acquires a non-blocking exclusive lock on its stable
@@ -226,6 +255,24 @@ or using a symlink alias cannot reset generation and resurrect a stale owner. Ac
 `recovery_required` claims all block a new writer until explicit fenced reconciliation; only `released` is
 non-blocking.
 
+That SQLite fence is joined to a host-global Unix lock independent of `data_dir`. Turn resolves the checkout
+directory to `(device, inode)` and uses one retained 0600 lock inode under the real, uid-owned 0700
+`checkout-locks` directory below Turn's stable platform data directory, independent of `TURN_DATA_DIR`.
+Unlike `/tmp` or a runtime directory, normal OS cleanup does not unlink live authority. Symlink aliases and
+directory renames therefore collide while
+distinct Git worktree directories do not. The file is opened with `O_NOFOLLOW`, its owner/type and named
+inode are verified, and the checkout identity is re-resolved after locking. Owner metadata is published by
+atomic sidecar rename so contention can return the other daemon's typed lease/session details.
+
+The daemon acquires the host lock before SQLite and supplies the same preallocated `LeaseId` to both halves.
+Every heartbeat and main-checkout launch requires the active SQLite generation and matching kernel lock.
+portable-pty still closes every unrelated descriptor, but explicitly preserves one duplicate of the
+checkout lock and clears `FD_CLOEXEC` only in the already-forked child. The parent copy remains CLOEXEC, so
+concurrent unrelated spawns cannot inherit it. Descendants inherit the same open-file description. Turn never
+calls `LOCK_UN`: explicit release first demotes SQLite and then closes the daemon descriptor; after a daemon
+crash the kernel releases authority only when the final surviving writer closes its copy. A replacement
+daemon therefore reconciles stale process state and reacquires the kernel lock before it can reclaim SQLite.
+
 Acquisition validates that Workspace, Session and checkout agree and that the checkout is the Workspace's
 primary one. Session assignment and acquisition commit atomically; init commands, process spawn and Pane
 materialisation occur only afterwards. A conflict rolls back all Session records and returns typed owner and
@@ -241,24 +288,42 @@ aliases are all judged by the resolved directory; the PTY receives that canonica
 caller's spelling. Isolated-worktree Sessions are checked against their worktree checkout, so a Pane cannot
 silently start in the primary checkout.
 
-This is **launch-directory containment, not a process sandbox**. Once running, same-user code may call
-`chdir`, open arbitrary absolute paths, follow a path component replaced after validation, or access network,
-Docker, credentials and other shared resources. Preventing those actions and eliminating filesystem TOCTOU
-requires an OS sandbox/container or an fd-based launcher; the cwd check must never be presented as that
-guarantee.
+For `main_checkout` and `isolated_worktree` this is **launch-directory containment, not a process sandbox**.
+Once running, same-user code may call `chdir`, open arbitrary absolute paths, follow a path component replaced
+after validation, or access network, Docker, credentials and other shared resources. The cwd check must never
+be presented as broader containment.
+
+`read_only` adds a separate process boundary on macOS. Before persisting enforcement, the daemon requires the
+fixed `/usr/bin/sandbox-exec` launcher, canonicalises the checkout and resolves `.git`, gitfile/symlink and
+`commondir` pointers. External Git metadata roots join the protected set. Each Pane, relaunch and init command
+is wrapped in a Seatbelt profile that allows normal execution but denies `file-write*` to each protected
+literal/subpath. Paths travel through `-D` parameters instead of profile-source interpolation. The policy is
+inherited by child processes; `TURN_READ_ONLY=1`, `TURN_READ_ONLY_ROOT` and `GIT_OPTIONAL_LOCKS=0` make the
+boundary visible to tools and prevent opportunistic Git index refreshes. Every spawn reconstructs the guard,
+so a stale persisted bit cannot authorise an unguarded process.
+
+The target is the resolved protected path. A symlink alias into the checkout remains blocked by Seatbelt;
+paths whose resolved target is outside the protected set remain writable. Like other pathname sandboxes, a
+pre-existing hard-link alias outside the protected set is not separately enumerated. The guard does not
+isolate credentials, network, Docker, ports, databases or services. Those limits are shown/documented rather
+than being called full process isolation.
 
 A heartbeat timeout is evidence, never proof that the writer died. Daemon restart enters reconciliation,
 checks process ownership and otherwise asks the user. Closing the UI, archiving a live Session and
 `keep_processes` are not release events. Migration 003 creates no lease, changes no permissions and performs
 no filesystem/process action.
 
-`read_only` always exposes `read_only_enforced`. A false value is a warning, not a security guarantee; agent
-instructions do not enforce it. `isolated_worktree` isolates files/Git index, not necessarily ports,
-containers, databases, credential helpers, caches or services, so those shared resources are declared and
-shown before launch. Worktree paths must be canonicalised, constrained to an approved parent and checked for
-alias/collision immediately before use.
+`read_only` always exposes `read_only_enforced`. On macOS true means the inherited write guard above is active.
+If the platform launcher or safe canonical metadata resolution is unavailable, the Session persists with
+false and launches no process; agent instructions never substitute for it. The UI names both states and an OS
+denial remains visible in the terminal. A read-only Session never acquires the primary lease. Explicit
+promotion is refused while any guarded process is running, then atomically acquires the exclusive lease and
+changes mode; no write attempt silently escalates. `isolated_worktree` isolates files/Git index, not
+necessarily ports, containers, databases, credential helpers, caches or services, so those shared resources
+are declared and shown before launch. Worktree paths must be canonicalised, constrained to an approved parent
+and checked for alias/collision immediately before use.
 
-### 3.8 Hierarchy identity and Activity Preview
+### 3.9 Hierarchy identity and Activity Preview
 
 An Agent may declare ids, roles, labels and task strings, but only an explicit parent/integration name enters
 `declared_name`; values such as `Explore` and `default` remain roles unless the source actually named the
@@ -278,7 +343,7 @@ hook payloads never enter the preview table. Retention is 20 snapshots per node 
 restored preview keeps its original timestamp. The current UI still lacks a distinct recovered/stale marker,
 so clients must not reinterpret that timestamp as fresh activity.
 
-### 3.9 Per-surface state and Pane bindings
+### 3.10 Per-surface state and Pane bindings
 
 Tree selection/expansion is scoped by stable `surface_id`, acknowledged to the originating client and never
 broadcast as another window's state. It is not a `TurnEvent`, does not change active Session/Pane focus and
@@ -317,12 +382,12 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Required invariant | Required proof |
 | --- | --- |
 | One canonical data directory has one daemon owner | different sockets and symlink aliases are rejected before Store/restore; a real `SIGKILL` releases the kernel lock and stale socket recovery succeeds |
-| One canonical checkout has one blocking write claim per canonical data directory | concurrent acquisition through path aliases and recreated Workspaces in that store yields exactly one owner |
+| One canonical checkout has one host-global write owner | separate data dirs through a symlink alias return the first daemon's typed owner; a surviving descendant retains authority after daemon loss; its exit permits recovery; distinct real Git worktrees write concurrently |
 | Fencing survives stale actors | heartbeat/release with the previous generation cannot mutate the current lease |
 | Migration grants no authority | v2→v3 creates no active lease and performs no launch/kill/move/chmod |
 | Conflict has no external side effects | failed `main_checkout` creation leaves no Session, init command, process or Pane |
 | A launch cwd stays in its assigned checkout | adversarial daemon tests cover Workspace A→B absolute paths, `../../`, symlink escapes, worktree Pane→primary and a stored Layout rechecked at the final PTY boundary |
-| Read-only never overclaims | unenforced mode remains visibly `read_only_enforced=false` through persistence/protocol |
+| Read-only never overclaims | macOS create/modify/delete/rename, child, alternate-cwd and symlink probes are denied while Git reads and outside writes succeed; unsupported platforms remain visibly unenforced and launch nothing |
 | Preview/event stores no source/secret | `turn-store/tests/secrets_never_reach_the_disk.rs::no_secret_value_is_present_anywhere_in_the_files_on_disk` scans the database and WAL for seeded preview credentials and non-redactable Claude-hook free text; `upgrading_physically_removes_historical_hook_free_text_from_sqlite_and_its_wal` proves migration 005 scrubs older files too |
 | Ambiguous worker Attention never broadens on restart | an unknown explicit worker id remains node-less under its authenticated parent; two parent runtimes resolve only their own durable parent/external-id scope |
 | Permission detail never crosses subjects | scoped node-less and stale exact queue entries cannot borrow the primary Agent's command/cwd/risk; Sessions-before-tree resolves the primary only by matching node id |
@@ -413,7 +478,8 @@ Stated so the next audit does not re-litigate them.
 - **A dropped receiver, a full channel, an unparsable body.** All answer `200`,
   because a registered agent has done nothing wrong and telling it otherwise risks
   Claude Code deciding Turn's hook is broken.
-- **The daemon's control socket.** `0600`, asserted by a test in `turnd`.
+- **The daemon's control socket.** `0600`, peer-UID checked, per-generation token authenticated and bounded
+  to 32 concurrent peers; integration tests cover wrong/missing/stale tokens, two valid UIs and floods.
 - **The parsed screen never contains escape sequences.** They are interpreted by
   `vt100`, and replay is regenerated rather than replayed from raw bytes.
 - **DNS rebinding against the hook port.** A browser can send a cross-origin
@@ -428,8 +494,8 @@ Stated so the next audit does not re-litigate them.
 
 **A compromised agent can impersonate any session.** An agent Turn launched runs
 as the user, so it can read another session's settings file, another process's
-environment, or simply connect to the daemon's `0600` control socket and drive
-Turn directly. The per-node token therefore buys separation between *accounts*,
+environment, or read the owner-only IPC token and drive the control socket. The
+per-node hook token and per-generation IPC token therefore buy separation between *accounts*,
 and honesty about which node reported what, but it is not a wall between two
 agents on one machine. Accepting this is a straight consequence of the product:
 Turn's job is to run the user's agents with the user's privileges. Anything better
@@ -480,9 +546,11 @@ containers, databases, caches or external services. Turn accepts those collision
 Workspace declares them and the conflict choice shows them. Calling the mode “isolated” must never imply
 process or credential isolation.
 
-**Read-only enforcement varies by platform/tool.** When Turn cannot install a technical guard, the Session
-remains explicit `read_only_enforced=false`, cannot acquire the primary write lease and cannot launch a
-process; a future write-capable escalation must be explicit. Hiding that limitation is not accepted.
+**Read-only enforcement is macOS-first and path-scoped.** When Turn cannot install the Seatbelt guard, the
+Session remains explicit `read_only_enforced=false`, cannot acquire the primary write lease and cannot launch
+a process. The guard blocks checkout and resolved Git-metadata writes for descendants, not access to every
+same-user resource. Write-capable escalation is explicit and requires every guarded process to end first.
+Hiding either limitation is not accepted.
 
 ## 8. Remaining audit follow-ups
 

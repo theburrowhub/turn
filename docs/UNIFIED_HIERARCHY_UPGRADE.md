@@ -66,7 +66,8 @@ WorkspaceWriteLease
 ```
 
 Within one canonical Turn data directory/store, SQLite and the daemon transaction enforce one canonical
-writer namespace per checkout. Every non-released
+writer namespace per checkout. A uid-scoped host lock keyed by checkout device/inode joins that authority
+across deliberately separate data directories. Every non-released
 lease blocks acquisition; the fencing generation remains monotonic even if a Workspace is deleted and
 recreated. The daemon owns acquisition, heartbeat and release. A new daemon first changes every unreleased
 lease to `recovery_required`; loading the former Session never adopts it. A stale or recovery lease is never
@@ -78,9 +79,9 @@ endpoints and do not define store ownership: a second daemon using another socke
 refused before it can fence live leases. Process death releases the kernel lock; the stable lock file itself
 is never removed.
 
-This is not yet host-global across deliberately separate `--data-dir` values. Two independent stores can
-register the same checkout without sharing a fence; a checkout-scoped OS lock is a hardening gate before
-Turn may claim exclusivity across multiple installations.
+The checkout lock is acquired before SQLite and its descriptor is inherited by every main-checkout process.
+If the daemon dies, a surviving writer keeps the lock; reconciliation can reacquire it only after the final
+writer exits. Symlink aliases collide, while distinct Git worktree directories keep independent authority.
 
 ### AgentNode independent of Pane
 
@@ -151,7 +152,8 @@ Updates are coalesced rather than byte-driven. The current daemon samples watche
 immediately; byte traffic never maps one-for-one to UI updates. Expansion-aware suppression for collapsed
 nodes and the wider semantic source ladder remain planned. The persisted last preview lets the tree return
 immediately after a UI restart. Preview history is bounded to 20 entries per node and 2,000 globally,
-pruned on write; no raw PTY bytes, terminal grid or scrollback are stored. The product requires global,
+pruned on write; this semantic preview store contains no raw PTY bytes, terminal grid or scrollback.
+ADR-052's separate private bounded terminal archive does not feed hierarchy previews. The product requires global,
 per-Session and per-Agent visibility controls; protocol v3 currently enforces the per-node Agent control,
 while the broader scopes remain planned rather than client-local guesses.
 

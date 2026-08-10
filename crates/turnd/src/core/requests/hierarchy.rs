@@ -9,12 +9,11 @@ use std::collections::{HashMap, HashSet};
 
 use super::workspaces::store;
 use super::Answer;
-use crate::core::authority::CheckoutIdentity;
 use crate::core::Core;
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     HierarchyNodeKind, LeaseState, PaneNodeBinding, PreviewVisibility, ProcessNode,
-    RelationshipKind, SessionMode, TreeUiState,
+    RelationshipKind, SessionMode, TreeUiState, WorkspaceWriteLease,
 };
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
@@ -247,82 +246,143 @@ impl Core {
                 "The Session is not assigned to the requested checkout",
             ));
         }
+        if session.mode == SessionMode::ReadOnly
+            && session.tree.iter().any(|node| node.is_running())
+        {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "End every read-only process before acquiring exclusive write access",
+            ));
+        }
         let current = self
             .store
             .hierarchy()
             .active_lease(workspace_id)
             .map_err(store)?;
-        let lease = if let Some(current) = current.filter(|lease| {
-            lease.state == LeaseState::RecoveryRequired
-                && &lease.session_id == session_id
-                && &lease.checkout_id == checkout_id
-        }) {
-            if legacy_reconciliation_required {
-                return Err(ProtoError::new(
-                    ErrorCode::Conflict,
-                    "This legacy Workspace needs checkout reconciliation before its write lease can be recovered",
-                ));
-            }
-            // The recovery prompt explicitly tells the user to stop an unreachable
-            // process outside Turn. Reconcile the OS process table at the moment they
-            // confirm so an already-dead orphan does not block this daemon generation
-            // forever. Command matching also protects against PID reuse.
-            self.reconcile_orphaned_recovery(session_id, now_ms)?;
-            let session = self.session(session_id)?;
-            if session.tree.iter().any(|node| node.is_running()) {
-                return Err(ProtoError::new(
-                    ErrorCode::Conflict,
-                    "A process from the previous daemon is still running; stop it outside Turn before confirming write access",
-                ));
-            }
-            // The same identity check the unattended recovery in
-            // [`crate::core::authority`] performs: a fence protects a filesystem
-            // identity, so authority cannot be handed back for a different directory.
-            match self.primary_checkout_identity(workspace_id, checkout_id) {
-                CheckoutIdentity::Intact => {}
-                CheckoutIdentity::Unverifiable(detail) => {
-                    return Err(ProtoError::refused(
-                        "Turn cannot verify the primary checkout before recovering write access",
-                    )
-                    .with_detail(detail))
+        let mut checkout_lock = None;
+        let lease = match current {
+            Some(current)
+                if current.state == LeaseState::RecoveryRequired
+                    && &current.session_id == session_id
+                    && &current.checkout_id == checkout_id =>
+            {
+                if legacy_reconciliation_required {
+                    return Err(ProtoError::new(
+                        ErrorCode::Conflict,
+                        "This legacy Workspace needs checkout reconciliation before its write lease can be recovered",
+                    ));
                 }
-                CheckoutIdentity::Moved => {
+                // The recovery prompt explicitly tells the user to stop an unreachable
+                // process outside Turn. Reconcile the OS process table at the moment they
+                // confirm so an already-dead orphan does not block this daemon generation
+                // forever. Command matching also protects against PID reuse.
+                self.reconcile_orphaned_recovery(session_id, now_ms)?;
+                let session = self.session(session_id)?;
+                if session.tree.iter().any(|node| node.is_running()) {
+                    return Err(ProtoError::new(
+                        ErrorCode::Conflict,
+                        "A process from the previous daemon is still running; stop it outside Turn before confirming write access",
+                    ));
+                }
+                let checkout = self
+                    .store
+                    .hierarchy()
+                    .checkout(workspace_id, checkout_id)
+                    .map_err(store)?
+                    .ok_or_else(|| {
+                        ProtoError::not_found("workspace checkout", checkout_id.as_str())
+                    })?;
+                let canonical = std::fs::canonicalize(&checkout.path)
+                    .map_err(|error| {
+                        ProtoError::refused(
+                            "Turn cannot verify the primary checkout before recovering write access",
+                        )
+                        .with_detail(error.to_string())
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                if canonical != checkout.canonical_path {
                     return Err(ProtoError::new(
                         ErrorCode::Conflict,
                         "The primary checkout now resolves to a different directory; write access was not recovered",
-                    ))
+                    ));
                 }
-            }
-            self.store
-                .hierarchy()
-                .reclaim_write_lease(
-                    workspace_id,
-                    session_id,
-                    checkout_id,
-                    &current.id,
-                    current.generation,
-                    now_ms,
-                )
-                .map_err(store)?
-                .ok_or_else(|| {
-                    ProtoError::new(
-                        ErrorCode::Conflict,
-                        "The recovery lease changed; refresh before confirming write access",
+                let mut writer = session.clone();
+                writer.mode = SessionMode::MainCheckout;
+                writer.read_only_enforced = false;
+                let mut claim = current.clone();
+                claim.state = LeaseState::Active;
+                claim.heartbeat_ms = now_ms;
+                let lock = self.checkout_lock_claim(&writer, &claim)?;
+                let reclaimed = self
+                    .store
+                    .hierarchy()
+                    .reclaim_write_lease(
+                        workspace_id,
+                        session_id,
+                        checkout_id,
+                        &current.id,
+                        current.generation,
+                        now_ms,
                     )
-                })?
-        } else {
-            self.store
-                .hierarchy()
-                .acquire_write_lease(workspace_id, session_id, checkout_id, now_ms)
-                .map_err(|error| {
-                    self.map_lease_store_error(workspace_id, Some(session_id), error)
-                })?
+                    .map_err(store)?
+                    .ok_or_else(|| {
+                        ProtoError::new(
+                            ErrorCode::Conflict,
+                            "The recovery lease changed; refresh before confirming write access",
+                        )
+                    })?;
+                checkout_lock = Some(lock);
+                reclaimed
+            }
+            Some(current)
+                if current.state == LeaseState::Active
+                    && &current.session_id == session_id
+                    && &current.checkout_id == checkout_id =>
+            {
+                self.require_checkout_write_lock(self.session(session_id)?, &current)?;
+                current
+            }
+            Some(held) => {
+                return Err(self.local_lease_conflict(workspace_id, Some(session_id), held));
+            }
+            None => {
+                let mut writer = self.session(session_id)?.clone();
+                writer.mode = SessionMode::MainCheckout;
+                writer.worktree_path = None;
+                writer.read_only_enforced = false;
+                let claim = WorkspaceWriteLease::active(
+                    workspace_id.clone(),
+                    session_id.clone(),
+                    checkout_id.clone(),
+                    now_ms,
+                );
+                let lock = self.checkout_lock_claim(&writer, &claim)?;
+                let acquired = self
+                    .store
+                    .hierarchy()
+                    .acquire_write_lease_with_id(
+                        workspace_id,
+                        session_id,
+                        checkout_id,
+                        Some(&claim.id),
+                        now_ms,
+                    )
+                    .map_err(|error| {
+                        self.map_lease_store_error(workspace_id, Some(session_id), error)
+                    })?;
+                checkout_lock = Some(lock);
+                acquired
+            }
         };
         let session = self.session_mut(session_id)?;
         session.mode = SessionMode::MainCheckout;
         session.checkout_id = checkout_id.clone();
         session.worktree_path = None;
         session.read_only_enforced = false;
+        if let Some(lock) = checkout_lock {
+            self.install_checkout_write_lock(session_id, &lease, lock);
+        }
         self.bump_hierarchy();
         self.push_workspace_lease(workspace_id, Some(lease.clone()), now_ms);
         Ok(Response::WorkspaceWriteLease {
@@ -359,25 +419,51 @@ impl Core {
                 actual_generation: current.generation,
             }));
         }
-        let owner = self.sessions.get(&current.session_id).ok_or_else(|| {
-            // Another daemon may have created the owner after this Core loaded.
-            // Absence from this process is uncertainty, never proof that it is
-            // safe to revoke a live/recovery claim.
-            ProtoError::new(
-                ErrorCode::Conflict,
-                "The lease owner is not loaded here; refresh before releasing it",
-            )
-        })?;
+        let owner = self
+            .sessions
+            .get(&current.session_id)
+            .cloned()
+            .ok_or_else(|| {
+                // Another daemon may have created the owner after this Core loaded.
+                // Absence from this process is uncertainty, never proof that it is
+                // safe to revoke a live/recovery claim.
+                ProtoError::new(
+                    ErrorCode::Conflict,
+                    "The lease owner is not loaded here; refresh before releasing it",
+                )
+            })?;
         if owner.tree.iter().any(|node| node.is_running()) {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
                 "Stop the Session processes before releasing its write lease",
             ));
         }
+        if current.state == LeaseState::Active {
+            self.require_checkout_write_lock(&owner, &current)?;
+        }
+        let mut read_only_owner = owner;
+        read_only_owner.mode = SessionMode::ReadOnly;
+        read_only_owner.worktree_path = None;
+        let read_only_enforced = match self.read_only_sandbox(&read_only_owner) {
+            Ok(sandbox) => sandbox.is_some(),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %read_only_owner.id,
+                    %error,
+                    "released Session will remain read-only with process launch disabled"
+                );
+                false
+            }
+        };
         let released = self
             .store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(lease_id, expected_generation, now_ms)
+            .release_write_lease_and_assign_read_only(
+                lease_id,
+                expected_generation,
+                read_only_enforced,
+                now_ms,
+            )
             .map_err(store)?;
         if !released {
             return Err(ProtoError::new(
@@ -388,8 +474,11 @@ impl Core {
         if let Some(session) = self.sessions.get_mut(&current.session_id) {
             session.mode = SessionMode::ReadOnly;
             session.worktree_path = None;
-            session.read_only_enforced = false;
+            session.read_only_enforced = read_only_enforced;
         }
+        // SQLite is demoted first, so the only release gap is conservative: the
+        // kernel may still reject another writer for a moment, never admit two.
+        self.drop_checkout_write_lock(lease_id);
         self.bump_hierarchy();
         self.push_workspace_lease(workspace_id, None, now_ms);
         Ok(Response::WorkspaceWriteLease {
@@ -742,16 +831,31 @@ impl Core {
             return;
         }
         self.last_lease_heartbeat_ms = now_ms;
-        for workspace in self.workspaces.keys() {
-            let Ok(Some(lease)) = self.store.hierarchy().active_lease(workspace) else {
+        let workspaces: Vec<_> = self.workspaces.keys().cloned().collect();
+        for workspace in workspaces {
+            let Ok(Some(lease)) = self.store.hierarchy().active_lease(&workspace) else {
                 continue;
             };
-            if lease.state == LeaseState::Active && self.sessions.contains_key(&lease.session_id) {
-                if let Err(error) =
-                    self.store
-                        .hierarchy()
-                        .heartbeat_lease(&lease.id, lease.generation, now_ms)
-                {
+            let Some(session) = self.sessions.get(&lease.session_id).cloned() else {
+                continue;
+            };
+            if lease.state != LeaseState::Active {
+                continue;
+            }
+            if let Err(error) = self.require_checkout_write_lock(&session, &lease) {
+                tracing::warn!(%error, lease = %lease.id, "refused to heartbeat a lease without host checkout authority");
+                continue;
+            }
+            match self
+                .store
+                .hierarchy()
+                .heartbeat_lease(&lease.id, lease.generation, now_ms)
+            {
+                Ok(true) => self.heartbeat_checkout_lock_owner(&lease, now_ms),
+                Ok(false) => {
+                    tracing::warn!(lease = %lease.id, "write lease changed before heartbeat")
+                }
+                Err(error) => {
                     tracing::warn!(%error, lease = %lease.id, "could not heartbeat write lease");
                 }
             }
@@ -848,6 +952,15 @@ impl Core {
         let Ok(Some(lease)) = self.store.hierarchy().lease(&lease_id) else {
             return store(error);
         };
+        self.local_lease_conflict(workspace_id, requesting_session_id, lease)
+    }
+
+    pub(crate) fn local_lease_conflict(
+        &self,
+        workspace_id: &WorkspaceId,
+        requesting_session_id: Option<&SessionId>,
+        lease: WorkspaceWriteLease,
+    ) -> ProtoError {
         // A competing daemon can create the owner after this Core's in-memory
         // snapshot. Fall back to durable state so the typed conflict never
         // degrades to a generic storage outage.
@@ -855,7 +968,12 @@ impl Core {
             Some(owner) => owner,
             None => match self.store.sessions().get(&lease.session_id) {
                 Ok(Some(owner)) => owner,
-                _ => return store(error),
+                _ => {
+                    return ProtoError::new(
+                        ErrorCode::Unavailable,
+                        "Turn could not load the local checkout lease owner",
+                    )
+                }
             },
         };
         ProtoError::workspace_write_lease_conflict(ProtoErrorContext::WorkspaceWriteLeaseConflict {
@@ -1196,6 +1314,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sqlite_lease_without_its_host_lock_is_never_heartbeated() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "heartbeat authority".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness
+            .core
+            .create_session(
+                &workspace_id,
+                "writer".into(),
+                None,
+                Some(vec![turn_proto::NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap();
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .unwrap();
+        harness.core.checkout_write_locks.remove(&lease.id);
+
+        harness
+            .core
+            .heartbeat_workspace_leases(NOW + LEASE_HEARTBEAT_INTERVAL_MS + 2);
+
+        let unchanged = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.heartbeat_ms, lease.heartbeat_ms);
+    }
+
+    #[tokio::test]
     async fn archived_sessions_and_workspaces_cannot_acquire_hidden_authority() {
         let mut harness = Harness::new().await;
         let workspace_id = match harness
@@ -1269,6 +1437,97 @@ mod tests {
             harness.core.sessions[&session_id].mode,
             SessionMode::ReadOnly
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_processes_must_end_before_explicit_write_escalation() {
+        let mut harness = Harness::new().await;
+        let workspace_id = match harness
+            .core
+            .create_workspace(
+                "promotion-boundary".into(),
+                harness._dir.path().to_string_lossy().into_owned(),
+                NOW,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let session_id = match harness
+            .core
+            .create_read_only_session(
+                &workspace_id,
+                "reader".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                NOW + 1,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let checkout = CheckoutId::primary_for(&workspace_id);
+        let mut reader = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            harness._dir.path().to_string_lossy(),
+            NOW + 2,
+        );
+        reader.lifecycle = Lifecycle::Alive;
+        let reader_id = reader.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(reader);
+
+        let error = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 3)
+            .expect_err("a live guarded process must not cross the authority boundary");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(error.message.contains("End every read-only process"));
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::ReadOnly
+        );
+
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&reader_id)
+            .unwrap()
+            .lifecycle = Lifecycle::Exited { code: 0 };
+        let promoted = harness
+            .core
+            .acquire_workspace_write_lease(&workspace_id, &session_id, &checkout, NOW + 4)
+            .expect("an ended read-only Session may be promoted explicitly");
+        assert!(matches!(
+            promoted,
+            Response::WorkspaceWriteLease { lease: Some(_), .. }
+        ));
+        assert_eq!(
+            harness.core.sessions[&session_id].mode,
+            SessionMode::MainCheckout
+        );
+        assert!(!harness.core.sessions[&session_id].read_only_enforced);
     }
 
     #[tokio::test]

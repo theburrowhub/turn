@@ -10,6 +10,7 @@ members = [
     "crates/turnd",
     "crates/turn-gui",
 ]
+exclude = ["vendor/portable-pty"]
 
 [workspace.package]
 version = "0.1.0"
@@ -43,8 +44,17 @@ axum = "0.8"
 directories = "6.0"
 regex = "1.11"
 shell-words = "1.1"
+crc32fast = "1.5"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# portable-pty deliberately closes every descriptor above stderr before exec. Turn's
+# checkout authority needs one explicitly selected descriptor to survive into a
+# main-checkout process, while all unrelated daemon descriptors must still close.
+# Keep this small upstream-compatible extension vendored until the preservation API
+# is available in a released portable-pty.
+[patch.crates-io]
+portable-pty = { path = "vendor/portable-pty" }

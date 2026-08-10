@@ -25,7 +25,9 @@
 //! frames it happened to watch would have gaps exactly where a build log is most
 //! interesting, and nothing at all for output that arrived before the window started. So
 //! history is read with [`Request::GetPaneHistory`](turn_proto::Request::GetPaneHistory),
-//! and what this module keeps is a **cache** of rows the daemon still has.
+//! and what this module keeps is a **cache** of rows the daemon still has. `attach_pane`
+//! also seeds that cache from the bounded durable scrollback checkpoint, so output from
+//! before a daemon restart is visible immediately and later windows remain fetchable.
 //!
 //! Rows are numbered by **line index**: `0` is the oldest row the daemon holds and
 //! [`PaneFeed::history_len`] is the line index of the live screen's top row. The offset the
@@ -122,6 +124,17 @@ impl HistoryRow {
     /// means the row was captured at another geometry and must not be painted.
     fn cells(&self, cols: u16) -> Option<Vec<Cell>> {
         decode_runs(&self.runs, cols, 0).ok()
+    }
+
+    /// One decoded durable row, converted back to the cache's compact representation.
+    fn from_cells(cells: Vec<Cell>, cols: u16) -> Self {
+        let mut grid = Grid::blank(1, cols);
+        for (col, cell) in cells.into_iter().enumerate().take(cols as usize) {
+            if let Some(target) = grid.cell_mut(0, col as u16) {
+                *target = cell;
+            }
+        }
+        Self::of(&grid, 0)
     }
 }
 
@@ -301,15 +314,32 @@ impl PaneFeed {
             Some(grid) => (**grid).clone(),
             None => Grid::blank(attachment.size.rows, attachment.size.cols),
         };
-        let history_len = screen.scrollback_len;
+        let decoded =
+            if attachment.scrollback.is_empty() || attachment.scrollback.cols() == screen.cols {
+                attachment.scrollback.decode_rows().ok()
+            } else {
+                None
+            };
+        let malformed_history = decoded.is_none() && !attachment.scrollback.is_empty();
+        let decoded = decoded.unwrap_or_default();
+        let history_len = screen.scrollback_len.max(decoded.len());
+        let first_line = history_len.saturating_sub(decoded.len());
+        let mut history = History::default();
+        for (offset, cells) in decoded.into_iter().enumerate() {
+            history.insert(
+                first_line + offset,
+                HistoryRow::from_cells(cells, screen.cols),
+                screen.cols,
+            );
+        }
         PaneFeed {
             screen,
-            history: History::default(),
+            history,
             offset: 0,
             history_len,
             floor: 0,
             next_seq: attachment.next_seq,
-            daemon_truncated: attachment.scrollback_truncated,
+            daemon_truncated: attachment.scrollback_truncated || malformed_history,
             cleared: false,
             wanted: None,
             fetching: false,
@@ -776,12 +806,21 @@ mod tests {
             node_id: None,
             stream: PaneStream::Cells,
             screen: screen.map(Box::new),
+            scrollback: turn_proto::Scrollback::default(),
             replay: TerminalBytes::new(Vec::new()),
             size,
             scrollback_truncated: false,
             bytes_seen: 0,
             next_seq,
         }
+    }
+
+    fn scrollback(lines: &[&str], cols: u16) -> turn_proto::Scrollback {
+        let grid = screen(lines, lines.len().max(1) as u16, cols);
+        let rows: Vec<Vec<CellRun>> = (0..lines.len())
+            .map(|row| grid.row_runs(row as u16))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "cols": cols, "rows": rows })).unwrap()
     }
 
     /// A screen of a fixed height, padded like a real terminal's.
@@ -881,6 +920,26 @@ mod tests {
         assert!(!feed.is_fetching());
         assert_eq!(feed.grid().row_text(0), "four hundred back");
         assert_eq!(feed.cached_rows(), 4);
+    }
+
+    #[test]
+    fn attaching_seeds_the_transcript_from_durable_scrollback() {
+        let live = screen(&["live-1", "live-2", "live-3"], 3, 12);
+        let mut attached = attachment(Some(live), 0);
+        attached.scrollback = scrollback(&["old-1", "old-2"], 12);
+        let mut feed = PaneFeed::attach(&attached);
+
+        assert_eq!(feed.history_rows(), 2);
+        assert!(feed.history_complete());
+        assert!(feed.scroll_by(2));
+        assert_eq!(
+            feed.grid()
+                .text()
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>(),
+            vec!["old-1", "old-2", "live-1"]
+        );
     }
 
     #[test]

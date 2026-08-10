@@ -50,7 +50,7 @@ use turn_core::model::{
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
-use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ScreenSize};
+use turn_pty::{ExitInfo, ProcessSpec, PtyProcess, ReadOnlySandbox, ScreenSize};
 
 /// The size a pane starts at before a client tells us what it is rendering.
 ///
@@ -122,22 +122,28 @@ impl Core {
         self.require_session_launchable(session_id)?;
         let session = self.session(session_id)?;
         match (session.mode, needs) {
-            (SessionMode::MainCheckout, LaunchAuthority::CheckoutWrite) => self
-                .store
-                .hierarchy()
-                .verify_active_write_lease(&session.workspace_id, session_id, &session.checkout_id)
-                .map(|_| ())
-                .map_err(|error| {
-                    // Relaunch/AddPane is not a lease acquisition flow. Missing,
-                    // recovery, stale, drifted, or unprovable authority all fail
-                    // closed at the last boundary before a PTY can be spawned.
-                    ProtoError::refused(
-                        "This Session must have confirmed write access to the main checkout \
-                         before Turn runs an agent or a command against it; a terminal can \
-                         be opened without it",
+            (SessionMode::MainCheckout, LaunchAuthority::CheckoutWrite) => {
+                let lease = self
+                    .store
+                    .hierarchy()
+                    .verify_active_write_lease(
+                        &session.workspace_id,
+                        session_id,
+                        &session.checkout_id,
                     )
-                    .with_detail(error.to_string())
-                }),
+                    .map_err(|error| {
+                        // Relaunch/AddPane is not a lease acquisition flow. Missing,
+                        // recovery, stale, drifted, or unprovable authority all fail
+                        // closed at the last boundary before a PTY can be spawned.
+                        ProtoError::refused(
+                            "This Session must have confirmed write access to the main checkout \
+                        before Turn runs an agent or a command against it; a terminal can \
+                         be opened without it",
+                        )
+                        .with_detail(error.to_string())
+                    })?;
+                self.require_checkout_write_lock(session, &lease)
+            }
             (SessionMode::MainCheckout, LaunchAuthority::InteractiveShell) => Ok(()),
             (SessionMode::ReadOnly | SessionMode::IsolatedWorktree, _) => Ok(()),
         }
@@ -239,7 +245,7 @@ impl Core {
         Ok(())
     }
 
-    fn checkout_for_session(
+    pub(crate) fn checkout_for_session(
         &self,
         session: &Session,
     ) -> std::result::Result<WorkspaceCheckout, ProtoError> {
@@ -263,6 +269,57 @@ impl Core {
             })?;
         verify_session_checkout_binding(session, &checkout)?;
         Ok(checkout)
+    }
+
+    /// Constructs the platform guard for a read-only Session without trusting its
+    /// persisted enforcement flag. Creation uses this to decide that flag; every
+    /// later spawn reconstructs the guard so stale metadata fails closed.
+    pub(crate) fn read_only_sandbox(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<Option<ReadOnlySandbox>, ProtoError> {
+        if session.mode != SessionMode::ReadOnly {
+            return Ok(None);
+        }
+        let checkout = self.checkout_for_session(session)?;
+        let checkout_root = verified_checkout_root(&checkout)?;
+        ReadOnlySandbox::for_checkout(&checkout_root).map_err(|error| {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Turn could not construct the read-only process guard",
+            )
+            .with_detail(error.to_string())
+        })
+    }
+
+    fn process_sandbox(
+        &self,
+        session: &Session,
+    ) -> std::result::Result<Option<ReadOnlySandbox>, ProtoError> {
+        let sandbox = self.read_only_sandbox(session)?;
+        if session.mode != SessionMode::ReadOnly {
+            return Ok(None);
+        }
+        if !session.read_only_enforced {
+            return Err(ProtoError::refused(
+                "This read-only Session has no technical write guard, so Turn will not launch a process in it",
+            ));
+        }
+        if sandbox.is_some() {
+            return Ok(sandbox);
+        }
+        // Old unit-test harnesses mark synthetic read-only Sessions as guarded so
+        // unrelated PTY lifecycle tests can cross the production launch boundary.
+        #[cfg(test)]
+        {
+            Ok(None)
+        }
+        #[cfg(not(test))]
+        {
+            Err(ProtoError::refused(
+                "The read-only process guard is unavailable on this platform; no process was started",
+            ))
+        }
     }
 
     /// Starts a process for every pane of a session that describes one.
@@ -475,6 +532,7 @@ impl Core {
         // The adapter's own environment goes last so it wins: a hook URL it just
         // generated must not be shadowed by a stale value in the workspace.
         env.extend(plan.env.iter().cloned());
+        let read_only_sandbox = self.process_sandbox(self.session(session_id)?)?;
 
         let spec = ProcessSpec {
             command: plan.command.clone(),
@@ -483,8 +541,17 @@ impl Core {
             env,
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
-        let pty = self.open_pty(&node_id, spec, command, token.as_deref(), now_ms)?;
+        let pty = self.open_pty(
+            session_id,
+            &node_id,
+            spec,
+            command,
+            token.as_deref(),
+            LaunchAuthority::CheckoutWrite,
+            now_ms,
+        )?;
         let pid = pty.pid();
 
         // What actually runs, which is not always what the user typed: an adapter may
@@ -497,7 +564,19 @@ impl Core {
         );
         node.lifecycle = Lifecycle::Spawning;
 
-        self.hold_process(&node_id, pty, &selection, &plan, token, None, session_id);
+        let fallback_title = node.title.clone();
+        let fallback_agent_name = node.agent.as_ref().map(|agent| agent.name.clone());
+        self.hold_process(
+            &node_id,
+            pty,
+            &selection,
+            &plan,
+            token,
+            None,
+            fallback_title,
+            fallback_agent_name,
+            session_id,
+        );
         {
             let session = self.session_mut(session_id)?;
             session.tree.insert(node);
@@ -552,6 +631,7 @@ impl Core {
         // must not be shadowed by a stale value in the workspace.
         env.extend(plan.env.iter().cloned());
         let shell_args = hosting::interactive();
+        let read_only_sandbox = self.process_sandbox(self.session(session_id)?)?;
 
         let spec = ProcessSpec {
             command: shell.to_string(),
@@ -560,8 +640,17 @@ impl Core {
             env,
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
-        let pty = self.open_pty(&shell_id, spec, shell, token.as_deref(), now_ms)?;
+        let pty = self.open_pty(
+            session_id,
+            &shell_id,
+            spec,
+            shell,
+            token.as_deref(),
+            LaunchAuthority::CheckoutWrite,
+            now_ms,
+        )?;
         let pid = pty.pid();
 
         // Written now, before anything else can reach this terminal. The bytes wait in
@@ -589,6 +678,7 @@ impl Core {
         agent.lifecycle = Lifecycle::Alive;
         agent.link_to(shell_id.clone(), Relation::Confirmed);
 
+        let fallback_title = shell_node.title.clone();
         self.hold_process(
             &shell_id,
             pty,
@@ -596,6 +686,8 @@ impl Core {
             &plan,
             token,
             Some(agent_id.clone()),
+            fallback_title,
+            None,
             session_id,
         );
         {
@@ -646,6 +738,7 @@ impl Core {
         node.title = executable_name(shell).to_string();
         let node_id = node.id.clone();
         let args = hosting::interactive();
+        let read_only_sandbox = self.process_sandbox(self.session(session_id)?)?;
 
         let spec = ProcessSpec {
             command: shell.to_string(),
@@ -654,8 +747,17 @@ impl Core {
             env: request.env.clone(),
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
-        let pty = self.open_pty(&node_id, spec, shell, None, now_ms)?;
+        let pty = self.open_pty(
+            session_id,
+            &node_id,
+            spec,
+            shell,
+            None,
+            LaunchAuthority::InteractiveShell,
+            now_ms,
+        )?;
         let pid = pty.pid();
         // The sentence is printed by the shell itself, because the shell is the only
         // thing that can put text on this screen. A failure to write it is not a reason
@@ -672,6 +774,9 @@ impl Core {
             node_id.clone(),
             Process {
                 pty,
+                process_title: None,
+                fallback_title: node.title.clone(),
+                fallback_agent_name: None,
                 // A shell is a terminal Turn makes no claims about, whatever the
                 // registry would say about the agent that is not running in it.
                 adapter_id: "generic-terminal".to_string(),
@@ -841,22 +946,65 @@ impl Core {
     }
 
     /// Opens the pty, revoking the launch's token if it cannot be opened.
+    ///
+    /// These arguments deliberately keep the launch authority, durable history identity,
+    /// human-facing command and token visible at the single process-creation boundary.
+    #[allow(clippy::too_many_arguments)]
     fn open_pty(
-        &self,
+        &mut self,
+        session_id: &SessionId,
         node_id: &NodeId,
         spec: ProcessSpec,
         command: &str,
         token: Option<&str>,
+        needs: LaunchAuthority,
         now_ms: i64,
     ) -> std::result::Result<PtyProcess, ProtoError> {
-        PtyProcess::spawn(node_id.clone(), spec, now_ms).map_err(|error| {
-            self.revoke(token);
-            ProtoError::new(
-                ErrorCode::Unavailable,
-                format!("Could not start `{command}`"),
-            )
-            .with_detail(error.to_string())
-        })
+        let journal_dir = self
+            .terminal_history_enabled(session_id)
+            .then(|| paths::node_terminal_history(&self.data_dir, session_id, node_id));
+        let checkout_lock_inheritance = if needs == LaunchAuthority::CheckoutWrite {
+            self.checkout_lock_inheritance(session_id)?
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let preserved_fds: Vec<_> = checkout_lock_inheritance
+            .iter()
+            .map(|lock| lock.raw_fd())
+            .collect();
+        #[cfg(not(unix))]
+        let preserved_fds = Vec::new();
+        let result = match &journal_dir {
+            Some(dir) => PtyProcess::spawn_persisted_with_preserved_fds(
+                node_id.clone(),
+                spec,
+                now_ms,
+                dir,
+                &preserved_fds,
+            ),
+            None => {
+                PtyProcess::spawn_with_preserved_fds(node_id.clone(), spec, now_ms, &preserved_fds)
+            }
+        };
+        drop(checkout_lock_inheritance);
+        match result {
+            Ok(pty) => {
+                self.recovered_terminals.remove(node_id);
+                Ok(pty)
+            }
+            Err(error) => {
+                self.revoke(token);
+                if journal_dir.is_some() {
+                    paths::remove_node_terminal_history(&self.data_dir, session_id, node_id);
+                }
+                Err(ProtoError::new(
+                    ErrorCode::Unavailable,
+                    format!("Could not start `{command}`"),
+                )
+                .with_detail(error.to_string()))
+            }
+        }
     }
 
     /// Takes ownership of a launched pty and starts watching it.
@@ -869,6 +1017,8 @@ impl Core {
         plan: &LaunchPlan,
         token: Option<String>,
         hosted: Option<NodeId>,
+        fallback_title: String,
+        fallback_agent_name: Option<turn_core::model::AgentName>,
         session_id: &SessionId,
     ) {
         self.watch_exit(node_id, &pty);
@@ -880,6 +1030,9 @@ impl Core {
             node_id.clone(),
             Process {
                 pty,
+                process_title: None,
+                fallback_title,
+                fallback_agent_name,
                 adapter_id: selection.adapter.id().to_string(),
                 level: plan.level,
                 hook_token: token,
@@ -934,6 +1087,7 @@ impl Core {
         )
         .with_node(node_id.clone());
         self.ingest(started, now_ms);
+        self.refresh_checkout_lock_owner(session_id);
     }
 
     /// Runs one of the session's configured start-up commands.
@@ -956,6 +1110,7 @@ impl Core {
         // confirmed write access exactly as a pane's command does.
         let cwd =
             self.resolve_authorized_launch_cwd(session_id, None, LaunchAuthority::CheckoutWrite)?;
+        let read_only_sandbox = self.process_sandbox(session)?;
         let mut env: Vec<(String, String)> = Vec::new();
         if let Some(workspace) = self.workspaces.get(&session.workspace_id) {
             env.extend(workspace.env.iter().cloned());
@@ -985,21 +1140,29 @@ impl Core {
             env,
             size: INITIAL_SIZE,
             clean_env: false,
+            read_only_sandbox,
         };
-        let pty = PtyProcess::spawn(node_id.clone(), spec, now_ms).map_err(|error| {
-            ProtoError::new(
-                ErrorCode::Unavailable,
-                format!("Could not run the start-up command `{command}`"),
-            )
-            .with_detail(error.to_string())
-        })?;
+        let pty = self.open_pty(
+            session_id,
+            &node_id,
+            spec,
+            command,
+            None,
+            LaunchAuthority::CheckoutWrite,
+            now_ms,
+        )?;
         let pid = pty.pid();
 
         self.watch_exit(&node_id, &pty);
+        let fallback_title = node.title.clone();
+        let fallback_agent_name = node.agent.as_ref().map(|agent| agent.name.clone());
         self.processes.insert(
             node_id.clone(),
             Process {
                 pty,
+                process_title: None,
+                fallback_title,
+                fallback_agent_name,
                 adapter_id: "generic-terminal".to_string(),
                 level: IntegrationLevel::GenericTerminal,
                 hook_token: None,
@@ -1025,6 +1188,7 @@ impl Core {
         )
         .with_node(node_id.clone());
         self.ingest(started, now_ms);
+        self.refresh_checkout_lock_owner(session_id);
         Ok(node_id)
     }
 
@@ -1064,12 +1228,26 @@ impl Core {
             pump.abort();
         }
         let process = self.processes.remove(node)?;
+        let session_id = process.session_id.clone();
         // The screen was a view of this pty. With the pty gone there is nothing for it
         // to be a view of, and a stale grid would be diffed against on the next attach.
         self.forget_screen(node);
         self.revoke(process.hook_token.as_deref());
         let info = process.pty.exit_info();
         drop(process);
+        if self.terminal_history_enabled(&session_id) {
+            let dir = paths::node_terminal_history(&self.data_dir, &session_id, node);
+            match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+                Ok(Some(recovered)) => {
+                    self.recovered_terminals
+                        .insert(node.clone(), recovered.buffer);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%node, %error, "could not retain terminal after releasing its PTY");
+                }
+            }
+        }
         info
     }
 }
@@ -1986,20 +2164,29 @@ mod tests {
             .create_session(&session, 1)
             .unwrap()
             .unwrap();
+        let checkout_lock = harness.core.checkout_lock_claim(&session, &lease).unwrap();
         harness
             .core
             .sessions
             .insert(session.id.clone(), session.clone());
         let pane_id = session.layout.panes()[0].id.clone();
-        for needs in [
-            LaunchAuthority::CheckoutWrite,
-            LaunchAuthority::InteractiveShell,
-        ] {
-            harness
-                .core
-                .require_session_launch_allowed(&session.id, needs)
-                .unwrap();
-        }
+        let missing_host_lock = harness
+            .core
+            .require_session_launch_allowed(&session.id, LaunchAuthority::CheckoutWrite)
+            .expect_err("SQLite authority alone must never launch a writer");
+        assert_eq!(missing_host_lock.code, ErrorCode::Refused);
+        assert!(missing_host_lock.message.contains("host-wide"));
+        harness
+            .core
+            .require_session_launch_allowed(&session.id, LaunchAuthority::InteractiveShell)
+            .expect("an interactive shell does not inherit checkout write authority");
+        harness
+            .core
+            .install_checkout_write_lock(&session.id, &lease, checkout_lock);
+        harness
+            .core
+            .require_session_launch_allowed(&session.id, LaunchAuthority::CheckoutWrite)
+            .unwrap();
 
         assert!(harness
             .core

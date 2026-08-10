@@ -440,11 +440,18 @@ impl Core {
                     truncated = buffer.is_truncated();
                     bytes_seen = buffer.bytes_seen();
                 }
+            } else if let Some(buffer) = self.recovered_terminals.get(node) {
+                truncated = buffer.is_truncated();
+                bytes_seen = buffer.bytes_seen();
             }
-            // A node with no live pty — orphaned or lost after a restart — attaches
-            // with an empty screen rather than being refused. The pane is real, its
-            // state says what happened to it, and the relaunch offer is the way back.
+            // A recovered terminal is display-only. The node remains Orphaned/Lost;
+            // retained output is never treated as proof that its process is alive.
         }
+
+        let attached_size = node_id
+            .as_ref()
+            .map(|node| self.node_size(node, requested))
+            .unwrap_or(requested);
 
         let attachment = Attachment {
             node_id: node_id.clone(),
@@ -465,10 +472,14 @@ impl Core {
 
         // Exactly one of the two payloads, decided by what the client asked for.
         let mut screen = None;
+        let mut scrollback = turn_proto::Scrollback::default();
         let mut replay = turn_proto::TerminalBytes::default();
         match (stream, &node_id) {
             (PaneStream::Cells, Some(node)) => {
-                let grid = self.screen_for_attach(node, requested);
+                let grid = self.screen_for_attach(node, attached_size);
+                let (history, history_truncated) = self.scrollback_for_attach(node);
+                scrollback = history;
+                truncated |= history_truncated;
                 if resized {
                     // The geometry moved, so every other client's baseline is the wrong
                     // shape and a row diff against it would be meaningless.
@@ -490,6 +501,8 @@ impl Core {
                     // The parsed screen re-emitted, not the raw ring: a truncated ring
                     // can begin mid-escape-sequence and corrupt the receiving terminal.
                     replay = turn_proto::TerminalBytes::new(process.pty.replay());
+                } else if let Some(buffer) = self.recovered_terminals.get(node) {
+                    replay = turn_proto::TerminalBytes::new(buffer.replay());
                 }
             }
             (PaneStream::Bytes, None) => {}
@@ -501,7 +514,7 @@ impl Core {
                 ServerEvent::PtyResized {
                     session_id: session_id.clone(),
                     node_id: node.clone(),
-                    size: requested,
+                    size: attached_size,
                 },
             );
         }
@@ -513,8 +526,9 @@ impl Core {
                 node_id,
                 stream,
                 screen,
+                scrollback,
                 replay,
-                size: requested,
+                size: attached_size,
                 scrollback_truncated: truncated,
                 bytes_seen,
                 next_seq: 0,

@@ -509,6 +509,8 @@ impl Core {
             self.expected_exits.remove(node);
             self.discard_process(node);
             crate::paths::remove_node_scratch(&self.data_dir, session_id, node);
+            self.recovered_terminals.remove(node);
+            crate::paths::remove_node_terminal_history(&self.data_dir, session_id, node);
         }
         Ok(())
     }

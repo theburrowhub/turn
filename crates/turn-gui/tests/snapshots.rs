@@ -4502,6 +4502,7 @@ fn new_output_while_scrolled_back_leaves_the_view_where_it_was() {
         node_id: None,
         stream: PaneStream::Cells,
         screen: Some(Box::new(daemon.clone())),
+        scrollback: turn_proto::Scrollback::default(),
         replay: TerminalBytes::new(Vec::new()),
         size: PtySize::new(rows, cols),
         scrollback_truncated: false,

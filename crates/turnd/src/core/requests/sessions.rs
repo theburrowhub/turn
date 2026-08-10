@@ -8,8 +8,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as SystemCommand;
 use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
+#[cfg(test)]
+use turn_core::model::SessionStatus;
 use turn_core::model::{
-    Direction, Layout, Pane, PaneKind, Session, SessionMode, Template, Workspace, WorkspaceCheckout,
+    Direction, Layout, Pane, PaneKind, Session, SessionMode, Template, Workspace,
+    WorkspaceCheckout, WorkspaceWriteLease,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{
@@ -198,14 +201,32 @@ impl Core {
         // init command, or PTY behind.
         session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
+        if let Some(held) = self
+            .store
+            .hierarchy()
+            .active_lease(workspace_id)
+            .map_err(store)?
+        {
+            return Err(self.local_lease_conflict(workspace_id, Some(&id), held));
+        }
+        let claim = WorkspaceWriteLease::active(
+            workspace_id.clone(),
+            id.clone(),
+            session.checkout_id.clone(),
+            now_ms,
+        );
+        let checkout_lock = self.checkout_lock_claim(&session, &claim)?;
         // The store arbitrates and persists this Session in one IMMEDIATE
         // transaction. Nothing user-configured is executed before the exclusive
         // primary-checkout lease exists.
-        self.store
+        let lease = self
+            .store
             .hierarchy()
-            .create_session(&session, now_ms)
-            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
+            .create_session_with_lease_id(&session, Some(&claim.id), now_ms)
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?
+            .ok_or_else(|| ProtoError::internal("a main-checkout Session acquired no lease"))?;
         self.sessions.insert(id.clone(), session);
+        self.install_checkout_write_lock(&id, &lease, checkout_lock);
 
         self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
         self.materialise_session(&id, now_ms);
@@ -218,11 +239,9 @@ impl Core {
 
     /// Creates the explicit safe alternative to a second checkout writer.
     ///
-    /// Until a platform process sandbox is available Turn persists the Session
-    /// but deliberately launches no configured process. `read_only_enforced`
-    /// remains false, so the UI cannot imply that an agent is safely confined.
-    /// This degraded mode is useful for organising the task and is strictly safer
-    /// than launching an unguarded shell that could write silently.
+    /// On a supported platform every configured process starts inside an inherited
+    /// OS write guard. Unsupported platforms retain the safe degraded mode: the
+    /// Session is persisted visibly unenforced and no process is launched.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_read_only_session(
         &mut self,
@@ -250,14 +269,20 @@ impl Core {
         session.attention = workspace.attention.clone();
         session.env = workspace.env.clone();
         session.mode = SessionMode::ReadOnly;
-        session.read_only_enforced = false;
         session.cwd = self.validate_session_definition_cwds(&session)?;
+        session.read_only_enforced = self.read_only_sandbox(&session)?.is_some();
+        let enforced = session.read_only_enforced;
         let id = session.id.clone();
         self.store
             .hierarchy()
-            .create_read_only_session(&session, false)
+            .create_read_only_session(&session, enforced)
             .map_err(store)?;
         self.sessions.insert(id.clone(), session);
+        if enforced {
+            self.run_init_commands(&id, &workspace.init_commands.clone(), now_ms);
+            self.materialise_session(&id, now_ms);
+            self.persist_session(&id)?;
+        }
         self.touch_workspace(workspace_id, now_ms);
         self.bump_hierarchy();
         self.push_hierarchy_all(now_ms);
@@ -269,8 +294,8 @@ impl Core {
     ///
     /// The client supplies only Template identity and interpolation inputs. It
     /// cannot flatten a summary back into panes, environment or policy. As with
-    /// ordinary read-only Sessions, configured commands remain visible in the
-    /// Layout but are not launched without a technical write guard.
+    /// ordinary read-only Sessions, configured commands launch only when a technical
+    /// write guard is available.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_read_only_session_from_template(
         &mut self,
@@ -305,14 +330,26 @@ impl Core {
             SessionMode::ReadOnly,
             now_ms,
         )?;
-        session.read_only_enforced = false;
         session.cwd = self.validate_session_definition_cwds(&session)?;
+        session.read_only_enforced = self.read_only_sandbox(&session)?.is_some();
+        let enforced = session.read_only_enforced;
         let id = session.id.clone();
         self.store
             .hierarchy()
-            .create_read_only_session(&session, false)
+            .create_read_only_session(&session, enforced)
             .map_err(store)?;
         self.sessions.insert(id.clone(), session);
+        if enforced {
+            let init: Vec<String> = workspace
+                .init_commands
+                .iter()
+                .cloned()
+                .chain(template.init_commands.iter().cloned())
+                .collect();
+            self.run_init_commands(&id, &init, now_ms);
+            self.materialise_session(&id, now_ms);
+            self.persist_session(&id)?;
+        }
         self.touch_workspace(workspace_id, now_ms);
         self.bump_hierarchy();
         self.push_hierarchy_all(now_ms);
@@ -651,11 +688,29 @@ impl Core {
         // every one before a lease or a template init command has side effects.
         session.cwd = self.validate_session_definition_cwds(&session)?;
         let id = session.id.clone();
-        self.store
+        if let Some(held) = self
+            .store
             .hierarchy()
-            .create_session(&session, now_ms)
-            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?;
+            .active_lease(workspace_id)
+            .map_err(store)?
+        {
+            return Err(self.local_lease_conflict(workspace_id, Some(&id), held));
+        }
+        let claim = WorkspaceWriteLease::active(
+            workspace_id.clone(),
+            id.clone(),
+            session.checkout_id.clone(),
+            now_ms,
+        );
+        let checkout_lock = self.checkout_lock_claim(&session, &claim)?;
+        let lease = self
+            .store
+            .hierarchy()
+            .create_session_with_lease_id(&session, Some(&claim.id), now_ms)
+            .map_err(|error| self.map_lease_store_error(workspace_id, Some(&id), error))?
+            .ok_or_else(|| ProtoError::internal("a main-checkout Session acquired no lease"))?;
         self.sessions.insert(id.clone(), session);
+        self.install_checkout_write_lock(&id, &lease, checkout_lock);
 
         let init: Vec<String> = workspace
             .init_commands
@@ -936,7 +991,7 @@ impl Core {
         match self
             .store
             .hierarchy()
-            .release_write_lease_and_assign_read_only(&held.id, held.generation, now_ms)
+            .release_write_lease_and_assign_read_only(&held.id, held.generation, false, now_ms)
         {
             Ok(true) => {
                 if let Ok(session) = self.session_mut(id) {
@@ -944,6 +999,7 @@ impl Core {
                     session.worktree_path = None;
                     session.read_only_enforced = false;
                 }
+                self.drop_checkout_write_lock(&held.id);
                 self.push_workspace_lease(&workspace_id, None, now_ms);
                 tracing::info!(session = %id, lease = %held.id, "write lease released as the session ended");
             }
@@ -1388,6 +1444,10 @@ fn default_shell_pane() -> Pane {
 pub(super) fn pane_from_spec(spec: &NewPane) -> Pane {
     let mut pane = Pane::new(spec.kind);
     pane.title = spec.title.clone();
+    // A title supplied in an API request is an explicit user choice. Built-in and
+    // saved templates construct Panes directly and retain their lower-priority
+    // fallback titles.
+    pane.title_is_user_set = spec.title.is_some();
     pane.command = spec.command.clone();
     pane.args = spec.args.clone();
     pane.cwd = spec.cwd.clone();
@@ -1537,9 +1597,62 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::ids::PaneId;
-    use turn_core::model::{ProcessNode, SessionStatus};
+    #[cfg(target_os = "macos")]
+    use turn_core::model::NodeKind;
+    use turn_core::model::ProcessNode;
     use turn_core::state::Lifecycle;
     use turn_proto::{Request, ServerMessage};
+
+    #[cfg(target_os = "macos")]
+    struct GuardedProbeAgent;
+
+    #[cfg(target_os = "macos")]
+    impl turn_agents::AgentAdapter for GuardedProbeAgent {
+        fn id(&self) -> &'static str {
+            "guarded-probe-agent"
+        }
+
+        fn provider(&self) -> &'static str {
+            "turn-test"
+        }
+
+        fn executables(&self) -> &'static [&'static str] {
+            &["turn-read-only-test-agent"]
+        }
+
+        fn best_level(&self) -> turn_agents::IntegrationLevel {
+            turn_agents::IntegrationLevel::Heuristic
+        }
+
+        fn capabilities(&self) -> turn_agents::Capabilities {
+            turn_agents::Capabilities::default()
+        }
+
+        fn detect(&self, executable: &str) -> Option<PathBuf> {
+            (executable == "turn-read-only-test-agent").then(|| PathBuf::from("/bin/sh"))
+        }
+
+        fn prepare(
+            &self,
+            ctx: &turn_agents::LaunchContext,
+        ) -> Result<turn_agents::LaunchPlan, turn_agents::AdapterError> {
+            Ok(turn_agents::LaunchPlan {
+                command: "/bin/sh".into(),
+                args: ctx.user_args.clone(),
+                env: Vec::new(),
+                level: turn_agents::IntegrationLevel::Heuristic,
+                note: "test Agent executed through a real shell".into(),
+            })
+        }
+
+        fn normalise(
+            &self,
+            _payload: &serde_json::Value,
+            _ctx: &turn_agents::EventContext,
+        ) -> Vec<turn_core::event::TurnEvent> {
+            Vec::new()
+        }
+    }
 
     fn drain_session_events(
         frames: &mut tokio::sync::mpsc::Receiver<turn_proto::ServerFrame>,
@@ -2146,11 +2259,24 @@ mod tests {
             })
             .collect();
         assert_eq!(actual_panes, expected_panes);
-        assert!(harness
-            .core
-            .processes
-            .values()
-            .all(|process| process.session_id != id));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(session.read_only_enforced);
+            assert!(harness
+                .core
+                .processes
+                .values()
+                .any(|process| process.session_id == id));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!session.read_only_enforced);
+            assert!(harness
+                .core
+                .processes
+                .values()
+                .all(|process| process.session_id != id));
+        }
         let stored = harness
             .core
             .store
@@ -2240,6 +2366,10 @@ mod tests {
             restore: turn_core::model::RestoreBehaviour::Relaunch,
         };
         let pane = pane_from_spec(&spec);
+        assert!(
+            pane.title_is_user_set,
+            "an explicitly requested title must outrank a later OSC title"
+        );
         assert_eq!(pane.command.as_deref(), Some("cargo run"));
         assert_eq!(pane.args, vec!["--release".to_string()]);
         assert_eq!(pane.cwd.as_deref(), Some("api"));
@@ -2707,6 +2837,7 @@ mod tests {
         assert!(harness.core.processes.is_empty());
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn a_read_only_alternative_never_launches_without_a_technical_guard() {
         let mut harness = Harness::new().await;
@@ -2792,6 +2923,139 @@ mod tests {
             .processes
             .values()
             .all(|process| process.session_id != id));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_guarded_read_only_session_runs_shell_and_agent_panes_without_a_lease() {
+        let mut harness = Harness::new().await;
+        harness
+            .core
+            .registry
+            .register(std::sync::Arc::new(GuardedProbeAgent));
+        let checkout = harness._dir.path().join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let shell_ran = outside.path().join("shell-ran");
+        let agent_ran = outside.path().join("agent-ran");
+        let blocked_shell_write = checkout.join("shell-write");
+        let blocked_agent_write = checkout.join("agent-write");
+        let workspace = match harness
+            .core
+            .create_workspace(
+                "guarded-review".into(),
+                checkout.to_string_lossy().into_owned(),
+                10,
+            )
+            .unwrap()
+        {
+            Response::Workspace { workspace } => workspace.id,
+            other => panic!("unexpected {other:?}"),
+        };
+        let writer = match harness
+            .core
+            .create_session(
+                &workspace,
+                "Writer".into(),
+                None,
+                Some(vec![NewPane::new(PaneKind::AgentTree)]),
+                None,
+                Vec::new(),
+                11,
+            )
+            .unwrap()
+        {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let probe = |kind, command: &str, ran: &Path, blocked: &Path| NewPane {
+            kind,
+            title: None,
+            command: Some(command.into()),
+            args: vec![
+                "-c".into(),
+                "touch \"$1\"; touch \"$2\" 2>/dev/null || true; sleep 5".into(),
+                "turn-read-only-core-test".into(),
+                ran.to_string_lossy().into_owned(),
+                blocked.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(".".into()),
+            env: Vec::new(),
+            restore: turn_core::model::RestoreBehaviour::ReattachOnly,
+        };
+        let response = harness
+            .core
+            .create_read_only_session(
+                &workspace,
+                "Review current changes".into(),
+                None,
+                Some(vec![
+                    probe(PaneKind::Shell, "/bin/sh", &shell_ran, &blocked_shell_write),
+                    probe(
+                        PaneKind::Agent,
+                        "turn-read-only-test-agent",
+                        &agent_ran,
+                        &blocked_agent_write,
+                    ),
+                ]),
+                None,
+                Vec::new(),
+                12,
+            )
+            .unwrap();
+        let id = match response {
+            Response::Session { session } => session.id,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && (!shell_ran.exists() || !agent_ran.exists()) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let session = &harness.core.sessions[&id];
+        assert_eq!(session.mode, SessionMode::ReadOnly);
+        assert!(session.read_only_enforced);
+        assert_eq!(session.layout.panes().len(), 2);
+        assert!(session
+            .layout
+            .panes()
+            .iter()
+            .all(|pane| pane.node_id.is_some()));
+        assert!(session.tree.iter().any(|node| node.kind == NodeKind::Shell));
+        assert!(session.tree.iter().any(|node| node.kind == NodeKind::Agent));
+        assert_eq!(
+            harness
+                .core
+                .processes
+                .values()
+                .filter(|process| process.session_id == id)
+                .count(),
+            2
+        );
+        assert!(shell_ran.exists(), "the guarded shell pane did not execute");
+        assert!(agent_ran.exists(), "the guarded agent pane did not execute");
+        assert!(!blocked_shell_write.exists());
+        assert!(!blocked_agent_write.exists());
+
+        let lease = harness
+            .core
+            .store
+            .hierarchy()
+            .active_lease(&workspace)
+            .unwrap()
+            .expect("the writer keeps the only checkout lease");
+        assert_eq!(lease.session_id, writer);
+        assert_ne!(lease.session_id, id);
+
+        for process in harness
+            .core
+            .processes
+            .values()
+            .filter(|process| process.session_id == id)
+        {
+            let _ = process.pty.kill();
+        }
     }
 
     #[tokio::test]

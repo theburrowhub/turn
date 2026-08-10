@@ -35,6 +35,7 @@ directories = { workspace = true }
 # Turn injects and the token-bearing URL both pass through a shell now, so the
 # quoting has to be the well-tested kind rather than something hand-rolled here.
 shell-words = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

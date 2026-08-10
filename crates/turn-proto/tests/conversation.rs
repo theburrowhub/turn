@@ -104,7 +104,11 @@ fn a_full_working_conversation_completes_over_the_real_framing() {
     let pane_id = session.layout.panes()[0].id.clone();
 
     // 1. Handshake.
-    wire.client_sends(&ClientFrame::hello(Hello::new("turn-ui", "0.1.0")));
+    wire.client_sends(&ClientFrame::hello(Hello::new(
+        "turn-ui",
+        "0.1.0",
+        turn_proto::AuthToken::new("conversation-token"),
+    )));
     let hello = wire.daemon_reads();
     assert_eq!(hello.len(), 1);
     let agreed = hello[0]
@@ -159,6 +163,7 @@ fn a_full_working_conversation_completes_over_the_real_framing() {
                 node_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(screen.clone())),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(40, 120),
                 scrollback_truncated: false,
@@ -265,7 +270,11 @@ fn a_ui_restart_rebuilds_its_terminals_without_touching_the_processes() {
     let pane_id = session.layout.panes()[0].id.clone();
 
     // The UI is gone. It comes back and re-handshakes from scratch.
-    wire.client_sends(&ClientFrame::hello(Hello::new("turn-ui", "0.1.0")));
+    wire.client_sends(&ClientFrame::hello(Hello::new(
+        "turn-ui",
+        "0.1.0",
+        turn_proto::AuthToken::new("conversation-token"),
+    )));
     let agreed = wire.daemon_reads()[0].negotiate().unwrap();
     // A different pid would mean the daemon restarted too and nothing survived;
     // the same pid is how the UI knows its processes are still there.
@@ -299,6 +308,7 @@ fn a_ui_restart_rebuilds_its_terminals_without_touching_the_processes() {
                 node_id: Some(node_id),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(Grid::from_lines(&["still waiting"], 80))),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(24, 80),
                 // A long-running build overflowed the daemon's ring, and the
@@ -367,6 +377,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
                 node_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(daemon_screen.clone())),
+                scrollback: turn_proto::Scrollback::default(),
                 replay: TerminalBytes::default(),
                 size: PtySize::new(2, 40),
                 scrollback_truncated: false,
@@ -820,7 +831,11 @@ fn a_stale_client_is_told_which_side_is_old_and_the_connection_ends() {
     let mut wire = Wire::new();
 
     // A daemon from the future: it has moved on to 3..=4.
-    let mut stale = ClientFrame::hello(Hello::new("turn-ui", "0.0.9"));
+    let mut stale = ClientFrame::hello(Hello::new(
+        "turn-ui",
+        "0.0.9",
+        turn_proto::AuthToken::new("conversation-token"),
+    ));
     stale.v = 2;
     wire.client_sends(&stale);
 

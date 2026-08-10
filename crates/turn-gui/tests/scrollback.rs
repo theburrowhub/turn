@@ -25,8 +25,8 @@ use turn_core::ids::{PaneId, SessionId};
 use turn_core::model::PaneKind;
 use turn_proto::search::{SearchQuery, MAX_MATCHES};
 use turn_proto::{
-    ClientFrame, ClientMessage, Grid, Hello, LineDecoder, NewPane, PaneStream, PtySize, Request,
-    RequestId, Response, ServerFrame, ServerMessage,
+    AuthToken, ClientFrame, ClientMessage, Grid, Hello, LineDecoder, NewPane, PaneStream, PtySize,
+    Request, RequestId, Response, ServerFrame, ServerMessage,
 };
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -47,6 +47,8 @@ struct Client {
 
 impl Client {
     async fn connect(socket: &std::path::Path) -> Self {
+        let token = std::fs::read_to_string(turn_proto::ipc_auth_token_path(socket))
+            .expect("the daemon publishes its owner-only authentication token");
         let stream = UnixStream::connect(socket)
             .await
             .expect("the daemon's socket accepts a connection");
@@ -60,6 +62,7 @@ impl Client {
             .write(&ClientMessage::Hello(Hello::new(
                 "scrollback-test",
                 "0.1.0",
+                AuthToken::new(token),
             )))
             .await;
         let welcome = client.read_frame().await;

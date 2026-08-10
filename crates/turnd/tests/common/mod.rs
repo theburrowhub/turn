@@ -23,8 +23,8 @@ use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_proto::envelope::{Hello, ServerMessage, Welcome};
 use turn_proto::{
-    ClientFrame, Grid, LineDecoder, PaneAttachment, PaneStream, ProtoError, PtySize, Request,
-    RequestId, Response, ServerEvent, ServerFrame, TreeNodeView,
+    AuthToken, ClientFrame, Grid, LineDecoder, PaneAttachment, PaneStream, ProtoError, PtySize,
+    Request, RequestId, Response, ServerEvent, ServerFrame, TreeNodeView,
 };
 use turnd::{Config, DaemonHandle};
 
@@ -54,6 +54,21 @@ impl TestDaemon {
     /// as the plain terminal it is.
     pub async fn start_plain() -> Self {
         Self::start_with(AdapterRegistry::with_builtin).await
+    }
+
+    /// Starts a plain daemon that shares a host-lock fixture with otherwise
+    /// independent data directories.
+    pub async fn start_plain_with_checkout_lock_dir(lock_dir: impl AsRef<Path>) -> Self {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let config = Config::in_dir(dir.path())
+            .with_registry(AdapterRegistry::with_builtin())
+            .with_checkout_lock_dir(lock_dir);
+        let handle = turnd::start(config).await.expect("the daemon must start");
+        Self {
+            dir,
+            handle: Some(handle),
+            registry: AdapterRegistry::with_builtin,
+        }
     }
 
     pub async fn start_with(registry: fn() -> AdapterRegistry) -> Self {
@@ -150,11 +165,29 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(socket: &Path) -> Self {
+        let token_path = turn_proto::ipc_auth_token_path(socket);
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let token = loop {
+            match std::fs::read_to_string(&token_path) {
+                Ok(token) => break token,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!(
+                    "could not read auth token for {}: {error}",
+                    socket.display()
+                ),
+            }
+        };
+        Self::connect_with_token(socket, AuthToken::new(token)).await
+    }
+
+    pub async fn connect_with_token(socket: &Path, token: AuthToken) -> Self {
         let mut stream = UnixStream::connect(socket)
             .await
             .unwrap_or_else(|error| panic!("could not connect to {}: {error}", socket.display()));
 
-        let hello = ClientFrame::hello(Hello::new("turn-test", "0.1.0"));
+        let hello = ClientFrame::hello(Hello::new("turn-test", "0.1.0", token));
         write_frame(&mut stream, &hello).await;
 
         let mut client = Self {

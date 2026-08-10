@@ -1,7 +1,7 @@
 # The Turn daemon protocol
 
-Normative contract for the implemented `turn-proto` version **3**. Version 2 is historical context for the
-retained terminal-cell transport, not a supported navigation mode. Operations explicitly labelled planned
+Normative contract for the implemented `turn-proto` version **4**. Versions 2 and 3 are historical context
+for the retained terminal-cell and hierarchy transports, not supported modes. Operations explicitly labelled planned
 below are product commitments, not wire operations in this build.
 
 This is the contract between `turnd` — which owns every pty, all state and the
@@ -252,7 +252,7 @@ Every frame, in both directions, carries `v` — the protocol version it is writ
 against — alongside a `type` discriminator.
 
 ```jsonc
-{"v": 3, "type": "request", "id": "r-1", "request": {"op": "..."}}
+{"v": 4, "type": "request", "id": "r-1", "request": {"op": "..."}}
 ```
 
 Negotiating once and trusting the connection afterwards would be enough. The
@@ -307,8 +307,17 @@ because an image cell's *text* is a private-use marker with the `image` bit set 
 nothing recognisable rather than as somebody else's character — which is the reason the marker
 alphabet is in plane 16 rather than in the private-use area real fonts use.
 
-The cell protocol introduced in v2 is retained unchanged. This pre-release codebase serves v3 only:
-`MIN_PROTOCOL_VERSION == PROTOCOL_VERSION == 3`. Legacy list/detail operations may remain as administrative
+The cell protocol introduced in v2 and hierarchy introduced in v3 are retained unchanged.
+
+### What changed in version 4
+
+Version 4 makes the opening handshake an authority boundary. `hello` gains an `auth_token` read from the
+owner-only `<socket>.token` file. A v3 client would omit it and could no longer control its panes, so this is
+not an additive rollout. Missing, invalid and stale-generation values are refused with `unauthorized` before
+client registration. `rate_limited` is also added for per-client admission control.
+
+This pre-release codebase serves v4 only:
+`MIN_PROTOCOL_VERSION == PROTOCOL_VERSION == 4`. Legacy list/detail operations may remain as administrative
 endpoints, not as a dual-v2 compatibility mode.
 
 ### Compatibility rules
@@ -330,7 +339,8 @@ The client sends `hello`. The daemon calls `negotiate(v)` and replies `welcome` 
 
 ```jsonc
 // UI → daemon
-{"v":3,"type":"hello","client":"turn-gui","client_version":"0.1.0"}
+{"v":4,"type":"hello","client":"turn-gui","client_version":"0.1.0",
+ "auth_token":"<64 lowercase hexadecimal characters from $SOCKET.token>"}
 ```
 
 `accepts_encoding` may be included (`["base64"]`); an empty or absent list means
@@ -338,8 +348,8 @@ base64.
 
 ```jsonc
 // daemon → UI
-{"v":3,"type":"welcome","protocol_version":3,"min_protocol_version":3,
- "agreed_version":3,"daemon_version":"0.1.0","daemon_pid":51234,
+{"v":4,"type":"welcome","protocol_version":4,"min_protocol_version":4,
+ "agreed_version":4,"daemon_version":"0.1.0","daemon_pid":51234,
  "daemon_started_ms":1700000000000,
  "limits":{"max_line_bytes":8388608,"max_output_chunk_bytes":262144,
            "max_screen_cells":65536,"max_image_pixels":1048576,
@@ -347,7 +357,8 @@ base64.
  "output_encoding":"base64"}
 ```
 
-`daemon_pid` and `daemon_started_ms` are how a reconnecting UI tells "my socket
+The client re-reads `$SOCKET.token` before every connection attempt; a daemon restart rotates the capability.
+The value is never logged or formatted through `Debug`. `daemon_pid` and `daemon_started_ms` are how a reconnecting UI tells "my socket
 hiccupped" from "the daemon restarted and nothing survived" — which decides whether
 it must re-attach every pane.
 
@@ -362,11 +373,11 @@ to start: an unrecognised variant deserialises as an error the UI reports as
 looks fine above a sidebar that quietly lies about what is running.
 
 ```jsonc
-// daemon → UI — a daemon that has moved on to protocol 3..=4, client speaks 2
-{"v":2,"type":"rejected","error":{
+// daemon → UI — a daemon that has moved on to protocol 4..=5, client speaks 3
+{"v":3,"type":"rejected","error":{
   "code":"unsupported_version",
-  "message":"This Turn app is too old for the daemon it is talking to (app speaks protocol 2, daemon needs 3 or newer). Quit Turn and start it again to pick up the matching app",
-  "detail":"client=2 supported=3..=4"}}
+  "message":"This Turn app is too old for the daemon it is talking to (app speaks protocol 3, daemon needs 4 or newer). Quit Turn and start it again to pick up the matching app",
+  "detail":"client=3 supported=4..=5"}}
 ```
 
 The other direction names the daemon instead: *"The running Turn daemon is older
@@ -391,20 +402,22 @@ One shape for every failure. Code is what software branches on; `message` is
 shown to the user verbatim and is never parsed. `detail` is for logs.
 
 ```jsonc
-{"v":3,"type":"error","id":"r-9","error":{
+{"v":4,"type":"error","id":"r-9","error":{
   "code":"not_found","message":"No such session","detail":"sess_gone"}}
 
-{"v":3,"type":"error","error":{
+{"v":4,"type":"error","error":{
   "code":"malformed_message","message":"A message could not be understood"}}
 ```
 
 | Code | Meaning | Retryable | Fatal to connection |
 | --- | --- | --- | --- |
 | `unsupported_version` | Version windows do not overlap | no | **yes** |
+| `unauthorized` | Missing, invalid or stale daemon capability | no | **yes** |
 | `handshake_required` | A request arrived before `hello` | no | **yes** |
 | `already_handshaked` | A second `hello` on one connection | no | no |
 | `malformed_message` | Not valid JSON, or not a message this protocol defines | no | no |
 | `line_too_long` | Over the frame limit; the line was discarded | no | no |
+| `rate_limited` | This client exceeded its frame budget | **yes** | no |
 | `not_found` | The id does not exist | no | no |
 | `invalid_argument` | Well-formed, but the arguments make no sense | no | no |
 | `conflict` | Contradicts current state (closing the last pane) | no | no |
@@ -418,7 +431,7 @@ shown to the user verbatim and is never parsed. `detail` is for logs.
 `context`. Checkout conflicts are therefore self-contained:
 
 ```jsonc
-{"v":3,"type":"error","id":"r-lease","error":{
+{"v":4,"type":"error","id":"r-lease","error":{
   "code":"conflict","message":"The primary checkout already has a writer",
   "context":{"kind":"workspace_write_lease_conflict",
     "workspace_id":"ws_9f2a1c","checkout_id":"checkout_a4c9",
@@ -477,7 +490,7 @@ are also removed when their last client disconnects and when the daemon restarts
 state, not restorable process state.
 
 `rename_node`, audited `correct_relationship` and tree visibility/filter mutations are accepted product
-APIs but are **not protocol-v3 operations in this build**. A client must not send those operation names or
+APIs but are **not protocol-v4 operations in this build**. A client must not send those operation names or
 pretend a local rename changed daemon state. Their eventual contracts must verify the old edge, refuse
 cycles and cross-Session moves, and record the user's correction at explicit confidence before this table
 can list them as implemented.
@@ -591,13 +604,16 @@ assignment and acquires the lease in one atomic store
 transaction, before init commands, processes or Panes exist. A conflict rolls the transaction back, returns
 the typed context in §5 and leaves no partial Session. Duplicate never inherits an active lease; it must
 choose/reconcile a mode. Read-only replies include `read_only_enforced`, because metadata and agent guidance
-are not enforcement. Worktree replies include the new checkout and declared shared resources.
+are not enforcement. True means the daemon constructed the platform process guard and may launch the
+configured Layout; false means commands remain stopped. Worktree replies include the new checkout and
+declared shared resources.
 
 When the failed request was `create_session_from_template`, the client retains only its original Template
 identity and interpolation inputs, then uses the matching `*_from_template` alternative. The daemon reloads
 the authoritative Template and applies the same Layout, commands, relative cwd, environment, Attention,
 tmux and name-pattern rules inside the selected safe checkout. A read-only alternative preserves that
-configuration but launches no process while enforcement is unavailable; a worktree alternative remaps
+configuration and launches it only after enforcement is active; while enforcement is unavailable it starts
+no process. A worktree alternative remaps
 absolute primary-checkout Session/Pane cwd values to the same repository-relative location in the isolated
 checkout. Clients must not reconstruct a Template from `TemplateSummary`. The non-Template alternatives
 remain the explicit blank/shell path.
@@ -793,7 +809,7 @@ A muted session still badges. Muting silences the interruption, not the evidence
 // The user fixing a state Turn got wrong. Recorded with
 // EventSource::UserCorrection at explicit confidence: on the question of what is
 // actually happening in their terminal, the human outranks every heuristic.
-{"v":3,"type":"request","id":"r-6","request":{
+{"v":4,"type":"request","id":"r-6","request":{
   "op":"correct_state","session_id":"sess_4b71e0","node_id":"proc_7a12ff",
   "turn":{"kind":"active"},"note":"still working"}}
 ```
@@ -805,7 +821,7 @@ A muted session still badges. Muting silences the interruption, not the evidence
 | `update_user_activity` | `context` | `effects` |
 
 ```jsonc
-{"v":3,"type":"request","id":"r-4","request":{
+{"v":4,"type":"request","id":"r-4","request":{
   "op":"update_user_activity","context":{
     "last_keystroke_ms":1700000000000,"app_foreground":true,
     "active_session":"sess_4b71e0","sensitive_operation":false}}}
@@ -843,39 +859,49 @@ lease. A fenced explicit release is valid only after no runtime node owned by th
 the same atomic operation demotes the Session to `read_only`. Before restoring Sessions or emitting any
 heartbeat, a new daemon changes every non-`released` lease
 to `recovery_required` while preserving its id, generation and previous heartbeat. Loading the former owner
-never auto-adopts that authority; release/reacquisition remains explicit.
+never auto-adopts that authority. An explicit `acquire_workspace_write_lease` may promote a read-only
+Session only after all of its runtime nodes have ended; success acquires the lease and changes the Session to
+`main_checkout` in the same durable transition.
+
+The wire lease is also the owner record for a uid-scoped host checkout lock independent of the daemon's
+data directory. Acquisition takes that lock before committing SQLite; heartbeat and launch require both.
+Symlink aliases collide and distinct checkout/worktree directory identities do not. If contention comes from
+another daemon, `workspace_write_lease_conflict` carries that daemon's owner but omits `focus_owner`, because
+the current socket cannot focus a Session owned by another daemon; the remaining alternatives are
+`create_read_only`, `create_isolated_worktree`, and `cancel`. A surviving writer process can retain this lock
+after daemon loss, so timeout or daemon death alone never authorises takeover.
 
 ### Examples
 
 ```jsonc
-{"v":3,"type":"request","id":"r-1","request":{
+{"v":4,"type":"request","id":"r-1","request":{
   "op":"get_hierarchy","surface_id":"main-window","include_archived":false}}
 
 // Cells, because the field is absent. What a renderer wants.
-{"v":3,"type":"request","id":"r-2","request":{
+{"v":4,"type":"request","id":"r-2","request":{
   "op":"attach_pane","session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
   "size":{"rows":40,"cols":120}}}
 
 // The escape stream instead, for something that needs the bytes themselves.
-{"v":3,"type":"request","id":"r-2b","request":{
+{"v":4,"type":"request","id":"r-2b","request":{
   "op":"attach_pane","session_id":"sess_4b71e0","pane_id":"pane_11c3d8",
   "size":{"rows":40,"cols":120},"stream":"bytes"}}
 
 // Answering an agent's y/n prompt. There is no "approve" request; this is it.
-{"v":3,"type":"request","id":"r-3","request":{
+{"v":4,"type":"request","id":"r-3","request":{
   "op":"write_pty","session_id":"sess_4b71e0","node_id":"proc_7a12ff","data":"eQ0="}}
 
-{"v":3,"type":"request","id":"r-5","request":{
+{"v":4,"type":"request","id":"r-5","request":{
   "op":"close_session","session_id":"sess_4b71e0","disposition":"keep_processes"}}
 
 // Review first. This response writes no PTY.
-{"v":3,"type":"request","id":"r-7","request":{
+{"v":4,"type":"request","id":"r-7","request":{
   "op":"prepare_context_handoff","session_id":"sess_4b71e0",
   "source_node_id":"proc_source","target_node_id":"proc_reviewer",
   "instruction":"Check the assumptions before continuing."}}
 
 // After displaying the exact context_handoff.body and receiving explicit consent:
-{"v":3,"type":"request","id":"r-8","request":{
+{"v":4,"type":"request","id":"r-8","request":{
   "op":"deliver_context_handoff","session_id":"sess_4b71e0",
   "handoff_id":"handoff_86d451"}}
 ```
@@ -917,18 +943,19 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `context_handoff` | `handoff: ContextHandoffView` — ids, safe labels, exact redacted `body`, fact count and redaction flag |
 
 ```jsonc
-{"v":3,"type":"response","id":"r-3","response":{"result":"ack"}}
+{"v":4,"type":"response","id":"r-3","response":{"result":"ack"}}
 ```
 
 ### `attached` — the feature made visible
 
 ```jsonc
-{"v":3,"type":"response","id":"r-2","response":{"result":"attached","attachment":{
+{"v":4,"type":"response","id":"r-2","response":{"result":"attached","attachment":{
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "stream":"cells",
   "screen":{"rows":40,"cols":120,"cursor":[1,0],
             "runs":[[{"t":"ready","n":5,"f":[0,205,0]},{"n":115}],
                     [{"n":120}],"…"]},
+  "scrollback":{"cols":120,"rows":[[{"t":"previous output","n":15},{"n":105}]]},
   "size":{"rows":40,"cols":120},
   "scrollback_truncated":false,"bytes_seen":12,"next_seq":0}}}
 ```
@@ -939,18 +966,22 @@ pane exactly as the user left it.
 
 Exactly one payload is present, decided by `stream`:
 
-- **`screen`** for a cells attachment — a `Grid` (§2.2). `replay` is absent.
+- **`screen`** for a cells attachment — a `Grid` (§2.2), plus bounded styled
+  `scrollback` rows when history exists. `replay` is absent.
 - **`replay`** for a byte attachment — the **parsed screen re-emitted**, not the raw
   scrollback, because a truncated raw ring can begin mid-escape-sequence and corrupt the
   receiving terminal. `screen` is absent.
 
 Sending both would double the cost of every attach to serve a client that asked for one.
 
-- `size` is the size the client asked for, applied to the pty *before* the screen or
-  replay was taken.
-- `scrollback_truncated` means output was dropped from the daemon's ring before this
-  point. The screen is still correct; the history above it is incomplete, and the UI
-  should say so rather than let the user scroll up into a lie.
+- `size` is the applied live PTY size. For a display-only terminal recovered after a
+  daemon restart it is the historical size the archived grid was recorded at.
+- `scrollback` is oldest-first compact `CellRun` rows, validated against its `cols`.
+  It is capped at 5,000 rows and a 3 MiB serialized budget so the whole attachment
+  stays inside the frame limit.
+- `scrollback_truncated` means output was discarded by memory/disk rotation or the
+  attachment budget. The screen is still correct; the history above it is incomplete,
+  and the UI must mark the boundary rather than let the user scroll into a lie.
 - `next_seq` is the `seq` the next update for this attachment will carry — a
   `pane_screen` for cells, a `pane_output` for bytes — so a client can detect a gap
   between what it was handed and the live stream.
@@ -962,7 +993,7 @@ Sending both would double the cost of every attach to serve a client that asked 
 ### `screen` — the answer to `resync_pane`
 
 ```jsonc
-{"v":3,"type":"response","id":"r-7","response":{"result":"screen",
+{"v":4,"type":"response","id":"r-7","response":{"result":"screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "next_seq":312,"grid":{"rows":40,"cols":120,"…":"…"}}}
 ```
@@ -1094,7 +1125,7 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 
 ```jsonc
 // The rows that differ. The everyday case.
-{"v":3,"type":"event","event":{"event":"pane_screen",
+{"v":4,"type":"event","event":{"event":"pane_screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":312,"update":{
     "mode":"rows","size":{"rows":40,"cols":120},"cursor":[7,18],
@@ -1103,7 +1134,7 @@ The default terminal push. It carries **what changed**, in one of two shapes, ta
 
 // The whole screen. Sent on resync, after a resize, and when a diff would not be
 // smaller.
-{"v":3,"type":"event","event":{"event":"pane_screen",
+{"v":4,"type":"event","event":{"event":"pane_screen",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":313,"update":{"mode":"full","grid":{"rows":40,"cols":120,"…":"…"}}}}
 ```
@@ -1167,11 +1198,11 @@ already accounted for in the next screen it takes. That is why there is no
 ### 8.3 Bytes: `pane_output`
 
 ```jsonc
-{"v":3,"type":"event","event":{"event":"pane_output",
+{"v":4,"type":"event","event":{"event":"pane_output",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
   "seq":41,"data":"b2sNCg=="}}
 
-{"v":3,"type":"event","event":{"event":"pane_output_gap",
+{"v":4,"type":"event","event":{"event":"pane_output_gap",
   "session_id":"sess_4b71e0","pane_id":"pane_11c3d8","dropped":12,"resume_seq":53}}
 ```
 
@@ -1200,7 +1231,7 @@ the difference between a daemon that idles and one that does not.
 ### State changes
 
 ```jsonc
-{"v":3,"type":"event","event":{"event":"node_state_changed",
+{"v":4,"type":"event","event":{"event":"node_state_changed",
   "session_id":"sess_4b71e0","node_id":"proc_7a12ff",
   "lifecycle":{"kind":"alive"},"turn":{"kind":"done"},
   "display_state":"completed_turn"}}
@@ -1219,7 +1250,7 @@ supervisor sweep) rather than being filled in with a fabricated cause.
 ### The event stream
 
 ```jsonc
-{"v":3,"type":"event","event":{"event":"turn_event_emitted","turn_event":{
+{"v":4,"type":"event","event":{"event":"turn_event_emitted","turn_event":{
   "id":"evt_c41b90","timestamp_ms":1700000000000,"workspace_id":null,
   "session_id":"sess_4b71e0","node_id":"proc_7a12ff","parent_node_id":null,
   "agent":{"provider":null,"tool":null,"model":null},
@@ -1239,7 +1270,7 @@ supervisor sweep) rather than being filled in with a fabricated cause.
 ### The unified hierarchy
 
 ```jsonc
-{"v":3,"type":"event","event":{"event":"hierarchy_changed","snapshot":{
+{"v":4,"type":"event","event":{"event":"hierarchy_changed","snapshot":{
   "revision":18,"tree_state":{"surface_id":"main-window","selected":null,"expanded":[]},
   "workspaces":[{"workspace":{"id":"ws_9f2a1c","name":"turn",
       "lease_reconciliation_required":false},"sessions":[{"session":{
@@ -1273,7 +1304,7 @@ never recomputes it.
 ### Restore
 
 ```jsonc
-{"v":3,"type":"event","event":{"event":"restore_result",
+{"v":4,"type":"event","event":{"event":"restore_result",
   "session_id":"sess_4b71e0","state":"partially_restored","needs_explanation":true,
   "panes":[
     {"pane_id":"pane_11c3d8","node_id":"proc_7a12ff",
@@ -1330,8 +1361,8 @@ Identity: `id`, `workspace_id`, `name`, `note`, `cwd`, `status`
 (`active`\|`paused`\|`archived`).
 
 Checkout safety: `mode` (`main_checkout`\|`read_only`\|`isolated_worktree`), `checkout_id?`,
-`worktree_path?`, `read_only_enforced`. A read-only badge must not imply technical enforcement when the last
-field is false.
+`worktree_path?`, `read_only_enforced`. A read-only badge must say whether the guard is enforced; when the
+last field is false it must also explain that process launch is disabled.
 
 Derived state — **the client renders these, it never computes them**:
 
@@ -1415,9 +1446,10 @@ from typing, and `mouse` (`none` \| `press` \| `button_motion` \| `any_motion`) 
 whether a wheel notch is a mouse report or Turn's own scrollback. Getting any of them
 wrong breaks arrow keys inside `vim`.
 
-`scrollback_offset` and `scrollback_len` are reported as 0 today: the daemon serves the
-live screen only, and there is no request that asks for history. A client should treat
-them as "no history offered" rather than as "no history exists".
+The attached live `Grid` starts with `scrollback_offset = 0`; `PaneAttachment.scrollback`
+seeds the client's transcript. The client then reports that transcript's length in
+`scrollback_len` and changes `scrollback_offset` as the user scrolls. A resync replaces
+the live grid, while a fresh attach is the operation that re-seeds durable history.
 
 `notices` is what the pane **refused to draw**, and it is the one field that is not the
 program's: a list of `{text, count}` where each `text` is a complete sentence Turn
@@ -1545,19 +1577,22 @@ descriptions has to argue with a test first.
    no force/steal flag; generation mismatch is a conflict, not a retry loop.
 6. **Navigation cannot fabricate ownership.** There is no unconstrained `move_node`, no client-supplied
    confidence promotion and no `tree.node_selected` domain event. Audited, cycle-checked relationship
-   correction is planned; protocol v3 refuses to approximate it with a local-only mutation.
+   correction is planned; protocol v4 refuses to approximate it with a local-only mutation.
 
 One more, on the transport, which this crate does not implement but assumes:
-`$SOCKET` is owner-only, and the hook server binds `127.0.0.1` with a per-node
-token. Never `0.0.0.0`.
+`$SOCKET` is owner-only, the kernel peer UID is checked, at most 32 connections are admitted and the
+per-generation token file is owner-only. The hook server is a separate listener that binds `127.0.0.1`
+with independent per-node tokens. Never `0.0.0.0` and never reuse an IPC token as hook authority.
 
 ---
 
 ## 11. Implementing a client
 
-1. Connect to `$SOCKET`. Send `hello` as the first frame.
-2. Read frames with a decoder matching §1. On `rejected`, show
-   `error.message` and stop — do not retry.
+1. Read the owner-only `$SOCKET.token`, connect to `$SOCKET`, and send `hello` with that capability as the
+   first frame. Re-read it for every reconnect because daemon restart revokes the old generation.
+2. Read frames with a decoder matching §1. On an `unauthorized` rejection, discard the presented token,
+   re-read `$SOCKET.token` and reconnect with normal backoff; never resend the same credential on the same
+   connection. On every other `rejected`, show `error.message` and stop — do not retry.
 3. Store `agreed_version`, `daemon_pid` and `limits` from `welcome`. Stamp `v` on
    every frame you send.
 4. Mint or restore a stable `surface_id`, then call `get_hierarchy`. Render that snapshot as the one
@@ -1583,5 +1618,5 @@ token. Never `0.0.0.0`.
 
 ---
 
-*Protocol version 3. The Rust request/response catalogue is authoritative for the exact variant count;
+*Protocol version 4. The Rust request/response catalogue is authoritative for the exact variant count;
 this document is authoritative for hierarchy, checkout-safety, revision and recovery semantics.*

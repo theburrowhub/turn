@@ -19,7 +19,7 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | Crate | Status | Tests | Notes |
 | --- | --- | --- | --- |
 | `turn-core` | Built | reproduce | Domain, state, attention and ADR-040 hierarchy/lease/preview values. |
-| `turn-proto` | Built | reproduce | Framing, terminal cells and implemented protocol-v3 hierarchy operations. |
+| `turn-proto` | Built | reproduce | Framing, terminal cells, protocol-v3 hierarchy and protocol-v4 authenticated handshakes. |
 | `turn-store` | Built | reproduce | Append-only migrations, store-wide fences, hierarchy and secure hook cleanup. |
 | `turn-pty` | Built | reproduce | Ptys, buffers, supervision. |
 | `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
@@ -265,6 +265,9 @@ linked PR reference, pin/favourite, `parent_session` for duplicates, checkout as
 for an empty tree — a Session whose processes have not started is not a mystery — and otherwise the
 tree's aggregate. `sidebar_rank()` returns `(pinned, demands_user, severity, last_activity_ms)` as a
 tuple rather than an `Ord` impl, because ordering is a presentation concern that may differ per view.
+`read_only_enforced` is launcher evidence, not a user preference: on macOS it means every Session process
+is wrapped in the checkout write guard; false means the platform guard is unavailable and no process may
+start.
 
 **`WorkspaceWriteLease`** — daemon-owned exclusivity for the primary checkout, not for a window or focus.
 The semantic record carries Workspace, Session and checkout identity, `ExclusiveWrite`, state, acquisition
@@ -272,6 +275,11 @@ time and heartbeat. At most one non-released lease exists for a canonical primar
 atomic and precedes Session insertion, init commands and process/Pane materialisation. Heartbeat expiry is
 evidence for reconciliation, never authority to steal. Closing a UI, archiving while processes live or
 `KeepProcesses` does not release it.
+
+SQLite is only the durable half of that authority. On Unix, every active lease also owns a uid-scoped host
+lock keyed by the checkout directory's device/inode identity. Symlink aliases and renames converge; distinct
+Git worktree directories do not. The daemon takes that lock before the SQLite transaction and preallocates
+one `LeaseId` for both records. Heartbeat and process launch require both halves.
 
 **`ProcessNode` / `SessionTree`** — the process hierarchy. Stored **flat with parent pointers**, not as
 nested structs: processes arrive out of order (a child's hook can land before the parent's spawn
@@ -876,9 +884,10 @@ through to a different unique child. Node-less Attention is durably scoped by au
 optional external worker id, so a prompt submission resolves only that exact provisional flow and cannot
 clear a sibling or another parent in the same Session.
 
-Creating a `main_checkout` Session is one daemon transaction boundary: canonicalise and validate the
-checkout plus the effective Session/Pane working directories, persist the Session/assignment and acquire its
-exclusive lease atomically, then run init commands and materialise processes/Panes. Working-directory
+Creating a `main_checkout` Session is one authority boundary: canonicalise and validate the checkout plus
+the effective Session/Pane working directories, acquire its host-global checkout lock, then atomically
+persist the Session/assignment and matching SQLite lease before running init commands or materialising
+processes/Panes. Working-directory
 validation is repeated immediately before every PTY launch because symlinks and stored Layouts can change
 after creation. The canonical cwd must be contained by the Session's registered primary or worktree checkout;
 this constrains where a process starts, not which files same-user code can later access. A conflict rolls the
@@ -887,6 +896,15 @@ effect. Duplicating a Session never copies an active lease. Release is fenced an
 runtime node owned by the Session remains running; that same atomic operation demotes the Session to
 `ReadOnly`. UI close, archive and `KeepProcesses` are not release signals.
 
+A `read_only` Session takes the same final cwd-validation path but never takes the primary write lease. On
+macOS `turn-pty` wraps every Pane, relaunch and init process with one inherited Seatbelt profile that denies
+`file-write*` for the canonical checkout and any external Git directory/common directory. The original
+command and arguments remain inside that wrapper, so descendants inherit the same boundary. Creation sets
+`read_only_enforced=true` only after constructing the profile; every later spawn reconstructs it rather than
+trusting the stored bit. If `/usr/bin/sandbox-exec` or a safe canonical target is unavailable, the Session
+persists visibly unenforced and launches nothing. Promotion is a separate lease request and is refused until
+all guarded processes have ended.
+
 #### Why the daemon exists from day one, and exactly what it buys
 
 **It buys:** the UI can crash, be quit, be hot-reloaded during development, or be updated, and the
@@ -894,10 +912,12 @@ Agents keep running. Reconnecting re-attaches — for each visible Pane, the UI 
 runtime node, receives the daemon-owned screen/replay and subscribes to the live stream. The Pane is a view;
 the runtime node, not that view, owns the PTY buffer.
 
-**It does not buy:** survival of the daemon exiting. The pty master lives in the daemon's file table,
-and `PtyProcess::drop` deliberately terminates the process it owns — `terminate()` then `kill()` —
-because closing a Session must not leave strays holding ptys, which are a finite kernel resource. When
-the daemon goes, the ptys close and the children get SIGHUP.
+**It does not buy:** general survival or reattachment after the daemon exits. The pty master lives in the
+daemon's file table, and `PtyProcess::drop` deliberately terminates the direct process it owns —
+`terminate()` then `kill()` — because closing a Session must not leave strays holding ptys, which are a
+finite kernel resource. Descendants can nevertheless ignore terminal loss or outlive that direct process. A
+main-checkout descendant inherits the checkout lock descriptor, so it remains a safety owner even though
+Turn can no longer reattach to its PTY.
 
 This is stated plainly rather than papered over, because the honest boundary is what `Lifecycle` is
 shaped around. `Orphaned` (stored runtime may still exist, handle lost) and `Lost` (the recorded runtime
@@ -921,6 +941,17 @@ queue is loaded without replay: id, age, confidence, priority, snooze and acknow
 its exact node or unresolved parent/external-id correlation scope survives as well. Interaction demands
 whose exact node/parent no longer runs are removed; postmortem evidence explicitly marked
 `survives_owner_exit` (for example failure/completion facts) remains.
+
+Separate data directories share a second kernel boundary for checkout writes. The uid-owned stable
+platform-data `checkout-locks` directory (independent of `TURN_DATA_DIR`) contains retained lock inodes
+keyed by checkout device and
+inode plus atomically replaced owner metadata. A contender takes `LOCK_EX|LOCK_NB`; failure returns the
+other daemon's typed lease owner and only locally actionable read-only/worktree/cancel alternatives. A
+successful main-checkout spawn preserves only a CLOEXEC duplicate of that descriptor through
+portable-pty's pre-exec close pass and clears CLOEXEC in the forked child. The daemon and every descendant
+therefore share one open-file description; no code
+calls `LOCK_UN`, and the kernel releases authority only after the final daemon/process copy closes. Explicit
+release first demotes SQLite, then drops the descriptor, so its only gap is conservative contention.
 
 #### Event flow
 
@@ -979,10 +1010,11 @@ daemon vertical. Planned operations are labelled as such in `docs/PROTOCOL.md`; 
 
 ### 6.1 turn-proto — the daemon↔UI protocol
 
-**Status: protocol v3 hierarchy vertical built.** Framing, terminal cell transport,
+**Status: protocol v4 authenticated hierarchy vertical built.** Framing, terminal cell transport,
 request correlation and the safety omissions remain unchanged. Version 3 replaces independent navigation
 bootstrap with one revisioned hierarchy projection and adds structured checkout conflict, Preview, binding
-and per-surface tree-state operations. It is still types only — no I/O, tokio or socket — so the contract can
+and per-surface tree-state operations. Version 4 makes the opening `hello` carry the daemon generation's
+ephemeral capability. The protocol crate is still types only — no I/O, tokio or socket — so the contract can
 be tested without either process existing.
 
 **The connection.** A versioned envelope (`ClientFrame` / `ServerFrame`) carries four things: a
@@ -991,15 +1023,15 @@ unsolicited `event` pushes at any time.
 
 ```text
 UI                                             turnd
- │  {"v":3,"type":"hello",…}                      │
+ │  {"v":4,"type":"hello","auth_token":…}       │
  │ ─────────────────────────────────────────────► │
- │                    {"v":3,"type":"welcome",…}  │   negotiate()
+ │                    {"v":4,"type":"welcome",…}  │   authenticate + negotiate()
  │ ◄───────────────────────────────────────────── │
- │  {"v":3,"type":"request","id":"r-1",…}         │
+ │  {"v":4,"type":"request","id":"r-1",…}         │
  │ ─────────────────────────────────────────────► │
- │                   {"v":3,"type":"response",…}  │   correlated by id
+ │                   {"v":4,"type":"response",…}  │   correlated by id
  │ ◄───────────────────────────────────────────── │
- │                      {"v":3,"type":"event",…}  │   unsolicited, any time
+ │                      {"v":4,"type":"event",…}  │   unsolicited, any time
  │ ◄───────────────────────────────────────────── │
 ```
 
@@ -1167,7 +1199,8 @@ The schema additions are Session mode/checkout/enforcement fields and
 `workspace_checkouts`, `checkout_write_fences`, `workspace_write_leases`, `activity_previews`,
 `pane_node_bindings` and `tree_ui_state`. `checkout_write_fences` is keyed by canonical path and survives
 Workspace/lease recreation, so generation is monotonic for that filesystem identity inside one canonical
-data directory. Separate data directories do not yet share a checkout-scoped OS lock.
+data directory. The host lock joins those per-store fences across deliberately separate data directories;
+the preallocated lease id keeps owner diagnostics stable across both boundaries.
 Partial uniqueness treats every non-released lease state — including stale/recovery-required — as blocking.
 
 **Codec.** Two column shapes, chosen per column. `tag` for payload-free enums, which land as a bare
@@ -1361,6 +1394,14 @@ Two details matter more than they look:
 - **The same sanitisation applies to screen rows** (`sanitise_row`), not only titles, because anything the
   UI renders as text can carry the same trick.
 
+The daemon projects a changed OSC 0/2 title onto the exact PTY-backed `ProcessNode`, persists it, and
+pushes the refreshed tree/hierarchy. It observes titles even when no window is attached, so reopening the
+UI starts from the title the process last set. The node title is deliberately a low-priority
+`NameSource::ProcessTitle`: declared, integration, structured-task and user-renamed Agent names remain
+authoritative. Pane chrome uses the bound node's title unless the Pane carries `title_is_user_set`; no
+title update mutates Layout, focus or Attention. The real-PTY acceptance path is
+`core::titles::tests::real_ptys_keep_dynamic_titles_isolated_and_preserve_stronger_names`.
+
 Invalid UTF-8 in a title is replaced rather than fatal, and a single enormous line is bounded by the
 terminal geometry.
 
@@ -1447,20 +1488,25 @@ So the net position is: one injection vector removed, one containment layer remo
 than the second in this specific product, because the containment only ever mattered if the injection
 succeeded — but it is a trade, not a free win.
 
-### 7.10 Checkouts, leases and previews — **implemented for the first vertical**
+### 7.10 Checkouts, leases and previews — **implemented for the first vertical and guarded read-only on macOS**
 
-Write exclusivity is enforced on canonical checkout identity, not a user-supplied path string. Session,
+Write exclusivity is enforced on checkout filesystem identity, not a user-supplied path string. Session,
 Workspace and checkout ownership must agree before acquisition. Symlink/path aliases cannot create a second
-lease, and worktree creation must stay below an approved parent and report shared resources it does not
-isolate. Read-only mode exposes whether the guard is enforced; an agent prompt saying “do not write” is not
-a security boundary.
+lease even across data directories, while distinct worktree directory inodes retain independent locks.
+Worktree creation must stay below an approved parent and report shared resources it does not isolate.
+Read-only mode exposes whether its OS guard is enforced; an agent prompt saying “do not write” is
+not a security boundary. On macOS the guard denies checkout and external-Git-metadata writes for the whole
+process tree. Other platforms fail closed by leaving the Session visible but its commands stopped.
 
 Lease acquisition happens before any init command or process spawn. Heartbeats and fencing generations
 prevent a stale daemon/client from releasing a newer owner's lease, but time alone never proves the old
 writer is dead. Separately, the daemon acquires an advisory exclusive lock on the canonical data directory
 before SQLite, migrations or restore; socket aliases therefore cannot create two cooperating store owners.
-The lock file is never removed, uses a stable inode and is released by the kernel on process death. Unsupported
-or unsafe filesystems fail closed. Migration 003 grants no lease and changes no filesystem permissions.
+The data-dir and checkout lock files are never removed, use stable inodes and are released by the kernel
+when their final owning descriptor closes. Main-checkout processes inherit only their checkout descriptor,
+so a daemon crash cannot admit a second writer while a descendant survives. Heartbeats and launches fail
+closed unless SQLite and the host lock agree. Unsupported or unsafe filesystems fail closed. Migration 003
+grants no lease and changes no filesystem permissions.
 
 Activity Preview and agent names cross an untrusted-text boundary before entering navigation chrome. They
 use the same control/bidi sanitisation as titles, known-secret redaction, strict character/history limits

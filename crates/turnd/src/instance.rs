@@ -163,7 +163,7 @@ impl Drop for DataDirLock {
 /// the kernel on process death. Any unsupported-filesystem error is propagated: a
 /// best-effort ownership guard is not an ownership guard.
 #[cfg(unix)]
-fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     loop {
         // SAFETY: `file` owns a valid descriptor for the duration of the call. The
@@ -180,7 +180,7 @@ fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "data-directory process locking is unavailable on this platform",
@@ -191,7 +191,7 @@ fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
 /// inode other contenders will no longer open. This is an acquisition check; the
 /// lock file must never be removed during daemon operation or clean shutdown.
 #[cfg(unix)]
-fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let opened = file.metadata()?;
     let named = std::fs::symlink_metadata(path)?;
@@ -205,7 +205,7 @@ fn verify_lock_identity(file: &File, path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn verify_lock_identity(_file: &File, _path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_lock_identity(_file: &File, _path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -235,8 +235,11 @@ pub enum Occupant {
     Absent,
     /// A file is there but nothing answers. Safe to remove.
     Stale,
-    /// A Turn daemon answered.
+    /// A Turn daemon completed an authenticated handshake.
     Live { pid: u32, version: String },
+    /// A Turn daemon rejected the probe before identifying its process. The socket
+    /// is still live and must not be taken over; no sentinel pid is invented.
+    LiveUnidentified,
     /// Something answered, but not with Turn's handshake. Not ours to remove.
     Foreign,
 }
@@ -251,7 +254,7 @@ pub async fn probe(socket: &Path) -> Occupant {
         // gone. This is the ordinary case after a crash or a hard reboot.
         return Occupant::Stale;
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, handshake(stream)).await {
+    match tokio::time::timeout(PROBE_TIMEOUT, handshake(stream, socket)).await {
         Ok(Some(occupant)) => occupant,
         // A connection that accepts and then says nothing is a socket held by
         // something that is not going to talk to us.
@@ -260,9 +263,13 @@ pub async fn probe(socket: &Path) -> Occupant {
 }
 
 /// Completes a handshake far enough to identify the peer.
-async fn handshake(stream: UnixStream) -> Option<Occupant> {
+async fn handshake(stream: UnixStream, socket: &Path) -> Option<Occupant> {
     let (read_half, mut write_half) = stream.into_split();
-    let hello = ClientFrame::hello(Hello::new("turnd-probe", crate::DAEMON_VERSION));
+    let hello = match probe_auth_token(socket) {
+        Some(token) => Hello::new("turnd-probe", crate::DAEMON_VERSION, token),
+        None => Hello::unauthenticated("turnd-probe", crate::DAEMON_VERSION),
+    };
+    let hello = ClientFrame::hello(hello);
     let frame = turn_proto::framing::encode(&hello).ok()?;
     write_half.write_all(&frame).await.ok()?;
     write_half.flush().await.ok()?;
@@ -275,14 +282,19 @@ async fn handshake(stream: UnixStream) -> Option<Occupant> {
             pid: welcome.daemon_pid,
             version: welcome.daemon_version,
         }),
-        // A refusal is still a Turn daemon: it just speaks a different protocol
-        // version. Taking its socket would be worse than telling the user.
-        ServerMessage::Rejected { .. } => Some(Occupant::Live {
-            pid: 0,
-            version: "unknown".to_string(),
-        }),
+        // Authentication and version refusals are both daemon-shaped answers.
+        // Taking the socket would be worse than admitting the peer did not disclose
+        // a pid to this probe.
+        ServerMessage::Rejected { .. } => Some(Occupant::LiveUnidentified),
         _ => Some(Occupant::Foreign),
     }
+}
+
+/// Reads just enough of the sidecar to let a probe obtain a current daemon's PID.
+/// Absence or an unsafe/malformed file falls back to an unauthenticated probe, which
+/// can still identify a `rejected` response without gaining any daemon authority.
+fn probe_auth_token(socket: &Path) -> Option<turn_proto::AuthToken> {
+    turn_proto::read_ipc_auth_token(socket).ok()
 }
 
 /// Binds the socket, refusing to displace a live daemon.
@@ -299,6 +311,12 @@ pub async fn bind_exclusive(socket: &Path) -> Result<UnixListener> {
             return Err(DaemonError::AlreadyRunning {
                 socket: socket.to_path_buf(),
                 pid,
+            });
+        }
+        Occupant::LiveUnidentified => {
+            tracing::info!(socket = %socket.display(), "an unidentified Turn daemon is already running");
+            return Err(DaemonError::AlreadyRunningUnidentified {
+                socket: socket.to_path_buf(),
             });
         }
         Occupant::Foreign => {
@@ -416,6 +434,32 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("turnd.sock");
         assert_eq!(probe(&socket).await, Occupant::Absent);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_probe_is_live_without_inventing_pid_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("turnd.sock");
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = tokio::spawn(async move {
+            let (read, mut write) = server.into_split();
+            let mut lines = BufReader::new(read).lines();
+            assert!(lines.next_line().await.unwrap().is_some());
+            let error = turn_proto::ProtoError::new(
+                turn_proto::ErrorCode::Unauthorized,
+                "the probe has no current capability",
+            );
+            write
+                .write_all(&turn_proto::encode(&ServerFrame::rejected(error)).unwrap())
+                .await
+                .unwrap();
+        });
+
+        assert_eq!(
+            handshake(client, &socket).await,
+            Some(Occupant::LiveUnidentified)
+        );
+        peer.await.unwrap();
     }
 
     #[tokio::test]
