@@ -529,6 +529,23 @@ impl AttentionManager {
         }
     }
 
+    /// Drops everything the manager holds about a session, because it no longer exists.
+    ///
+    /// Not the same as [`Self::engage_session`], which is about a demand being *met*: this is
+    /// about the subject being gone. It therefore also clears the per-session runtime — the
+    /// mute deadline, the cooldown, the counters — which engaging deliberately keeps, and it
+    /// emits no `Cleared` effect, because there is no session left for a client to clear.
+    ///
+    /// Called when a Session is deleted. Left uncalled, a deleted Session's demands would keep
+    /// their place in the queue: `Next attention` would move focus to a Session that is not in
+    /// the tree, and a mute deadline would outlive its subject.
+    pub fn forget_session(&mut self, session: &SessionId) -> usize {
+        let cleared = self.queue.resolve_session(session);
+        self.deferred.retain(|d| &d.session_id != session);
+        self.runtimes.remove(session);
+        cleared
+    }
+
     /// Silences a session until a deadline.
     pub fn mute_session(&mut self, session: &SessionId, until_ms: i64) {
         self.runtimes

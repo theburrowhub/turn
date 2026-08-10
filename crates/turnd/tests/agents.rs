@@ -36,14 +36,14 @@ async fn a_notification_that_the_agent_needs_input_puts_the_session_in_the_queue
         .await,
     );
     assert_eq!(
-        details.tree[0].turn,
+        agent_row(&details).turn,
         Some(Turn::AwaitingUser {
             reason: AwaitingReason::Input
         })
     );
     assert!(details.summary.needs_user);
     assert!(
-        details.tree[0].lifecycle.is_running(),
+        agent_row(&details).lifecycle.is_running(),
         "the process is fine; it is the turn that is waiting"
     );
 
@@ -77,9 +77,9 @@ async fn a_notification_that_the_agent_needs_input_puts_the_session_in_the_queue
         })
         .await,
     );
-    assert_eq!(details.tree[0].turn, Some(Turn::Active));
+    assert_eq!(agent_row(&details).turn, Some(Turn::Active));
     assert_eq!(
-        details.tree[0]
+        agent_row(&details)
             .agent
             .as_ref()
             .unwrap()
@@ -111,7 +111,7 @@ async fn a_permission_request_is_carried_in_full_and_never_answered_by_turn() {
         })
         .await,
     );
-    let pending = details.tree[0]
+    let pending = agent_row(&details)
         .agent
         .as_ref()
         .and_then(|agent| agent.pending_permission.clone())
@@ -150,7 +150,7 @@ async fn a_permission_request_is_carried_in_full_and_never_answered_by_turn() {
         .await,
     );
     assert!(
-        details.tree[0]
+        agent_row(&details)
             .agent
             .as_ref()
             .and_then(|agent| agent.pending_permission.as_ref())
@@ -187,7 +187,9 @@ async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer()
     let reviewer = ui
         .wait_for("Reviewer in the hierarchy", |event| match event {
             ServerEvent::TreeChanged { session_id, nodes }
-                if session_id == &agent.session && nodes.len() == 2 =>
+                // Three rows: the pane's shell, the agent Turn started in it, and the
+                // worker the agent declared.
+                if session_id == &agent.session && nodes.len() == 3 =>
             {
                 nodes
                     .iter()
@@ -315,7 +317,9 @@ async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer()
         Response::PaneFocus {
             focus: Some(ref focus)
         } if focus.attention_subject_node_id.as_ref() == Some(&reviewer)
-            && focus.node_id == agent.node
+            // The pane's shell, not the agent: the agent reads from that tty, so it is
+            // where a person answering the worker would type.
+            && focus.node_id == agent.shell
     ));
 
     let prompt = fixtures()["UserPromptSubmit"].clone();
@@ -453,10 +457,13 @@ async fn two_hook_parents_keep_out_of_order_and_idless_attention_in_their_own_sc
         })
         .await,
     );
+    // Each agent hangs off the shell of its own pane, so neither is a root — what makes
+    // them independent is that they are different agents in different terminals, which
+    // is the only thing this test needs of them.
     let parents: Vec<_> = details
         .tree
         .iter()
-        .filter(|node| node.kind == NodeKind::Agent && node.parent.is_none())
+        .filter(|node| node.kind == NodeKind::Agent)
         .map(|node| node.node_id.clone())
         .collect();
     assert_eq!(
@@ -770,7 +777,9 @@ async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_re
     let nodes = ui
         .wait_for("the tree to gain a subagent", |event| match event {
             ServerEvent::TreeChanged { session_id, nodes }
-                if session_id == &agent.session && nodes.len() == 2 =>
+                // Three rows: the pane's shell, the agent Turn started in it, and the
+                // worker the agent declared.
+                if session_id == &agent.session && nodes.len() == 3 =>
             {
                 Some(nodes.clone())
             }
@@ -790,7 +799,10 @@ async fn the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_re
     );
     assert_eq!(subagent.relationship.confidence, Confidence::Explicit);
     assert!(!subagent.relationship_is_provisional);
-    assert_eq!(subagent.depth, 1);
+    assert_eq!(
+        subagent.depth, 2,
+        "the pane's shell, then its agent, then the worker"
+    );
     assert_eq!(subagent.title, "Reviewer");
     assert_eq!(
         subagent
@@ -987,7 +999,7 @@ async fn a_turn_ending_while_work_continues_does_not_read_as_finished() {
         })
         .await,
     );
-    assert_eq!(details.tree[0].turn, Some(Turn::Done));
+    assert_eq!(agent_row(&details).turn, Some(Turn::Done));
     assert_eq!(
         details.summary.display_state,
         DisplayState::CompletedTurn,
@@ -995,10 +1007,13 @@ async fn a_turn_ending_while_work_continues_does_not_read_as_finished() {
     );
     assert_ne!(details.summary.display_state, DisplayState::CompletedTask);
     assert!(
-        details.tree[0].lifecycle.is_running(),
+        agent_row(&details).lifecycle.is_running(),
         "the process is still alive; the turn ending said nothing about it"
     );
-    assert_eq!(details.summary.running_count, 1);
+    assert_eq!(
+        details.summary.running_count, 2,
+        "the pane's shell and the agent running in it"
+    );
 
     daemon.shutdown().await;
 }
@@ -1034,7 +1049,7 @@ async fn a_guess_never_moves_the_user_and_never_overrides_them() {
         })
         .await,
     );
-    let node = details.tree[0].node_id.clone();
+    let node = agent_row(&details).node_id.clone();
 
     // A confirmation box on screen. The heuristic reports it as a demand for the user.
     ui.ask(Request::WritePty {
@@ -1136,7 +1151,7 @@ async fn a_guess_never_moves_the_user_and_never_overrides_them() {
         .await,
     );
     assert_eq!(
-        details.tree[0].turn,
+        agent_row(&details).turn,
         Some(Turn::Active),
         "the user's correction stands"
     );
@@ -1195,6 +1210,11 @@ async fn an_agents_process_ending_takes_its_demand_out_of_the_queue() {
         1
     );
 
+    // Stopping the agent is a signal to the agent's own process, so Turn has to know
+    // which process that is. The pane's shell is not the target: it survives this, which
+    // is the whole point of the agent running inside one.
+    let agent_pid = wait_for_agent_pid(&mut ui, &agent.session, &agent.node).await;
+    assert!(pid_is_alive(agent_pid));
     ui.ask(Request::TerminateNode {
         session_id: agent.session.clone(),
         node_id: agent.node.clone(),
@@ -1239,7 +1259,14 @@ async fn an_agents_process_ending_takes_its_demand_out_of_the_queue() {
         relaunched.node_id, agent.node,
         "a new process is a new node"
     );
-    assert!(pid_is_alive(relaunched.pid.expect("a pid")));
+    assert_eq!(
+        relaunched.parent.as_ref(),
+        Some(&agent.shell),
+        "the shell it was typed into is the same shell as before"
+    );
+    let fresh_pid = wait_for_agent_pid(&mut ui, &agent.session, &relaunched.node_id).await;
+    assert!(pid_is_alive(fresh_pid));
+    assert_ne!(fresh_pid, agent_pid, "a new process is a new pid");
 
     daemon.shutdown().await;
 }
@@ -1309,13 +1336,435 @@ async fn answering_an_agent_is_a_keystroke_and_nothing_else() {
         .await,
     );
     assert!(
-        details.tree[0]
+        agent_row(&details)
             .agent
             .as_ref()
             .and_then(|agent| agent.pending_permission.as_ref())
             .is_none(),
         "the agent said it was resolved, so the pending permission is gone"
     );
+
+    daemon.shutdown().await;
+}
+
+/// A workspace with a root of its own, so each fixture has a distinct canonical
+/// checkout identity and the production lease arbiter is not fighting the test.
+async fn own_workspace(
+    daemon: &TestDaemon,
+    ui: &mut Client,
+    name: &str,
+) -> turn_proto::WorkspaceSummary {
+    let root = daemon
+        .data_dir()
+        .join("workspaces")
+        .join(turn_core::ids::WorkspaceId::new().as_str());
+    std::fs::create_dir_all(&root).expect("agent test Workspace root");
+    workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: name.to_string(),
+            root: root.display().to_string(),
+        })
+        .await,
+    )
+}
+
+// ------------------------------------- an agent runs inside the pane's shell
+
+/// The report: leaving Claude with `/exit` left the pane flickering, because the pane's
+/// process *was* Claude. It is not any more. The pane runs the user's shell, the agent
+/// runs in it, and quitting the agent gives the prompt back — which is what quitting an
+/// agent in iTerm2 does.
+///
+/// `cat` stands in for the agent, so its EOF stands in for `/exit`: a clean exit the
+/// agent chose. What proves the shell is really still working is arithmetic — `turn-42`
+/// is something only a shell can print, where a program still holding the terminal would
+/// merely echo the characters back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quitting_the_agent_leaves_a_working_shell_in_the_pane() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = agent_session(&daemon, &mut ui, "quits cleanly").await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let pane = details.layout.panes()[0].id.clone();
+    let shell_pid = row(&details, &agent.shell)
+        .pid
+        .expect("the pane's own process has a pid from the moment it is spawned");
+    wait_for_agent_pid(&mut ui, &agent.session, &agent.node).await;
+
+    // End-of-transmission on the pane's tty: the agent reads it, decides it is done and
+    // exits. Nothing about this is Turn stopping anything.
+    ui.ask(Request::WritePty {
+        session_id: agent.session.clone(),
+        node_id: agent.shell.clone(),
+        data: turn_proto::TerminalBytes::new(vec![0x04]),
+    })
+    .await;
+
+    let ended = ui
+        .wait_for("the agent to end", |event| match event {
+            ServerEvent::NodeStateChanged {
+                node_id,
+                lifecycle,
+                display_state,
+                ..
+            } if node_id == &agent.node && !lifecycle.is_running() => Some(*display_state),
+            _ => None,
+        })
+        .await;
+    assert!(
+        !ended.demands_user(),
+        "an agent that quit is not waiting for anybody: {ended:?}"
+    );
+
+    // The pane never blinked: same process, same pid, still running.
+    let after = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let shell = row(&after, &agent.shell);
+    assert!(
+        shell.lifecycle.is_running(),
+        "the pane's shell outlives the agent: {:?}",
+        shell.lifecycle
+    );
+    assert_eq!(shell.pid, Some(shell_pid), "and it is the same shell");
+    assert!(
+        pid_is_alive(shell_pid),
+        "the kernel agrees, not only the daemon"
+    );
+    assert!(
+        !shell.lifecycle.is_failure() && !after.summary.display_state.demands_user(),
+        "quitting an agent is not a failure and demands nothing: {:#?}",
+        after.summary
+    );
+
+    // And the prompt is really a prompt. Arithmetic no echo could produce.
+    ui.attach_cells(&agent.session, &pane, turn_proto::PtySize::new(30, 100))
+        .await;
+    ui.ask(Request::WritePty {
+        session_id: agent.session.clone(),
+        node_id: agent.shell.clone(),
+        data: turn_proto::TerminalBytes::new(b"echo turn-$((6 * 7))\n".to_vec()),
+    })
+    .await;
+    let screen = ui.wait_for_screen("turn-42").await;
+    assert!(screen.contains("turn-42"), "the screen reads {screen:?}");
+
+    daemon.shutdown().await;
+}
+
+/// The agent is still an agent, which is the part that had to be got right: its node is
+/// no longer the pane's process, so everything that makes it an agent has to travel with
+/// it deliberately. Its adapter, its integration level, its turn axis, its hook endpoint
+/// — and an edge to the shell that is *confirmed*, because Turn wrote the command line
+/// itself. An inferred edge here would be Turn guessing about its own launch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_started_in_a_pane_shell_is_still_an_agent_in_the_tree() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = agent_session(&daemon, &mut ui, "still an agent").await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+
+    let shell = row(&details, &agent.shell);
+    assert_eq!(shell.kind, NodeKind::Shell, "the pane's process is a shell");
+    assert!(shell.turn.is_none(), "a shell owes the user nothing");
+    assert_eq!(shell.depth, 0);
+    assert_eq!(
+        details.layout.panes()[0].node_id.as_ref(),
+        Some(&agent.shell),
+        "the pane shows the shell, because that is the process it runs"
+    );
+
+    let row = row(&details, &agent.node);
+    assert_eq!(row.kind, NodeKind::Agent);
+    assert!(row.is_agentic, "it carries the turn axis");
+    assert_eq!(
+        row.turn,
+        Some(Turn::Idle),
+        "idle until it reports otherwise"
+    );
+    assert_eq!(row.depth, 1);
+    assert_eq!(row.parent.as_ref(), Some(&agent.shell));
+    assert_eq!(
+        row.relationship.kind,
+        turn_core::model::RelationshipKind::SpawnedBy
+    );
+    assert_eq!(
+        row.relationship.confidence,
+        Confidence::Explicit,
+        "Turn typed this command itself; there is nothing to infer"
+    );
+    assert!(
+        !row.relationship_is_provisional,
+        "the edge must not be drawn as a guess"
+    );
+    let info = row.agent.as_ref().expect("the agent detail");
+    assert_eq!(info.agent.tool.as_deref(), Some("claude-code"));
+    assert_eq!(info.agent.provider.as_deref(), Some("anthropic"));
+    assert!(
+        matches!(
+            row.pane_capability,
+            turn_proto::NodePaneCapability::Terminal { .. }
+        ),
+        "the shell's terminal is the agent's terminal: {:?}",
+        row.pane_capability
+    );
+
+    // Its hook endpoint is its own, issued to its own node, with its own scratch
+    // directory — the shell has neither, and nothing may report as the shell.
+    assert!(!agent.hook.is_empty());
+    assert!(
+        !turnd::paths::node_scratch(daemon.data_dir(), &agent.session, &agent.shell).exists(),
+        "a shell needs no injected configuration and is issued no token"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// A payload captured from a real Claude Code run, posted to the URL the adapter was
+/// handed, still lands on the agent — not on the shell it happens to be running in, and
+/// not nowhere. This is the whole integration crossing the change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_captured_claude_payload_still_reaches_the_agent_under_its_pane_shell() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = agent_session(&daemon, &mut ui, "hooked through a shell").await;
+
+    post_hook(&agent.hook, &fixtures()["Stop"]).await;
+    let reported = ui
+        .wait_for("the turn ending", |event| match event {
+            ServerEvent::NodeStateChanged { node_id, turn, .. }
+                if node_id == &agent.node && turn.is_some() =>
+            {
+                turn.clone()
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(reported, Turn::Done);
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    assert_eq!(agent_row(&details).turn, Some(Turn::Done));
+    assert_eq!(
+        agent_row(&details).node_id,
+        agent.node,
+        "the callback resolved to the agent's own node"
+    );
+    assert!(
+        row(&details, &agent.shell).turn.is_none(),
+        "and gave the shell around it no turn state it could never fill"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The report: `+ Pane Agent` does nothing. With no default agent configured and none on
+/// the machine, the pane is still the user's shell and it says why it is only that.
+/// Silence was the bug; an error nobody sees would be the same bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_an_agent_pane_with_no_agent_anywhere_opens_a_shell_that_says_so() {
+    // A registry with no agent adapters at all, so "nothing installed" is a fact about
+    // this test rather than about the machine it runs on.
+    let daemon = TestDaemon::start_with(turn_agents::AdapterRegistry::bare).await;
+    let mut ui = daemon.connect().await;
+    let workspace = own_workspace(&daemon, &mut ui, "no agents here").await;
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id.clone(),
+            name: "nothing to run".to_string(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Shell)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let first = details.layout.panes()[0].id.clone();
+
+    let layout = layout_of(
+        ui.ask(Request::SplitPane {
+            session_id: session.id.clone(),
+            pane_id: first.clone(),
+            direction: turn_core::model::Direction::Horizontal,
+            // No command, and the workspace names no default agent: exactly the
+            // "+ Pane > Agent" the owner pressed.
+            pane: NewPane::new(PaneKind::Agent),
+        })
+        .await,
+    );
+    let added = layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.id != first)
+        .cloned()
+        .expect("the new pane");
+    let node = added
+        .node_id
+        .clone()
+        .expect("an agent pane always starts something: an empty pane is the bug");
+
+    ui.attach_cells(&session.id, &added.id, turn_proto::PtySize::new(30, 100))
+        .await;
+    let screen = ui.wait_for_screen("no agent CLI on your PATH").await;
+    assert!(
+        screen.contains("this pane is your shell"),
+        "the pane has to say what it is instead: {screen:?}"
+    );
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let opened = row(&details, &node);
+    assert_eq!(opened.kind, NodeKind::Shell);
+    assert!(opened.lifecycle.is_running());
+    assert!(
+        details.tree.iter().all(|view| !view.is_agentic),
+        "no agent was invented: {:#?}",
+        details.tree
+    );
+
+    daemon.shutdown().await;
+}
+
+/// And with an agent CLI on the PATH but no default configured, the same press launches
+/// it. Falling back to what is installed is the difference between a pane that works and
+/// a pane that explains itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adding_an_agent_pane_with_no_configured_default_still_launches_one() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let workspace = own_workspace(&daemon, &mut ui, "no default configured").await;
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id.clone(),
+            name: "falls back".to_string(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Shell)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let first = details.layout.panes()[0].id.clone();
+
+    let layout = layout_of(
+        ui.ask(Request::SplitPane {
+            session_id: session.id.clone(),
+            pane_id: first.clone(),
+            direction: turn_core::model::Direction::Horizontal,
+            pane: NewPane::new(PaneKind::Agent),
+        })
+        .await,
+    );
+    let added = layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.id != first)
+        .cloned()
+        .expect("the new pane");
+    let shell = added.node_id.clone().expect("the pane runs a shell");
+
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let started = details
+        .tree
+        .iter()
+        .find(|view| view.is_agentic)
+        .expect("an agent was started without one being configured");
+    assert_eq!(started.parent.as_ref(), Some(&shell));
+    assert_eq!(started.relationship.confidence, Confidence::Explicit);
+    assert_eq!(
+        started
+            .agent
+            .as_ref()
+            .and_then(|info| info.agent.tool.clone()),
+        Some("claude-code".to_string()),
+        "the strongest integration the registry can actually find"
+    );
+
+    daemon.shutdown().await;
+}
+
+/// The other way the old pane died: ctrl-C. The interrupt goes through the tty, so it
+/// reaches the agent's whole foreground process group — and the pane's shell is
+/// interactive, which is what makes it carry on rather than exit alongside what it was
+/// running. A non-interactive shell would take the pane down with the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupting_a_hosted_agent_leaves_its_pane_alive() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let agent = agent_session(&daemon, &mut ui, "interrupted").await;
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let shell_pid = row(&details, &agent.shell).pid.expect("the pane's own pid");
+    let agent_pid = wait_for_agent_pid(&mut ui, &agent.session, &agent.node).await;
+
+    // Addressed to the agent, delivered through the tty it is reading from. `cat` does
+    // not catch it, so it dies: the observable proof that the signal was delivered.
+    ui.ask(Request::InterruptNode {
+        session_id: agent.session.clone(),
+        node_id: agent.node.clone(),
+    })
+    .await;
+    ui.wait_for("the agent to end", |event| match event {
+        ServerEvent::NodeStateChanged {
+            node_id, lifecycle, ..
+        } if node_id == &agent.node && !lifecycle.is_running() => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(!pid_is_alive(agent_pid), "the agent really is gone");
+
+    let after = details_of(
+        ui.ask(Request::GetSession {
+            session_id: agent.session.clone(),
+        })
+        .await,
+    );
+    let shell = row(&after, &agent.shell);
+    assert!(shell.lifecycle.is_running(), "{:?}", shell.lifecycle);
+    assert_eq!(shell.pid, Some(shell_pid));
+    assert!(pid_is_alive(shell_pid), "the pane is still there");
 
     daemon.shutdown().await;
 }

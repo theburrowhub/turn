@@ -11,8 +11,13 @@ impl Core {
     /// Sends keystrokes or pasted text to a process.
     ///
     /// This is also how an agent's pending permission or question is answered. There
-    /// is no request that approves anything: a reviewed context handoff is refused at
+    /// is no request that approves anything: the only thing that reaches a pty is what
+    /// the human typed, and that is the point. A reviewed context handoff is refused at
     /// a pending interaction and can only submit to an idle or done Agent.
+    ///
+    /// Addressed to an agent, the keystrokes go to the tty the agent is reading from —
+    /// its pane's shell. That is not a redirection: it is where the agent's own prompt
+    /// is, and where a person answering it would type.
     pub(super) fn write_pty(
         &mut self,
         session_id: &SessionId,
@@ -21,7 +26,8 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         self.node_of(session_id, node_id)?;
-        let process = self.running_process(node_id)?;
+        let tty = self.tty_node(session_id, node_id);
+        let process = self.running_process(&tty)?;
         process
             .pty
             .write(data)
@@ -73,9 +79,15 @@ impl Core {
     /// Not `kill(pid)`: the tty delivers the signal to the whole foreground process
     /// group, which is what reaches the `cargo test` an agent started rather than only
     /// the agent itself.
+    ///
+    /// For an agent running in a pane's shell that is not a detail — it is the *only*
+    /// correct route. The agent is the shell's foreground process group, so the control
+    /// character reaches it exactly as pressing ctrl-C in the pane would, and the shell
+    /// itself carries on because it is interactive.
     pub(super) fn interrupt_node(&mut self, session_id: &SessionId, node_id: &NodeId) -> Answer {
         self.node_of(session_id, node_id)?;
-        let process = self.running_process(node_id)?;
+        let tty = self.tty_node(session_id, node_id);
+        let process = self.running_process(&tty)?;
         process
             .pty
             .interrupt()
@@ -92,15 +104,96 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         self.node_of(session_id, node_id)?;
-        self.running_process(node_id)?;
-        self.signal_node(node_id, hard, now_ms);
+        if self.processes.contains_key(node_id) {
+            self.running_process(node_id)?;
+            self.signal_node(node_id, hard, now_ms);
+            return Ok(Response::Ack);
+        }
+        self.stop_hosted_agent(session_id, node_id, hard, now_ms)
+    }
+
+    /// Stops an agent Turn started inside a pane's shell.
+    ///
+    /// The signal goes to the agent's own pid rather than through the tty, which is the
+    /// difference between stopping the agent and interrupting whatever happens to be in
+    /// the foreground. The pid is one Turn identified from its own launch — see
+    /// `supervise::identify_hosted_process` — and if it has not been identified yet the
+    /// request is refused rather than answered with a success that signalled nothing.
+    fn stop_hosted_agent(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        hard: bool,
+        now_ms: i64,
+    ) -> Answer {
+        if self.hosting_shell(session_id, node_id).is_none() {
+            // Not ours to stop: a subagent with no process of its own, a node a tool
+            // reported, or one lost to a restart. `running_process` says so precisely.
+            self.running_process(node_id)?;
+        }
+        let node = self.node_of(session_id, node_id)?.clone();
+        if !node.is_running() {
+            return Err(ProtoError::new(
+                ErrorCode::ProcessNotRunning,
+                "That agent has ended",
+            ));
+        }
+        let Some(pid) = node.pid else {
+            return Err(ProtoError::new(
+                ErrorCode::ProcessNotRunning,
+                "Turn has not identified this agent's process yet",
+            )
+            .with_detail(
+                "it was started in the pane's shell a moment ago; interrupt the pane, or \
+                 try again once the process table has been swept",
+            ));
+        };
+        // A pid is only an address in the process table, not an identity. Refresh and
+        // corroborate the command and launch time immediately before signalling so a
+        // recycled pid can never make Stop kill an unrelated process.
+        self.supervisor.refresh();
+        let observed = self.supervisor.observe(pid);
+        if !observed.as_ref().is_some_and(|observed| {
+            crate::core::supervise::corroborates_hosted_process(&node, observed)
+        }) {
+            self.publish_hosted_loss(session_id, node_id, now_ms);
+            return Err(ProtoError::new(
+                ErrorCode::ProcessNotRunning,
+                "That agent's process has ended or changed",
+            )
+            .with_detail("Turn refused to signal a pid it could no longer identify"));
+        }
+        signal_pid(pid, hard).map_err(|error| {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Could not stop that agent's process",
+            )
+            .with_detail(error.to_string())
+        })?;
+        self.expect_exit(node_id, now_ms);
+        // There is no exit watcher for a process Turn does not hold, so the process table
+        // is how this death is noticed. A signal is a reason to look: without the request
+        // the node would go on claiming to be running until the slow safety net came
+        // round, which is a long time to look at a pane and disbelieve it.
+        self.request_sweep(now_ms);
         Ok(Response::Ack)
     }
 
-    /// Starts a pane's process again, because the user asked.
+    /// The node whose tty carries this node's keystrokes and control characters.
     ///
-    /// Turn never relaunches on its own — not on restore, not after a crash — so this
-    /// is the only path back into a running process, and it always begins with a human.
+    /// An agent hosted in a pane's shell types into that shell's tty. Anything else is
+    /// its own.
+    fn tty_node(&self, session_id: &SessionId, node_id: &NodeId) -> NodeId {
+        if self.processes.contains_key(node_id) {
+            return node_id.clone();
+        }
+        self.hosting_shell(session_id, node_id)
+            .unwrap_or_else(|| node_id.clone())
+    }
+
+    /// Starts a pane's process again, because the user asked or a connected window is restoring
+    /// a pane explicitly marked safe to relaunch. The daemon never calls this unattended during
+    /// boot: automatic recovery begins only while a window is present to show the Session.
     ///
     /// The old node record leaves the tree. Two nodes cannot both claim one pane, and
     /// the event log keeps the whole history of the one that ended.
@@ -111,13 +204,23 @@ impl Core {
         resume: bool,
         now_ms: i64,
     ) -> Answer {
-        self.require_session_launch_allowed(session_id)?;
+        // Only the checks that hold whatever this pane runs. What it *does* need from the
+        // checkout depends on its launch shape, and that is decided below, once the pane
+        // is known — starting a terminal again is not an act of writing to the checkout.
+        self.require_session_launchable(session_id)?;
         let node = self.node_of(session_id, node_id)?.clone();
         if node.is_running() {
             return Err(ProtoError::new(
                 ErrorCode::Conflict,
                 "That process is still running",
             ));
+        }
+        // An agent that ended inside a pane's shell is started again by typing it at the
+        // prompt, because the pane's process never died. Nothing is respawned and the
+        // pane never blinks: this is the same thing the user could do by hand, which is
+        // the whole point of hosting the agent in a shell.
+        if let Some(shell) = self.hosting_shell(session_id, node_id) {
+            return self.relaunch_hosted_agent(session_id, node_id, &shell, resume, now_ms);
         }
         let Some((pane_id, pane_cwd)) = self
             .session(session_id)?
@@ -136,9 +239,14 @@ impl Core {
                  a tool or seen in the process table",
             ));
         };
-        // Prove the cwd is still inside the assigned checkout before attempting a
-        // replacement; materialisation repeats the check at the PTY boundary.
-        self.resolve_authorized_launch_cwd(session_id, pane_cwd.as_deref())?;
+        // Prove the authority this pane's launch needs and that the cwd is still inside
+        // the assigned checkout before attempting a replacement; materialisation repeats
+        // both checks at the PTY boundary.
+        self.resolve_authorized_launch_cwd(
+            session_id,
+            pane_cwd.as_deref(),
+            self.pane_launch_authority(session_id, &pane_id),
+        )?;
         let session = self.session(session_id)?;
         if session.layout.get(&pane_id).is_none() {
             return Err(ProtoError::new(
@@ -153,24 +261,7 @@ impl Core {
             Vec::new()
         };
 
-        let descendants: Vec<NodeId> = self
-            .session(session_id)?
-            .tree
-            .descendants(node_id)
-            .into_iter()
-            .map(|node| node.id.clone())
-            .collect();
-        if descendants.iter().any(|id| {
-            self.session(session_id)
-                .ok()
-                .and_then(|session| session.tree.get(id))
-                .is_some_and(|node| node.is_running())
-        }) {
-            return Err(ProtoError::new(
-                ErrorCode::Conflict,
-                "A child process is still running; stop it before starting this pane again",
-            ));
-        }
+        let descendants = self.settled_descendants(session_id, node_id)?;
 
         // Spawn first. If the executable is missing or adapter preparation fails, the
         // old node, pane binding and recovery offer remain intact and retryable.
@@ -181,26 +272,7 @@ impl Core {
                 "That pane has no command to run",
             ));
         };
-        let retired_nodes: Vec<NodeId> = std::iter::once(node_id.clone())
-            .chain(descendants.iter().cloned())
-            .collect();
-        self.clear_node_temporary_bindings(session_id, &retired_nodes, now_ms)?;
-        if let Ok(session) = self.session_mut(session_id) {
-            for id in &descendants {
-                session.tree.remove(id);
-            }
-            session.tree.remove(node_id);
-        }
-        self.remove_attention_for_deleted_nodes(session_id, &retired_nodes, now_ms);
-        for retired in &retired_nodes {
-            self.turn_authority.remove(retired);
-            self.background_tasks.remove(retired);
-            self.expected_exits.remove(retired);
-            self.discard_process(retired);
-            crate::paths::remove_node_scratch(&self.data_dir, session_id, retired);
-            self.recovered_terminals.remove(retired);
-            crate::paths::remove_node_terminal_history(&self.data_dir, session_id, retired);
-        }
+        self.retire_replaced_node(session_id, node_id, &descendants, now_ms)?;
         let restore_update = self.resolve_restore_node(session_id, node_id);
         if let Ok(session) = self.session_mut(session_id) {
             session.status = SessionStatus::Active;
@@ -222,6 +294,225 @@ impl Core {
         Ok(Response::Node {
             node: Box::new(view),
         })
+    }
+
+    /// The shell one of Turn's processes is running an agent in, if this node is that
+    /// agent.
+    ///
+    /// Read from [`crate::core::Process::hosted`] rather than from the node's parent
+    /// edge: what makes this a relaunch Turn can perform is that Turn still holds the
+    /// pty the command would be typed into, not what the tree says about lineage.
+    fn hosting_shell(&self, session_id: &SessionId, node_id: &NodeId) -> Option<NodeId> {
+        self.processes
+            .iter()
+            .find(|(_, process)| {
+                process.session_id == *session_id
+                    && process.hosted.as_ref() == Some(node_id)
+                    && process.pty.is_running()
+            })
+            .map(|(shell, _)| shell.clone())
+    }
+
+    /// Starts an agent again in the shell it was running in.
+    ///
+    /// The command is resolved from the pane's definition, exactly as the first launch
+    /// resolved it, and never from the retired node: that node's arguments are the ones
+    /// the adapter produced — a `--settings` pointing at a revoked token — and reusing
+    /// them would either resume a dead configuration or make Claude Code refuse Turn's
+    /// own injection as the user's.
+    fn relaunch_hosted_agent(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        shell: &NodeId,
+        resume: bool,
+        now_ms: i64,
+    ) -> Answer {
+        let node = self.node_of(session_id, node_id)?.clone();
+        let pane_id = self
+            .session(session_id)?
+            .layout
+            .panes()
+            .into_iter()
+            .find(|pane| pane.node_id.as_ref() == Some(shell))
+            .map(|pane| pane.id.clone())
+            .ok_or_else(|| {
+                ProtoError::new(
+                    ErrorCode::Conflict,
+                    "The pane this agent was running in is gone",
+                )
+            })?;
+        let extra = if resume {
+            resume_arguments(&self.resume_target(&node))?
+        } else {
+            Vec::new()
+        };
+        let Some((command, request)) = self.hosted_agent_request(session_id, &pane_id, &extra)?
+        else {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "That pane has no agent to run",
+            ));
+        };
+        let descendants = self.settled_descendants(session_id, node_id)?;
+
+        // Prepared before anything is retired, so a missing executable or a scratch
+        // directory Turn cannot write leaves the old node and its recovery offer intact.
+        let selection = self.select_installed(&command, &request.args)?;
+        let (mut agent, plan, token) =
+            self.prepare_hosted_agent(session_id, &command, &request, &selection, now_ms)?;
+        let new_node = agent.id.clone();
+        let line = crate::core::hosting::command_line(&plan.command, &plan.args);
+        // This shell is already running, so its environment cannot be replaced — and the
+        // new launch has a new token in it, which must not be typed onto a line that
+        // reaches the screen, the scrollback and the user's history file. It is written
+        // where only the user can read it, and the shell is told to source it.
+        let env_file = self.write_launch_environment(session_id, &new_node, &plan.env)?;
+        let typed = crate::core::hosting::typed(&line, env_file.as_deref());
+        let process = self
+            .processes
+            .get_mut(shell)
+            .filter(|process| process.pty.is_running())
+            .ok_or_else(|| {
+                ProtoError::new(
+                    ErrorCode::ProcessNotRunning,
+                    "The shell this agent was running in has ended",
+                )
+            })?;
+        if let Err(error) = process.pty.write(&typed) {
+            self.revoke(token.as_deref());
+            crate::paths::remove_node_scratch(&self.data_dir, session_id, &new_node);
+            return Err(pty_failure("write to", error));
+        }
+        // The shell is now hosting a different agent, so everything the pty carries on
+        // its behalf moves with it: the token it may report through, and the observer
+        // that infers from its output.
+        let previous_token = std::mem::replace(&mut process.hook_token, token);
+        process.hosted = Some(new_node.clone());
+        process.level = plan.level;
+        process.adapter_id = selection.adapter.id().to_string();
+        process.heuristic = (plan.level == turn_agents::IntegrationLevel::Heuristic)
+            .then(turn_agents::OutputHeuristic::new);
+        self.revoke(previous_token.as_deref());
+
+        agent.lifecycle = turn_core::state::Lifecycle::Alive;
+        agent.link_to(shell.clone(), turn_core::model::Relation::Confirmed);
+        if let Ok(session) = self.session_mut(session_id) {
+            session.tree.insert(agent);
+            session.touch(now_ms);
+        }
+        self.retire_replaced_node(session_id, node_id, &descendants, now_ms)?;
+        if let Ok(session) = self.session_mut(session_id) {
+            session.status = SessionStatus::Active;
+        }
+        self.persist_session(session_id)?;
+        // The pid arrives when the sweep identifies it: the shell has only just been
+        // told to run this, and it has not forked yet.
+        self.request_sweep(now_ms);
+        self.push_tree(session_id, now_ms);
+        self.push_session_state(session_id, now_ms);
+        tracing::info!(
+            %session_id, %shell, agent = %new_node, level = plan.level.label(),
+            command = %plan.command, "started an agent again in the shell it was running in"
+        );
+
+        let view = self
+            .node_view(session_id, &new_node, now_ms)
+            .ok_or_else(|| ProtoError::internal("the relaunched agent is missing from the tree"))?;
+        Ok(Response::Node {
+            node: Box::new(view),
+        })
+    }
+
+    /// Writes one launch's environment where a running shell can source it.
+    ///
+    /// `None` when the launch needs no environment, which is a launch with nothing to
+    /// source. The file lives in the node's own scratch directory — the same directory the
+    /// adapter writes its injected configuration into, and the same directory that is
+    /// deleted when the node is retired — and is readable only by its owner, because one
+    /// of the values is a URL carrying this node's hook token.
+    fn write_launch_environment(
+        &self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        env: &[(String, String)],
+    ) -> std::result::Result<Option<std::path::PathBuf>, ProtoError> {
+        if env.is_empty() {
+            return Ok(None);
+        }
+        let dir = crate::paths::node_scratch(&self.data_dir, session_id, node_id);
+        let path = dir.join("turn-env.sh");
+        let script = crate::core::hosting::env_script(env);
+        write_private(&dir, &path, script.as_bytes()).map_err(|error| {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Turn could not write the environment this agent needs",
+            )
+            .with_detail(format!("{}: {error}", path.display()))
+        })?;
+        Ok(Some(path))
+    }
+
+    /// The descendants of a node about to be replaced, refusing while any of them is
+    /// still running.
+    ///
+    /// A child that outlived its parent has to be dealt with deliberately: removing its
+    /// node would leave a running process nothing in the UI accounts for.
+    fn settled_descendants(
+        &self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+    ) -> std::result::Result<Vec<NodeId>, ProtoError> {
+        let session = self.session(session_id)?;
+        let descendants: Vec<NodeId> = session
+            .tree
+            .descendants(node_id)
+            .into_iter()
+            .map(|node| node.id.clone())
+            .collect();
+        if descendants
+            .iter()
+            .any(|id| session.tree.get(id).is_some_and(|node| node.is_running()))
+        {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "A child process is still running; stop it before starting this pane again",
+            ));
+        }
+        Ok(descendants)
+    }
+
+    /// Takes a replaced node and everything under it out of the tree, and takes its
+    /// launch with it: the hook token, the configuration Turn injected, the attention it
+    /// raised and the state the daemon kept about it.
+    fn retire_replaced_node(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        descendants: &[NodeId],
+        now_ms: i64,
+    ) -> std::result::Result<(), ProtoError> {
+        let retired: Vec<NodeId> = std::iter::once(node_id.clone())
+            .chain(descendants.iter().cloned())
+            .collect();
+        self.clear_node_temporary_bindings(session_id, &retired, now_ms)?;
+        if let Ok(session) = self.session_mut(session_id) {
+            for id in descendants {
+                session.tree.remove(id);
+            }
+            session.tree.remove(node_id);
+        }
+        self.remove_attention_for_deleted_nodes(session_id, &retired, now_ms);
+        for node in &retired {
+            self.turn_authority.remove(node);
+            self.background_tasks.remove(node);
+            self.expected_exits.remove(node);
+            self.discard_process(node);
+            crate::paths::remove_node_scratch(&self.data_dir, session_id, node);
+            self.recovered_terminals.remove(node);
+            crate::paths::remove_node_terminal_history(&self.data_dir, session_id, node);
+        }
+        Ok(())
     }
 
     /// Stops a process and records that we asked for it.
@@ -290,7 +581,18 @@ impl Core {
         // has a chance to matter.
         self.expect_exit(node, now_ms);
         self.signal_node(node, hard, now_ms);
+        // Taken before the handle goes, because the handle is where Turn's knowledge of
+        // what it started in this terminal lives.
+        let hosted = self.hosted_agent_of(node);
         let observed = self.discard_process(node);
+        if let Some(hosted) = hosted {
+            // Closing the pty delivers `SIGHUP` to its foreground process group, which is
+            // the agent. Recorded from that fact rather than from a later look at the
+            // process table: Turn took the terminal away and never saw the agent exit, and
+            // a node left claiming to run because a pid lingered for a millisecond is a
+            // session the user cannot close.
+            self.record_hosted_loss(session_id, &hosted, now_ms);
+        }
         let info = observed.unwrap_or_else(|| {
             // The shell convention for a signal death, which is what this is: the
             // process was signalled and its terminal taken away.
@@ -390,6 +692,63 @@ fn resume_arguments(target: &ResumeTarget) -> std::result::Result<Vec<String>, P
              a fresh conversation",
         ),
     }
+}
+
+/// Writes a file only its owner can read, creating its directory the same way.
+///
+/// The mode is set on creation rather than afterwards, so there is no moment in which the
+/// file exists and is readable by anybody else. This is the same rule the adapters follow
+/// for the configuration they inject.
+fn write_private(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Sends a stop signal to a process Turn started but does not hold a pty for.
+///
+/// The only such process is an agent Turn typed into a pane's shell, and the pid is one
+/// Turn identified from that launch rather than one it found by searching. `SIGTERM`
+/// first because an agent asked to stop should get the chance to write its state out;
+/// `SIGKILL` only when the user asked for a kill.
+#[cfg(unix)]
+fn signal_pid(pid: u32, hard: bool) -> std::io::Result<()> {
+    let signal = if hard { libc::SIGKILL } else { libc::SIGTERM };
+    // Safe: `kill` takes two integers and touches no memory we own.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_pid(_pid: u32, _hard: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Turn can only signal a process it does not hold on unix",
+    ))
 }
 
 /// Turns a pty failure into an answer the user can read.
@@ -615,6 +974,8 @@ mod tests {
                     lifecycle: Lifecycle::Lost,
                     can_relaunch: true,
                     command: Some("turn-command-that-definitely-does-not-exist".into()),
+                    auto_start: false,
+                    needs_checkout_write: true,
                 }],
             });
 

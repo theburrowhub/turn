@@ -20,10 +20,14 @@
 //! * **Directional navigation is geometric.** "The pane to the left" is a question
 //!   about rectangles, not about tree order, and a user with a three-pane layout
 //!   will notice immediately if it is answered from the tree.
+//! * **So is a drop.** Which of a target's five regions the pointer is in is what
+//!   decides whether a dragged pane lands left, right, above, below or exchanges, so
+//!   the bands and the preview rectangle are computed here — and the preview the user
+//!   sees is the same rectangle the decision was made from, not a second guess at it.
 
 use egui::{Pos2, Rect, Vec2};
 use turn_core::ids::{NodeId, PaneId};
-use turn_core::model::{Direction, Layout, LayoutNode, PaneKind};
+use turn_core::model::{Direction, DropZone, Layout, LayoutNode, PaneKind};
 
 /// The thickness of a divider, in points.
 ///
@@ -40,6 +44,26 @@ pub const DIVIDER_GRAB_MARGIN: f32 = 3.0;
 /// A pane thinner than this cannot show even one column of text, and painting it
 /// would cost a draw call to produce a sliver.
 pub const MIN_PANE_EXTENT: f32 = 12.0;
+
+/// The share of a target's width, or height, that one edge band takes.
+///
+/// Both numbers in this pair are the feature. Bands too thin and "left" is a
+/// coin-flip nobody aims for; bands too thick and the centre — the one zone that
+/// exchanges rather than splits — becomes impossible to mean. A little over a
+/// quarter of each axis leaves the middle roughly two fifths of the pane in each
+/// direction, which is a target the size of a pane's own text area.
+pub const DROP_EDGE_SHARE: f32 = 0.28;
+
+/// The smallest an edge band may be, in points.
+///
+/// A share alone would make the bands of a small pane too thin to hit on purpose.
+pub const DROP_EDGE_MIN: f32 = 22.0;
+
+/// The largest an edge band may be, in points.
+///
+/// A share alone would give a maximised pane bands hundreds of points deep, so a
+/// pointer resting well inside the pane would still read as an edge.
+pub const DROP_EDGE_MAX: f32 = 96.0;
 
 /// One pane, placed.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,6 +159,38 @@ impl Arrangement {
             .iter()
             .find(|divider| divider.grab_rect().contains(pos))
     }
+
+    /// Where `moved` would land if it were dropped at `pointer`.
+    ///
+    /// `None` for a pointer outside every pane, and for a pointer over the pane being
+    /// moved: a pane cannot be relocated relative to itself, and a drop with no target
+    /// is how a drag is abandoned.
+    pub fn drop_target_at(&self, moved: &PaneId, pointer: Pos2) -> Option<DropTarget> {
+        let target = self
+            .pane_at(pointer)
+            .filter(|target| &target.pane_id != moved)?;
+        let zone = drop_zone_at(target.rect, pointer);
+        Some(DropTarget {
+            pane_id: target.pane_id.clone(),
+            zone,
+            preview: drop_preview(target.rect, zone),
+        })
+    }
+
+    /// The rectangle every pane sits inside.
+    ///
+    /// The union of what was drawn rather than the area it was drawn into, so a pane
+    /// left out for being too small cannot make the layout look wider than it is.
+    fn bounds(&self) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        for pane in &self.panes {
+            bounds = Some(match bounds {
+                Some(union) => union.union(pane.rect),
+                None => pane.rect,
+            });
+        }
+        bounds
+    }
 }
 
 /// Which way a keyboard navigation is going.
@@ -144,6 +200,101 @@ pub enum Side {
     Right,
     Up,
     Down,
+}
+
+impl Side {
+    /// The drop zone a directional move means.
+    ///
+    /// Moving right means landing on the *right* of the pane over there, not on the
+    /// side of it that faces you: dropping a pane on its right neighbour's left edge
+    /// would put it back exactly where it already was.
+    pub fn zone(self) -> DropZone {
+        match self {
+            Side::Left => DropZone::Left,
+            Side::Right => DropZone::Right,
+            Side::Up => DropZone::Above,
+            Side::Down => DropZone::Below,
+        }
+    }
+}
+
+/// Where a dragged pane would land, and what that looks like.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTarget {
+    /// The pane under the pointer. Never the pane being moved.
+    pub pane_id: PaneId,
+    pub zone: DropZone,
+    /// The region the moved pane would occupy. This is what the window highlights:
+    /// an outline of the whole target would say "here somewhere", which is the one
+    /// thing the five zones exist to stop it saying.
+    pub preview: Rect,
+}
+
+/// One edge band of a pane that is `extent` points across.
+///
+/// Clamped at both ends, and never more than a third of the axis, so that even a pane
+/// squeezed to a sliver keeps a middle: five zones of which one is unreachable would
+/// be four zones and a lie.
+pub fn drop_edge_band(extent: f32) -> f32 {
+    if extent <= 0.0 {
+        return 0.0;
+    }
+    (extent * DROP_EDGE_SHARE)
+        .clamp(DROP_EDGE_MIN, DROP_EDGE_MAX)
+        .min(extent / 3.0)
+}
+
+/// Which of a target's five regions a point is in.
+///
+/// Each edge is scored by how far into its own band the point is, as a fraction of
+/// that band. A point inside no band is in the centre; a point inside two — a corner —
+/// belongs to the one it is proportionally deepest into, which is what makes the
+/// diagonal between "left" and "above" fall where a user would draw it rather than
+/// where the pane's aspect ratio happens to put it. An exact tie resolves in the order
+/// left, right, above, below, so a corner is at least never a flicker between two.
+pub fn drop_zone_at(target: Rect, pointer: Pos2) -> DropZone {
+    let across = drop_edge_band(target.width());
+    let down = drop_edge_band(target.height());
+    if across <= 0.0 || down <= 0.0 {
+        // A pane with no measurable extent can still be exchanged with, and exchanging
+        // is the zone that asks nothing of the geometry.
+        return DropZone::Centre;
+    }
+    let depths = [
+        (DropZone::Left, (pointer.x - target.min.x) / across),
+        (DropZone::Right, (target.max.x - pointer.x) / across),
+        (DropZone::Above, (pointer.y - target.min.y) / down),
+        (DropZone::Below, (target.max.y - pointer.y) / down),
+    ];
+    let mut shallowest = (DropZone::Centre, 1.0);
+    for (zone, depth) in depths {
+        if depth < shallowest.1 {
+            shallowest = (zone, depth);
+        }
+    }
+    shallowest.0
+}
+
+/// The region a pane dropped in `zone` would occupy.
+///
+/// Half the target for an edge, because that is what a split of two gives; the whole
+/// target for the centre, because an exchange puts the moved pane exactly where the
+/// target is now.
+pub fn drop_preview(target: Rect, zone: DropZone) -> Rect {
+    let half = target.size() / 2.0;
+    match zone {
+        DropZone::Left => Rect::from_min_size(target.min, Vec2::new(half.x, target.height())),
+        DropZone::Right => Rect::from_min_size(
+            Pos2::new(target.center().x, target.min.y),
+            Vec2::new(half.x, target.height()),
+        ),
+        DropZone::Above => Rect::from_min_size(target.min, Vec2::new(target.width(), half.y)),
+        DropZone::Below => Rect::from_min_size(
+            Pos2::new(target.min.x, target.center().y),
+            Vec2::new(target.width(), half.y),
+        ),
+        DropZone::Centre => target,
+    }
 }
 
 /// Places every pane in `area`.
@@ -349,6 +500,95 @@ pub fn neighbour(arrangement: &Arrangement, from: &PaneId, side: Side) -> Option
 
 fn overlap_1d(a_min: f32, a_max: f32, b_min: f32, b_max: f32) -> f32 {
     (a_max.min(b_max) - a_min.max(b_min)).max(0.0)
+}
+
+/// How close to the layout's edge a pane has to be to count as owning it.
+///
+/// Half a point: sibling rectangles are computed from the same cursor, so a pane that
+/// touches an edge touches it exactly, and anything larger would start admitting the
+/// pane behind a divider.
+const EDGE_TOLERANCE: f32 = 0.5;
+
+/// The relocation a directional move command means: which pane to name, and which of
+/// its five regions to land in.
+///
+/// Two readings, and the second one is the whole reason this is not a swap:
+///
+/// * **With a neighbour on that side**, the pane lands on the far side of it. In a row
+///   of three that shifts the pane one place along; against a nested column it moves
+///   the pane into that column. Both are the layout a drag onto that neighbour's far
+///   edge would have produced, which is the point — the keyboard and the pointer must
+///   not disagree about what "move right" means.
+/// * **With nothing on that side**, the pane is already against that edge of the
+///   layout, and the move becomes a move to the *outer* edge: the pane leaves the split
+///   it is nested in and attaches to that side of whichever pane owns that edge of the
+///   layout. This is the reading that makes the keyboard a first-class path rather than
+///   a degraded one. Doing nothing here is the other honest option and it is a dead
+///   end: in `A│B` nothing is above either pane, so "move up" would never be able to
+///   turn a row into a column, and in a row of three no keyboard press could ever
+///   produce anything but another row. That is the owner's original complaint, left
+///   half-fixed for anybody without a pointer.
+///
+/// When no *other* pane owns that edge the pane already spans it alone, there is
+/// genuinely nowhere further to go, and this returns `None` for the caller to report.
+pub fn relocation(
+    arrangement: &Arrangement,
+    moved: &PaneId,
+    side: Side,
+) -> Option<(PaneId, DropZone)> {
+    let target = match neighbour(arrangement, moved, side) {
+        Some(neighbour) => neighbour,
+        None => outer_edge_owner(arrangement, moved, side)?,
+    };
+    Some((target, side.zone()))
+}
+
+/// The pane holding the layout's own edge on one side, nearest the pane being moved.
+///
+/// Ranked by the edge it shares with the moved pane, then by how close it is, then by
+/// the order it was drawn in — which is tree order, so a tie between two panes that are
+/// equally far away and share no edge at all still resolves the same way every time.
+fn outer_edge_owner(arrangement: &Arrangement, moved: &PaneId, side: Side) -> Option<PaneId> {
+    let bounds = arrangement.bounds()?;
+    let source = arrangement.pane(moved)?.rect;
+    let mut best: Option<(f32, f32, PaneId)> = None;
+
+    for candidate in &arrangement.panes {
+        if &candidate.pane_id == moved {
+            continue;
+        }
+        let rect = candidate.rect;
+        let (distance_to_edge, overlap) = match side {
+            Side::Left => (
+                (rect.min.x - bounds.min.x).abs(),
+                overlap_1d(source.min.y, source.max.y, rect.min.y, rect.max.y),
+            ),
+            Side::Right => (
+                (bounds.max.x - rect.max.x).abs(),
+                overlap_1d(source.min.y, source.max.y, rect.min.y, rect.max.y),
+            ),
+            Side::Up => (
+                (rect.min.y - bounds.min.y).abs(),
+                overlap_1d(source.min.x, source.max.x, rect.min.x, rect.max.x),
+            ),
+            Side::Down => (
+                (bounds.max.y - rect.max.y).abs(),
+                overlap_1d(source.min.x, source.max.x, rect.min.x, rect.max.x),
+            ),
+        };
+        if distance_to_edge > EDGE_TOLERANCE {
+            continue;
+        }
+        let key = (-overlap, source.center().distance(rect.center()));
+        let better = match &best {
+            None => true,
+            Some((best_overlap, best_distance, _)) => key < (*best_overlap, *best_distance),
+        };
+        if better {
+            best = Some((key.0, key.1, candidate.pane_id.clone()));
+        }
+    }
+    best.map(|(_, _, id)| id)
 }
 
 /// The size in cells a rectangle can show, given the size of one cell.
@@ -612,6 +852,331 @@ mod tests {
             rightwards == Some(top) || rightwards == Some(bottom),
             "got {rightwards:?}"
         );
+    }
+
+    /// Both ends of the clamp, and the rule that keeps the middle reachable. A band that
+    /// grew with the pane would make a maximised pane one big edge.
+    #[test]
+    fn an_edge_band_is_a_share_of_the_pane_but_never_thinner_than_a_target_nor_a_third_of_it() {
+        assert!((drop_edge_band(200.0) - 56.0).abs() < 0.01, "a share");
+        assert!(
+            (drop_edge_band(1000.0) - DROP_EDGE_MAX).abs() < 0.01,
+            "a wide pane's bands stop growing, or its centre would be unreachable"
+        );
+        assert!(
+            (drop_edge_band(60.0) - 20.0).abs() < 0.01,
+            "a third of a narrow pane, so the two bands and a centre each get one"
+        );
+        // The minimum only applies where there is room for it.
+        assert!(drop_edge_band(120.0) >= DROP_EDGE_MIN);
+        assert_eq!(drop_edge_band(0.0), 0.0);
+        for extent in [13.0f32, 40.0, 97.0, 333.0, 1600.0] {
+            assert!(
+                drop_edge_band(extent) * 2.0 < extent,
+                "a pane {extent} points across kept no centre"
+            );
+        }
+    }
+
+    #[test]
+    fn each_edge_of_a_pane_reads_as_that_edge_and_the_middle_reads_as_an_exchange() {
+        let target = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(400.0, 300.0));
+        let band = drop_edge_band(400.0);
+        let inside = band / 2.0;
+
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(target.min.x + inside, target.center().y)),
+            DropZone::Left
+        );
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(target.max.x - inside, target.center().y)),
+            DropZone::Right
+        );
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(target.center().x, target.min.y + inside)),
+            DropZone::Above
+        );
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(target.center().x, target.max.y - inside)),
+            DropZone::Below
+        );
+        assert_eq!(drop_zone_at(target, target.center()), DropZone::Centre);
+        // And the centre is not a knife edge: a pointer well inside the pane but nowhere
+        // near the middle of it still means "exchange".
+        assert_eq!(
+            drop_zone_at(
+                target,
+                Pos2::new(target.min.x + band * 1.5, target.min.y + band * 1.4)
+            ),
+            DropZone::Centre
+        );
+    }
+
+    /// A pane squeezed narrow is where a share-only rule stops working: the bands have to
+    /// stay hittable and the centre has to stay meanable.
+    #[test]
+    fn a_narrow_pane_still_has_five_regions() {
+        let target = Rect::from_min_size(Pos2::ZERO, Vec2::new(60.0, 400.0));
+        assert_eq!(drop_zone_at(target, Pos2::new(3.0, 200.0)), DropZone::Left);
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(57.0, 200.0)),
+            DropZone::Right
+        );
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(30.0, 200.0)),
+            DropZone::Centre
+        );
+        assert_eq!(drop_zone_at(target, Pos2::new(30.0, 4.0)), DropZone::Above);
+        assert_eq!(
+            drop_zone_at(target, Pos2::new(30.0, 396.0)),
+            DropZone::Below
+        );
+    }
+
+    /// The corner case, literally. Comparing how deep the pointer is into each band as a
+    /// fraction of that band is what stops a wide pane's corners all reading as "above".
+    #[test]
+    fn a_corner_belongs_to_the_band_the_pointer_is_proportionally_deepest_into() {
+        let wide = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 200.0));
+        let across = drop_edge_band(900.0);
+        let down = drop_edge_band(200.0);
+        assert!(across > down, "the bands differ, which is the point");
+
+        // Nearer its own left band than its own top band, in fractions of each.
+        assert_eq!(
+            drop_zone_at(wide, Pos2::new(across * 0.2, down * 0.6)),
+            DropZone::Left
+        );
+        assert_eq!(
+            drop_zone_at(wide, Pos2::new(across * 0.6, down * 0.2)),
+            DropZone::Above
+        );
+        // A perfect diagonal tie resolves the same way every time rather than flickering.
+        let tie = drop_zone_at(wide, Pos2::new(across * 0.5, down * 0.5));
+        assert_eq!(tie, DropZone::Left);
+    }
+
+    #[test]
+    fn the_preview_is_the_half_the_pane_would_take_and_the_whole_pane_for_an_exchange() {
+        let target = Rect::from_min_size(Pos2::new(20.0, 40.0), Vec2::new(400.0, 200.0));
+
+        let left = drop_preview(target, DropZone::Left);
+        assert_eq!(left.min, target.min);
+        assert!((left.width() - 200.0).abs() < 0.01);
+        assert!((left.height() - target.height()).abs() < 0.01);
+
+        let right = drop_preview(target, DropZone::Right);
+        assert_eq!(right.max, target.max);
+        assert!((right.width() - 200.0).abs() < 0.01);
+
+        let above = drop_preview(target, DropZone::Above);
+        assert_eq!(above.min, target.min);
+        assert!((above.height() - 100.0).abs() < 0.01);
+        assert!((above.width() - target.width()).abs() < 0.01);
+
+        let below = drop_preview(target, DropZone::Below);
+        assert_eq!(below.max, target.max);
+        assert!((below.height() - 100.0).abs() < 0.01);
+
+        assert_eq!(
+            drop_preview(target, DropZone::Centre),
+            target,
+            "an exchange puts the moved pane exactly where the target is"
+        );
+    }
+
+    #[test]
+    fn a_drop_lands_on_the_pane_under_the_pointer_and_in_the_region_it_is_over() {
+        let mut layout = Layout::single(pane("left"));
+        let first = layout.panes()[0].id.clone();
+        layout.split(&first, Direction::Horizontal, pane("right"));
+        let arrangement = arrange(&layout, area());
+        let left = titled(&arrangement, "left").pane_id.clone();
+        let right = titled(&arrangement, "right");
+        let right_rect = right.rect;
+        let right_id = right.pane_id.clone();
+
+        let onto_top = arrangement
+            .drop_target_at(
+                &left,
+                Pos2::new(right_rect.center().x, right_rect.min.y + 6.0),
+            )
+            .expect("the pointer is over the right pane");
+        assert_eq!(onto_top.pane_id, right_id);
+        assert_eq!(onto_top.zone, DropZone::Above);
+        assert_eq!(onto_top.preview, drop_preview(right_rect, DropZone::Above));
+
+        let onto_middle = arrangement
+            .drop_target_at(&left, right_rect.center())
+            .expect("the pointer is over the right pane");
+        assert_eq!(onto_middle.zone, DropZone::Centre);
+        assert_eq!(onto_middle.preview, right_rect);
+    }
+
+    /// The two ways a gesture ends without a move: back where it started, or nowhere.
+    #[test]
+    fn a_drop_on_the_pane_being_moved_or_outside_every_pane_is_not_a_target() {
+        let mut layout = Layout::single(pane("left"));
+        let first = layout.panes()[0].id.clone();
+        layout.split(&first, Direction::Horizontal, pane("right"));
+        let arrangement = arrange(&layout, area());
+        let left = titled(&arrangement, "left");
+        let left_id = left.pane_id.clone();
+
+        assert_eq!(
+            arrangement.drop_target_at(&left_id, left.rect.center()),
+            None
+        );
+        assert_eq!(
+            arrangement.drop_target_at(&left_id, Pos2::new(-40.0, -40.0)),
+            None
+        );
+    }
+
+    /// The keyboard reading of "move right": the pane lands on the far side of the pane
+    /// that is there, which in a row of three is one place along rather than a swap of
+    /// the two ends.
+    #[test]
+    fn a_directional_move_lands_the_pane_on_the_far_side_of_its_neighbour() {
+        let mut layout = Layout::single(pane("a"));
+        let first = layout.panes()[0].id.clone();
+        layout.split(&first, Direction::Horizontal, pane("b"));
+        let second = layout.panes()[1].id.clone();
+        layout.split(&second, Direction::Horizontal, pane("c"));
+        let arrangement = arrange(&layout, area());
+        let a = titled(&arrangement, "a").pane_id.clone();
+        let b = titled(&arrangement, "b").pane_id.clone();
+        let c = titled(&arrangement, "c").pane_id.clone();
+
+        assert_eq!(
+            relocation(&arrangement, &a, Side::Right),
+            Some((b.clone(), DropZone::Right)),
+            "the pane goes past its neighbour, not into where it already was"
+        );
+        assert_eq!(
+            relocation(&arrangement, &c, Side::Left),
+            Some((b, DropZone::Left))
+        );
+        assert_eq!(
+            relocation(&arrangement, &c, Side::Right),
+            None,
+            "the rightmost pane of a row already spans that edge on its own"
+        );
+        assert_eq!(relocation(&arrangement, &a, Side::Left), None);
+    }
+
+    /// The reading that makes the keyboard able to change the shape of a layout at all.
+    /// Nothing is above either pane of a row, and "nothing happens" would mean a row could
+    /// never become a column without a pointer.
+    #[test]
+    fn moving_a_pane_of_a_row_upwards_takes_it_to_the_outer_edge_and_makes_a_column() {
+        let mut layout = Layout::single(pane("left"));
+        let first = layout.panes()[0].id.clone();
+        layout.split(&first, Direction::Horizontal, pane("right"));
+        let arrangement = arrange(&layout, area());
+        let left = titled(&arrangement, "left").pane_id.clone();
+        let right = titled(&arrangement, "right").pane_id.clone();
+
+        assert_eq!(
+            neighbour(&arrangement, &right, Side::Up),
+            None,
+            "there is nothing above it, which is the case under test"
+        );
+        assert_eq!(
+            relocation(&arrangement, &right, Side::Up),
+            Some((left.clone(), DropZone::Above)),
+            "the pane becomes the top of the layout rather than doing nothing"
+        );
+        assert_eq!(
+            relocation(&arrangement, &left, Side::Down),
+            Some((right, DropZone::Below))
+        );
+    }
+
+    /// A pane nested in a column, moved along the axis its column does not run in. It has
+    /// to leave the column, and it attaches to the pane that owns the edge it is heading
+    /// for.
+    #[test]
+    fn a_pane_nested_in_a_column_can_be_moved_out_of_it_by_keyboard() {
+        let mut layout = Layout::single(pane("tall"));
+        let tall = layout.panes()[0].id.clone();
+        layout.split(&tall, Direction::Horizontal, pane("top"));
+        let top = layout.panes()[1].id.clone();
+        layout.split(&top, Direction::Vertical, pane("bottom"));
+        let arrangement = arrange(&layout, area());
+        let tall_id = titled(&arrangement, "tall").pane_id.clone();
+        let top_id = titled(&arrangement, "top").pane_id.clone();
+        let bottom_id = titled(&arrangement, "bottom").pane_id.clone();
+
+        // Within the column, the neighbour reading applies and the two exchange places.
+        assert_eq!(
+            relocation(&arrangement, &bottom_id, Side::Up),
+            Some((top_id.clone(), DropZone::Above))
+        );
+        // Downwards there is nothing below the bottom pane, and the pane that owns the
+        // bottom edge of the layout is the tall one beside it.
+        assert_eq!(
+            relocation(&arrangement, &bottom_id, Side::Down),
+            Some((tall_id.clone(), DropZone::Below))
+        );
+        // The tall pane is not the only pane touching the top of the layout — the column
+        // beside it starts there too — so moving it up takes it out of the row and makes it
+        // the top of the whole layout.
+        assert_eq!(
+            relocation(&arrangement, &tall_id, Side::Up),
+            Some((top_id, DropZone::Above))
+        );
+        assert_eq!(
+            relocation(&arrangement, &tall_id, Side::Down),
+            Some((bottom_id, DropZone::Below))
+        );
+        // Leftwards it is the only pane against that edge, so there is genuinely nowhere
+        // further to go.
+        assert_eq!(relocation(&arrangement, &tall_id, Side::Left), None);
+    }
+
+    /// The move that the "outer edge" reading exists for, proved against the domain rather
+    /// than described: the pane comes out of the row and spans the whole width. The window
+    /// only names the pane and the zone, so this is the layout the daemon will answer with.
+    #[test]
+    fn a_move_to_the_outer_edge_produces_a_pane_that_spans_it() {
+        let mut layout = Layout::single(pane("tall"));
+        let tall = layout.panes()[0].id.clone();
+        layout.split(&tall, Direction::Horizontal, pane("top"));
+        let top = layout.panes()[1].id.clone();
+        layout.split(&top, Direction::Vertical, pane("bottom"));
+        let arrangement = arrange(&layout, area());
+        let tall_id = titled(&arrangement, "tall").pane_id.clone();
+
+        let (target, zone) =
+            relocation(&arrangement, &tall_id, Side::Up).expect("there is an edge to move to");
+        assert!(layout.relocate(&tall_id, &target, zone));
+        assert!(layout.sizes_are_normalised());
+
+        let moved = arrange(&layout, area());
+        let tall_rect = moved
+            .pane(&tall_id)
+            .expect("the pane survived the move")
+            .rect;
+        assert!(
+            (tall_rect.width() - area().width()).abs() < 0.01,
+            "the pane should span the width of the layout, got {tall_rect:?}"
+        );
+        assert!(
+            tall_rect.min.y - area().min.y < 0.01,
+            "and sit against the top of it"
+        );
+        assert_eq!(moved.panes.len(), 3, "no pane was lost on the way");
+    }
+
+    #[test]
+    fn a_session_of_one_pane_has_nowhere_to_move_it() {
+        let layout = Layout::single(pane("only"));
+        let arrangement = arrange(&layout, area());
+        let only = arrangement.panes[0].pane_id.clone();
+        for side in [Side::Left, Side::Right, Side::Up, Side::Down] {
+            assert_eq!(relocation(&arrangement, &only, side), None, "{side:?}");
+        }
     }
 
     #[test]

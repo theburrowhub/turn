@@ -15,6 +15,7 @@ pub mod event;
 pub mod hierarchy;
 pub mod node;
 pub mod session;
+pub mod setting_layer;
 pub mod settings;
 pub mod template;
 pub mod workspace;

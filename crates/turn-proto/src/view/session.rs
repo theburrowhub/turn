@@ -103,6 +103,15 @@ pub struct SessionSummary {
     /// finished its turn" and "nothing is running any more" are different claims.
     pub subagent_count: usize,
     pub running_count: usize,
+    /// Of the running ones, how many survived the daemon that started them.
+    ///
+    /// A subset of `running_count`, and the part of it Turn cannot stop. It travels with
+    /// the summary so that a confirmation dialog for any row in the tree can say what
+    /// ending it will and will not achieve, without holding that Session's whole tree.
+    /// Defaults to zero for an older peer's payload, which reads as "nothing escaped" —
+    /// the same thing the field said before it existed.
+    #[serde(default)]
+    pub orphaned_count: usize,
     pub node_count: usize,
     pub pane_count: usize,
 
@@ -165,6 +174,7 @@ impl SessionSummary {
             needs_user: session.needs_user(),
             subagent_count: session.tree.subagent_count(),
             running_count: session.tree.running_count(),
+            orphaned_count: session.tree.orphaned_count(),
             node_count: session.tree.len(),
             pane_count: session.layout.pane_count(),
             idle_ms: session.idle_for_ms(now_ms),

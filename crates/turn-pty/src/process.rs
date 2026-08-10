@@ -607,12 +607,30 @@ impl PtyProcess {
         self.buffer.lock().ok().map(|b| b.snapshot())
     }
 
-    /// Current sanitised OSC 0/2 title without constructing a screen snapshot.
-    pub fn title(&self) -> Result<Option<String>, PtyError> {
+    /// The title this process set for itself, if any.
+    ///
+    /// Already sanitised: control characters, escape sequences, bidi overrides and
+    /// invisible tag characters are gone, and the length is capped, because this
+    /// string is written by the process and ends up in Turn's own chrome.
+    pub fn title(&self) -> Option<String> {
         self.buffer
             .lock()
-            .map(|buffer| buffer.title())
-            .map_err(|_| PtyError::Unavailable)
+            .ok()
+            .and_then(|b| b.title().map(str::to_string))
+    }
+
+    /// Reads the title only when it has changed since `seen`, returning the new
+    /// generation alongside it.
+    ///
+    /// Shaped this way so the caller never has to hold the buffer lock to find out
+    /// that nothing happened, which is the answer almost every time it asks.
+    pub fn title_if_changed(&self, seen: u64) -> Option<(u64, Option<String>)> {
+        let buffer = self.buffer.lock().ok()?;
+        let generation = buffer.title_generation();
+        if generation == seen {
+            return None;
+        }
+        Some((generation, buffer.title().map(str::to_string)))
     }
 
     /// Shared access to the buffer, for the heuristic adapters.
@@ -1076,6 +1094,55 @@ mod tests {
         assert!(result.is_err(), "a missing binary must not panic");
     }
 
+    /// The reported defect, through a real pseudo-terminal.
+    ///
+    /// The buffer's own tests write the bytes in directly. This one has a shell print them, so
+    /// what is exercised is the whole path a user's output takes: a process writes a Kitty
+    /// transmission naming a file on disk — which Turn will not open — in the middle of a line
+    /// of ordinary output. The line must arrive as the process wrote it, and the refusal must
+    /// arrive beside the screen rather than in it.
+    #[test]
+    fn a_refused_picture_from_a_real_process_leaves_its_line_alone() {
+        // `printf` in three parts, so the sequence really does land mid-line.
+        let script = "printf 'MCP startup interrupted: codex_apps'; \
+                      printf '\\033_Ga=T,f=100,t=f;L3RtcC9wbG90LnBuZw==\\033\\\\'; \
+                      printf ' ok\\r\\n> Explain this codebase\\r\\n'";
+        let process = spawn(ProcessSpec::new("sh", "/").arg("-c").arg(script));
+
+        wait_until("the whole script to print", || {
+            process
+                .snapshot()
+                .map(|s| s.text().contains("Explain this codebase"))
+                .unwrap_or(false)
+        });
+
+        let grid = process.buffer().lock().expect("the buffer lock").grid();
+
+        assert_eq!(
+            grid.notices.len(),
+            1,
+            "the refusal must be recorded: {:?}",
+            grid.notices
+        );
+        assert!(
+            grid.notices[0]
+                .text
+                .contains("does not read images from a file on disk"),
+            "got {:?}",
+            grid.notices
+        );
+
+        let text = grid.text();
+        assert!(
+            text.contains("MCP startup interrupted: codex_apps ok"),
+            "the process's own line must be whole: {text:?}"
+        );
+        assert!(
+            !text.contains("image not shown"),
+            "Turn's sentence must not be in the process's screen: {text:?}"
+        );
+    }
+
     #[test]
     fn input_written_to_the_pty_reaches_the_process() {
         // `cat` echoes whatever it is given, which proves the write path works.
@@ -1117,48 +1184,67 @@ mod tests {
     /// fell behind instead of growing an unbounded queue.
     #[test]
     fn a_slow_subscriber_is_told_it_fell_behind_rather_than_buffering_forever() {
-        let process = spawn(ProcessSpec::new("cat", "/"));
-        let mut lazy = process.subscribe();
+        // Driven by the channel directly rather than by a real flood.
+        //
+        // An earlier version of this test ran 4,000 `echo`s and assumed they would
+        // arrive as more than `OUTPUT_CHANNEL_CAPACITY` separate reads. That held on
+        // macOS and failed on Linux, where a different shell and pty buffer size
+        // coalesce the same output into far fewer chunks: the channel never
+        // overflowed, so nothing lagged and the test failed on a platform
+        // difference rather than on the behaviour it was written to check.
+        //
+        // The guarantee under test belongs to the channel — a subscriber that stops
+        // reading is *told* it lost data instead of being buffered without bound —
+        // so it is asserted where it lives, with an overflow that cannot depend on
+        // how an operating system happens to slice a pipe.
+        let (tx, _keep) = broadcast::channel::<OutputChunk>(OUTPUT_CHANNEL_CAPACITY);
+        let mut lazy = tx.subscribe();
 
-        process.write(b"authoritative buffer\n").unwrap();
-        wait_until("output to reach the buffer", || {
-            process
-                .snapshot()
-                .is_some_and(|snapshot| snapshot.text().contains("authoritative buffer"))
-        });
-
-        // A PTY is allowed to coalesce thousands of printed lines into only a few
-        // large reads. Overflow the exact production sender instead, so the test
-        // produces more channel messages than its capacity on every kernel.
-        for index in 0..=OUTPUT_CHANNEL_CAPACITY {
-            process
-                .output_tx
-                .send(Arc::new(format!("synthetic chunk {index}").into_bytes()))
-                .expect("the deliberately idle subscriber is still attached");
+        for i in 0..(OUTPUT_CHANNEL_CAPACITY * 2) {
+            let _ = tx.send(Arc::new(format!("chunk {i}").into_bytes()));
         }
 
-        let mut lagged = false;
+        let mut lagged_by = None;
         loop {
             match lazy.try_recv() {
                 Ok(_) => continue,
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    assert!(skipped > 0);
-                    lagged = true;
+                    lagged_by = Some(skipped);
                     break;
                 }
                 Err(_) => break,
             }
         }
-        assert!(
-            lagged,
-            "a subscriber that ignored a flood must be told it lost data"
+        let skipped =
+            lagged_by.expect("a subscriber that ignored a flood must be told it lost data");
+        assert!(skipped > 0, "the report must say how much was lost");
+    }
+
+    /// The other half of the same story, and the half that is genuinely about the
+    /// pty: however the platform slices the output, the authoritative buffer keeps
+    #[test]
+    fn a_flood_reaches_the_buffer_whole_and_leaves_it_bounded() {
+        let process = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("i=0; while [ $i -lt 4000 ]; do echo \"line $i padding padding padding\"; i=$((i+1)); done"),
         );
 
-        // And the authoritative buffer is still correct and bounded.
+        wait_until("the flood to finish", || !process.is_running());
+        wait_until("the last line to be parsed", || {
+            process
+                .snapshot()
+                .map(|s| s.text().contains("line 3999"))
+                .unwrap_or(false)
+        });
+
         let snapshot = process.snapshot().unwrap();
-        assert!(snapshot.text().contains("authoritative buffer"));
-        assert_eq!(snapshot.lines.len(), 24);
-        let _ = process.kill();
+        assert_eq!(snapshot.lines.len(), 24, "only the visible rows are kept");
+        assert!(
+            process.buffer().lock().unwrap().retained_bytes()
+                <= crate::buffer::DEFAULT_BYTE_CAPACITY,
+            "the ring must stay bounded under a flood"
+        );
     }
 
     #[test]
@@ -1361,6 +1447,108 @@ mod tests {
         assert!(rebuilt.snapshot().text().contains("first line"));
 
         let _ = process.kill();
+    }
+
+    /// The issue's reproducible test: a real pty emits a title sequence and the
+    /// change is observed.
+    ///
+    /// `printf` writes the OSC 2 form Claude Code and every shell use:
+    /// `ESC ] 2 ; <title> BEL`.
+    #[test]
+    fn a_process_can_set_its_own_title_through_a_real_pty() {
+        // Two titles from the script itself, half a second apart. Writing the
+        // second one to the pty would not work: the process is sitting in `sleep`,
+        // not reading stdin, which is also true of a real agent mid-task.
+        let process = spawn(ProcessSpec::new("sh", "/").arg("-c").arg(
+            "printf '\\033]2;fixing the climbing bug\\007'; sleep 0.5; \
+             printf '\\033]2;running the tests\\007'; sleep 5",
+        ));
+
+        wait_until("the first title", || {
+            process.title().as_deref() == Some("fixing the climbing bug")
+        });
+        wait_until("the second title to replace it", || {
+            process.title().as_deref() == Some("running the tests")
+        });
+        let _ = process.kill();
+    }
+
+    /// Two processes on two ptys keep separate titles: the buffer is per process,
+    /// so isolation is structural rather than something to remember.
+    #[test]
+    fn two_processes_keep_their_own_titles() {
+        let first = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("printf '\\033]2;first instance\\007'; sleep 5"),
+        );
+        let second = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("printf '\\033]2;second instance\\007'; sleep 5"),
+        );
+
+        wait_until("both titles", || {
+            first.title().as_deref() == Some("first instance")
+                && second.title().as_deref() == Some("second instance")
+        });
+
+        // Killing one leaves the other's title untouched.
+        let _ = first.kill();
+        wait_until("the first to die", || !first.is_running());
+        assert_eq!(second.title().as_deref(), Some("second instance"));
+    }
+
+    /// The generation only moves when the title becomes something different, which
+    /// is what stops a `PROMPT_COMMAND` re-sending the same title from producing
+    /// work on every command.
+    #[test]
+    fn a_repeated_identical_title_does_not_count_as_a_change() {
+        let process = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                .arg("printf '\\033]2;same\\007'; printf '\\033]2;same\\007'; printf '\\033]2;same\\007'; sleep 5"),
+        );
+
+        wait_until("the title to arrive", || {
+            process.title().as_deref() == Some("same")
+        });
+        let (generation, _) = process
+            .title_if_changed(0)
+            .expect("the first read reports a change");
+        assert_eq!(generation, 1, "three identical titles are one change");
+        assert!(
+            process.title_if_changed(generation).is_none(),
+            "nothing changed since, so there is nothing to report"
+        );
+    }
+
+    /// A hostile title cannot reach the caller unsanitised, and it cannot cost
+    /// unbounded memory either.
+    #[test]
+    fn a_hostile_title_from_a_real_process_arrives_sanitised_and_bounded() {
+        let process = spawn(
+            ProcessSpec::new("sh", "/")
+                .arg("-c")
+                // A cursor-clearing sequence, a bidi override and 4,000 characters.
+                .arg("printf '\\033]2;evil\\033[2J\\342\\200\\256flip'; printf 'A%.0s' $(seq 1 4000); printf '\\007'; sleep 5"),
+        );
+
+        wait_until("the title to arrive", || process.title().is_some());
+        let title = process.title().unwrap();
+        assert!(
+            !title.chars().any(|c| c.is_control()),
+            "control characters reached the caller: {title:?}"
+        );
+        assert!(
+            !title.contains('\u{202e}'),
+            "a bidi override survived: {title:?}"
+        );
+        assert!(
+            title.chars().count() <= crate::buffer::MAX_TITLE_CHARS,
+            "an unbounded title was retained: {} chars",
+            title.chars().count()
+        );
     }
 
     #[test]

@@ -519,6 +519,8 @@ fn a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept() {
                 lifecycle: Lifecycle::Orphaned,
                 can_relaunch: false,
                 command: None,
+                auto_start: false,
+                needs_checkout_write: true,
             },
             PaneRestoreOutcome {
                 pane_id: lost_pane.clone(),
@@ -526,6 +528,8 @@ fn a_partial_restore_offers_a_relaunch_that_only_the_user_can_accept() {
                 lifecycle: Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("cargo watch -x test".into()),
+                auto_start: false,
+                needs_checkout_write: false,
             },
         ],
     }));

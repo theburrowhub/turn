@@ -57,10 +57,18 @@ Status values:
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
-| [044](#adr-044) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
-| [045](#adr-045) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
-| [046](#adr-046) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
-| [047](#adr-047) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
+| [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
+| [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
+| [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
+| [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
+| [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Accepted, implemented |
+| [049](#adr-049) | Coming back to a Session starts it; the daemon still starts nothing on its own | Accepted, implemented; overturns the restore half of the never-relaunch rule |
+| [050](#adr-050) | Ending is authoritative: a process Turn cannot stop is reported, never a veto | Accepted, implemented |
+| [051](#adr-051) | Settings resolve in the daemon through one explicit hierarchy | Accepted, implemented |
+| [052](#adr-052) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
+| [053](#adr-053) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
+| [054](#adr-054) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
+| [055](#adr-055) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
 
 ---
 
@@ -2601,7 +2609,153 @@ tree selection, focus and layout are not part of the operation.
 ---
 
 <a id="adr-044"></a>
-## ADR-044 — Terminal history is a private bounded journal, never proof of liveness
+## ADR-044 — A terminal pane hosts the user's shell, and an agent runs inside it
+
+**Status:** Accepted, implemented. Narrows ADR-017's evidence ladder to say that Turn's own launch is
+evidence, and extends ADR-019's on-demand process scan with a single-pid liveness check.
+
+### Context
+
+A pane's process *was* the agent. Two reports followed from that one fact, and neither was a bug in the
+code that could be fixed where it was observed:
+
+* Leaving Claude Code with `/exit` left the pane flickering and dead. The process the pane was a view of
+  had ended, so there was nothing left to draw and nothing left to type into. In every terminal the user
+  already owns, quitting an agent returns them to a prompt.
+* `+ Pane Agent` did nothing. With no `default_agent` configured, the pane's command resolved to `None`,
+  the pane opened empty, and nothing said why.
+
+### Alternatives considered
+
+**Relaunch the agent when it exits.** Rejected outright. Turn never relaunches on its own — not on
+restore, not after a crash — and the pane's emptiness is not a reason to make an exception.
+
+**Keep the agent as the pane's process and re-draw the dead pane as a recovery offer.** This is what the
+restore path does for a process that did not survive a daemon restart, and it is right *there*: the daemon
+was not running, so it cannot know what the user wants. It is wrong here. The user quit the agent
+deliberately, in a terminal, and expects the terminal.
+
+**Put the agent in the shell's `argv`: `shell -i -c '<agent>; exec <shell> -i'`.** Tried, measured on real
+pseudo-terminals, and rejected. It is the tidier shape — the command cannot race the shell's start-up — but
+**zsh exits with 130 when a command given to it with `-c` is interrupted**, interactive or not, with `exec`
+waiting after the semicolon or not. Ctrl-C in the pane would then take the pane down along with the agent:
+the same report arriving by a different route. bash and `sh` survive it; zsh is the default shell on macOS.
+
+**Host every pane's command in a shell.** Rejected. A pane that names a job — `npm run dev`, a test run —
+exists to show that job and its ending. Wrapping it in a shell that outlives it would hide the exit code
+that is the whole point of the pane.
+
+### Decision
+
+A pane whose command the adapter registry recognises as an agent runs `shell -i`, and the agent's command
+line is **written to the pty**, exactly as if the user had typed it. The pane's process is the user's shell;
+the agent is a command running in it; and when the agent ends the shell is still there with its prompt, its
+pid and its scrollback. Which panes this applies to is decided by the adapter, not by the pane's label
+(ADR-029): `claude` typed into a plain terminal pane is an agent, and `npm run dev` in an agent pane is not.
+
+Writing the command in does not race the shell's start-up, and that was measured rather than assumed: the
+bytes wait in the terminal's input queue until the shell begins reading, so they survive an rc file being
+sourced and a line editor being set up — verified with a zero-millisecond delay against a shell with a slow
+rc, on zsh, bash and `sh`, for both ctrl-C and ctrl-D. It also puts the command in the user's shell history,
+which is what makes "the user can start it again by typing" an up-arrow rather than a paragraph of
+documentation.
+
+The agent's *environment* is never typed. One of its values is a URL carrying this node's hook token, and an
+input line reaches the pane's screen, its scrollback and the user's history file. A launch into a shell Turn
+is about to start puts it in that shell's environment, where it is invisible and inherited. A launch into a
+shell that is already running — which is what `RelaunchNode` does — writes it to an owner-only file in the
+node's scratch directory and tells the shell to source it.
+
+One launch produces **two nodes**. A `Shell` node owns the pty and the pane. An agent node owns everything
+that makes an agent an agent — its `AgentInfo`, its adapter, the integration level the launch achieved, its
+hook token and its turn axis — and hangs off the shell at `Relation::Confirmed`. Confirmed is the whole
+point: Turn wrote that command line itself, so the edge is knowledge, not an inference from the process
+table. ADR-017's ladder is unchanged; this is a new source at its top rather than a new rung.
+
+The agent's *pid* is a separate question from its *identity*. The shell forked it, so Turn never held it:
+the pid is learned by matching one direct child of the shell against the executable Turn asked for, and
+until that happens the node carries no pid rather than borrowing the shell's. Its death is noticed by
+asking the kernel about that one pid on each tick — a single `kill(pid, 0)`, not the process-table refresh
+ADR-019 keeps on demand — and recorded as `Lifecycle::Lost`, because Turn did not see it exit and will not
+invent an exit code.
+
+Everything Turn types now passes through a shell, so every word is quoted with `shell-words`: notably the
+`--settings` path the adapter generated, which Turn produced from a data directory the user chose and which
+may contain a space, a `$` or a backtick. It has to arrive at the agent unchanged, and it must not be able to
+run anything.
+
+`+ Pane Agent` always resolves to something: the workspace's configured agent, else the first agent CLI on
+the user's `PATH`, else the shell with a printed sentence saying why it is only a shell. A configured agent
+that is missing is named rather than silently replaced by a different one.
+
+### Consequences
+
+- Quitting an agent leaves a working shell in the pane. Ctrl-C leaves one too. The pane is never dead, and
+  the user starts the agent again by typing — or with `RelaunchNode`, which types it for them into the shell
+  that never died.
+- Closing an agent pane still refuses to stop the agent, as it always did; the check now also asks whether
+  the pane's shell is *hosting* one.
+- `Stop Agent` signals the agent's own pid, which is the difference between stopping the agent and
+  interrupting whatever is in the foreground. `Interrupt` still goes through the tty, and for a hosted
+  agent that is not a detail but the only correct route.
+- Attention routing walks from a hosted agent to its shell, because the shell's tty is where an answer is
+  typed. A node with a pid but no terminal of its own is not an input boundary.
+- **Downside:** an agent pane now starts two processes and shows two rows. The tree is one deeper, and a
+  session's `running_count` counts the shell.
+- **Downside:** the pane's shell sources the user's rc, which is what makes the agent's `PATH` theirs — and
+  also means an rc that prints, or that `cd`s, does so in the pane. Launch-root containment still resolves
+  and proves the starting directory; it does not follow a process that moves.
+- **Downside:** the command Turn typed is in the user's shell history, alongside the commands they typed
+  themselves. That is the same thing typing it would have done, and it is what makes an up-arrow work.
+- **Downside:** Turn does not hold the agent's process, so `SIGTERM` from `TerminateNode` is refused in the
+  moment between the launch and the sweep that identifies the pid.
+- **Downside:** `Process::hosted` is in-memory only. After a daemon restart the surviving parent edge is
+  still durable and still confirmed, but the recovery offer is the pane's — the shell's — as it is for
+  every other pane.
+
+---
+
+<a id="adr-051"></a>
+## ADR-051 — Settings resolve in the daemon through one explicit hierarchy
+
+**Status:** Accepted, implemented. `turn-core::settings`, the settings requests in `turn-proto`, and the
+native settings window.
+
+### Context
+
+Turn has defaults that apply globally, to a Workspace, to a Template, to one Session and temporarily to one
+window. Letting every client merge those layers independently would create multiple sources of truth, make a
+reset indistinguishable from writing a copied default, and leave headless clients unable to explain why a
+value is active.
+
+### Decision
+
+The daemon is the only settings resolver. Precedence is Global, Workspace, Template, Session, Temporary;
+later layers override earlier ones. A resolved entry carries its value, origin, shadowed layers and the
+levels where it may be written. Owner ids are explicit for Workspace, Template and Session operations.
+
+Writes and resets answer with the complete resolved settings document, not an acknowledgement. The GUI
+replaces its copy with that answer and fetches again after any write, so it never patches or reimplements the
+precedence table. Unknown values already stored by another Turn version remain visible and resettable, while
+new writes still require a key and value shape known to this daemon. Secret values are redacted before they
+cross the protocol boundary.
+
+Keyboard bindings are resolved through the same hierarchy, but applied in the window because the daemon does
+not receive physical key events. Conflict detection compares physical modifier equivalence on the current
+platform, including Command/Control aliases, rather than comparing display strings.
+
+### Consequences
+
+- Every client observes one resolved value and can explain where it came from.
+- Removing an override reveals the next layer without the client guessing what changed.
+- Settings from a newer build can be removed safely by an older build without pretending it understands them.
+- **Downside:** a write returns more data than the changed key, and every settings surface must treat that
+  response as authoritative.
+
+---
+
+<a id="adr-052"></a>
+## ADR-052 — Terminal history is a private bounded journal, never proof of liveness
 
 **Status:** Accepted, implemented. Supersedes ADR-036's persistence prohibition while preserving its
 lifecycle honesty. `turn-pty::journal`, `turnd::core::restore`, `turn-proto::cells::Scrollback`.
@@ -2667,7 +2821,76 @@ security boundary.
 ---
 
 <a id="adr-045"></a>
-## ADR-045 — The control socket admits only the owner with a per-generation capability and bounded load
+## ADR-045 — Turn never writes its own words into a program's screen
+
+**Status:** Accepted, implemented for inline-image refusals, which is the only place Turn was doing it.
+
+### Context
+
+A pane refused to draw a picture — a Kitty transmission naming a file on disk, which Turn will not open —
+and explained itself by **feeding the sentence to the terminal parser**, at the cursor, with a newline
+after it. The intent was right and is unchanged: a picture that silently did not appear is a bug report
+nobody can write.
+
+The surface was wrong, and it showed up as soon as a real agent ran in a real pane. Codex printed a line
+about an interrupted MCP server; the sentence landed in the middle of it; the line wrapped; the row below
+shifted by one. Turn had corrupted output that had nothing to do with pictures.
+
+This is not a bug in the notice's wording or its length. A program's screen is the program's: it computed
+a layout, it addresses its cursor absolutely, and it repaints. Anything Turn inserts is therefore
+permanent — the program will never overwrite it, because the program does not know it is there — and every
+row after it is off by one. The same reasoning already forbids inventing an exit code (ADR-010). This is
+the display equivalent: Turn does not put words in a program's mouth.
+
+### Alternatives considered
+
+**Make the notice shorter, or draw it without a newline.** Rejected. Both reduce how much of the screen is
+corrupted without changing that it is corrupted. A one-character marker in the wrong cell still moves the
+program's text.
+
+**Say nothing and count it.** Rejected for the reason the notice existed: the user watched something not
+appear, and a counter they never look at does not tell them why.
+
+**Reserve the cells the picture would have occupied and leave them blank.** Considered seriously, because
+it is the least surprising thing for a program's layout. Rejected as the *only* answer: it is silent, and
+for a refused file transmission Turn does not know the intended box in the first place.
+
+**Keep the sentence, move it out of the grid.** Chosen.
+
+### Decision
+
+Refusals are recorded against the pane rather than drawn into it, as a bounded table of sentences with a
+count each, and they travel to the client *beside* the grid — a field of `Grid`, checked on arrival like
+every other field, never cells. The client shows them in a strip across the bottom of the pane, in the
+same register as the find bar, which is Turn's furniture and Turn's to write in.
+
+The strip can be dismissed, because while it is up it covers a row of the program's output and nothing
+Turn has to say about a pane outranks the pane. Dismissal is recorded against *how much* the pane had
+refused, not as a boolean, so putting away the first explanation does not silence the second. Clicking it
+is not also a click in the pane, so dismissing a sentence does not move the program's cursor.
+
+Identical refusals are counted rather than repeated, and the table is capped at eight distinct sentences,
+so a program in a loop cannot grow it.
+
+### Consequences
+
+- A refused picture leaves the program's screen byte for byte what the program wrote, which is asserted
+  directly: the same output with and without the refused sequence produces the same text and the same
+  cursor.
+- The explanation can no longer scroll away, since it is not on the screen that scrolls. The test that
+  used to write five pictures hoping the notice would still be visible now just reads it.
+- **Downside:** the strip covers the pane's bottom row while it is up. That is a row of the program's
+  output hidden, which is recoverable, rather than a row overwritten, which is not.
+- **Downside:** a ninth distinct kind of refusal does not reopen a dismissed strip, because the pane
+  tracks eight and the ninth changes no count.
+- **Downside:** Turn still shows nothing where the picture would have been, so a program whose layout
+  assumed a picture occupies rows is laid out for a screen Turn did not draw. Honouring the box would need
+  the size the sequence asked for, which a refused file transmission does not carry.
+
+---
+
+<a id="adr-053"></a>
+## ADR-053 — The control socket admits only the owner with a per-generation capability and bounded load
 
 **Status:** Accepted, implemented. `turnd::server::security`, protocol v4 and the native GUI transport.
 
@@ -2736,7 +2959,88 @@ statistics. No IPC capability is placed in a hook URL or agent configuration.
 ---
 
 <a id="adr-046"></a>
-## ADR-046 — Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere
+## ADR-046 — Archive, close and delete are three verbs, and delete forgets only Turn's record
+
+**Status:** Accepted, implemented for Sessions and Workspaces.
+
+### Context
+
+A Session could be archived, which hides it and stops nothing, or closed, which stops its
+processes and leaves it in the tree as `Paused`. Neither gets rid of it. The record stayed, the
+row came back the moment archived rows were shown, and there was no answer to "I am done with
+this, take it away" — reported, exactly, as *"no hay manera"*.
+
+The reason it had been left out is worth naming, because it is a real fear rather than an
+oversight: a Session names a checkout, a branch and sometimes a worktree, and a "delete" that
+was vague about which of those it meant would be a destructive action on somebody's work.
+
+### Alternatives considered
+
+**Hide archived rows harder.** Rejected. It answers "off my screen" and not "gone"; the record
+still accumulates, and a user who archived something to be rid of it has been told a small lie.
+
+**Delete the checkout too, or offer it as a checkbox.** Rejected outright. Turn does not own
+that directory — the user chose it, other tools use it, and it may hold work no one else has a
+copy of. A terminal multiplexer that can delete a repository is not a tool anybody should leave
+running.
+
+**One verb with flags** (`close(delete: true)`). Rejected. The two ask different questions and
+the answer to one is not the answer to the other. A flag on a dialog is also the shape most
+likely to be clicked through.
+
+### Decision
+
+A third verb, distinct from both, and its promise is stated in one line: **delete forgets
+Turn's record and nothing else.**
+
+| | Stops processes | Leaves the tree | Record kept | Reversible |
+| --- | --- | --- | --- | --- |
+| Archive | no | yes | yes | yes |
+| Close | yes | no | yes | the work is not |
+| Delete | yes | yes | **no** | **no** |
+
+What is deleted: the row, the layout, the process tree, the event log, the attention entries,
+the activity previews, the pane bindings, the write lease, the scratch directory, and the
+per-window tree state. A Workspace takes its Sessions with it, deleted one at a time rather
+than by database cascade, because each has processes to stop and clients to detach and neither
+is the schema's job.
+
+What is not deleted: anything on the user's disk. The dialog therefore **names the checkout
+path verbatim** — "/Users/x/personal-workspace/turn stays exactly as it is" — because a promise
+about "your files" is not checkable by the person reading it and a path is.
+
+`KeepProcesses` is refused. Forgetting a Session while its processes run would leave them alive
+with nothing left that names them: not in the tree, not in the store, not in a pane. That is a
+leak the user cannot see, let alone fix.
+
+Deleting something already gone answers `Ack`, so a client that lost a reply can retry.
+
+It is offered on the row's context menu and in the command palette, not as a fourth button on
+the row. A row that carries four controls, one of them irreversible and one click from the
+name, is worse than a row of three and a menu — and the palette is the surface where nothing is
+hidden.
+
+### Consequences
+
+- An archived Session can be deleted, and that is deliberate: a filed-away row is the likeliest
+  thing somebody clearing out their tree wants gone, and refusing there would leave it with no
+  way out at all.
+- `AttentionManager` gained `forget_session`, distinct from `engage_session`: engaging means a
+  demand was *met* and keeps the session's runtime, while forgetting means the subject is gone
+  and drops the mute deadline with it. Without it, `Next attention` could move focus to a
+  Session that is not in the tree.
+- The store's deletes now also clear `tree_ui_state`, which has no foreign key to cascade
+  through. A test walks the *schema* — every table with a `session_id` column — rather than a
+  list written by hand, so a table added later without a cascade fails the day it is added.
+- **Downside:** there is no undo and no trash. A deleted Session's history is gone, and the
+  only protection is the dialog. That is the cost of the promise being simple enough to state.
+- **Downside:** deleting a Workspace with many Sessions is a long operation that stops each
+  one's processes in turn, and the window has one acknowledgement to show for all of it.
+
+---
+
+<a id="adr-054"></a>
+## ADR-054 — Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere
 
 **Status:** Accepted, implemented macOS-first. `turn-pty::ReadOnlySandbox`, guarded Session creation and
 explicit lease promotion.
@@ -2801,7 +3105,302 @@ atomically changes the Session to `main_checkout`; a failed write never changes 
 ---
 
 <a id="adr-047"></a>
-## ADR-047 — Checkout write authority is a host-global inode lock inherited by every writer
+## ADR-047 — Ending a Session takes its row out of the tree; a Workspace is a project and stays
+
+**Status:** Accepted, implemented. Narrows ADR-046's middle verb.
+
+### Context
+
+"End session" stopped every process and set the Session to `Paused`, leaving its row in the tree.
+Reported as the Sessions "sitting there laughing at me every time I end them", and that is a fair
+description: the row stayed, in the same place, with the same shape, next to rows that were live.
+The only signal was a count going to zero. So the verb looked like it had done nothing, and a
+tree in daily use filled with rows its owner had already finished with.
+
+ADR-046 added `delete` and answered a different question — how to get rid of something for
+good — while leaving the visible button doing the thing that was reported. The user asked twice
+for Sessions to leave the interface, and got a third verb in a context menu.
+
+### Alternatives considered
+
+**Leave it and rely on Delete.** Rejected. Delete is for "forget this ever existed"; ending a
+task is ordinary and happens many times a day. Making the ordinary act reach for the irreversible
+one is not a design, it is a workaround.
+
+**Keep the row and make it look ended** — greyed out, or in a collapsed "Ended" group. Rejected
+for now: it is more interface, and the request was for fewer rows rather than better-labelled
+ones. It stays available if the archived list turns out to be a poor home.
+
+**Delete on end.** Rejected. A Session that has just ended is exactly the one most likely to be
+wanted back — the branch is still there, the task may not be finished.
+
+### Decision
+
+**Ending a Session archives it.** The processes stop, the write lease it held is released, and the
+row leaves the tree. Reversible in the way archiving always was: it comes back, stopped, when
+archived rows are shown or when it is restored. `DeleteSession` is still the one that forgets.
+
+Releasing the lease is part of it. A Session whose processes have stopped is not writing to the
+checkout, and leaving the lease held meant the user had to find "Release write lease" in a menu
+before they could start work in their own Workspace again — a second, obscure step for something
+already finished. The release is quiet: a failure is logged, not returned, because the Session has
+already ended and refusing the whole operation would leave the user with neither outcome.
+
+**A Workspace does not follow.** Stopping every Session in a Workspace takes every *Session* row
+out of the tree and leaves the Workspace's own row where it is. A Session is a task and finishing
+it means it is over; a Workspace is a *project* — a directory the user comes back to — and filing
+the project away because its last task stopped would mean restoring it before starting the next
+one. The control is therefore renamed to what it does: **"Stop all sessions in X"**, not "Close
+workspace". Getting the project itself out of the tree is `ArchiveWorkspace`, or
+`DeleteWorkspace`, both on the same row.
+
+Every lifecycle command's title now says two things, and a test enforces both: what happens to
+the work, and what happens to the row. The absence of the second is what made this defect
+invisible until it was used.
+
+### Consequences
+
+- Ending a Session does what the word says. The tree holds what is being worked on.
+- A Session can be brought back from the archived list, stopped, with its layout and history.
+- The write lease follows the work rather than the record, so finishing a Session in the primary
+  checkout leaves the checkout free for the next one without a second step.
+- **Downside:** a Session ended by mistake is in the archived list, which is off by default. It is
+  one preference away, and this is the reason ending archives rather than deletes.
+- **Downside:** `close_session` now has two jobs — stopping and filing — where before it had one.
+  They are one act from the user's side, which is the side that decides.
+- **Downside:** the asymmetry between a Session and a Workspace has to be learnt. It is carried by
+  the control's name rather than by documentation, which is the only place it can be learnt from.
+
+---
+
+<a id="adr-048"></a>
+## ADR-048 — The tree points at one worker: click a managed node to show its pane, its owner to restore
+
+**Status:** Accepted, implemented.
+
+### Context
+
+An agent managing work has children in the tree: the subagents it reported through its hooks, and
+the processes it started that ADR-019's scan found. Listing them is what makes it possible to see
+what an agent is *doing*. What the tree could not do was **show** you one. A subagent has no pane:
+it runs inside its parent's, four of them share one screen, and finding the one that mattered meant
+reading output from all four.
+
+The request was precise: an entry per subagent or process the agent is managing, clicking one
+maximises it, clicking the parent or the Session restores the layout, and Turn should notice when
+one has gone quiet and offer a quick way to stop it.
+
+### Alternatives considered
+
+**Give each subagent its own pane.** Rejected. A subagent is not a process with a terminal — it is
+a conversation inside the agent's. There is no pty to attach, and inventing a pane for one would
+mean inventing its output.
+
+**Open a temporary pane per subagent** (`OpenNodeAsTemporaryPane` already exists). Rejected as the
+default: it is the right answer for *inspecting* a node's details, and the wrong one for "show me
+this worker" — it adds a surface rather than picking one of the ones already there.
+
+**A separate maximise control on each row.** Rejected. The row already means "this worker", and a
+control beside it that means "this worker, but bigger" is a second way to say the same thing. The
+click is the gesture.
+
+### Decision
+
+Clicking a node an agent is **managing** maximises the pane it runs inside; clicking the thing that
+**owns** it — its agent, its shell, its Session, its Workspace — puts the layout back.
+
+*Managed* is decided by ancestry, not by kind: a hook-reported subagent is agentic and a `gh` the
+agent started is not, and both are things the agent is managing. The pane is the nearest ancestor's,
+walking up until one is bound to a pane, because the binding may be on the agent or on the shell and
+assuming which would be wrong for one of them.
+
+The whole decision is a value in `spotlight`, testable without a window, because the part worth
+getting right is *which* pane.
+
+`zoom_pane` toggles, which is right for the keyboard chord and wrong here: clicking two subagents
+that share a pane would maximise and then un-maximise it. So the window sends the request only when
+the toggle would land on the state it wants, compared against the layout **the daemon last
+reported** rather than against an idea the window keeps for itself.
+
+**Silence is reported, not acted on.** A managed node that has produced nothing for two minutes says
+so on its own row, in place of the activity preview it would otherwise repeat — a preview two
+minutes old is not news. It is a word on a row: nothing is stopped, nothing steals focus, and being
+wrong about it costs a line of text. A *shell* is never called idle; it is waiting for the person at
+the keyboard. Neither is a node that has ended: it is finished, not idle.
+
+**One control on the row: stop.** Managed nodes carry it and nothing else does, decided by kind
+rather than by state — a control that appeared only when Turn thought something was wrong would make
+its absence a claim Turn cannot support. Stopping a shell or the agent itself stays in the context
+menu, because that is a decision about the pane.
+
+### Consequences
+
+- The tree becomes the way to point at one worker among many, which is the job it was closest to.
+- A maximised pane always has a way back: every ancestor of the row that maximised it restores.
+- **Downside:** clicking a managed row now changes the layout, so a user selecting rows to read
+  their state will see panes maximise. Clicking the owner is one click back, and the alternative —
+  a modifier or a second control — would hide the feature behind something to learn.
+- **Downside:** the idle threshold is a constant. Two minutes is defensible and not derived from
+  anything about the agent; a worker that thinks for three minutes will be called quiet once.
+- **Downside:** none of this reaches a Session whose agent Turn did not launch. Without hooks there
+  are no reported subagents, only the OS children the scan finds, so a hand-started `claude` shows
+  its processes and not its workers. That is the launch path's problem, not this one's.
+
+---
+
+<a id="adr-049"></a>
+## ADR-049 — Coming back to a Session starts it; the daemon still starts nothing on its own
+
+**Status:** Accepted, implemented. Overturns the restore half of "Turn never relaunches", which was
+a product rule of this project from its brief onwards.
+
+### Context
+
+Turn restored a Session's layout and started nothing. Every pane came back empty with a button in
+the middle of it, and the user's Session — four panes — was four buttons. It was reported three
+times: as "one click per pane, unusable", then again after the collective "Start all N panes" was
+added, and finally as *"I don't want this, it has to start on its own"*.
+
+The rule it came from is a good rule, and I defended it three times: **Turn never runs the user's
+commands for them.** A restore that relaunched could re-run a deploy, a migration, a script with a
+side effect, and the user would find out afterwards.
+
+What the rule got wrong was treating every pane the same. A Session assembled from a template is
+made of shells, agent panes and file browsers — things whose whole content is "run this again" —
+and the layout model has said so since it was written: `RestoreBehaviour::Relaunch` means *running
+this again is harmless*, and every built-in template sets it. The rule was being applied as though
+that value did not exist.
+
+### Alternatives considered
+
+**Fewer clicks.** Tried, shipped, and rejected by the owner within the hour: the collective offer
+made four clicks into one, and one was still one too many. The complaint was never about the count.
+
+**Start everything with `can_relaunch`.** Rejected. That flag means "this *could* be started" — it
+is true for a pane naming `npm run deploy` — and using it as permission is the failure mode the
+original rule existed to prevent.
+
+**Start in the daemon, at restore.** Rejected, and this is the substantive half of the decision.
+The daemon restores when it starts, which includes after a crash and at boot with no window
+attached. Relaunching thirty panes with nobody watching is how a person discovers that Turn ran
+something.
+
+### Decision
+
+The daemon marks each pane `auto_start` when its `RestoreBehaviour` is `Relaunch` and it could be
+started at all. It does not act on it: `RelaunchNode` remains the only request that starts
+anything, and the daemon does not send itself requests. The executable form of that is unchanged
+and still passing.
+
+The **window** acts on it, when it receives the restore report — which is the moment a person has
+opened Turn and asked for that Session. It starts every `auto_start` pane, once, without asking,
+and holds back exactly two cases: a pane that would use the checkout while a write confirmation is
+pending, and any pane at all while a process from the previous daemon is still alive and out of
+reach, because a replacement running beside it would do the work twice.
+
+`ReattachOnly` now means what it says for a pane naming a command: **do not run this one by
+itself.** A commandless terminal is always restored as the user's configured shell, including
+legacy layouts that predate `Relaunch`; an empty panel is not a useful safety property. No pane
+shows an inline start button. A consequential stopped command remains available from the Process
+row's contextual `Start again` action without turning every recovered layout into a form.
+
+### Consequences
+
+- Coming back to a Session is coming back to the Session. Nothing to click.
+- The safety the original rule protected is now expressed where it can be reasoned about — per
+  pane, in a value the template author or the user sets — rather than as a blanket refusal.
+- The two moments are separated: a daemon restoring alone starts nothing; a window that a person
+  is looking at starts what is safe.
+- **Downside:** a command-bearing pane left on the default `ReattachOnly` does not start
+  automatically, so a hand-built job behaves differently from a template's. The default is the
+  cautious one; commandless terminal panes are exempt because their fallback is only a shell.
+- **Downside:** two windows attached to the same Session both act on the report. The second
+  request arrives after the first has started the node and is refused, so the outcome is right and
+  the log carries a refusal nobody asked about.
+- **Downside:** this is a product rule reversed under pressure from its owner, on the third
+  report. The rule was defensible and the way it was applied was not, and the record should say
+  that the owner was right and I was slow.
+
+## ADR-050 — Ending is authoritative: a process Turn cannot stop is reported, never a veto
+
+**Status:** Accepted, implemented. Reverses the refusal added with `ensure_session_processes_stoppable`.
+
+### Context
+
+Choosing "End session" on a Session restored after a daemon restart produced a red banner —
+*"Turn cannot safely stop processes that survived the previous daemon"* — and the Session could not
+be got rid of at all. Retrying did not help; the instruction was to go and stop the process outside
+Turn first, and only then would Turn allow the user to close their own task.
+
+The reasoning behind the refusal was sound as far as it went, and is worth keeping on the record
+because the code was right about the danger and wrong about the remedy. A process restored from a
+previous daemon has a PID-shaped observation and no owned handle. Signalling it blindly is unsafe
+because PIDs are reused, and fabricating its exit would release the checkout write lease while the
+real process may still be writing to the very files the Session was working on. Both are true. The
+conclusion drawn from them — *therefore the Session may not end* — does not follow.
+
+It does not follow because the refusal changes nothing about the danger. The survivor keeps running
+whether Turn refuses or not. Nothing about holding the Session open stops it, warns about it, or
+reaches it. The only thing the refusal preserved was the row in the tree, and the row is what the
+user was trying to be rid of. So the safety was notional and the cost was total: the destructive
+verb, which exists precisely for "I am done with this", stopped working exactly when the daemon had
+had a bad day.
+
+The same guard also blocked `close_workspace` and `delete_workspace`, both of which pre-validated
+every Session before touching the first one. One unreachable process in the fourth Session refused
+the whole Workspace.
+
+### Alternatives considered
+
+**Kill by pid anyway.** Rejected, and this is the part of the original reasoning that survives
+intact. PID reuse means the signal may land on an unrelated process, and Turn would have chosen to
+do that on the user's behalf.
+
+**Fabricate the exit and release the lease.** Rejected for the reason the original comment gives: a
+Session whose lease is released while a real process still writes to the checkout is the
+lost-work scenario the lease exists to prevent. What *is* released is the lease of a Session whose
+processes Turn did stop, which is the ordinary case.
+
+**A second, scarier confirmation — "force end".** Rejected. Two destructive doors for one act, and
+the user has to learn which one their situation is. Ending already asks once; the question can carry
+one more sentence.
+
+### Decision
+
+Ending is authoritative. Past the point where the disposition is known, `close_session` treats
+everything as best-effort: a process it cannot signal, a lease row that will not update, a write
+that will not land. Each is logged; none of them abandons the act. The Session is archived, its row
+leaves the tree, and the two errors that remain are asking about a Session that does not exist and
+`KeepProcesses`, which is not destructive and can afford to be strict.
+
+What replaces the veto is an answer. `Response::Closed { escaped }` is a new result shape carrying
+the processes Turn could not stop, each with its title and last-known pid, and it is what
+`CloseSession`, `DeleteSession`, `CloseWorkspace` and `DeleteWorkspace` now return. The window says
+it twice: `SessionSummary::orphaned_count` lets the confirmation dialog say what ending *will not*
+achieve before the click, and the answer's `escaped` list names the survivors with their pids
+afterwards, because the user's next step is a process list in another terminal.
+
+Nothing claims the orphan died. Its `Lifecycle::Orphaned` is untouched, which is the half of the
+original reasoning that was never in question.
+
+### Consequences
+
+- The destructive verb works when the daemon has had a bad day, which is when it is needed most.
+- A user who ends such a Session is told, in the dialog and again afterwards, that a process may
+  still be running and how to find it.
+- **Downside:** the Session's row is gone while one of its processes may not be. Turn has no place
+  left to show that process, and the honest sentence at the end of the act is the whole of what the
+  user gets. A "processes Turn has lost track of" view would be better and does not exist.
+- **Downside:** the lease is released for a Session that may still have a writer in it. This is a
+  real narrowing of the guarantee, taken deliberately: the alternative was a Workspace permanently
+  locked out of its own checkout by a process nobody can stop.
+- **Downside:** `Response::Ack` no longer answers the close and delete requests, so any client
+  matching on it for those four sees an unhandled shape rather than a compile error.
+
+---
+
+<a id="adr-055"></a>
+## ADR-055 — Checkout write authority is a host-global inode lock inherited by every writer
 
 **Status:** Accepted, implemented on Unix. `turnd::checkout_lock`, joined SQLite/lock acquisition and
 recovery, explicit PTY descriptor preservation, and cross-daemon integration coverage.

@@ -345,6 +345,16 @@ pub(crate) fn from_row(row: &Row<'_>) -> Result<ProcessNode> {
         session_id: SessionId::from_stored(row.get::<_, String>("session_id")?),
         kind: from_tag::<NodeKind>("node kind", &id, &row.get::<_, String>("kind")?)?,
         title,
+        // Deliberately not persisted: a title describes what a process is doing, and
+        // that process is gone. Restoring one would put a dead agent's last words
+        // back on screen, which is precisely the ephemeral/persistent boundary this
+        // crate's module docs draw.
+        process_title: None,
+        // Not yet persisted. For an agent, a rename already survives through
+        // `AgentName::user_renamed`, which is stored; this field exists so a shell or
+        // a TUI can also be renamed, and giving it a column needs a migration.
+        // Tracked as debt rather than half-done.
+        user_title: None,
         command: row.get("command")?,
         args: from_json("node args", &id, &row.get::<_, String>("args_json")?)?,
         cwd: row.get("cwd")?,

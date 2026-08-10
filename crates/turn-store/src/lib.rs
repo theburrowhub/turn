@@ -300,6 +300,12 @@ impl Store {
         SettingsRepo::new(&self.conn)
     }
 
+    /// The user's layered preferences. Separate from [`Self::settings`], which holds Turn's
+    /// own singletons: a preference's identity includes the level it was set at.
+    pub fn setting_layers(&self) -> crate::repo::setting_layer::SettingLayerRepo<'_> {
+        crate::repo::setting_layer::SettingLayerRepo::new(&self.conn)
+    }
+
     /// Atomically records everything one accepted runtime event changed.
     ///
     /// Ordering is part of the contract: an out-of-order stop can materialise a
@@ -341,6 +347,48 @@ pub(crate) mod testing {
 
     pub(crate) fn store() -> Store {
         Store::open_in_memory().expect("an in-memory store always opens")
+    }
+
+    /// Every table that still mentions `value` in a column called `column`, with the count.
+    ///
+    /// Asks the schema which tables have the column rather than being given a list, so a table
+    /// added later is covered the day it is added. This is what makes "Turn forgets it" a
+    /// testable claim instead of a sentence in a dialog: a delete that leaves a row behind
+    /// names the table that kept it.
+    pub(crate) fn rows_mentioning(store: &Store, column: &str, value: &str) -> Vec<(String, i64)> {
+        let conn = store.connection();
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_master m \
+                     JOIN pragma_table_info(m.name) c \
+                     WHERE m.type = 'table' AND c.name = ?1 \
+                     ORDER BY m.name",
+                )
+                .expect("the schema can always be queried");
+            let mut rows = stmt.query([column]).expect("query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("row") {
+                out.push(row.get(0).expect("table name"));
+            }
+            out
+        };
+        assert!(
+            !tables.is_empty(),
+            "no table has a column called {column:?}, so this check would pass vacuously"
+        );
+        let mut found = Vec::new();
+        for table in tables {
+            // The table name comes from `sqlite_master`, not from a caller.
+            let sql = format!("SELECT COUNT(*) FROM \"{table}\" WHERE \"{column}\" = ?1");
+            let count: i64 = conn
+                .query_row(&sql, [value], |row| row.get(0))
+                .unwrap_or_else(|cause| panic!("counting {table}: {cause}"));
+            if count > 0 {
+                found.push((table, count));
+            }
+        }
+        found
     }
 
     pub(crate) fn saved_workspace(store: &Store, name: &str) -> Workspace {

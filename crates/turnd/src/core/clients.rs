@@ -571,18 +571,24 @@ impl Core {
     /// the parsed screen, and whoever asked for bytes is sent the bytes. A pane with no
     /// cells attachment never has a grid built for it, and a pane with no byte
     /// attachment never pays for base64.
-    pub(crate) fn deliver_output(&mut self, node: &NodeId, data: Vec<u8>, dropped: u64) {
+    pub(crate) fn deliver_output(
+        &mut self,
+        node: &NodeId,
+        data: Vec<u8>,
+        dropped: u64,
+        now_ms: i64,
+    ) {
         let could_change_title = output_may_change_title(&data);
         match self.deliver_screen(node) {
             // A cells renderer already locked the authoritative buffer to build its
             // grid, so reuse the title read under that same lock.
             Some(observed) => {
-                self.apply_observed_process_title(node, observed, turn_core::now_ms());
+                self.apply_observed_process_title(node, observed, now_ms);
             }
             // Bytes-only panes need a separate read for low-latency title updates,
             // but ordinary output can wait for the periodic all-process observer.
             None if could_change_title => {
-                self.observe_process_title(node, turn_core::now_ms());
+                self.observe_process_title(node, now_ms);
             }
             None => {}
         }
@@ -776,7 +782,7 @@ mod tests {
         drain(&mut frames);
         harness
             .core
-            .deliver_output(&first_node, b"hello".to_vec(), 0);
+            .deliver_output(&first_node, b"hello".to_vec(), 0, 0);
         let addressed: Vec<SessionId> = drain(&mut frames)
             .into_iter()
             .filter_map(|event| match event {
@@ -868,6 +874,8 @@ mod tests {
                 lifecycle: turn_core::state::Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("claude".into()),
+                auto_start: false,
+                needs_checkout_write: true,
             }],
         };
         harness.core.restore_reports.push(report.clone());

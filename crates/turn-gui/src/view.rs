@@ -30,8 +30,8 @@ use turn_core::ids::{
     AttentionId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    ActivityPreview, Direction, Layout, LayoutPreset, LeaseState, NodeKind, Pane, PaneKind,
-    PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionMode,
+    ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
+    PaneKind, PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionMode,
     SessionStatus, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
@@ -43,9 +43,10 @@ use turn_proto::{
     WorkspaceSummary, WorkspaceTreeView,
 };
 
+use crate::icons;
 use crate::keymap::{Command, Keymap};
 use crate::palette::{self, Palette};
-use crate::panes::{self, Arrangement, Divider, Side};
+use crate::panes::{self, Arrangement, Divider, DropTarget, Side};
 use crate::terminal::{self, PaneAction, PaneInteraction, PaneOptions};
 use crate::theme::Theme;
 use crate::transport::ConnectionState;
@@ -174,16 +175,57 @@ pub struct SessionRestoreView {
 }
 
 /// A destructive lifecycle choice awaiting a second, explicit click.
+///
+/// Every field here exists to be *said* in the dialog. Nothing in Turn stops a process
+/// without one of these on screen first, so a confirmation that could not name what it
+/// was about to terminate would be the whole guarantee reduced to a shrug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleConfirmation {
     EndSession {
         session_id: SessionId,
         name: String,
         running_count: usize,
+        /// Of those, how many Turn cannot stop because they survived a previous daemon.
+        ///
+        /// The act goes ahead with them — a Session the user has finished with is not kept
+        /// alive because a process escaped the daemon — so the honest place to say so is
+        /// here, before the click, rather than in a status line afterwards.
+        escaped_count: usize,
     },
     StopWorkspace {
         workspace_id: WorkspaceId,
         name: String,
+        escaped_count: usize,
+        /// How many Sessions the Workspace holds, and how many of them have something
+        /// running. Closing a Workspace reaches every one of them, and a user who is
+        /// only shown the Workspace's name cannot know how much that is.
+        session_count: usize,
+        running_sessions: usize,
+        running_processes: usize,
+    },
+    /// The one that does not come back.
+    ///
+    /// A separate variant from `EndSession` rather than a flag on it, because the two ask
+    /// different questions and the answer to one is not the answer to the other. Ending is
+    /// about the work; deleting is about the record.
+    DeleteSession {
+        session_id: SessionId,
+        name: String,
+        running_count: usize,
+        escaped_count: usize,
+    },
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+        session_count: usize,
+        running_processes: usize,
+        escaped_count: usize,
+        /// The directory the Workspace points at, shown verbatim.
+        ///
+        /// The one thing a person needs to see before deleting a Workspace is the path that is
+        /// *not* being deleted. Naming it — rather than promising in the abstract that files
+        /// are safe — is what makes the promise checkable by the person reading it.
+        root: String,
     },
 }
 
@@ -265,6 +307,81 @@ impl ContextHandoffDraft {
     }
 }
 
+impl LifecycleConfirmation {
+    /// The confirmation for ending one Session, from the daemon's own summary of it.
+    pub fn end_session(session: &SessionSummary) -> Self {
+        LifecycleConfirmation::EndSession {
+            session_id: session.id.clone(),
+            name: session.name.clone(),
+            running_count: session.running_count,
+            escaped_count: session.orphaned_count,
+        }
+    }
+
+    /// The confirmation for deleting one Session, from the daemon's own summary of it.
+    pub fn delete_session(session: &SessionSummary) -> Self {
+        LifecycleConfirmation::DeleteSession {
+            session_id: session.id.clone(),
+            name: session.name.clone(),
+            running_count: session.running_count,
+            escaped_count: session.orphaned_count,
+        }
+    }
+
+    /// The confirmation for deleting a whole Workspace, counted from the tree branch.
+    ///
+    /// The root path comes from the Workspace's own summary rather than from anything the
+    /// caller assembles: the dialog's promise is about that exact directory, and a path the
+    /// window guessed would be a promise about the wrong one.
+    pub fn delete_workspace(workspace: &WorkspaceTreeView) -> Self {
+        LifecycleConfirmation::DeleteWorkspace {
+            workspace_id: workspace.workspace.id.clone(),
+            name: workspace.workspace.name.clone(),
+            session_count: workspace.sessions.len(),
+            running_processes: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.running_count)
+                .sum(),
+            escaped_count: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.orphaned_count)
+                .sum(),
+            root: workspace.workspace.root.clone(),
+        }
+    }
+
+    /// The confirmation for stopping a whole Workspace, counted from the tree branch.
+    ///
+    /// A constructor rather than three call sites adding up `running_count` themselves:
+    /// the row control, the context menu and the keyboard command must all put the same
+    /// number in front of the user, and a number the dialog computed differently from the
+    /// row would be worse than no number at all.
+    pub fn stop_workspace(workspace: &WorkspaceTreeView) -> Self {
+        LifecycleConfirmation::StopWorkspace {
+            workspace_id: workspace.workspace.id.clone(),
+            name: workspace.workspace.name.clone(),
+            session_count: workspace.sessions.len(),
+            running_sessions: workspace
+                .sessions
+                .iter()
+                .filter(|session| session.session.running_count > 0)
+                .count(),
+            running_processes: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.running_count)
+                .sum(),
+            escaped_count: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.orphaned_count)
+                .sum(),
+        }
+    }
+}
+
 /// What the window is showing.
 #[derive(Debug, Default)]
 pub struct TurnView<'a> {
@@ -280,7 +397,8 @@ pub struct TurnView<'a> {
     /// At most one explicit temporary Pane for this window. Rendering it must never
     /// insert its PaneId into `layout`.
     pub temporary_pane: Option<TemporaryPaneContent<'a>>,
-    /// Actionable recovery for the selected Session. It never relaunches by itself.
+    /// Recovery state for the selected Session. Safe panes relaunch automatically in the Desk;
+    /// this remains here to explain any safety gate while that happens.
     pub restore: Option<&'a SessionRestoreView>,
     /// A previous daemon owned this Session's checkout. Starting anything remains
     /// blocked until the user explicitly confirms a new fenced lease.
@@ -288,7 +406,7 @@ pub struct TurnView<'a> {
     /// Processes from the previous daemon that are still alive but cannot be controlled.
     /// They block recovery/relaunch so Turn never creates a second writer beside them.
     pub unreachable_processes: usize,
-    /// Nodes whose explicit relaunch request is currently in flight.
+    /// Nodes whose relaunch request is currently in flight, normally from automatic recovery.
     pub relaunching: Vec<NodeId>,
     pub reclaiming_workspaces: Vec<WorkspaceId>,
     pub reclaiming_write_access: bool,
@@ -303,6 +421,13 @@ pub struct TurnView<'a> {
     pub notice: Option<String>,
     /// Typed checkout conflict, rendered as a recovery flow rather than parsed text.
     pub write_conflict: Option<&'a ProtoErrorContext>,
+    /// A link from a pane that must be confirmed before Turn hands it to the desktop.
+    ///
+    /// Only ever set for a link whose visible text names a different target than the one it
+    /// would open — `links` decides that, and an ordinary link never arrives here.
+    pub link_confirmation: Option<&'a terminal::links::LinkRequest>,
+    /// The preferences in force, resolved by the daemon. `None` before the first answer.
+    pub settings: Option<&'a turn_proto::SettingsView>,
     /// The attention policy in force, for the settings sheet.
     pub policy: Option<AttentionPolicy>,
     pub now_ms: i64,
@@ -310,10 +435,34 @@ pub struct TurnView<'a> {
 
 /// The window's own mutable state: what is typed in the palette, and what is selected
 /// in each pane.
+#[derive(Default)]
+struct LogoTexture(Option<egui::TextureHandle>);
+
+impl std::fmt::Debug for LogoTexture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LogoTexture")
+            .field(&self.0.as_ref().map(egui::TextureHandle::id))
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
+    /// The checked-in product mark, decoded and uploaded once for the lifetime of the window.
+    /// Keeping the handle here avoids allocating a GPU texture on every immediate-mode frame.
+    logo_texture: LogoTexture,
+    /// The pane whose header is being dragged, if any.
+    ///
+    /// The gesture itself belongs to `egui`, which also abandons it when Escape is
+    /// pressed — so cancelling needs no bookkeeping here. What this is for is knowing
+    /// that the Escape *belonged* to the drag, so the same press is not also spent on
+    /// closing whatever is open behind it. Where the pane would land is deliberately not
+    /// stored: it is recomputed from the pointer every frame, so a layout arriving from
+    /// the daemon mid-drag cannot leave a landing spot on screen that no longer exists.
+    pub dragged_pane: Option<PaneId>,
     /// Which command sheet is open, if any.
     pub shortcuts_open: bool,
     pub settings_open: bool,
@@ -321,6 +470,21 @@ pub struct ViewState {
     /// overlay, never a second persistent navigator beside the hierarchy.
     pub attention_panel_open: bool,
     pub write_conflict_open: bool,
+    /// Which level the settings sheet writes to.
+    ///
+    /// Window-local, and remembered across openings: a user adjusting their Workspace does
+    /// several in a row, and a selector that reset to Global between each would be a way to
+    /// write the third one to the wrong place. Defaults to the narrowest level that exists,
+    /// because that is the one a change is least likely to surprise somebody else with.
+    pub settings_level: Option<turn_core::settings::Scope>,
+    /// The chord being typed into one command's field, keyed by the command id.
+    pub shortcut_drafts: std::collections::BTreeMap<String, String>,
+    /// The text being typed into one preference's field, keyed by its key.
+    ///
+    /// Held while editing rather than written per keystroke: a `set_setting` per character
+    /// would be a round trip per character, and every intermediate value would be refused as
+    /// out of range on the way to a valid one.
+    pub settings_drafts: std::collections::BTreeMap<String, String>,
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
     pub workspace_draft: Option<WorkspaceDraft>,
@@ -711,6 +875,26 @@ pub enum ViewAction {
         workspace_id: WorkspaceId,
         disposition: CloseDisposition,
     },
+    /// Maximises a pane, or puts the layout back when it is already the maximised one.
+    ///
+    /// The daemon's `zoom_pane` *toggles*, which is right for the keyboard chord and wrong for
+    /// the tree: clicking two different subagents that share a pane would maximise and then
+    /// un-maximise it. So the window sends this only when the toggle would land on the state it
+    /// wants, worked out from the layout the daemon last gave it.
+    ZoomPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
+    /// Removes a Session from Turn for good. Only ever produced by the confirmation dialog.
+    DeleteSession {
+        session_id: SessionId,
+        disposition: CloseDisposition,
+    },
+    /// Removes a Workspace and its Sessions for good. Only ever produced by the dialog.
+    DeleteWorkspace {
+        workspace_id: WorkspaceId,
+        disposition: CloseDisposition,
+    },
     RelaunchNode {
         session_id: SessionId,
         node_id: NodeId,
@@ -768,6 +952,25 @@ pub enum ViewAction {
         expected_generation: u64,
     },
     ResolveWriteConflict(SessionConflictAlternative),
+    /// Close one named pane — the one whose header control was used, never "whichever
+    /// is active". The process it was showing keeps running; the control that produces
+    /// this says so in as many words.
+    ClosePane {
+        pane_id: PaneId,
+    },
+    /// Move one pane so it sits beside another, from a header drag or from a
+    /// `MovePane…` command. `zone` is which of the target's five regions it lands in,
+    /// so the same action expresses "left of", "above" and "exchange with".
+    ///
+    /// The daemon owns the tree: the window asks and draws whatever comes back, and
+    /// never rearranges its own copy. A window that moved the pane itself and then
+    /// received a different layout would flicker, which is the failure this whole
+    /// architecture exists to avoid.
+    RelocatePane {
+        moved: PaneId,
+        target: PaneId,
+        zone: DropZone,
+    },
     /// Closing a temporary view always keeps the Agent/Process alive.
     CloseTemporaryPane {
         session_id: SessionId,
@@ -775,6 +978,140 @@ pub enum ViewAction {
     },
     /// Close a sheet.
     CloseOverlay,
+
+    /// Forget the scrollback Turn kept for one pane, from that pane's own menu.
+    ///
+    /// Turn's record only. The screen belongs to the program in the pane, and clearing that
+    /// would mean typing into whatever is running.
+    ClearPaneHistory {
+        pane_id: PaneId,
+    },
+    /// Open a link found in a pane's output.
+    ///
+    /// Carries the whole [`terminal::links::LinkRequest`] rather than a URL, because whether
+    /// this needs asking about first is a property of the link — a target whose visible text
+    /// names a different host arrives with that warning attached — and the window is the
+    /// thing that can ask.
+    FollowLink(terminal::links::LinkRequest),
+    /// Turn saying something in its own voice, from a pane that declined part of what the
+    /// user asked for.
+    Notice(String),
+    /// The user said yes to the link they were asked about.
+    ConfirmLink,
+    /// The user said no, or pressed Escape.
+    DismissLink,
+
+    /// Record one preference at one level.
+    ///
+    /// The level is explicit and comes from the control the user used, never from what is
+    /// selected: "set the font size" is four different acts, and a window that guessed would
+    /// be the one that silently edited the wrong one.
+    SetSetting {
+        scope: turn_core::settings::Scope,
+        owner_id: String,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Bind, unbind or reset one command's chord.
+    ///
+    /// The chord arrives as the text the user typed, unparsed. Parsing it here would put a
+    /// second reader of the chord grammar in the window; `Overrides::from_settings` already
+    /// has one, and it reports what it could not read rather than dropping it.
+    RebindCommand {
+        command: String,
+        /// The chord as written, `""` to unbind, or [`DEFAULT_CHORD`] to go back to Turn's own.
+        chord: String,
+    },
+    /// Remove one level's opinion, so the level below is in force again.
+    ResetSetting {
+        scope: turn_core::settings::Scope,
+        owner_id: String,
+        key: String,
+    },
+}
+
+/// What one toolbar button does when it is pressed.
+///
+/// Two of them open a draft in [`ViewState`] rather than sending a command, because
+/// creating a Workspace or a Session is a form the user fills in and not a request the
+/// window can make on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolbarIntent {
+    Run(Command),
+    NewWorkspace,
+    /// The layout presets, as a menu: there are five of them and a toolbar button
+    /// cannot mean five things.
+    LayoutMenu,
+}
+
+/// One button of the top bar's toolbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolbarButton {
+    pub icon: &'static str,
+    /// The words. An icon on its own would convey the action by appearance, which this
+    /// project does not allow: this is the accessible name and the tooltip.
+    pub label: &'static str,
+    pub intent: ToolbarIntent,
+}
+
+/// The toolbar, in the order the buttons are drawn and the reverse of the order they
+/// are dropped when the window is too narrow for all of them.
+///
+/// Everything here already exists as a command or as a visible control somewhere else.
+/// The toolbar is not new capability; it is the capability Turn accumulated, in one
+/// place a person can find without reading documentation.
+pub const TOOLBAR: &[ToolbarButton] = &[
+    ToolbarButton {
+        icon: icons::PLUS_SQUARE,
+        label: "New pane",
+        intent: ToolbarIntent::Run(Command::SplitHorizontal),
+    },
+    ToolbarButton {
+        icon: icons::LAYOUT,
+        label: "Layout",
+        intent: ToolbarIntent::LayoutMenu,
+    },
+    ToolbarButton {
+        icon: icons::FOLDER_PLUS,
+        label: "New workspace",
+        intent: ToolbarIntent::NewWorkspace,
+    },
+    ToolbarButton {
+        icon: icons::COMMAND,
+        label: "Command palette",
+        intent: ToolbarIntent::Run(Command::OpenPalette),
+    },
+    ToolbarButton {
+        icon: icons::BELL,
+        label: "Attention queue",
+        intent: ToolbarIntent::Run(Command::ToggleAttentionPanel),
+    },
+    ToolbarButton {
+        icon: icons::KEYBOARD,
+        label: "Keyboard shortcuts",
+        intent: ToolbarIntent::Run(Command::ShowKeyboardShortcuts),
+    },
+    ToolbarButton {
+        icon: icons::GEAR,
+        label: "Settings",
+        intent: ToolbarIntent::Run(Command::OpenSettings),
+    },
+];
+
+/// How many toolbar buttons fit in `width`.
+///
+/// Worked out before anything is drawn, and the reason is a failure two earlier
+/// snapshots caught: egui draws a widget wherever the cursor has reached, including past
+/// the edge of the region it was given, so a row that ran out of room overlapped the
+/// text beside it instead of stopping. Buttons are dropped from the end, which is why
+/// [`TOOLBAR`] is ordered by how much the action is worth.
+pub fn toolbar_capacity(width: f32) -> usize {
+    if width < icons::SIZE.x {
+        return 0;
+    }
+    // The last button needs its own width but not the gap that would follow it.
+    let fits = ((width + (icons::PITCH - icons::SIZE.x)) / icons::PITCH).floor();
+    (fits.max(0.0) as usize).min(TOOLBAR.len())
 }
 
 /// A region of the window, with an id of its own.
@@ -788,11 +1125,164 @@ fn region(rect: Rect, name: &'static str) -> egui::UiBuilder {
     egui::UiBuilder::new().max_rect(rect).id_salt(name)
 }
 
+/// The same thing for a region that exists once per pane or per workspace.
+///
+/// The key has to be in the salt: three pane headers each holding one close button would
+/// otherwise share that button's id, and with it its hover and press state — closing the
+/// first pane would highlight the third.
+fn keyed_region(rect: Rect, name: &'static str, key: &str) -> egui::UiBuilder {
+    egui::UiBuilder::new().max_rect(rect).id_salt((name, key))
+}
+
 const SIDEBAR_WIDTH: f32 = 344.0;
 const INSPECTOR_WIDTH: f32 = 264.0;
-const STATUS_HEIGHT: f32 = 26.0;
+/// The top bar: the connection, the toolbar of actions, and the version.
+///
+/// Taller than the 26 points it used to be because it now carries real controls rather
+/// than only text. A 26-point bar with 22-point buttons in it leaves one point of
+/// padding, and the buttons touch the border.
+const STATUS_HEIGHT: f32 = 32.0;
+/// The bar along the bottom of the window.
+const WINDOW_STATUS_HEIGHT: f32 = 26.0;
 const ROW_HEIGHT: f32 = 40.0;
 const PANE_HEADER: f32 = 22.0;
+/// The room the close control needs at the right of a pane header.
+const PANE_CLOSE_WIDTH: f32 = 18.0;
+/// The gap between a row's last control and the right edge of the tree.
+const ROW_ACTION_MARGIN: f32 = 6.0;
+/// How far below the top of a row its controls sit.
+///
+/// On the *first* line, deliberately, and that is what lets a row carry three controls
+/// without narrowing the second line at all: the name and the status tag share the first
+/// line with the buttons and have to make room for them, while the detail line underneath
+/// keeps the full width of the tree.
+const ROW_ACTION_TOP: f32 = 3.0;
+
+/// How many controls a row of the tree carries.
+///
+/// A Workspace row carries three — new session, archive, close — and a Session row two.
+/// The count is a function of the row rather than of its state: a control that vanished
+/// when it did not apply would teach nothing about why, so an inapplicable one is drawn
+/// disabled with the reason in its tooltip, and the room it needs is reserved either way.
+fn row_action_count(row: HierarchyRow<'_>) -> usize {
+    match row {
+        HierarchyRow::Workspace(_) => 3,
+        HierarchyRow::Session { .. } => 2,
+        // A worker an agent is managing carries one: the way to stop it.
+        //
+        // Every other Process row carries none, and that difference is the point rather than an
+        // inconsistency. An agent can be managing a dozen subagents and processes at once, and
+        // the row is where the user finds out one of them has gone quiet — so it is also where
+        // they should be able to do something about it, without a right-click and a menu. A shell
+        // or the agent itself is not in that position: stopping either is a decision about the
+        // pane, and it stays in the context menu where it always was.
+        //
+        // Decided by kind rather than by state: the control is there whether the worker is busy
+        // or idle, because a control that appeared only when Turn thought something was wrong
+        // would make its absence a claim Turn cannot support.
+        HierarchyRow::Process { session, node } => {
+            usize::from(crate::spotlight::is_managed(session, node))
+        }
+    }
+}
+
+/// The widest a row's status tag gets, for deciding beforehand whether the row can afford
+/// its controls.
+///
+/// The tag itself is measured when it is painted — this is the allowance the *decision* is
+/// made against, so a Session's controls do not appear and disappear as its `YOUR TURN`
+/// comes and goes.
+const TAG_COLUMN: f32 = 94.0;
+/// The least room a row's name may be left with before its controls give way.
+///
+/// Enough for a dozen characters and the ellipsis, which is the difference between a name a
+/// person can recognise and one they cannot.
+const ROW_MIN_TITLE: f32 = 96.0;
+
+/// Where a row's text starts, measured from the left of the row.
+fn row_text_x(row: HierarchyRow<'_>) -> f32 {
+    // The caret sits in the indent; the text begins after it.
+    9.0 + row.depth() as f32 * 14.0 + 15.0
+}
+
+/// The room a row's controls need at its right-hand end, or nothing when the row is too
+/// narrow to afford them.
+///
+/// Reserved inside [`hierarchy_row`] rather than left to the buttons, because the row's
+/// name and its status tag are painted, not laid out, and painted text does not move
+/// aside for a widget drawn on top of it.
+///
+/// A tree narrow enough that its rows would be left with no room for a name gives the
+/// controls up instead of the name: `Fix cli…` identifies nothing, while every one of
+/// these acts is also on the row's context menu and on the keyboard. Worked out from the
+/// row's width before anything is drawn, for the same reason `toolbar_capacity` is — and
+/// from the width the *tag* case needs, so the controls do not appear and disappear as a
+/// Session's `YOUR TURN` comes and goes.
+fn row_action_width(row: HierarchyRow<'_>, row_width: f32) -> f32 {
+    let wanted = match row_action_count(row) {
+        0 => return 0.0,
+        count => count as f32 * icons::ROW_PITCH + ROW_ACTION_MARGIN,
+    };
+    if row_width - row_text_x(row) - TAG_COLUMN - wanted >= ROW_MIN_TITLE {
+        wanted
+    } else {
+        0.0
+    }
+}
+
+/// Paints one line of text, abbreviated with an ellipsis when it does not fit.
+///
+/// The rows of the tree are painted rather than laid out, and a clip rectangle cuts at
+/// whatever pixel it reaches: `Fix climbing bugs` becomes `Fix climbing bug`, which is a
+/// different name and says nothing about being shortened. An ellipsis says so. This is the
+/// failure two rounds of recorded screenshots caught, and the rows have less room now that
+/// they carry controls, so it is worth the galley.
+fn paint_line(
+    painter: &egui::Painter,
+    at: egui::Pos2,
+    max_width: f32,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+) {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat {
+            font_id: font,
+            color: colour,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width,
+        max_rows: 1,
+        // Anywhere rather than at a word boundary: a name is one long word as often as not,
+        // and dropping the whole of it would be worse than abbreviating it.
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    painter.galley(at, painter.layout_job(job), colour);
+}
+
+/// Where the `index`-th control of a row goes, counted from the right-hand edge.
+///
+/// Counted from the right so the destructive one is furthest from the name and always in
+/// the same place, whatever else the row happens to carry.
+fn row_action_slot(row: Rect, index: usize) -> Rect {
+    let right = row.max.x - ROW_ACTION_MARGIN - index as f32 * icons::ROW_PITCH;
+    Rect::from_min_size(
+        egui::pos2(right - icons::ROW_SIZE.x, row.min.y + ROW_ACTION_TOP),
+        icons::ROW_SIZE,
+    )
+}
+
+/// The window's own version, shown at the right of the top bar.
+///
+/// The window's, not the daemon's: the daemon's version and pid are already in the
+/// connection sentence a few characters to the left, and the two disagreeing is exactly
+/// the thing a user needs to be able to see.
+const WINDOW_VERSION: &str = env!("CARGO_PKG_VERSION");
+const TURN_LOGO_PNG: &[u8] = include_bytes!("../assets/turn-icon.png");
 
 #[derive(Clone, Copy)]
 enum HierarchyRow<'a> {
@@ -913,6 +1403,12 @@ impl HierarchyRow<'_> {
                 if node.relationship_is_provisional {
                     name.push_str(" — relationship inferred");
                 }
+                // A title the process printed is announced as such. A screen-reader
+                // user gets the same caveat a sighted one gets from the styling, and
+                // the point is the same: this text is the program's word about itself.
+                if node.title_is_provisional {
+                    name.push_str(" — title set by the process");
+                }
                 if let Some(preview) = visible_preview(node) {
                     name.push_str(&format!(" — {}", preview.normalized_text));
                 }
@@ -945,6 +1441,12 @@ fn node_kind_label(kind: NodeKind) -> &'static str {
     }
 }
 
+/// The node's title, as the daemon resolved it.
+///
+/// This used to pick between the agent's display name and the node title, which was
+/// the UI applying its own precedence. `TreeNodeView::title` now arrives already
+/// resolved — user name, then declared name, then process title, then command — so
+/// there is one order and the window cannot disagree with the daemon about it.
 fn read_only_guard_label(summary: &SessionSummary) -> Option<&'static str> {
     if summary.mode != SessionMode::ReadOnly {
         return None;
@@ -957,11 +1459,7 @@ fn read_only_guard_label(summary: &SessionSummary) -> Option<&'static str> {
 }
 
 fn process_title(node: &TreeNodeView) -> &str {
-    node.agent
-        .as_ref()
-        .map(|agent| agent.name.display_name.as_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(&node.title)
+    &node.title
 }
 
 /// A visual explanation only; the daemon repeats every check authoritatively at
@@ -1054,12 +1552,24 @@ fn row_is_expanded(snapshot: &HierarchySnapshot, state: &ViewState, key: &Hierar
         .unwrap_or_else(|| snapshot.tree_state.expanded.contains(key))
 }
 
+/// The rows the tree shows, in order.
+///
+/// `include_archived` is the preference from Settings, and it is applied here as well as
+/// in the request that fetched the snapshot. Both, deliberately: the request is what makes
+/// the daemon send the archived rows at all, and this is what makes archiving *look* like
+/// it worked. Without the local half, a row the user just archived would sit in the tree
+/// until a snapshot happened to arrive, and an action whose effect you cannot see is an
+/// action a user will try again — this time reaching for Close.
 fn visible_hierarchy_rows<'a>(
     snapshot: &'a HierarchySnapshot,
     state: &ViewState,
+    include_archived: bool,
 ) -> Vec<HierarchyRow<'a>> {
     let mut rows = Vec::new();
     for workspace in &snapshot.workspaces {
+        if workspace.workspace.archived && !include_archived {
+            continue;
+        }
         let workspace_row = HierarchyRow::Workspace(workspace);
         let workspace_key = workspace_row.key();
         rows.push(workspace_row);
@@ -1068,6 +1578,9 @@ fn visible_hierarchy_rows<'a>(
         }
 
         for session in &workspace.sessions {
+            if session.session.status == SessionStatus::Archived && !include_archived {
+                continue;
+            }
             let session_row = HierarchyRow::Session { workspace, session };
             let session_key = session_row.key();
             rows.push(session_row);
@@ -1166,6 +1679,22 @@ impl<'a> TurnView<'a> {
         let mut actions = Vec::new();
         let full = ui.available_rect_before_wrap();
         ui.painter().rect_filled(full, 0.0, theme.background);
+        // Idempotent, and here rather than at startup so no caller of this view — the
+        // application, a snapshot harness, a future second window — can forget it and
+        // draw a toolbar of missing-glyph boxes.
+        icons::install(ui.ctx());
+
+        // Escape abandons a pane drag — `egui` has already dropped the gesture by the time
+        // this runs — and the press is spent here rather than left to fall through to the
+        // handlers below. Cancelling a rearrangement must not have the side effect of
+        // closing a temporary pane the user was reading; a gesture people are afraid to
+        // start is one they will not use. A second press, with no drag in progress, reaches
+        // those handlers normally.
+        if state.dragged_pane.is_some()
+            && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            state.dragged_pane = None;
+        }
 
         // Temporarily take the snapshot so the UI may update its local interaction
         // state without cloning the complete process tree every frame.
@@ -1202,21 +1731,10 @@ impl<'a> TurnView<'a> {
             state.observed_temporary_pane = temporary_pane_id;
         }
 
-        actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref()));
+        actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref(), state));
         if let Some(permission) = &self.permission {
             actions.extend(self.permission_banner(ui, theme, permission));
         }
-        if let Some(notice) = &self.notice {
-            self.notice_bar(ui, theme, notice);
-        }
-        if self.restore.is_some()
-            || self.recovery_lease.is_some()
-            || self.reclaiming_write_access
-            || self.unreachable_processes > 0
-        {
-            actions.extend(self.restore_bar(ui, theme, self.restore));
-        }
-
         if state.quick_preview.is_some()
             && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
         {
@@ -1233,7 +1751,16 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        let body = ui.available_rect_before_wrap();
+        // The bottom bar is taken out of the body before anything else is placed, so it
+        // is a bar the window has rather than a strip that pushes the panes around when
+        // recovery appears.
+        let remaining = ui.available_rect_before_wrap();
+        let status_height = WINDOW_STATUS_HEIGHT.min(remaining.height());
+        let bottom_status = Rect::from_min_size(
+            remaining.left_bottom() - Vec2::new(0.0, status_height),
+            Vec2::new(remaining.width(), status_height),
+        );
+        let body = Rect::from_min_max(remaining.min, bottom_status.right_top());
         let sidebar_width = SIDEBAR_WIDTH
             .min((body.width() * 0.42).max(80.0))
             .min(body.width());
@@ -1265,7 +1792,7 @@ impl<'a> TurnView<'a> {
         ui.scope_builder(region(sidebar, "sidebar"), |ui| {
             match hierarchy.as_ref() {
                 Some(snapshot) => {
-                    actions.extend(self.hierarchy_sidebar(ui, theme, snapshot, state));
+                    actions.extend(self.hierarchy_sidebar(ui, theme, keymap, snapshot, state));
                 }
                 // Startup and legacy fixtures get one fallback list, never a second
                 // navigation surface beside the hierarchy.
@@ -1280,21 +1807,9 @@ impl<'a> TurnView<'a> {
         } else {
             0.0
         };
-        let footer_height = if self.layout.is_some() {
-            23.0_f32.min((centre.height() - context_height).max(0.0))
-        } else {
-            0.0
-        };
         let context_rect =
             Rect::from_min_size(centre.min, Vec2::new(centre.width(), context_height));
-        let pane_rect = Rect::from_min_max(
-            centre.min + Vec2::new(0.0, context_height),
-            centre.max - Vec2::new(0.0, footer_height),
-        );
-        let footer_rect = Rect::from_min_size(
-            pane_rect.left_bottom(),
-            Vec2::new(centre.width(), footer_height),
-        );
+        let pane_rect = Rect::from_min_max(centre.min + Vec2::new(0.0, context_height), centre.max);
         if let Some((workspace, session)) = active_context {
             ui.scope_builder(region(context_rect, "session-context"), |ui| {
                 actions.extend(self.session_context_bar(ui, theme, workspace, session, state));
@@ -1338,10 +1853,13 @@ impl<'a> TurnView<'a> {
                 actions.extend(temporary_actions);
             });
         }
-        if footer_height > 0.0 {
-            ui.scope_builder(region(footer_rect, "pane-status"), |ui| {
-                self.pane_status_bar(ui, theme, active_context.map(|(_, session)| session));
-            });
+        if status_height > 0.0 {
+            actions.extend(self.window_status_bar(
+                ui,
+                theme,
+                bottom_status,
+                active_context.map(|(_, session)| session),
+            ));
         }
 
         if inspector_width > 0.0 {
@@ -1393,6 +1911,8 @@ impl<'a> TurnView<'a> {
             }
         } else if state.lifecycle_confirmation.is_some() {
             actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
+        } else if let Some(link) = self.link_confirmation {
+            actions.extend(self.link_confirmation_overlay(ui, theme, link, full));
         } else if state.layout_draft.is_some() {
             actions.extend(self.layout_editor_overlay(ui, theme, state, full));
         } else if state.workspace_draft.is_some() {
@@ -1406,7 +1926,7 @@ impl<'a> TurnView<'a> {
         } else if state.palette.open {
             actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
         } else if state.shortcuts_open {
-            actions.extend(self.shortcuts_sheet(ui, theme, keymap, full));
+            actions.extend(self.shortcuts_sheet(ui, theme, keymap, state, full));
         } else if state.settings_open {
             actions.extend(self.settings_sheet(ui, theme, state, full));
         }
@@ -1414,12 +1934,22 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    /// The top bar: what Turn is talking to, what the user can do, and which build this
+    /// is.
+    ///
+    /// Laid out in explicit zones rather than as one `horizontal`, and that is the whole
+    /// reason this function is longer than it looks like it should be. A `horizontal`
+    /// gives its first label as much room as the label wants, so a long disconnection
+    /// sentence used to push the attention button off the right-hand edge — the failure
+    /// mode this bar has had twice. Every zone here is measured, clipped and allowed to
+    /// disappear, in the order of what matters least.
     fn status_bar(
         &self,
         ui: &mut Ui,
         theme: &Theme,
         keymap: &Keymap,
         hierarchy: Option<&HierarchySnapshot>,
+        state: &mut ViewState,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
         let rect = Rect::from_min_size(
@@ -1439,45 +1969,96 @@ impl<'a> TurnView<'a> {
             ConnectionState::Disconnected { .. } => (theme.failure, "○"),
             ConnectionState::Incompatible { .. } => (theme.failure, "×"),
         };
+        let waiting = hierarchy.map_or_else(
+            || {
+                self.sessions
+                    .iter()
+                    .filter(|row| row.state.demands_user() || row.badge > 0)
+                    .count()
+            },
+            |snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.workspace.sessions_needing_user)
+                    .sum()
+            },
+        );
 
-        ui.scope_builder(region(rect.shrink2(Vec2::new(10.0, 5.0)), "status"), |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("TURN")
-                        .color(theme.text)
-                        .font(FontId::new(12.0, egui::FontFamily::Monospace)),
-                );
-                // Monospace, deliberately: the proportional face the body text uses
-                // has no glyph for these and draws a missing-glyph box, which would
-                // leave the connection state signalled by colour alone.
-                ui.label(
-                    RichText::new(glyph)
-                        .color(colour)
-                        .font(FontId::new(11.0, egui::FontFamily::Monospace)),
-                );
-                ui.label(RichText::new(connection.word()).color(colour).small());
-                ui.label(
-                    RichText::new(connection.detail())
-                        .color(theme.text_faint)
-                        .small(),
-                );
+        let (version_value, connection_detail) = match &connection {
+            ConnectionState::Connected {
+                daemon_version,
+                daemon_pid,
+                ..
+            } => (daemon_version.as_str(), format!("pid {daemon_pid}")),
+            _ => (WINDOW_VERSION, connection.detail()),
+        };
+        let version = format!("v{version_value}");
 
-                let waiting = hierarchy.map_or_else(
-                    || {
-                        self.sessions
-                            .iter()
-                            .filter(|row| row.state.demands_user() || row.badge > 0)
-                            .count()
-                    },
-                    |snapshot| {
-                        snapshot
-                            .workspaces
-                            .iter()
-                            .map(|workspace| workspace.workspace.sessions_needing_user)
-                            .sum()
-                    },
+        // Identity and controls are one left-aligned cluster. The product mark is the same
+        // checked-in artwork used by the Dock/window icon, so the app does not acquire a second
+        // improvised logo in its own chrome.
+        let texture_id = state
+            .logo_texture
+            .0
+            .get_or_insert_with(|| {
+                let icon = eframe::icon_data::from_png_bytes(TURN_LOGO_PNG)
+                    .expect("the embedded Turn logo must be a valid PNG");
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [icon.width as usize, icon.height as usize],
+                    &icon.rgba,
                 );
+                ui.ctx()
+                    .load_texture("turn-product-mark", image, egui::TextureOptions::LINEAR)
+            })
+            .id();
+        let logo = Rect::from_center_size(
+            egui::pos2(rect.min.x + 19.0, rect.center().y),
+            Vec2::splat(22.0),
+        );
+        ui.painter().image(
+            texture_id,
+            logo,
+            Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        let brand = ui.painter().text(
+            egui::pos2(logo.max.x + 6.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            "TURN",
+            FontId::new(12.0, egui::FontFamily::Monospace),
+            theme.text,
+        );
+
+        // Connection, process identity, attention and the single visible version are metadata,
+        // so they live together at the right edge. The daemon's version is the visible version
+        // while connected; showing the identical window version again conveyed no information.
+        let metadata_wanted: f32 = if waiting > 0 { 450.0 } else { 330.0 };
+        let metadata_width = metadata_wanted.min((rect.width() - 92.0).max(0.0));
+        let metadata = Rect::from_min_max(
+            egui::pos2(rect.max.x - metadata_width, rect.min.y + 4.0),
+            egui::pos2(rect.max.x - 8.0, rect.max.y - 4.0),
+        );
+        if metadata.width() > 40.0 {
+            ui.scope_builder(region(metadata, "status-metadata"), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(&version)
+                            .monospace()
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(&connection_detail)
+                            .color(theme.text_faint)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(format!("{glyph} {}", connection.word()))
+                            .color(colour)
+                            .small(),
+                    );
                     if waiting > 0 {
                         let shortcut = keymap
                             .chord_for(Command::NextAttention)
@@ -1497,15 +2078,6 @@ impl<'a> TurnView<'a> {
                         {
                             actions.push(ViewAction::Run(Command::NextAttention));
                         }
-                        if ui
-                            .add(egui::Button::new(
-                                RichText::new("Queue").color(theme.text_dim).small(),
-                            ))
-                            .on_hover_text("Open the Attention Queue")
-                            .clicked()
-                        {
-                            actions.push(ViewAction::Run(Command::ToggleAttentionPanel));
-                        }
                     } else {
                         ui.label(
                             RichText::new("nothing waiting")
@@ -1515,36 +2087,152 @@ impl<'a> TurnView<'a> {
                     }
                 });
             });
+        }
+
+        // Every global control begins immediately after the mark and product name. Contextual
+        // Session creation deliberately does not live here; each Workspace row owns that action.
+        let toolbar_left = brand.max.x + 12.0;
+        let toolbar = Rect::from_min_max(
+            egui::pos2(toolbar_left, rect.min.y + 5.0),
+            egui::pos2(metadata.min.x - 10.0, rect.max.y - 5.0),
+        );
+        let capacity = if toolbar.width() > 0.0 {
+            toolbar_capacity(toolbar.width())
+        } else {
+            0
+        };
+        if capacity > 0 {
+            ui.scope_builder(region(toolbar, "status-toolbar"), |ui| {
+                ui.spacing_mut().item_spacing.x = icons::PITCH - icons::SIZE.x;
+                ui.horizontal(|ui| {
+                    for button in &TOOLBAR[..capacity] {
+                        actions.extend(self.toolbar_button(ui, keymap, state, *button));
+                    }
+                });
+            });
+        }
+
+        // One node for the whole bar, so a screen reader hears the sentence rather than
+        // four unrelated fragments — and hears the version, which is painted.
+        let status_id = ui.id().with("window-top-status");
+        let announced = format!(
+            "Turn {version_value}, {}, {}, {}",
+            connection.word(),
+            connection_detail,
+            if waiting == 1 {
+                "1 session needs you".to_string()
+            } else if waiting > 0 {
+                format!("{waiting} sessions need you")
+            } else {
+                "nothing waiting".to_string()
+            }
+        );
+        ui.ctx().accesskit_node_builder(status_id, |node| {
+            node.set_role(egui::accesskit::Role::Group);
+            node.set_label(announced);
         });
         ui.advance_cursor_after_rect(rect);
         actions
     }
 
-    fn notice_bar(&self, ui: &mut Ui, theme: &Theme, notice: &str) {
-        let rect = Rect::from_min_size(
-            ui.available_rect_before_wrap().min,
-            Vec2::new(ui.available_width(), 22.0),
-        );
-        ui.painter().rect_filled(rect, 0.0, theme.raised);
-        ui.painter()
-            .hline(rect.x_range(), rect.max.y, Stroke::new(1.0, theme.border));
-        ui.painter().text(
-            rect.left_center() + Vec2::new(10.0, 0.0),
-            Align2::LEFT_CENTER,
-            notice,
-            FontId::new(11.0, egui::FontFamily::Proportional),
-            theme.failure,
-        );
-        ui.advance_cursor_after_rect(rect);
+    /// One toolbar button, with its words attached.
+    fn toolbar_button(
+        &self,
+        ui: &mut Ui,
+        keymap: &Keymap,
+        state: &mut ViewState,
+        button: ToolbarButton,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let has_session = self.selected.is_some() && self.layout.is_some();
+        match button.intent {
+            ToolbarIntent::Run(command) => {
+                let enabled = match command {
+                    Command::SplitHorizontal => has_session,
+                    _ => true,
+                };
+                let shortcut = keymap
+                    .chord_for(command)
+                    .map(|chord| chord.describe(keymap.platform()));
+                if icons::icon_button(ui, button.icon, button.label, shortcut.as_deref(), enabled)
+                    .clicked()
+                {
+                    actions.push(ViewAction::Run(command));
+                }
+            }
+            ToolbarIntent::NewWorkspace => {
+                let shortcut = keymap
+                    .chord_for(Command::NewWorkspace)
+                    .map(|chord| chord.describe(keymap.platform()));
+                if icons::icon_button(ui, button.icon, button.label, shortcut.as_deref(), true)
+                    .clicked()
+                {
+                    state.workspace_draft = Some(WorkspaceDraft::new(false));
+                }
+            }
+            ToolbarIntent::LayoutMenu => {
+                let menu = egui::containers::menu::MenuButton::from_button(
+                    egui::Button::new(RichText::new(button.icon).font(icons::font(15.0)))
+                        .min_size(icons::SIZE),
+                );
+                let (response, _) = menu.ui(ui, |ui| {
+                    for (label, preset) in [
+                        ("Balance current splits", LayoutPreset::Balanced),
+                        ("Equal columns", LayoutPreset::Columns),
+                        ("Equal rows", LayoutPreset::Rows),
+                        ("Main pane left", LayoutPreset::MainLeft),
+                        ("Grid", LayoutPreset::Grid),
+                    ] {
+                        if ui
+                            .add_enabled(has_session, egui::Button::new(label))
+                            .clicked()
+                        {
+                            actions.push(ViewAction::ApplyLayoutPreset(preset));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            has_session,
+                            egui::Button::new("Save current layout as preset"),
+                        )
+                        .clicked()
+                    {
+                        actions.push(ViewAction::Run(Command::SaveLayoutAsTemplate));
+                        ui.close();
+                    }
+                    if ui.button("New layout preset…").clicked() {
+                        actions.push(ViewAction::OpenLayoutEditor(LayoutEditorOrigin::Settings));
+                        ui.close();
+                    }
+                });
+                icons::describe(&response, button.label);
+                response.on_hover_text("Layout — balance, columns, rows, grid or a saved preset");
+            }
+        }
+        actions
     }
 
-    fn restore_bar(
+    /// The bar along the bottom of the window.
+    ///
+    /// This is where the `RESTORED SAFELY` strip went. It used to be a band pushed in
+    /// between the top bar and the panes, which moved everything down whenever recovery
+    /// was pending; a status bar is a place the window always has, so the same sentence
+    /// can appear and disappear without the layout jumping.
+    ///
+    /// The recovery decision stays a decision. Confirming write access to a main checkout
+    /// is an authority the user grants, so it remains a real, named, focusable button
+    /// here — never a passive label, and never something the window does on its own.
+    fn window_status_bar(
         &self,
         ui: &mut Ui,
         theme: &Theme,
-        restore: Option<&SessionRestoreView>,
+        rect: Rect,
+        session: Option<&SessionTreeView>,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
+        let restore = self.restore;
         let available = restore
             .into_iter()
             .flat_map(|restore| &restore.panes)
@@ -1552,96 +2240,214 @@ impl<'a> TurnView<'a> {
             .count();
         let needs_write_confirmation =
             self.recovery_lease.is_some() || self.reclaiming_write_access;
-        let rect = Rect::from_min_size(
-            ui.available_rect_before_wrap().min,
-            Vec2::new(ui.available_width(), 34.0),
+        let recovering =
+            restore.is_some() || needs_write_confirmation || self.unreachable_processes > 0;
+        let status_alert = recovering || self.notice.is_some();
+
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            if status_alert {
+                theme.raised
+            } else {
+                theme.panel
+            },
         );
-        ui.painter().rect_filled(rect, 0.0, theme.raised);
         ui.painter()
-            .hline(rect.x_range(), rect.max.y, Stroke::new(1.0, theme.border));
-        ui.painter().text(
-            rect.left_center() + Vec2::new(10.0, 0.0),
-            Align2::LEFT_CENTER,
-            if self.unreachable_processes > 0 {
-                format!(
+            .hline(rect.x_range(), rect.min.y, Stroke::new(1.0, theme.border));
+
+        // The right-hand end first: its controls are laid out as widgets, and the
+        // sentence on the left has to be clipped to whatever is left over rather than
+        // painted straight through them.
+        let recovery_has_controls = self.recovery_lease.is_some() || self.reclaiming_write_access;
+        let controls_width = if recovery_has_controls { 250.0 } else { 0.0 };
+        let controls = Rect::from_min_max(
+            egui::pos2(
+                (rect.max.x - controls_width).max(rect.min.x),
+                rect.min.y + 2.0,
+            ),
+            egui::pos2(rect.max.x - 8.0, rect.max.y - 2.0),
+        );
+        if recovery_has_controls && controls.width() > 60.0 {
+            ui.scope_builder(region(controls, "recovery-actions"), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(lease) = self.recovery_lease {
+                        let pending = self.reclaiming_workspaces.contains(&lease.workspace_id);
+                        if ui
+                            .add_enabled(
+                                !pending,
+                                egui::Button::new(if pending {
+                                    "Confirming…"
+                                } else if self.unreachable_processes > 0 {
+                                    "Check & confirm access"
+                                } else {
+                                    "Confirm write access"
+                                })
+                                .small(),
+                            )
+                            .on_hover_text(
+                                "Grant this Session write access to the main checkout again",
+                            )
+                            .clicked()
+                        {
+                            actions.push(ViewAction::ReclaimWorkspaceWriteLease {
+                                workspace_id: lease.workspace_id.clone(),
+                                session_id: lease.session_id.clone(),
+                                checkout_id: lease.checkout_id.clone(),
+                            });
+                        }
+                    } else if self.reclaiming_write_access {
+                        ui.add_enabled(false, egui::Button::new("Confirming…").small());
+                    }
+                });
+            });
+        }
+
+        let focused = self.panes.iter().find(|pane| pane.focused);
+        let (sentence, colour) =
+            if let Some(notice) = self.notice.as_deref() {
+                (notice.to_string(), theme.failure)
+            } else if self.unreachable_processes > 0 {
+                (
+                    format!(
                     "RESTORED SAFELY · {} surviving process{} cannot be controlled by this daemon",
                     self.unreachable_processes,
-                    if self.unreachable_processes == 1 {
-                        ""
-                    } else {
-                        "es"
-                    }
+                    if self.unreachable_processes == 1 { "" } else { "es" }
+                ),
+                    theme.attention,
                 )
             } else if needs_write_confirmation {
-                "RESTORED SAFELY · confirm main-checkout write access before starting panes"
-                    .to_string()
-            } else {
-                format!(
-                    "RESTORED SAFELY · {available} pane{} stopped · no command was restarted",
-                    if available == 1 { "" } else { "s" }
+                (
+                    // Not "before starting panes": a pane that only opens a terminal
+                    // writes nothing to the shared checkout and starts without this, so
+                    // saying otherwise would ask the user for something they do not need.
+                    "RESTORED SAFELY · confirm main-checkout write access to start agents \
+                     and commands"
+                        .to_string(),
+                    theme.attention,
                 )
-            },
-            FontId::new(11.0, egui::FontFamily::Proportional),
-            theme.attention,
-        );
-        let controls = Rect::from_min_size(
-            rect.right_top() - Vec2::new(255.0, -4.0),
-            Vec2::new(245.0, 26.0),
-        );
-        ui.scope_builder(region(controls, "restore-actions"), |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(lease) = self.recovery_lease {
-                    let pending = self.reclaiming_workspaces.contains(&lease.workspace_id);
-                    if ui
-                        .add_enabled(
-                            !pending,
-                            egui::Button::new(if pending {
-                                "Confirming…"
-                            } else if self.unreachable_processes > 0 {
-                                "Check & confirm access"
-                            } else {
-                                "Confirm write access"
-                            })
-                            .small(),
-                        )
-                        .clicked()
-                    {
-                        actions.push(ViewAction::ReclaimWorkspaceWriteLease {
-                            workspace_id: lease.workspace_id.clone(),
-                            session_id: lease.session_id.clone(),
-                            checkout_id: lease.checkout_id.clone(),
-                        });
-                    }
-                } else if self.reclaiming_write_access {
-                    ui.add_enabled(false, egui::Button::new("Confirming…").small());
-                } else if ui
-                    .add_enabled(
-                        available > 0 && self.unreachable_processes == 0,
-                        egui::Button::new("Start all").small(),
-                    )
-                    .on_disabled_hover_text(if self.unreachable_processes > 0 {
-                        "Stop surviving processes outside Turn before starting replacement panes."
-                    } else {
-                        "No stopped pane can be started again."
-                    })
-                    .clicked()
-                {
-                    if let Some(restore) = restore {
-                        for pane in restore.panes.iter().filter(|pane| pane.can_relaunch) {
-                            if !self.relaunching.contains(&pane.node_id) {
-                                actions.push(ViewAction::RelaunchNode {
-                                    session_id: restore.session_id.clone(),
-                                    node_id: pane.node_id.clone(),
-                                    resume: false,
-                                });
-                            }
-                        }
-                    }
+            } else if restore.is_some() {
+                (
+                    format!(
+                        "RESTORED SAFELY · {available} pane{} stopped · no command was restarted",
+                        if available == 1 { "" } else { "s" }
+                    ),
+                    theme.attention,
+                )
+            } else {
+                // Nothing to recover. The bar still earns its height: which pane has the
+                // keyboard is the thing a terminal user asks of a status bar.
+                match focused {
+                    Some(pane) => (format!("FOCUS · {}", pane.title), theme.running),
+                    None => ("FOCUS · no pane focused".to_string(), theme.text_faint),
                 }
-            });
+            };
+        let sentence_limit = if recovery_has_controls {
+            controls.min.x - 10.0
+        } else if status_alert {
+            rect.max.x - 10.0
+        } else {
+            rect.max.x - 220.0
+        };
+        ui.painter()
+            .with_clip_rect(Rect::from_min_max(
+                rect.min,
+                egui::pos2(sentence_limit.max(rect.min.x), rect.max.y),
+            ))
+            .text(
+                rect.left_center() + Vec2::new(10.0, 0.0),
+                Align2::LEFT_CENTER,
+                &sentence,
+                FontId::new(11.0, egui::FontFamily::Proportional),
+                colour,
+            );
+
+        // The session's own counts sit at the right when there is nothing to recover, so
+        // the space the recovery controls need is never shared with them.
+        let counts = session.filter(|_| !status_alert).map(|session| {
+            let guard = read_only_guard_label(&session.session)
+                .map(|guard| format!(" · {guard}"))
+                .unwrap_or_default();
+            format!(
+                "{}{} · {} running · {} panes",
+                session.session.mode.label(),
+                guard,
+                session.session.running_count,
+                session.session.pane_count
+            )
         });
-        ui.advance_cursor_after_rect(rect);
+        if let Some(counts) = &counts {
+            ui.painter().text(
+                rect.right_center() - Vec2::new(9.0, 0.0),
+                Align2::RIGHT_CENTER,
+                counts,
+                FontId::new(10.0, egui::FontFamily::Monospace),
+                theme.text_faint,
+            );
+        }
+
+        let status_id = ui.id().with("window-bottom-status");
+        let announced = match &counts {
+            Some(counts) => format!("Status: {sentence} — {counts}"),
+            None => format!("Status: {sentence}"),
+        };
+        ui.ctx().accesskit_node_builder(status_id, |node| {
+            node.set_role(egui::accesskit::Role::Group);
+            node.set_label(announced);
+        });
         actions
+    }
+
+    /// What a click on a row does to the layout, as at most one request.
+    ///
+    /// Clicking a subagent — or a process an agent started — maximises the pane it is running
+    /// inside; clicking the agent, the Session or the Workspace that owns it puts the layout
+    /// back. Which pane, and which of the two, is [`spotlight`]'s decision; this turns it into a
+    /// request, and its whole remaining job is *not sending one when nothing would change*.
+    ///
+    /// That matters because `zoom_pane` toggles. Asking to show a pane that is already maximised
+    /// would un-maximise it, so clicking through four subagents that share a pane would flicker
+    /// the layout in and out instead of leaving it maximised. The state the daemon last reported
+    /// is what the comparison is against — the window does not keep its own idea of it.
+    fn spotlight_for(&self, row: HierarchyRow<'_>) -> Vec<ViewAction> {
+        let Some(layout) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        let zoomed = layout.zoomed.clone();
+        let restore = |zoomed: Option<PaneId>, session_id: SessionId| match zoomed {
+            // Toggling the pane that *is* maximised is how the layout comes back.
+            Some(pane) => vec![ViewAction::ZoomPane {
+                session_id,
+                pane_id: pane,
+            }],
+            None => Vec::new(),
+        };
+        match row {
+            // A Session or a Workspace owns everything under it, so picking one is asking to see
+            // the whole layout again.
+            HierarchyRow::Session { session, .. } => restore(zoomed, session.session.id.clone()),
+            HierarchyRow::Workspace(workspace) => workspace
+                .sessions
+                .iter()
+                .find(|session| Some(&session.session.id) == self.selected.as_ref())
+                .map(|session| restore(zoomed, session.session.id.clone()))
+                .unwrap_or_default(),
+            HierarchyRow::Process { session, node } => {
+                match crate::spotlight::for_node(session, node) {
+                    crate::spotlight::Spotlight::Show(pane) if zoomed.as_ref() != Some(&pane) => {
+                        vec![ViewAction::ZoomPane {
+                            session_id: session.session.id.clone(),
+                            pane_id: pane,
+                        }]
+                    }
+                    crate::spotlight::Spotlight::Show(_) => Vec::new(),
+                    crate::spotlight::Spotlight::Restore => {
+                        restore(zoomed, session.session.id.clone())
+                    }
+                    crate::spotlight::Spotlight::Leave => Vec::new(),
+                }
+            }
+        }
     }
 
     fn lifecycle_confirmation_overlay(
@@ -1652,102 +2458,363 @@ impl<'a> TurnView<'a> {
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
-        let panel = Rect::from_center_size(
+        let Some(confirmation) = state.lifecycle_confirmation.clone() else {
+            return actions;
+        };
+        // `full` is no longer used to place anything: the modal owns its own backdrop and
+        // centres its own card, and it measures the card from what is put in it rather than
+        // from a height guessed per variant — which is what the hand-painted panel had to do,
+        // and got wrong every time a sentence was added.
+        let _ = full;
+
+        let (title, subject, detail, scope, terminating) = match &confirmation {
+            LifecycleConfirmation::EndSession {
+                name,
+                running_count,
+                ..
+            } => (
+                "End session?",
+                name.as_str(),
+                "Turn will politely stop every process in this Session, and its row leaves the \
+                 tree. Its layout and history are kept — restoring it brings the Session back, \
+                 stopped.",
+                None,
+                format!(
+                    "{} running process{} will receive a termination request.",
+                    running_count,
+                    if *running_count == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::StopWorkspace {
+                name,
+                session_count,
+                running_sessions,
+                running_processes,
+                ..
+            } => (
+                "Stop all sessions in this workspace?",
+                name.as_str(),
+                "Turn will politely stop processes in every Session, and the Workspace leaves \
+                 the tree. The project directory and all files stay untouched, and restoring it \
+                 brings the Workspace and its Sessions back, stopped.",
+                // The blast radius, in numbers, because "this workspace" is not a
+                // quantity and the user is about to stop everything in it.
+                Some(format!(
+                    "{} session{} in this Workspace · {} with something running.",
+                    session_count,
+                    if *session_count == 1 { "" } else { "s" },
+                    running_sessions
+                )),
+                format!(
+                    "{} running process{} will receive a termination request, including in archived Sessions.",
+                    running_processes,
+                    if *running_processes == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::DeleteSession {
+                name,
+                running_count,
+                ..
+            } => (
+                "Delete this session?",
+                name.as_str(),
+                // What is deleted, then what is not, in that order. A person reading
+                // "delete" is asking about their work, and the answer is in the second
+                // half of the sentence.
+                "Turn will forget this Session: its layout, its history and its record. \
+                 Your files, branches and worktrees are not touched.",
+                None,
+                format!(
+                    "This cannot be undone. {} running process{} will be stopped first.",
+                    running_count,
+                    if *running_count == 1 { "" } else { "es" }
+                ),
+            ),
+            LifecycleConfirmation::DeleteWorkspace {
+                name,
+                session_count,
+                running_processes,
+                root,
+                ..
+            } => (
+                "Delete this workspace?",
+                name.as_str(),
+                "Turn will forget this Workspace and every Session in it.",
+                // The path, verbatim: the one thing worth reading twice is what stays.
+                Some(format!("{root} stays exactly as it is.")),
+                format!(
+                    "This cannot be undone. {} session{} and {} running process{} will \
+                     be stopped and deleted.",
+                    session_count,
+                    if *session_count == 1 { "" } else { "s" },
+                    running_processes,
+                    if *running_processes == 1 { "" } else { "es" }
+                ),
+            ),
+        };
+        // What the act will *not* achieve, said before the click rather than after it.
+        //
+        // Turn used to refuse the whole operation here — a Session with a process from a
+        // previous daemon in it could not be ended at all, and the user was told to go and
+        // stop it themselves first. That protected nothing: the survivor kept running either
+        // way, and the only thing the refusal preserved was a row the user had finished with.
+        // So the act goes ahead, and what is owed instead is this sentence. It is deliberately
+        // not phrased as a warning to be dismissed: it says what stays running and leaves the
+        // decision alone.
+        let escaped_count = match &confirmation {
+            LifecycleConfirmation::EndSession { escaped_count, .. }
+            | LifecycleConfirmation::StopWorkspace { escaped_count, .. }
+            | LifecycleConfirmation::DeleteSession { escaped_count, .. }
+            | LifecycleConfirmation::DeleteWorkspace { escaped_count, .. } => *escaped_count,
+        };
+        let escaped = (escaped_count > 0).then(|| {
+            format!(
+                "{} of them survived a previous daemon and cannot be stopped by Turn. \
+                 This will go ahead without {}; stop {} yourself if you need to.",
+                escaped_count,
+                if escaped_count == 1 { "it" } else { "them" },
+                if escaped_count == 1 { "it" } else { "them" }
+            )
+        });
+        // The other door, named on the way through this one. Somebody who only wants the row
+        // gone must be able to see that stopping the work is not the price of a tidy tree.
+        let alternative = match &confirmation {
+            // Not "archive instead": ending *is* archiving now, with the work stopped first.
+            // The alternative worth naming is the one that keeps the work running.
+            LifecycleConfirmation::EndSession { .. } => {
+                "Only clearing your screen? Detach its views instead — the panes close, the row stays and the work carries on."
+            }
+            LifecycleConfirmation::StopWorkspace { .. } => {
+                "Only clearing your screen? Archive it instead — the Workspace leaves the tree and nothing stops."
+            }
+            LifecycleConfirmation::DeleteSession { .. } => {
+                "Want it back later? Archive it instead — the row leaves the tree and the Session keeps everything."
+            }
+            LifecycleConfirmation::DeleteWorkspace { .. } => {
+                "Want it back later? Archive it instead — the Workspace leaves the tree and keeps its Sessions."
+            }
+        };
+        // Named for what it does, and the same word the control that opened it used.
+        let confirm_label = match &confirmation {
+            LifecycleConfirmation::EndSession { .. } => "End session",
+            LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
+            LifecycleConfirmation::DeleteSession { .. } => "Delete session",
+            LifecycleConfirmation::DeleteWorkspace { .. } => "Delete workspace",
+        };
+
+        // Turn paints this itself. `egui-elegance` was tried for it and rejected: its symbols
+        // font is inserted into the same private-use range as Turn's icon font at the same
+        // priority, and it won — every archive drawer in the tree became a plus sign. What it
+        // was worth having, though, was three properties this dialog did not have, and they are
+        // implemented below rather than lost with it: the accessibility role of an *alert*, a
+        // way out with the keyboard, and giving focus back to whatever had it.
+        // Taller for the two that say one thing more — how many Sessions the act reaches, or
+        // which directory it leaves alone. A panel sized for the longest of the four would leave
+        // the shortest with a band of empty space under its buttons.
+        let wanted_height = match &confirmation {
+            LifecycleConfirmation::StopWorkspace { .. }
+            | LifecycleConfirmation::DeleteWorkspace { .. } => 312.0_f32,
+            _ => 284.0_f32,
+        }
+        // And taller again for the one that only appears when a process has escaped. Two
+        // lines: it names a count and then what the user can do about it, and a card sized
+        // without it clipped the buttons underneath.
+        + if escaped.is_some() { 40.0 } else { 0.0 };
+        let bounds = Rect::from_center_size(
             full.center(),
             Vec2::new(
                 520.0_f32.min((full.width() - 32.0).max(300.0)),
-                250.0_f32.min((full.height() - 32.0).max(220.0)),
+                wanted_height.min((full.height() - 32.0).max(220.0)),
             ),
         );
         ui.painter()
             .rect_filled(full, 0.0, Color32::from_black_alpha(165));
-        ui.painter().rect_filled(panel, 10.0, theme.panel);
+
+        // Escape declines. A modal question with no keyboard way out is a trap for anyone not
+        // using a pointer, and declining is always the safe answer — every one of these four
+        // stops or destroys something.
+        //
+        // Dismissing on a click outside the panel was written and then removed. The click that
+        // *opens* the dialog is in the same frame's input as the first frame it is drawn on, so
+        // the question appeared and closed again in one frame — caught by the test that presses
+        // the row's own control. Distinguishing the two would mean tracking which frame the
+        // dialog appeared on, and the convention buys nothing here: Escape covers the keyboard,
+        // Cancel covers the pointer, and neither can be triggered by the act of asking.
+        let mut confirmed = false;
+        let mut cancelled = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        ui.painter().rect_filled(bounds, 10.0, theme.panel);
         ui.painter().rect_stroke(
-            panel,
+            bounds,
             10.0,
             Stroke::new(1.0, theme.border),
             egui::StrokeKind::Outside,
         );
-        ui.scope_builder(region(panel.shrink(20.0), "lifecycle-confirmation"), |ui| {
+        ui.scope_builder(
+            region(bounds.shrink(20.0), "lifecycle-confirmation"),
+            |ui| {
+                ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                    // An *alert* dialog, not a plain one. Every one of these four questions is about
+                    // stopping or destroying something, and a screen reader announces an alert
+                    // before its content rather than waiting to be asked.
+                    node.set_role(egui::accesskit::Role::AlertDialog);
+                    node.set_modal();
+                    node.set_label(title);
+                });
+                ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
+                ui.label(RichText::new(subject).color(theme.text_dim).strong());
+                ui.add_space(10.0);
+                ui.label(RichText::new(detail).color(theme.text_dim));
+                if let Some(scope) = scope {
+                    ui.label(RichText::new(scope).color(theme.text_dim));
+                }
+                // At body size, not small. This is the line that says how much of the world the
+                // button reaches, and for a delete it is also the line that says it does not come
+                // back — it must not be the same weight as the hint underneath it, which is the
+                // way *out*.
+                ui.label(RichText::new(terminating).color(theme.attention));
+                if let Some(escaped) = escaped.as_deref() {
+                    ui.label(RichText::new(escaped).color(theme.failure));
+                }
+                ui.label(RichText::new(alternative).color(theme.text_faint).small());
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE))
+                                .fill(theme.failure),
+                        )
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            },
+        );
+
+        if confirmed {
+            match confirmation {
+                LifecycleConfirmation::EndSession { session_id, .. } => {
+                    actions.push(ViewAction::CloseSession {
+                        session_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
+                    actions.push(ViewAction::CloseWorkspace {
+                        workspace_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::DeleteSession { session_id, .. } => {
+                    actions.push(ViewAction::DeleteSession {
+                        session_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+                LifecycleConfirmation::DeleteWorkspace { workspace_id, .. } => {
+                    actions.push(ViewAction::DeleteWorkspace {
+                        workspace_id,
+                        disposition: CloseDisposition::Terminate,
+                    });
+                }
+            }
+        }
+        if confirmed || cancelled {
+            state.lifecycle_confirmation = None;
+        }
+        actions
+    }
+
+    /// The question asked before Turn hands a suspicious link to the desktop.
+    ///
+    /// Only reached for a link `links` flagged: an ordinary hyperlink opens on the click, and
+    /// a dialog in front of every link would train the user to dismiss this one. What makes
+    /// it worth asking is that the program in the pane chose both halves — the text the user
+    /// read and the target they did not — so the two are quoted separately and neither is
+    /// paraphrased.
+    ///
+    /// The default is the safe answer: Escape declines, and "Open link" is the one that has to
+    /// be aimed at.
+    fn link_confirmation_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        link: &terminal::links::LinkRequest,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let bounds = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                560.0_f32.min((full.width() - 32.0).max(300.0)),
+                268.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(bounds, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            bounds,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        let mut confirmed = false;
+        let mut declined = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        ui.scope_builder(region(bounds.shrink(20.0), "link-confirmation"), |ui| {
             ui.ctx().accesskit_node_builder(ui.id(), |node| {
-                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_role(egui::accesskit::Role::AlertDialog);
                 node.set_modal();
+                node.set_label("Open this link?");
             });
-            let Some(confirmation) = state.lifecycle_confirmation.clone() else {
-                return;
-            };
-            let (title, subject, detail, count) = match &confirmation {
-                LifecycleConfirmation::EndSession {
-                    name,
-                    running_count,
-                    ..
-                } => (
-                    "End session?",
-                    name.as_str(),
-                    "Turn will politely stop every process in this Session. Its layout and history remain available.",
-                    Some(*running_count),
-                ),
-                LifecycleConfirmation::StopWorkspace {
-                    name,
-                    ..
-                } => (
-                    "Stop all sessions in this workspace?",
-                    name.as_str(),
-                    "Turn will politely stop processes in every Session. The project directory and all files stay untouched.",
-                    None,
-                ),
-            };
-            ui.label(RichText::new(title).size(21.0).color(theme.text).strong());
-            ui.label(RichText::new(subject).color(theme.text_dim).strong());
-            ui.add_space(10.0);
-            ui.label(RichText::new(detail).color(theme.text_dim));
             ui.label(
-                RichText::new(match count {
-                    Some(count) => format!(
-                        "{} running process{} will receive a termination request.",
-                        count,
-                        if count == 1 { "" } else { "es" }
-                    ),
-                    None => "Every running process, including in archived Sessions, will receive a termination request."
-                        .to_string(),
-                })
-                .color(theme.attention)
-                .small(),
+                RichText::new("Open this link?")
+                    .size(21.0)
+                    .color(theme.text)
+                    .strong(),
             );
+            ui.add_space(6.0);
+            // Monospace, both of them. These are strings chosen by a program to be
+            // mistaken for one another, and a proportional font is where a lookalike
+            // character hides.
+            ui.label(
+                RichText::new(format!("shown as  {}", link.text))
+                    .monospace()
+                    .color(theme.text_dim),
+            );
+            ui.label(
+                RichText::new(format!("goes to   {}", link.display))
+                    .monospace()
+                    .color(theme.text),
+            );
+            ui.add_space(10.0);
+            if let Some(warning) = &link.warning {
+                ui.label(RichText::new(warning.describe()).color(theme.failure));
+            }
             ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let confirm_label = match confirmation {
-                    LifecycleConfirmation::EndSession { .. } => "End session",
-                    LifecycleConfirmation::StopWorkspace { .. } => "Stop all sessions",
-                };
                 if ui
                     .add(
-                        egui::Button::new(RichText::new(confirm_label).color(Color32::WHITE))
+                        egui::Button::new(RichText::new("Open link").color(Color32::WHITE))
                             .fill(theme.failure),
                     )
                     .clicked()
                 {
-                    match confirmation {
-                        LifecycleConfirmation::EndSession { session_id, .. } => {
-                            actions.push(ViewAction::CloseSession {
-                                session_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                        LifecycleConfirmation::StopWorkspace { workspace_id, .. } => {
-                            actions.push(ViewAction::CloseWorkspace {
-                                workspace_id,
-                                disposition: CloseDisposition::Terminate,
-                            });
-                        }
-                    }
-                    state.lifecycle_confirmation = None;
+                    confirmed = true;
                 }
                 if ui.button("Cancel").clicked() {
-                    state.lifecycle_confirmation = None;
+                    declined = true;
                 }
             });
         });
+        if confirmed {
+            actions.push(ViewAction::ConfirmLink);
+        } else if declined {
+            actions.push(ViewAction::DismissLink);
+        }
         actions
     }
 
@@ -1966,6 +3033,7 @@ impl<'a> TurnView<'a> {
         &self,
         ui: &mut Ui,
         theme: &Theme,
+        keymap: &Keymap,
         snapshot: &HierarchySnapshot,
         state: &mut ViewState,
     ) -> Vec<ViewAction> {
@@ -1987,7 +3055,14 @@ impl<'a> TurnView<'a> {
         ui.painter().text(
             header.min + Vec2::new(10.0, 34.0),
             Align2::LEFT_TOP,
-            "Space preview · Enter focus · ⌘Enter temporary",
+            // Spelled for the keyboard in front of the user rather than hard-coded to a
+            // Mac, and in words rather than in glyphs the bundled fonts draw on top of
+            // each other.
+            if keymap.platform().uses_command_key {
+                "Space preview · Enter focus · Cmd+Enter temporary"
+            } else {
+                "Space preview · Enter focus · Ctrl+Enter temporary"
+            },
             FontId::new(10.0, egui::FontFamily::Monospace),
             theme.text_faint,
         );
@@ -1996,38 +3071,24 @@ impl<'a> TurnView<'a> {
             header.max.y,
             Stroke::new(1.0, theme.border),
         );
+        // Only `+ Workspace` lives up here now. A Session is created *in* a Workspace, and
+        // a global button could not say which one, so it moved to the right of each
+        // Workspace row where the answer is unambiguous. The archived filter left the bar
+        // entirely: it is a preference about what the list contains, not an action.
         let action_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-278.0, 4.0),
-            Vec2::new(268.0, 26.0),
+            header.right_top() + Vec2::new(-128.0, 4.0),
+            Vec2::new(118.0, 26.0),
         );
         ui.scope_builder(region(action_rect, "hierarchy-create-actions"), |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("+ Workspace").clicked() {
                     state.workspace_draft = Some(WorkspaceDraft::new(false));
                 }
-                if ui
-                    .add_enabled(
-                        !snapshot.workspaces.is_empty(),
-                        egui::Button::new("+ Session").small(),
-                    )
-                    .clicked()
-                {
-                    state.session_draft = self.new_session_draft(snapshot, state);
-                }
-                if ui
-                    .selectable_label(self.include_archived, "Archived")
-                    .on_hover_text("Show or hide archived Workspaces and Sessions")
-                    .clicked()
-                {
-                    actions.push(ViewAction::SetArchivedVisibility {
-                        include: !self.include_archived,
-                    });
-                }
             });
         });
         ui.advance_cursor_after_rect(header);
 
-        let rows = visible_hierarchy_rows(snapshot, state);
+        let rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
         let tree_id = ui.id().with("workspace-session-process-tree");
         ui.ctx().accesskit_node_builder(tree_id, |node| {
             node.set_role(egui::accesskit::Role::Tree);
@@ -2037,14 +3098,29 @@ impl<'a> TurnView<'a> {
             ));
         });
 
-        if snapshot.workspaces.is_empty() {
+        if rows.is_empty() {
+            // An empty tree with archived Workspaces behind it is not the same thing as an
+            // empty tree, and a blank sidebar would leave the user to guess which they are
+            // looking at.
+            let everything_is_archived = !snapshot.workspaces.is_empty();
             ui.vertical_centered(|ui| {
                 ui.add_space(28.0);
-                ui.label(RichText::new("No workspaces yet").color(theme.text_dim));
                 ui.label(
-                    RichText::new("Create a project root before starting a Session")
-                        .color(theme.text_faint)
-                        .small(),
+                    RichText::new(if everything_is_archived {
+                        "Every Workspace is archived"
+                    } else {
+                        "No workspaces yet"
+                    })
+                    .color(theme.text_dim),
+                );
+                ui.label(
+                    RichText::new(if everything_is_archived {
+                        "Turn on Show archived Workspaces and Sessions in Settings to see them"
+                    } else {
+                        "Create a project root before starting a Session"
+                    })
+                    .color(theme.text_faint)
+                    .small(),
                 );
                 ui.add_space(8.0);
                 if ui.button("Create workspace").clicked() {
@@ -2060,6 +3136,13 @@ impl<'a> TurnView<'a> {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(4.0);
+                // One width for every row, measured before the first one is placed. Asking
+                // for `available_width()` per row instead let each row inherit the previous
+                // one's overhang — a control placed at the right-hand end expands the used
+                // area, so the next row came out a few points wider and the one after that
+                // wider again, which is how the lower rows' controls ended up drifting
+                // under the divider and being clipped in half.
+                let row_width = ui.available_width();
                 for row in &rows {
                     let key = row.key();
                     let is_selected = selected.as_ref() == Some(&key);
@@ -2084,15 +3167,35 @@ impl<'a> TurnView<'a> {
                         ui,
                         theme,
                         *row,
-                        is_selected,
-                        expanded,
-                        focused_pane,
-                        active_session,
+                        row_width,
+                        RowState {
+                            selected: is_selected,
+                            expanded,
+                            focused_pane,
+                            active_session,
+                            idle: match row {
+                                HierarchyRow::Process { session, node } => {
+                                    crate::spotlight::idleness(session, node, self.now_ms)
+                                }
+                                _ => None,
+                            },
+                        },
                     );
                     if state.scroll_tree_to.as_ref() == Some(&key) {
                         response.scroll_to_me(Some(egui::Align::Center));
                         state.scroll_tree_to = None;
                     }
+                    // The row's own controls: create, archive, close. Drawn after the row
+                    // and therefore on top of it — egui gives the later widget the click,
+                    // which is what keeps a control from also selecting the row underneath.
+                    actions.extend(self.hierarchy_row_controls(
+                        ui,
+                        theme,
+                        keymap,
+                        *row,
+                        response.rect,
+                        state,
+                    ));
                     let mut accessible_expansion = None;
                     ui.input_mut(|input| {
                         input.consume_accesskit_action_requests(
@@ -2128,6 +3231,7 @@ impl<'a> TurnView<'a> {
                             set_hierarchy_expanded(state, snapshot, key.clone(), !expanded);
                         } else {
                             actions.extend(select_hierarchy_row(state, snapshot, *row));
+                            actions.extend(self.spotlight_for(*row));
                         }
                     }
                     if response.double_clicked() && !caret_clicked {
@@ -2159,10 +3263,7 @@ impl<'a> TurnView<'a> {
                                     .clicked()
                                 {
                                     state.lifecycle_confirmation =
-                                        Some(LifecycleConfirmation::StopWorkspace {
-                                            workspace_id: workspace.workspace.id.clone(),
-                                            name: workspace.workspace.name.clone(),
-                                        });
+                                        Some(LifecycleConfirmation::stop_workspace(workspace));
                                     ui.close();
                                 }
                                 let running_count: usize = workspace
@@ -2186,6 +3287,19 @@ impl<'a> TurnView<'a> {
                                     ui.close();
                                 }
                             }
+                            // Last, after a separator, and offered whether the Workspace is
+                            // archived or not: an archived row is exactly what somebody
+                            // tidying up wants to get rid of, and refusing there would leave
+                            // no way to remove it at all.
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Delete workspace…").color(theme.failure))
+                                .clicked()
+                            {
+                                state.lifecycle_confirmation =
+                                    Some(LifecycleConfirmation::delete_workspace(workspace));
+                                ui.close();
+                            }
                         }),
                         HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
                             if session.session.status == SessionStatus::Archived {
@@ -2203,6 +3317,16 @@ impl<'a> TurnView<'a> {
                                         session_id: session.session.id.clone(),
                                         archived: false,
                                     });
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui
+                                    .button(RichText::new("Delete session…").color(theme.failure))
+                                    .clicked()
+                                {
+                                    state.lifecycle_confirmation = Some(
+                                        LifecycleConfirmation::delete_session(&session.session),
+                                    );
                                     ui.close();
                                 }
                                 return;
@@ -2229,11 +3353,7 @@ impl<'a> TurnView<'a> {
                                 .clicked()
                             {
                                 state.lifecycle_confirmation =
-                                    Some(LifecycleConfirmation::EndSession {
-                                        session_id: session.session.id.clone(),
-                                        name: session.session.name.clone(),
-                                        running_count: session.session.running_count,
-                                });
+                                    Some(LifecycleConfirmation::end_session(&session.session));
                                 ui.close();
                             }
                             let owns_lease = workspace
@@ -2267,6 +3387,15 @@ impl<'a> TurnView<'a> {
                                     session_id: session.session.id.clone(),
                                     archived: true,
                                 });
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Delete session…").color(theme.failure))
+                                .clicked()
+                            {
+                                state.lifecycle_confirmation =
+                                    Some(LifecycleConfirmation::delete_session(&session.session));
                                 ui.close();
                             }
                         }),
@@ -2421,7 +3550,7 @@ impl<'a> TurnView<'a> {
             });
 
         if hierarchy_accepts_keyboard(state) {
-            let updated_rows = visible_hierarchy_rows(snapshot, state);
+            let updated_rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
             actions.extend(handle_hierarchy_keyboard(
                 ui,
                 snapshot,
@@ -2429,6 +3558,287 @@ impl<'a> TurnView<'a> {
                 &updated_rows,
             ));
         }
+        actions
+    }
+
+    /// The controls that live on one row of the tree.
+    ///
+    /// Three acts, and the whole point of drawing them side by side is that a user can see
+    /// they are not the same act:
+    ///
+    /// * **New session** creates.
+    /// * **Archive** takes the row out of the tree. Nothing is stopped, nothing is lost,
+    ///   and the same control brings it back. It is the answer to "get this out of my
+    ///   way", and it is deliberately the reversible one.
+    /// * **Close** stops processes. It cannot do so from here: it opens the confirmation,
+    ///   which is the only place in Turn where anything is terminated, and which says how
+    ///   much and offers archiving instead.
+    ///
+    /// Every control names its exact target — "Close session Fix climbing bugs" — so a
+    /// screen reader announces which row it belongs to, and carries its chord so the tree
+    /// teaches the keyboard rather than hiding it in a sheet.
+    fn hierarchy_row_controls(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        keymap: &Keymap,
+        row: HierarchyRow<'_>,
+        row_rect: Rect,
+        state: &mut ViewState,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        // The same answer the row used when it reserved its width, so a control is never
+        // drawn over a name that was not asked to make room for it.
+        if row_action_width(row, row_rect.width()) <= 0.0 {
+            return actions;
+        }
+        let shortcut = |command: Command| {
+            keymap
+                .chord_for(command)
+                .map(|chord| chord.describe(keymap.platform()))
+        };
+        match row {
+            HierarchyRow::Workspace(workspace) => {
+                let summary = &workspace.workspace;
+                let key = summary.id.as_str();
+                let running: usize = workspace
+                    .sessions
+                    .iter()
+                    .map(|session| session.session.running_count)
+                    .sum();
+
+                let label = format!("New session in {}", summary.name);
+                let slot = row_action_slot(row_rect, 2);
+                ui.scope_builder(keyed_region(slot, "workspace-new-session", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::FILE_PLUS,
+                        &label,
+                        "its Workspace, layout preset and checkout are already chosen",
+                        shortcut(Command::NewSession).as_deref(),
+                        !summary.archived,
+                    )
+                    .on_disabled_hover_text(
+                        "Restore this Workspace before creating a Session in it.",
+                    )
+                    .clicked()
+                    {
+                        state.session_draft = Some(SessionDraft::new(
+                            summary.id.clone(),
+                            self.preferred_template_id(&summary.id),
+                        ));
+                    }
+                });
+
+                let archived = summary.archived;
+                let label = if archived {
+                    format!("Restore workspace {}", summary.name)
+                } else {
+                    format!("Archive workspace {}", summary.name)
+                };
+                let can_archive = archived || (running == 0 && workspace.write_lease.is_none());
+                let slot = row_action_slot(row_rect, 1);
+                ui.scope_builder(keyed_region(slot, "workspace-archive", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        if archived {
+                            icons::UNARCHIVE
+                        } else {
+                            icons::ARCHIVE
+                        },
+                        &label,
+                        if archived {
+                            "brings it back into the tree"
+                        } else {
+                            "takes it out of the tree · stops nothing · reversible"
+                        },
+                        shortcut(Command::ArchiveWorkspace).as_deref(),
+                        can_archive,
+                    )
+                    .on_disabled_hover_text(
+                        "End its Sessions and release the write lease before archiving.",
+                    )
+                    .clicked()
+                    {
+                        actions.push(ViewAction::ArchiveWorkspace {
+                            workspace_id: summary.id.clone(),
+                            archived: !archived,
+                        });
+                    }
+                });
+
+                // "Stop all sessions", not "Close workspace". The control stops the *work*: it
+                // ends every Session in the Workspace, and each ended Session's row leaves the
+                // tree. The Workspace's own row stays, because a Workspace is a project rather
+                // than a task. Calling it "close" promised the project would go, which it does
+                // not — and the two controls that really do that are on this same row.
+                let label = format!("Stop all sessions in {}", summary.name);
+                let detail = format!(
+                    "ends its {} session{} · the Workspace stays · asks first",
+                    workspace.sessions.len(),
+                    if workspace.sessions.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                );
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(keyed_region(slot, "workspace-close", key), |ui| {
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::POWER,
+                        &label,
+                        &detail,
+                        shortcut(Command::CloseWorkspace).as_deref(),
+                        !archived,
+                    )
+                    .on_disabled_hover_text(
+                        "An archived Workspace has nothing running. Restore it first.",
+                    )
+                    .clicked()
+                    {
+                        // The control opens the question; the dialog is the only thing
+                        // that can answer it.
+                        state.lifecycle_confirmation =
+                            Some(LifecycleConfirmation::stop_workspace(workspace));
+                    }
+                });
+            }
+            HierarchyRow::Session { workspace, session } => {
+                let summary = &session.session;
+                let key = summary.id.as_str();
+                let archived = summary.status == SessionStatus::Archived;
+                let owns_lease = workspace
+                    .write_lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.session_id == summary.id);
+
+                let label = if archived {
+                    format!("Restore session {}", summary.name)
+                } else {
+                    format!("Archive session {}", summary.name)
+                };
+                let enabled = if archived {
+                    !workspace.workspace.archived
+                } else {
+                    summary.running_count == 0 && !owns_lease
+                };
+                let slot = row_action_slot(row_rect, 1);
+                ui.scope_builder(keyed_region(slot, "session-archive", key), |ui| {
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        if archived {
+                            icons::UNARCHIVE
+                        } else {
+                            icons::ARCHIVE
+                        },
+                        &label,
+                        if archived {
+                            "brings it back into the tree"
+                        } else {
+                            "takes it out of the tree · stops nothing · reversible"
+                        },
+                        shortcut(Command::ArchiveSession).as_deref(),
+                        enabled,
+                    )
+                    .on_disabled_hover_text(if archived {
+                        "Restore the Workspace before restoring this Session."
+                    } else {
+                        "End it and release its write lease before archiving."
+                    })
+                    .clicked()
+                    {
+                        actions.push(ViewAction::ArchiveSession {
+                            session_id: summary.id.clone(),
+                            archived: !archived,
+                        });
+                    }
+                });
+
+                let label = format!("Close session {}", summary.name);
+                let detail = format!(
+                    "stops its {} running process{} · asks first",
+                    summary.running_count,
+                    if summary.running_count == 1 { "" } else { "es" }
+                );
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(keyed_region(slot, "session-close", key), |ui| {
+                    ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                    if icons::row_button(
+                        ui,
+                        slot,
+                        icons::POWER,
+                        &label,
+                        &detail,
+                        shortcut(Command::CloseSession).as_deref(),
+                        !archived,
+                    )
+                    .on_disabled_hover_text(
+                        "An archived Session has nothing running. Restore it first.",
+                    )
+                    .clicked()
+                    {
+                        state.lifecycle_confirmation =
+                            Some(LifecycleConfirmation::end_session(summary));
+                    }
+                });
+            }
+            HierarchyRow::Process { session, node } => {
+                // Only a worker an agent is managing, which is what reserved the room above.
+                if !crate::spotlight::is_managed(session, node) || node.lifecycle.is_terminal() {
+                    return actions;
+                }
+                let what = if node.is_agentic { "agent" } else { "process" };
+                let label = format!("Stop {what} {}", process_title(node));
+                let idle = crate::spotlight::idleness(session, node, self.now_ms)
+                    .filter(|idle| idle.worth_saying);
+                let detail = match &idle {
+                    // The reason the control is being looked at, in the tooltip that names it.
+                    Some(idle) => format!(
+                        "it has said nothing for {} · asks nothing first",
+                        crate::spotlight::describe_silence(idle.silent_ms)
+                    ),
+                    None => "signals it to stop · asks nothing first".to_string(),
+                };
+                let slot = row_action_slot(row_rect, 0);
+                ui.scope_builder(
+                    keyed_region(slot, "process-stop", node.node_id.as_str()),
+                    |ui| {
+                        ui.visuals_mut().widgets.hovered.fg_stroke.color = theme.failure;
+                        if icons::row_button(
+                            ui,
+                            slot,
+                            icons::POWER,
+                            &label,
+                            &detail,
+                            None,
+                            node.lifecycle != Lifecycle::Orphaned,
+                        )
+                        .on_disabled_hover_text(
+                            "This process survived the previous daemon and is not controllable. \
+                             Stop it outside Turn, then confirm recovery.",
+                        )
+                        .clicked()
+                        {
+                            actions.push(ViewAction::TerminateNode {
+                                session_id: node.session_id.clone(),
+                                node_id: node.node_id.clone(),
+                            });
+                        }
+                    },
+                );
+            }
+        }
+        // Back to the bottom of the row. Placing a widget moves the parent's cursor to the
+        // bottom of *that* widget, and these sit on the row's first line — so without this
+        // the next row started a line and a half too high and was drawn straight over this
+        // one's state text.
+        ui.advance_cursor_after_rect(row_rect);
         actions
     }
 
@@ -2674,11 +4084,7 @@ impl<'a> TurnView<'a> {
                             .clicked()
                         {
                             state.lifecycle_confirmation =
-                                Some(LifecycleConfirmation::EndSession {
-                                    session_id: summary.id.clone(),
-                                    name: summary.name.clone(),
-                                    running_count: summary.running_count,
-                                });
+                                Some(LifecycleConfirmation::end_session(summary));
                             ui.close();
                         }
                         if ui
@@ -2703,10 +4109,7 @@ impl<'a> TurnView<'a> {
                             .clicked()
                         {
                             state.lifecycle_confirmation =
-                                Some(LifecycleConfirmation::StopWorkspace {
-                                    workspace_id: workspace.workspace.id.clone(),
-                                    name: workspace.workspace.name.clone(),
-                                });
+                                Some(LifecycleConfirmation::stop_workspace(workspace));
                             ui.close();
                         }
                         let workspace_running: usize = workspace
@@ -3204,7 +4607,7 @@ impl<'a> TurnView<'a> {
                     );
                     ui.label(
                         RichText::new(
-                            "Add rows or columns, choose a program per cell, drag cells to swap, and drag dividers to resize.",
+                            "Add rows or columns, choose a program per cell, drag a cell onto another one's edge to move it there or its middle to swap, and drag dividers to resize.",
                         )
                         .color(theme.text_dim)
                         .small(),
@@ -3293,10 +4696,18 @@ impl<'a> TurnView<'a> {
                     theme.ui_font.clone(),
                     theme.text,
                 );
-                ui.painter().text(
+                // Only as much of the hint as the cell can hold. A layout of six cells
+                // makes each one narrow, and a caption wider than its cell would spill
+                // across the cell next door and describe the wrong one.
+                paint_widest_that_fits(
+                    ui.painter(),
+                    placed.rect.shrink(6.0),
                     placed.rect.center() + Vec2::new(0.0, 11.0),
-                    Align2::CENTER_CENTER,
-                    "drag to move · select to configure",
+                    &[
+                        "drag onto an edge or a middle · select to configure",
+                        "drag onto an edge or a middle",
+                        "drag to move",
+                    ],
                     FontId::new(10.0, egui::FontFamily::Proportional),
                     theme.text_faint,
                 );
@@ -3304,20 +4715,57 @@ impl<'a> TurnView<'a> {
                     draft.selected = placed.pane_id.clone();
                     draft.layout.active = Some(placed.pane_id.clone());
                 }
-                if response.drag_started() {
+                if response.dragged() && draft.dragged_pane.is_none() {
                     draft.dragged_pane = Some(placed.pane_id.clone());
                 }
             }
 
-            let released = ui.input(|input| input.pointer.any_released());
-            if released {
-                let target = ui
-                    .input(|input| input.pointer.interact_pos())
-                    .and_then(|position| arrangement.pane_at(position))
-                    .map(|pane| pane.pane_id.clone());
-                if let (Some(source), Some(target)) = (draft.dragged_pane.take(), target) {
-                    if source != target && draft.layout.swap(&source, &target) {
-                        draft.selected = source;
+            // Escape abandons the drag rather than closing the sheet: the key belongs to
+            // the gesture in progress, and consuming it here is what keeps a cancelled
+            // move from also discarding the template the user is drawing.
+            if draft.dragged_pane.is_some()
+                && ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape))
+            {
+                draft.dragged_pane = None;
+            }
+
+            // The same five zones as a session pane, because this is the editor where a
+            // layout is designed and a template that could only ever be reshaped by
+            // deleting cells would be the original complaint in a second place.
+            let landing = draft
+                .dragged_pane
+                .as_ref()
+                .zip(ui.input(|input| input.pointer.interact_pos()))
+                .and_then(|(moved, pointer)| arrangement.drop_target_at(moved, pointer));
+            if let Some(moved) = draft
+                .dragged_pane
+                .as_ref()
+                .and_then(|moved| arrangement.pane(moved))
+            {
+                let title = landing
+                    .as_ref()
+                    .and_then(|landing| arrangement.pane(&landing.pane_id))
+                    .map(|target| draft.cell_label(&target.pane_id))
+                    .unwrap_or_default();
+                paint_drop_preview(
+                    ui,
+                    theme,
+                    moved.rect,
+                    landing.as_ref(),
+                    &title,
+                    ui.id().with("layout-editor-move-hint"),
+                );
+            }
+            if ui.input(|input| input.pointer.any_released()) {
+                // A draft is the window's own, so this one is applied locally: no daemon
+                // owns a template that has not been created yet.
+                if let (Some(moved), Some(landing)) = (draft.dragged_pane.take(), landing) {
+                    if draft.layout.relocate(&moved, &landing.pane_id, landing.zone) {
+                        draft.selected = moved;
+                        debug_assert!(
+                            draft.layout.sizes_are_normalised(),
+                            "a relocation left the draft's sibling sizes not summing to one"
+                        );
                     }
                 }
             }
@@ -3601,49 +5049,78 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    fn pane_status_bar(&self, ui: &mut Ui, theme: &Theme, session: Option<&SessionTreeView>) {
-        let area = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(area, 0.0, theme.panel);
-        ui.painter()
-            .hline(area.x_range(), area.min.y, Stroke::new(1.0, theme.border));
-        let focused = self
-            .panes
-            .iter()
-            .find(|pane| pane.focused)
-            .map(|pane| pane.title.as_str())
-            .unwrap_or("no pane focused");
-        ui.painter().text(
-            area.left_center() + Vec2::new(9.0, 0.0),
-            Align2::LEFT_CENTER,
-            format!("FOCUS · {focused}"),
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            if self.panes.iter().any(|pane| pane.focused) {
-                theme.running
-            } else {
-                theme.text_faint
-            },
-        );
-        if let Some(session) = session {
-            let guard = read_only_guard_label(&session.session)
-                .map(|guard| format!(" · {guard}"))
-                .unwrap_or_default();
-            ui.painter().text(
-                area.right_center() + Vec2::new(-9.0, 0.0),
-                Align2::RIGHT_CENTER,
-                format!(
-                    "{}{} · {} running · {} panes",
-                    session.session.mode.label(),
-                    guard,
-                    session.session.running_count,
-                    session.session.pane_count
-                ),
-                FontId::new(10.0, egui::FontFamily::Monospace),
-                theme.text_faint,
-            );
+    /// The panes of the selected session, with their dividers.
+    /// Turns what one pane did this frame into what the window will do about it.
+    ///
+    /// The two halves arrive together and are handled differently on purpose.
+    /// [`PaneAction`]s are things that happen *to* the pane and are forwarded verbatim.
+    /// [`PaneRequest`]s are things the pane cannot do itself, and two of them are answered
+    /// here rather than passed on, because they are window-local state in the same way
+    /// `settings_open` is: the find bar belongs to the pane's own interaction record, and
+    /// nothing outside this window needs to know it opened.
+    fn pane_outcome(
+        &self,
+        state: &mut ViewState,
+        pane_id: &PaneId,
+        outcome: terminal::PaneOutcome,
+        panes_in_layout: usize,
+        scrollback_offset: usize,
+    ) -> Vec<ViewAction> {
+        let mut actions: Vec<ViewAction> = outcome
+            .actions
+            .into_iter()
+            .map(|action| ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action,
+            })
+            .collect();
+        for request in outcome.requests {
+            match request {
+                terminal::PaneRequest::Search(text) => {
+                    // The offset the user is looking at, so closing the search puts them back
+                    // where they were rather than at the bottom of a pane they had scrolled up
+                    // in to read the thing they are searching for.
+                    state
+                        .pane(pane_id)
+                        .search
+                        .open_with(text, scrollback_offset, self.now_ms);
+                }
+                terminal::PaneRequest::ClearHistory => {
+                    actions.push(ViewAction::ClearPaneHistory {
+                        pane_id: pane_id.clone(),
+                    });
+                }
+                terminal::PaneRequest::FollowLink(link) => {
+                    actions.push(ViewAction::FollowLink(link));
+                }
+                terminal::PaneRequest::Split(Direction::Horizontal) => {
+                    actions.push(ViewAction::Run(Command::SplitHorizontal));
+                }
+                terminal::PaneRequest::Split(Direction::Vertical) => {
+                    actions.push(ViewAction::Run(Command::SplitVertical));
+                }
+                // Refused here rather than only greyed out in the menu. The menu is built
+                // from the same count, so this is unreachable through it — but a chord is
+                // not the menu, and the last pane of a Session is the one whose closure
+                // would leave a Session with nowhere to type.
+                terminal::PaneRequest::Close if panes_in_layout <= 1 => {
+                    actions.push(ViewAction::Notice(
+                        "this is the Session's only pane — end the Session to close it".into(),
+                    ));
+                }
+                terminal::PaneRequest::Close => {
+                    actions.push(ViewAction::ClosePane {
+                        pane_id: pane_id.clone(),
+                    });
+                }
+                terminal::PaneRequest::Notice(message) => {
+                    actions.push(ViewAction::Notice(message));
+                }
+            }
         }
+        actions
     }
 
-    /// The panes of the selected session, with their dividers.
     fn pane_area(
         &self,
         ui: &mut Ui,
@@ -3724,7 +5201,30 @@ impl<'a> TurnView<'a> {
         // Persisted pane focus and the window's keyboard lease are different things.
         // Keep the visual focus in place behind a sheet, but never let that sheet's
         // Text/Paste/Key events reach a PTY.
-        let accepts_terminal_input = !state.is_sensitive() && self.write_conflict.is_none();
+        // A modal question holds the keyboard, and the link dialog is one: a keystroke aimed at
+        // "Cancel" must not also be typed into whatever is running underneath it.
+        let accepts_terminal_input = !state.is_sensitive()
+            && self.write_conflict.is_none()
+            && self.link_confirmation.is_none();
+
+        // The pane menu's chords come from the same keymap the rest of the window uses, so a
+        // user who rebound "close pane" sees their own chord in the menu rather than the
+        // default it no longer is.
+        let shortcuts = terminal::menu::PaneShortcuts::from_keymap(keymap);
+        let panes_in_layout = arrangement.panes.len();
+        // Why an item is greyed out, in the words the menu will show. Each reason is a
+        // sentence rather than a bool: an item that is simply dim teaches the user nothing,
+        // and "why can I not close this pane" is a question the menu can answer itself.
+        let pane_context = terminal::menu::PaneContext {
+            split_unavailable: (!accepts_terminal_input)
+                .then(|| "Not while a sheet is open.".to_string()),
+            close_unavailable: (panes_in_layout <= 1).then(|| {
+                "This is the Session's only pane. End the Session to close it.".to_string()
+            }),
+            paste_unavailable: (!accepts_terminal_input)
+                .then(|| "Not while a sheet is open.".to_string()),
+            search_unavailable: None,
+        };
         for placed in &arrangement.panes {
             let header =
                 Rect::from_min_size(placed.rect.min, Vec2::new(placed.rect.width(), PANE_HEADER));
@@ -3745,27 +5245,50 @@ impl<'a> TurnView<'a> {
                 .map(|content| content.title.clone())
                 .or_else(|| placed.title.clone())
                 .unwrap_or_else(|| format!("{:?}", placed.kind).to_lowercase());
-            ui.painter().text(
-                header.min + Vec2::new(8.0, 4.0),
-                Align2::LEFT_TOP,
-                title,
-                FontId::new(11.0, egui::FontFamily::Monospace),
-                if focused { theme.text } else { theme.text_dim },
-            );
+
+            // The close control owns the right-hand end of the header. Everything else in
+            // the header is measured against it rather than drawn on top of it.
+            let mut title_limit = pane_close_slot(header).min.x - 6.0;
             if arrangement.zoomed {
-                ui.painter().text(
-                    header.right_top() + Vec2::new(-8.0, 4.0),
-                    Align2::RIGHT_TOP,
-                    "zoomed",
-                    FontId::new(11.0, egui::FontFamily::Monospace),
-                    theme.attention,
-                );
+                title_limit = ui
+                    .painter()
+                    .text(
+                        egui::pos2(title_limit, header.min.y + 4.0),
+                        Align2::RIGHT_TOP,
+                        "zoomed",
+                        FontId::new(11.0, egui::FontFamily::Monospace),
+                        theme.attention,
+                    )
+                    .min
+                    .x
+                    - 6.0;
             }
+            ui.painter()
+                .with_clip_rect(Rect::from_min_max(
+                    header.min,
+                    egui::pos2(title_limit.max(header.min.x), header.max.y),
+                ))
+                .text(
+                    header.min + Vec2::new(8.0, 4.0),
+                    Align2::LEFT_TOP,
+                    &title,
+                    FontId::new(11.0, egui::FontFamily::Monospace),
+                    if focused { theme.text } else { theme.text_dim },
+                );
             ui.painter().hline(
                 header.x_range(),
                 header.max.y,
                 Stroke::new(1.0, theme.border),
             );
+            actions.extend(pane_header_controls(
+                ui,
+                theme,
+                keymap,
+                placed,
+                &arrangement,
+                &mut state.dragged_pane,
+                &title,
+            ));
 
             let restore = self.restore.and_then(|restore| {
                 restore
@@ -3775,7 +5298,7 @@ impl<'a> TurnView<'a> {
                     .map(|outcome| (restore, outcome))
             });
             match (restore, content) {
-                (Some((restore, outcome)), _) => {
+                (Some((_restore, outcome)), _) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
                     let content_rect = Rect::from_center_size(
                         body.center(),
@@ -3784,82 +5307,59 @@ impl<'a> TurnView<'a> {
                     ui.scope_builder(region(content_rect, "restored-pane-action"), |ui| {
                         ui.vertical_centered(|ui| {
                             let orphaned = outcome.lifecycle.is_running();
-                            ui.label(
-                                RichText::new(if orphaned {
-                                    "Process is still running"
-                                } else {
-                                    "Process is stopped"
-                                })
-                                .color(theme.text)
-                                .strong(),
-                            );
+                            let pending = self.relaunching.contains(&outcome.node_id);
+                            // Only what would actually use the checkout waits for the
+                            // confirmation. A pane that opens the user's own shell starts
+                            // now — including the terminal they need in order to go and
+                            // stop whatever the confirmation is about.
+                            let lease_blocked = (self.recovery_lease.is_some()
+                                || self.reclaiming_write_access)
+                                && outcome.needs_checkout_write;
+                            let unreachable_blocked = self.unreachable_processes > 0;
+                            let heading = if orphaned {
+                                "Process survived outside Turn"
+                            } else if pending {
+                                "Starting automatically…"
+                            } else if lease_blocked {
+                                "Waiting for write access"
+                            } else if unreachable_blocked {
+                                "Waiting for the surviving process"
+                            } else if selected_archived {
+                                "Session is archived"
+                            } else if outcome.can_relaunch {
+                                "Restarting automatically…"
+                            } else {
+                                "Process is stopped"
+                            };
+                            ui.label(RichText::new(heading).color(theme.text).strong());
                             ui.label(
                                 RichText::new(
-                                    outcome.command.as_deref().unwrap_or("No command recorded"),
+                                    outcome
+                                        .command
+                                        .as_deref()
+                                        .unwrap_or("Opening your configured shell"),
                                 )
                                 .monospace()
                                 .color(theme.text_dim),
                             );
+                            let explanation = if orphaned {
+                                "Its terminal belonged to the previous daemon and cannot be reattached."
+                            } else if pending || outcome.can_relaunch && !lease_blocked && !unreachable_blocked {
+                                "Turn is restoring this pane; no action is required."
+                            } else if lease_blocked {
+                                "Automatic recovery will continue after write access is confirmed."
+                            } else if unreachable_blocked {
+                                "Turn will continue automatically when it is safe to avoid a duplicate process."
+                            } else if selected_archived {
+                                "Archived work stays stopped."
+                            } else {
+                                "This consequential command is not configured for automatic restart."
+                            };
                             ui.label(
-                                RichText::new(if orphaned {
-                                    "Its terminal belonged to the previous daemon and cannot be reattached."
-                                } else {
-                                    "Turn restored the layout without running this command."
-                                })
-                                .color(theme.text_faint)
-                                .small(),
+                                RichText::new(explanation)
+                                    .color(theme.text_faint)
+                                    .small(),
                             );
-                            ui.add_space(7.0);
-                            let pending = self.relaunching.contains(&outcome.node_id);
-                            let lease_blocked =
-                                self.recovery_lease.is_some() || self.reclaiming_write_access;
-                            let unreachable_blocked = self.unreachable_processes > 0;
-                            if ui
-                                .add_enabled(
-                                    outcome.can_relaunch
-                                        && !pending
-                                        && !lease_blocked
-                                        && !unreachable_blocked
-                                        && !selected_archived,
-                                    egui::Button::new(if pending {
-                                        "Starting…"
-                                    } else if orphaned {
-                                        "Still running"
-                                    } else {
-                                        "Start pane"
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                actions.push(ViewAction::RelaunchNode {
-                                    session_id: restore.session_id.clone(),
-                                    node_id: outcome.node_id.clone(),
-                                    resume: false,
-                                });
-                            }
-                            if lease_blocked && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new("Confirm write access in the banner first.")
-                                        .color(theme.attention)
-                                        .small(),
-                                );
-                            } else if unreachable_blocked && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new(
-                                        "Stop surviving processes outside Turn before starting.",
-                                    )
-                                    .color(theme.attention)
-                                    .small(),
-                                );
-                            } else if selected_archived && outcome.can_relaunch {
-                                ui.label(
-                                    RichText::new(
-                                        "Restore the Session and Workspace before starting.",
-                                    )
-                                    .color(theme.attention)
-                                    .small(),
-                                );
-                            }
                         });
                     });
                 }
@@ -3872,15 +5372,33 @@ impl<'a> TurnView<'a> {
                         history_complete: content.history_complete,
                     };
                     let id = ui.id().with(("pane", placed.pane_id.as_str()));
-                    let interaction = state.pane(&placed.pane_id);
-                    for action in
-                        terminal::show(ui, theme, body, content.grid, interaction, options, id)
-                    {
-                        actions.push(ViewAction::Pane {
-                            pane_id: placed.pane_id.clone(),
-                            action,
-                        });
-                    }
+                    // Through `show_pane` rather than `show`, which is what makes the pane's
+                    // own menu, its links and its find bar reachable at all. They were
+                    // written, tested and then left behind the entry point that discards
+                    // every request a pane makes — so following an OSC-8 hyperlink worked in
+                    // the module's tests and did nothing in the window.
+                    let outcome = terminal::show_pane(
+                        ui,
+                        state.pane(&placed.pane_id),
+                        terminal::PaneInput {
+                            theme,
+                            rect: body,
+                            grid: content.grid,
+                            options,
+                            id,
+                            chrome: Some(terminal::PaneChrome {
+                                shortcuts: &shortcuts,
+                                context: &pane_context,
+                            }),
+                        },
+                    );
+                    actions.extend(self.pane_outcome(
+                        state,
+                        &placed.pane_id,
+                        outcome,
+                        panes_in_layout,
+                        content.grid.scrollback_offset,
+                    ));
                 }
                 (None, None) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
@@ -3913,31 +5431,20 @@ impl<'a> TurnView<'a> {
                                         .monospace()
                                         .color(theme.text_dim),
                                 );
-                                ui.add_space(7.0);
                                 let pending = self.relaunching.contains(&node.node_id);
-                                let lease_blocked =
-                                    self.recovery_lease.is_some() || self.reclaiming_write_access;
-                                let unreachable_blocked = self.unreachable_processes > 0;
-                                if ui
-                                    .add_enabled(
-                                        !pending
-                                            && !lease_blocked
-                                            && !unreachable_blocked
-                                            && !selected_archived,
-                                        egui::Button::new(if pending {
-                                            "Starting…"
-                                        } else {
-                                            "Start pane"
-                                        }),
-                                    )
-                                    .clicked()
-                                {
-                                    actions.push(ViewAction::RelaunchNode {
-                                        session_id: node.session_id.clone(),
-                                        node_id: node.node_id.clone(),
-                                        resume: false,
-                                    });
-                                }
+                                ui.label(
+                                    RichText::new(if pending {
+                                        "Starting automatically…"
+                                    } else {
+                                        "Turn could not restart this process automatically."
+                                    })
+                                    .color(if pending {
+                                        theme.running
+                                    } else {
+                                        theme.text_faint
+                                    })
+                                    .small(),
+                                );
                             });
                         });
                     } else {
@@ -3954,6 +5461,19 @@ impl<'a> TurnView<'a> {
                     }
                 }
             }
+        }
+
+        // A drag whose header stopped being drawn — its pane closed, or a new layout
+        // arrived from the daemon mid-gesture — never reports that it stopped. Forgetting
+        // it once the pointer is up is what stops a dead gesture holding on to Escape.
+        let dragged_pane_is_gone = state
+            .dragged_pane
+            .as_ref()
+            .is_some_and(|moved| arrangement.pane(moved).is_none());
+        if dragged_pane_is_gone
+            || (state.dragged_pane.is_some() && !ui.input(|input| input.pointer.any_down()))
+        {
+            state.dragged_pane = None;
         }
 
         for divider in &arrangement.dividers {
@@ -4021,7 +5541,9 @@ impl<'a> TurnView<'a> {
             (NodePaneCapability::Terminal { .. }, Some(grid)) => {
                 let options = PaneOptions {
                     focused: true,
-                    accepts_input: !state.is_sensitive() && self.write_conflict.is_none(),
+                    accepts_input: !state.is_sensitive()
+                        && self.write_conflict.is_none()
+                        && self.link_confirmation.is_none(),
                     now_ms: self.now_ms,
                     scrolled: false,
                     history_complete: true,
@@ -4433,7 +5955,7 @@ impl<'a> TurnView<'a> {
 
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Open temporary pane  ⌘⏎").clicked() {
+                    if ui.button("Open temporary pane").clicked() {
                         state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
                             surface_id: snapshot.tree_state.surface_id.clone(),
                             session_id: node.session_id.clone(),
@@ -4823,6 +6345,7 @@ impl<'a> TurnView<'a> {
         ui: &mut Ui,
         theme: &Theme,
         keymap: &Keymap,
+        state: &mut ViewState,
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
@@ -4853,22 +6376,98 @@ impl<'a> TurnView<'a> {
                     .small(),
                 );
             }
+            // Two chords on one key is the failure this whole sheet has to make visible: the
+            // second binding never fires and nothing else would say so. Reported before the
+            // list, because it is about the set rather than about any one row.
+            let conflicts = keymap.conflicts();
+            for (chord, commands) in &conflicts {
+                ui.label(
+                    RichText::new(format!(
+                        "{} is bound to {} commands: {}. Only the first will fire.",
+                        chord.describe(keymap.platform()),
+                        commands.len(),
+                        commands
+                            .iter()
+                            .map(|command| command.title())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .color(theme.failure)
+                    .small(),
+                );
+            }
+            let taken: std::collections::BTreeMap<String, Command> = keymap
+                .bindings()
+                .iter()
+                .map(|bound| (bound.chord.describe(keymap.platform()), bound.command))
+                .collect();
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Type a chord and press Enter. An empty field unbinds the command.")
+                    .color(theme.text_faint)
+                    .small(),
+            );
+            ui.add_space(6.0);
             egui::ScrollArea::vertical()
                 .id_salt("shortcut-rows")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for bound in keymap.bindings() {
+                        let written = bound.chord.describe(keymap.platform());
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(bound.chord.describe(keymap.platform()))
-                                    .monospace()
-                                    .color(theme.text),
+                            let id = bound.command.id();
+                            let draft = state
+                                .shortcut_drafts
+                                .entry(id.to_string())
+                                .or_insert_with(|| written.clone());
+                            let response = ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .desired_width(160.0)
+                                    .font(egui::TextStyle::Monospace),
                             );
+                            describe_control(
+                                &response,
+                                egui::accesskit::Role::TextInput,
+                                bound.command.title(),
+                            );
+                            let committed = response.lost_focus()
+                                || (response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                            if committed {
+                                let typed = draft.trim().to_string();
+                                state.shortcut_drafts.remove(id);
+                                if typed != written {
+                                    actions.push(ViewAction::RebindCommand {
+                                        command: id.to_string(),
+                                        chord: typed,
+                                    });
+                                }
+                            }
                             ui.label(
                                 RichText::new(bound.command.title())
                                     .color(theme.text_dim)
                                     .small(),
                             );
+                            if bound.customised && ui.small_button("Reset").clicked() {
+                                actions.push(ViewAction::RebindCommand {
+                                    command: id.to_string(),
+                                    // The sentinel that means "no opinion" rather than
+                                    // "unbound": an empty chord unbinds, and there has to be a
+                                    // way back to the default that is neither.
+                                    chord: DEFAULT_CHORD.to_string(),
+                                });
+                            }
+                            // A chord already in use, named. Said on the row that would lose,
+                            // because that is the row the user is looking at.
+                            if let Some(other) =
+                                taken.get(&written).filter(|other| **other != bound.command)
+                            {
+                                ui.label(
+                                    RichText::new(format!("also {}", other.title()))
+                                        .color(theme.failure)
+                                        .small(),
+                                );
+                            }
                             if bound.chord.shadows_control_character(keymap.platform()) {
                                 ui.label(
                                     RichText::new("hidden from the terminal")
@@ -4883,11 +6482,237 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    /// The preferences, section by section, with where each value came from.
+    ///
+    /// Three things make this honest rather than a list of controls:
+    ///
+    /// **The level is chosen once, at the top, and shown on every control.** A change is
+    /// four different acts depending on the level, and a sheet that let the user set a font
+    /// size without saying where would be a sheet that edits their whole account when they
+    /// meant this Session. The selector offers only levels that exist.
+    ///
+    /// **Every value says where it came from.** "Turn's default", or the level that set it.
+    /// Without that the user cannot tell a value they chose from one that came with the
+    /// product, and "reset" has nothing to mean.
+    ///
+    /// **Reset appears only when there is something to reset at the chosen level**, and its
+    /// hover says what would come back. A greyed-out reset on an inherited value teaches
+    /// nothing; one that silently did nothing would be worse.
+    fn settings_preferences(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let Some(settings) = self.settings else {
+            ui.label(
+                RichText::new("loading preferences…")
+                    .color(theme.text_faint)
+                    .small(),
+            );
+            return actions;
+        };
+
+        // The narrowest level that exists, unless the user has already chosen one. Narrowest
+        // because a change made there surprises the fewest other things.
+        let chosen = state
+            .settings_level
+            .filter(|scope| settings.level(*scope).is_some())
+            .or_else(|| settings.levels.last().map(|level| level.scope));
+        let Some(chosen) = chosen else {
+            return actions;
+        };
+        state.settings_level = Some(chosen);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Changes apply to").color(theme.text_dim));
+            for level in &settings.levels {
+                let selected = level.scope == chosen;
+                if ui
+                    .selectable_label(
+                        selected,
+                        RichText::new(format!("{} · {}", level.scope.label(), level.label))
+                            .color(if selected { theme.text } else { theme.text_dim }),
+                    )
+                    .on_hover_text(match level.scope {
+                        turn_core::settings::Scope::Global => {
+                            "Everywhere in Turn, for every Workspace and Session."
+                        }
+                        turn_core::settings::Scope::Workspace => {
+                            "This project, and every Session in it that does not say otherwise."
+                        }
+                        turn_core::settings::Scope::Template => {
+                            "Every Session made from this Template."
+                        }
+                        turn_core::settings::Scope::Session => "This Session alone.",
+                        turn_core::settings::Scope::Temporary => {
+                            "This window, until it closes. Not saved."
+                        }
+                    })
+                    .clicked()
+                {
+                    state.settings_level = Some(level.scope);
+                }
+            }
+        });
+        let owner = settings
+            .level(chosen)
+            .map(|level| level.owner_id.clone())
+            .unwrap_or_default();
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("settings-preferences")
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for area in turn_core::settings::Area::ALL {
+                    let entries: Vec<&turn_proto::SettingsEntry> = settings.in_area(area).collect();
+                    // An area with nothing in it is not drawn. The empty section is honest in
+                    // the catalogue, where it says the area exists; on screen it would be a
+                    // heading over nothing.
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(area.title()).color(theme.text).strong());
+                    ui.add_space(4.0);
+                    for entry in entries {
+                        actions.extend(self.settings_row(ui, theme, state, entry, chosen, &owner));
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        actions
+    }
+
+    /// One preference: its control, where its value came from, and its way back.
+    fn settings_row(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        entry: &turn_proto::SettingsEntry,
+        chosen: turn_core::settings::Scope,
+        owner: &str,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let key = entry.resolution.key.clone();
+        // Whether this key can be written at the level the user picked. A control drawn where
+        // the write would be refused is a control that lies, so it is disabled and says why.
+        let settable = entry.settable_at.contains(&chosen);
+        // Whether *this* level is the one holding the value, which is the only case where
+        // "reset" has anything to remove.
+        let set_here = entry.resolution.origin == Some(chosen);
+
+        egui::Frame::new()
+            .fill(theme.raised)
+            .stroke(Stroke::new(1.0, theme.border))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width() * 0.55);
+                        ui.label(RichText::new(&entry.title).color(theme.text).strong());
+                        ui.label(
+                            RichText::new(&entry.description)
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        // Where it came from, always. Sentence rather than a badge: "from the
+                        // Workspace" is what the user needs to know before changing it.
+                        let (origin, colour) = match entry.resolution.origin {
+                            None => ("Turn's default".to_string(), theme.text_faint),
+                            Some(scope) if scope == chosen => {
+                                (format!("set here · {}", scope.label()), theme.running)
+                            }
+                            Some(scope) => (
+                                format!("inherited from {}", scope.label()),
+                                theme.provisional,
+                            ),
+                        };
+                        ui.label(RichText::new(origin).color(colour).small());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Reset first in right-to-left order, so it sits at the far edge and
+                        // the control the user came for is next to its own value.
+                        if set_here {
+                            let reveals = match entry.resolution.inherited() {
+                                Some(shadowed) => format!(
+                                    "Remove this {} value; {} takes over again",
+                                    chosen.label(),
+                                    shadowed.scope.label()
+                                ),
+                                None => format!(
+                                    "Remove this {} value and go back to Turn's default",
+                                    chosen.label()
+                                ),
+                            };
+                            let response = ui.button("Reset").on_hover_text(reveals);
+                            crate::icons::describe(
+                                &response,
+                                &format!("Reset {}", entry.title),
+                            );
+                            if response.clicked() {
+                                actions.push(ViewAction::ResetSetting {
+                                    scope: chosen,
+                                    owner_id: owner.to_string(),
+                                    key: key.clone(),
+                                });
+                            }
+                        }
+                        ui.add_enabled_ui(settable && !entry.hidden, |ui| {
+                            actions.extend(settings_control(
+                                ui, theme, state, entry, chosen, owner, &key,
+                            ));
+                        });
+                    });
+                });
+                if entry.hidden {
+                    if entry.known {
+                        ui.label(
+                            RichText::new(
+                                "Not shown, and not editable here: Turn does not display a value that may be a credential.",
+                            )
+                            .color(theme.text_faint)
+                            .small(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Written by a newer version of Turn. Its sensitivity is unknown, so the value stays hidden and can only be reset.",
+                            )
+                            .color(theme.attention)
+                            .small(),
+                        );
+                    }
+                } else if !settable {
+                    ui.label(
+                        RichText::new(format!(
+                            "Cannot be set at the {} level. It belongs to: {}",
+                            chosen.label(),
+                            entry
+                                .settable_at
+                                .iter()
+                                .map(|scope| scope.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .color(theme.text_faint)
+                        .small(),
+                    );
+                }
+            });
+        ui.add_space(5.0);
+        actions
+    }
+
     fn settings_sheet(
         &self,
         ui: &mut Ui,
         theme: &Theme,
-        _state: &mut ViewState,
+        state: &mut ViewState,
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
@@ -4925,6 +6750,31 @@ impl<'a> TurnView<'a> {
             ui.add_space(14.0);
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
+                    // The preferences first, because they are what "Settings" means to
+                    // somebody opening this. The Layout presets and the archived filter below
+                    // are about what Turn shows rather than how it behaves.
+                    actions.extend(self.settings_preferences(ui, theme, state));
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    // The archived filter used to be a third button in the Workspaces bar,
+                    // beside two that create things. It is a preference about what the list
+                    // contains, not an action, and it belongs where preferences are.
+                    let mut include_archived = self.include_archived;
+                    if ui
+                        .checkbox(
+                            &mut include_archived,
+                            "Show archived Workspaces and Sessions",
+                        )
+                        .changed()
+                    {
+                        actions.push(ViewAction::SetArchivedVisibility {
+                            include: include_archived,
+                        });
+                    }
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
@@ -5061,19 +6911,281 @@ impl<'a> TurnView<'a> {
     }
 }
 
+/// The control for one preference, and the value it produces when the user finishes with it.
+///
+/// **Nothing here validates.** The daemon refuses a value out of range and says what would be
+/// accepted; a window that also checked would be a second validator able to disagree about
+/// which values exist. What the control does is stay inside the bounds it was *told*, which is
+/// a different thing: a slider cannot express 400 in the first place, so the user is not
+/// offered a value that would be refused.
+///
+/// **A field commits on Enter or on losing focus, never per keystroke.** A `set_setting` per
+/// character would be a round trip per character, and every intermediate value on the way to
+/// `14` — `1` — would be refused as out of range, so the user would type into a field that
+/// rejected them until they finished.
+fn settings_control(
+    ui: &mut Ui,
+    theme: &Theme,
+    state: &mut ViewState,
+    entry: &turn_proto::SettingsEntry,
+    chosen: turn_core::settings::Scope,
+    owner: &str,
+    key: &str,
+) -> Vec<ViewAction> {
+    use turn_proto::SettingsControl;
+    let mut actions = Vec::new();
+    let set = |value: serde_json::Value| ViewAction::SetSetting {
+        scope: chosen,
+        owner_id: owner.to_string(),
+        key: key.to_string(),
+        value,
+    };
+    // Every control carries the preference's own title as its accessible name. There is no
+    // DOM here, so a control whose name is only the label drawn beside it is a control a
+    // screen reader — and a test — cannot find. The title is already on screen to the left,
+    // so the name is set on the widget rather than drawn again.
+    match &entry.control {
+        SettingsControl::Toggle => {
+            let mut on = entry.resolution.value.as_bool().unwrap_or(false);
+            let response = ui.checkbox(&mut on, "");
+            describe_control(&response, egui::accesskit::Role::CheckBox, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::Value::Bool(on)));
+            }
+        }
+        SettingsControl::Integer { min, max } => {
+            let mut number = entry.resolution.value.as_i64().unwrap_or(*min);
+            let response = ui
+                .add(egui::DragValue::new(&mut number).range(*min..=*max))
+                .on_hover_text(&entry.accepts);
+            describe_control(&response, egui::accesskit::Role::SpinButton, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::Value::from(number)));
+            }
+        }
+        SettingsControl::Number { min, max } => {
+            let mut number = entry.resolution.value.as_f64().unwrap_or(*min);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut number)
+                        .range(*min..=*max)
+                        .speed(0.05),
+                )
+                .on_hover_text(&entry.accepts);
+            describe_control(&response, egui::accesskit::Role::SpinButton, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::json!(number)));
+            }
+        }
+        SettingsControl::Choice { options } => {
+            let current = entry
+                .resolution
+                .value
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            egui::ComboBox::from_id_salt(("setting-choice", key))
+                .selected_text(if current.is_empty() {
+                    "—".to_string()
+                } else {
+                    current.clone()
+                })
+                .show_ui(ui, |ui| {
+                    for option in options {
+                        if ui
+                            .selectable_label(option == &current, option.as_str())
+                            .clicked()
+                            && option != &current
+                        {
+                            actions.push(set(serde_json::Value::String(option.clone())));
+                        }
+                    }
+                });
+        }
+        SettingsControl::Text | SettingsControl::TextList | SettingsControl::TextMap => {
+            // The stored value as text the user can edit, and back again on commit. One
+            // line per item for a list, `NAME=value` per line for a map — which is how the
+            // user already writes both of these everywhere else.
+            let stored = settings_text_of(&entry.resolution.value, &entry.control);
+            let draft = state
+                .settings_drafts
+                .entry(key.to_string())
+                .or_insert_with(|| stored.clone());
+            let multiline = !matches!(entry.control, SettingsControl::Text);
+            let response = if multiline {
+                ui.add(
+                    egui::TextEdit::multiline(draft)
+                        .desired_rows(2)
+                        .desired_width(220.0)
+                        .hint_text(&entry.accepts),
+                )
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .desired_width(220.0)
+                        .hint_text(&entry.accepts),
+                )
+            };
+            describe_control(&response, egui::accesskit::Role::TextInput, &entry.title);
+            // `has_focus` matters as much as the key: `key_pressed` is window-wide input, so
+            // without it one Enter would commit every field on the sheet at once.
+            let committed = response.lost_focus()
+                || (!multiline
+                    && response.has_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if committed {
+                let typed = draft.clone();
+                state.settings_drafts.remove(key);
+                if typed != stored {
+                    actions.push(set(settings_value_of(&typed, &entry.control)));
+                }
+            }
+            let _ = theme;
+        }
+        SettingsControl::Unknown => {
+            // Shown as it was stored, with no control. Anything else would be a guess about
+            // what a newer build meant, presented as an editor.
+            ui.label(
+                RichText::new(entry.resolution.value.to_string())
+                    .monospace()
+                    .color(theme.text_dim)
+                    .small(),
+            );
+        }
+    }
+    actions
+}
+
+/// Puts a settings control into the accessibility tree under its own name and role.
+///
+/// `icons::describe` exists for the icon buttons and calls everything a button, which is right
+/// for those and wrong here: a checkbox announced as a button tells a listener they can press
+/// it and not whether it is on. There is no DOM to infer any of this from, so the role is
+/// stated per control.
+fn describe_control(response: &Response, role: egui::accesskit::Role, label: &str) {
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            match role {
+                egui::accesskit::Role::CheckBox => egui::WidgetType::Checkbox,
+                egui::accesskit::Role::TextInput => egui::WidgetType::TextEdit,
+                _ => egui::WidgetType::Button,
+            },
+            response.enabled(),
+            label,
+        )
+    });
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(role);
+        node.set_label(label.to_string());
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// A stored value as the text a user edits.
+fn settings_text_of(value: &serde_json::Value, control: &turn_proto::SettingsControl) -> String {
+    use turn_proto::SettingsControl;
+    match (control, value) {
+        (SettingsControl::TextList, serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (SettingsControl::TextMap, serde_json::Value::Object(pairs)) => pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (_, serde_json::Value::String(text)) => text.clone(),
+        // Null is the deliberate nothing, and an empty field is how the user says it.
+        (_, serde_json::Value::Null) => String::new(),
+        (_, other) => other.to_string(),
+    }
+}
+
+/// The text a user typed, as the value to store.
+///
+/// An empty field is `null` — the deliberate "nothing here" — rather than an empty string or
+/// an empty list, because that is the value that overrides an inherited something with an
+/// absence. Clearing a field and resetting are different acts and produce different results:
+/// this one says "nothing, here"; reset says "whatever the level below says".
+fn settings_value_of(typed: &str, control: &turn_proto::SettingsControl) -> serde_json::Value {
+    use turn_proto::SettingsControl;
+    if typed.trim().is_empty() {
+        return serde_json::Value::Null;
+    }
+    match control {
+        SettingsControl::TextList => serde_json::Value::Array(
+            typed
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::Value::String(line.to_string()))
+                .collect(),
+        ),
+        SettingsControl::TextMap => {
+            let mut pairs = serde_json::Map::new();
+            for line in typed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                // A line with no `=` is a name with no value, which is a name the user is
+                // part-way through typing. Kept with an empty value rather than dropped: a
+                // line that vanished on commit would look like the field losing text.
+                let (name, value) = line.split_once('=').unwrap_or((line, ""));
+                pairs.insert(
+                    name.trim().to_string(),
+                    serde_json::Value::String(value.trim().to_string()),
+                );
+            }
+            serde_json::Value::Object(pairs)
+        }
+        _ => serde_json::Value::String(typed.to_string()),
+    }
+}
+
+/// The chord text that means "no opinion, use Turn's own".
+///
+/// Needed because the preference has three states and a text field only naturally has two: a
+/// chord, an empty string that unbinds, and the absence of an entry that inherits. This is how
+/// the third is asked for, and it never reaches the stored value — the daemon is asked to
+/// remove the key instead.
+pub const DEFAULT_CHORD: &str = "<default>";
+
+/// What the window knows about one row that the row itself cannot work out: whether it is
+/// the selection, whether it is open, and whether anything of it is on screen.
+///
+/// A struct rather than four more parameters, because four booleans in a row is a call site
+/// nobody can read and an argument order anybody can get wrong.
+#[derive(Clone, Copy, Default)]
+struct RowState {
+    selected: bool,
+    expanded: bool,
+    /// The pane this row's Process is showing has keyboard focus.
+    focused_pane: bool,
+    /// This row's Session is the one whose layout the window is drawing.
+    active_session: bool,
+    /// How long a worker an agent is managing has had nothing to say.
+    ///
+    /// Computed by the caller rather than in the row, because it needs the whole Session to know
+    /// whether this node is being managed at all, and a row only has itself.
+    idle: Option<crate::spotlight::Idleness>,
+}
+
 fn hierarchy_row(
     ui: &mut Ui,
     theme: &Theme,
     row: HierarchyRow<'_>,
-    selected: bool,
-    expanded: bool,
-    focused_pane: bool,
-    active_session: bool,
+    width: f32,
+    state: RowState,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), row.height()),
-        Sense::click(),
-    );
+    let RowState {
+        selected,
+        expanded,
+        focused_pane,
+        active_session,
+        idle: idle_note,
+    } = state;
+    // The width is passed in rather than read from the `Ui`, so every row in the tree is
+    // the same width and the column its controls occupy is in the same place on all of
+    // them. See the note where it is measured.
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row.height()), Sense::click());
     if selected {
         ui.painter().rect_filled(rect, 0.0, theme.selection);
     } else if response.hovered() {
@@ -5105,7 +7217,9 @@ fn hierarchy_row(
         );
     }
 
-    let indent = 9.0 + row.depth() as f32 * 14.0;
+    // The same indent [`row_text_x`] works from, so the room reserved for the controls is
+    // measured against where the text really starts.
+    let indent = row_text_x(row) - 15.0;
     let caret = if row.child_count() == 0 {
         "·"
     } else if expanded {
@@ -5159,18 +7273,46 @@ fn hierarchy_row(
         ),
         _ => None,
     };
-    let right_width = if right_tag.is_some() { 94.0 } else { 10.0 };
-    let clip = Rect::from_min_max(
-        egui::pos2(text_x, rect.min.y),
-        egui::pos2((rect.max.x - right_width).max(text_x), rect.max.y),
-    );
-    let painter = ui.painter().with_clip_rect(clip);
+    // A row carries its lifecycle controls at its right edge. The name and the tag are
+    // painted rather than laid out, so the room those controls need has to be subtracted
+    // here — otherwise the name runs under a button and is truncated mid-word, which is
+    // exactly the failure earlier snapshots caught.
+    let reserved = row_action_width(row, rect.width());
+    let tag_colour = if needs_user {
+        theme.attention
+    } else {
+        theme.running
+    };
+    // Measured, not reserved at a guess. The tag column used to be a flat 94 points whether
+    // the tag said `ARCHIVED` or nothing at all, and every point of it was taken from the
+    // name — which is what left `Task 01 on a longish branch name` ending at `branch`.
+    let tag = right_tag.map(|tag| {
+        ui.painter().layout_no_wrap(
+            tag,
+            FontId::new(9.0, egui::FontFamily::Monospace),
+            tag_colour,
+        )
+    });
+    let tag_right = rect.max.x - 9.0 - reserved;
+    // Two widths, not one, and the controls and the tag are only subtracted from the first.
+    // Both sit on the row's *first* line, so charging the second line for them as well is
+    // what cut `archived` short to `archivec` and `1 running · enforced` to `enforce` —
+    // words halved by room nothing was going to use.
+    let title_width = match &tag {
+        Some(tag) => tag_right - tag.size().x - 8.0 - text_x,
+        None => rect.max.x - 10.0 - reserved - text_x,
+    }
+    .max(24.0);
+    let detail_width = (rect.max.x - 10.0 - text_x).max(24.0);
+    // Nothing may draw outside its own row, whatever the arithmetic above says.
+    let painter = ui.painter().with_clip_rect(rect);
 
     match row {
         HierarchyRow::Workspace(workspace) => {
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 4.0),
-                Align2::LEFT_TOP,
+                title_width,
                 &workspace.workspace.name,
                 theme.ui_font.clone(),
                 theme.text,
@@ -5182,10 +7324,11 @@ fn hierarchy_row(
             if workspace.workspace.lease_reconciliation_required {
                 detail.push_str(" · LEASE CHECK");
             }
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 22.0),
-                Align2::LEFT_TOP,
-                detail,
+                detail_width,
+                &detail,
                 FontId::new(10.0, egui::FontFamily::Monospace),
                 if workspace.workspace.lease_reconciliation_required {
                     theme.attention
@@ -5196,9 +7339,10 @@ fn hierarchy_row(
         }
         HierarchyRow::Session { session, .. } => {
             let summary = &session.session;
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 4.0),
-                Align2::LEFT_TOP,
+                title_width,
                 &summary.name,
                 theme.ui_font.clone(),
                 theme.text,
@@ -5224,18 +7368,20 @@ fn hierarchy_row(
             if summary.muted {
                 detail.push_str(" · muted");
             }
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 23.0),
-                Align2::LEFT_TOP,
-                detail,
+                detail_width,
+                &detail,
                 FontId::new(10.0, egui::FontFamily::Monospace),
                 colour,
             );
         }
         HierarchyRow::Process { node, .. } => {
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 3.0),
-                Align2::LEFT_TOP,
+                title_width,
                 process_title(node),
                 theme.ui_font.clone(),
                 theme.text,
@@ -5246,10 +7392,11 @@ fn hierarchy_row(
             } else {
                 ""
             };
-            painter.text(
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 21.0),
-                Align2::LEFT_TOP,
-                format!(
+                detail_width,
+                &format!(
                     "{} · {glyph} {}{relation}",
                     node_kind_label(node.kind),
                     node.state_label
@@ -5261,29 +7408,42 @@ fn hierarchy_row(
                     colour
                 },
             );
-            painter.text(
+            // The third line is what the node last said. For a worker an agent is managing,
+            // a long silence replaces it: "nothing for six minutes" is the fact worth having
+            // there, and the preview it would otherwise repeat is six minutes old anyway.
+            let idle = idle_note.filter(|idle| idle.worth_saying);
+            let (preview_text, preview_colour) = match &idle {
+                Some(idle) => (
+                    format!(
+                        "nothing for {} — click to see its pane",
+                        crate::spotlight::describe_silence(idle.silent_ms)
+                    ),
+                    theme.attention,
+                ),
+                None => (
+                    visible_preview(node)
+                        .map(|preview| preview.normalized_text.clone())
+                        .unwrap_or_else(|| "no activity preview".into()),
+                    theme.text_faint,
+                ),
+            };
+            paint_line(
+                &painter,
                 egui::pos2(text_x, rect.min.y + 39.0),
-                Align2::LEFT_TOP,
-                visible_preview(node)
-                    .map(|preview| preview.normalized_text.as_str())
-                    .unwrap_or("no activity preview"),
+                detail_width,
+                &preview_text,
                 FontId::new(10.0, egui::FontFamily::Proportional),
-                theme.text_faint,
+                preview_colour,
             );
         }
     }
 
-    if let Some(tag) = right_tag {
-        ui.painter().text(
-            rect.right_top() + Vec2::new(-9.0, 6.0),
-            Align2::RIGHT_TOP,
+    if let Some(tag) = tag {
+        // The galley the title width was measured against, so the two cannot disagree.
+        painter.galley(
+            egui::pos2(tag_right - tag.size().x, rect.min.y + 6.0),
             tag,
-            FontId::new(9.0, egui::FontFamily::Monospace),
-            if needs_user {
-                theme.attention
-            } else {
-                theme.running
-            },
+            tag_colour,
         );
     }
 
@@ -5743,25 +7903,42 @@ fn palette_row(ui: &mut Ui, theme: &Theme, row: &palette::Row, selected: bool) -
         ui.painter().rect_filled(rect, 0.0, theme.selection);
     }
     let painter = ui.painter();
-    painter.text(
+    // Three columns, measured right to left. The shortcut column used to be a fixed
+    // hundred points, and `Opt+Shift+Left` does not fit in a hundred points: the group name
+    // was painted underneath the shortcut's last word, which a recorded palette shows as
+    // `PaneOpt+Shift+Left`. Measuring the text is the only version of this that cannot be
+    // wrong for a chord somebody rebinds.
+    let shortcut = painter.layout_no_wrap(
+        row.shortcut.clone().unwrap_or_default(),
+        FontId::new(11.0, egui::FontFamily::Monospace),
+        theme.text_faint,
+    );
+    let group = painter.layout_no_wrap(
+        row.group.to_string(),
+        FontId::new(10.0, egui::FontFamily::Monospace),
+        theme.text_faint,
+    );
+    let shortcut_left = rect.right() - 8.0 - shortcut.size().x;
+    let group_left = shortcut_left - 10.0 - group.size().x;
+    let title_clip = Rect::from_min_max(
+        rect.min,
+        egui::pos2((group_left - 8.0).max(rect.min.x), rect.max.y),
+    );
+    painter.with_clip_rect(title_clip).text(
         rect.left_center() + Vec2::new(8.0, 0.0),
         Align2::LEFT_CENTER,
         row.title,
         theme.ui_font.clone(),
         theme.text,
     );
-    painter.text(
-        rect.right_center() + Vec2::new(-8.0, 0.0),
-        Align2::RIGHT_CENTER,
-        row.shortcut.clone().unwrap_or_default(),
-        FontId::new(11.0, egui::FontFamily::Monospace),
+    painter.galley(
+        egui::pos2(shortcut_left, rect.center().y - shortcut.size().y / 2.0),
+        shortcut,
         theme.text_faint,
     );
-    painter.text(
-        rect.right_center() + Vec2::new(-100.0, 0.0),
-        Align2::RIGHT_CENTER,
-        row.group,
-        FontId::new(10.0, egui::FontFamily::Monospace),
+    painter.galley(
+        egui::pos2(group_left, rect.center().y - group.size().y / 2.0),
+        group,
         theme.text_faint,
     );
 
@@ -5814,13 +7991,299 @@ fn draggable_divider(ui: &mut Ui, theme: &Theme, divider: &Divider) -> Vec<ViewA
     actions
 }
 
-/// Which way an arrow key moves between panes.
+/// The header strip of a pane.
+fn pane_header_rect(pane: Rect) -> Rect {
+    Rect::from_min_size(pane.min, Vec2::new(pane.width(), PANE_HEADER))
+}
+
+/// Where a pane's close control sits inside its header.
+fn pane_close_slot(header: Rect) -> Rect {
+    Rect::from_min_size(
+        header.right_top() + Vec2::new(-PANE_CLOSE_WIDTH - 3.0, 3.0),
+        Vec2::new(PANE_CLOSE_WIDTH, PANE_HEADER - 6.0),
+    )
+}
+
+/// What a drop zone does, said in words.
+///
+/// Spelled here rather than at the two places that paint it so the region the user sees
+/// and the sentence a screen reader hears cannot describe different outcomes.
+pub fn drop_zone_phrase(zone: DropZone) -> &'static str {
+    match zone {
+        DropZone::Left => "left of",
+        DropZone::Right => "right of",
+        DropZone::Above => "above",
+        DropZone::Below => "below",
+        DropZone::Centre => "swap with",
+    }
+}
+
+/// The short form, for a region too narrow to hold the sentence.
+fn drop_zone_word(zone: DropZone) -> &'static str {
+    match zone {
+        DropZone::Left => "left",
+        DropZone::Right => "right",
+        DropZone::Above => "above",
+        DropZone::Below => "below",
+        DropZone::Centre => "swap",
+    }
+}
+
+/// Paints where a dragged pane is about to land.
+///
+/// The feedback *is* the feature. An outline of the whole target pane says "somewhere in
+/// here", which is exactly what five zones exist to stop it saying: the highlight is the
+/// shape the pane will occupy, so half a pane means a split and a full pane means an
+/// exchange, and the two are told apart without letting go to find out.
+///
+/// Everything goes into the foreground layer, because the target pane's terminal is
+/// painted after this header and would cover anything left underneath it.
+fn paint_drop_preview(
+    ui: &Ui,
+    theme: &Theme,
+    source: Rect,
+    target: Option<&DropTarget>,
+    target_title: &str,
+    id: egui::Id,
+) {
+    let ahead = ui
+        .painter()
+        .clone()
+        .with_layer_id(egui::LayerId::new(egui::Order::Foreground, id));
+    // The pane the user picked up, marked as the one in flight for as long as the
+    // gesture lasts. It stays where it is: the window rearranges nothing locally.
+    ahead.rect_stroke(
+        source.shrink(1.0),
+        0.0,
+        Stroke::new(1.0, theme.provisional),
+        egui::StrokeKind::Inside,
+    );
+    let Some(target) = target else {
+        return;
+    };
+
+    // Translucent, so the pane underneath is still legible: the user is aiming at its
+    // edges and needs to see where they are.
+    ahead.rect_filled(target.preview, 0.0, theme.running.gamma_multiply(0.22));
+    ahead.rect_stroke(
+        target.preview.shrink(1.0),
+        0.0,
+        Stroke::new(2.0, theme.running),
+        egui::StrokeKind::Inside,
+    );
+
+    // The words, if they fit. The shape has already said where the pane lands, so a
+    // region too small for even one word carries none rather than one that spills.
+    let sentence = format!("{} {target_title}", drop_zone_phrase(target.zone));
+    paint_widest_that_fits(
+        &ahead,
+        target.preview.shrink(4.0),
+        target.preview.center(),
+        &[sentence.as_str(), drop_zone_word(target.zone)],
+        FontId::new(11.0, egui::FontFamily::Monospace),
+        theme.running,
+    );
+}
+
+/// Paints the first of several phrasings that fits inside `room`, centred on `at`.
+///
+/// Text wider than the thing it describes is the failure that keeps coming back to this
+/// window: a caption painted past the edge of a narrow pane lands on the pane next door and
+/// says something untrue about it. Returns whether anything was painted; nothing is, when
+/// even the shortest phrasing does not fit, because a legible layout is worth more than a
+/// label.
+fn paint_widest_that_fits(
+    painter: &egui::Painter,
+    room: Rect,
+    at: egui::Pos2,
+    options: &[&str],
+    font: FontId,
+    colour: Color32,
+) -> bool {
+    for text in options {
+        let galley = painter.layout_no_wrap((*text).to_string(), font.clone(), colour);
+        if galley.size().x <= room.width() && galley.size().y <= room.height() {
+            painter.galley(at - galley.size() / 2.0, galley, colour);
+            return true;
+        }
+    }
+    false
+}
+
+/// The two things a pane header is for besides saying what is in the pane: closing it,
+/// and moving it.
+///
+/// `Command::ClosePane` has existed since the first keymap and had no affordance at all,
+/// which for anybody who has not read the shortcut sheet is the same as not existing. The
+/// control is here, on the pane it closes, and its tooltip carries the chord so the window
+/// teaches the keyboard rather than replacing it.
+///
+/// Moving is a drag of the header onto one of another pane's five regions — its four edges
+/// and its middle — which is the gesture every tiling editor already taught the user, and
+/// which needs no instructions as long as the feedback is right. It is not the only way:
+/// `MovePane…` is bound in all four directions and relocates exactly the same way, because
+/// a drag is unusable without a pointer. Both go through the daemon: the request names two
+/// panes and a zone, and the window redraws whatever layout comes back, so a refused move
+/// leaves the window agreeing with the daemon instead of showing a rearrangement that did
+/// not happen.
+fn pane_header_controls(
+    ui: &mut Ui,
+    theme: &Theme,
+    keymap: &Keymap,
+    placed: &panes::PaneRect,
+    arrangement: &Arrangement,
+    drag: &mut Option<PaneId>,
+    title: &str,
+) -> Vec<ViewAction> {
+    let mut actions = Vec::new();
+    let header = pane_header_rect(placed.rect);
+    let close_slot = pane_close_slot(header);
+
+    let grip = Rect::from_min_max(
+        header.min,
+        egui::pos2((close_slot.min.x - 2.0).max(header.min.x), header.max.y),
+    );
+    let grip_response = ui.interact(
+        grip,
+        ui.id().with(("pane-header", placed.pane_id.as_str())),
+        Sense::click_and_drag(),
+    );
+    let movable = arrangement.panes.len() > 1;
+    if movable && (grip_response.hovered() || grip_response.dragged()) {
+        ui.ctx().set_cursor_icon(if grip_response.dragged() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::Grab
+        });
+    }
+
+    // Recorded from `dragged` rather than only from `drag_started`, so a gesture whose
+    // first frame was missed — a pane that appeared under a pointer already down — is still
+    // known to be in progress.
+    if movable && grip_response.dragged() && drag.as_ref() != Some(&placed.pane_id) {
+        *drag = Some(placed.pane_id.clone());
+    }
+    // Recomputed from the pointer every frame rather than remembered: a layout arriving
+    // from the daemon in the middle of a drag must not leave a landing spot on screen
+    // that no longer exists. After Escape there is no drag left to ask, so this is `None`
+    // and the gesture ends having changed nothing.
+    let landing = grip_response
+        .interact_pointer_pos()
+        .and_then(|pointer| arrangement.drop_target_at(&placed.pane_id, pointer));
+    let landing_title = landing
+        .as_ref()
+        .and_then(|landing| arrangement.pane(&landing.pane_id))
+        .map(pane_title_of)
+        .unwrap_or_default();
+
+    if movable && grip_response.dragged() {
+        paint_drop_preview(
+            ui,
+            theme,
+            placed.rect,
+            landing.as_ref(),
+            &landing_title,
+            ui.id().with("pane-move-hint"),
+        );
+    }
+    if grip_response.drag_stopped() {
+        // A drop outside every pane, or on the pane itself, leaves the layout exactly as it
+        // was: `landing` is `None` and nothing is sent.
+        if let Some(landing) = &landing {
+            actions.push(ViewAction::RelocatePane {
+                moved: placed.pane_id.clone(),
+                target: landing.pane_id.clone(),
+                zone: landing.zone,
+            });
+        }
+        if drag.as_ref() == Some(&placed.pane_id) {
+            *drag = None;
+        }
+    } else if grip_response.clicked() {
+        actions.push(ViewAction::Pane {
+            pane_id: placed.pane_id.clone(),
+            action: PaneAction::Focus,
+        });
+    }
+    let move_shortcut = keymap
+        .chord_for(Command::MovePaneRight)
+        .map(|chord| chord.describe(keymap.platform()))
+        .unwrap_or_else(|| "the move pane commands".to_string());
+    // The accessible name carries the whole gesture, including what the drag is currently
+    // about to do: a screen reader has no highlighted region to read.
+    let grip_name = match &landing {
+        Some(landing) => format!(
+            "{title} pane header — moving {} {landing_title}; Escape cancels",
+            drop_zone_phrase(landing.zone)
+        ),
+        None if grip_response.dragged() => format!(
+            "{title} pane header — moving it; drop it on another pane's edge or middle, or press Escape to cancel"
+        ),
+        None => format!(
+            "{title} pane header — click to focus, drag onto another pane's edge to move it there or its middle to swap"
+        ),
+    };
+    icons::describe(&grip_response, &grip_name);
+    grip_response.on_hover_text(format!(
+        "{title} — drag this header onto another pane: its edges put this pane beside it, its middle swaps the two. Or press {move_shortcut}"
+    ));
+
+    let close_shortcut = keymap
+        .chord_for(Command::ClosePane)
+        .map(|chord| chord.describe(keymap.platform()));
+    let close_name = format!("Close pane {title}");
+    ui.scope_builder(
+        keyed_region(close_slot, "pane-close", placed.pane_id.as_str()),
+        |ui| {
+            // Through the shared placement, which is what keeps it inside its slot: added to
+            // this region directly it was sized from the style's interaction floor — 28 points
+            // tall in a 16-point header — so the hover frame overflowed the header and was
+            // clipped, which is what "the close button does not draw properly" was.
+            let close = icons::glyph_button(
+                ui,
+                close_slot,
+                icons::CLOSE,
+                12.0,
+                true,
+                Some(theme.text_dim),
+            );
+            icons::describe(&close, &close_name);
+            let hint = match &close_shortcut {
+                Some(chord) => format!(
+                    "{close_name} · {chord} — the process keeps running; stopping it is a separate command"
+                ),
+                None => format!(
+                    "{close_name} — the process keeps running; stopping it is a separate command"
+                ),
+            };
+            if close.on_hover_text(hint).clicked() {
+                actions.push(ViewAction::ClosePane {
+                    pane_id: placed.pane_id.clone(),
+                });
+            }
+        },
+    );
+    actions
+}
+
+/// What a pane calls itself, for a sentence about it.
+fn pane_title_of(pane: &panes::PaneRect) -> String {
+    pane.title
+        .clone()
+        .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase())
+}
+
+/// Which way a directional pane command points.
+///
+/// Focusing and moving share the geometry deliberately: "move left" has to land where
+/// "focus left" would have gone, or the two commands would disagree about which pane is
+/// on the left.
 pub fn side_for(command: Command) -> Option<Side> {
     match command {
-        Command::FocusPaneLeft => Some(Side::Left),
-        Command::FocusPaneRight => Some(Side::Right),
-        Command::FocusPaneUp => Some(Side::Up),
-        Command::FocusPaneDown => Some(Side::Down),
+        Command::FocusPaneLeft | Command::MovePaneLeft => Some(Side::Left),
+        Command::FocusPaneRight | Command::MovePaneRight => Some(Side::Right),
+        Command::FocusPaneUp | Command::MovePaneUp => Some(Side::Up),
+        Command::FocusPaneDown | Command::MovePaneDown => Some(Side::Down),
         _ => None,
     }
 }
@@ -5828,6 +8291,19 @@ pub fn side_for(command: Command) -> Option<Side> {
 /// The pane a directional command would move to, given what is on screen.
 pub fn neighbour_for(arrangement: &Arrangement, from: &PaneId, command: Command) -> Option<PaneId> {
     panes::neighbour(arrangement, from, side_for(command)?)
+}
+
+/// The relocation a `MovePane…` command means: the pane to name, and where beside it the
+/// moved pane lands.
+///
+/// `None` when there is nowhere to go, which the caller reports rather than sending a
+/// request that could only be refused.
+pub fn relocation_for(
+    arrangement: &Arrangement,
+    from: &PaneId,
+    command: Command,
+) -> Option<(PaneId, DropZone)> {
+    panes::relocation(arrangement, from, side_for(command)?)
 }
 
 #[cfg(test)]
@@ -6005,7 +8481,7 @@ mod tests {
     fn the_unified_tree_respects_each_expansion_level() {
         let (snapshot, root_id, child_id, _) = hierarchy_fixture();
         let mut state = ViewState::default();
-        let collapsed = visible_hierarchy_rows(&snapshot, &state);
+        let collapsed = visible_hierarchy_rows(&snapshot, &state, false);
         assert_eq!(collapsed.len(), 3, "workspace, session, collapsed agent");
         assert_eq!(
             collapsed.iter().map(|row| row.depth()).collect::<Vec<_>>(),
@@ -6016,7 +8492,7 @@ mod tests {
             .any(|row| row.key() == HierarchyKey::process(child_id.clone())));
 
         set_hierarchy_expanded(&mut state, &snapshot, HierarchyKey::process(root_id), true);
-        let expanded = visible_hierarchy_rows(&snapshot, &state);
+        let expanded = visible_hierarchy_rows(&snapshot, &state, false);
         assert_eq!(expanded.len(), 4);
         assert_eq!(expanded.last().map(|row| row.depth()), Some(3));
         assert!(expanded
@@ -6031,7 +8507,7 @@ mod tests {
         let key = HierarchyKey::process(root_id.clone());
 
         set_hierarchy_expanded(&mut state, &snapshot, key.clone(), true);
-        let process = visible_hierarchy_rows(&snapshot, &state)
+        let process = visible_hierarchy_rows(&snapshot, &state, false)
             .into_iter()
             .find(|row| row.key() == key)
             .expect("root agent is visible");
@@ -6298,8 +8774,200 @@ mod tests {
         assert_eq!(side_for(Command::FocusPaneRight), Some(Side::Right));
         assert_eq!(side_for(Command::FocusPaneUp), Some(Side::Up));
         assert_eq!(side_for(Command::FocusPaneDown), Some(Side::Down));
+        assert_eq!(side_for(Command::MovePaneLeft), Some(Side::Left));
+        assert_eq!(side_for(Command::MovePaneRight), Some(Side::Right));
+        assert_eq!(side_for(Command::MovePaneUp), Some(Side::Up));
+        assert_eq!(side_for(Command::MovePaneDown), Some(Side::Down));
         assert_eq!(side_for(Command::ZoomPane), None);
         assert_eq!(side_for(Command::CyclePane), None);
+    }
+
+    /// The toolbar has to survive a window nobody sized for it. Dropping buttons from the
+    /// end is the behaviour; drawing them past the edge of their zone, on top of the
+    /// version, is the failure this replaced.
+    #[test]
+    fn a_toolbar_too_narrow_for_every_button_drops_them_from_the_end() {
+        assert_eq!(toolbar_capacity(0.0), 0);
+        assert_eq!(toolbar_capacity(icons::SIZE.x - 1.0), 0);
+        assert_eq!(toolbar_capacity(icons::SIZE.x), 1);
+        assert_eq!(toolbar_capacity(icons::PITCH + icons::SIZE.x), 2);
+        assert_eq!(
+            toolbar_capacity(10_000.0),
+            TOOLBAR.len(),
+            "a wide window shows all of them and invents none"
+        );
+        // Whatever fits, it fits: the room the buttons need never exceeds the room given.
+        for width in [30.0_f32, 61.0, 100.0, 187.0, 260.0, 400.0] {
+            let count = toolbar_capacity(width);
+            let needed = count as f32 * icons::PITCH - (icons::PITCH - icons::SIZE.x);
+            assert!(
+                needed <= width + 0.01,
+                "{count} buttons need {needed} points but were given {width}"
+            );
+        }
+    }
+
+    /// The rows gained controls, and the thing that goes wrong when a row runs out of room
+    /// is a name cut off mid-word. At the tree's normal width every row can afford its
+    /// controls *and* a legible name; in a tree squeezed to two hundred points the controls
+    /// give way instead of the name, because a name identifies the row and the controls are
+    /// also on its context menu and on the keyboard.
+    #[test]
+    fn a_row_too_narrow_for_a_name_and_its_controls_keeps_the_name() {
+        let (snapshot, _, _, _) = hierarchy_fixture();
+        let workspace = &snapshot.workspaces[0];
+        let session = &workspace.sessions[0];
+        let rows = [
+            HierarchyRow::Workspace(workspace),
+            HierarchyRow::Session { workspace, session },
+        ];
+
+        for row in rows {
+            let reserved = row_action_width(row, SIDEBAR_WIDTH);
+            assert!(
+                reserved > 0.0,
+                "the tree's own width must fit a row's controls"
+            );
+            // What the name is left with, in the case that reserves the most: a row with a
+            // status tag on it.
+            let left_for_name = SIDEBAR_WIDTH - row_text_x(row) - TAG_COLUMN - reserved;
+            assert!(
+                left_for_name >= ROW_MIN_TITLE,
+                "a name would be left {left_for_name} points"
+            );
+            assert_eq!(
+                row_action_width(row, 218.0),
+                0.0,
+                "a tree this narrow must keep the name rather than the controls"
+            );
+        }
+
+        // A Process row has no controls at any width: stopping one Agent is its own action
+        // in its own menu, not a lifecycle act on the tree.
+        let process = HierarchyRow::Process {
+            session,
+            node: &session.nodes[0],
+        };
+        for width in [120.0, SIDEBAR_WIDTH, 1_000.0] {
+            assert_eq!(row_action_width(process, width), 0.0);
+        }
+    }
+
+    /// Archiving is only believable if the row leaves. The preference in Settings decides
+    /// what the tree contains, and it decides it here as well as in the request.
+    #[test]
+    fn an_archived_row_is_out_of_the_tree_until_the_preference_asks_for_it() {
+        let (mut snapshot, _, _, session_id) = hierarchy_fixture();
+        snapshot.workspaces[0].sessions[0].session.status = SessionStatus::Archived;
+        let state = ViewState::default();
+
+        let hidden = visible_hierarchy_rows(&snapshot, &state, false);
+        assert!(
+            !hidden
+                .iter()
+                .any(|row| row.key() == HierarchyKey::session(session_id.clone())),
+            "the archived Session must leave the tree"
+        );
+        assert!(
+            hidden.iter().any(|row| matches!(
+                row,
+                HierarchyRow::Workspace(workspace) if !workspace.workspace.archived
+            )),
+            "its Workspace stays: it is not the thing that was archived"
+        );
+        assert_eq!(
+            hidden.len(),
+            1,
+            "and its Processes go with it rather than being left parentless"
+        );
+
+        let shown = visible_hierarchy_rows(&snapshot, &state, true);
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.key() == HierarchyKey::session(session_id.clone())),
+            "and the preference brings it back"
+        );
+
+        // An archived Workspace takes its Sessions out of the tree with it.
+        snapshot.workspaces[0].workspace.archived = true;
+        assert!(visible_hierarchy_rows(&snapshot, &state, false).is_empty());
+        assert!(!visible_hierarchy_rows(&snapshot, &state, true).is_empty());
+    }
+
+    /// Every toolbar button says what it does in words, and every one of them is an
+    /// action that already existed. A toolbar entry with no label would be a control
+    /// recognisable only by its picture.
+    #[test]
+    fn every_toolbar_button_has_words_and_a_distinct_icon() {
+        let mut labels: Vec<&str> = TOOLBAR.iter().map(|button| button.label).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "two toolbar buttons share a label");
+        let mut glyphs: Vec<&str> = TOOLBAR.iter().map(|button| button.icon).collect();
+        glyphs.sort_unstable();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), count, "two toolbar buttons share an icon");
+        for button in TOOLBAR {
+            assert!(
+                button.label.len() > 3,
+                "{:?} has no words to announce",
+                button.intent
+            );
+            if let ToolbarIntent::Run(command) = button.intent {
+                assert!(
+                    Command::ALL.contains(&command),
+                    "{command:?} is on the toolbar but not in the palette"
+                );
+            }
+        }
+    }
+
+    /// Moving and focusing must resolve to the same neighbour, and a move must name the
+    /// side it is going to. A layout where "focus right" and "move right" disagreed would
+    /// be a pane that moved somewhere other than where the user was looking.
+    #[test]
+    fn moving_a_pane_resolves_to_the_same_neighbour_as_focusing_one_and_names_that_side() {
+        let mut layout = Layout::single(Pane::new(PaneKind::Terminal).with_title("left"));
+        let left = layout.panes()[0].id.clone();
+        layout.split(
+            &left,
+            Direction::Horizontal,
+            Pane::new(PaneKind::Terminal).with_title("right"),
+        );
+        let arrangement = panes::arrange(
+            &layout,
+            Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 600.0)),
+        );
+        for (moving, focusing, zone) in [
+            // Rightwards there is a neighbour and the pane lands past it. Upwards there is
+            // none, and the move becomes one to the outer edge — the row becomes a column —
+            // rather than nothing. Leftwards this pane is the only one against that edge, so
+            // there is genuinely nowhere to go.
+            (
+                Command::MovePaneRight,
+                Command::FocusPaneRight,
+                Some(DropZone::Right),
+            ),
+            (Command::MovePaneLeft, Command::FocusPaneLeft, None),
+            (
+                Command::MovePaneUp,
+                Command::FocusPaneUp,
+                Some(DropZone::Above),
+            ),
+        ] {
+            assert_eq!(
+                neighbour_for(&arrangement, &left, moving),
+                neighbour_for(&arrangement, &left, focusing),
+                "{moving:?} and {focusing:?} disagree about which pane is there"
+            );
+            assert_eq!(
+                relocation_for(&arrangement, &left, moving).map(|(_, zone)| zone),
+                zone,
+                "{moving:?} must land on the side it is named after"
+            );
+        }
     }
 
     /// An overlay is a sensitive operation: the focus governor must not move somebody
@@ -6329,6 +8997,7 @@ mod tests {
                 session_id: SessionId::from_stored("sess_modal_shortcuts"),
                 name: "Do not mutate behind me".into(),
                 running_count: 2,
+                escaped_count: 0,
             }),
             ..ViewState::default()
         };

@@ -20,6 +20,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 vt100 = { workspace = true, optional = true }
+# Scrollback search. Deliberately a finite-automaton engine rather than a hand-rolled
+# matcher: a pattern typed by a user cannot then be made to backtrack for ever, which is
+# the whole difficulty of offering regular expressions at all.
+regex = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

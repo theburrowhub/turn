@@ -228,6 +228,8 @@ fn a_restore_result_offers_a_relaunch_without_having_performed_one() {
                 lifecycle: Lifecycle::Orphaned,
                 can_relaunch: false,
                 command: None,
+                auto_start: false,
+                needs_checkout_write: true,
             },
             PaneRestoreOutcome {
                 pane_id: PaneId::from_stored("pane_gone"),
@@ -235,6 +237,8 @@ fn a_restore_result_offers_a_relaunch_without_having_performed_one() {
                 lifecycle: Lifecycle::Lost,
                 can_relaunch: true,
                 command: Some("cargo watch -x test".into()),
+                auto_start: false,
+                needs_checkout_write: true,
             },
         ],
     };
@@ -458,6 +462,8 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
                 lifecycle: Lifecycle::Reconnected,
                 can_relaunch: false,
                 command: None,
+                auto_start: false,
+                needs_checkout_write: true,
             }],
         },
     ]

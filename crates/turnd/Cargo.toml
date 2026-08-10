@@ -31,6 +31,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
+# Quoting, for the agent command line a pane's shell is asked to run. The path
+# Turn injects and the token-bearing URL both pass through a shell now, so the
+# quoting has to be the well-tested kind rather than something hand-rolled here.
+shell-words = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

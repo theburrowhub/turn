@@ -26,7 +26,8 @@ impl Core {
         let Some(process) = self.processes.get(node_id) else {
             return;
         };
-        let Ok(observed) = process.pty.title() else {
+        let Some((generation, observed)) = process.pty.title_if_changed(process.title_generation)
+        else {
             return;
         };
 
@@ -34,6 +35,9 @@ impl Core {
         // immutably borrows `self.processes` while the buffer mutex is held; ending
         // that borrow before the mutable lookup below is what keeps the lock out of
         // the state projection and satisfies the borrow checker.
+        if let Some(process) = self.processes.get_mut(node_id) {
+            process.title_generation = generation;
+        }
         self.apply_observed_process_title(node_id, observed, now_ms);
     }
 

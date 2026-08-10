@@ -175,6 +175,50 @@ impl Core {
         self.request_sweep(now_ms);
     }
 
+    /// Records that an agent Turn started inside a terminal went with that terminal.
+    ///
+    /// [`Lifecycle::Lost`] because that is what happened: Turn closed the terminal the
+    /// agent was reading from and never saw the agent exit, so there is no exit code and
+    /// none is invented. `Lost` is terminal without being a failure, which is the right
+    /// reading for a pane the user closed.
+    pub(crate) fn record_hosted_loss(
+        &mut self,
+        session_id: &SessionId,
+        hosted: &NodeId,
+        now_ms: i64,
+    ) {
+        let retired = match self.sessions.get_mut(session_id) {
+            Some(session) => match session
+                .tree
+                .get_mut(hosted)
+                .filter(|node| node.is_running())
+            {
+                Some(node) => {
+                    node.lifecycle = Lifecycle::Lost;
+                    node.ended_ms = Some(now_ms);
+                    super::clear_interaction_state(node);
+                    (
+                        node.id.clone(),
+                        node.parent.clone(),
+                        node.agent.as_ref().and_then(|agent| {
+                            agent
+                                .external_id
+                                .clone()
+                                .or_else(|| agent.agent.external_id.clone())
+                        }),
+                    )
+                }
+                None => return,
+            },
+            None => return,
+        };
+        // Whatever the agent itself had reported — subagents, a pending permission — went
+        // with it, and the demands it raised stop being answerable.
+        let mut gone = vec![retired];
+        gone.extend(self.mark_runtime_dependents(session_id, hosted, now_ms));
+        self.resolve_lifecycle_attention(session_id, &gone, now_ms);
+    }
+
     /// Applies only the in-memory part of dependent retirement. Event ingestion
     /// uses this form so its normal session/queue checkpoint and push remain the
     /// single publication boundary for a SubagentStop.
@@ -221,7 +265,15 @@ impl Core {
             // inferred PID-less nodes also relied on the dead owner's channel.
             let depends_on_owner = node.pid.is_some()
                 || node.kind == NodeKind::Subagent
-                || node.relation == Relation::Inferred;
+                || node.relation == Relation::Inferred
+                // An agent Turn started inside the owner's shell, before the process
+                // table was swept and its own pid became known: the terminal that just
+                // died is the only thing it was ever running in. Without this it would
+                // claim to be running for as long as its session lived, and no sweep
+                // would ever correct it because there is no pid to look for.
+                || (node.relation == Relation::Confirmed
+                    && node.pid.is_none()
+                    && !self.processes.contains_key(&node.id));
             if node.is_running() && depends_on_owner {
                 children.push((
                     node.id.clone(),
@@ -250,6 +302,44 @@ impl Core {
         children
     }
 
+    /// Notices when an agent running in a pane's shell has ended.
+    ///
+    /// Turn holds no handle on it — the shell forked it — so there is no exit watcher and
+    /// nothing pushes its death. The alternative to noticing is a tree that shows an
+    /// agent as running for as long as its shell lives, which is precisely the pane the
+    /// user is looking at after typing `/exit`.
+    ///
+    /// This is not the process-table sweep and must not become it: it asks the kernel
+    /// about one pid Turn already knows, which is a single syscall per hosted agent, not
+    /// a scan of every process on the machine. That is what makes it affordable on every
+    /// tick where a full refresh would not be.
+    pub(crate) fn observe_hosted_agents(&mut self, now_ms: i64) {
+        let ended: Vec<(SessionId, NodeId)> = self
+            .processes
+            .values()
+            .filter(|process| process.pty.is_running())
+            .filter_map(|process| {
+                let hosted = process.hosted.as_ref()?;
+                let node = self.sessions.get(&process.session_id)?.tree.get(hosted)?;
+                // No pid yet means the sweep has not identified it, which says nothing
+                // about whether it is alive. Only a pid Turn knows can be asked about.
+                let pid = node.pid.filter(|_| node.is_running())?;
+                (!pid_exists(pid)).then(|| (process.session_id.clone(), hosted.clone()))
+            })
+            .collect();
+        for (session_id, node_id) in ended {
+            tracing::debug!(
+                %session_id, %node_id,
+                "an agent running in a pane's shell has ended; the shell is still there"
+            );
+            self.record_hosted_loss(&session_id, &node_id, now_ms);
+            self.persist_session_quietly(&session_id);
+            self.push_tree(&session_id, now_ms);
+            self.push_node_state(&session_id, &node_id, None, now_ms);
+            self.push_session_state(&session_id, now_ms);
+        }
+    }
+
     /// Runs output inference for the panes that have it, and feeds anything it
     /// concludes through the same pipeline as a hook callback.
     pub(crate) fn observe_heuristics(&mut self, now_ms: i64) {
@@ -266,7 +356,11 @@ impl Core {
             };
             let ctx = turn_agents::EventContext {
                 session_id: process.session_id.clone(),
-                node_id: node.clone(),
+                // The screen belongs to the pty, but what is inferred from it belongs to
+                // the agent drawing on it. Attributing a hosted agent's inferred state
+                // to the shell around it would give the shell a turn axis and leave the
+                // agent's own permanently unknown.
+                node_id: process.hosted.clone().unwrap_or_else(|| node.clone()),
                 timestamp_ms: now_ms,
             };
             inferred.extend(heuristic.observe(&snapshot, now_ms, &ctx));
@@ -275,6 +369,27 @@ impl Core {
             self.ingest(event, now_ms);
         }
     }
+}
+
+/// Whether a pid is still a process, asked of the kernel rather than of a snapshot.
+///
+/// Signal zero performs every permission check and delivers nothing, which is the
+/// portable way to ask this question. `EPERM` means the process exists and belongs to
+/// somebody else — still a process, so still alive.
+#[cfg(unix)]
+fn pid_exists(pid: u32) -> bool {
+    // Safe: `kill` takes two integers and touches no memory we own.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Without a way to ask, nothing is claimed: a node keeps the state it was last told
+/// about rather than being retired on a guess.
+#[cfg(not(unix))]
+fn pid_exists(_pid: u32) -> bool {
+    true
 }
 
 /// The lifecycle to record for an exit, given whether the user asked for it.

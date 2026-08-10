@@ -85,7 +85,7 @@ async fn seed_custom_coding_session(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() {
+async fn a_clean_restart_asks_nothing_and_reports_what_it_could_not_recover() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
     let before = seed_custom_coding_session(&daemon, &mut ui).await;
@@ -129,7 +129,10 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
     assert_eq!(workspaces[0].id, workspace_id);
     assert_eq!(workspaces[0].name, "restarted");
 
-    let recovery_lease = match ui
+    // The daemon was stopped on purpose, so it gave the checkout back on the way out and
+    // this start has nothing to ask about. The user is never made to confirm write access
+    // they never gave up.
+    let restored_lease = match ui
         .ask(Request::GetWorkspaceWriteLease {
             workspace_id: workspace_id.clone(),
         })
@@ -138,14 +141,21 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         Response::WorkspaceWriteLease {
             lease: Some(lease), ..
         } => lease,
-        other => panic!("expected the fenced write lease, got {other:?}"),
+        other => panic!("expected the reacquired write lease, got {other:?}"),
     };
-    assert_eq!(recovery_lease.id, before_lease.id);
-    assert_eq!(recovery_lease.generation, before_lease.generation);
-    assert_eq!(recovery_lease.state, LeaseState::RecoveryRequired);
-    assert_eq!(
-        recovery_lease.heartbeat_ms, before_lease.heartbeat_ms,
-        "starting a new daemon must not forge the previous owner's heartbeat"
+    assert_eq!(restored_lease.state, LeaseState::Active);
+    assert_eq!(restored_lease.session_id, session_id);
+    assert_ne!(
+        restored_lease.id, before_lease.id,
+        "a clean stop releases its lease; this is a new acquisition, not an adopted one"
+    );
+    assert!(
+        restored_lease.generation > before_lease.generation,
+        "taking the checkout again must advance its fence"
+    );
+    assert!(
+        restored_lease.heartbeat_ms >= restored_lease.acquired_ms,
+        "the heartbeat belongs to this daemon rather than being copied from the last one"
     );
 
     let sessions = match ui
@@ -225,34 +235,9 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         );
     }
 
-    // A restart never auto-adopts the old write authority. Even an explicit process
-    // relaunch fails closed until the user reconciles the fenced lease.
-    let shell_pane = after
-        .layout
-        .panes()
-        .into_iter()
-        .find(|pane| pane.kind == PaneKind::Shell)
-        .cloned()
-        .expect("the shell pane");
-    let dead_node = shell_pane.node_id.clone().expect("its lost node record");
-    let refused = ui
-        .try_ask(Request::RelaunchNode {
-            session_id: session_id.clone(),
-            node_id: dead_node.clone(),
-            resume: false,
-        })
-        .await
-        .expect_err("recovery-required is not launch authority");
-    assert_eq!(refused.code, ErrorCode::Refused);
-    assert!(refused
-        .detail
-        .as_deref()
-        .is_some_and(|detail| detail.contains("reconciliation")));
-
-    // The explicit Acquire action atomically adopts the exact recovery claim. There is
-    // no Release -> ReadOnly -> Acquire gap in which authority disappears or another
-    // writer can slip in.
-    let acquired = match ui
+    // Asking for the lease again is harmless: the Session already has it, so the button
+    // the UI would offer changes nothing rather than minting a second claim.
+    let asked_again = match ui
         .ask(Request::AcquireWorkspaceWriteLease {
             workspace_id: workspace_id.clone(),
             session_id: session_id.clone(),
@@ -263,13 +248,51 @@ async fn a_restart_brings_back_the_desk_and_reports_what_it_could_not_recover() 
         Response::WorkspaceWriteLease {
             lease: Some(lease), ..
         } => lease,
-        other => panic!("expected an explicitly recovered lease, got {other:?}"),
+        other => panic!("expected the lease this Session already holds, got {other:?}"),
     };
-    assert_eq!(acquired.id, recovery_lease.id);
-    assert_eq!(acquired.state, LeaseState::Active);
-    assert!(acquired.generation > before_lease.generation);
+    assert_eq!(asked_again.id, restored_lease.id);
+    assert_eq!(asked_again.generation, restored_lease.generation);
 
-    // The offer is answered by the user only after explicit reconciliation.
+    // And the session is usable immediately: the offer for a pane that really did lose
+    // its process can be answered straight away, agent panes included — which is what
+    // proves write authority came back rather than merely looking restored.
+    let agent_pane = after
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Agent)
+        .cloned()
+        .expect("the agent pane");
+    let agent_node = agent_pane.node_id.clone().expect("its lost node record");
+    let restarted_agent = node_of(
+        ui.ask(Request::RelaunchNode {
+            session_id: session_id.clone(),
+            node_id: agent_node,
+            resume: false,
+        })
+        .await,
+    );
+    assert!(restarted_agent.lifecycle.is_running());
+    // The agent runs inside a shell Turn owns, so the live pid belongs to that shell.
+    assert!(details_of(
+        ui.ask(Request::GetSession {
+            session_id: session_id.clone(),
+        })
+        .await,
+    )
+    .tree
+    .iter()
+    .filter_map(|node| node.pid)
+    .any(pid_is_alive));
+
+    let shell_pane = after
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .cloned()
+        .expect("the shell pane");
+    let dead_node = shell_pane.node_id.clone().expect("its lost node record");
     let relaunched = node_of(
         ui.ask(Request::RelaunchNode {
             session_id: session_id.clone(),
@@ -905,6 +928,149 @@ async fn stopping_an_orphan_outside_turn_unblocks_recovery_without_another_resta
     daemon.shutdown().await;
 }
 
+/// A pid is not an identity, and the check that says so must not lean on start times in
+/// the direction that would declare a living agent dead.
+///
+/// A recorded launch time can legitimately sit *after* the moment the OS says the process
+/// began: start times arrive in whole seconds and Turn writes the node down around the
+/// fork rather than exactly at it. A rule that read "older than its node" as "a stranger
+/// at that pid" would hand the checkout back while the agent was still writing to it. So
+/// the process here is genuinely alive, genuinely the recorded command, and dated as if
+/// the clock had drifted a minute — and the answer must still be to ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_process_recorded_with_a_later_timestamp_is_not_mistaken_for_a_reused_pid() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
+    let session_id = before.summary.id.clone();
+    let workspace_id = before.summary.workspace_id.clone();
+    let node_id = before
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .and_then(|pane| pane.node_id.clone())
+        .expect("the shell pane's runtime node");
+    drop(ui);
+
+    let dir = daemon.stop().await;
+    let mut survivor = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("a runtime that outlived its daemon");
+    {
+        let store = turn_store::Store::open_in(dir.path()).expect("the store must reopen");
+        let mut session = store
+            .sessions()
+            .get(&session_id)
+            .expect("the session query")
+            .expect("the persisted Session");
+        let node = session
+            .tree
+            .get_mut(&node_id)
+            .expect("the pane's persisted runtime");
+        node.pid = Some(survivor.id());
+        node.command = "sleep 300".into();
+        node.lifecycle = Lifecycle::Alive;
+        // The recorded launch is a minute *later* than the process's real start.
+        node.started_ms = turn_core::now_ms() + 60_000;
+        store
+            .sessions()
+            .save(&session)
+            .expect("the survivor metadata must save");
+    }
+
+    let daemon = TestDaemon::adopt(dir).await;
+    let mut ui = daemon.connect().await;
+    let lease = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected a withheld write lease, got {other:?}"),
+    };
+    assert_eq!(
+        lease.state,
+        LeaseState::RecoveryRequired,
+        "a live recorded process must be asked about, whatever its timestamps say"
+    );
+    let refused = ui
+        .try_ask(Request::AcquireWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+            session_id: session_id.clone(),
+            checkout_id: CheckoutId::primary_for(&workspace_id),
+        })
+        .await
+        .expect_err("the surviving process still owns the checkout");
+    assert_eq!(refused.code, ErrorCode::Conflict);
+
+    survivor.kill().expect("the user can stop it externally");
+    survivor.wait().expect("the orphan must be reaped");
+    daemon.shutdown().await;
+}
+
+/// The clean-stop half of the lease lifecycle, read straight off the disk.
+///
+/// Asserting it here as well as through a restart is deliberate: the restart test proves
+/// the user is not asked, and this proves *why* — the row says `released`, which is the
+/// fact that separates a quit from a crash on the next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ordered_shutdown_writes_the_release_that_a_crash_cannot() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "released cleanly".to_string(),
+            root: daemon.data_dir().display().to_string(),
+        })
+        .await,
+    );
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id.clone(),
+            name: "writer".to_string(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Terminal)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let held = match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace.id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease {
+            lease: Some(lease), ..
+        } => lease,
+        other => panic!("expected the active lease, got {other:?}"),
+    };
+    assert_eq!(held.state, LeaseState::Active);
+    drop(ui);
+
+    let dir = daemon.stop().await;
+    let store = turn_store::Store::open_in(dir.path()).expect("the store must reopen");
+    assert!(
+        store
+            .hierarchy()
+            .active_lease(&workspace.id)
+            .expect("the lease query")
+            .is_none(),
+        "an ordered shutdown leaves no unreleased lease to be mistaken for a crash"
+    );
+    assert_eq!(
+        store.sessions().get(&session.id).unwrap().unwrap().mode,
+        turn_core::model::SessionMode::MainCheckout,
+        "the Session is still the writer the user chose; only the lease was handed back"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn data_directory_and_socket_ownership_are_independent_and_recoverable() {
     let daemon = TestDaemon::start().await;
@@ -1406,11 +1572,16 @@ async fn a_session_that_had_nothing_to_lose_does_not_claim_turn_lost_something()
     daemon.shutdown().await;
 }
 
-/// The fourth product rule, executable: **Turn never relaunches on restore.** It is
-/// structurally true — `RelaunchNode` is the only request that starts anything — and this
-/// is the test that keeps it true, including for the panes that say they are safe to
-/// restart. `RestoreBehaviour::Relaunch` marks a pane Turn *may offer* to start again; a
-/// daemon that read it as permission would be running the user's commands for them.
+/// The fourth product rule, executable: **the daemon never relaunches on restore.** It is
+/// structurally true — `RelaunchNode` is the only request that starts anything, and the daemon
+/// does not send itself requests — and this is the test that keeps it true, including for the
+/// panes that say they are safe to restart.
+///
+/// Still true after auto-start, and worth being precise about why. A window that has received the
+/// restore report *does* start the panes marked `auto_start`, because a person is there and asked
+/// for that Session; the daemon restoring on its own — after a crash, at boot, with nothing
+/// attached — starts nothing, which is the case this test covers. The two are different moments
+/// and only one of them has somebody watching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_relaunches_nothing_even_for_a_pane_that_says_it_is_safe_to() {
     let daemon = TestDaemon::start().await;
