@@ -25,7 +25,7 @@ codesign --verify --deep --strict --verbose=2 dist/Turn.app
 The opt-in test connects to the daemon already launched by the packaged app. It never
 runs in normal CI and refuses to use an account unless `TURN_LIVE_CLAUDE=1` is present.
 Use a disposable Git repository so the run leaves no project history behind. The test
-keeps Claude in `plan` permission mode, never bypasses its permission system, and
+keeps Claude in `default` permission mode, never bypasses its permission system, and
 enables experimental Agent Teams only in the launched Pane's environment. The project
 root is test-data isolation, not a host security boundary.
 
@@ -97,6 +97,46 @@ Automation does not replace the visible interaction check. During the same run:
    rendering remain intact.
 9. Close only Turn.app. Confirm `turnd` and Claude remain alive, then reopen the bundle.
 10. Confirm the same tree edge, Layout, preview, write lease and live terminal return.
+
+## Passing run record — 2026-08-10
+
+Environment:
+
+- Turn base commit `f494817`, local ad-hoc signed arm64 bundle built from the isolated
+  issue worktree.
+- macOS 26.5.2 (25F84), arm64.
+- Claude Code 2.1.226, authenticated with the installed first-party Team account.
+- Claude `default` permission mode with Agent Teams enabled only in the Pane. No
+  permission was bypassed or approved by the harness.
+- Fresh persistent data directory, socket and one-file Git repository.
+
+Both ignored tests passed. The authenticated run produced one uniquely declared live
+Reviewer with explicit `spawned_by` confidence, the real Claude Agent as parent, a
+stable activity preview, no PID, no Pane binding and an `Alive` lifecycle after its
+temporary Pane was closed. The main-checkout write lease remained active and the saved
+Layout remained one Pane. Real hook-derived events covered `SessionStart`,
+`UserPromptSubmit`, the Agent Teams declaration, subagent start/stop callbacks and
+completed turns; SQLite retained zero raw hook payloads.
+
+The terminal evidence was 44×132 cells with 1,449 styled cells and bracketed paste
+enabled after the editor settled. Claude 2.1.226 rendered this run on the primary
+screen (`alternate_screen=false`) and requested no terminal mouse reporting
+(`mouse_mode=None`), unlike the 2.1.224 run below. Those values are recorded as real
+version differences rather than fabricated capabilities. Resize, paste/submit and the
+restored primary-screen terminal all passed.
+
+Closing GUI PID 36573 left daemon PID 36575, hosting shell PID 36596 and Claude PID
+36653 alive. Reopening produced GUI PID 36919 against the same daemon, socket, PTY,
+Session id and write lease; the restoration test passed immediately. Targeted window
+captures before and after reopening were inspected locally and showed the packaged
+app, one Pane, styled Claude output and Reviewer's report with no external terminal or
+extra Turn Pane. The captures are not checked in because they include account-local UI
+labels; the redacted facts above are the durable evidence.
+
+Claude emitted both the Agent Teams declaration and the tool's terminal subagent
+callback lifecycle. Turn kept the uniquely declared Reviewer as the live semantic
+teammate and the callback record as an exited child, matching the two distinct external
+identities rather than aliasing them.
 
 ## Run record — 2026-08-07
 

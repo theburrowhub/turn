@@ -55,6 +55,18 @@ fn claude_version(binary: &Path) -> String {
         .to_string()
 }
 
+fn looks_like_claude_editor(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("claude code v") && text.lines().any(|line| line.trim() == "❯")
+}
+
+#[test]
+fn editor_readiness_requires_the_product_banner_and_empty_prompt() {
+    assert!(looks_like_claude_editor("Claude Code v2.1.226\n\n  ❯  \n"));
+    assert!(!looks_like_claude_editor("Claude Code v2.1.226\n"));
+    assert!(!looks_like_claude_editor("shell\n❯\n"));
+}
+
 async fn session_details(
     ui: &mut Client,
     session_id: &turn_core::ids::SessionId,
@@ -70,27 +82,33 @@ async fn session_details(
 async fn wait_for_claude_editor(
     ui: &mut Client,
     session_id: &turn_core::ids::SessionId,
-    node_id: &turn_core::ids::NodeId,
+    runtime_node_id: &turn_core::ids::NodeId,
     pane_id: &turn_core::ids::PaneId,
 ) {
     let deadline = tokio::time::Instant::now() + CLAUDE_STARTUP_WAIT;
     let mut accepted_trust = false;
     loop {
         ui.poll_screens().await;
-        let (text, interactive) = {
+        let (text, alternate_screen, bracketed_paste) = {
             let screen = ui.screen(session_id, pane_id);
             (
                 screen.text().to_ascii_lowercase(),
-                screen.alternate_screen && screen.modes.bracketed_paste,
+                screen.alternate_screen,
+                screen.modes.bracketed_paste,
             )
         };
         let trust_prompt =
             text.contains(TRUST_PROMPT_HEADING) && text.contains(TRUST_PROMPT_CONFIRM);
+        // Screen modes are acceptance evidence, not the readiness signal: Claude
+        // 2.1.226's initial editor paint can expose neither alternate screen nor
+        // bracketed paste. The product banner and empty input prompt together
+        // identify the editor without mistaking the hosting shell for it.
+        let interactive = looks_like_claude_editor(&text);
         if trust_prompt {
             if !accepted_trust {
                 ui.ask(Request::WritePty {
                     session_id: session_id.clone(),
-                    node_id: node_id.clone(),
+                    node_id: runtime_node_id.clone(),
                     data: TerminalBytes::new(b"\r".to_vec()),
                 })
                 .await;
@@ -101,7 +119,7 @@ async fn wait_for_claude_editor(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "Claude did not reach its interactive editor within {CLAUDE_STARTUP_WAIT:?}; screen={text:?}"
+            "Claude did not reach its interactive editor within {CLAUDE_STARTUP_WAIT:?}; alternate_screen={alternate_screen}; bracketed_paste={bracketed_paste}; screen={text:?}"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -184,7 +202,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     pane.command = Some(binary.display().to_string());
     pane.args = vec![
         "--permission-mode".into(),
-        "plan".into(),
+        "default".into(),
         "--model".into(),
         "sonnet".into(),
         "--no-chrome".into(),
@@ -233,16 +251,21 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
         .find(|node| node.kind == NodeKind::Agent)
         .expect("Claude is represented as an Agent")
         .clone();
-    let pane_id = layout_before.panes()[0].id.clone();
+    let pane = &layout_before.panes()[0];
+    let pane_id = pane.id.clone();
+    let runtime_node = pane
+        .node_id
+        .clone()
+        .expect("the Pane is bound to its hosting shell");
     let parent_node = parent.node_id.clone();
 
     ui.attach_cells(&session.id, &pane_id, PtySize::new(40, 120))
         .await;
-    wait_for_claude_editor(&mut ui, &session.id, &parent_node, &pane_id).await;
+    wait_for_claude_editor(&mut ui, &session.id, &runtime_node, &pane_id).await;
 
     ui.ask(Request::ResizePty {
         session_id: session.id.clone(),
-        node_id: parent_node.clone(),
+        node_id: runtime_node.clone(),
         size: PtySize::new(44, 132),
     })
     .await;
@@ -261,7 +284,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     }
     ui.ask(Request::WritePty {
         session_id: session.id.clone(),
-        node_id: parent_node.clone(),
+        node_id: runtime_node.clone(),
         data: TerminalBytes::new(input),
     })
     .await;
@@ -271,7 +294,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     ui.ask(Request::WritePty {
         session_id: session.id.clone(),
-        node_id: parent_node.clone(),
+        node_id: runtime_node,
         data: TerminalBytes::new(b"\r".to_vec()),
     })
     .await;
@@ -371,6 +394,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
         &evidence_path,
         &serde_json::json!({
             "claude_version": version,
+            "claude_permission_mode": "default",
             "daemon_version": ui.welcome.daemon_version,
             "protocol_version": ui.welcome.protocol_version,
             "workspace_root": project,
