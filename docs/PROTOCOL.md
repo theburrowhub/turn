@@ -544,6 +544,38 @@ the process exited: its `Lifecycle` stays `orphaned`.
 | `get_session` | `session_id` | `session_details` |
 | `get_process_tree` | `session_id` | `tree` |
 
+### Settings
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `get_settings` | `session_id?` (absent = the Global level alone) | `settings` |
+| `set_setting` | `scope`, `owner_id?`, `key`, `value` | `settings` |
+| `reset_setting` | `scope`, `owner_id?`, `key` | `settings` |
+
+`scope` is one of `global`, `workspace`, `template`, `session`, `temporary`, in that precedence order:
+later beats earlier. `owner_id` names the Workspace, Template or Session; it is ignored for `global`,
+which has one owner.
+
+All three answer with the whole resolved set rather than an ack, for the same reason a pane operation
+answers with the layout: one write can move what is in force for more than the key that was written —
+removing a Session override reveals the Workspace's value — and a client that patched its own copy
+would be a second resolver able to disagree with the daemon's. **The daemon is the only resolver**
+(ADR-051): the window receives resolved values with their origin and never applies the precedence
+order itself.
+
+`set_setting` refuses an unknown key (`not_found`), a level the key does not belong to (`refused`,
+with the levels it does belong to in the detail), a value of the wrong shape (`invalid_argument`,
+naming what would be accepted), an owner that does not exist (`not_found`), and the `temporary` level,
+which lives in the window and is never persisted. `reset_setting` refuses none of those: resetting a
+key this build does not define is how a user removes a value a newer Turn wrote.
+
+A `settings` response carries `levels` — the levels that exist for this Session, each with the
+`owner_id` a write quotes back — and one `entries` row per preference, with the resolved value, the
+level it came from (`null` for Turn's own default, which is distinguishable from a level having set
+the same value), every level it shadowed, and the levels it may be set at. A secret arrives already
+replaced with `<redacted>` and `hidden: true`; the daemon keeps the real value because it needs it,
+and this is the boundary past which nothing does.
+
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
 

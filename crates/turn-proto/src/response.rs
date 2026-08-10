@@ -23,7 +23,7 @@ use crate::screen::PaneStream;
 use crate::search::SearchOutcome;
 use crate::view::{
     AttentionView, ContextHandoffView, HierarchySnapshot, NodePaneView, PaneFocusView,
-    SessionDetails, SessionSummary, TemplateSummary, TreeNodeView, TreeSurfaceState,
+    SessionDetails, SessionSummary, SettingsView, TemplateSummary, TreeNodeView, TreeSurfaceState,
     WorkspaceSummary,
 };
 
@@ -152,6 +152,19 @@ pub enum Response {
     },
     SessionDetails {
         details: Box<SessionDetails>,
+    },
+
+    /// Every preference in force, with where each value came from.
+    ///
+    /// Sent whole after a write as well as on a read, for the same reason a pane operation
+    /// answers with the resulting layout: one change can move what is in force for more than
+    /// the key that was written — removing a Session override reveals the Workspace's value —
+    /// and a client that patched its own copy would be a second resolver, able to disagree
+    /// with the daemon's. `scopes` says which levels this answer was assembled from, so a
+    /// surface can offer "set at the Workspace level" only when there is a Workspace to set
+    /// it on.
+    Settings {
+        settings: Box<SettingsView>,
     },
 
     Templates {
@@ -288,6 +301,7 @@ impl Response {
             Response::Sessions { .. } => "sessions",
             Response::Session { .. } => "session",
             Response::SessionDetails { .. } => "session_details",
+            Response::Settings { .. } => "settings",
             Response::Templates { .. } => "templates",
             Response::Template { .. } => "template",
             Response::Layout { .. } => "layout",
@@ -321,6 +335,7 @@ impl Response {
         "sessions",
         "session",
         "session_details",
+        "settings",
         "templates",
         "template",
         "layout",
@@ -555,9 +570,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 27 result shapes. Asserted so adding one without documenting it in
+        // 28 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 27, "the response catalogue changed size");
+        assert_eq!(declared.len(), 28, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -740,7 +755,16 @@ pub(crate) mod tests {
                 entries: Vec::new(),
             },
             Response::Effects {
-                effects: vec![Effect::Cleared { session_id: s.id }],
+                effects: vec![Effect::Cleared {
+                    session_id: s.id.clone(),
+                }],
+            },
+            Response::Settings {
+                settings: Box::new(crate::view::SettingsView {
+                    session_id: Some(s.id),
+                    levels: vec![crate::view::SettingsLevel::global()],
+                    entries: Vec::new(),
+                }),
             },
         ]
     }

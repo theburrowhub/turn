@@ -28,6 +28,7 @@ use turn_core::ids::{
 use turn_core::model::{
     Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
 };
+use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
 
 use crate::bytes::TerminalBytes;
@@ -724,6 +725,44 @@ pub enum Request {
     UpdateUserActivity {
         context: UserContext,
     },
+
+    // ------------------------------------------------------------------- settings
+    /// Every preference in force for one Session, with where each value came from.
+    ///
+    /// Asked per Session rather than globally because that is the question a settings
+    /// surface has: the answer for a Session in one Workspace is not the answer for a
+    /// Session in another, and the levels that make the difference are the daemon's to
+    /// assemble. `session_id` absent means "the Global level alone", which is what the
+    /// preferences sheet shows before any Session is selected.
+    GetSettings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
+    /// Records one preference at one level.
+    ///
+    /// The level is explicit and never inferred from what is selected. "Set the font size"
+    /// is four different acts depending on whether it means this Session, this Workspace,
+    /// this Template or everywhere, and a request that guessed would be the one that
+    /// silently edited the wrong one.
+    SetSetting {
+        scope: SettingsScope,
+        /// The Workspace, Template or Session the level belongs to. Ignored for the Global
+        /// level, which has exactly one owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_id: Option<String>,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Removes one level's opinion, so the level below is in force again.
+    ///
+    /// "Reset to inherited". A removal rather than a write of the inherited value: writing it
+    /// would freeze today's inherited answer as tomorrow's override.
+    ResetSetting {
+        scope: SettingsScope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_id: Option<String>,
+        key: String,
+    },
 }
 
 impl Request {
@@ -802,6 +841,9 @@ impl Request {
             Request::MuteSession { .. } => "mute_session",
             Request::CorrectState { .. } => "correct_state",
             Request::UpdateUserActivity { .. } => "update_user_activity",
+            Request::GetSettings { .. } => "get_settings",
+            Request::SetSetting { .. } => "set_setting",
+            Request::ResetSetting { .. } => "reset_setting",
         }
     }
 
@@ -891,6 +933,15 @@ impl Request {
             // The governor may release a deferred focus jump the moment the user
             // stops typing, so even this returns effects rather than an ack.
             Request::UpdateUserActivity { .. } => "effects",
+
+            // A write answers with the whole resolved set rather than an ack, for the same
+            // reason a pane operation answers with the layout: one change can move what is
+            // in force for several keys at once — a Session override removed reveals a
+            // Workspace value — and a client that patched its own copy would be a second
+            // resolver able to disagree with the daemon's.
+            Request::GetSettings { .. }
+            | Request::SetSetting { .. }
+            | Request::ResetSetting { .. } => "settings",
         }
     }
 
@@ -921,6 +972,7 @@ impl Request {
                 // client's search cannot scroll another client's screen.
                 | Request::GetPaneHistory { .. }
                 | Request::SearchPane { .. }
+                | Request::GetSettings { .. }
         )
     }
 

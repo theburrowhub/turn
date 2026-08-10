@@ -13,6 +13,7 @@ mod nodes;
 mod panes;
 mod scrollback;
 mod sessions;
+mod settings;
 mod workspaces;
 
 use super::command::ClientId;
@@ -453,6 +454,20 @@ impl Core {
 
             // ------------------------------------------------------ user behaviour
             Request::UpdateUserActivity { context } => self.update_user_activity(context, now_ms),
+
+            // ----------------------------------------------------------- settings
+            Request::GetSettings { session_id } => self.get_settings(session_id),
+            Request::SetSetting {
+                scope,
+                owner_id,
+                key,
+                value,
+            } => self.set_setting(scope, owner_id, key, value, now_ms),
+            Request::ResetSetting {
+                scope,
+                owner_id,
+                key,
+            } => self.reset_setting(scope, owner_id, key),
         }
     }
 }

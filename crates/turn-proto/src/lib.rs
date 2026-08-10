@@ -131,6 +131,6 @@ pub use search::{
 pub use view::{
     AgentSummary, AttentionView, ContextHandoffText, ContextHandoffView, HierarchyKey,
     HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView, SessionDetails,
-    SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
-    WorkspaceSummary, WorkspaceTreeView,
+    SessionSummary, SessionTreeView, SettingsEntry, SettingsLevel, SettingsView, TemplateSummary,
+    TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };

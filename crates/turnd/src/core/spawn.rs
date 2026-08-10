@@ -359,6 +359,7 @@ impl Core {
             pane.kind,
             pane.command.as_deref(),
             workspace,
+            self.shell_for(Some(session_id)),
             &self.registry,
         ) else {
             return Ok(None);
@@ -409,6 +410,7 @@ impl Core {
             pane.kind,
             pane.command.as_deref(),
             self.workspaces.get(&session.workspace_id),
+            self.shell_for(Some(session_id)),
             &self.registry,
         ) else {
             return LaunchAuthority::CheckoutWrite;
@@ -959,7 +961,7 @@ impl Core {
             env.extend(workspace.env.iter().cloned());
         }
         env.extend(session.env.iter().cloned());
-        let shell = default_shell(self.workspaces.get(&session.workspace_id));
+        let shell = self.shell_for(Some(session_id));
 
         let mut node = ProcessNode::process(
             session_id.clone(),
@@ -1116,13 +1118,16 @@ enum PaneLaunch {
 ///
 /// Any other terminal pane with no command stays empty. Guessing what a pane labelled
 /// "server" should run would start something the user did not ask for.
+/// `shell` is resolved by the caller rather than here, because the answer depends on
+/// settings the caller has the Session for — a Session-level `shell.command` beats its
+/// Workspace's, and this function is given only the Workspace.
 fn pane_launch(
     kind: PaneKind,
     declared: Option<&str>,
     workspace: Option<&turn_core::model::Workspace>,
+    shell: String,
     registry: &AdapterRegistry,
 ) -> Option<PaneLaunch> {
-    let shell = default_shell(workspace);
     if let Some(command) = declared.filter(|c| !c.trim().is_empty()) {
         // A command that is not installed still resolves here and is refused, with the
         // adapter's own explanation, by the launch itself. Substituting a different
@@ -1278,6 +1283,30 @@ pub(crate) fn executable_name(command: &str) -> &str {
         .rsplit('/')
         .next()
         .unwrap_or(command)
+}
+
+impl Core {
+    /// The shell to run for one Session, settings included.
+    ///
+    /// The chain is: the resolved `shell.command` preference, then the Workspace's own
+    /// `default_shell` field, then `$SHELL`, then `/bin/sh`. The preference goes first
+    /// because it is the more specific statement — it can be made per Session and per
+    /// Template, and the field cannot — and the field stays because it is what existing
+    /// Workspaces already hold.
+    pub(crate) fn shell_for(&self, session_id: Option<&SessionId>) -> String {
+        let configured = self
+            .setting_for(session_id, "shell.command")
+            .as_str()
+            .map(str::to_string)
+            .filter(|shell| !shell.trim().is_empty());
+        if let Some(shell) = configured {
+            return shell;
+        }
+        let workspace = session_id
+            .and_then(|id| self.session(id).ok())
+            .and_then(|session| self.workspaces.get(&session.workspace_id));
+        default_shell(workspace)
+    }
 }
 
 /// The shell to run when a pane asks for one without saying which.
@@ -1474,7 +1503,13 @@ mod tests {
         let registry = AdapterRegistry::bare();
         let workspace = workspace_with_shell(Some("/bin/zsh"));
         assert_eq!(
-            pane_launch(PaneKind::Shell, None, Some(&workspace), &registry),
+            pane_launch(
+                PaneKind::Shell,
+                None,
+                Some(&workspace),
+                default_shell(Some(&workspace)),
+                &registry,
+            ),
             Some(PaneLaunch::Direct {
                 command: "/bin/zsh".to_string()
             }),
@@ -1483,9 +1518,13 @@ mod tests {
         // With no workspace preference the environment decides, and failing that a
         // shell that exists on every unix.
         let bare = workspace_with_shell(None);
-        let Some(PaneLaunch::Direct { command }) =
-            pane_launch(PaneKind::Shell, None, Some(&bare), &registry)
-        else {
+        let Some(PaneLaunch::Direct { command }) = pane_launch(
+            PaneKind::Shell,
+            None,
+            Some(&bare),
+            default_shell(Some(&bare)),
+            &registry,
+        ) else {
             panic!("a shell pane always resolves to a shell")
         };
         assert!(!command.trim().is_empty());
@@ -1503,7 +1542,11 @@ mod tests {
             PaneKind::TestOutput,
             PaneKind::Tui,
         ] {
-            assert_eq!(pane_launch(kind, None, None, &registry), None, "{kind:?}");
+            assert_eq!(
+                pane_launch(kind, None, None, default_shell(None), &registry),
+                None,
+                "{kind:?}"
+            );
         }
     }
 
@@ -1515,7 +1558,13 @@ mod tests {
         let registry = registry_with_an_installed_agent();
         let workspace = workspace_with_shell(Some("/bin/zsh"));
         assert_eq!(
-            pane_launch(PaneKind::Agent, None, Some(&workspace), &registry),
+            pane_launch(
+                PaneKind::Agent,
+                None,
+                Some(&workspace),
+                default_shell(Some(&workspace)),
+                &registry,
+            ),
             Some(PaneLaunch::Hosted {
                 shell: "/bin/zsh".to_string(),
                 command: "sh".to_string()
@@ -1529,6 +1578,7 @@ mod tests {
             PaneKind::Agent,
             None,
             Some(&workspace),
+            default_shell(Some(&workspace)),
             &AdapterRegistry::bare(),
         ) else {
             panic!("an agent pane must always resolve to something")
@@ -1543,9 +1593,13 @@ mod tests {
         let registry = registry_with_an_installed_agent();
         let mut workspace = workspace_with_shell(Some("/bin/zsh"));
         workspace.default_agent = Some("turn-absent-agent-xyz".to_string());
-        let Some(PaneLaunch::Unhosted { note, .. }) =
-            pane_launch(PaneKind::Agent, None, Some(&workspace), &registry)
-        else {
+        let Some(PaneLaunch::Unhosted { note, .. }) = pane_launch(
+            PaneKind::Agent,
+            None,
+            Some(&workspace),
+            default_shell(Some(&workspace)),
+            &registry,
+        ) else {
             panic!("a missing default agent must not leave the pane empty")
         };
         assert!(note.contains("turn-absent-agent-xyz"), "{note}");
@@ -1559,7 +1613,13 @@ mod tests {
         // registry's own first answer.
         workspace.default_agent = Some(" sh ".to_string());
         assert_eq!(
-            pane_launch(PaneKind::Agent, None, Some(&workspace), &registry),
+            pane_launch(
+                PaneKind::Agent,
+                None,
+                Some(&workspace),
+                default_shell(Some(&workspace)),
+                &registry,
+            ),
             Some(PaneLaunch::Hosted {
                 shell: "/bin/zsh".to_string(),
                 command: "sh".to_string()
@@ -1573,13 +1633,25 @@ mod tests {
         let registry = AdapterRegistry::bare();
         let workspace = workspace_with_shell(Some("/bin/zsh"));
         assert_eq!(
-            pane_launch(PaneKind::Shell, Some("fish"), Some(&workspace), &registry),
+            pane_launch(
+                PaneKind::Shell,
+                Some("fish"),
+                Some(&workspace),
+                default_shell(Some(&workspace)),
+                &registry
+            ),
             Some(PaneLaunch::Direct {
                 command: "fish".to_string()
             })
         );
         assert_eq!(
-            pane_launch(PaneKind::Shell, Some("   "), Some(&workspace), &registry),
+            pane_launch(
+                PaneKind::Shell,
+                Some("   "),
+                Some(&workspace),
+                default_shell(Some(&workspace)),
+                &registry
+            ),
             Some(PaneLaunch::Direct {
                 command: "/bin/zsh".to_string()
             }),
@@ -1598,6 +1670,7 @@ mod tests {
                 PaneKind::Terminal,
                 Some("sh"),
                 Some(&workspace_with_shell(Some("/bin/zsh"))),
+                "/bin/zsh".to_string(),
                 &registry
             ),
             Some(PaneLaunch::Hosted {
@@ -1610,6 +1683,7 @@ mod tests {
                 PaneKind::Agent,
                 Some("npm run dev"),
                 Some(&workspace_with_shell(Some("/bin/zsh"))),
+                "/bin/zsh".to_string(),
                 &registry
             ),
             Some(PaneLaunch::Direct {

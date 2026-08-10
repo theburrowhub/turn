@@ -23,6 +23,7 @@ mod attention;
 mod handoff;
 mod hierarchy;
 mod session;
+mod settings;
 mod tree;
 mod workspace;
 
@@ -33,5 +34,6 @@ pub use hierarchy::{
     SessionTreeView, TreeSurfaceState, WorkspaceTreeView,
 };
 pub use session::{AgentSummary, SessionDetails, SessionSummary};
+pub use settings::{SettingsEntry, SettingsLevel, SettingsView};
 pub use tree::TreeNodeView;
 pub use workspace::{TemplateSummary, WorkspaceSummary};
