@@ -263,9 +263,9 @@ impl CheckoutWriteLock {
         Ok(current == self.identity && self.owner.lease.id == lease.id)
     }
 
-    /// Duplicates this lock descriptor for exactly one process spawn and clears
-    /// `CLOEXEC` on that duplicate. The caller keeps the returned guard alive until
-    /// `Command::spawn` completes, then drops its parent-side copy.
+    /// Duplicates this lock descriptor for exactly one process spawn while retaining
+    /// `CLOEXEC`. The PTY launcher preserves it only in the authorised forked child;
+    /// the caller drops its parent-side copy once `Command::spawn` completes.
     pub(crate) fn inherit_for_spawn(&self) -> Result<CheckoutLockInheritance, CheckoutLockError> {
         let file = inheritable_clone(&self.file, &self.path)?;
         Ok(CheckoutLockInheritance { _file: file })
@@ -600,8 +600,25 @@ mod tests {
         drop(inherited);
         drop(lock);
 
-        CheckoutWriteLock::acquire(&checkout, &locks, |identity| owner(identity, temp.path()))
-            .expect("an unrelated exec must not retain checkout authority");
+        // The Rust test harness is multithreaded. Another test can have forked while
+        // these descriptors existed and still be between fork and exec when the two
+        // parent copies are dropped. CLOEXEC closes that transient copy at exec, so
+        // allow that bounded handoff to finish while still proving the long-running
+        // unrelated process cannot retain authority.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let _replacement = loop {
+            match CheckoutWriteLock::acquire(&checkout, &locks, |identity| {
+                owner(identity, temp.path())
+            }) {
+                Ok(lock) => break lock,
+                Err(CheckoutLockError::Contended { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("an unrelated exec retained checkout authority: {error:?}"),
+            }
+        };
 
         child.kill().unwrap();
         child.wait().unwrap();
