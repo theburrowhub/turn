@@ -10,7 +10,7 @@ use turn_core::model::{LeaseState, PaneKind, RestoreState, SessionMode, Template
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_core::Confidence;
 use turn_proto::{
-    ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent,
+    CloseDisposition, ErrorCode, NewPane, ProtoErrorContext, Request, Response, ServerEvent,
     SessionConflictAlternative,
 };
 
@@ -926,6 +926,149 @@ async fn stopping_an_orphan_outside_turn_unblocks_recovery_without_another_resta
     );
 
     daemon.shutdown().await;
+}
+
+/// Reproduces the user-visible failure from #23 across real daemon boundaries.
+///
+/// A process that the first daemon no longer owns is restored honestly as `Orphaned`.
+/// Ending the Session through the public protocol must still succeed, name the survivor,
+/// hide the Session immediately and persist that decision so a third daemon does not put
+/// the row back. The external process remains alive until the test explicitly cleans it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_a_restored_orphan_stays_ended_after_another_daemon_restart() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let before = seed_custom_coding_session(&daemon, &mut ui).await;
+    let session_id = before.summary.id.clone();
+    let workspace_id = before.summary.workspace_id.clone();
+    let node_id = before
+        .layout
+        .panes()
+        .iter()
+        .find(|pane| pane.kind == PaneKind::Shell)
+        .and_then(|pane| pane.node_id.clone())
+        .expect("the shell Pane's runtime node");
+    let mut survivor = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("a process that will outlive its original daemon");
+    assert!(pid_is_alive(survivor.id()));
+    drop(ui);
+
+    let dir = daemon.stop().await;
+    assert!(
+        pid_is_alive(survivor.id()),
+        "the external process genuinely survived the first daemon"
+    );
+    {
+        let store = turn_store::Store::open_in(dir.path()).expect("the store must reopen");
+        let mut session = store
+            .sessions()
+            .get(&session_id)
+            .expect("the session query")
+            .expect("the persisted Session");
+        let node = session
+            .tree
+            .get_mut(&node_id)
+            .expect("the persisted shell runtime");
+        node.pid = Some(survivor.id());
+        node.command = "sleep 300".into();
+        node.lifecycle = Lifecycle::Alive;
+        store
+            .sessions()
+            .save(&session)
+            .expect("the survivor metadata must save");
+    }
+
+    let daemon = TestDaemon::adopt(dir).await;
+    let mut ui = daemon.connect().await;
+    let restored = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session_id.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        restored
+            .tree
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .expect("the restored survivor")
+            .lifecycle,
+        Lifecycle::Orphaned,
+        "the new daemon sees the process but does not pretend to control it"
+    );
+
+    let response = ui
+        .ask(Request::CloseSession {
+            session_id: session_id.clone(),
+            disposition: CloseDisposition::Terminate,
+        })
+        .await;
+    let Response::Closed { escaped } = response else {
+        panic!("ending must answer with any process it could not stop: {response:?}");
+    };
+    assert_eq!(escaped.len(), 1, "only the restored orphan survives");
+    assert_eq!(escaped[0].node_id, node_id);
+    assert_eq!(escaped[0].pid, Some(survivor.id()));
+    assert!(
+        pid_is_alive(survivor.id()),
+        "the honest warning is necessary because Turn did not invent control of the orphan"
+    );
+
+    let visible = match ui
+        .ask(Request::ListSessions {
+            workspace_id: Some(workspace_id.clone()),
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("expected the visible Sessions, got {other:?}"),
+    };
+    assert!(
+        visible.iter().all(|session| session.id != session_id),
+        "the user's destructive decision removes the row immediately"
+    );
+    drop(ui);
+
+    let daemon = daemon.restart().await;
+    let mut ui = daemon.connect().await;
+    let visible_after_restart = match ui
+        .ask(Request::ListSessions {
+            workspace_id: Some(workspace_id.clone()),
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Sessions { sessions } => sessions,
+        other => panic!("expected the visible Sessions after restart, got {other:?}"),
+    };
+    assert!(
+        visible_after_restart
+            .iter()
+            .all(|session| session.id != session_id),
+        "the archived Session must not reappear after another daemon restart"
+    );
+    match ui
+        .ask(Request::GetWorkspaceWriteLease {
+            workspace_id: workspace_id.clone(),
+        })
+        .await
+    {
+        Response::WorkspaceWriteLease { lease: None, .. } => {}
+        other => panic!("an ended Session cannot retain checkout authority: {other:?}"),
+    }
+    assert!(
+        pid_is_alive(survivor.id()),
+        "a second daemon still must not claim the external survivor died"
+    );
+
+    daemon.shutdown().await;
+    survivor
+        .kill()
+        .expect("the test cleans up the deliberately escaped process");
+    survivor.wait().expect("the escaped process must be reaped");
 }
 
 /// A pid is not an identity, and the check that says so must not lean on start times in
