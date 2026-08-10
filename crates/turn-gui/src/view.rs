@@ -185,10 +185,17 @@ pub enum LifecycleConfirmation {
         session_id: SessionId,
         name: String,
         running_count: usize,
+        /// Of those, how many Turn cannot stop because they survived a previous daemon.
+        ///
+        /// The act goes ahead with them — a Session the user has finished with is not kept
+        /// alive because a process escaped the daemon — so the honest place to say so is
+        /// here, before the click, rather than in a status line afterwards.
+        escaped_count: usize,
     },
     StopWorkspace {
         workspace_id: WorkspaceId,
         name: String,
+        escaped_count: usize,
         /// How many Sessions the Workspace holds, and how many of them have something
         /// running. Closing a Workspace reaches every one of them, and a user who is
         /// only shown the Workspace's name cannot know how much that is.
@@ -205,12 +212,14 @@ pub enum LifecycleConfirmation {
         session_id: SessionId,
         name: String,
         running_count: usize,
+        escaped_count: usize,
     },
     DeleteWorkspace {
         workspace_id: WorkspaceId,
         name: String,
         session_count: usize,
         running_processes: usize,
+        escaped_count: usize,
         /// The directory the Workspace points at, shown verbatim.
         ///
         /// The one thing a person needs to see before deleting a Workspace is the path that is
@@ -305,6 +314,7 @@ impl LifecycleConfirmation {
             session_id: session.id.clone(),
             name: session.name.clone(),
             running_count: session.running_count,
+            escaped_count: session.orphaned_count,
         }
     }
 
@@ -314,6 +324,7 @@ impl LifecycleConfirmation {
             session_id: session.id.clone(),
             name: session.name.clone(),
             running_count: session.running_count,
+            escaped_count: session.orphaned_count,
         }
     }
 
@@ -331,6 +342,11 @@ impl LifecycleConfirmation {
                 .sessions
                 .iter()
                 .map(|session| session.session.running_count)
+                .sum(),
+            escaped_count: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.orphaned_count)
                 .sum(),
             root: workspace.workspace.root.clone(),
         }
@@ -356,6 +372,11 @@ impl LifecycleConfirmation {
                 .sessions
                 .iter()
                 .map(|session| session.session.running_count)
+                .sum(),
+            escaped_count: workspace
+                .sessions
+                .iter()
+                .map(|session| session.session.orphaned_count)
                 .sum(),
         }
     }
@@ -2486,6 +2507,30 @@ impl<'a> TurnView<'a> {
                 ),
             ),
         };
+        // What the act will *not* achieve, said before the click rather than after it.
+        //
+        // Turn used to refuse the whole operation here — a Session with a process from a
+        // previous daemon in it could not be ended at all, and the user was told to go and
+        // stop it themselves first. That protected nothing: the survivor kept running either
+        // way, and the only thing the refusal preserved was a row the user had finished with.
+        // So the act goes ahead, and what is owed instead is this sentence. It is deliberately
+        // not phrased as a warning to be dismissed: it says what stays running and leaves the
+        // decision alone.
+        let escaped_count = match &confirmation {
+            LifecycleConfirmation::EndSession { escaped_count, .. }
+            | LifecycleConfirmation::StopWorkspace { escaped_count, .. }
+            | LifecycleConfirmation::DeleteSession { escaped_count, .. }
+            | LifecycleConfirmation::DeleteWorkspace { escaped_count, .. } => *escaped_count,
+        };
+        let escaped = (escaped_count > 0).then(|| {
+            format!(
+                "{} of them survived a previous daemon and cannot be stopped by Turn. \
+                 This will go ahead without {}; stop {} yourself if you need to.",
+                escaped_count,
+                if escaped_count == 1 { "it" } else { "them" },
+                if escaped_count == 1 { "it" } else { "them" }
+            )
+        });
         // The other door, named on the way through this one. Somebody who only wants the row
         // gone must be able to see that stopping the work is not the price of a tidy tree.
         let alternative = match &confirmation {
@@ -2525,7 +2570,11 @@ impl<'a> TurnView<'a> {
             LifecycleConfirmation::StopWorkspace { .. }
             | LifecycleConfirmation::DeleteWorkspace { .. } => 312.0_f32,
             _ => 284.0_f32,
-        };
+        }
+        // And taller again for the one that only appears when a process has escaped. Two
+        // lines: it names a count and then what the user can do about it, and a card sized
+        // without it clipped the buttons underneath.
+        + if escaped.is_some() { 40.0 } else { 0.0 };
         let bounds = Rect::from_center_size(
             full.center(),
             Vec2::new(
@@ -2578,6 +2627,9 @@ impl<'a> TurnView<'a> {
                 // back — it must not be the same weight as the hint underneath it, which is the
                 // way *out*.
                 ui.label(RichText::new(terminating).color(theme.attention));
+                if let Some(escaped) = escaped.as_deref() {
+                    ui.label(RichText::new(escaped).color(theme.failure));
+                }
                 ui.label(RichText::new(alternative).color(theme.text_faint).small());
                 ui.add_space(14.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3166,11 +3218,7 @@ impl<'a> TurnView<'a> {
                                 .clicked()
                             {
                                 state.lifecycle_confirmation =
-                                    Some(LifecycleConfirmation::EndSession {
-                                        session_id: session.session.id.clone(),
-                                        name: session.session.name.clone(),
-                                        running_count: session.session.running_count,
-                                });
+                                    Some(LifecycleConfirmation::end_session(&session.session));
                                 ui.close();
                             }
                             let owns_lease = workspace
@@ -3856,11 +3904,7 @@ impl<'a> TurnView<'a> {
                             .clicked()
                         {
                             state.lifecycle_confirmation =
-                                Some(LifecycleConfirmation::EndSession {
-                                    session_id: summary.id.clone(),
-                                    name: summary.name.clone(),
-                                    running_count: summary.running_count,
-                                });
+                                Some(LifecycleConfirmation::end_session(summary));
                             ui.close();
                         }
                         if ui
@@ -8185,6 +8229,7 @@ mod tests {
                 session_id: SessionId::from_stored("sess_modal_shortcuts"),
                 name: "Do not mutate behind me".into(),
                 running_count: 2,
+                escaped_count: 0,
             }),
             ..ViewState::default()
         };

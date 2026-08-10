@@ -817,7 +817,7 @@ impl Request {
             | Request::RenameWorkspace { .. }
             | Request::ArchiveWorkspace { .. }
             | Request::DuplicateWorkspace { .. } => "workspace",
-            Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "ack",
+            Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "closed",
 
             Request::GetHierarchy { .. } => "hierarchy",
             Request::SetTreeExpanded { .. } | Request::SelectTreeNode { .. } => "tree_state",
@@ -835,7 +835,7 @@ impl Request {
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }
             | Request::DuplicateSession { .. } => "session",
-            Request::CloseSession { .. } | Request::DeleteSession { .. } => "ack",
+            Request::CloseSession { .. } | Request::DeleteSession { .. } => "closed",
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
             Request::GetPreviewHistory { .. } => "preview_history",

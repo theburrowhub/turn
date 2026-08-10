@@ -2015,6 +2015,7 @@ fn a_session_row_offers_archiving_and_closing_as_different_acts() {
             session_id: SessionId::from_stored("sess_fixclimbing"),
             name: "Fix climbing bugs".into(),
             running_count: 6,
+            escaped_count: 0,
         })
     );
 }
@@ -2260,6 +2261,7 @@ fn ending_a_session_requires_confirmation_and_requests_process_termination() {
         session_id: session_id.clone(),
         name: "Fix climbing bugs".into(),
         running_count: 6,
+        escaped_count: 0,
     });
     h.run();
     h.snapshot("end_session_confirmation");
@@ -2267,6 +2269,40 @@ fn ending_a_session_requires_confirmation_and_requests_process_termination() {
     h.state_mut().actions.clear();
     h.query_by_label("End session")
         .expect("the destructive action is a visible button")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::CloseSession {
+            session_id,
+            disposition: CloseDisposition::Terminate,
+        }]
+    );
+}
+
+/// The same question when one of the processes cannot be stopped.
+///
+/// Turn used to refuse this outright, so there was no picture to record: a Session with a
+/// survivor of a previous daemon in it could not be ended at all. It can now, and the
+/// difference has to be legible in the dialog rather than only in a log — the extra line says
+/// what will keep running after the button is pressed, and the button still works.
+#[test]
+fn a_session_with_an_unstoppable_process_says_what_ending_it_will_not_achieve() {
+    let fixture = busy_desk();
+    let session_id = fixture.selected.clone().expect("selected Session");
+    let mut h = harness(fixture);
+    h.state_mut().state.lifecycle_confirmation = Some(LifecycleConfirmation::EndSession {
+        session_id: session_id.clone(),
+        name: "Fix climbing bugs".into(),
+        running_count: 6,
+        escaped_count: 2,
+    });
+    h.run();
+    h.snapshot("end_session_confirmation_with_survivors");
+
+    h.state_mut().actions.clear();
+    h.query_by_label("End session")
+        .expect("a process Turn cannot reach does not disable the act")
         .click();
     h.run_steps(1);
     assert_eq!(

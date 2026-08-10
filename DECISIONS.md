@@ -3071,3 +3071,79 @@ naming a command with a consequence belongs, and it keeps its button.
 - **Downside:** this is a product rule reversed under pressure from its owner, on the third
   report. The rule was defensible and the way it was applied was not, and the record should say
   that the owner was right and I was slow.
+
+## ADR-050 — Ending is authoritative: a process Turn cannot stop is reported, never a veto
+
+**Status:** Accepted, implemented. Reverses the refusal added with `ensure_session_processes_stoppable`.
+
+### Context
+
+Choosing "End session" on a Session restored after a daemon restart produced a red banner —
+*"Turn cannot safely stop processes that survived the previous daemon"* — and the Session could not
+be got rid of at all. Retrying did not help; the instruction was to go and stop the process outside
+Turn first, and only then would Turn allow the user to close their own task.
+
+The reasoning behind the refusal was sound as far as it went, and is worth keeping on the record
+because the code was right about the danger and wrong about the remedy. A process restored from a
+previous daemon has a PID-shaped observation and no owned handle. Signalling it blindly is unsafe
+because PIDs are reused, and fabricating its exit would release the checkout write lease while the
+real process may still be writing to the very files the Session was working on. Both are true. The
+conclusion drawn from them — *therefore the Session may not end* — does not follow.
+
+It does not follow because the refusal changes nothing about the danger. The survivor keeps running
+whether Turn refuses or not. Nothing about holding the Session open stops it, warns about it, or
+reaches it. The only thing the refusal preserved was the row in the tree, and the row is what the
+user was trying to be rid of. So the safety was notional and the cost was total: the destructive
+verb, which exists precisely for "I am done with this", stopped working exactly when the daemon had
+had a bad day.
+
+The same guard also blocked `close_workspace` and `delete_workspace`, both of which pre-validated
+every Session before touching the first one. One unreachable process in the fourth Session refused
+the whole Workspace.
+
+### Alternatives considered
+
+**Kill by pid anyway.** Rejected, and this is the part of the original reasoning that survives
+intact. PID reuse means the signal may land on an unrelated process, and Turn would have chosen to
+do that on the user's behalf.
+
+**Fabricate the exit and release the lease.** Rejected for the reason the original comment gives: a
+Session whose lease is released while a real process still writes to the checkout is the
+lost-work scenario the lease exists to prevent. What *is* released is the lease of a Session whose
+processes Turn did stop, which is the ordinary case.
+
+**A second, scarier confirmation — "force end".** Rejected. Two destructive doors for one act, and
+the user has to learn which one their situation is. Ending already asks once; the question can carry
+one more sentence.
+
+### Decision
+
+Ending is authoritative. Past the point where the disposition is known, `close_session` treats
+everything as best-effort: a process it cannot signal, a lease row that will not update, a write
+that will not land. Each is logged; none of them abandons the act. The Session is archived, its row
+leaves the tree, and the two errors that remain are asking about a Session that does not exist and
+`KeepProcesses`, which is not destructive and can afford to be strict.
+
+What replaces the veto is an answer. `Response::Closed { escaped }` is a new result shape carrying
+the processes Turn could not stop, each with its title and last-known pid, and it is what
+`CloseSession`, `DeleteSession`, `CloseWorkspace` and `DeleteWorkspace` now return. The window says
+it twice: `SessionSummary::orphaned_count` lets the confirmation dialog say what ending *will not*
+achieve before the click, and the answer's `escaped` list names the survivors with their pids
+afterwards, because the user's next step is a process list in another terminal.
+
+Nothing claims the orphan died. Its `Lifecycle::Orphaned` is untouched, which is the half of the
+original reasoning that was never in question.
+
+### Consequences
+
+- The destructive verb works when the daemon has had a bad day, which is when it is needed most.
+- A user who ends such a Session is told, in the dialog and again afterwards, that a process may
+  still be running and how to find it.
+- **Downside:** the Session's row is gone while one of its processes may not be. Turn has no place
+  left to show that process, and the honest sentence at the end of the act is the whole of what the
+  user gets. A "processes Turn has lost track of" view would be better and does not exist.
+- **Downside:** the lease is released for a Session that may still have a writer in it. This is a
+  real narrowing of the guarantee, taken deliberately: the alternative was a Workspace permanently
+  locked out of its own checkout by a process nobody can stop.
+- **Downside:** `Response::Ack` no longer answers the close and delete requests, so any client
+  matching on it for those four sees an unhandled shape rather than a compile error.

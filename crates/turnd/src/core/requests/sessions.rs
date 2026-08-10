@@ -9,29 +9,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command as SystemCommand;
 use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    Direction, Layout, Pane, PaneKind, Session, SessionMode, SessionStatus, Template, Workspace,
-    WorkspaceCheckout,
+    Direction, Layout, Pane, PaneKind, Session, SessionMode, Template, Workspace, WorkspaceCheckout,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{
-    CloseDisposition, ErrorCode, NewPane, ProtoError, Response, ServerEvent, TemplateSummary,
+    CloseDisposition, ErrorCode, EscapedProcess, NewPane, ProtoError, Response, ServerEvent,
+    TemplateSummary,
 };
 
 impl Core {
-    /// Proves that a destructive close can actually signal every process it would claim
-    /// to stop. A restored orphan has a PID-shaped observation but no owned handle; PID
-    /// reuse makes signalling it blindly unsafe, and fabricating an exit would release
-    /// checkout authority while the real process may still be writing.
-    pub(crate) fn ensure_session_processes_stoppable(
+    /// The processes in this Session that a destructive close cannot signal, and that may
+    /// therefore still be alive once it is over.
+    ///
+    /// A restored orphan has a PID-shaped observation but no owned handle. PID reuse makes
+    /// signalling it blindly a coin flip on somebody else's process, and fabricating an
+    /// exit would release checkout authority while the real process may still be writing.
+    /// So Turn does neither: it names them.
+    ///
+    /// **This used to refuse the close.** It returned `Conflict` — "Turn cannot safely stop
+    /// processes that survived the previous daemon" — and the user was left holding a
+    /// Session they had already finished with, told to go and fix the daemon's problem
+    /// before they were allowed to be rid of it. Ending a Session is the user saying it is
+    /// over, and Turn declining to believe them in the name of safety protected nothing:
+    /// the survivor kept running either way, and the only thing the refusal preserved was
+    /// the row in the tree. What is owed here is an honest sentence, not a veto.
+    pub(crate) fn escaped_session_processes(
         &self,
         id: &SessionId,
         disposition: CloseDisposition,
-    ) -> Result<(), ProtoError> {
+    ) -> Vec<EscapedProcess> {
         if disposition == CloseDisposition::KeepProcesses {
-            return Ok(());
+            return Vec::new();
         }
-        let session = self.session(id)?;
-        let unreachable: Vec<String> = session
+        let Ok(session) = self.session(id) else {
+            return Vec::new();
+        };
+        session
             .tree
             .iter()
             .filter(|node| {
@@ -49,19 +62,13 @@ impl Core {
                 // group; Turn must not claim it died merely because the parent did.
                 node.lifecycle == Lifecycle::Orphaned || node.pid.is_some()
             })
-            .map(|node| format!("{} ({})", node.title, node.id))
-            .collect();
-        if unreachable.is_empty() {
-            return Ok(());
-        }
-        Err(ProtoError::new(
-            ErrorCode::Conflict,
-            "Turn cannot safely stop processes that survived the previous daemon",
-        )
-        .with_detail(format!(
-            "Stop these processes outside Turn, then retry: {}",
-            unreachable.join(", ")
-        )))
+            .map(|node| EscapedProcess {
+                node_id: node.id.clone(),
+                session_id: id.clone(),
+                title: node.title.clone(),
+                pid: node.pid,
+            })
+            .collect()
     }
 
     /// Proves that one Pane's exact runtime can be signalled before removing its view.
@@ -763,16 +770,23 @@ impl Core {
     ///
     /// * `KeepProcesses` detaches the clients and leaves everything running. The
     ///   session stays in the list; reopening it re-attaches to the same ptys.
-    /// * `Terminate` and `Kill` stop the processes and park the session as paused. It
-    ///   stays on disk and in the list, because a stopped session is still a task the
-    ///   user was working on — filing it away is [`Self::archive_session`].
+    /// * `Terminate` and `Kill` stop what Turn can reach, archive the Session, and answer
+    ///   with the processes they could not reach.
+    ///
+    /// **`Terminate` and `Kill` cannot fail on the user's behalf.** Past the point where
+    /// the disposition is known, everything after it is best-effort: a process that cannot
+    /// be signalled, a write that will not land, a lease row that will not update. Each is
+    /// logged and none of them abandons the act, because a half-ended Session is worse
+    /// than either outcome and the user has already said what they want. The two things
+    /// that still return an error are asking about a Session that does not exist, and
+    /// `KeepProcesses`, which is not destructive and can therefore afford to be strict.
     pub(super) fn close_session(
         &mut self,
         id: &SessionId,
         disposition: CloseDisposition,
         now_ms: i64,
     ) -> Answer {
-        self.ensure_session_processes_stoppable(id, disposition)?;
+        let mut escaped = self.escaped_session_processes(id, disposition);
         let session = self.session(id)?;
         let panes: Vec<turn_core::ids::PaneId> = session
             .layout
@@ -791,7 +805,11 @@ impl Core {
         for pane in &panes {
             self.detach_everyone(id, pane);
         }
-        self.clear_session_temporary_bindings(id, now_ms)?;
+        if disposition == CloseDisposition::KeepProcesses {
+            self.clear_session_temporary_bindings(id, now_ms)?;
+        } else if let Err(error) = self.clear_session_temporary_bindings(id, now_ms) {
+            tracing::warn!(%error, session = %id, "could not clear temporary bindings while ending");
+        }
         for node in &nodes {
             self.stop_pump_if_unwatched(node);
         }
@@ -812,34 +830,13 @@ impl Core {
                         now_ms,
                     );
                 }
-                let remaining: Vec<String> = self
-                    .session(id)?
-                    .tree
-                    .iter()
-                    .filter(|node| node.is_running())
-                    .map(|node| format!("{} ({})", node.title, node.id))
-                    .collect();
-                if let Ok(session) = self.session_mut(id) {
-                    if session.status != SessionStatus::Archived {
-                        session.status = if remaining.is_empty() {
-                            SessionStatus::Paused
-                        } else {
-                            SessionStatus::Active
-                        };
-                    }
-                }
-                if !remaining.is_empty() {
-                    self.persist_session(id)?;
-                    self.push_session_state(id, now_ms);
-                    return Err(ProtoError::new(
-                        ErrorCode::Conflict,
-                        "Some child processes are still running outside Turn",
-                    )
-                    .with_detail(format!(
-                        "Stop these processes outside Turn, then retry: {}",
-                        remaining.join(", ")
-                    )));
-                }
+                // Whatever is still running now is a process Turn asked to stop and could
+                // not, or one it never had a handle on. Either way it goes in the answer
+                // rather than into an error: this used to `return Err` here, which left
+                // the Session parked as `Active` with its row back in the tree — the
+                // exact state the user had just asked to be rid of, restored on their
+                // behalf as a safety measure that made nothing safer.
+                merge_escaped(&mut escaped, self.still_running(id));
                 let restore_update = self.resolve_restore_session(id);
                 // The injected agent configuration goes with the processes it was
                 // written for. Nothing will read it again, and a settings file naming a
@@ -861,20 +858,60 @@ impl Core {
                 if let Ok(session) = self.session_mut(id) {
                     session.archive();
                 }
-                let workspace_id = self.session(id)?.workspace_id.clone();
-                self.clear_session_temporary_bindings(id, now_ms)?;
-                self.persist_session(id)?;
-                self.push_all(ServerEvent::SessionRemoved {
-                    session_id: id.clone(),
-                    workspace_id,
-                });
+                let workspace_id = self
+                    .session(id)
+                    .map(|session| session.workspace_id.clone())
+                    .ok();
+                if let Err(error) = self.clear_session_temporary_bindings(id, now_ms) {
+                    tracing::warn!(%error, session = %id, "could not clear temporary bindings while ending");
+                }
+                // A Session that will not persist has still ended. The window is told
+                // either way, so the row leaves the tree now rather than after a restart
+                // that may never come — and if the write really is broken the user finds
+                // out from the log and from every other operation, not by being refused
+                // the one thing they asked for.
+                if let Err(error) = self.persist_session(id) {
+                    tracing::error!(%error, session = %id, "ended a Session that would not persist");
+                }
+                if let Some(workspace_id) = workspace_id {
+                    self.push_all(ServerEvent::SessionRemoved {
+                        session_id: id.clone(),
+                        workspace_id,
+                    });
+                }
                 self.push_session_state(id, now_ms);
                 if let Some(update) = restore_update {
                     self.push_all(update);
                 }
+                if !escaped.is_empty() {
+                    tracing::warn!(
+                        session = %id,
+                        escaped = escaped.len(),
+                        "ended a Session with processes Turn could not stop"
+                    );
+                }
             }
         }
-        Ok(Response::Ack)
+        Ok(Response::Closed { escaped })
+    }
+
+    /// The Session's processes that are still marked running, as things that may have
+    /// survived it. Read after the stop attempts, so it is the leftovers.
+    fn still_running(&self, id: &SessionId) -> Vec<EscapedProcess> {
+        let Ok(session) = self.session(id) else {
+            return Vec::new();
+        };
+        session
+            .tree
+            .iter()
+            .filter(|node| node.is_running())
+            .map(|node| EscapedProcess {
+                node_id: node.id.clone(),
+                session_id: id.clone(),
+                title: node.title.clone(),
+                pid: node.pid,
+            })
+            .collect()
     }
 
     /// Releases the primary-checkout write lease this Session holds, if it holds one.
@@ -964,16 +1001,23 @@ impl Core {
         let Ok(session) = self.session(id) else {
             // Already gone. Said plainly rather than as an error, so a retry is not a failure.
             tracing::info!(session = %id, "delete asked for a Session that is already gone");
-            return Ok(Response::Ack);
+            return Ok(Response::Closed {
+                escaped: Vec::new(),
+            });
         };
         let workspace_id = session.workspace_id.clone();
         let name = session.name.clone();
         let nodes: Vec<turn_core::ids::NodeId> =
             session.tree.iter().map(|node| node.id.clone()).collect();
 
-        // Stops the processes, detaches every client and removes the scratch directory. It
-        // refuses if anything cannot be stopped, and that refusal is this one too.
-        self.close_session(id, disposition, now_ms)?;
+        // Stops the processes, detaches every client and removes the scratch directory. What
+        // it could not stop it names, and that report is this one too: a Session being
+        // forgotten is the last moment anything can tell the user about a process of its
+        // that is still alive, because afterwards nothing in Turn names it.
+        let escaped = match self.close_session(id, disposition, now_ms)? {
+            Response::Closed { escaped } => escaped,
+            _ => Vec::new(),
+        };
 
         self.store.sessions().delete(id).map_err(store)?;
         self.sessions.remove(id);
@@ -990,7 +1034,7 @@ impl Core {
         });
         self.bump_hierarchy();
         self.push_hierarchy_all(now_ms);
-        Ok(Response::Ack)
+        Ok(Response::Closed { escaped })
     }
 
     /// Captures a session's current arrangement as a template.
@@ -1076,6 +1120,23 @@ impl Core {
         Ok(Response::Session {
             session: Box::new(session),
         })
+    }
+}
+
+/// Adds processes to an escaped list without repeating a node already in it.
+///
+/// The two ways a process survives an end overlap: one that was already out of reach
+/// before the attempt is also, necessarily, still running after it. Naming it twice in the
+/// sentence the user reads would make Turn look like it does not know what it is talking
+/// about.
+pub(crate) fn merge_escaped(into: &mut Vec<EscapedProcess>, more: Vec<EscapedProcess>) {
+    for process in more {
+        if !into
+            .iter()
+            .any(|known| known.node_id == process.node_id && known.session_id == process.session_id)
+        {
+            into.push(process);
+        }
     }
 }
 
@@ -1476,7 +1537,7 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::ids::PaneId;
-    use turn_core::model::ProcessNode;
+    use turn_core::model::{ProcessNode, SessionStatus};
     use turn_core::state::Lifecycle;
     use turn_proto::{Request, ServerMessage};
 
@@ -1491,8 +1552,19 @@ mod tests {
             .collect()
     }
 
+    /// Ending a Session with a process from a previous daemon in it ends the Session.
+    ///
+    /// Reported from the window: the red banner said "Turn cannot safely stop processes that
+    /// survived the previous daemon" and the Session could not be got rid of at all. The
+    /// safety being protected was real but the trade was not — the survivor kept running
+    /// whether Turn refused or not, so the only thing the refusal preserved was a row its
+    /// owner had finished with, and the user was told to go and fix the daemon's problem
+    /// before they were allowed to close their own task.
+    ///
+    /// So the act goes through, and the two halves of the honesty it owes are both kept:
+    /// nothing claims the orphan died, and the answer names it.
     #[tokio::test]
-    async fn closing_a_session_never_fabricates_the_death_of_an_uncontrolled_orphan() {
+    async fn ending_a_session_with_a_process_from_a_previous_daemon_still_ends_it() {
         let mut harness = Harness::new().await;
         let session_id = SessionId::from_stored("sess_orphan_close_guard");
         let pane_id = PaneId::from_stored("pane_orphan_close_guard");
@@ -1514,11 +1586,23 @@ mod tests {
             .tree
             .insert(orphan);
 
-        let error = harness
+        let answer = harness
             .core
             .close_session(&session_id, CloseDisposition::Terminate, 11)
-            .expect_err("an unowned PID cannot be claimed as terminated");
-        assert_eq!(error.code, ErrorCode::Conflict);
+            .expect("a process Turn cannot reach does not veto the user's own decision");
+
+        // Named, with its pid, because the user's next step is a process list in another
+        // terminal and the pid is what they will search for.
+        let Response::Closed { escaped } = answer else {
+            panic!("ending answers with what it could not stop: {answer:?}");
+        };
+        assert_eq!(escaped.len(), 1, "exactly the survivor: {escaped:?}");
+        assert_eq!(escaped[0].node_id, orphan_id);
+        assert_eq!(escaped[0].pid, Some(424_242));
+
+        // And still not claimed dead. Fabricating the exit is the one thing that was never
+        // on the table: it would release checkout authority while the real process may
+        // still be writing to the very files this Session was working on.
         assert_eq!(
             harness.core.sessions[&session_id]
                 .tree
@@ -1526,6 +1610,182 @@ mod tests {
                 .unwrap()
                 .lifecycle,
             Lifecycle::Orphaned
+        );
+        // The row leaves the tree, which is what the user asked for and what the refusal
+        // used to prevent.
+        assert_eq!(
+            harness.core.sessions[&session_id].status,
+            SessionStatus::Archived
+        );
+    }
+
+    /// The same thing with a process that is genuinely running, and genuinely out of reach.
+    ///
+    /// The test above builds the orphan by hand, which proves the branch and not the claim.
+    /// This one spawns a real process on a real pty and then drops the handle to it, which is
+    /// exactly the state a daemon restart leaves behind: the process is in the process table,
+    /// Turn knows its pid, and Turn cannot signal it. Ending the Session has to work, and it
+    /// has to be honest — the process is still alive afterwards, and Turn says so.
+    #[tokio::test]
+    async fn a_process_that_outlived_its_daemon_is_named_rather_than_claimed_dead() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_real_survivor");
+        let pane_id = PaneId::from_stored("pane_real_survivor");
+        harness.add_session(session_id.clone(), pane_id.clone(), 10);
+        let node_id = harness.spawn_process(&session_id, &pane_id, 10).await;
+        let pid = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap()
+            .pid
+            .expect("a spawned process has a pid");
+
+        // Losing the handle while the process lives on is what a restart does. Held in a
+        // local rather than dropped, and that detail is the whole fidelity of the test: the
+        // pty's file descriptor has to stay open somewhere, because dropping it closes the
+        // terminal and the process dies of that instead of surviving. After a real restart
+        // it stays open in the kernel's books alone. Here it stays open out of the Core's
+        // reach, which is the property being tested — `processes` has no entry for this
+        // node, so nothing `close_session` does can signal it.
+        let _survivor = harness.core.processes.remove(&node_id);
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&node_id)
+            .unwrap()
+            .lifecycle = Lifecycle::Orphaned;
+        assert!(
+            alive(pid),
+            "the survivor is running before we end its Session"
+        );
+
+        let answer = harness
+            .core
+            .close_session(&session_id, CloseDisposition::Terminate, 11)
+            .expect("ending is the user's decision, not the daemon's");
+
+        let Response::Closed { escaped } = answer else {
+            panic!("ending answers with what it could not stop: {answer:?}");
+        };
+        assert_eq!(escaped.len(), 1, "the survivor, named: {escaped:?}");
+        assert_eq!(escaped[0].pid, Some(pid));
+        assert_eq!(
+            harness.core.sessions[&session_id].status,
+            SessionStatus::Archived,
+            "the Session ends whether or not its runaway process does"
+        );
+        assert!(
+            alive(pid),
+            "and nothing pretended otherwise: pid {pid} is still there, which is why the \
+             answer names it"
+        );
+
+        // Left running would be a test that leaks a process per run.
+        unsafe { kill(pid as i32, 9) };
+    }
+
+    /// A write that will not land does not cancel the end either.
+    ///
+    /// The other half of the same principle, and the one that is easier to get wrong because
+    /// it reads as diligence: `persist_session` returns an error when the Session has an
+    /// event checkpoint stuck behind a failed disk write, and `close_session` used to pass
+    /// that up with a `?`. The user would then be refused the act *and* left with the row,
+    /// on account of a storage problem they cannot see and did not cause. Ending is not
+    /// conditional on the record of it succeeding.
+    #[tokio::test]
+    async fn a_store_that_will_not_take_the_write_does_not_cancel_the_end() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_unwritable");
+        let pane_id = PaneId::from_stored("pane_unwritable");
+        harness.add_session(session_id.clone(), pane_id, 10);
+
+        // The daemon's own "this Session cannot be written right now" state, put there the
+        // way a failed ingest would: every later write for it is deferred and refused.
+        harness
+            .core
+            .failed_ingest_checkpoints
+            .push_back(crate::core::FailedIngestCheckpoint {
+                event: turn_core::event::TurnEvent::new(
+                    session_id.clone(),
+                    turn_core::event::EventKind::ProcessExited { code: 0 },
+                    turn_core::event::EventSource::Supervisor,
+                    turn_core::event::Confidence::Explicit,
+                    10,
+                ),
+                effects: Vec::new(),
+            });
+        assert!(
+            harness.core.persist_session(&session_id).is_err(),
+            "the premise of the test: this Session cannot be persisted"
+        );
+
+        harness
+            .core
+            .close_session(&session_id, CloseDisposition::Terminate, 11)
+            .expect("a Session that will not persist has still ended");
+        assert_eq!(
+            harness.core.sessions[&session_id].status,
+            SessionStatus::Archived,
+            "and the window is told so, rather than being handed back the row"
+        );
+    }
+
+    /// Signal 0 asks the kernel whether a process exists without touching it.
+    fn alive(pid: u32) -> bool {
+        unsafe { kill(pid as i32, 0) == 0 }
+    }
+
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    /// And it stays gone across a restart of the daemon.
+    ///
+    /// The acceptance criterion of the report, and not implied by the assertion above: a
+    /// Session archived only in memory would come back the next time `turnd` started, with
+    /// the same orphan in it and the same banner on top of it.
+    #[tokio::test]
+    async fn a_session_ended_with_an_orphan_in_it_does_not_come_back() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_orphan_close_durable");
+        let pane_id = PaneId::from_stored("pane_orphan_close_durable");
+        harness.add_session(session_id.clone(), pane_id, 10);
+        let mut orphan = ProcessNode::process(
+            session_id.clone(),
+            turn_core::model::NodeKind::Shell,
+            "sh",
+            "/tmp",
+            10,
+        );
+        orphan.lifecycle = Lifecycle::Orphaned;
+        orphan.pid = Some(424_243);
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(orphan);
+
+        harness
+            .core
+            .close_session(&session_id, CloseDisposition::Terminate, 11)
+            .expect("ending is authoritative");
+
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .expect("the store can be read")
+            .expect("the Session is still on disk, archived rather than forgotten");
+        assert_eq!(
+            stored.status,
+            SessionStatus::Archived,
+            "an end that only happened in memory is an end that undoes itself on restart"
         );
     }
 
@@ -1555,7 +1815,13 @@ mod tests {
             .core
             .close_session(&session_id, CloseDisposition::Terminate, 12)
             .expect("the owned parent is the stoppable runtime boundary");
-        assert_eq!(answer, Response::Ack);
+        assert_eq!(
+            answer,
+            Response::Closed {
+                escaped: Vec::new()
+            },
+            "everything here was reachable, so nothing is reported as surviving"
+        );
         assert!(!harness.core.processes.contains_key(&parent_id));
         let session = &harness.core.sessions[&session_id];
         // Ending takes the row out of the tree. It used to leave it `Paused` — stopped, but

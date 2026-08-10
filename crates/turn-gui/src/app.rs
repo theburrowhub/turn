@@ -934,6 +934,7 @@ mod tests {
                 session_id: session_id.clone(),
                 name: "Rotate the certificates".into(),
                 running_count: 1,
+                escaped_count: 0,
             }),
             "the chord asks about the row the tree has selected"
         );
@@ -948,6 +949,7 @@ mod tests {
                 session_count: 1,
                 running_sessions: 1,
                 running_processes: 1,
+                escaped_count: 0,
             }),
             "and the Workspace one says how much of the world it would reach"
         );

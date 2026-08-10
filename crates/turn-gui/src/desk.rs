@@ -32,10 +32,10 @@ use turn_core::model::{
 use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
 use turn_proto::{
-    AttentionView, CloseDisposition, ContextHandoffText, ContextHandoffView, FocusTarget,
-    HierarchyKey, HierarchySnapshot, NewPane, NodePaneCapability, NodePaneView, ProtoErrorContext,
-    PtySize, Request, Response, SessionConflictAlternative, SessionSummary, TemplateSummary,
-    TerminalBytes, TreeNodeView, WorkspaceSummary,
+    AttentionView, CloseDisposition, ContextHandoffText, ContextHandoffView, EscapedProcess,
+    FocusTarget, HierarchyKey, HierarchySnapshot, NewPane, NodePaneCapability, NodePaneView,
+    ProtoErrorContext, PtySize, Request, Response, SessionConflictAlternative, SessionSummary,
+    TemplateSummary, TerminalBytes, TreeNodeView, WorkspaceSummary,
 };
 
 use crate::announce::Announcement;
@@ -295,6 +295,42 @@ impl Desk {
     /// guards (for example Quick New before templates arrive) use this path.
     pub fn show_notice(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
+    }
+
+    /// Says which processes may have outlived the thing that was just ended.
+    ///
+    /// The act succeeded — that is why this arrives with a response rather than an error —
+    /// so the sentence has to carry both halves without hedging either. It names the
+    /// processes and their pids, because the user's next step is a process list in another
+    /// terminal and a name they can search for is the whole value of the message.
+    ///
+    /// Empty in the ordinary case, which is most of them: this is the report of a Session
+    /// that had a process from a previous daemon still alive in it.
+    fn report_escaped(&mut self, escaped: &[EscapedProcess]) -> Vec<Reaction> {
+        if escaped.is_empty() {
+            return Vec::new();
+        }
+        let named: Vec<String> = escaped
+            .iter()
+            .map(|process| match process.pid {
+                Some(pid) => format!("{} (pid {pid})", process.title),
+                None => process.title.clone(),
+            })
+            .collect();
+        let message = if named.len() == 1 {
+            format!(
+                "ended · Turn could not stop {}, which may still be running outside it",
+                named[0]
+            )
+        } else {
+            format!(
+                "ended · Turn could not stop {} processes, which may still be running outside it: {}",
+                named.len(),
+                named.join(", ")
+            )
+        };
+        self.notice = Some(message.clone());
+        vec![Reaction::Notice(message)]
     }
 
     pub fn new_session_draft(&self) -> Option<SessionDraft> {
@@ -785,12 +821,14 @@ impl Desk {
                     session_id,
                     disposition,
                 },
-                Response::Ack,
+                Response::Closed { escaped },
             ) => {
+                let survivors = self.report_escaped(&escaped);
                 self.drop_session_feeds(&session_id);
                 if disposition != CloseDisposition::KeepProcesses {
                     self.restores.remove(&session_id);
                 }
+                let mut reactions = survivors;
                 if disposition == CloseDisposition::KeepProcesses
                     && self.selected.as_ref() == Some(&session_id)
                 {
@@ -801,25 +839,27 @@ impl Desk {
                         .find(|session| session.id != session_id)
                         .map(|session| session.id.clone())
                     {
-                        return self.select(next);
+                        reactions.extend(self.select(next));
+                        return reactions;
                     }
-                    return vec![Reaction::Send {
+                    reactions.push(Reaction::Send {
                         ask: Ask::Action("clearing the detached Session selection"),
                         request: Request::SelectTreeNode {
                             surface_id: self.surface_id.clone(),
                             selected: None,
                         },
-                    }];
+                    });
                 }
-                Vec::new()
+                reactions
             }
             (
                 Ask::CloseWorkspace {
                     workspace_id,
                     disposition,
                 },
-                Response::Ack,
+                Response::Closed { escaped },
             ) => {
+                let survivors = self.report_escaped(&escaped);
                 let sessions: HashSet<SessionId> = self
                     .hierarchy
                     .as_ref()
@@ -848,14 +888,15 @@ impl Desk {
                     .selected
                     .as_ref()
                     .is_some_and(|session_id| sessions.contains(session_id));
-                let mut reactions = vec![Reaction::Send {
+                let mut reactions = survivors;
+                reactions.push(Reaction::Send {
                     ask: Ask::Action("collapsing the stopped Workspace"),
                     request: Request::SetTreeExpanded {
                         surface_id: self.surface_id.clone(),
                         key: HierarchyKey::workspace(workspace_id.clone()),
                         expanded: false,
                     },
-                }];
+                });
                 if selected_closed {
                     self.selected = None;
                     if let Some(next) = self.hierarchy.as_ref().and_then(|snapshot| {
@@ -4741,6 +4782,7 @@ mod tests {
                 session_id: session.id.clone(),
                 name: "Keep my work".into(),
                 running_count: 1,
+                escaped_count: 0,
             }
         );
 
@@ -4760,6 +4802,117 @@ mod tests {
             }] => assert_eq!(session_id, &session.id),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// A Session with a process from a previous daemon in it can be ended, and the question
+    /// says what ending it will not achieve.
+    ///
+    /// Reported from the window: the red banner read "Turn cannot safely stop processes that
+    /// survived the previous daemon" and the Session could not be got rid of at all. The
+    /// daemon no longer refuses, so what the window owes is the sentence — before the click,
+    /// counted from the daemon's own summary rather than from a tree this window may not hold
+    /// for the row the user right-clicked.
+    #[test]
+    fn a_session_holding_an_unstoppable_process_can_still_be_ended_and_says_so() {
+        let (mut session, _, node_id) = session_with_agent("Ended by its owner");
+        if let Some(node) = session.tree.get_mut(&node_id) {
+            node.lifecycle = Lifecycle::Orphaned;
+            node.pid = Some(424_242);
+        }
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+
+        assert_eq!(
+            desk.end_session_confirmation()
+                .expect("nothing about a survivor stops the question being asked"),
+            LifecycleConfirmation::EndSession {
+                session_id: session.id.clone(),
+                name: "Ended by its owner".into(),
+                running_count: 1,
+                escaped_count: 1,
+            },
+            "the count of what cannot be stopped travels with the summary"
+        );
+    }
+
+    /// And afterwards it says which process may still be out there.
+    ///
+    /// The act succeeded — that is why this arrives as an answer and not a failure — so the
+    /// message cannot be an error, and it cannot be silence either. It names the process and
+    /// its pid, because what the user does next is look for it in another terminal.
+    #[test]
+    fn ending_a_session_reports_the_process_it_could_not_stop() {
+        let (session, _, node_id) = session_with_agent("Ended by its owner");
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::CloseSession {
+                    session_id: session.id.clone(),
+                    disposition: CloseDisposition::Terminate,
+                },
+                response: Box::new(Response::Closed {
+                    escaped: vec![turn_proto::EscapedProcess {
+                        node_id,
+                        session_id: session.id.clone(),
+                        title: "npm run dev".into(),
+                        pid: Some(424_242),
+                    }],
+                }),
+            },
+            T0,
+        );
+
+        match reactions
+            .iter()
+            .find(|reaction| matches!(reaction, Reaction::Notice(_)))
+        {
+            Some(Reaction::Notice(message)) => {
+                assert!(message.contains("npm run dev"), "got {message}");
+                assert!(
+                    message.contains("424242") || message.contains("424_242"),
+                    "the pid is what the user searches for: {message}"
+                );
+                assert!(
+                    message.contains("could not stop"),
+                    "and it says whose fault the leftover is: {message}"
+                );
+            }
+            _ => panic!("a surviving process has to be said out loud: {reactions:?}"),
+        }
+    }
+
+    /// The ordinary case stays quiet. Nearly every end has nothing to report, and a window
+    /// that put a line in the status bar after each one would train the user past the line
+    /// that matters.
+    #[test]
+    fn an_end_with_nothing_left_running_says_nothing() {
+        let (session, _, _) = session_with_agent("Ended cleanly");
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::CloseSession {
+                    session_id: session.id,
+                    disposition: CloseDisposition::Terminate,
+                },
+                response: Box::new(Response::Closed {
+                    escaped: Vec::new(),
+                }),
+            },
+            T0,
+        );
+        assert!(
+            !reactions
+                .iter()
+                .any(|reaction| matches!(reaction, Reaction::Notice(_))),
+            "got {reactions:?}"
+        );
     }
 
     /// Taking a row out of the tree is not stopping the work in it. Nothing in the archive
@@ -4924,6 +5077,7 @@ mod tests {
                 session_id: other.id.clone(),
                 name: "Selected in the tree".into(),
                 running_count: 1,
+                escaped_count: 0,
             }
         );
 
@@ -4961,6 +5115,7 @@ mod tests {
                 session_count: 3,
                 running_sessions: 2,
                 running_processes: 2,
+                escaped_count: 0,
             }
         );
     }

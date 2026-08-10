@@ -80,12 +80,44 @@ pub struct PaneAttachment {
     pub next_seq: u64,
 }
 
+/// A process Turn stopped short of and that may still be alive.
+///
+/// Ending a Session is authoritative: it does not fail because one of its processes
+/// escaped the daemon that started it. But it must not pretend either. A survivor of a
+/// previous daemon has a PID-shaped observation and no owned handle, so Turn can neither
+/// signal it safely — PID reuse makes that a coin flip on somebody else's process — nor
+/// claim it exited. What it can do is name it, and let the user go and look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct EscapedProcess {
+    pub node_id: NodeId,
+    pub session_id: SessionId,
+    /// What the row was called in the tree, so the sentence the user reads names the
+    /// same thing they were looking at.
+    pub title: String,
+    /// The last PID observed for it, when one was. `None` for a node whose runtime was
+    /// only ever known through a pty the previous daemon owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
 /// A successful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     /// The request succeeded and has nothing to report.
     Ack,
+
+    /// Something was closed, ended or deleted, and it happened.
+    ///
+    /// Separate from [`Response::Ack`] because ending is destructive and authoritative,
+    /// and the honest report of it has two halves: it is done, *and* these processes may
+    /// still be running. Turn used to refuse the whole act when it could not guarantee
+    /// the second half was empty, which left the user holding a Session they had already
+    /// finished with and no way to be rid of it. `escaped` is empty in the ordinary case.
+    Closed {
+        escaped: Vec<EscapedProcess>,
+    },
 
     Workspaces {
         workspaces: Vec<WorkspaceSummary>,
@@ -247,6 +279,7 @@ impl Response {
     pub fn result_name(&self) -> &'static str {
         match self {
             Response::Ack => "ack",
+            Response::Closed { .. } => "closed",
             Response::Workspaces { .. } => "workspaces",
             Response::Workspace { .. } => "workspace",
             Response::Hierarchy { .. } => "hierarchy",
@@ -279,6 +312,7 @@ impl Response {
     /// mapping is complete.
     pub const RESULT_NAMES: &'static [&'static str] = &[
         "ack",
+        "closed",
         "workspaces",
         "workspace",
         "hierarchy",
@@ -521,9 +555,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 26 result shapes. Asserted so adding one without documenting it in
+        // 27 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 26, "the response catalogue changed size");
+        assert_eq!(declared.len(), 27, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -565,6 +599,14 @@ pub(crate) mod tests {
 
         vec![
             Response::Ack,
+            Response::Closed {
+                escaped: vec![EscapedProcess {
+                    node_id: node_id.clone(),
+                    session_id: s.id.clone(),
+                    title: "npm run dev".into(),
+                    pid: Some(4821),
+                }],
+            },
             Response::Workspaces {
                 workspaces: vec![workspace.clone()],
             },

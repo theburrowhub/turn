@@ -508,14 +508,22 @@ resolved runtime Pane.
 | `rename_workspace` | `workspace_id`, `name` | `workspace` |
 | `archive_workspace` | `workspace_id`, `archived` | `workspace` |
 | `duplicate_workspace` | `workspace_id`, `name?` — settings only, no sessions | `workspace` |
-| `close_workspace` | `workspace_id`, `disposition` | `ack` |
-| `delete_workspace` | `workspace_id`, `disposition` | `ack` |
+| `close_workspace` | `workspace_id`, `disposition` | `closed` |
+| `delete_workspace` | `workspace_id`, `disposition` | `closed` |
 | `get_workspace_write_lease` | `workspace_id` | `workspace_write_lease` |
 | `acquire_workspace_write_lease` | `workspace_id`, `session_id`, `checkout_id` | `workspace_write_lease` |
 | `release_workspace_write_lease` | `workspace_id`, `lease_id`, `expected_generation` | `workspace_write_lease` |
 
 `archive_*` takes a flag rather than existing as two operations, so undo is the
 same code path as do.
+
+The four destructive operations answer `closed` rather than `ack`, and the difference is the point:
+`closed` carries `escaped`, the processes Turn could not stop. A destructive act is authoritative — it
+does not fail because a process survived the daemon that started it, since refusing would leave that
+process running anyway and the user holding a Session they had finished with (ADR-050). `escaped` is
+empty in the ordinary case; each entry names `node_id`, `session_id`, `title` and the last observed
+`pid`, which is what a user needs in order to find it in a process list. Nothing in that path claims
+the process exited: its `Lifecycle` stays `orphaned`.
 
 ### Sessions
 
@@ -531,8 +539,8 @@ same code path as do.
 | `rename_session` | `session_id`, `name` | `session` |
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
-| `close_session` | `session_id`, `disposition` | `ack` |
-| `delete_session` | `session_id`, `disposition` | `ack` |
+| `close_session` | `session_id`, `disposition` | `closed` |
+| `delete_session` | `session_id`, `disposition` | `closed` |
 | `get_session` | `session_id` | `session_details` |
 | `get_process_tree` | `session_id` | `tree` |
 
@@ -1296,9 +1304,12 @@ Derived state — **the client renders these, it never computes them**:
 | `severity` | Ranking weight, so a client sorting locally sorts as the daemon would |
 | `needs_user` | Whether the runtime tree itself is blocked on the human; `badge_count` independently exposes exact or scoped Attention |
 
-Counts: `subagent_count`, `running_count`, `node_count`, `pane_count`. Subagents
+Counts: `subagent_count`, `running_count`, `orphaned_count`, `node_count`, `pane_count`. Subagents
 and running processes are counted separately because "the agent finished its turn"
-and "nothing is running any more" are different claims.
+and "nothing is running any more" are different claims. `orphaned_count` is the subset of
+`running_count` that survived a previous daemon and that Turn cannot stop; it travels with the summary
+so a confirmation dialog for any row can say what ending it will not achieve without holding that
+Session's whole tree.
 
 Timing: `idle_ms` (never negative, even under clock skew), `last_activity_ms`,
 `created_ms`.

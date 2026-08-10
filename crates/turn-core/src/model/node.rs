@@ -435,6 +435,19 @@ impl SessionTree {
         self.iter().filter(|n| n.is_running()).count()
     }
 
+    /// Processes that outlived the daemon that started them.
+    ///
+    /// Counted separately from `running_count` because the difference is what the user can
+    /// do about them: a running process can be stopped by ending its Session, and one of
+    /// these cannot be stopped by Turn at all. Any surface offering a destructive act has
+    /// to say so before the user commits to it, which means the count has to travel with
+    /// the summary rather than being recomputed from a tree the window may not hold.
+    pub fn orphaned_count(&self) -> usize {
+        self.iter()
+            .filter(|n| n.lifecycle == Lifecycle::Orphaned)
+            .count()
+    }
+
     /// The session's aggregate state: the most severe of its running nodes.
     ///
     /// Severity rather than recency, because a session with one failure and nine
