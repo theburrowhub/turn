@@ -934,6 +934,47 @@ async fn stopping_an_orphan_outside_turn_unblocks_recovery_without_another_resta
 /// Ending the Session through the public protocol must still succeed, name the survivor,
 /// hide the Session immediately and persist that decision so a third daemon does not put
 /// the row back. The external process remains alive until the test explicitly cleans it up.
+struct ChildCleanupGuard(Option<std::process::Child>);
+
+impl ChildCleanupGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn id(&self) -> u32 {
+        self.0.as_ref().expect("the guarded child").id()
+    }
+
+    fn assert_running(&mut self, context: &str) {
+        let status = self
+            .0
+            .as_mut()
+            .expect("the guarded child")
+            .try_wait()
+            .expect("the guarded child's status");
+        assert!(status.is_none(), "{context}; child exited with {status:?}");
+    }
+
+    fn cleanup(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+impl Drop for ChildCleanupGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ending_a_restored_orphan_stays_ended_after_another_daemon_restart() {
     let daemon = TestDaemon::start().await;
@@ -948,18 +989,17 @@ async fn ending_a_restored_orphan_stays_ended_after_another_daemon_restart() {
         .find(|pane| pane.kind == PaneKind::Shell)
         .and_then(|pane| pane.node_id.clone())
         .expect("the shell Pane's runtime node");
-    let mut survivor = std::process::Command::new("sleep")
-        .arg("300")
-        .spawn()
-        .expect("a process that will outlive its original daemon");
-    assert!(pid_is_alive(survivor.id()));
+    let mut survivor = ChildCleanupGuard::new(
+        std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("a process that will outlive its original daemon"),
+    );
+    survivor.assert_running("the external process must start alive");
     drop(ui);
 
     let dir = daemon.stop().await;
-    assert!(
-        pid_is_alive(survivor.id()),
-        "the external process genuinely survived the first daemon"
-    );
+    survivor.assert_running("the external process genuinely survived the first daemon");
     {
         let store = turn_store::Store::open_in(dir.path()).expect("the store must reopen");
         let mut session = store
@@ -1011,9 +1051,8 @@ async fn ending_a_restored_orphan_stays_ended_after_another_daemon_restart() {
     assert_eq!(escaped.len(), 1, "only the restored orphan survives");
     assert_eq!(escaped[0].node_id, node_id);
     assert_eq!(escaped[0].pid, Some(survivor.id()));
-    assert!(
-        pid_is_alive(survivor.id()),
-        "the honest warning is necessary because Turn did not invent control of the orphan"
+    survivor.assert_running(
+        "the honest warning is necessary because Turn did not invent control of the orphan",
     );
 
     let visible = match ui
@@ -1059,16 +1098,10 @@ async fn ending_a_restored_orphan_stays_ended_after_another_daemon_restart() {
         Response::WorkspaceWriteLease { lease: None, .. } => {}
         other => panic!("an ended Session cannot retain checkout authority: {other:?}"),
     }
-    assert!(
-        pid_is_alive(survivor.id()),
-        "a second daemon still must not claim the external survivor died"
-    );
+    survivor.assert_running("a second daemon still must not claim the external survivor died");
 
     daemon.shutdown().await;
-    survivor
-        .kill()
-        .expect("the test cleans up the deliberately escaped process");
-    survivor.wait().expect("the escaped process must be reaped");
+    survivor.cleanup();
 }
 
 /// A pid is not an identity, and the check that says so must not lean on start times in
