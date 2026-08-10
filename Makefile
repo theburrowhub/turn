@@ -51,7 +51,7 @@ test: ## Run the whole test suite
 .PHONY: test-headless
 test-headless: ## Run every test that needs no GPU (what Linux CI runs)
 	$(CARGO) test --workspace --exclude turn-gui -- --test-threads=$(TEST_THREADS)
-	$(CARGO) test -p turn-gui --lib --bins --test onboarding
+	$(CARGO) test -p turn-gui --lib --bins --test links --test onboarding --test scrollback
 
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
@@ -170,7 +170,7 @@ linux-test: ## Run the headless suite in a Linux container
 		$(LINUX_IMAGE) \
 		bash -c 'set -e; uname -srm; \
 			cargo test --workspace --exclude turn-gui -- --test-threads=$(TEST_THREADS); \
-			cargo test -p turn-gui --lib --bins --test onboarding'
+			cargo test -p turn-gui --lib --bins --test links --test onboarding --test scrollback'
 
 .PHONY: linux-build
 linux-build: ## Prove the window links on Linux
