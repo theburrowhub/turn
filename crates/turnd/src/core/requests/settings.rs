@@ -260,6 +260,9 @@ fn entry_for(catalogue: &Catalogue, resolution: Resolution, existing: &[Scope]) 
         accepts: definition
             .map(|definition| definition.kind.describe())
             .unwrap_or_else(|| "unknown".to_string()),
+        control: definition
+            .map(|definition| turn_proto::SettingsControl::from_kind(&definition.kind))
+            .unwrap_or(turn_proto::SettingsControl::Unknown),
         settable_at: definition
             .map(|definition| {
                 definition

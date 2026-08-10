@@ -89,6 +89,7 @@ struct Fixture {
     temporary_previews: Vec<ActivityPreview>,
     write_conflict: Option<ProtoErrorContext>,
     link_confirmation: Option<turn_gui::terminal::links::LinkRequest>,
+    settings: Option<turn_proto::SettingsView>,
     restore: Option<SessionRestoreView>,
     recovery_lease: Option<WorkspaceWriteLease>,
     /// The Settings preference. Off by default, as it is in the window, so a fixture that
@@ -150,6 +151,7 @@ impl Fixture {
             notice: self.notice.clone(),
             write_conflict: self.write_conflict.as_ref(),
             link_confirmation: self.link_confirmation.as_ref(),
+            settings: self.settings.as_ref(),
             include_archived: self.include_archived,
             policy: None,
             now_ms: cursor_on(),
@@ -2351,6 +2353,206 @@ fn a_link_that_does_not_go_where_it_says_is_asked_about_before_it_opens() {
         h.state().actions,
         vec![ViewAction::DismissLink],
         "and it is the decline that is one keystroke away, not the open"
+    );
+}
+
+/// A settings view with one value at each of three levels, so the picture shows the thing the
+/// whole feature is about: which level a value came from and what resetting it would reveal.
+fn layered_settings() -> turn_proto::SettingsView {
+    use turn_core::settings::{Resolution, Scope, Sensitivity, Shadowed};
+    use turn_proto::{SettingsControl, SettingsEntry, SettingsLevel};
+
+    let entry = |key: &str,
+                 title: &str,
+                 description: &str,
+                 control: SettingsControl,
+                 accepts: &str,
+                 resolution: Resolution,
+                 settable_at: Vec<Scope>| SettingsEntry {
+        area: turn_core::settings::Area::Appearance,
+        area_title: turn_core::settings::Area::Appearance.title().to_string(),
+        title: title.to_string(),
+        description: description.to_string(),
+        accepts: accepts.to_string(),
+        control,
+        settable_at,
+        hidden: false,
+        known: true,
+        resolution: Resolution {
+            key: key.to_string(),
+            ..resolution
+        },
+    };
+    let everywhere = vec![Scope::Global, Scope::Workspace, Scope::Session];
+    turn_proto::SettingsView {
+        session_id: Some(SessionId::from_stored("sess_fixclimbing")),
+        levels: vec![
+            SettingsLevel::global(),
+            SettingsLevel {
+                scope: Scope::Workspace,
+                owner_id: "ws_spacetroopers".into(),
+                label: "space-troopers".into(),
+            },
+            SettingsLevel {
+                scope: Scope::Session,
+                owner_id: "sess_fixclimbing".into(),
+                label: "Fix climbing bugs".into(),
+            },
+        ],
+        entries: vec![
+            // Set at the level the sheet is writing to: this one offers a reset, and the
+            // hover on it names the Workspace value that would come back.
+            entry(
+                "appearance.font_size",
+                "Terminal font size",
+                "Point size of the monospaced font in every pane.",
+                SettingsControl::Integer { min: 6, max: 32 },
+                "a whole number from 6 to 32",
+                Resolution {
+                    key: String::new(),
+                    value: serde_json::json!(17),
+                    origin: Some(Scope::Session),
+                    shadowed: vec![Shadowed {
+                        scope: Scope::Workspace,
+                        value: serde_json::json!(13),
+                    }],
+                    sensitivity: Sensitivity::Plain,
+                },
+                everywhere.clone(),
+            ),
+            // Inherited: no reset, and the origin line says where it comes from.
+            entry(
+                "appearance.cursor",
+                "Cursor",
+                "The shape Turn draws when the program in the pane has not asked for one.",
+                SettingsControl::Choice {
+                    options: vec!["block".into(), "bar".into(), "underline".into()],
+                },
+                "one of block, bar, underline",
+                Resolution {
+                    key: String::new(),
+                    value: serde_json::json!("bar"),
+                    origin: Some(Scope::Workspace),
+                    shadowed: Vec::new(),
+                    sensitivity: Sensitivity::Plain,
+                },
+                everywhere.clone(),
+            ),
+            // Nobody set it: "Turn's default", which is distinguishable from a level having
+            // set the same value and is why `origin` is an Option.
+            entry(
+                "appearance.ligatures",
+                "Font ligatures",
+                "Joins sequences like -> into one glyph.",
+                SettingsControl::Toggle,
+                "on or off",
+                Resolution {
+                    key: String::new(),
+                    value: serde_json::json!(false),
+                    origin: None,
+                    shadowed: Vec::new(),
+                    sensitivity: Sensitivity::Plain,
+                },
+                everywhere,
+            ),
+        ],
+    }
+}
+
+/// The preferences sheet, with a value from each of the three levels.
+///
+/// What the picture has to show, and what a reviewer should check in it: every value says
+/// where it came from, the level being written to is named once at the top rather than implied,
+/// and "Reset" appears only on the value this level actually holds.
+#[test]
+fn the_settings_sheet_says_where_every_value_came_from() {
+    let mut fixture = busy_desk();
+    fixture.settings = Some(layered_settings());
+    let mut h = harness(fixture);
+    h.state_mut().state.settings_open = true;
+    h.run();
+    h.run();
+    h.snapshot("settings_levels");
+}
+
+/// A change is written at the level the selector names, and nowhere else.
+///
+/// The failure this rules out is the one that makes a settings sheet dangerous: a user with a
+/// Session selected adjusts a font size meaning "here", and it lands on their whole account.
+/// The level is chosen once, explicitly, and every write quotes it back with the owner id.
+#[test]
+fn a_change_is_written_at_the_level_the_selector_names() {
+    let mut fixture = busy_desk();
+    fixture.settings = Some(layered_settings());
+    let mut h = harness(fixture);
+    h.state_mut().state.settings_open = true;
+    // The Workspace level, chosen deliberately rather than left to default: the default is the
+    // Session, and a test that used it could not tell the two apart.
+    h.state_mut().state.settings_level = Some(turn_core::settings::Scope::Workspace);
+    h.run();
+    h.run();
+
+    h.state_mut().actions.clear();
+    // By role, not only by name: the preference's title is drawn beside its control as well,
+    // so a name alone matches two nodes. The role is also the assertion that the control is
+    // announced as a checkbox rather than as a button — a listener needs to know it has a
+    // state, not just that it can be pressed.
+    h.query_all_by_role(egui::accesskit::Role::CheckBox)
+        .find(|node| node.accesskit_node().label().as_deref() == Some("Font ligatures"))
+        .expect("the toggle is in the accessibility tree under its own name")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::SetSetting {
+            scope: turn_core::settings::Scope::Workspace,
+            owner_id: "ws_spacetroopers".into(),
+            key: "appearance.ligatures".into(),
+            value: serde_json::json!(true),
+        }],
+        "the write names the level the selector showed, with that level's own owner id"
+    );
+}
+
+/// Reset is offered only where there is something to remove.
+///
+/// A greyed-out reset on an inherited value teaches nothing, and one that silently did nothing
+/// would be worse. So the control appears exactly when the chosen level is the level holding
+/// the value — which means switching the selector changes which rows offer it.
+#[test]
+fn reset_is_offered_only_at_the_level_that_holds_the_value() {
+    let mut fixture = busy_desk();
+    fixture.settings = Some(layered_settings());
+    let mut h = harness(fixture);
+    h.state_mut().state.settings_open = true;
+
+    // At the Global level nothing in this fixture is set, so nothing can be reset.
+    h.state_mut().state.settings_level = Some(turn_core::settings::Scope::Global);
+    h.run();
+    h.run();
+    assert!(
+        h.query_by_label("Reset Terminal font size").is_none(),
+        "no value here belongs to the Global level"
+    );
+
+    // At the Session level the font size is, so exactly that row offers it.
+    h.state_mut().state.settings_level = Some(turn_core::settings::Scope::Session);
+    h.run();
+    h.run();
+    h.state_mut().actions.clear();
+    // Named per preference, not just "Reset": nine identical buttons are nine identical
+    // announcements to anyone listening to the sheet rather than looking at it.
+    h.query_by_label("Reset Terminal font size")
+        .expect("the Session holds the font size")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::ResetSetting {
+            scope: turn_core::settings::Scope::Session,
+            owner_id: "sess_fixclimbing".into(),
+            key: "appearance.font_size".into(),
+        }]
     );
 }
 

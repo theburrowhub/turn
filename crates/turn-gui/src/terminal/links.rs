@@ -51,6 +51,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
 
 use turn_proto::cells::{Cell, Grid, RowLink};
@@ -299,6 +300,7 @@ pub fn open(target: &LinkTarget) -> Result<(), OpenError> {
 /// invent an editor URL scheme to smuggle one in: the line and column stay on the
 /// [`LinkTarget`] and in the hover, where they are true, rather than becoming a guess about
 /// which editor somebody uses.
+#[cfg(not(test))]
 fn opener() -> &'static str {
     if cfg!(target_os = "macos") {
         "open"
@@ -307,6 +309,19 @@ fn opener() -> &'static str {
     }
 }
 
+/// Under test this records and does not run.
+///
+/// A suite that launched the developer's browser would open a page per run of `make test`,
+/// which is exactly what happened once. The assertion worth making is "Turn asked the desktop
+/// to open this", and the record supports it better than a spawned process nobody observes.
+#[cfg(test)]
+fn hand_to_opener(argument: impl AsRef<std::ffi::OsStr>) -> Result<(), OpenError> {
+    let asked = argument.as_ref().to_string_lossy().into_owned();
+    OPENED.with(|opened| opened.borrow_mut().push(asked));
+    Ok(())
+}
+
+#[cfg(not(test))]
 fn hand_to_opener(argument: impl AsRef<std::ffi::OsStr>) -> Result<(), OpenError> {
     Command::new(opener())
         .arg(argument)
@@ -316,6 +331,16 @@ fn hand_to_opener(argument: impl AsRef<std::ffi::OsStr>) -> Result<(), OpenError
         .spawn()
         .map(|_| ())
         .map_err(|error| OpenError::Handler(error.to_string()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What [`open`] was asked to hand to the desktop, in this thread, under test.
+    ///
+    /// Thread-local because the harness runs tests in parallel and a shared list would make
+    /// one test's assertion depend on another's timing.
+    pub(crate) static OPENED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether a scheme is one Turn will open. Case-insensitive, because `HTTPS:` is `https:`.

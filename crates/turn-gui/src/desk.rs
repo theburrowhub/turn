@@ -153,6 +153,12 @@ pub struct Desk {
     /// A link from a pane whose visible text disagreed with its target, waiting to be
     /// confirmed. Window-local: nothing outside this window is affected by a question.
     link_confirmation: Option<crate::terminal::links::LinkRequest>,
+    /// The preferences in force, as the daemon resolved them.
+    ///
+    /// Held whole rather than merged into anything: the window renders what it is told and
+    /// applies no precedence of its own, so there is nothing here to keep in step. `None`
+    /// until the first answer arrives, which is what the sheet shows as "loading".
+    settings: Option<Box<turn_proto::SettingsView>>,
     reclaiming_leases: HashSet<WorkspaceId>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
@@ -204,6 +210,7 @@ impl Desk {
             relaunching: HashSet::new(),
             auto_started: HashSet::new(),
             link_confirmation: None,
+            settings: None,
             reclaiming_leases: HashSet::new(),
             temporary_pane: None,
             write_conflict: None,
@@ -764,6 +771,7 @@ impl Desk {
         self.temporary_pane = None;
         self.write_conflict = None;
         self.link_confirmation = None;
+        self.settings = None;
         self.pending_workspace_creation = false;
         self.pending_session = None;
         self.workspaces.clear();
@@ -781,6 +789,12 @@ impl Desk {
             Reaction::Send {
                 ask: Ask::Templates,
                 request: Request::ListTemplates,
+            },
+            // The Global level, before anything is selected. Selecting a Session asks again
+            // with its id, because the levels that exist depend on which Session it is.
+            Reaction::Send {
+                ask: Ask::Settings,
+                request: Request::GetSettings { session_id: None },
             },
             Reaction::Send {
                 ask: Ask::AttentionQueue,
@@ -1040,6 +1054,13 @@ impl Desk {
             }
             (_, Response::Templates { templates }) => {
                 self.templates = templates;
+                Vec::new()
+            }
+            // Whole, from every answer including a write's. A write can move what is in force
+            // for keys other than the one written — a Session override removed reveals the
+            // Workspace's value — so there is nothing to patch and nothing to reconcile.
+            (_, Response::Settings { settings }) => {
+                self.settings = Some(settings);
                 Vec::new()
             }
             (Ask::CreateTemplate, Response::Template { template }) => {
@@ -2203,11 +2224,27 @@ impl Desk {
             select_tree,
             Reaction::Send {
                 ask: Ask::Details(session_id.clone()),
-                request: Request::GetSession { session_id },
+                request: Request::GetSession {
+                    session_id: session_id.clone(),
+                },
+            },
+            // Asked again per Session, because which levels exist and what they hold both
+            // depend on which one it is: a Session in another Workspace inherits from a
+            // different Workspace, and one made from a Template has a level this one lacks.
+            Reaction::Send {
+                ask: Ask::Settings,
+                request: Request::GetSettings {
+                    session_id: Some(session_id),
+                },
             },
         ];
         reactions.extend(self.attach_wanted());
         reactions
+    }
+
+    /// The preferences in force, for the sheet that shows them.
+    pub fn settings(&self) -> Option<&turn_proto::SettingsView> {
+        self.settings.as_deref()
     }
 
     /// Routes typed intents from the unified tree. Selection, Pane focus and opening a
@@ -3181,6 +3218,32 @@ impl Desk {
                 self.notice = Some(message.clone());
                 vec![Reaction::Notice(message)]
             }
+            ViewAction::SetSetting {
+                scope,
+                owner_id,
+                key,
+                value,
+            } => vec![Reaction::Send {
+                ask: Ask::WriteSetting { key: key.clone() },
+                request: Request::SetSetting {
+                    scope,
+                    owner_id: Some(owner_id),
+                    key,
+                    value,
+                },
+            }],
+            ViewAction::ResetSetting {
+                scope,
+                owner_id,
+                key,
+            } => vec![Reaction::Send {
+                ask: Ask::WriteSetting { key: key.clone() },
+                request: Request::ResetSetting {
+                    scope,
+                    owner_id: Some(owner_id),
+                    key,
+                },
+            }],
             ViewAction::ConfirmLink => self.confirm_link(),
             ViewAction::DismissLink => {
                 self.dismiss_link();
@@ -3451,6 +3514,7 @@ impl Desk {
                 .or_else(|| self.notice.clone()),
             write_conflict: self.write_conflict(),
             link_confirmation: self.link_confirmation(),
+            settings: self.settings(),
             include_archived: self.include_archived,
             policy: self
                 .selected
@@ -3774,7 +3838,12 @@ mod tests {
         let ops: Vec<&str> = sent(&reactions).iter().map(Request::op).collect();
         assert_eq!(
             ops,
-            vec!["get_hierarchy", "list_templates", "list_attention"]
+            vec![
+                "get_hierarchy",
+                "list_templates",
+                "get_settings",
+                "list_attention"
+            ]
         );
         assert!(desk.connection().is_live());
     }
@@ -7154,7 +7223,12 @@ mod tests {
         let requests = sent(&reconnected);
         assert_eq!(
             requests.iter().map(Request::op).collect::<Vec<_>>(),
-            vec!["get_hierarchy", "list_templates", "list_attention"]
+            vec![
+                "get_hierarchy",
+                "list_templates",
+                "get_settings",
+                "list_attention"
+            ]
         );
     }
 
@@ -7250,10 +7324,18 @@ mod tests {
             desk.link_confirmation().is_none(),
             "an ordinary link must not put a dialog in front of the user"
         );
-        // Whether the platform opener succeeded is the platform's business and not
-        // assertable in a test that must not launch a browser. What is asserted is that
-        // nothing was *asked* and nothing was sent to the daemon: opening a link is not a
-        // daemon operation.
+        // The opener is recorded rather than run under test: a suite that launched the
+        // developer's browser would open a page per run, which it did once before this
+        // was fixed. What is asserted is the thing that matters — Turn asked the desktop
+        // to open exactly this target.
+        crate::terminal::links::OPENED.with(|opened| {
+            assert_eq!(
+                opened.borrow().last().map(String::as_str),
+                Some("https://example.com/x"),
+                "the link Turn handed over"
+            );
+        });
+        // And nothing went to the daemon: opening a link is not a daemon operation.
         assert!(
             !reactions
                 .iter()

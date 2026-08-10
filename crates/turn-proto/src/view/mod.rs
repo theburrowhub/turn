@@ -34,6 +34,6 @@ pub use hierarchy::{
     SessionTreeView, TreeSurfaceState, WorkspaceTreeView,
 };
 pub use session::{AgentSummary, SessionDetails, SessionSummary};
-pub use settings::{SettingsEntry, SettingsLevel, SettingsView};
+pub use settings::{SettingsControl, SettingsEntry, SettingsLevel, SettingsView};
 pub use tree::TreeNodeView;
 pub use workspace::{TemplateSummary, WorkspaceSummary};

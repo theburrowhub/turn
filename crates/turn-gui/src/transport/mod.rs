@@ -56,6 +56,15 @@ pub enum Ask {
     Sessions,
     Details(SessionId),
     Templates,
+    /// Reading the preferences in force. Carries no id: the answer names the Session it was
+    /// resolved for, and a reply that arrived after the selection moved is recognised by that
+    /// rather than by remembering what was asked.
+    Settings,
+    /// Writing one preference at one level, named so a refusal can say which act failed —
+    /// "setting the font size at the Workspace level" rather than "a request failed".
+    WriteSetting {
+        key: String,
+    },
     AttentionQueue,
     Preview {
         session_id: SessionId,
@@ -150,6 +159,8 @@ impl Ask {
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",
             Ask::Templates => "loading templates",
+            Ask::Settings => "loading preferences",
+            Ask::WriteSetting { .. } => "saving the preference",
             Ask::AttentionQueue => "loading the attention queue",
             Ask::Preview { .. } => "loading an activity preview",
             Ask::PrepareContextHandoff { .. } => "preparing an Agent context handoff",

@@ -80,6 +80,64 @@ impl SettingsLevel {
     }
 }
 
+/// What kind of control a preference wants.
+///
+/// The projection of [`ValueKind`](turn_core::settings::ValueKind), with its choice list
+/// owned rather than borrowed from the catalogue. A separate type on purpose: the catalogue's
+/// version is the daemon's own validation vocabulary, and this one is a drawing instruction.
+/// The window renders whichever it is told and validates nothing — the daemon refuses a bad
+/// write, and a window that reimplemented the bounds would be a second validator able to
+/// disagree about which values exist.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "control", rename_all = "snake_case")]
+pub enum SettingsControl {
+    Toggle,
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Number {
+        min: f64,
+        max: f64,
+    },
+    Text,
+    Choice {
+        options: Vec<String>,
+    },
+    /// A list of lines, edited as text: one per line, which is how the user already thinks of
+    /// init commands.
+    TextList,
+    /// Name/value pairs, edited as `NAME=value` lines for the same reason.
+    TextMap,
+    /// A key this build does not define. Shown as it was stored, with no control: the only
+    /// thing that can honestly be offered for it is a reset.
+    Unknown,
+}
+
+impl SettingsControl {
+    /// The drawing instruction for a catalogue definition's shape.
+    pub fn from_kind(kind: &turn_core::settings::ValueKind) -> Self {
+        use turn_core::settings::ValueKind;
+        match kind {
+            ValueKind::Bool => SettingsControl::Toggle,
+            ValueKind::Integer { min, max } => SettingsControl::Integer {
+                min: *min,
+                max: *max,
+            },
+            ValueKind::Number { min, max } => SettingsControl::Number {
+                min: *min,
+                max: *max,
+            },
+            ValueKind::Text => SettingsControl::Text,
+            ValueKind::Choice { options } => SettingsControl::Choice {
+                options: options.iter().map(|option| option.to_string()).collect(),
+            },
+            ValueKind::TextList => SettingsControl::TextList,
+            ValueKind::TextMap => SettingsControl::TextMap,
+        }
+    }
+}
+
 /// One preference, resolved, with enough of its definition to draw a control for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,10 +149,10 @@ pub struct SettingsEntry {
     pub area_title: String,
     pub title: String,
     pub description: String,
-    /// How to draw and validate it, as a sentence rather than a type the window would have to
-    /// mirror. A window that reimplemented the bounds would be a second validator; the
-    /// daemon refuses a bad write, and this is what the control says while the user types.
+    /// What would be accepted, as a sentence, for the control to show while the user types.
     pub accepts: String,
+    /// Which control to draw.
+    pub control: SettingsControl,
     /// The levels this key may be set at, of the ones that exist. A control offered at a level
     /// that would refuse the write is a control that lies.
     pub settable_at: Vec<Scope>,

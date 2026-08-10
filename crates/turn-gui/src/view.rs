@@ -425,6 +425,8 @@ pub struct TurnView<'a> {
     /// Only ever set for a link whose visible text names a different target than the one it
     /// would open — `links` decides that, and an ordinary link never arrives here.
     pub link_confirmation: Option<&'a terminal::links::LinkRequest>,
+    /// The preferences in force, resolved by the daemon. `None` before the first answer.
+    pub settings: Option<&'a turn_proto::SettingsView>,
     /// The attention policy in force, for the settings sheet.
     pub policy: Option<AttentionPolicy>,
     pub now_ms: i64,
@@ -452,6 +454,19 @@ pub struct ViewState {
     /// overlay, never a second persistent navigator beside the hierarchy.
     pub attention_panel_open: bool,
     pub write_conflict_open: bool,
+    /// Which level the settings sheet writes to.
+    ///
+    /// Window-local, and remembered across openings: a user adjusting their Workspace does
+    /// several in a row, and a selector that reset to Global between each would be a way to
+    /// write the third one to the wrong place. Defaults to the narrowest level that exists,
+    /// because that is the one a change is least likely to surprise somebody else with.
+    pub settings_level: Option<turn_core::settings::Scope>,
+    /// The text being typed into one preference's field, keyed by its key.
+    ///
+    /// Held while editing rather than written per keystroke: a `set_setting` per character
+    /// would be a round trip per character, and every intermediate value would be refused as
+    /// out of range on the way to a valid one.
+    pub settings_drafts: std::collections::BTreeMap<String, String>,
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
     pub workspace_draft: Option<WorkspaceDraft>,
@@ -967,6 +982,24 @@ pub enum ViewAction {
     ConfirmLink,
     /// The user said no, or pressed Escape.
     DismissLink,
+
+    /// Record one preference at one level.
+    ///
+    /// The level is explicit and comes from the control the user used, never from what is
+    /// selected: "set the font size" is four different acts, and a window that guessed would
+    /// be the one that silently edited the wrong one.
+    SetSetting {
+        scope: turn_core::settings::Scope,
+        owner_id: String,
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Remove one level's opinion, so the level below is in force again.
+    ResetSetting {
+        scope: turn_core::settings::Scope,
+        owner_id: String,
+        key: String,
+    },
 }
 
 /// What one toolbar button does when it is pressed.
@@ -6441,11 +6474,235 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    /// The preferences, section by section, with where each value came from.
+    ///
+    /// Three things make this honest rather than a list of controls:
+    ///
+    /// **The level is chosen once, at the top, and shown on every control.** A change is
+    /// four different acts depending on the level, and a sheet that let the user set a font
+    /// size without saying where would be a sheet that edits their whole account when they
+    /// meant this Session. The selector offers only levels that exist.
+    ///
+    /// **Every value says where it came from.** "Turn's default", or the level that set it.
+    /// Without that the user cannot tell a value they chose from one that came with the
+    /// product, and "reset" has nothing to mean.
+    ///
+    /// **Reset appears only when there is something to reset at the chosen level**, and its
+    /// hover says what would come back. A greyed-out reset on an inherited value teaches
+    /// nothing; one that silently did nothing would be worse.
+    fn settings_preferences(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let Some(settings) = self.settings else {
+            ui.label(
+                RichText::new("loading preferences…")
+                    .color(theme.text_faint)
+                    .small(),
+            );
+            return actions;
+        };
+
+        // The narrowest level that exists, unless the user has already chosen one. Narrowest
+        // because a change made there surprises the fewest other things.
+        let chosen = state
+            .settings_level
+            .filter(|scope| settings.level(*scope).is_some())
+            .or_else(|| settings.levels.last().map(|level| level.scope));
+        let Some(chosen) = chosen else {
+            return actions;
+        };
+        state.settings_level = Some(chosen);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Changes apply to").color(theme.text_dim));
+            for level in &settings.levels {
+                let selected = level.scope == chosen;
+                if ui
+                    .selectable_label(
+                        selected,
+                        RichText::new(format!("{} · {}", level.scope.label(), level.label))
+                            .color(if selected { theme.text } else { theme.text_dim }),
+                    )
+                    .on_hover_text(match level.scope {
+                        turn_core::settings::Scope::Global => {
+                            "Everywhere in Turn, for every Workspace and Session."
+                        }
+                        turn_core::settings::Scope::Workspace => {
+                            "This project, and every Session in it that does not say otherwise."
+                        }
+                        turn_core::settings::Scope::Template => {
+                            "Every Session made from this Template."
+                        }
+                        turn_core::settings::Scope::Session => "This Session alone.",
+                        turn_core::settings::Scope::Temporary => {
+                            "This window, until it closes. Not saved."
+                        }
+                    })
+                    .clicked()
+                {
+                    state.settings_level = Some(level.scope);
+                }
+            }
+        });
+        let owner = settings
+            .level(chosen)
+            .map(|level| level.owner_id.clone())
+            .unwrap_or_default();
+        ui.add_space(10.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("settings-preferences")
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for area in turn_core::settings::Area::ALL {
+                    let entries: Vec<&turn_proto::SettingsEntry> = settings.in_area(area).collect();
+                    // An area with nothing in it is not drawn. The empty section is honest in
+                    // the catalogue, where it says the area exists; on screen it would be a
+                    // heading over nothing.
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(area.title()).color(theme.text).strong());
+                    ui.add_space(4.0);
+                    for entry in entries {
+                        actions.extend(self.settings_row(ui, theme, state, entry, chosen, &owner));
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        actions
+    }
+
+    /// One preference: its control, where its value came from, and its way back.
+    fn settings_row(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        entry: &turn_proto::SettingsEntry,
+        chosen: turn_core::settings::Scope,
+        owner: &str,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let key = entry.resolution.key.clone();
+        // Whether this key can be written at the level the user picked. A control drawn where
+        // the write would be refused is a control that lies, so it is disabled and says why.
+        let settable = entry.settable_at.contains(&chosen);
+        // Whether *this* level is the one holding the value, which is the only case where
+        // "reset" has anything to remove.
+        let set_here = entry.resolution.origin == Some(chosen);
+
+        egui::Frame::new()
+            .fill(theme.raised)
+            .stroke(Stroke::new(1.0, theme.border))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width() * 0.55);
+                        ui.label(RichText::new(&entry.title).color(theme.text).strong());
+                        ui.label(
+                            RichText::new(&entry.description)
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        // Where it came from, always. Sentence rather than a badge: "from the
+                        // Workspace" is what the user needs to know before changing it.
+                        let (origin, colour) = match entry.resolution.origin {
+                            None => ("Turn's default".to_string(), theme.text_faint),
+                            Some(scope) if scope == chosen => {
+                                (format!("set here · {}", scope.label()), theme.running)
+                            }
+                            Some(scope) => (
+                                format!("inherited from {}", scope.label()),
+                                theme.provisional,
+                            ),
+                        };
+                        ui.label(RichText::new(origin).color(colour).small());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Reset first in right-to-left order, so it sits at the far edge and
+                        // the control the user came for is next to its own value.
+                        if set_here {
+                            let reveals = match entry.resolution.inherited() {
+                                Some(shadowed) => format!(
+                                    "Remove this {} value; {} takes over again",
+                                    chosen.label(),
+                                    shadowed.scope.label()
+                                ),
+                                None => format!(
+                                    "Remove this {} value and go back to Turn's default",
+                                    chosen.label()
+                                ),
+                            };
+                            let response = ui.button("Reset").on_hover_text(reveals);
+                            crate::icons::describe(
+                                &response,
+                                &format!("Reset {}", entry.title),
+                            );
+                            if response.clicked() {
+                                actions.push(ViewAction::ResetSetting {
+                                    scope: chosen,
+                                    owner_id: owner.to_string(),
+                                    key: key.clone(),
+                                });
+                            }
+                        }
+                        ui.add_enabled_ui(settable && !entry.hidden, |ui| {
+                            actions.extend(settings_control(
+                                ui, theme, state, entry, chosen, owner, &key,
+                            ));
+                        });
+                    });
+                });
+                if entry.hidden {
+                    ui.label(
+                        RichText::new(
+                            "Not shown, and not editable here: Turn does not display a value                              that may be a credential.",
+                        )
+                        .color(theme.text_faint)
+                        .small(),
+                    );
+                } else if !settable {
+                    ui.label(
+                        RichText::new(format!(
+                            "Cannot be set at the {} level. It belongs to: {}",
+                            chosen.label(),
+                            entry
+                                .settable_at
+                                .iter()
+                                .map(|scope| scope.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                        .color(theme.text_faint)
+                        .small(),
+                    );
+                } else if !entry.known {
+                    ui.label(
+                        RichText::new(
+                            "Written by a newer version of Turn. This build cannot say what it                              does, so it can only be reset.",
+                        )
+                        .color(theme.attention)
+                        .small(),
+                    );
+                }
+            });
+        ui.add_space(5.0);
+        actions
+    }
+
     fn settings_sheet(
         &self,
         ui: &mut Ui,
         theme: &Theme,
-        _state: &mut ViewState,
+        state: &mut ViewState,
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
@@ -6483,6 +6740,13 @@ impl<'a> TurnView<'a> {
             ui.add_space(14.0);
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
+                    // The preferences first, because they are what "Settings" means to
+                    // somebody opening this. The Layout presets and the archived filter below
+                    // are about what Turn shows rather than how it behaves.
+                    actions.extend(self.settings_preferences(ui, theme, state));
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(6.0);
                     // The archived filter used to be a third button in the Workspaces bar,
                     // beside two that create things. It is a preference about what the list
                     // contains, not an action, and it belongs where preferences are.
@@ -6634,6 +6898,231 @@ impl<'a> TurnView<'a> {
             });
         });
         actions
+    }
+}
+
+/// The control for one preference, and the value it produces when the user finishes with it.
+///
+/// **Nothing here validates.** The daemon refuses a value out of range and says what would be
+/// accepted; a window that also checked would be a second validator able to disagree about
+/// which values exist. What the control does is stay inside the bounds it was *told*, which is
+/// a different thing: a slider cannot express 400 in the first place, so the user is not
+/// offered a value that would be refused.
+///
+/// **A field commits on Enter or on losing focus, never per keystroke.** A `set_setting` per
+/// character would be a round trip per character, and every intermediate value on the way to
+/// `14` — `1` — would be refused as out of range, so the user would type into a field that
+/// rejected them until they finished.
+fn settings_control(
+    ui: &mut Ui,
+    theme: &Theme,
+    state: &mut ViewState,
+    entry: &turn_proto::SettingsEntry,
+    chosen: turn_core::settings::Scope,
+    owner: &str,
+    key: &str,
+) -> Vec<ViewAction> {
+    use turn_proto::SettingsControl;
+    let mut actions = Vec::new();
+    let set = |value: serde_json::Value| ViewAction::SetSetting {
+        scope: chosen,
+        owner_id: owner.to_string(),
+        key: key.to_string(),
+        value,
+    };
+    // Every control carries the preference's own title as its accessible name. There is no
+    // DOM here, so a control whose name is only the label drawn beside it is a control a
+    // screen reader — and a test — cannot find. The title is already on screen to the left,
+    // so the name is set on the widget rather than drawn again.
+    match &entry.control {
+        SettingsControl::Toggle => {
+            let mut on = entry.resolution.value.as_bool().unwrap_or(false);
+            let response = ui.checkbox(&mut on, "");
+            describe_control(&response, egui::accesskit::Role::CheckBox, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::Value::Bool(on)));
+            }
+        }
+        SettingsControl::Integer { min, max } => {
+            let mut number = entry.resolution.value.as_i64().unwrap_or(*min);
+            let response = ui
+                .add(egui::DragValue::new(&mut number).range(*min..=*max))
+                .on_hover_text(&entry.accepts);
+            describe_control(&response, egui::accesskit::Role::SpinButton, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::Value::from(number)));
+            }
+        }
+        SettingsControl::Number { min, max } => {
+            let mut number = entry.resolution.value.as_f64().unwrap_or(*min);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut number)
+                        .range(*min..=*max)
+                        .speed(0.05),
+                )
+                .on_hover_text(&entry.accepts);
+            describe_control(&response, egui::accesskit::Role::SpinButton, &entry.title);
+            if response.changed() {
+                actions.push(set(serde_json::json!(number)));
+            }
+        }
+        SettingsControl::Choice { options } => {
+            let current = entry
+                .resolution
+                .value
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            egui::ComboBox::from_id_salt(("setting-choice", key))
+                .selected_text(if current.is_empty() {
+                    "—".to_string()
+                } else {
+                    current.clone()
+                })
+                .show_ui(ui, |ui| {
+                    for option in options {
+                        if ui
+                            .selectable_label(option == &current, option.as_str())
+                            .clicked()
+                            && option != &current
+                        {
+                            actions.push(set(serde_json::Value::String(option.clone())));
+                        }
+                    }
+                });
+        }
+        SettingsControl::Text | SettingsControl::TextList | SettingsControl::TextMap => {
+            // The stored value as text the user can edit, and back again on commit. One
+            // line per item for a list, `NAME=value` per line for a map — which is how the
+            // user already writes both of these everywhere else.
+            let stored = settings_text_of(&entry.resolution.value, &entry.control);
+            let draft = state
+                .settings_drafts
+                .entry(key.to_string())
+                .or_insert_with(|| stored.clone());
+            let multiline = !matches!(entry.control, SettingsControl::Text);
+            let response = if multiline {
+                ui.add(
+                    egui::TextEdit::multiline(draft)
+                        .desired_rows(2)
+                        .desired_width(220.0)
+                        .hint_text(&entry.accepts),
+                )
+            } else {
+                ui.add(
+                    egui::TextEdit::singleline(draft)
+                        .desired_width(220.0)
+                        .hint_text(&entry.accepts),
+                )
+            };
+            describe_control(&response, egui::accesskit::Role::TextInput, &entry.title);
+            let committed = response.lost_focus()
+                || (!multiline && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+            if committed {
+                let typed = draft.clone();
+                state.settings_drafts.remove(key);
+                if typed != stored {
+                    actions.push(set(settings_value_of(&typed, &entry.control)));
+                }
+            }
+            let _ = theme;
+        }
+        SettingsControl::Unknown => {
+            // Shown as it was stored, with no control. Anything else would be a guess about
+            // what a newer build meant, presented as an editor.
+            ui.label(
+                RichText::new(entry.resolution.value.to_string())
+                    .monospace()
+                    .color(theme.text_dim)
+                    .small(),
+            );
+        }
+    }
+    actions
+}
+
+/// Puts a settings control into the accessibility tree under its own name and role.
+///
+/// `icons::describe` exists for the icon buttons and calls everything a button, which is right
+/// for those and wrong here: a checkbox announced as a button tells a listener they can press
+/// it and not whether it is on. There is no DOM to infer any of this from, so the role is
+/// stated per control.
+fn describe_control(response: &Response, role: egui::accesskit::Role, label: &str) {
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            match role {
+                egui::accesskit::Role::CheckBox => egui::WidgetType::Checkbox,
+                egui::accesskit::Role::TextInput => egui::WidgetType::TextEdit,
+                _ => egui::WidgetType::Button,
+            },
+            response.enabled(),
+            label,
+        )
+    });
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_role(role);
+        node.set_label(label.to_string());
+        node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// A stored value as the text a user edits.
+fn settings_text_of(value: &serde_json::Value, control: &turn_proto::SettingsControl) -> String {
+    use turn_proto::SettingsControl;
+    match (control, value) {
+        (SettingsControl::TextList, serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (SettingsControl::TextMap, serde_json::Value::Object(pairs)) => pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={}", value.as_str().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        (_, serde_json::Value::String(text)) => text.clone(),
+        // Null is the deliberate nothing, and an empty field is how the user says it.
+        (_, serde_json::Value::Null) => String::new(),
+        (_, other) => other.to_string(),
+    }
+}
+
+/// The text a user typed, as the value to store.
+///
+/// An empty field is `null` — the deliberate "nothing here" — rather than an empty string or
+/// an empty list, because that is the value that overrides an inherited something with an
+/// absence. Clearing a field and resetting are different acts and produce different results:
+/// this one says "nothing, here"; reset says "whatever the level below says".
+fn settings_value_of(typed: &str, control: &turn_proto::SettingsControl) -> serde_json::Value {
+    use turn_proto::SettingsControl;
+    if typed.trim().is_empty() {
+        return serde_json::Value::Null;
+    }
+    match control {
+        SettingsControl::TextList => serde_json::Value::Array(
+            typed
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::Value::String(line.to_string()))
+                .collect(),
+        ),
+        SettingsControl::TextMap => {
+            let mut pairs = serde_json::Map::new();
+            for line in typed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                // A line with no `=` is a name with no value, which is a name the user is
+                // part-way through typing. Kept with an empty value rather than dropped: a
+                // line that vanished on commit would look like the field losing text.
+                let (name, value) = line.split_once('=').unwrap_or((line, ""));
+                pairs.insert(
+                    name.trim().to_string(),
+                    serde_json::Value::String(value.trim().to_string()),
+                );
+            }
+            serde_json::Value::Object(pairs)
+        }
+        _ => serde_json::Value::String(typed.to_string()),
     }
 }
 
