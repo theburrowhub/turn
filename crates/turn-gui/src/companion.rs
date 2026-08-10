@@ -555,7 +555,6 @@ fn detach(_command: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long a test waits for the monitor to report a child's exit.
@@ -779,10 +778,9 @@ mod tests {
             EnsureOutcome::Started(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        let wake_count = Arc::new(AtomicUsize::new(0));
-        let wake_counter = Arc::clone(&wake_count);
+        let (wake_send, wake_events) = mpsc::channel();
         let events = launch.monitor.watch(Arc::new(move || {
-            wake_counter.fetch_add(1, Ordering::SeqCst);
+            let _ = wake_send.send(());
         }));
 
         let CompanionEvent::Failed(message) = events.recv_timeout(EVENT_WAIT).unwrap() else {
@@ -790,7 +788,13 @@ mod tests {
         };
         assert!(message.contains("exit status: 7"), "{message}");
         assert!(message.contains(&context.log_path.display().to_string()));
-        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        wake_events
+            .recv_timeout(EVENT_WAIT)
+            .expect("the companion event must wake the window");
+        assert!(
+            wake_events.try_recv().is_err(),
+            "one companion event must request exactly one wake"
+        );
         assert!(std::fs::read_to_string(context.log_path)
             .unwrap()
             .contains("late failure"));
