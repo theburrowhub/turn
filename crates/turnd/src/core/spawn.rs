@@ -1378,7 +1378,7 @@ fn launch_authority(launch: &PaneLaunch, kind: PaneKind, args: &[String]) -> Lau
         PaneLaunch::Unhosted { shell, .. } if bare_shell(shell) => {
             LaunchAuthority::InteractiveShell
         }
-        PaneLaunch::Direct { command } if kind.is_terminal() && bare_shell(command) => {
+        PaneLaunch::Direct { command } if kind == PaneKind::Shell && bare_shell(command) => {
             LaunchAuthority::InteractiveShell
         }
         _ => LaunchAuthority::CheckoutWrite,

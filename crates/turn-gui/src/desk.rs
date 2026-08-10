@@ -3887,7 +3887,7 @@ mod tests {
         let session_id = SessionId::from_stored("sess_pane_titles");
         let mut first = Pane::new(PaneKind::Agent).with_title("claude");
         let mut first_node = ProcessNode::agent(session_id.clone(), "claude", "/repo", T0);
-        first_node.title = "Claude Alpha".into();
+        assert!(first_node.set_process_title("Claude Alpha"));
         first.node_id = Some(first_node.id.clone());
 
         let unrelated = ProcessNode::agent(session_id, "claude", "/repo", T0);

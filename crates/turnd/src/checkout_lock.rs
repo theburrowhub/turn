@@ -147,7 +147,12 @@ impl CheckoutWriteLock {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            // `CLOEXEC` is part of the authority boundary, not an optimisation: the
+            // lock reaches a child only through the one descriptor portable-pty
+            // explicitly preserves for a checkout writer.
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
         }
         let file = options
             .open(&path)
@@ -574,6 +579,13 @@ mod tests {
             CheckoutWriteLock::acquire(&checkout, &locks, |identity| owner(identity, temp.path()))
                 .expect("the daemon lock");
         let inherited = lock.inherit_for_spawn().expect("an inheritable duplicate");
+        let lock_flags = unsafe { libc::fcntl(lock.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(lock_flags, -1, "the daemon descriptor must be valid");
+        assert_ne!(
+            lock_flags & libc::FD_CLOEXEC,
+            0,
+            "the daemon descriptor must never reach an unrelated exec"
+        );
         let flags = unsafe { libc::fcntl(inherited._file.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(flags, -1, "the inherited descriptor must be valid");
         assert_ne!(

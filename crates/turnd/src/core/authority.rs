@@ -31,7 +31,7 @@
 
 use super::Core;
 use turn_core::ids::{CheckoutId, NodeId, SessionId, WorkspaceId};
-use turn_core::model::{LeaseState, ProcessNode, SessionMode};
+use turn_core::model::{LeaseState, ProcessNode, SessionMode, WorkspaceWriteLease};
 use turn_pty::ObservedProcess;
 
 /// How far a node's recorded launch and the OS's own start time may disagree before the
@@ -269,6 +269,26 @@ impl Core {
             match &current {
                 // A crash: the fenced row keeps its identity and is adopted exactly.
                 Some(lease) => {
+                    let Some(writer) = self.sessions.get(&session_id).cloned() else {
+                        continue;
+                    };
+                    // Host authority is acquired before SQLite is promoted. If another
+                    // daemon or surviving descendant still holds it, the durable row
+                    // remains fenced and this start asks instead of admitting two writers.
+                    let mut claim = lease.clone();
+                    claim.state = LeaseState::Active;
+                    claim.heartbeat_ms = now_ms;
+                    let checkout_lock = match self.checkout_lock_claim(&writer, &claim) {
+                        Ok(lock) => lock,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error, session = %session_id,
+                                "could not recover host-wide checkout authority; it still needs confirmation"
+                            );
+                            summary.withheld += 1;
+                            continue;
+                        }
+                    };
                     match self.store.hierarchy().reclaim_write_lease(
                         &workspace_id,
                         &session_id,
@@ -278,6 +298,7 @@ impl Core {
                         now_ms,
                     ) {
                         Ok(Some(adopted)) => {
+                            self.install_checkout_write_lock(&session_id, &adopted, checkout_lock);
                             tracing::info!(
                                 session = %session_id,
                                 lease = %adopted.id,
@@ -299,26 +320,50 @@ impl Core {
                 }
                 // A clean stop: nothing was fenced, so this is an ordinary acquisition
                 // for the Session that was already the writer.
-                None => match self.store.hierarchy().acquire_write_lease(
-                    &workspace_id,
-                    &session_id,
-                    &checkout_id,
-                    now_ms,
-                ) {
-                    Ok(lease) => {
-                        tracing::info!(
-                            session = %session_id,
-                            lease = %lease.id,
-                            generation = lease.generation,
-                            "took checkout write access back after a clean stop"
-                        );
-                        summary.reacquired += 1;
+                None => {
+                    let Some(writer) = self.sessions.get(&session_id).cloned() else {
+                        continue;
+                    };
+                    let claim = WorkspaceWriteLease::active(
+                        workspace_id.clone(),
+                        session_id.clone(),
+                        checkout_id.clone(),
+                        now_ms,
+                    );
+                    let checkout_lock = match self.checkout_lock_claim(&writer, &claim) {
+                        Ok(lock) => lock,
+                        Err(error) => {
+                            tracing::warn!(
+                                %error, session = %session_id,
+                                "could not take host-wide checkout authority back; the Session must ask for it"
+                            );
+                            summary.withheld += 1;
+                            continue;
+                        }
+                    };
+                    match self.store.hierarchy().acquire_write_lease_with_id(
+                        &workspace_id,
+                        &session_id,
+                        &checkout_id,
+                        Some(&claim.id),
+                        now_ms,
+                    ) {
+                        Ok(lease) => {
+                            self.install_checkout_write_lock(&session_id, &lease, checkout_lock);
+                            tracing::info!(
+                                session = %session_id,
+                                lease = %lease.id,
+                                generation = lease.generation,
+                                "took checkout write access back after a clean stop"
+                            );
+                            summary.reacquired += 1;
+                        }
+                        Err(error) => tracing::warn!(
+                            %error, session = %session_id,
+                            "could not take checkout write access back; the Session must ask for it"
+                        ),
                     }
-                    Err(error) => tracing::warn!(
-                        %error, session = %session_id,
-                        "could not take checkout write access back; the Session must ask for it"
-                    ),
-                },
+                }
             }
         }
         summary
