@@ -143,6 +143,13 @@ pub struct Desk {
     /// one Session cannot overwrite another with a global red string.
     restores: HashMap<SessionId, SessionRestoreView>,
     relaunching: HashSet<NodeId>,
+    /// Nodes this window has already tried to start on its own.
+    ///
+    /// Separate from [`Self::relaunching`], which is cleared when a request finishes — including
+    /// when it *fails*. Without a second record a failing relaunch would be asked for again on
+    /// the next sweep, and again, for as long as the window stayed open. A node is tried once;
+    /// after that the pane's own button is the way, and it is the user asking rather than Turn.
+    auto_started: HashSet<NodeId>,
     reclaiming_leases: HashSet<WorkspaceId>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
@@ -192,6 +199,7 @@ impl Desk {
             preview_history: HashMap::new(),
             restores: HashMap::new(),
             relaunching: HashSet::new(),
+            auto_started: HashSet::new(),
             reclaiming_leases: HashSet::new(),
             temporary_pane: None,
             write_conflict: None,
@@ -540,6 +548,16 @@ impl Desk {
 
     /// Applies a message from the daemon.
     pub fn apply_inbound(&mut self, message: Inbound, now_ms: i64) -> Vec<Reaction> {
+        let mut out = self.apply_inbound_message(message, now_ms);
+        // After every message, because any of them can be the one that revealed a stopped pane:
+        // the layout arriving, the tree arriving, a process exiting, a write confirmation being
+        // granted. Sweeping after each is what makes this impossible to miss — the two earlier
+        // attempts each hooked a single event and each missed the case that was reported.
+        out.extend(self.autostart_stopped_panes());
+        out
+    }
+
+    fn apply_inbound_message(&mut self, message: Inbound, now_ms: i64) -> Vec<Reaction> {
         match message {
             Inbound::Status(state) => self.apply_status(state),
             Inbound::Event(event) => self.apply_event(*event, now_ms),
@@ -1566,63 +1584,11 @@ impl Desk {
                     self.attaching.remove(&outcome.pane_id);
                     self.pty_sizes.remove(&outcome.pane_id);
                 }
-                // Coming back to a Session starts it.
-                //
-                // This used to say "merely receiving this event never starts a process", and the
-                // Session came back as a grid of empty panes with a button under each one. That
-                // is not a Session, it is a form — and it was reported three times before it was
-                // fixed, the last time as unusable.
-                //
-                // What starts is what the daemon marked `auto_start`: a pane whose
-                // `RestoreBehaviour` is `Relaunch`, the value that has always meant "running this
-                // again is harmless" and that every built-in template sets. `ReattachOnly` now
-                // means what it says and keeps its button, which is where a pane naming a deploy
-                // or a migration belongs.
-                //
-                // Here rather than in the daemon, deliberately. The daemon restores when it
-                // starts, including after a crash with no window open — and relaunching thirty
-                // panes with nobody watching is how a user finds out Turn ran something. This
-                // fires when a window has actually received the report, which is when somebody
-                // is there.
-                let held_back = self.write_recovery_pending(&session_id);
-                let start: Vec<Reaction> = panes
-                    .iter()
-                    .filter(|outcome| outcome.auto_start)
-                    // A pane that would use the checkout waits for the write confirmation, and
-                    // only that pane: the shell the user needs in order to go and deal with
-                    // whatever the confirmation is about starts now, as it always did.
-                    .filter(|outcome| !(held_back && outcome.needs_checkout_write))
-                    // Something from the previous daemon is still alive and out of reach.
-                    // Starting a replacement beside it would run the work twice.
-                    .filter(|_| !self.has_unreachable_processes(&session_id))
-                    .map(|outcome| Reaction::Send {
-                        ask: Ask::RelaunchNode {
-                            session_id: session_id.clone(),
-                            node_id: outcome.node_id.clone(),
-                        },
-                        request: Request::RelaunchNode {
-                            session_id: session_id.clone(),
-                            node_id: outcome.node_id.clone(),
-                            resume: false,
-                        },
-                    })
-                    .collect();
-                for reaction in &start {
-                    if let Reaction::Send {
-                        request: Request::RelaunchNode { node_id, .. },
-                        ..
-                    } = reaction
-                    {
-                        self.relaunching.insert(node_id.clone());
-                    }
-                }
-                if !start.is_empty() {
-                    tracing::info!(
-                        session = %session_id,
-                        panes = start.len(),
-                        "starting the panes this Session came back with"
-                    );
-                }
+                // Nothing is started here. The sweep in `autostart_stopped_panes` does it, over
+                // every stopped pane the window knows about — this event only fires when the
+                // daemon has something to explain, and a Session whose processes had simply ended
+                // never produced one, which is how the first attempt at this missed the case it
+                // was written for.
                 self.restores.insert(
                     session_id.clone(),
                     SessionRestoreView {
@@ -1631,7 +1597,7 @@ impl Desk {
                         panes,
                     },
                 );
-                start
+                Vec::new()
             }
             E::NodeStateChanged {
                 session_id,
@@ -1758,6 +1724,89 @@ impl Desk {
         ancestors.reverse();
         keys.extend(ancestors.into_iter().map(HierarchyKey::process));
         keys
+    }
+
+    /// Starts every stopped pane that says it is safe to start, in every Session the window knows
+    /// about. Called after anything arrives from the daemon.
+    ///
+    /// **This is where the answer belongs, and the first two attempts put it in the wrong place.**
+    /// The first added a collective button; the second acted on the restore report — which the
+    /// daemon only sends when it has something to *explain*, so a Session whose processes had
+    /// simply ended came back to a grid of "Session process stopped / Start pane" and nothing had
+    /// changed for the person looking at it. A sweep over what is actually on screen cannot miss a
+    /// case the way a single event can.
+    ///
+    /// What it needs is in the window already: the layout says each pane's `RestoreBehaviour` and
+    /// the tree says whether its process has ended. `Relaunch` means running it again is harmless,
+    /// which every built-in template sets for its shells, its agent panes and its file browsers.
+    /// `ReattachOnly` keeps its button, and is where a pane naming a deploy or a migration belongs.
+    ///
+    /// Held back in the two cases where starting would be wrong rather than merely eager: a pane
+    /// that would use the checkout while a write confirmation is pending, and every pane in a
+    /// Session with a process from the previous daemon still alive and out of reach.
+    fn autostart_stopped_panes(&mut self) -> Vec<Reaction> {
+        let mut out = Vec::new();
+        let sessions: Vec<SessionId> = self.layouts.keys().cloned().collect();
+        for session_id in sessions {
+            if self.has_unreachable_processes(&session_id) {
+                continue;
+            }
+            let held_back = self.write_recovery_pending(&session_id);
+            let Some(layout) = self.layouts.get(&session_id) else {
+                continue;
+            };
+            let Some(tree) = self.trees.get(&session_id) else {
+                continue;
+            };
+            let mut wanted: Vec<NodeId> = Vec::new();
+            for pane in layout.panes() {
+                if pane.restore != turn_core::model::RestoreBehaviour::Relaunch {
+                    continue;
+                }
+                let Some(node_id) = pane.node_id.clone() else {
+                    continue;
+                };
+                if self.relaunching.contains(&node_id) || self.auto_started.contains(&node_id) {
+                    continue;
+                }
+                // Only a pane whose process has actually ended. A running one needs nothing, and
+                // a node the window has not heard about yet is not evidence of anything.
+                let ended = tree
+                    .iter()
+                    .any(|node| node.node_id == node_id && node.lifecycle.is_terminal());
+                if !ended {
+                    continue;
+                }
+                // An agent, or anything the pane names, would use the checkout; the user's own
+                // shell would not, and that shell is what they need in order to go and deal with
+                // whatever the confirmation is about.
+                if held_back && pane.command.is_some() {
+                    continue;
+                }
+                wanted.push(node_id);
+            }
+            for node_id in wanted {
+                self.relaunching.insert(node_id.clone());
+                self.auto_started.insert(node_id.clone());
+                tracing::info!(
+                    session = %session_id,
+                    node = %node_id,
+                    "starting a stopped pane the Session came back with"
+                );
+                out.push(Reaction::Send {
+                    ask: Ask::RelaunchNode {
+                        session_id: session_id.clone(),
+                        node_id: node_id.clone(),
+                    },
+                    request: Request::RelaunchNode {
+                        session_id: session_id.clone(),
+                        node_id,
+                        resume: false,
+                    },
+                });
+            }
+        }
+        out
     }
 
     /// Whether this Session is waiting for the user to confirm write access to the checkout.
@@ -5067,17 +5116,28 @@ mod tests {
     /// open the user's own shell starts; the one that would run an agent against the
     /// Coming back to a Session starts it.
     ///
-    /// Reported three times: Turn restored the layout and left every pane empty with a button
-    /// under it, so a Session came back as a form to fill in. The rule it came from — that Turn
-    /// never runs anything by itself — is right for a command with a consequence and wrong for
-    /// the shells and agent panes every template is made of, which is what
-    /// `RestoreBehaviour::Relaunch` has always meant. The daemon marks those `auto_start`; this
-    /// is the window acting on them.
+    /// Reported four times, and the first three attempts each fixed the wrong thing: a collective
+    /// button, then the restore report — which the daemon only sends when it has something to
+    /// *explain*, so a Session whose processes had simply ended still came back as a grid of
+    /// "Session process stopped / Start pane".
+    ///
+    /// This is the sweep, over what is actually on screen: a pane marked `Relaunch` whose process
+    /// has ended is started, once, without being asked.
     #[test]
-    fn a_restore_report_starts_the_panes_it_says_are_safe_to_start() {
-        let (session, pane_id, node_id) = session_with_agent("Restarting");
+    fn a_stopped_pane_that_is_safe_to_start_is_started_without_being_asked() {
+        let (mut session, pane_id, node_id) = session_with_agent("Restarting");
+        // Marked safe to run again, which is what every built-in template does.
+        if let Some(pane) = session.layout.get_mut(&pane_id) {
+            pane.restore = turn_core::model::RestoreBehaviour::Relaunch;
+        }
+        // And its process has ended, which is the state the screenshot was taken in.
+        if let Some(node) = session.tree.get_mut(&node_id) {
+            node.lifecycle = Lifecycle::Lost;
+            node.turn = None;
+        }
 
         let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
         desk.apply_inbound(
             answer(Response::Sessions {
                 sessions: vec![summary(&session, 0)],
@@ -5085,33 +5145,9 @@ mod tests {
             T0,
         );
         let reactions = desk.apply_inbound(
-            Inbound::Event(Box::new(ServerEvent::RestoreResult {
-                session_id: session.id.clone(),
-                state: turn_core::model::RestoreState::LayoutOnly,
-                needs_explanation: true,
-                panes: vec![
-                    turn_proto::PaneRestoreOutcome {
-                        pane_id: pane_id.clone(),
-                        node_id: node_id.clone(),
-                        lifecycle: Lifecycle::Lost,
-                        can_relaunch: true,
-                        command: Some("zsh".into()),
-                        auto_start: true,
-                        needs_checkout_write: false,
-                    },
-                    // Marked `ReattachOnly` by whoever built the pane: it can be started, and not
-                    // without being asked. This is where a deploy or a migration belongs.
-                    turn_proto::PaneRestoreOutcome {
-                        pane_id: PaneId::from_stored("pane_careful"),
-                        node_id: NodeId::from_stored("node_careful"),
-                        lifecycle: Lifecycle::Lost,
-                        can_relaunch: true,
-                        command: Some("npm run deploy".into()),
-                        auto_start: false,
-                        needs_checkout_write: false,
-                    },
-                ],
-            })),
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
             T0,
         );
 
@@ -5122,14 +5158,63 @@ mod tests {
         assert_eq!(
             started.len(),
             1,
-            "exactly the pane that said it was safe: {started:?}"
+            "the stopped pane must be started without a click: {started:?}"
         );
         assert!(
             matches!(
                 &started[0],
                 Request::RelaunchNode { node_id: asked, resume: false, .. } if *asked == node_id
             ),
-            "and it is the one that said so, started fresh rather than resumed: {started:?}"
+            "and it is that pane's node, started fresh rather than resumed: {started:?}"
+        );
+
+        // Asked once. The sweep runs after every message from the daemon, so anything that did
+        // not remember having tried would send a relaunch per message for as long as the pane
+        // stayed stopped.
+        let again = desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0 + 1,
+        );
+        assert!(
+            !sent(&again)
+                .iter()
+                .any(|request| matches!(request, Request::RelaunchNode { .. })),
+            "a pane is started once, not once per message: {:?}",
+            sent(&again)
+        );
+    }
+
+    /// A pane whose command has a consequence keeps its button.
+    ///
+    /// `ReattachOnly` is the default and now means what it says. This is the half of the original
+    /// rule that was worth keeping: Turn does not run somebody's deploy because their window
+    /// reopened.
+    #[test]
+    fn a_pane_that_did_not_say_it_was_safe_is_left_alone() {
+        let (mut session, pane_id, node_id) = session_with_agent("Careful");
+        if let Some(pane) = session.layout.get_mut(&pane_id) {
+            pane.restore = turn_core::model::RestoreBehaviour::ReattachOnly;
+            pane.command = Some("npm run deploy".into());
+        }
+        if let Some(node) = session.tree.get_mut(&node_id) {
+            node.lifecycle = Lifecycle::Lost;
+        }
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        let reactions = desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        assert!(
+            !sent(&reactions)
+                .iter()
+                .any(|request| matches!(request, Request::RelaunchNode { .. })),
+            "nothing may run a command the pane did not say was safe to repeat"
         );
     }
 
