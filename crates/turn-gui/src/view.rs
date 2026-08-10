@@ -420,6 +420,11 @@ pub struct TurnView<'a> {
     pub notice: Option<String>,
     /// Typed checkout conflict, rendered as a recovery flow rather than parsed text.
     pub write_conflict: Option<&'a ProtoErrorContext>,
+    /// A link from a pane that must be confirmed before Turn hands it to the desktop.
+    ///
+    /// Only ever set for a link whose visible text names a different target than the one it
+    /// would open — `links` decides that, and an ordinary link never arrives here.
+    pub link_confirmation: Option<&'a terminal::links::LinkRequest>,
     /// The attention policy in force, for the settings sheet.
     pub policy: Option<AttentionPolicy>,
     pub now_ms: i64,
@@ -940,6 +945,28 @@ pub enum ViewAction {
     },
     /// Close a sheet.
     CloseOverlay,
+
+    /// Forget the scrollback Turn kept for one pane, from that pane's own menu.
+    ///
+    /// Turn's record only. The screen belongs to the program in the pane, and clearing that
+    /// would mean typing into whatever is running.
+    ClearPaneHistory {
+        pane_id: PaneId,
+    },
+    /// Open a link found in a pane's output.
+    ///
+    /// Carries the whole [`terminal::links::LinkRequest`] rather than a URL, because whether
+    /// this needs asking about first is a property of the link — a target whose visible text
+    /// names a different host arrives with that warning attached — and the window is the
+    /// thing that can ask.
+    FollowLink(terminal::links::LinkRequest),
+    /// Turn saying something in its own voice, from a pane that declined part of what the
+    /// user asked for.
+    Notice(String),
+    /// The user said yes to the link they were asked about.
+    ConfirmLink,
+    /// The user said no, or pressed Escape.
+    DismissLink,
 }
 
 /// What one toolbar button does when it is pressed.
@@ -1818,6 +1845,8 @@ impl<'a> TurnView<'a> {
             }
         } else if state.lifecycle_confirmation.is_some() {
             actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
+        } else if let Some(link) = self.link_confirmation {
+            actions.extend(self.link_confirmation_overlay(ui, theme, link, full));
         } else if state.layout_draft.is_some() {
             actions.extend(self.layout_editor_overlay(ui, theme, state, full));
         } else if state.workspace_draft.is_some() {
@@ -2679,6 +2708,96 @@ impl<'a> TurnView<'a> {
         }
         if confirmed || cancelled {
             state.lifecycle_confirmation = None;
+        }
+        actions
+    }
+
+    /// The question asked before Turn hands a suspicious link to the desktop.
+    ///
+    /// Only reached for a link `links` flagged: an ordinary hyperlink opens on the click, and
+    /// a dialog in front of every link would train the user to dismiss this one. What makes
+    /// it worth asking is that the program in the pane chose both halves — the text the user
+    /// read and the target they did not — so the two are quoted separately and neither is
+    /// paraphrased.
+    ///
+    /// The default is the safe answer: Escape declines, and "Open link" is the one that has to
+    /// be aimed at.
+    fn link_confirmation_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        link: &terminal::links::LinkRequest,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let bounds = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                560.0_f32.min((full.width() - 32.0).max(300.0)),
+                268.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(bounds, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            bounds,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        let mut confirmed = false;
+        let mut declined = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        ui.scope_builder(region(bounds.shrink(20.0), "link-confirmation"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::AlertDialog);
+                node.set_modal();
+                node.set_label("Open this link?");
+            });
+            ui.label(
+                RichText::new("Open this link?")
+                    .size(21.0)
+                    .color(theme.text)
+                    .strong(),
+            );
+            ui.add_space(6.0);
+            // Monospace, both of them. These are strings chosen by a program to be
+            // mistaken for one another, and a proportional font is where a lookalike
+            // character hides.
+            ui.label(
+                RichText::new(format!("shown as  {}", link.text))
+                    .monospace()
+                    .color(theme.text_dim),
+            );
+            ui.label(
+                RichText::new(format!("goes to   {}", link.display))
+                    .monospace()
+                    .color(theme.text),
+            );
+            ui.add_space(10.0);
+            if let Some(warning) = &link.warning {
+                ui.label(RichText::new(warning.describe()).color(theme.failure));
+            }
+            ui.add_space(14.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Open link").color(Color32::WHITE))
+                            .fill(theme.failure),
+                    )
+                    .clicked()
+                {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    declined = true;
+                }
+            });
+        });
+        if confirmed {
+            actions.push(ViewAction::ConfirmLink);
+        } else if declined {
+            actions.push(ViewAction::DismissLink);
         }
         actions
     }
@@ -4870,6 +4989,77 @@ impl<'a> TurnView<'a> {
     }
 
     /// The panes of the selected session, with their dividers.
+    /// Turns what one pane did this frame into what the window will do about it.
+    ///
+    /// The two halves arrive together and are handled differently on purpose.
+    /// [`PaneAction`]s are things that happen *to* the pane and are forwarded verbatim.
+    /// [`PaneRequest`]s are things the pane cannot do itself, and two of them are answered
+    /// here rather than passed on, because they are window-local state in the same way
+    /// `settings_open` is: the find bar belongs to the pane's own interaction record, and
+    /// nothing outside this window needs to know it opened.
+    fn pane_outcome(
+        &self,
+        state: &mut ViewState,
+        pane_id: &PaneId,
+        outcome: terminal::PaneOutcome,
+        panes_in_layout: usize,
+        scrollback_offset: usize,
+    ) -> Vec<ViewAction> {
+        let mut actions: Vec<ViewAction> = outcome
+            .actions
+            .into_iter()
+            .map(|action| ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action,
+            })
+            .collect();
+        for request in outcome.requests {
+            match request {
+                terminal::PaneRequest::Search(text) => {
+                    // The offset the user is looking at, so closing the search puts them back
+                    // where they were rather than at the bottom of a pane they had scrolled up
+                    // in to read the thing they are searching for.
+                    state
+                        .pane(pane_id)
+                        .search
+                        .open_with(text, scrollback_offset, self.now_ms);
+                }
+                terminal::PaneRequest::ClearHistory => {
+                    actions.push(ViewAction::ClearPaneHistory {
+                        pane_id: pane_id.clone(),
+                    });
+                }
+                terminal::PaneRequest::FollowLink(link) => {
+                    actions.push(ViewAction::FollowLink(link));
+                }
+                terminal::PaneRequest::Split(Direction::Horizontal) => {
+                    actions.push(ViewAction::Run(Command::SplitHorizontal));
+                }
+                terminal::PaneRequest::Split(Direction::Vertical) => {
+                    actions.push(ViewAction::Run(Command::SplitVertical));
+                }
+                // Refused here rather than only greyed out in the menu. The menu is built
+                // from the same count, so this is unreachable through it — but a chord is
+                // not the menu, and the last pane of a Session is the one whose closure
+                // would leave a Session with nowhere to type.
+                terminal::PaneRequest::Close if panes_in_layout <= 1 => {
+                    actions.push(ViewAction::Notice(
+                        "this is the Session's only pane — end the Session to close it".into(),
+                    ));
+                }
+                terminal::PaneRequest::Close => {
+                    actions.push(ViewAction::ClosePane {
+                        pane_id: pane_id.clone(),
+                    });
+                }
+                terminal::PaneRequest::Notice(message) => {
+                    actions.push(ViewAction::Notice(message));
+                }
+            }
+        }
+        actions
+    }
+
     fn pane_area(
         &self,
         ui: &mut Ui,
@@ -4950,7 +5140,30 @@ impl<'a> TurnView<'a> {
         // Persisted pane focus and the window's keyboard lease are different things.
         // Keep the visual focus in place behind a sheet, but never let that sheet's
         // Text/Paste/Key events reach a PTY.
-        let accepts_terminal_input = !state.is_sensitive() && self.write_conflict.is_none();
+        // A modal question holds the keyboard, and the link dialog is one: a keystroke aimed at
+        // "Cancel" must not also be typed into whatever is running underneath it.
+        let accepts_terminal_input = !state.is_sensitive()
+            && self.write_conflict.is_none()
+            && self.link_confirmation.is_none();
+
+        // The pane menu's chords come from the same keymap the rest of the window uses, so a
+        // user who rebound "close pane" sees their own chord in the menu rather than the
+        // default it no longer is.
+        let shortcuts = terminal::menu::PaneShortcuts::from_keymap(keymap);
+        let panes_in_layout = arrangement.panes.len();
+        // Why an item is greyed out, in the words the menu will show. Each reason is a
+        // sentence rather than a bool: an item that is simply dim teaches the user nothing,
+        // and "why can I not close this pane" is a question the menu can answer itself.
+        let pane_context = terminal::menu::PaneContext {
+            split_unavailable: (!accepts_terminal_input)
+                .then(|| "Not while a sheet is open.".to_string()),
+            close_unavailable: (panes_in_layout <= 1).then(|| {
+                "This is the Session's only pane. End the Session to close it.".to_string()
+            }),
+            paste_unavailable: (!accepts_terminal_input)
+                .then(|| "Not while a sheet is open.".to_string()),
+            search_unavailable: None,
+        };
         for placed in &arrangement.panes {
             let header =
                 Rect::from_min_size(placed.rect.min, Vec2::new(placed.rect.width(), PANE_HEADER));
@@ -5184,15 +5397,33 @@ impl<'a> TurnView<'a> {
                         history_complete: content.history_complete,
                     };
                     let id = ui.id().with(("pane", placed.pane_id.as_str()));
-                    let interaction = state.pane(&placed.pane_id);
-                    for action in
-                        terminal::show(ui, theme, body, content.grid, interaction, options, id)
-                    {
-                        actions.push(ViewAction::Pane {
-                            pane_id: placed.pane_id.clone(),
-                            action,
-                        });
-                    }
+                    // Through `show_pane` rather than `show`, which is what makes the pane's
+                    // own menu, its links and its find bar reachable at all. They were
+                    // written, tested and then left behind the entry point that discards
+                    // every request a pane makes — so following an OSC-8 hyperlink worked in
+                    // the module's tests and did nothing in the window.
+                    let outcome = terminal::show_pane(
+                        ui,
+                        state.pane(&placed.pane_id),
+                        terminal::PaneInput {
+                            theme,
+                            rect: body,
+                            grid: content.grid,
+                            options,
+                            id,
+                            chrome: Some(terminal::PaneChrome {
+                                shortcuts: &shortcuts,
+                                context: &pane_context,
+                            }),
+                        },
+                    );
+                    actions.extend(self.pane_outcome(
+                        state,
+                        &placed.pane_id,
+                        outcome,
+                        panes_in_layout,
+                        content.grid.scrollback_offset,
+                    ));
                 }
                 (None, None) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
@@ -5346,7 +5577,9 @@ impl<'a> TurnView<'a> {
             (NodePaneCapability::Terminal { .. }, Some(grid)) => {
                 let options = PaneOptions {
                     focused: true,
-                    accepts_input: !state.is_sensitive() && self.write_conflict.is_none(),
+                    accepts_input: !state.is_sensitive()
+                        && self.write_conflict.is_none()
+                        && self.link_confirmation.is_none(),
                     now_ms: self.now_ms,
                     scrolled: false,
                     history_complete: true,

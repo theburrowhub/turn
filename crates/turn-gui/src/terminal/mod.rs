@@ -41,6 +41,7 @@ pub mod links;
 pub mod menu;
 pub mod mouse;
 pub mod notices;
+pub mod paths;
 pub mod search;
 pub mod selection;
 
@@ -109,6 +110,13 @@ pub enum PaneRequest {
     Split(Direction),
     /// Close this pane.
     Close,
+    /// Say something in the window's own voice — `Desk::show_notice`.
+    ///
+    /// For the case where a pane declined to do part of what the user asked and the reason
+    /// is not visible from the result. There is no pane-local place to put it: `grid.notices`
+    /// belongs to the daemon's report about the *program*, and this is Turn talking about
+    /// its own refusal.
+    Notice(String),
 }
 
 /// Everything one frame of a pane produced.
@@ -1156,6 +1164,7 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
             &mut outcome,
         );
     }
+    collect_dropped_paths(ui, theme, rect, grid, options, &mut outcome);
     // While the find field holds the keyboard every keystroke is the search's. Sending them
     // to the program as well would type the query into whatever is running.
     let field_has_keyboard = searching && ui.ctx().memory(|m| m.focused().is_some());
@@ -1681,6 +1690,76 @@ pub fn pane_label(grid: &Grid, state: &PaneInteraction, options: PaneOptions) ->
         }
     }
     label
+}
+
+/// Files dragged in from outside Turn, as text at the prompt.
+///
+/// Inserted, never run. Dropping a file on a terminal is a request to name it — the user
+/// reads what appeared and presses Enter themselves — so this appends no newline, and the
+/// path is quoted so that whatever is in the filename stays in the filename. `paths` decides
+/// all of that; this function is the frame plumbing around it.
+///
+/// **Only the pane under the pointer takes the drop**, and it takes it by draining the
+/// event. `dropped_files` is window-wide raw input: every pane sees the same list, so
+/// without both halves of that a four-pane Session would insert the paths four times.
+///
+/// Written as a paste rather than as typed text so it goes through the same bracketed-paste
+/// encoding a Cmd+V does. A shell that asked for bracketed paste then treats the whole
+/// insertion as one pasted unit — which is what stops readline from running anything if a
+/// path contains something it would otherwise act on.
+fn collect_dropped_paths(
+    ui: &Ui,
+    theme: &Theme,
+    rect: Rect,
+    grid: &Grid,
+    options: PaneOptions,
+    outcome: &mut PaneOutcome,
+) {
+    if !options.accepts_input {
+        return;
+    }
+    let pointer_here = ui
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|at| rect.contains(at));
+    if !pointer_here {
+        return;
+    }
+    // Before the drop lands: say where it would go. Without this the user is dragging a file
+    // over a window of identical panes with no idea which one is listening.
+    if ui.input(|input| !input.raw.hovered_files.is_empty()) {
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            2.0,
+            Stroke::new(2.0, theme.cursor),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let files = ui.ctx().input_mut(|input| {
+        if input.raw.dropped_files.is_empty() {
+            Vec::new()
+        } else {
+            input.raw.dropped_files.drain(..).collect::<Vec<_>>()
+        }
+    });
+    if files.is_empty() {
+        return;
+    }
+    // An empty path is a drop with nothing on disk behind it. There is nothing to name, and
+    // inventing a filename for it would be worse than ignoring it.
+    let paths: Vec<&std::path::Path> = files
+        .iter()
+        .map(|file| file.path())
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    let dropped = paths::dropped(&paths);
+    if let Some(text) = dropped.text.as_deref() {
+        outcome
+            .actions
+            .push(PaneAction::Write(keys::encode_paste(text, &grid.modes)));
+    }
+    if let Some(refusal) = dropped.refusal() {
+        outcome.requests.push(PaneRequest::Notice(refusal));
+    }
 }
 
 /// Selection, focus, the wheel, and mouse reporting.

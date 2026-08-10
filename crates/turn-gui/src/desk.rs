@@ -150,6 +150,9 @@ pub struct Desk {
     /// the next sweep, and again, for as long as the window stayed open. A node is tried once;
     /// after that the pane's own button is the way, and it is the user asking rather than Turn.
     auto_started: HashSet<NodeId>,
+    /// A link from a pane whose visible text disagreed with its target, waiting to be
+    /// confirmed. Window-local: nothing outside this window is affected by a question.
+    link_confirmation: Option<crate::terminal::links::LinkRequest>,
     reclaiming_leases: HashSet<WorkspaceId>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
@@ -200,6 +203,7 @@ impl Desk {
             restores: HashMap::new(),
             relaunching: HashSet::new(),
             auto_started: HashSet::new(),
+            link_confirmation: None,
             reclaiming_leases: HashSet::new(),
             temporary_pane: None,
             write_conflict: None,
@@ -295,6 +299,43 @@ impl Desk {
     /// guards (for example Quick New before templates arrive) use this path.
     pub fn show_notice(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
+    }
+
+    /// The link waiting for the user to say yes, if one is.
+    pub fn link_confirmation(&self) -> Option<&crate::terminal::links::LinkRequest> {
+        self.link_confirmation.as_ref()
+    }
+
+    /// The user said yes to the link they were asked about.
+    pub fn confirm_link(&mut self) -> Vec<Reaction> {
+        let Some(link) = self.link_confirmation.take() else {
+            return Vec::new();
+        };
+        self.open_link(&link)
+    }
+
+    /// The user said no, or pressed Escape.
+    pub fn dismiss_link(&mut self) {
+        self.link_confirmation = None;
+    }
+
+    /// Hands a link to the platform's own opener, and says so if it will not go.
+    ///
+    /// A failure is a notice rather than silence: the user clicked something and nothing
+    /// happened is the worst of the three outcomes, and "the scheme is not one Turn will
+    /// open" is a sentence that tells them what to do instead.
+    fn open_link(&mut self, link: &crate::terminal::links::LinkRequest) -> Vec<Reaction> {
+        match crate::terminal::links::open(&link.target) {
+            Ok(()) => {
+                tracing::info!(target = %link.display, "opened a link from a pane");
+                Vec::new()
+            }
+            Err(error) => {
+                let message = format!("could not open {}: {error}", link.display);
+                self.notice = Some(message.clone());
+                vec![Reaction::Notice(message)]
+            }
+        }
     }
 
     /// Says which processes may have outlived the thing that was just ended.
@@ -722,6 +763,7 @@ impl Desk {
         self.reclaiming_leases.clear();
         self.temporary_pane = None;
         self.write_conflict = None;
+        self.link_confirmation = None;
         self.pending_workspace_creation = false;
         self.pending_session = None;
         self.workspaces.clear();
@@ -3114,6 +3156,36 @@ impl Desk {
                 }],
                 None => Vec::new(),
             },
+            // Turn's own record of the pane, forgotten. Local by definition: the scrollback
+            // above the screen is a buffer this window kept, and the daemon has its own. What
+            // is *on* the screen is untouched, because clearing that would mean writing bytes
+            // into the pty, which is typing at whatever is running.
+            ViewAction::ClearPaneHistory { pane_id } => {
+                if let Some(feed) = self.feeds.get_mut(&pane_id) {
+                    feed.clear_history();
+                }
+                Vec::new()
+            }
+            // Opening a link reaches the user's desktop, which is as far outside Turn as
+            // anything it does goes. Two gates, both in `links`: the scheme has to be one Turn
+            // will hand over at all, and a link whose visible text names a different host than
+            // its target arrives asking to be confirmed first.
+            ViewAction::FollowLink(link) => {
+                if link.needs_confirmation() {
+                    self.link_confirmation = Some(link);
+                    return Vec::new();
+                }
+                self.open_link(&link)
+            }
+            ViewAction::Notice(message) => {
+                self.notice = Some(message.clone());
+                vec![Reaction::Notice(message)]
+            }
+            ViewAction::ConfirmLink => self.confirm_link(),
+            ViewAction::DismissLink => {
+                self.dismiss_link();
+                Vec::new()
+            }
             ViewAction::ClosePane { pane_id } => {
                 let Some(session_id) = self
                     .session_of_pane(&pane_id)
@@ -3378,6 +3450,7 @@ impl Desk {
                 .clone()
                 .or_else(|| self.notice.clone()),
             write_conflict: self.write_conflict(),
+            link_confirmation: self.link_confirmation(),
             include_archived: self.include_archived,
             policy: self
                 .selected
@@ -7151,6 +7224,90 @@ mod tests {
         assert!(
             !desk.view(T0).panes[0].scrolled,
             "typing returns to the live screen, as in every terminal"
+        );
+    }
+
+    /// A link whose text agrees with its target opens on the click.
+    ///
+    /// The whole apparatus for this — scheme allow-list, normalisation, the lookalike
+    /// check — was written and tested inside `terminal::links`, and then reached nothing:
+    /// the window drew panes through the entry point that discards every request a pane
+    /// makes, so following a hyperlink was a no-op in the actual product. These two tests
+    /// are about the wire, not about the link logic.
+    #[test]
+    fn a_link_that_matches_its_own_text_needs_no_second_question() {
+        let mut desk = Desk::new();
+        let reactions = desk.apply_view_action(
+            ViewAction::FollowLink(crate::terminal::links::LinkRequest {
+                target: crate::terminal::links::LinkTarget::Url("https://example.com/x".into()),
+                display: "https://example.com/x".into(),
+                text: "https://example.com/x".into(),
+                warning: None,
+            }),
+            T0,
+        );
+        assert!(
+            desk.link_confirmation().is_none(),
+            "an ordinary link must not put a dialog in front of the user"
+        );
+        // Whether the platform opener succeeded is the platform's business and not
+        // assertable in a test that must not launch a browser. What is asserted is that
+        // nothing was *asked* and nothing was sent to the daemon: opening a link is not a
+        // daemon operation.
+        assert!(
+            !reactions
+                .iter()
+                .any(|reaction| matches!(reaction, Reaction::Send { .. })),
+            "got {reactions:?}"
+        );
+    }
+
+    /// And one whose text names a different host waits to be confirmed.
+    #[test]
+    fn a_link_whose_text_names_another_host_waits_for_the_user() {
+        let mut desk = Desk::new();
+        let link = crate::terminal::links::LinkRequest {
+            target: crate::terminal::links::LinkTarget::Url("https://evil.example/steal".into()),
+            display: "https://evil.example/steal".into(),
+            text: "https://github.com/theburrowhub/turn".into(),
+            warning: Some(crate::terminal::links::LinkWarning::TextNamesAnotherHost {
+                shown: "github.com".into(),
+                target: "evil.example".into(),
+            }),
+        };
+        desk.apply_view_action(ViewAction::FollowLink(link.clone()), T0);
+        assert_eq!(
+            desk.link_confirmation(),
+            Some(&link),
+            "the question has to name both halves, so it holds the whole request"
+        );
+
+        // Declining leaves nothing behind. A dialog that reappeared would be a dialog the
+        // user cannot get out of.
+        desk.apply_view_action(ViewAction::DismissLink, T0);
+        assert!(desk.link_confirmation().is_none());
+
+        // And a reconnect drops it too: the pane that found the link may not exist on the
+        // other side of a daemon restart, and a question about it would outlive its subject.
+        desk.apply_view_action(ViewAction::FollowLink(link), T0);
+        assert!(desk.link_confirmation().is_some());
+        desk.apply_inbound(connected(), T0);
+        assert!(desk.link_confirmation().is_none());
+    }
+
+    /// Clearing a pane's history is Turn's own record and never the program's screen.
+    #[test]
+    fn clearing_a_panes_history_asks_the_daemon_for_nothing() {
+        let mut desk = Desk::new();
+        let reactions = desk.apply_view_action(
+            ViewAction::ClearPaneHistory {
+                pane_id: PaneId::from_stored("pane_a"),
+            },
+            T0,
+        );
+        assert!(
+            reactions.is_empty(),
+            "the scrollback above the screen is this window's buffer: {reactions:?}"
         );
     }
 

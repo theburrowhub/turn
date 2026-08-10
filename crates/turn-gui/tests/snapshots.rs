@@ -88,6 +88,7 @@ struct Fixture {
     temporary_pane: Option<NodePaneView>,
     temporary_previews: Vec<ActivityPreview>,
     write_conflict: Option<ProtoErrorContext>,
+    link_confirmation: Option<turn_gui::terminal::links::LinkRequest>,
     restore: Option<SessionRestoreView>,
     recovery_lease: Option<WorkspaceWriteLease>,
     /// The Settings preference. Off by default, as it is in the window, so a fixture that
@@ -148,6 +149,7 @@ impl Fixture {
             connection: self.connection.clone(),
             notice: self.notice.clone(),
             write_conflict: self.write_conflict.as_ref(),
+            link_confirmation: self.link_confirmation.as_ref(),
             include_archived: self.include_archived,
             policy: None,
             now_ms: cursor_on(),
@@ -2311,6 +2313,44 @@ fn a_session_with_an_unstoppable_process_says_what_ending_it_will_not_achieve() 
             session_id,
             disposition: CloseDisposition::Terminate,
         }]
+    );
+}
+
+/// A link whose visible text names a different host than its target is asked about, and the
+/// question quotes both halves.
+///
+/// The program in the pane chose the text *and* the target, which is the whole reason this
+/// dialog exists — so neither is paraphrased and both are monospace, because a lookalike
+/// character is exactly what a proportional font hides.
+#[test]
+fn a_link_that_does_not_go_where_it_says_is_asked_about_before_it_opens() {
+    let mut fixture = busy_desk();
+    fixture.link_confirmation = Some(turn_gui::terminal::links::LinkRequest {
+        target: turn_gui::terminal::links::LinkTarget::Url(
+            "https://evil.example/harvest?token=1".into(),
+        ),
+        display: "https://evil.example/harvest?token=1".into(),
+        text: "https://github.com/theburrowhub/turn/pull/28".into(),
+        warning: Some(
+            turn_gui::terminal::links::LinkWarning::TextNamesAnotherHost {
+                shown: "github.com".into(),
+                target: "evil.example".into(),
+            },
+        ),
+    });
+    let mut h = harness(fixture);
+    h.run();
+    h.snapshot("link_confirmation");
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Cancel")
+        .expect("declining is always available")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::DismissLink],
+        "and it is the decline that is one keystroke away, not the open"
     );
 }
 
