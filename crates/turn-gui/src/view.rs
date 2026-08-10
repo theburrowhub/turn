@@ -461,6 +461,8 @@ pub struct ViewState {
     /// write the third one to the wrong place. Defaults to the narrowest level that exists,
     /// because that is the one a change is least likely to surprise somebody else with.
     pub settings_level: Option<turn_core::settings::Scope>,
+    /// The chord being typed into one command's field, keyed by the command id.
+    pub shortcut_drafts: std::collections::BTreeMap<String, String>,
     /// The text being typed into one preference's field, keyed by its key.
     ///
     /// Held while editing rather than written per keystroke: a `set_setting` per character
@@ -993,6 +995,16 @@ pub enum ViewAction {
         owner_id: String,
         key: String,
         value: serde_json::Value,
+    },
+    /// Bind, unbind or reset one command's chord.
+    ///
+    /// The chord arrives as the text the user typed, unparsed. Parsing it here would put a
+    /// second reader of the chord grammar in the window; `Overrides::from_settings` already
+    /// has one, and it reports what it could not read rather than dropping it.
+    RebindCommand {
+        command: String,
+        /// The chord as written, `""` to unbind, or [`DEFAULT_CHORD`] to go back to Turn's own.
+        chord: String,
     },
     /// Remove one level's opinion, so the level below is in force again.
     ResetSetting {
@@ -1893,7 +1905,7 @@ impl<'a> TurnView<'a> {
         } else if state.palette.open {
             actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
         } else if state.shortcuts_open {
-            actions.extend(self.shortcuts_sheet(ui, theme, keymap, full));
+            actions.extend(self.shortcuts_sheet(ui, theme, keymap, state, full));
         } else if state.settings_open {
             actions.extend(self.settings_sheet(ui, theme, state, full));
         }
@@ -6414,6 +6426,7 @@ impl<'a> TurnView<'a> {
         ui: &mut Ui,
         theme: &Theme,
         keymap: &Keymap,
+        state: &mut ViewState,
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
@@ -6444,22 +6457,98 @@ impl<'a> TurnView<'a> {
                     .small(),
                 );
             }
+            // Two chords on one key is the failure this whole sheet has to make visible: the
+            // second binding never fires and nothing else would say so. Reported before the
+            // list, because it is about the set rather than about any one row.
+            let conflicts = keymap.conflicts();
+            for (chord, commands) in &conflicts {
+                ui.label(
+                    RichText::new(format!(
+                        "{} is bound to {} commands: {}. Only the first will fire.",
+                        chord.describe(keymap.platform()),
+                        commands.len(),
+                        commands
+                            .iter()
+                            .map(|command| command.title())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .color(theme.failure)
+                    .small(),
+                );
+            }
+            let taken: std::collections::BTreeMap<String, Command> = keymap
+                .bindings()
+                .iter()
+                .map(|bound| (bound.chord.describe(keymap.platform()), bound.command))
+                .collect();
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Type a chord and press Enter. An empty field unbinds the command.")
+                    .color(theme.text_faint)
+                    .small(),
+            );
+            ui.add_space(6.0);
             egui::ScrollArea::vertical()
                 .id_salt("shortcut-rows")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for bound in keymap.bindings() {
+                        let written = bound.chord.describe(keymap.platform());
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(bound.chord.describe(keymap.platform()))
-                                    .monospace()
-                                    .color(theme.text),
+                            let id = bound.command.id();
+                            let draft = state
+                                .shortcut_drafts
+                                .entry(id.to_string())
+                                .or_insert_with(|| written.clone());
+                            let response = ui.add(
+                                egui::TextEdit::singleline(draft)
+                                    .desired_width(160.0)
+                                    .font(egui::TextStyle::Monospace),
                             );
+                            describe_control(
+                                &response,
+                                egui::accesskit::Role::TextInput,
+                                bound.command.title(),
+                            );
+                            let committed = response.lost_focus()
+                                || (response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                            if committed {
+                                let typed = draft.trim().to_string();
+                                state.shortcut_drafts.remove(id);
+                                if typed != written {
+                                    actions.push(ViewAction::RebindCommand {
+                                        command: id.to_string(),
+                                        chord: typed,
+                                    });
+                                }
+                            }
                             ui.label(
                                 RichText::new(bound.command.title())
                                     .color(theme.text_dim)
                                     .small(),
                             );
+                            if bound.customised && ui.small_button("Reset").clicked() {
+                                actions.push(ViewAction::RebindCommand {
+                                    command: id.to_string(),
+                                    // The sentinel that means "no opinion" rather than
+                                    // "unbound": an empty chord unbinds, and there has to be a
+                                    // way back to the default that is neither.
+                                    chord: DEFAULT_CHORD.to_string(),
+                                });
+                            }
+                            // A chord already in use, named. Said on the row that would lose,
+                            // because that is the row the user is looking at.
+                            if let Some(other) =
+                                taken.get(&written).filter(|other| **other != bound.command)
+                            {
+                                ui.label(
+                                    RichText::new(format!("also {}", other.title()))
+                                        .color(theme.failure)
+                                        .small(),
+                                );
+                            }
                             if bound.chord.shadows_control_character(keymap.platform()) {
                                 ui.label(
                                     RichText::new("hidden from the terminal")
@@ -7017,8 +7106,12 @@ fn settings_control(
                 )
             };
             describe_control(&response, egui::accesskit::Role::TextInput, &entry.title);
+            // `has_focus` matters as much as the key: `key_pressed` is window-wide input, so
+            // without it one Enter would commit every field on the sheet at once.
             let committed = response.lost_focus()
-                || (!multiline && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                || (!multiline
+                    && response.has_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter)));
             if committed {
                 let typed = draft.clone();
                 state.settings_drafts.remove(key);
@@ -7125,6 +7218,14 @@ fn settings_value_of(typed: &str, control: &turn_proto::SettingsControl) -> serd
         _ => serde_json::Value::String(typed.to_string()),
     }
 }
+
+/// The chord text that means "no opinion, use Turn's own".
+///
+/// Needed because the preference has three states and a text field only naturally has two: a
+/// chord, an empty string that unbinds, and the absence of an entry that inherits. This is how
+/// the third is asked for, and it never reaches the stored value — the daemon is asked to
+/// remove the key instead.
+pub const DEFAULT_CHORD: &str = "<default>";
 
 /// What the window knows about one row that the row itself cannot work out: whether it is
 /// the selection, whether it is open, and whether anything of it is on screen.

@@ -576,6 +576,12 @@ the same value), every level it shadowed, and the levels it may be set at. A sec
 replaced with `<redacted>` and `hidden: true`; the daemon keeps the real value because it needs it,
 and this is the boundary past which nothing does.
 
+The `keyboard.bindings` preference is the one the **window** applies rather than the daemon: it is a
+map from command id to chord, and the daemon never sees a keystroke. An empty chord unbinds a command;
+an absent entry inherits, which is why resetting a binding removes its entry rather than writing the
+default into it. `keymap.json` still loads at startup and the stored preference wins over it per
+command, so a command the preference does not mention keeps what the file said.
+
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
 

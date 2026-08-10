@@ -2556,6 +2556,66 @@ fn reset_is_offered_only_at_the_level_that_holds_the_value() {
     );
 }
 
+/// The keyboard sheet, with a conflict the user made and can see.
+///
+/// The picture has to show the thing a shortcut editor exists to prevent: two commands on one
+/// chord, where the second never fires and nothing else in Turn would say so. The row that
+/// loses says which other command took its key, and the count is stated once above the list
+/// because it is a fact about the set rather than about any row.
+#[test]
+fn the_keyboard_sheet_names_a_chord_bound_to_two_commands() {
+    let mut h = harness(busy_desk());
+    // The conflict, made the way a user would: a chord typed into a second command that
+    // another one already had.
+    let taken = turn_gui::keymap::Chord::parse("Mod+Shift+Q").expect("a chord");
+    h.state_mut().keymap = Keymap::build(
+        &Overrides::new()
+            .bind(turn_gui::keymap::Command::ArchiveSession, taken)
+            .bind(turn_gui::keymap::Command::ZoomPane, taken),
+        Platform::MAC,
+    );
+    h.state_mut().state.shortcuts_open = true;
+    h.run();
+    h.run();
+    h.snapshot("keyboard_conflict");
+}
+
+/// Typing a chord asks for the rebind, and an empty field asks to unbind.
+#[test]
+fn typing_a_chord_rebinds_the_command_it_belongs_to() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.shortcuts_open = true;
+    h.run();
+    h.run();
+
+    // The chord as typed, put in the draft the field is editing. Typed character by character
+    // through the harness would be the same assertion with a dependency on how egui delivers
+    // text events.
+    h.state_mut()
+        .state
+        .shortcut_drafts
+        .insert("pane.zoom".into(), "Mod+Shift+J".into());
+    h.query_all_by_role(egui::accesskit::Role::TextInput)
+        .find(|node| node.accesskit_node().label().as_deref() == Some("Maximise pane (toggle)"))
+        .expect("every command's chord is editable under its own name")
+        .focus();
+    h.run();
+    h.state_mut().actions.clear();
+    // Committed on Enter, never per keystroke: a write per character would be a round trip per
+    // character, and "Mod+" on its own is not a chord anybody meant.
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(
+        h.state().actions.iter().any(|action| matches!(
+            action,
+            ViewAction::RebindCommand { command, chord }
+                if command == "pane.zoom" && chord.contains("Mod+Shift+J")
+        )),
+        "got {:?}",
+        h.state().actions
+    );
+}
+
 #[test]
 fn the_attention_queue_is_an_explicit_overlay_not_a_second_navigator() {
     let mut h = harness(busy_desk());

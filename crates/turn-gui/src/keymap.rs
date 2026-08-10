@@ -802,6 +802,19 @@ impl Overrides {
         self.entries.is_empty()
     }
 
+    /// Whether this set has an opinion about a command — including "unbound", which is an
+    /// opinion and not an absence.
+    pub fn mentions(&self, command: Command) -> bool {
+        self.entries.contains_key(&command)
+    }
+
+    /// Every opinion in this set, for layering one set over another.
+    pub fn entries(&self) -> impl Iterator<Item = (Command, Option<Chord>)> + '_ {
+        self.entries
+            .iter()
+            .map(|(command, chord)| (*command, *chord))
+    }
+
     /// Reads overrides out of the settings shape: command id to chord, or to
     /// nothing to unbind.
     ///
@@ -847,6 +860,12 @@ impl Overrides {
     }
 }
 
+/// The settings key the stored keyboard overrides live under.
+///
+/// Named here rather than as a string at each use site, because the catalogue in `turn-core`
+/// and the window that reads it have to agree and neither imports the other.
+pub const BINDINGS_KEY: &str = "keyboard.bindings";
+
 /// One binding with its chord settled for the keyboard in front of the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bound {
@@ -872,6 +891,34 @@ impl Keymap {
     /// the conflict list for the keyboard the user actually has. A user's own
     /// override wins on both platforms — they named a chord, and substituting a
     /// different one would be the map arguing with them.
+    /// The overrides that would rebuild this exact map.
+    ///
+    /// Needed because the window is handed a finished `Keymap` at startup — the file has
+    /// already been folded into it — and later has to layer the stored `keyboard.bindings`
+    /// preference on top without losing what the file said. Reconstructed rather than
+    /// remembered so there is one representation of the map and not two that can disagree.
+    ///
+    /// A command absent from `bindings` was unbound, which is why this walks the defaults
+    /// rather than only the bindings that are present: an unbind is a decision and reads as
+    /// an absence.
+    pub fn overrides(&self) -> Overrides {
+        let mut overrides = Overrides::new();
+        for binding in DEFAULT_BINDINGS {
+            match self
+                .bindings
+                .iter()
+                .find(|bound| bound.command == binding.command)
+            {
+                Some(bound) if bound.customised => {
+                    overrides = overrides.bind(bound.command, bound.chord);
+                }
+                Some(_) => {}
+                None => overrides = overrides.unbind(binding.command),
+            }
+        }
+        overrides
+    }
+
     pub fn build(overrides: &Overrides, platform: Platform) -> Keymap {
         let mut bindings = Vec::with_capacity(DEFAULT_BINDINGS.len());
         for binding in DEFAULT_BINDINGS {

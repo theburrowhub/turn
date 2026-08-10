@@ -3232,6 +3232,41 @@ impl Desk {
                     value,
                 },
             }],
+            // One command's chord, written into the whole `keyboard.bindings` map.
+            //
+            // The map is one preference rather than one per command, so a rebind is a
+            // read-modify-write of it. Read from the resolved value the daemon last sent,
+            // never from a copy the window keeps: that is the only version both sides agree
+            // on, and the answer to this write replaces it.
+            ViewAction::RebindCommand { command, chord } => {
+                let mut bindings = self
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.entry(crate::keymap::BINDINGS_KEY))
+                    .and_then(|entry| entry.resolution.value.as_object().cloned())
+                    .unwrap_or_default();
+                if chord == crate::view::DEFAULT_CHORD {
+                    // Back to Turn's own: the entry is removed rather than set, because an
+                    // entry saying "the default" would freeze today's default as tomorrow's
+                    // override.
+                    bindings.remove(&command);
+                } else {
+                    // An empty string is stored, not skipped: it is how "unbound" is said,
+                    // and it has to survive as a decision rather than as an absence.
+                    bindings.insert(command, serde_json::Value::String(chord));
+                }
+                vec![Reaction::Send {
+                    ask: Ask::WriteSetting {
+                        key: crate::keymap::BINDINGS_KEY.to_string(),
+                    },
+                    request: Request::SetSetting {
+                        scope: turn_core::settings::Scope::Global,
+                        owner_id: None,
+                        key: crate::keymap::BINDINGS_KEY.to_string(),
+                        value: serde_json::Value::Object(bindings),
+                    },
+                }]
+            }
             ViewAction::ResetSetting {
                 scope,
                 owner_id,
@@ -7375,6 +7410,119 @@ mod tests {
         assert!(desk.link_confirmation().is_some());
         desk.apply_inbound(connected(), T0);
         assert!(desk.link_confirmation().is_none());
+    }
+
+    /// A rebind is a read-modify-write of the one bindings map, and it keeps the rest.
+    ///
+    /// The map is one preference rather than one per command, so the danger is a write that
+    /// sends only the chord being changed and silently drops every other customisation the
+    /// user had. The read comes from the daemon's last answer, which is the only version both
+    /// sides agree on.
+    #[test]
+    fn rebinding_one_command_keeps_every_other_binding() {
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        desk.apply_inbound(
+            answer(Response::Settings {
+                settings: Box::new(settings_with_bindings(serde_json::json!({
+                    "pane.zoom": "Mod+Shift+Q",
+                    "session.archive": "",
+                }))),
+            }),
+            T0,
+        );
+
+        match sent(&desk.apply_view_action(
+            ViewAction::RebindCommand {
+                command: "palette.open".into(),
+                chord: "Mod+Shift+P".into(),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::SetSetting {
+                scope: turn_core::settings::Scope::Global,
+                key,
+                value,
+                ..
+            }] => {
+                assert_eq!(key, crate::keymap::BINDINGS_KEY);
+                assert_eq!(
+                    value,
+                    &serde_json::json!({
+                        "pane.zoom": "Mod+Shift+Q",
+                        // The empty string survives: it is how "unbound" is said, and losing
+                        // it would silently rebind a command the user had deliberately freed.
+                        "session.archive": "",
+                        "palette.open": "Mod+Shift+P",
+                    }),
+                    "the whole map is written, with the other two intact"
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// Going back to Turn's own chord removes the entry rather than writing the default into
+    /// it. Writing it would freeze today's default as tomorrow's override, and the user would
+    /// have "reset" a binding into permanence.
+    #[test]
+    fn resetting_a_binding_removes_it_instead_of_recording_the_default() {
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        desk.apply_inbound(
+            answer(Response::Settings {
+                settings: Box::new(settings_with_bindings(serde_json::json!({
+                    "pane.zoom": "Mod+Shift+Q",
+                    "palette.open": "Mod+K",
+                }))),
+            }),
+            T0,
+        );
+
+        match sent(&desk.apply_view_action(
+            ViewAction::RebindCommand {
+                command: "palette.open".into(),
+                chord: crate::view::DEFAULT_CHORD.into(),
+            },
+            T0,
+        ))
+        .as_slice()
+        {
+            [Request::SetSetting { value, .. }] => assert_eq!(
+                value,
+                &serde_json::json!({"pane.zoom": "Mod+Shift+Q"}),
+                "the entry is gone, so nothing overrides the built-in chord any more"
+            ),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// A `SettingsView` holding one `keyboard.bindings` value, which is all these tests need.
+    fn settings_with_bindings(bindings: serde_json::Value) -> turn_proto::SettingsView {
+        turn_proto::SettingsView {
+            session_id: None,
+            levels: vec![turn_proto::SettingsLevel::global()],
+            entries: vec![turn_proto::SettingsEntry {
+                area: turn_core::settings::Area::Keyboard,
+                area_title: "Keyboard".into(),
+                title: "Keyboard shortcuts".into(),
+                description: String::new(),
+                accepts: "a set of name/value pairs".into(),
+                control: turn_proto::SettingsControl::TextMap,
+                settable_at: vec![turn_core::settings::Scope::Global],
+                hidden: false,
+                known: true,
+                resolution: turn_core::settings::Resolution {
+                    key: crate::keymap::BINDINGS_KEY.to_string(),
+                    value: bindings,
+                    origin: Some(turn_core::settings::Scope::Global),
+                    shadowed: Vec::new(),
+                    sensitivity: turn_core::settings::Sensitivity::Plain,
+                },
+            }],
+        }
     }
 
     /// Clearing a pane's history is Turn's own record and never the program's screen.

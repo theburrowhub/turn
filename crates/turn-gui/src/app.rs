@@ -108,6 +108,13 @@ pub struct TurnApp {
     companion_events: Option<mpsc::Receiver<CompanionEvent>>,
     folder_dialog: FolderDialog,
     pending_folder_request: Option<u64>,
+    /// The bindings the window started with — `keymap.json`, already folded into the map it
+    /// was handed. Kept so a stored preference can be layered over them rather than replacing
+    /// them: a command the preference does not mention keeps what the file said.
+    file_overrides: crate::keymap::Overrides,
+    /// The `keyboard.bindings` value the current keymap was built from, so the map is rebuilt
+    /// when it changes rather than once per frame.
+    applied_bindings: Option<serde_json::Value>,
 }
 
 impl TurnApp {
@@ -150,6 +157,7 @@ impl TurnApp {
             Arc::new(move || waker.request_repaint()),
         );
 
+        let file_overrides = keymap.overrides();
         let mut desk = Desk::new();
         if let Some(error) = startup_error {
             desk.show_companion_notice(error);
@@ -170,6 +178,8 @@ impl TurnApp {
             companion_events,
             folder_dialog: FolderDialog::default(),
             pending_folder_request: None,
+            file_overrides,
+            applied_bindings: None,
         }
     }
 
@@ -480,6 +490,61 @@ impl TurnApp {
     }
 
     /// The commands the window handles itself rather than sending on.
+    /// Rebuilds the keymap when the daemon's `keyboard.bindings` preference changes.
+    ///
+    /// Without this the shortcut editor would be a control that lies: it writes a preference,
+    /// the daemon stores it, and the window carries on resolving keystrokes against the map it
+    /// was constructed with — so the user rebinds a chord, watches the sheet update, and the
+    /// old key keeps working. The bindings are the one preference the *window* applies,
+    /// because the daemon never sees a keystroke.
+    ///
+    /// `keymap.json` still loads at startup and is still honoured — it is what existing users
+    /// have — and the stored preference wins over it per command, because it is the one they
+    /// can change from inside Turn and therefore the one they will expect to have taken
+    /// effect. A command the preference says nothing about keeps what the file said.
+    ///
+    /// Guarded on the value rather than run every frame: rebuilding the map is cheap but not
+    /// free, and a rebuild per frame would also re-report every unreadable chord once per
+    /// frame.
+    fn follow_keyboard_settings(&mut self) {
+        let Some(stored) = self
+            .desk
+            .settings()
+            .and_then(|settings| settings.entry(crate::keymap::BINDINGS_KEY))
+            .map(|entry| entry.resolution.value.clone())
+        else {
+            return;
+        };
+        if self.applied_bindings.as_ref() == Some(&stored) {
+            return;
+        }
+        let pairs: Vec<(String, Option<String>)> = stored
+            .as_object()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(id, chord)| (id.clone(), chord.as_str().map(str::to_string)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (mut overrides, problems) = crate::keymap::Overrides::from_settings(pairs);
+        for (command, chord) in self.file_overrides.entries() {
+            if !overrides.mentions(command) {
+                overrides = match chord {
+                    Some(chord) => overrides.bind(command, chord),
+                    None => overrides.unbind(command),
+                };
+            }
+        }
+        for problem in &problems {
+            // Said out loud rather than dropped: a binding that silently did not load looks
+            // exactly like one that did not save, and the user's next move is to type it again.
+            self.desk.show_notice(problem.to_string());
+        }
+        self.keymap = crate::keymap::Keymap::build(&overrides, self.keymap.platform());
+        self.applied_bindings = Some(stored);
+    }
+
     fn handle_locally(&mut self, command: Command) -> bool {
         let visible_selection = self.state.selected_tree.clone().or_else(|| {
             self.state
@@ -646,6 +711,7 @@ impl eframe::App for TurnApp {
             self.state.preview_history = self.desk.preview_histories().clone();
         }
         self.state.write_conflict_open = self.desk.write_conflict().is_some();
+        self.follow_keyboard_settings();
 
         // 2. What the user is doing to the window.
         self.observe_activity(&ctx, now_ms);
@@ -1144,6 +1210,125 @@ mod tests {
                 );
             }
             other => panic!("expected a delayed frame, got {other:?}"),
+        }
+    }
+
+    /// A stored binding changes what a keystroke does, and a file binding it does not mention
+    /// survives.
+    ///
+    /// The failure this rules out is a shortcut editor that lies: it writes the preference, the
+    /// daemon stores it, and the window carries on resolving keystrokes against the map it was
+    /// built with — so the user rebinds a chord, sees the sheet update, and the old key keeps
+    /// working. The bindings are the one preference the *window* applies, because the daemon
+    /// never sees a keystroke.
+    #[test]
+    fn a_stored_binding_takes_effect_without_losing_what_the_file_said() {
+        let ctx = egui::Context::default();
+        // The file's contribution: one command moved off its default.
+        let from_file = Overrides::new().bind(
+            Command::ZoomPane,
+            crate::keymap::Chord::parse("Mod+Shift+J").expect("a chord"),
+        );
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-bindings.sock"),
+            Keymap::build(&from_file, Platform::MAC),
+        );
+        assert_eq!(
+            app.keymap
+                .chord_for(Command::ZoomPane)
+                .map(|chord| chord.describe(Platform::MAC)),
+            Some("Shift+Cmd+J".to_string()),
+            "the premise: the file's binding is in force before any preference arrives"
+        );
+
+        // And now the daemon's answer, mentioning a different command.
+        app.desk.apply_inbound(
+            crate::transport::Inbound::Answer {
+                ask: crate::transport::Ask::Settings,
+                response: Box::new(turn_proto::Response::Settings {
+                    settings: Box::new(bindings_view(serde_json::json!({
+                        "palette.open": "Mod+Shift+K",
+                    }))),
+                }),
+            },
+            1_700_000_000_000,
+        );
+        app.follow_keyboard_settings();
+
+        assert_eq!(
+            app.keymap
+                .chord_for(Command::OpenPalette)
+                .map(|chord| chord.describe(Platform::MAC)),
+            Some("Shift+Cmd+K".to_string()),
+            "the stored binding is what the window now resolves against"
+        );
+        assert_eq!(
+            app.keymap
+                .chord_for(Command::ZoomPane)
+                .map(|chord| chord.describe(Platform::MAC)),
+            Some("Shift+Cmd+J".to_string()),
+            "and the file's binding, which the preference says nothing about, is still there"
+        );
+    }
+
+    /// A chord the window cannot read is reported rather than dropped.
+    ///
+    /// A binding that silently did not load looks exactly like one that did not save, and the
+    /// user's next move is to type it again.
+    #[test]
+    fn an_unreadable_stored_chord_is_said_out_loud() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-bad-chord.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        app.desk.apply_inbound(
+            crate::transport::Inbound::Answer {
+                ask: crate::transport::Ask::Settings,
+                response: Box::new(turn_proto::Response::Settings {
+                    settings: Box::new(bindings_view(serde_json::json!({
+                        "palette.open": "Mod+Shift+Nonsense",
+                    }))),
+                }),
+            },
+            1_700_000_000_000,
+        );
+        app.follow_keyboard_settings();
+
+        assert!(
+            app.desk
+                .view(1_700_000_000_000)
+                .notice
+                .is_some_and(|notice| notice.contains("Mod+Shift+Nonsense")),
+            "the window says which chord it could not read"
+        );
+    }
+
+    /// A settings answer carrying one `keyboard.bindings` value.
+    fn bindings_view(bindings: serde_json::Value) -> turn_proto::SettingsView {
+        turn_proto::SettingsView {
+            session_id: None,
+            levels: vec![turn_proto::SettingsLevel::global()],
+            entries: vec![turn_proto::SettingsEntry {
+                area: turn_core::settings::Area::Keyboard,
+                area_title: "Keyboard".into(),
+                title: "Keyboard shortcuts".into(),
+                description: String::new(),
+                accepts: "a set of name/value pairs".into(),
+                control: turn_proto::SettingsControl::TextMap,
+                settable_at: vec![turn_core::settings::Scope::Global],
+                hidden: false,
+                known: true,
+                resolution: turn_core::settings::Resolution {
+                    key: crate::keymap::BINDINGS_KEY.to_string(),
+                    value: bindings,
+                    origin: Some(turn_core::settings::Scope::Global),
+                    shadowed: Vec::new(),
+                    sensitivity: turn_core::settings::Sensitivity::Plain,
+                },
+            }],
         }
     }
 
