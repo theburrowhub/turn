@@ -23,6 +23,7 @@ use turn_proto::{
 
 const LIVE_WAIT: Duration = Duration::from_secs(240);
 const CLAUDE_STARTUP_WAIT: Duration = Duration::from_secs(45);
+const CLAUDE_PERMISSION_MODE: &str = "default";
 const SURFACE: &str = "live-claude-reviewer-acceptance";
 const TRUST_PROMPT_HEADING: &str =
     "quick safety check: is this a project you created or one you trust?";
@@ -55,16 +56,22 @@ fn claude_version(binary: &Path) -> String {
         .to_string()
 }
 
-fn looks_like_claude_editor(text: &str) -> bool {
+fn has_claude_editor_markers(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.contains("claude code v") && text.lines().any(|line| line.trim() == "❯")
 }
 
+fn claude_editor_is_ready(text: &str, claude_is_running: bool) -> bool {
+    claude_is_running && has_claude_editor_markers(text)
+}
+
 #[test]
-fn editor_readiness_requires_the_product_banner_and_empty_prompt() {
-    assert!(looks_like_claude_editor("Claude Code v2.1.226\n\n  ❯  \n"));
-    assert!(!looks_like_claude_editor("Claude Code v2.1.226\n"));
-    assert!(!looks_like_claude_editor("shell\n❯\n"));
+fn editor_readiness_requires_a_live_claude_banner_and_empty_prompt() {
+    let editor = "Claude Code v2.1.226\n\n  ❯  \n";
+    assert!(claude_editor_is_ready(editor, true));
+    assert!(!claude_editor_is_ready(editor, false));
+    assert!(!claude_editor_is_ready("Claude Code v2.1.226\n", true));
+    assert!(!claude_editor_is_ready("shell\n❯\n", true));
 }
 
 async fn session_details(
@@ -83,6 +90,7 @@ async fn wait_for_claude_editor(
     ui: &mut Client,
     session_id: &turn_core::ids::SessionId,
     runtime_node_id: &turn_core::ids::NodeId,
+    claude_node_id: &turn_core::ids::NodeId,
     pane_id: &turn_core::ids::PaneId,
 ) {
     let deadline = tokio::time::Instant::now() + CLAUDE_STARTUP_WAIT;
@@ -103,7 +111,7 @@ async fn wait_for_claude_editor(
         // 2.1.226's initial editor paint can expose neither alternate screen nor
         // bracketed paste. The product banner and empty input prompt together
         // identify the editor without mistaking the hosting shell for it.
-        let interactive = looks_like_claude_editor(&text);
+        let has_editor_markers = has_claude_editor_markers(&text);
         if trust_prompt {
             if !accepted_trust {
                 ui.ask(Request::WritePty {
@@ -114,7 +122,17 @@ async fn wait_for_claude_editor(
                 .await;
                 accepted_trust = true;
             }
-        } else if interactive {
+        } else if has_editor_markers {
+            let details = session_details(ui, session_id).await;
+            let claude = details
+                .tree
+                .iter()
+                .find(|node| &node.node_id == claude_node_id)
+                .expect("Claude's semantic node remains present at editor readiness");
+            assert!(
+                claude_editor_is_ready(&text, claude.lifecycle.is_running()),
+                "Claude exited before editor readiness; the visible banner and prompt are residual terminal content"
+            );
             return;
         }
         assert!(
@@ -202,7 +220,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     pane.command = Some(binary.display().to_string());
     pane.args = vec![
         "--permission-mode".into(),
-        "default".into(),
+        CLAUDE_PERMISSION_MODE.into(),
         "--model".into(),
         "sonnet".into(),
         "--no-chrome".into(),
@@ -261,7 +279,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
 
     ui.attach_cells(&session.id, &pane_id, PtySize::new(40, 120))
         .await;
-    wait_for_claude_editor(&mut ui, &session.id, &runtime_node, &pane_id).await;
+    wait_for_claude_editor(&mut ui, &session.id, &runtime_node, &parent_node, &pane_id).await;
 
     ui.ask(Request::ResizePty {
         session_id: session.id.clone(),
@@ -273,24 +291,14 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
     ui.poll_screens().await;
 
     let prompt = "In this isolated repository, create an agent team and spawn one in-process teammate named Reviewer. Ask Reviewer to inspect README.md and report one concise observation. Do not edit files and do not open any terminal, pane, window, or external application. Wait for Reviewer to report back.";
-    let screen = ui.screen(&session.id, &pane_id);
-    let mut input = Vec::new();
-    if screen.modes.bracketed_paste {
-        input.extend_from_slice(b"\x1b[200~");
-        input.extend_from_slice(prompt.as_bytes());
-        input.extend_from_slice(b"\x1b[201~");
-    } else {
-        input.extend_from_slice(prompt.as_bytes());
-    }
     ui.ask(Request::WritePty {
         session_id: session.id.clone(),
         node_id: runtime_node.clone(),
-        data: TerminalBytes::new(input),
+        data: TerminalBytes::new(prompt.as_bytes().to_vec()),
     })
     .await;
-    // Claude's bracketed-paste parser intentionally keeps an Enter received in the
-    // same PTY read inside the editor. A GUI paste and the user's submit are two
-    // actions, so preserve that boundary here too.
+    // Keep text insertion and submit as separate PTY writes, matching the two GUI
+    // actions without making delivery depend on when Claude enables bracketed paste.
     tokio::time::sleep(Duration::from_millis(150)).await;
     ui.ask(Request::WritePty {
         session_id: session.id.clone(),
@@ -394,7 +402,7 @@ async fn packaged_app_runs_authenticated_claude_reviewer_vertical() {
         &evidence_path,
         &serde_json::json!({
             "claude_version": version,
-            "claude_permission_mode": "default",
+            "claude_permission_mode": CLAUDE_PERMISSION_MODE,
             "daemon_version": ui.welcome.daemon_version,
             "protocol_version": ui.welcome.protocol_version,
             "workspace_root": project,

@@ -72,8 +72,9 @@ The harness proves the main-checkout lease, real PTY, explicit parent/name/relat
 stable preview, absence of an invented subagent PID or Pane, Quick Preview data,
 temporary Pane close semantics, saved Layout and the live UI-reconnect boundary. It
 also records the terminal modes reported by the actual Claude TUI. Paste and submit
-are deliberately separate PTY writes: Claude correctly keeps Enter inside the editor
-when it arrives in the same read as a bracketed paste.
+are deliberately separate PTY writes. The one-line acceptance prompt is inserted as
+plain text so delivery is independent of when Claude enables bracketed paste; the
+reported terminal mode is still captured and verified independently.
 
 ## Manual window checklist
 
@@ -137,6 +138,13 @@ Claude emitted both the Agent Teams declaration and the tool's terminal subagent
 callback lifecycle. Turn kept the uniquely declared Reviewer as the live semantic
 teammate and the callback record as an exited child, matching the two distinct external
 identities rather than aliasing them.
+
+After review hardening, the final harness was repeated against the same signed bundle
+with plain-text prompt insertion. The authenticated vertical passed in 14.39 seconds,
+recorded 1,438 styled cells and the same explicit live Reviewer invariants, then passed
+the GUI-only close/reopen restoration test against the surviving daemon and Claude
+processes. Every process created exclusively for that confirmation was stopped after
+the restoration check.
 
 ## Run record — 2026-08-07
 
