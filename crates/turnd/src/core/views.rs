@@ -30,6 +30,7 @@ impl Core {
         let badge = self.attention.queue().count_for_session(id, now_ms);
         let muted = self.attention.is_muted(id, now_ms);
         let mut details = SessionDetails::from_session(session, badge, muted, now_ms);
+        details.attention = self.attention_policy_for_session(id);
         // Protocol v3's Pane→Node table is authoritative. The convenience constructor
         // cannot see the store, so replace its honest-but-unbound legacy projection
         // with the same normalised view used by hierarchy and tree pushes.

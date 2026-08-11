@@ -6,6 +6,10 @@ use turn_core::attention::Effect;
 use turn_core::ids::{AttentionId, NodeId, SessionId};
 use turn_proto::ServerEvent;
 
+pub(crate) fn mute_setting_key(session_id: &SessionId) -> String {
+    format!("attention.mute_until.{}", session_id.as_str())
+}
+
 impl Core {
     /// Pushes effects to the UI and keeps the queue's projection current.
     ///

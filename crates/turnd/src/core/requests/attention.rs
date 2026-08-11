@@ -130,10 +130,46 @@ impl Core {
             Some(until) if until <= now_ms => {
                 return Err(ProtoError::invalid("A mute must end in the future"))
             }
-            Some(until) => self.attention.mute_session(session, until),
-            None => self.attention.unmute_session(session),
+            Some(until) => {
+                self.store
+                    .settings()
+                    .set(
+                        &crate::core::attention::mute_setting_key(session),
+                        &until,
+                        now_ms,
+                    )
+                    .map_err(super::workspaces::store)?;
+                self.attention.mute_session(session, until);
+            }
+            None => {
+                self.store
+                    .settings()
+                    .remove(&crate::core::attention::mute_setting_key(session))
+                    .map_err(super::workspaces::store)?;
+                self.attention.unmute_session(session);
+            }
         }
         self.push_session_state(session, now_ms);
+        Ok(Response::Ack)
+    }
+
+    pub(super) fn set_attention_priority(
+        &mut self,
+        id: &AttentionId,
+        priority_boost: i16,
+        now_ms: i64,
+    ) -> Answer {
+        if !(-100..=100).contains(&priority_boost) {
+            return Err(ProtoError::invalid(
+                "An attention priority must be between -100 and 100",
+            ));
+        }
+        if !self.attention.set_priority_boost(id, priority_boost) {
+            return Err(ProtoError::not_found("attention entry", id.as_str()));
+        }
+        if self.persist_attention() {
+            self.push_attention_queue(now_ms);
+        }
         Ok(Response::Ack)
     }
 
@@ -312,10 +348,10 @@ impl Core {
         self.persist_event(&event);
         self.persist_session_quietly(session_id);
 
-        let policy = match self.sessions.get(session_id) {
-            Some(session) => session.attention.clone(),
-            None => return,
-        };
+        if !self.sessions.contains_key(session_id) {
+            return;
+        }
+        let policy = self.attention_policy_for_session(session_id);
         let effects = self
             .attention
             .ingest(&event, &policy, &self.user.clone(), now_ms);
@@ -383,6 +419,10 @@ fn correction_kind(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::testing::Harness;
+    use turn_core::attention::{AttentionManager, AttentionPolicy};
+    use turn_core::event::{EventSource, TurnEvent};
+    use turn_core::ids::PaneId;
     use turn_core::state::AwaitingReason;
 
     fn node() -> turn_core::model::ProcessNode {
@@ -464,5 +504,85 @@ mod tests {
             correction_kind(None, Some(&Turn::Unknown), None, &node()),
             EventKind::SessionAttentionResolved
         ));
+    }
+
+    #[tokio::test]
+    async fn queue_priority_is_reordered_and_persisted() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_priority_persists");
+        harness.add_session(session_id.clone(), PaneId::new(), 1_700_000_000_000);
+        let event = TurnEvent::new(
+            session_id,
+            EventKind::AgentQuestionAsked {
+                question: "Which branch?".into(),
+            },
+            EventSource::UserCorrection,
+            Confidence::Explicit,
+            1_700_000_000_001,
+        );
+        harness.core.attention.ingest(
+            &event,
+            &AttentionPolicy::default(),
+            &UserContext::default(),
+            1_700_000_000_001,
+        );
+        let id = harness
+            .core
+            .attention
+            .queue()
+            .iter()
+            .next()
+            .unwrap()
+            .id
+            .clone();
+
+        harness
+            .core
+            .set_attention_priority(&id, 70, 1_700_000_000_002)
+            .expect("priority changes");
+        assert_eq!(
+            harness
+                .core
+                .attention
+                .queue()
+                .get(&id)
+                .unwrap()
+                .priority_boost,
+            70
+        );
+        assert_eq!(
+            harness
+                .core
+                .store
+                .attention()
+                .load_queue()
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .priority_boost,
+            70,
+            "the reordered demand is durable, not only a GUI sort"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_mute_is_restored_after_attention_runtime_restarts() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_mute_persists");
+        let now_ms = 1_700_000_000_000;
+        let until_ms = now_ms + 60_000;
+        harness.add_session(session_id.clone(), PaneId::new(), now_ms);
+        harness
+            .core
+            .mute_session(&session_id, Some(until_ms), now_ms)
+            .expect("mute is accepted");
+
+        harness.core.attention = AttentionManager::new();
+        assert!(!harness.core.attention.is_muted(&session_id, now_ms + 1));
+        harness.core.restore_attention_mutes(now_ms + 1).unwrap();
+        assert!(
+            harness.core.attention.is_muted(&session_id, now_ms + 1),
+            "the durable deadline hydrates a fresh Attention runtime"
+        );
     }
 }

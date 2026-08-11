@@ -780,6 +780,12 @@ pub enum Request {
         attention_id: AttentionId,
         until_ms: i64,
     },
+    /// Changes one queued demand's explicit ranking adjustment. The daemon persists the
+    /// new value before publishing the reordered queue.
+    SetAttentionPriority {
+        attention_id: AttentionId,
+        priority_boost: i16,
+    },
     DismissAttention {
         attention_id: AttentionId,
     },
@@ -944,6 +950,7 @@ impl Request {
             Request::GotoAttention { .. } => "goto_attention",
             Request::AcknowledgeAttention { .. } => "acknowledge_attention",
             Request::SnoozeAttention { .. } => "snooze_attention",
+            Request::SetAttentionPriority { .. } => "set_attention_priority",
             Request::DismissAttention { .. } => "dismiss_attention",
             Request::MuteSession { .. } => "mute_session",
             Request::CorrectState { .. } => "correct_state",
@@ -1046,6 +1053,7 @@ impl Request {
             Request::GotoAttention { .. } => "effects",
             Request::AcknowledgeAttention { .. }
             | Request::SnoozeAttention { .. }
+            | Request::SetAttentionPriority { .. }
             | Request::DismissAttention { .. }
             | Request::MuteSession { .. } => "ack",
             Request::CorrectState { .. } => "node",

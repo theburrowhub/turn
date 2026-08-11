@@ -151,6 +151,11 @@ pub trait Announcer {
     /// Post a notification. Failure is logged and dropped: a notification that could
     /// not be shown must never take the window down or block a frame.
     fn notify(&self, title: &str, body: &str, sound: Option<&str>);
+
+    /// Spawn a command the user explicitly configured as an Attention action. It runs away
+    /// from the UI thread; output is discarded so a background notification action cannot
+    /// inherit or stall Turn's own process streams.
+    fn run_custom(&self, command: &str);
 }
 
 /// The real one.
@@ -169,6 +174,33 @@ impl Announcer for DesktopAnnouncer {
             // notifications switched off. The badge and the queue still say everything
             // this would have.
             tracing::debug!(%error, "could not post a notification");
+        }
+    }
+
+    fn run_custom(&self, command: &str) {
+        use std::process::{Command, Stdio};
+
+        #[cfg(unix)]
+        let child = Command::new("/bin/sh")
+            .arg("-lc")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if let Err(error) = child {
+            // The command itself may contain a credential, so it is deliberately absent from
+            // the log record. Settings presents it as a blind replacement for the same reason.
+            tracing::warn!(%error, "could not spawn the configured Attention action");
         }
     }
 }
@@ -192,6 +224,10 @@ pub fn perform(announcement: &Announcement, announcer: &dyn Announcer) -> bool {
             }
             None => false,
         },
+        Announcement::RunCustom { command, .. } => {
+            announcer.run_custom(command);
+            true
+        }
         _ => false,
     }
 }
@@ -206,6 +242,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         posted: RefCell<Vec<(String, String, Option<String>)>>,
+        commands: RefCell<Vec<String>>,
     }
 
     impl Announcer for Recorder {
@@ -215,6 +252,10 @@ mod tests {
                 body.to_string(),
                 sound.map(str::to_string),
             ));
+        }
+
+        fn run_custom(&self, command: &str) {
+            self.commands.borrow_mut().push(command.to_string());
         }
     }
 
@@ -345,6 +386,23 @@ mod tests {
         assert_eq!(
             posted[0].1, "2 still running",
             "the body is the manager's, not a paraphrase"
+        );
+    }
+
+    #[test]
+    fn a_custom_action_reaches_the_command_runner_exactly_once() {
+        let recorder = Recorder::default();
+        assert!(perform(
+            &Announcement::RunCustom {
+                session_id: session(),
+                command: "touch /tmp/turn-attention-accepted".into(),
+            },
+            &recorder,
+        ));
+        assert_eq!(
+            recorder.commands.borrow().as_slice(),
+            ["touch /tmp/turn-attention-accepted"],
+            "the configured command is executed, not merely represented in the protocol"
         );
     }
 

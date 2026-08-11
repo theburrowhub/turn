@@ -3115,6 +3115,16 @@ impl Desk {
                     until_ms,
                 },
             }],
+            ViewAction::SetAttentionPriority {
+                attention_id,
+                priority_boost,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("changing attention priority"),
+                request: Request::SetAttentionPriority {
+                    attention_id,
+                    priority_boost,
+                },
+            }],
             ViewAction::MuteAttentionSession {
                 session_id,
                 until_ms,
@@ -4101,6 +4111,18 @@ impl Desk {
                     .flatten()
             })?;
         let pending = agent.pending_permission.as_ref()?;
+        let agent_name = if agent.name.display_name.trim().is_empty() {
+            agent
+                .agent
+                .tool
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        } else {
+            agent.name.display_name.clone()
+        };
+        let process_name = targeted_node
+            .map(|node| node.title.clone())
+            .unwrap_or_else(|| agent_name.clone());
         Some(PendingPermission {
             attention_id: Some(entry.entry.id.clone()),
             session_id: summary.id.clone(),
@@ -4114,6 +4136,8 @@ impl Desk {
                 .tool_name
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string()),
+            agent: agent_name,
+            process: process_name,
             risk: pending.risk,
             blocked_secs: now_ms
                 .saturating_sub(pending.requested_ms)
@@ -4178,6 +4202,7 @@ fn queue_item(view: &AttentionView) -> QueueItem {
         summary: view.entry.summary.clone(),
         provisional: view.provisional,
         actionable: view.actionable,
+        priority_boost: view.entry.priority_boost,
     }
 }
 
@@ -4765,6 +4790,25 @@ mod tests {
             Some(selected),
             "passive Attention revelation never moves the user's selection"
         );
+    }
+
+    #[test]
+    fn selecting_a_tree_node_never_acknowledges_or_resolves_attention() {
+        let mut desk = Desk::new();
+        let reactions = desk.apply_hierarchy_action(HierarchyAction::Select {
+            surface_id: "window-attention-selection".into(),
+            key: HierarchyKey::process(NodeId::from_stored("proc_waiting_selection")),
+        });
+        assert!(matches!(
+            sent(&reactions).as_slice(),
+            [Request::SelectTreeNode { .. }]
+        ));
+        assert!(!sent(&reactions).iter().any(|request| matches!(
+            request,
+            Request::AcknowledgeAttention { .. }
+                | Request::DismissAttention { .. }
+                | Request::GotoAttention { .. }
+        )));
     }
 
     #[test]
@@ -6615,6 +6659,21 @@ mod tests {
             other => panic!("got {other:?}"),
         }
 
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::SetAttentionPriority {
+                    attention_id: attention_id.clone(),
+                    priority_boost: 40,
+                },
+                T0,
+            ))
+            .as_slice(),
+            [Request::SetAttentionPriority {
+                attention_id: sent_id,
+                priority_boost: 40,
+            }] if sent_id == &attention_id
+        ));
+
         let node_id = NodeId::from_stored("agent_reviewer_triage");
         match sent(&desk.apply_view_action(
             ViewAction::TerminateNode {
@@ -6698,6 +6757,8 @@ mod tests {
             "the directory is shown verbatim"
         );
         assert_eq!(banner.risk, Risk::High);
+        assert!(!banner.agent.is_empty(), "the Agent identity is shown");
+        assert!(!banner.process.is_empty(), "the Process identity is shown");
         assert_eq!(banner.blocked_secs, 47);
         assert_eq!(
             banner.attention_id,

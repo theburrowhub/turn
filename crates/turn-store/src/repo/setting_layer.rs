@@ -1,8 +1,8 @@
 //! Preferences, one row per level.
 //!
 //! The flat [`SettingsRepo`](super::settings::SettingsRepo) beside this one holds Turn's own
-//! singletons — the attention policy, a maintenance flag — read by key with no notion of a
-//! level. This one holds the user's preferences, and the level is half of the identity: a
+//! runtime deadlines and maintenance flags, read by key with no notion of a level. This one
+//! holds the user's preferences, and the level is half of the identity: a
 //! Workspace and a Session may both have an opinion about the font size, and neither may
 //! overwrite the other.
 //!

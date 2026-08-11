@@ -825,6 +825,7 @@ it.
 | `goto_attention` | `attention_id?` (absent = next) | `effects` |
 | `acknowledge_attention` | `attention_id` | `ack` |
 | `snooze_attention` | `attention_id`, `until_ms` | `ack` |
+| `set_attention_priority` | `attention_id`, `priority_boost` (-100..100) | `ack` |
 | `dismiss_attention` | `attention_id` | `ack` |
 | `mute_session` | `session_id`, `until_ms?` (absent = unmute) | `ack` |
 | `correct_state` | `session_id`, `node_id`, `lifecycle?`, `turn?`, `note?` | `node` |
@@ -833,7 +834,9 @@ it.
 guards — pressing the shortcut is consent. It still resets the rate limiter so
 automatic focus does not immediately fight manual navigation.
 
-A muted session still badges. Muting silences the interruption, not the evidence.
+A muted session still badges. Muting silences the interruption, not the evidence, and its
+deadline is restored after a daemon restart. Snooze, dismiss, acknowledgement and explicit
+queue priority are stored with the queue before its reordered projection is pushed.
 
 ```jsonc
 // The user fixing a state Turn got wrong. Recorded with

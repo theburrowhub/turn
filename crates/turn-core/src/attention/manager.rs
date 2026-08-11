@@ -135,10 +135,10 @@ impl AttentionManager {
 
     /// Restores the durable queue without replaying old demands as new events.
     ///
-    /// Focus cooldowns, deferred focus requests and transient mute timers belong
-    /// to the daemon process that created them, so they intentionally start
-    /// empty. Queue entries, by contrast, retain their exact persisted identity,
-    /// age, state and priority.
+    /// Focus cooldowns and deferred focus requests belong to the daemon process that created
+    /// them, so they intentionally start empty. Queue entries retain their exact persisted
+    /// identity, age, state and priority. Durable mute deadlines are restored separately by
+    /// the daemon after it has rebuilt this manager.
     pub fn from_persisted_queue(queue: AttentionQueue) -> Self {
         Self {
             queue,
@@ -579,6 +579,10 @@ impl AttentionManager {
             }
         }
         snoozed
+    }
+
+    pub fn set_priority_boost(&mut self, id: &AttentionId, priority_boost: i16) -> bool {
+        self.queue.set_priority_boost(id, priority_boost)
     }
 
     pub fn dismiss(&mut self, id: &AttentionId) -> bool {
@@ -1142,6 +1146,25 @@ mod tests {
         );
         assert!(!effects.iter().any(|e| matches!(e, Effect::Focus { .. })));
         assert!(effects.iter().any(|e| matches!(e, Effect::Badge { .. })));
+    }
+
+    #[test]
+    fn a_configured_custom_action_emits_the_exact_command() {
+        let mut manager = AttentionManager::new();
+        let policy = AttentionPolicy {
+            on_permission_required: vec![Action::Custom],
+            custom_command: Some("open turn://attention-ready".into()),
+            cooldown_seconds: 0,
+            ..AttentionPolicy::default()
+        };
+        let effects = manager.ingest(&permission("sess_a"), &policy, &ctx(), T0);
+        assert_eq!(
+            effects,
+            vec![Effect::RunCustom {
+                session_id: sess("sess_a"),
+                command: "open turn://attention-ready".into(),
+            }]
+        );
     }
 
     /// Case B: focus is deferred while typing, then delivered by `tick`.

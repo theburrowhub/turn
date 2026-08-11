@@ -248,6 +248,17 @@ impl AttentionQueue {
         }
     }
 
+    /// Changes the user's explicit ranking adjustment without changing the demand's state.
+    pub fn set_priority_boost(&mut self, id: &AttentionId, priority_boost: i16) -> bool {
+        match self.entries.iter_mut().find(|entry| &entry.id == id) {
+            Some(entry) => {
+                entry.priority_boost = priority_boost;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Removes a demand entirely.
     pub fn dismiss(&mut self, id: &AttentionId) -> bool {
         let before = self.entries.len();
