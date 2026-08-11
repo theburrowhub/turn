@@ -311,8 +311,10 @@ Without that report the typing guard is inert, so it is not optional polish.
 **What exists now.** `crates/turn-gui` renders one accessible
 Workspace → Session → Agent/Tool → Child tree; there are no persistent Session tabs, thumbnail strip or
 second Agent tree. The centre is the saved user Layout, subagents stay in the background, Space opens a
-semantic Quick Preview and Cmd+Enter/double-click can open a temporary Pane. Selection, pane focus and
-Attention are separate. The right inspector is contextual and collapsible. Typed checkout conflicts offer
+semantic Quick Preview and explicit open offers remembered replace/right/below/temporary placement.
+Temporary panes can be promoted without restarting their process; active panes can be moved, duplicated,
+retyped, floated with persistent geometry and docked again. Selection, pane focus and Attention are
+separate. The right inspector is contextual and collapsible. Typed checkout conflicts offer
 focus/read-only/worktree/cancel, first run can create a Workspace, Quick New chooses the Coding Template,
 and the Attention Queue is an explicit overlay with open/snooze/mute/dismiss actions. GPU snapshots render
 the real widget tree and AccessKit tests require `Tree`/`TreeItem` semantics with no duplicate `ListItem`
@@ -326,14 +328,13 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_full_screen_program_reports_its_alternate_screen_and_its_input_modes`,
 `the_indexed_palette_matches_the_xterm_cube_and_greys` — plus
 `every_state_has_a_glyph_as_well_as_a_colour` and
-`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 29
-tests, including 15 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
+`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 95
+tests, including 62 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
 `an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
-**What is not.** Tree search/filter modes, manual ordering, user rename and audited relationship correction,
-full context menus, permanent open-placement choices and IME sign-off remain. Snapshot baselines are native
-GPU output and still need platform CI coverage. No manual authenticated Claude session has been accepted.
+**What is not.** IME sign-off remains. Snapshot baselines are native GPU output and still need platform CI
+coverage. No manual authenticated Claude session has been accepted.
 
 **Exit criterion.** The automated first-vertical form is met. Human live-CLI acceptance remains open.
 

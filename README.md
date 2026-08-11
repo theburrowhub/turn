@@ -64,7 +64,8 @@ Implemented today:
 - Workspace and Session creation with an optional task name.
 - Portable first-run preset: two shell columns, with no dependency on optional tools.
 - Visual layout editor and reusable layout presets.
-- Persistent PTYs, terminal panes, process hierarchy, subagent previews, and temporary panes.
+- Persistent PTYs, terminal panes, process hierarchy, subagent previews, and temporary panes that can be
+  promoted into remembered permanent placement without restarting their process.
 - Review-before-send context handoffs between controllable Agents in one Session.
 - Claude Code and Codex adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.

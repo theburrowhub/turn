@@ -478,6 +478,8 @@ kind matters.
 | `get_preview_history` | `session_id`, `node_id`, `limit?` (clamped to 20) | `preview_history` |
 | `set_preview_visibility` | `session_id`, `node_id`, `visibility` | `ack` |
 | `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `node_pane` |
+| `open_node_as_pane` | `surface_id`, `session_id`, `node_id`, `target_pane_id`, `placement` | `layout` |
+| `promote_temporary_pane` | `surface_id`, `session_id`, `pane_id`, `target_pane_id`, `placement` | `layout` |
 | `focus_pane_for_node` | `surface_id`, `session_id`, `node_id` | `pane_focus` |
 | `focus_pane_for_attention` | `surface_id`, `session_id`, `subject_node_id` | `pane_focus` |
 
@@ -642,6 +644,7 @@ draft identity only, and every Session instantiation mints a fresh set.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `split_pane` | `session_id`, `pane_id`, `direction`, `pane` | `layout` |
+| `create_pane` | `session_id`, `target_pane_id`, `placement`, `pane` | `layout` |
 | `close_pane` | `session_id`, `pane_id`, `disposition` | `layout` |
 | `resize_pane` | `session_id`, `pane_id`, `delta` | `layout` |
 | `resize_divider` | `session_id`, `before`, `after`, `delta` | `layout` |
@@ -651,6 +654,11 @@ draft identity only, and every Session instantiation mints a fresh set.
 | `relocate_pane` | `session_id`, `moved`, `target`, `zone` | `layout` |
 | `swap_panes` | `session_id`, `a`, `b` — superseded by `relocate_pane` | `layout` |
 | `zoom_pane` | `session_id`, `pane_id` — **toggles** | `layout` |
+| `duplicate_pane` | `session_id`, `pane_id` | `layout` |
+| `change_pane_kind` | `session_id`, `pane_id`, `kind` | `layout` |
+| `float_pane` | `session_id`, `pane_id`, `geometry` | `layout` |
+| `dock_pane` | `session_id`, `pane_id` | `layout` |
+| `set_floating_pane_geometry` | `session_id`, `pane_id`, `geometry` | `layout` |
 | `attach_pane` | `session_id`, `pane_id`, `size`, `stream?` | `attached` |
 | `resync_pane` | `session_id`, `pane_id` | `screen` |
 | `pane_image` | `session_id`, `pane_id`, `image_id` | `pane_image` |
@@ -668,6 +676,15 @@ node, one node may have zero or many Panes. `ProcessNode.pane_id` is not a v3 au
 subagent with no independent PTY yields a Preview/Process Details pane capability, not a terminal that
 cannot work. Detach or `ClosePane(KeepProcesses)` never terminates the node; explicit `Terminate`/`Kill`
 dispositions apply only where process-control rules allow them, and an Agent requires a separate node action.
+
+`placement` is `replace_current`, `split_right`, `split_below` or `temporary`. Opening an existing node and
+promoting its temporary view reuse the same vocabulary; only the temporary choice leaves the saved Layout
+untouched. `create_pane` accepts the complete `NewPane`, including an arbitrary executable and argv without
+shell evaluation. `duplicate_pane` creates another view of the same node rather than another process.
+`change_pane_kind`, floating, docking and geometry updates are likewise view-only operations. A floating Pane
+retains its split-tree position and exact point geometry, so docking restores it without reparenting its node.
+The wire-level `detach_pane` remains the older operation that detaches a client's output stream; `float_pane`
+is the distinct saved-Layout operation.
 
 - `direction`: `"horizontal"` \| `"vertical"`
 - `target`: `{"kind":"pane","pane_id":…}` \| `{"kind":"next"}` \| `{"kind":"previous"}`

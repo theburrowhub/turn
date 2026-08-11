@@ -26,8 +26,8 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RelationshipKind,
-    RestoreBehaviour, TreeFilter, TreeVisibilityMode,
+    Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind, PanePlacement,
+    PreviewVisibility, RelationshipKind, RestoreBehaviour, TreeFilter, TreeVisibilityMode,
 };
 use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
@@ -483,6 +483,14 @@ pub enum Request {
         direction: Direction,
         pane: NewPane,
     },
+    /// Creates a user-defined Pane at one explicit place. Unlike opening an
+    /// existing node, this may materialise the supplied command.
+    CreatePane {
+        session_id: SessionId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+        pane: NewPane,
+    },
     ClosePane {
         session_id: SessionId,
         pane_id: PaneId,
@@ -559,6 +567,51 @@ pub enum Request {
         surface_id: String,
         session_id: SessionId,
         node_id: NodeId,
+    },
+    /// Explicitly opens a Process/Agent view and chooses whether it replaces,
+    /// splits or remains temporary. Only the temporary choice is surface-scoped.
+    OpenNodeAsPane {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+    },
+    /// Makes the currently visible temporary view durable without restarting or
+    /// reparenting the Process behind it.
+    PromoteTemporaryPane {
+        surface_id: String,
+        session_id: SessionId,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+    },
+    /// Adds a second view of the same Pane/Process beside the original.
+    DuplicatePane {
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
+    /// Changes only the view renderer. Process identity and lifetime are stable.
+    ChangePaneKind {
+        session_id: SessionId,
+        pane_id: PaneId,
+        kind: PaneKind,
+    },
+    /// Renders a Pane as a persistent floating window while retaining its dock
+    /// position in the split tree.
+    FloatPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+        geometry: PaneGeometry,
+    },
+    DockPane {
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
+    SetFloatingPaneGeometry {
+        session_id: SessionId,
+        pane_id: PaneId,
+        geometry: PaneGeometry,
     },
     /// Chooses an existing binding for this surface. It never opens one
     /// implicitly; an empty focus result is a normal outcome.
@@ -854,6 +907,7 @@ impl Request {
             Request::CreateLayoutTemplate { .. } => "create_layout_template",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
             Request::SplitPane { .. } => "split_pane",
+            Request::CreatePane { .. } => "create_pane",
             Request::ClosePane { .. } => "close_pane",
             Request::ResizePane { .. } => "resize_pane",
             Request::ResizeDivider { .. } => "resize_divider",
@@ -864,6 +918,13 @@ impl Request {
             Request::SwapPanes { .. } => "swap_panes",
             Request::ZoomPane { .. } => "zoom_pane",
             Request::OpenNodeAsTemporaryPane { .. } => "open_node_as_temporary_pane",
+            Request::OpenNodeAsPane { .. } => "open_node_as_pane",
+            Request::PromoteTemporaryPane { .. } => "promote_temporary_pane",
+            Request::DuplicatePane { .. } => "duplicate_pane",
+            Request::ChangePaneKind { .. } => "change_pane_kind",
+            Request::FloatPane { .. } => "float_pane",
+            Request::DockPane { .. } => "dock_pane",
+            Request::SetFloatingPaneGeometry { .. } => "set_floating_pane_geometry",
             Request::FocusPaneForNode { .. } => "focus_pane_for_node",
             Request::FocusPaneForAttention { .. } => "focus_pane_for_attention",
             Request::AttachPane { .. } => "attach_pane",
@@ -945,6 +1006,7 @@ impl Request {
             // re-renders from the daemon's version rather than its own optimistic
             // guess at what a split does.
             Request::SplitPane { .. }
+            | Request::CreatePane { .. }
             | Request::ClosePane { .. }
             | Request::ResizePane { .. }
             | Request::ResizeDivider { .. }
@@ -953,7 +1015,14 @@ impl Request {
             | Request::FocusPane { .. }
             | Request::RelocatePane { .. }
             | Request::SwapPanes { .. }
-            | Request::ZoomPane { .. } => "layout",
+            | Request::ZoomPane { .. }
+            | Request::OpenNodeAsPane { .. }
+            | Request::PromoteTemporaryPane { .. }
+            | Request::DuplicatePane { .. }
+            | Request::ChangePaneKind { .. }
+            | Request::FloatPane { .. }
+            | Request::DockPane { .. }
+            | Request::SetFloatingPaneGeometry { .. } => "layout",
             Request::OpenNodeAsTemporaryPane { .. } => "node_pane",
             Request::FocusPaneForNode { .. } | Request::FocusPaneForAttention { .. } => {
                 "pane_focus"
@@ -1045,6 +1114,7 @@ impl Request {
             | Request::DeliverContextHandoff { session_id, .. }
             | Request::SaveLayoutAsTemplate { session_id, .. }
             | Request::SplitPane { session_id, .. }
+            | Request::CreatePane { session_id, .. }
             | Request::ClosePane { session_id, .. }
             | Request::ResizePane { session_id, .. }
             | Request::ResizeDivider { session_id, .. }
@@ -1055,6 +1125,13 @@ impl Request {
             | Request::SwapPanes { session_id, .. }
             | Request::ZoomPane { session_id, .. }
             | Request::OpenNodeAsTemporaryPane { session_id, .. }
+            | Request::OpenNodeAsPane { session_id, .. }
+            | Request::PromoteTemporaryPane { session_id, .. }
+            | Request::DuplicatePane { session_id, .. }
+            | Request::ChangePaneKind { session_id, .. }
+            | Request::FloatPane { session_id, .. }
+            | Request::DockPane { session_id, .. }
+            | Request::SetFloatingPaneGeometry { session_id, .. }
             | Request::FocusPaneForNode { session_id, .. }
             | Request::FocusPaneForAttention { session_id, .. }
             | Request::AttachPane { session_id, .. }

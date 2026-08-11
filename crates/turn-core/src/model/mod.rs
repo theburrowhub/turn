@@ -19,8 +19,8 @@ pub use hierarchy::{
     WorkspaceWriteLease,
 };
 pub use layout::{
-    Child, Direction, DropZone, Layout, LayoutNode, LayoutPreset, Pane, PaneKind, RestoreBehaviour,
-    Split,
+    Child, Direction, DropZone, FloatingPane, Layout, LayoutNode, LayoutPreset, Pane, PaneGeometry,
+    PaneKind, PanePlacement, RestoreBehaviour, Split,
 };
 pub use node::{AgentInfo, NodeKind, PendingPermission, ProcessNode, Relation, SessionTree};
 pub use session::{RestoreState, Session, SessionStatus};

@@ -56,6 +56,69 @@ pub enum Direction {
     Vertical,
 }
 
+/// Where an explicitly opened view becomes part of the active Session.
+///
+/// Temporary is included in the same vocabulary so the UI can remember one
+/// placement preference and present one coherent choice, while the daemon keeps
+/// the important distinction: temporary views never mutate [`Layout`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanePlacement {
+    ReplaceCurrent,
+    #[default]
+    SplitRight,
+    SplitBelow,
+    Temporary,
+}
+
+/// Persisted geometry for a pane floating above the tiled layout.
+///
+/// Points are used because this is the coordinate system the renderer reports.
+/// The renderer clamps the rectangle to the current window when restoring on a
+/// smaller display, then writes the adjusted geometry only after the user moves
+/// or resizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PaneGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for PaneGeometry {
+    fn default() -> Self {
+        Self {
+            x: 120.0,
+            y: 96.0,
+            width: 720.0,
+            height: 480.0,
+        }
+    }
+}
+
+impl PaneGeometry {
+    pub fn is_valid(self) -> bool {
+        [self.x, self.y, self.width, self.height]
+            .into_iter()
+            .all(f32::is_finite)
+            && self.width >= 160.0
+            && self.height >= 100.0
+            && self.width <= 100_000.0
+            && self.height <= 100_000.0
+            && self.x.abs() <= 100_000.0
+            && self.y.abs() <= 100_000.0
+    }
+}
+
+/// A pane that retains its exact place in the split tree while being rendered as
+/// a movable floating window. Docking removes this marker and therefore restores
+/// the pane to that place without disturbing its process binding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FloatingPane {
+    pub pane_id: PaneId,
+    pub geometry: PaneGeometry,
+}
+
 /// Where a moved pane lands relative to the pane it was dropped on.
 ///
 /// Named in the domain rather than derived from a pixel offset in the window,
@@ -247,6 +310,10 @@ pub struct Layout {
     /// A pane temporarily filling the session. The tree is untouched, so
     /// un-zooming restores the exact previous geometry.
     pub zoomed: Option<PaneId>,
+    /// Panes rendered above, rather than inside, the split tree. The pane itself
+    /// remains in `root`, preserving its dock position and process identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub floating: Vec<FloatingPane>,
 }
 
 impl Layout {
@@ -257,6 +324,7 @@ impl Layout {
             root: LayoutNode::Leaf(pane),
             active: Some(id),
             zoomed: None,
+            floating: Vec::new(),
         }
     }
 
@@ -276,6 +344,30 @@ impl Layout {
         self.root.find_mut(id)
     }
 
+    pub fn is_floating(&self, id: &PaneId) -> bool {
+        self.floating.iter().any(|floating| &floating.pane_id == id)
+    }
+
+    pub fn floating_geometry(&self, id: &PaneId) -> Option<PaneGeometry> {
+        self.floating
+            .iter()
+            .find(|floating| &floating.pane_id == id)
+            .map(|floating| floating.geometry)
+    }
+
+    pub fn tiled_pane_count(&self) -> usize {
+        self.panes()
+            .into_iter()
+            .filter(|pane| !self.is_floating(&pane.id))
+            .count()
+    }
+
+    /// A render-only tree without floating leaves. The durable root is untouched,
+    /// which is what lets Dock restore the exact previous split geometry.
+    pub fn tiled_root(&self) -> Option<LayoutNode> {
+        tiled_node(&self.root, &self.floating)
+    }
+
     /// Splits `target`, inserting `new_pane` next to it.
     ///
     /// When the target already sits in a split of the same direction, the new
@@ -287,6 +379,85 @@ impl Layout {
             return false;
         }
         self.active = Some(new_id);
+        true
+    }
+
+    /// Replaces one view in-place. The old process is intentionally not part of
+    /// this operation: callers may unbind the discarded view, but process control
+    /// remains a separate explicit action.
+    pub fn replace(&mut self, target: &PaneId, pane: Pane) -> Option<Pane> {
+        let slot = self.root.find_mut(target)?;
+        let new_id = pane.id.clone();
+        let old = std::mem::replace(slot, pane);
+        self.floating.retain(|floating| &floating.pane_id != target);
+        if self.active.as_ref() == Some(target) {
+            self.active = Some(new_id.clone());
+        }
+        if self.zoomed.as_ref() == Some(target) {
+            self.zoomed = Some(new_id);
+        }
+        Some(old)
+    }
+
+    /// Creates another view of the same process beside this one.
+    pub fn duplicate(&mut self, target: &PaneId) -> Option<PaneId> {
+        let mut copy = self.get(target)?.clone();
+        copy.id = PaneId::new();
+        let id = copy.id.clone();
+        self.split(target, Direction::Horizontal, copy)
+            .then_some(id)
+    }
+
+    /// Changes what renderer owns the view, without touching its process binding.
+    pub fn change_kind(&mut self, target: &PaneId, kind: PaneKind) -> bool {
+        let Some(pane) = self.get_mut(target) else {
+            return false;
+        };
+        pane.kind = kind;
+        true
+    }
+
+    /// Lifts a tiled pane into a persistent floating window.
+    pub fn float(&mut self, target: &PaneId, geometry: PaneGeometry) -> bool {
+        if !geometry.is_valid()
+            || self.get(target).is_none()
+            || self.is_floating(target)
+            || self.tiled_pane_count() <= 1
+        {
+            return false;
+        }
+        self.floating.push(FloatingPane {
+            pane_id: target.clone(),
+            geometry,
+        });
+        self.zoomed = None;
+        self.active = Some(target.clone());
+        true
+    }
+
+    /// Restores a floating pane to the exact split-tree position it retained.
+    pub fn dock(&mut self, target: &PaneId) -> bool {
+        let before = self.floating.len();
+        self.floating.retain(|floating| &floating.pane_id != target);
+        if self.floating.len() == before {
+            return false;
+        }
+        self.active = Some(target.clone());
+        true
+    }
+
+    pub fn set_floating_geometry(&mut self, target: &PaneId, geometry: PaneGeometry) -> bool {
+        if !geometry.is_valid() {
+            return false;
+        }
+        let Some(floating) = self
+            .floating
+            .iter_mut()
+            .find(|floating| &floating.pane_id == target)
+        else {
+            return false;
+        };
+        floating.geometry = geometry;
         true
     }
 
@@ -382,6 +553,7 @@ impl Layout {
         if Self::detach_in(&mut self.root, target).is_none() {
             return false;
         }
+        self.floating.retain(|floating| &floating.pane_id != target);
         if self.zoomed.as_ref() == Some(target) {
             self.zoomed = None;
         }
@@ -727,10 +899,36 @@ impl Layout {
     ///
     /// Process bindings are dropped for the same reason: a copy owns no processes.
     pub fn reidentified(&self) -> Layout {
+        let pane_ids: Vec<PaneId> = self.panes().iter().map(|pane| pane.id.clone()).collect();
+        let floating_positions: Vec<(usize, PaneGeometry)> = self
+            .floating
+            .iter()
+            .filter_map(|floating| {
+                pane_ids
+                    .iter()
+                    .position(|pane_id| pane_id == &floating.pane_id)
+                    .map(|index| (index, floating.geometry))
+            })
+            .collect();
         let mut copy = self.clone();
         reassign_pane_ids(&mut copy.root);
         copy.active = copy.root.panes().first().map(|p| p.id.clone());
         copy.zoomed = None;
+        let new_ids: Vec<PaneId> = copy
+            .root
+            .panes()
+            .iter()
+            .map(|pane| pane.id.clone())
+            .collect();
+        copy.floating = floating_positions
+            .into_iter()
+            .filter_map(|(index, geometry)| {
+                new_ids
+                    .get(index)
+                    .cloned()
+                    .map(|pane_id| FloatingPane { pane_id, geometry })
+            })
+            .collect();
         copy
     }
 
@@ -780,6 +978,48 @@ impl Layout {
 /// a running process with no way back to it. One constant for resizing, dragging a
 /// divider and arriving in a split, because it is one rule.
 const MIN_SHARE: f32 = 0.05;
+
+fn tiled_node(node: &LayoutNode, floating: &[FloatingPane]) -> Option<LayoutNode> {
+    match node {
+        LayoutNode::Leaf(pane) => (!floating
+            .iter()
+            .any(|candidate| candidate.pane_id == pane.id))
+        .then(|| LayoutNode::Leaf(pane.clone())),
+        LayoutNode::Split(split) => {
+            let mut children: Vec<Child> = split
+                .children
+                .iter()
+                .filter_map(|child| {
+                    tiled_node(&child.node, floating).map(|node| Child {
+                        size: child.size,
+                        node,
+                    })
+                })
+                .collect();
+            match children.len() {
+                0 => None,
+                1 => Some(children.remove(0).node),
+                _ => {
+                    let total: f32 = children.iter().map(|child| child.size).sum();
+                    if total > 0.0 {
+                        for child in &mut children {
+                            child.size /= total;
+                        }
+                    } else {
+                        let share = 1.0 / children.len() as f32;
+                        for child in &mut children {
+                            child.size = share;
+                        }
+                    }
+                    Some(LayoutNode::Split(Split {
+                        direction: split.direction,
+                        children,
+                    }))
+                }
+            }
+        }
+    }
+}
 
 /// Lifts any child below [`MIN_SHARE`] back to it, taking the difference from the
 /// children that have room to spare.
@@ -1533,6 +1773,7 @@ mod tests {
             }),
             active: None,
             zoomed: None,
+            floating: Vec::new(),
         };
         l.active = Some(l.panes()[0].id.clone());
         assert!(l.sizes_are_normalised());
@@ -1738,6 +1979,7 @@ mod tests {
             }),
             active: None,
             zoomed: None,
+            floating: Vec::new(),
         };
         assert!(!l.sizes_are_normalised());
         l.normalise();
@@ -1760,5 +2002,60 @@ mod tests {
         let back: Layout = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);
         assert_eq!(back.pane_count(), 3);
+    }
+
+    #[test]
+    fn floating_and_docking_preserve_the_pane_binding_and_exact_geometry() {
+        let mut layout = layout();
+        let first = layout.panes()[0].id.clone();
+        let node = NodeId::from_stored("node_float_identity");
+        layout.get_mut(&first).unwrap().node_id = Some(node.clone());
+        layout.split(&first, Direction::Horizontal, Pane::new(PaneKind::Shell));
+        let geometry = PaneGeometry {
+            x: 83.0,
+            y: 47.0,
+            width: 731.0,
+            height: 419.0,
+        };
+
+        assert!(layout.float(&first, geometry));
+        assert_eq!(layout.tiled_pane_count(), 1);
+        assert_eq!(layout.floating_geometry(&first), Some(geometry));
+        assert_eq!(layout.get(&first).unwrap().node_id.as_ref(), Some(&node));
+        let json = serde_json::to_string(&layout).unwrap();
+        let mut restored: Layout = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.floating_geometry(&first), Some(geometry));
+        let copied = restored.reidentified();
+        assert_eq!(copied.floating.len(), 1);
+        assert_eq!(copied.floating[0].geometry, geometry);
+        assert_ne!(copied.floating[0].pane_id, first);
+        assert!(copied.get(&copied.floating[0].pane_id).is_some());
+        assert!(restored.dock(&first));
+        assert_eq!(restored.tiled_pane_count(), 2);
+        assert_eq!(restored.get(&first).unwrap().node_id.as_ref(), Some(&node));
+    }
+
+    #[test]
+    fn duplicating_and_retyping_a_pane_change_only_the_view() {
+        let mut layout = layout();
+        let original = layout.panes()[0].id.clone();
+        let node = NodeId::from_stored("node_duplicate_identity");
+        layout.get_mut(&original).unwrap().node_id = Some(node.clone());
+
+        let duplicate = layout.duplicate(&original).expect("a view duplicates");
+        assert_ne!(duplicate, original);
+        assert_eq!(
+            layout.get(&duplicate).unwrap().node_id.as_ref(),
+            Some(&node)
+        );
+        assert!(layout.change_kind(&duplicate, PaneKind::ProcessDetails));
+        assert_eq!(
+            layout.get(&duplicate).unwrap().kind,
+            PaneKind::ProcessDetails
+        );
+        assert_eq!(
+            layout.get(&duplicate).unwrap().node_id.as_ref(),
+            Some(&node)
+        );
     }
 }

@@ -338,7 +338,10 @@ fn sync_layout_bindings(conn: &Connection, session: &Session) -> Result<()> {
         conn.execute(
             "INSERT INTO pane_node_bindings \
                  (pane_id, session_id, node_id, temporary, surface_id, opened_ms) \
-             VALUES (?1, ?2, ?3, 0, NULL, ?4)",
+             VALUES (?1, ?2, ?3, 0, NULL, ?4) \
+             ON CONFLICT(session_id, pane_id) DO UPDATE SET \
+                 node_id = excluded.node_id, temporary = 0, surface_id = NULL, \
+                 opened_ms = excluded.opened_ms",
             params![
                 pane.id.as_str(),
                 session.id.as_str(),

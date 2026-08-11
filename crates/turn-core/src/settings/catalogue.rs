@@ -254,6 +254,21 @@ impl Catalogue {
                     sensitivity: Sensitivity::Plain,
                     scopes: PERSISTED,
                 },
+                // ------------------------------------------------------- layout
+                Definition {
+                    key: "layout.open_pane_placement",
+                    area: Area::Layout,
+                    title: "Open Process panes",
+                    description: "The placement Turn reuses after you open an Agent or Process: \
+                                  replace the current Pane, split right, split below or keep it \
+                                  temporary.",
+                    kind: ValueKind::Choice {
+                        options: &["replace_current", "split_right", "split_below", "temporary"],
+                    },
+                    default: json!("split_right"),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: GLOBAL_ONLY,
+                },
                 // ---------------------------------------------- appearance
                 Definition {
                     key: "appearance.font_size",

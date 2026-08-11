@@ -159,6 +159,11 @@ while the broader scopes remain planned rather than client-local guesses.
 
 Quick Preview is an overlay driven by the selected node. `Space` opens it without changing layout, session, pane focus, process state or OS focus. It contains stable preview history and can promote the node to an explicit pane action. `Esc` closes it.
 
+That explicit action now supports remembered replace-current, split-right, split-below and temporary
+placement. A temporary Pane can be promoted in place; its Pane identity, node binding and live process are
+retained. Permanent views can also be duplicated, retyped, floated with durable geometry and docked without
+performing process control.
+
 A temporary Pane is scoped to one live UI `surface_id`. Another surface never sees its binding. A
 replacement connection, the last disconnect and a daemon restart remove that temporary binding before a
 new hierarchy snapshot is built; expansion/selection, permanent Layout bindings and the Agent survive. This
@@ -246,9 +251,9 @@ resolved runtime with stale Attention.
 The list below is the accepted product boundary, not a claim that every operation is already exposed by
 protocol v3. The current vertical implements hierarchy list/subscription via revisioned snapshots,
 expand/collapse-all/select, persistent filters/visibility/viewport/manual ordering, audited rename and
-relationship correction, preview history/visibility, temporary Pane open/focus/close, and lease
-acquire/release plus read-only/worktree creation. Explicit redaction, permanent `OpenNodeAsPane`,
-`ListPanesForNode` and direct preview subscriptions remain planned and must not be simulated only in the GUI.
+relationship correction, preview history/visibility, temporary and permanent Pane open/focus/close/promotion,
+and lease acquire/release plus read-only/worktree creation. Explicit redaction, `ListPanesForNode` and direct
+preview subscriptions remain planned and must not be simulated only in the GUI.
 
 ```text
 Tree:    ListWorkspaceTree, SubscribeTreeChanges, ExpandNode, CollapseNode,
