@@ -25,7 +25,7 @@ use crate::companion::{CompanionEvent, CompanionMonitor};
 use crate::desk::{Desk, Reaction};
 use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
-use crate::theme::Theme;
+use crate::theme::{AppearanceSettings, Theme};
 use crate::transport::{Ask, DaemonLink};
 use crate::view::{LayoutEditorOrigin, LayoutTemplateDraft, ViewAction, ViewState};
 
@@ -115,6 +115,9 @@ pub struct TurnApp {
     /// The `keyboard.bindings` value the current keymap was built from, so the map is rebuilt
     /// when it changes rather than once per frame.
     applied_bindings: Option<serde_json::Value>,
+    /// The appearance projection already installed into egui. Comparing the small value keeps
+    /// a settings sheet from rebuilding font styles and requesting another pass every frame.
+    applied_appearance: Option<AppearanceSettings>,
 }
 
 impl TurnApp {
@@ -180,6 +183,7 @@ impl TurnApp {
             pending_folder_request: None,
             file_overrides,
             applied_bindings: None,
+            applied_appearance: None,
         }
     }
 
@@ -545,6 +549,29 @@ impl TurnApp {
         self.applied_bindings = Some(stored);
     }
 
+    /// Installs the winning appearance values into the actual renderer.
+    ///
+    /// The settings sheet is not the feature: the terminal font changes the cell measurement,
+    /// the UI font changes the chrome, zoom changes egui's scale, and cursor/ligature values are
+    /// read by terminal painting. Applying this after each authoritative settings answer also
+    /// makes a temporary override immediate and makes switching Sessions pick up that Session's
+    /// own resolved layer without restarting the window.
+    fn follow_appearance_settings(&mut self, ctx: &egui::Context) {
+        let Some(settings) = self.desk.settings() else {
+            return;
+        };
+        let appearance = AppearanceSettings::from_view(Some(settings));
+        if self.applied_appearance.as_ref() == Some(&appearance) {
+            return;
+        }
+
+        self.theme = Theme::with_appearance(&appearance);
+        self.theme.install(ctx);
+        ctx.set_zoom_factor(appearance.zoom);
+        self.applied_appearance = Some(appearance);
+        ctx.request_repaint();
+    }
+
     fn handle_locally(&mut self, command: Command) -> bool {
         let visible_selection = self.state.selected_tree.clone().or_else(|| {
             self.state
@@ -712,6 +739,7 @@ impl eframe::App for TurnApp {
         }
         self.state.write_conflict_open = self.desk.write_conflict().is_some();
         self.follow_keyboard_settings();
+        self.follow_appearance_settings(&ctx);
 
         // 2. What the user is doing to the window.
         self.observe_activity(&ctx, now_ms);
@@ -819,7 +847,8 @@ impl TurnApp {
         let focused_cursor = self
             .desk
             .active_pane()
-            .is_some_and(|_| !self.state.is_sensitive());
+            .is_some_and(|_| !self.state.is_sensitive())
+            && self.theme.cursor_blink;
         Deadlines {
             cursor_blink_at: focused_cursor.then(|| next_cursor_phase(now_ms)),
             // Only when something with an elapsed time is actually on screen.
@@ -1306,6 +1335,79 @@ mod tests {
                 .is_some_and(|notice| notice.contains("Mod+Shift+Nonsense")),
             "the window says which chord it could not read"
         );
+    }
+
+    #[test]
+    fn appearance_settings_are_installed_into_the_live_context_without_a_restart() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-appearance.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        app.desk.apply_inbound(
+            crate::transport::Inbound::Answer {
+                ask: crate::transport::Ask::Settings,
+                response: Box::new(turn_proto::Response::Settings {
+                    settings: Box::new(appearance_view(&[
+                        ("appearance.font_size", serde_json::json!(20)),
+                        ("appearance.ui_font_size", serde_json::json!(16)),
+                        ("appearance.zoom", serde_json::json!(1.5)),
+                        ("appearance.cursor", serde_json::json!("bar")),
+                        ("appearance.cursor_blink", serde_json::json!(false)),
+                        ("appearance.ligatures", serde_json::json!(true)),
+                    ])),
+                }),
+            },
+            1_700_000_000_000,
+        );
+
+        crate::frames::run(&ctx, |ui| {
+            app.follow_appearance_settings(ui.ctx());
+        });
+        // Zoom is activated at the start of the pass after it is requested.
+        crate::frames::run(&ctx, |_| {});
+
+        assert_eq!(app.theme.mono.size, 20.0);
+        assert_eq!(app.theme.ui_font.size, 16.0);
+        assert_eq!(app.theme.cursor_style, crate::theme::CursorStyle::Bar);
+        assert!(!app.theme.cursor_blink);
+        assert!(app.theme.ligatures);
+        assert_eq!(ctx.zoom_factor(), 1.5);
+    }
+
+    fn appearance_view(values: &[(&str, serde_json::Value)]) -> turn_proto::SettingsView {
+        let catalogue = turn_core::settings::Catalogue::built_in();
+        let entries = values
+            .iter()
+            .map(|(key, value)| {
+                let definition = catalogue.get(key).expect("an appearance definition");
+                turn_proto::SettingsEntry {
+                    resolution: turn_core::settings::Resolution {
+                        key: (*key).to_string(),
+                        value: value.clone(),
+                        origin: Some(turn_core::settings::Scope::Global),
+                        shadowed: Vec::new(),
+                        sensitivity: definition.sensitivity,
+                    },
+                    default_value: definition.default.clone(),
+                    area: definition.area,
+                    area_title: definition.area.title().to_string(),
+                    title: definition.title.to_string(),
+                    description: definition.description.to_string(),
+                    accepts: definition.kind.describe(),
+                    control: turn_proto::SettingsControl::from_kind(&definition.kind),
+                    settable_at: definition.scopes.to_vec(),
+                    hidden: false,
+                    known: true,
+                }
+            })
+            .collect();
+        turn_proto::SettingsView {
+            session_id: None,
+            levels: vec![turn_proto::SettingsLevel::global()],
+            entries,
+        }
     }
 
     /// A settings answer carrying one `keyboard.bindings` value.

@@ -196,6 +196,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   opt-in live-Claude harness, manual checklist, and honest run record.
 - [Attention policy acceptance](docs/ATTENTION_ACCEPTANCE.md) — hierarchical policy, focus,
   durable queue triage, notifications, sound and custom action checks.
+- [Terminal interaction acceptance](docs/TERMINAL_ACCEPTANCE.md) — search, safe links, path drop,
+  appearance preferences, IME, TUI modes and bounded-output proof.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 

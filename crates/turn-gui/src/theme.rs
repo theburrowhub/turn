@@ -14,8 +14,102 @@
 
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
 
+/// The cursor Turn draws when a pane exposes one.
+///
+/// Kept in the renderer rather than the settings catalogue: the catalogue validates the
+/// stored word, while this type makes it impossible for painting code to invent a fourth
+/// shape or silently fall back after the value has already been resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CursorStyle {
+    fn from_setting(value: Option<&serde_json::Value>) -> Self {
+        match value.and_then(serde_json::Value::as_str) {
+            Some("bar") => Self::Bar,
+            Some("underline") => Self::Underline,
+            _ => Self::Block,
+        }
+    }
+}
+
+/// Appearance preferences resolved for the Session currently on screen.
+///
+/// The daemon owns Global → Workspace → Template → Session resolution and the Desk appends
+/// this window's temporary layer. This reader consumes only those winning values: it is not
+/// another precedence implementation. Malformed values fall back defensively, although a
+/// conforming daemon has already validated them before they reach the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppearanceSettings {
+    pub terminal_font_size: f32,
+    pub ui_font_size: f32,
+    pub zoom: f32,
+    pub cursor: CursorStyle,
+    pub cursor_blink: bool,
+    pub ligatures: bool,
+}
+
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            terminal_font_size: 13.0,
+            ui_font_size: 13.0,
+            zoom: 1.0,
+            cursor: CursorStyle::Block,
+            cursor_blink: true,
+            ligatures: false,
+        }
+    }
+}
+
+impl AppearanceSettings {
+    pub fn from_view(settings: Option<&turn_proto::SettingsView>) -> Self {
+        let mut appearance = Self::default();
+        let Some(settings) = settings else {
+            return appearance;
+        };
+        let value = |key: &str| settings.entry(key).map(|entry| &entry.resolution.value);
+        if let Some(size) = value("appearance.font_size")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|size| (6..=32).contains(size))
+        {
+            appearance.terminal_font_size = size as f32;
+        }
+        if let Some(size) = value("appearance.ui_font_size")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|size| (8..=28).contains(size))
+        {
+            appearance.ui_font_size = size as f32;
+        }
+        if let Some(zoom) = value("appearance.zoom")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|zoom| (0.5..=3.0).contains(zoom))
+        {
+            appearance.zoom = zoom as f32;
+        }
+        appearance.cursor = CursorStyle::from_setting(value("appearance.cursor"));
+        appearance.cursor_blink = value("appearance.cursor_blink")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        appearance.ligatures = value("appearance.ligatures")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if value("appearance.reduced_motion")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            appearance.cursor_blink = false;
+        }
+        appearance
+    }
+}
+
 /// Colours and metrics, resolved once.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Theme {
     pub background: Color32,
     pub panel: Color32,
@@ -35,6 +129,11 @@ pub struct Theme {
     pub cursor: Color32,
     pub mono: FontId,
     pub ui_font: FontId,
+    pub cursor_style: CursorStyle,
+    pub cursor_blink: bool,
+    /// Joins a small, explicit set of programming operators visually while keeping their
+    /// original cells, selection and copied text intact.
+    pub ligatures: bool,
 }
 
 /// The glyph the terminal cell is measured from.
@@ -103,6 +202,21 @@ impl Theme {
             cursor: Color32::from_rgb(0xd6, 0xdb, 0xe1),
             mono: FontId::new(13.0, FontFamily::Monospace),
             ui_font: FontId::new(13.0, FontFamily::Proportional),
+            cursor_style: CursorStyle::Block,
+            cursor_blink: true,
+            ligatures: false,
+        }
+    }
+
+    /// Resolves the fixed palette with the appearance values currently in force.
+    pub fn with_appearance(appearance: &AppearanceSettings) -> Self {
+        Self {
+            mono: FontId::new(appearance.terminal_font_size, FontFamily::Monospace),
+            ui_font: FontId::new(appearance.ui_font_size, FontFamily::Proportional),
+            cursor_style: appearance.cursor,
+            cursor_blink: appearance.cursor_blink,
+            ligatures: appearance.ligatures,
+            ..Self::dark()
         }
     }
 
@@ -249,7 +363,85 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
+    use turn_core::settings::{Catalogue, Resolution, Scope};
     use turn_core::state::DisplayState;
+
+    fn appearance_view(values: &[(&str, Value)]) -> turn_proto::SettingsView {
+        let catalogue = Catalogue::built_in();
+        let entries = values
+            .iter()
+            .map(|(key, value)| {
+                let definition = catalogue.get(key).expect("an appearance definition");
+                turn_proto::SettingsEntry {
+                    resolution: Resolution {
+                        key: (*key).to_string(),
+                        value: value.clone(),
+                        origin: Some(Scope::Global),
+                        shadowed: Vec::new(),
+                        sensitivity: definition.sensitivity,
+                    },
+                    default_value: definition.default.clone(),
+                    area: definition.area,
+                    area_title: definition.area.title().to_string(),
+                    title: definition.title.to_string(),
+                    description: definition.description.to_string(),
+                    accepts: definition.kind.describe(),
+                    control: turn_proto::SettingsControl::from_kind(&definition.kind),
+                    settable_at: definition.scopes.to_vec(),
+                    hidden: false,
+                    known: true,
+                }
+            })
+            .collect();
+        turn_proto::SettingsView {
+            session_id: None,
+            levels: vec![turn_proto::SettingsLevel::global()],
+            entries,
+        }
+    }
+
+    #[test]
+    fn every_appearance_control_changes_the_values_the_renderer_reads() {
+        let view = appearance_view(&[
+            ("appearance.font_size", json!(21)),
+            ("appearance.ui_font_size", json!(17)),
+            ("appearance.zoom", json!(1.5)),
+            ("appearance.cursor", json!("underline")),
+            ("appearance.cursor_blink", json!(false)),
+            ("appearance.ligatures", json!(true)),
+        ]);
+        let appearance = AppearanceSettings::from_view(Some(&view));
+        assert_eq!(appearance.terminal_font_size, 21.0);
+        assert_eq!(appearance.ui_font_size, 17.0);
+        assert_eq!(appearance.zoom, 1.5);
+        assert_eq!(appearance.cursor, CursorStyle::Underline);
+        assert!(!appearance.cursor_blink);
+        assert!(appearance.ligatures);
+
+        let theme = Theme::with_appearance(&appearance);
+        assert_eq!(theme.mono.size, 21.0);
+        assert_eq!(theme.ui_font.size, 17.0);
+        assert_eq!(theme.cursor_style, CursorStyle::Underline);
+        assert!(!theme.cursor_blink);
+        assert!(theme.ligatures);
+    }
+
+    #[test]
+    fn reduced_motion_overrides_cursor_blink_and_bad_input_falls_back_safely() {
+        let view = appearance_view(&[
+            ("appearance.font_size", json!(400)),
+            ("appearance.zoom", json!("huge")),
+            ("appearance.cursor", json!("unknown")),
+            ("appearance.cursor_blink", json!(true)),
+            ("appearance.reduced_motion", json!(true)),
+        ]);
+        let appearance = AppearanceSettings::from_view(Some(&view));
+        assert_eq!(appearance.terminal_font_size, 13.0);
+        assert_eq!(appearance.zoom, 1.0);
+        assert_eq!(appearance.cursor, CursorStyle::Block);
+        assert!(!appearance.cursor_blink);
+    }
 
     /// The rule is structural: every state must have a glyph, so nothing is ever
     /// distinguishable by colour alone.

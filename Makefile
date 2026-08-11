@@ -53,6 +53,14 @@ test-headless: ## Run every test that needs no GPU (what Linux CI runs)
 	$(CARGO) test --workspace --exclude turn-gui -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turn-gui --lib --bins --test links --test onboarding --test scrollback
 
+.PHONY: terminal-acceptance
+terminal-acceptance: ## Reproduce the complete terminal interaction contract without opening a window
+	$(CARGO) test -p turn-proto -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-pty -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui --test links --test scrollback -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd --test cells -- --test-threads=$(TEST_THREADS)
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }
