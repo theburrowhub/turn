@@ -579,8 +579,15 @@ document. Unchecked items say what evidence or implementation is still missing, 
   `template::tests::saving_a_live_layout_as_a_template_drops_process_bindings`.
 - [x] **A hand-edited Layout with sizes that do not add up is normalised on load.**
   `layout::tests::a_hand_edited_layout_with_bad_sizes_is_normalised_on_load`.
-- [x] **The four built-in Templates are present and structurally valid.**
-  `template::tests::the_built_in_set_is_present_and_valid`.
+- [x] **First run offers one portable built-in: Two Shells.** It has equal columns, starts only
+  the Workspace shell and needs no optional third-party executable.
+  `template::tests::the_built_in_set_is_present_and_valid`,
+  `template::tests::the_first_run_preset_is_two_equal_portable_shells`.
+- [x] **The complete Template lifecycle is available without editing JSON.** The visual UI creates,
+  captures with an explicit name, edits, duplicates, deletes, selects Global/Workspace defaults and
+  applies a Template to a stopped Session. It preserves geometry and Pane/startup configuration;
+  missing tools are visible before launch, built-ins stay read-only, and deleting an in-use Template
+  clears references without changing instantiated Sessions. Reproduce with `make template-acceptance`.
 - [x] **Choosing a safe alternative after a Template lease conflict preserves the complete Template.**
   The client retains only Template id/name/cwd/branch/task intent; the daemon authoritatively reapplies
   Layout, commands, env, Attention, tmux and naming. An unenforced read-only alternative launches nothing;

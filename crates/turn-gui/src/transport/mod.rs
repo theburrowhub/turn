@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use turn_core::ids::{CheckoutId, HandoffId, NodeId, PaneId, SessionId, WorkspaceId};
+use turn_core::ids::{CheckoutId, HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_proto::{CloseDisposition, ProtoError, Request, RequestId, Response, ServerEvent};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
@@ -56,6 +56,7 @@ pub enum Ask {
     Sessions,
     Details(SessionId),
     Templates,
+    TemplateDetails(TemplateId),
     /// Reading the preferences in force. Carries no id: the answer names the Session it was
     /// resolved for, and a reply that arrived after the selection moved is recognised by that
     /// rather than by remembering what was asked.
@@ -96,6 +97,7 @@ pub enum Ask {
         workspace_id: WorkspaceId,
     },
     CreateTemplate,
+    ApplyTemplate(SessionId),
     Attach {
         session_id: SessionId,
         pane_id: PaneId,
@@ -159,6 +161,7 @@ impl Ask {
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",
             Ask::Templates => "loading templates",
+            Ask::TemplateDetails(_) => "loading the template editor",
             Ask::Settings => "loading preferences",
             Ask::WriteSetting { .. } => "saving the preference",
             Ask::AttentionQueue => "loading the attention queue",
@@ -170,6 +173,7 @@ impl Ask {
             Ask::CreateWorkspace { .. } => "creating a workspace",
             Ask::CreateSession { .. } => "creating a session",
             Ask::CreateTemplate => "saving the layout preset",
+            Ask::ApplyTemplate(_) => "applying the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
             Ask::RelaunchNode { .. } => "starting the restored pane",
             Ask::RestoreLeaseAcquire { .. } => "acquiring exclusive write access",

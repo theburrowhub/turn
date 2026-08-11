@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use turn_core::attention::Effect;
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{ActivityPreview, Layout, WorkspaceWriteLease};
+use turn_core::model::{ActivityPreview, Layout, Template, WorkspaceWriteLease};
 
 use crate::bytes::TerminalBytes;
 use crate::cells::{Grid, Scrollback};
@@ -176,6 +176,10 @@ pub enum Response {
     Template {
         template: TemplateSummary,
     },
+    /// The complete Template definition, fetched only for the explicit editor.
+    TemplateDetails {
+        template: Box<Template>,
+    },
 
     /// The layout after a pane operation. Returned rather than acked so the UI
     /// renders the daemon's arrangement instead of its own guess at what a split,
@@ -307,6 +311,7 @@ impl Response {
             Response::Settings { .. } => "settings",
             Response::Templates { .. } => "templates",
             Response::Template { .. } => "template",
+            Response::TemplateDetails { .. } => "template_details",
             Response::Layout { .. } => "layout",
             Response::Attached { .. } => "attached",
             Response::Screen { .. } => "screen",
@@ -341,6 +346,7 @@ impl Response {
         "settings",
         "templates",
         "template",
+        "template_details",
         "layout",
         "attached",
         "screen",
@@ -576,9 +582,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 28 result shapes. Asserted so adding one without documenting it in
+        // 29 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 28, "the response catalogue changed size");
+        assert_eq!(declared.len(), 29, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -660,6 +666,9 @@ pub(crate) mod tests {
                 templates: vec![template.clone()],
             },
             Response::Template { template },
+            Response::TemplateDetails {
+                template: Box::new(turn_core::model::Template::two_shells(T0)),
+            },
             Response::Layout {
                 session_id: s.id.clone(),
                 layout: s.layout.clone(),

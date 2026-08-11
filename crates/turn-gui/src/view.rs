@@ -32,7 +32,8 @@ use turn_core::ids::{
 use turn_core::model::{
     ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
     PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour,
-    RestoreState, SessionMode, SessionStatus, TreeFilter, TreeVisibilityMode, WorkspaceWriteLease,
+    RestoreState, SessionMode, SessionStatus, Template, TreeFilter, TreeVisibilityMode,
+    WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
@@ -52,6 +53,7 @@ use crate::theme::Theme;
 use crate::transport::ConnectionState;
 
 pub const OPEN_PANE_PLACEMENT_KEY: &str = "layout.open_pane_placement";
+pub const DEFAULT_TEMPLATE_KEY: &str = "templates.default";
 
 /// One row in the session list. The daemon supplies these already derived; the client
 /// never computes a state.
@@ -509,6 +511,12 @@ pub struct ViewState {
     /// Reusable visual editor shared by New Session and Settings. It contains only
     /// a local draft; no process starts until a Session is explicitly created.
     pub layout_draft: Option<LayoutTemplateDraft>,
+    /// Explicit naming step when a live Session is captured as a Template.
+    pub save_template_draft: Option<SaveTemplateDraft>,
+    /// Named confirmation for the only irreversible Template operation.
+    pub delete_template_confirmation: Option<DeleteTemplateConfirmation>,
+    /// Opened by the Command Palette so Settings becomes an Apply Template picker.
+    pub template_apply_mode: bool,
     /// The daemon-owned navigation projection for this window. `None` is kept as a
     /// narrow compatibility path while the first hierarchy snapshot is in flight.
     pub hierarchy: Option<HierarchySnapshot>,
@@ -584,6 +592,8 @@ impl ViewState {
             || self.workspace_draft.is_some()
             || self.session_draft.is_some()
             || self.layout_draft.is_some()
+            || self.save_template_draft.is_some()
+            || self.delete_template_confirmation.is_some()
             || self.quick_preview.is_some()
             || self.lifecycle_confirmation.is_some()
             || self.context_handoff.is_some()
@@ -774,6 +784,31 @@ pub struct SessionDraft {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveTemplateDraft {
+    pub name: String,
+    pub description: String,
+    pub submitting: bool,
+    pub error: Option<String>,
+}
+
+impl SaveTemplateDraft {
+    pub fn new(session_name: &str) -> Self {
+        Self {
+            name: format!("{} layout", session_name.trim()),
+            description: String::new(),
+            submitting: false,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTemplateConfirmation {
+    pub template_id: TemplateId,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutEditorOrigin {
     NewSession,
@@ -787,11 +822,39 @@ pub struct CellCommandDraft {
     pub program: String,
     /// Shell-style quoting is parsed into argv, but operators are not evaluated.
     pub arguments: String,
+    /// Optional working directory, relative to the Workspace unless absolute.
+    pub cwd: String,
+    /// One `NAME=value` pair per line. Parsed as data, never evaluated by a shell.
+    pub environment: String,
+    pub restore: RestoreBehaviour,
+}
+
+impl CellCommandDraft {
+    fn from_pane(pane: &Pane) -> Self {
+        Self {
+            program: pane.command.clone().unwrap_or_default(),
+            arguments: shell_words::join(&pane.args),
+            cwd: pane.cwd.clone().unwrap_or_default(),
+            environment: format_environment(&pane.env),
+            restore: pane.restore,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayoutTemplateDraft {
+    pub template_id: Option<TemplateId>,
+    pub built_in: bool,
     pub name: String,
+    pub description: String,
+    pub icon: String,
+    pub name_pattern: String,
+    pub hotkey: String,
+    pub environment: String,
+    pub init_commands: String,
+    pub inherit_attention: bool,
+    pub attention: AttentionPolicy,
+    pub tmux: bool,
     pub layout: Layout,
     pub selected: PaneId,
     pub cells: HashMap<PaneId, CellCommandDraft>,
@@ -816,11 +879,59 @@ impl LayoutTemplateDraft {
         let cells = layout
             .panes()
             .into_iter()
-            .map(|pane| (pane.id.clone(), CellCommandDraft::default()))
+            .map(|pane| (pane.id.clone(), CellCommandDraft::from_pane(pane)))
             .collect();
         Self {
+            template_id: None,
+            built_in: false,
             name: String::new(),
+            description: String::new(),
+            icon: String::new(),
+            name_pattern: String::new(),
+            hotkey: String::new(),
+            environment: String::new(),
+            init_commands: String::new(),
+            inherit_attention: true,
+            attention: AttentionPolicy::default(),
+            tmux: false,
             layout,
+            selected,
+            cells,
+            dragged_pane: None,
+            origin,
+            submitting: false,
+            error: None,
+        }
+    }
+
+    pub fn from_template(template: Template, origin: LayoutEditorOrigin) -> Self {
+        let selected = template
+            .layout
+            .active
+            .clone()
+            .or_else(|| template.layout.panes().first().map(|pane| pane.id.clone()))
+            .expect("a persisted Template has at least one Pane");
+        let cells = template
+            .layout
+            .panes()
+            .into_iter()
+            .map(|pane| (pane.id.clone(), CellCommandDraft::from_pane(pane)))
+            .collect();
+        let inherit_attention = template.attention.is_none();
+        Self {
+            template_id: Some(template.id),
+            built_in: template.built_in,
+            name: template.name,
+            description: template.description.unwrap_or_default(),
+            icon: template.icon.unwrap_or_default(),
+            name_pattern: template.name_pattern.unwrap_or_default(),
+            hotkey: template.hotkey.unwrap_or_default(),
+            environment: format_environment(&template.env),
+            init_commands: template.init_commands.join("\n"),
+            inherit_attention,
+            attention: template.attention.unwrap_or_default(),
+            tmux: template.tmux,
+            layout: template.layout,
             selected,
             cells,
             dragged_pane: None,
@@ -840,7 +951,10 @@ impl LayoutTemplateDraft {
             .with_restore(RestoreBehaviour::Relaunch);
         let id = pane.id.clone();
         if self.layout.split(&self.selected, direction, pane) {
-            self.cells.insert(id.clone(), CellCommandDraft::default());
+            self.cells.insert(
+                id.clone(),
+                CellCommandDraft::from_pane(self.layout.get(&id).unwrap()),
+            );
             self.selected = id;
             self.error = None;
         }
@@ -890,11 +1004,37 @@ impl LayoutTemplateDraft {
                 pane.title = Some(program.rsplit('/').next().unwrap_or(program).to_string());
             }
             pane.node_id = None;
-            pane.restore = RestoreBehaviour::Relaunch;
+            pane.cwd = nonempty(command.cwd);
+            pane.env = parse_environment(&command.environment)?;
+            pane.restore = command.restore;
         }
         layout.zoomed = None;
         layout.normalise();
         Ok(layout)
+    }
+
+    fn materialized_template(&self) -> Result<Template, String> {
+        let layout = self.materialized_layout()?;
+        let mut template = Template::from_layout(self.name.trim(), &layout, 0);
+        if let Some(id) = &self.template_id {
+            template.id = id.clone();
+        }
+        template.built_in = self.built_in;
+        template.description = nonempty(self.description.clone());
+        template.icon = nonempty(self.icon.clone());
+        template.name_pattern = nonempty(self.name_pattern.clone());
+        template.hotkey = nonempty(self.hotkey.clone());
+        template.env = parse_environment(&self.environment)?;
+        template.init_commands = self
+            .init_commands
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        template.attention = (!self.inherit_attention).then(|| self.attention.clone());
+        template.tmux = self.tmux;
+        Ok(template)
     }
 
     fn cell_label(&self, pane_id: &PaneId) -> String {
@@ -905,6 +1045,43 @@ impl LayoutTemplateDraft {
             .unwrap_or("Shell")
             .to_string()
     }
+}
+
+fn nonempty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn format_environment(values: &[(String, String)]) -> String {
+    values
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_environment(text: &str) -> Result<Vec<(String, String)>, String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| format!("Environment line {} needs NAME=value.", index + 1))?;
+            let key = key.trim();
+            if key.is_empty()
+                || !key.chars().enumerate().all(|(at, ch)| {
+                    ch == '_' || ch.is_ascii_alphanumeric() && (at > 0 || !ch.is_ascii_digit())
+                })
+            {
+                return Err(format!(
+                    "Environment line {} has an invalid variable name.",
+                    index + 1
+                ));
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 impl SessionDraft {
@@ -1116,6 +1293,35 @@ pub enum ViewAction {
     CreateLayoutTemplate {
         name: String,
         layout: Layout,
+    },
+    SaveSessionAsTemplate {
+        name: String,
+        description: Option<String>,
+    },
+    SaveTemplateDefinition {
+        template_id: Option<TemplateId>,
+        template: Box<Template>,
+    },
+    EditTemplate {
+        template_id: TemplateId,
+    },
+    DuplicateTemplate {
+        template_id: TemplateId,
+        name: String,
+    },
+    DeleteTemplate {
+        template_id: TemplateId,
+    },
+    SetGlobalDefaultTemplate {
+        template_id: TemplateId,
+    },
+    SetWorkspaceDefaultTemplate {
+        workspace_id: WorkspaceId,
+        template_id: Option<TemplateId>,
+    },
+    ApplyTemplateToSession {
+        session_id: SessionId,
+        template_id: TemplateId,
     },
     ReleaseWorkspaceLease {
         workspace_id: WorkspaceId,
@@ -2216,13 +2422,23 @@ impl<'a> TurnView<'a> {
     }
 
     fn preferred_template_id(&self, workspace_id: &WorkspaceId) -> Option<TemplateId> {
-        let configured = self
+        let workspace_default = self
             .workspaces
             .iter()
             .find(|workspace| &workspace.id == workspace_id)
             .and_then(|workspace| workspace.default_template.as_ref());
-        configured
+        let global_default = self
+            .settings
+            .and_then(|settings| settings.entry(DEFAULT_TEMPLATE_KEY))
+            .and_then(|entry| entry.resolution.value.as_str())
+            .map(TemplateId::from_stored);
+        workspace_default
             .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            .or_else(|| {
+                global_default
+                    .as_ref()
+                    .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            })
             .or_else(|| self.templates.first())
             .map(|template| template.id.clone())
     }
@@ -2513,6 +2729,10 @@ impl<'a> TurnView<'a> {
             actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
         } else if let Some(link) = self.link_confirmation {
             actions.extend(self.link_confirmation_overlay(ui, theme, link, full));
+        } else if state.delete_template_confirmation.is_some() {
+            actions.extend(self.delete_template_overlay(ui, theme, state, full));
+        } else if state.save_template_draft.is_some() {
+            actions.extend(self.save_template_overlay(ui, theme, state, full));
         } else if state.layout_draft.is_some() {
             actions.extend(self.layout_editor_overlay(ui, theme, state, full));
         } else if state.workspace_draft.is_some() {
@@ -2528,7 +2748,7 @@ impl<'a> TurnView<'a> {
         } else if state.shortcuts_open {
             actions.extend(self.shortcuts_sheet(ui, theme, keymap, state, full));
         } else if state.settings_open {
-            actions.extend(self.settings_sheet(ui, theme, state, full));
+            actions.extend(self.settings_sheet(ui, theme, hierarchy.as_ref(), state, full));
         }
         state.hierarchy = hierarchy;
         actions
@@ -5623,6 +5843,16 @@ impl<'a> TurnView<'a> {
                         .color(theme.text_faint)
                         .small(),
                 );
+                if !template.missing_commands.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Missing on this machine: {}. Turn will create the layout, leave those Panes stopped and explain why in the status bar.",
+                            template.missing_commands.join(", ")
+                        ))
+                        .color(theme.failure)
+                        .small(),
+                    );
+                }
             }
             ui.label(
                 RichText::new(
@@ -5727,7 +5957,11 @@ impl<'a> TurnView<'a> {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new("Create layout preset")
+                        RichText::new(if draft.template_id.is_some() {
+                            "Edit Template"
+                        } else {
+                            "Create Template"
+                        })
                             .size(21.0)
                             .color(theme.text)
                             .strong(),
@@ -5776,7 +6010,7 @@ impl<'a> TurnView<'a> {
             });
             ui.add_space(8.0);
 
-            let canvas_height = (panel.height() * 0.42).clamp(210.0, 290.0);
+            let canvas_height = (panel.height() * 0.30).clamp(150.0, 205.0);
             let (canvas, _) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), canvas_height),
                 Sense::hover(),
@@ -5982,9 +6216,155 @@ impl<'a> TurnView<'a> {
                     .color(theme.text_faint)
                     .small(),
                 );
+                egui::CollapsingHeader::new("Cell working directory, environment & restore")
+                    .id_salt("template-cell-advanced")
+                    .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            columns[0].label(
+                                RichText::new("Working directory")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            columns[0].add(
+                                egui::TextEdit::singleline(&mut command.cwd)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("relative/to/workspace"),
+                            );
+                            columns[1].label(
+                                RichText::new("Restore behaviour")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            egui::ComboBox::from_id_salt(("template-cell-restore", draft.selected.as_str()))
+                                .selected_text(match command.restore {
+                                    RestoreBehaviour::ReattachOnly => "Reattach only",
+                                    RestoreBehaviour::Relaunch => "Relaunch",
+                                    RestoreBehaviour::Skip => "Skip",
+                                })
+                                .show_ui(&mut columns[1], |ui| {
+                                    ui.selectable_value(
+                                        &mut command.restore,
+                                        RestoreBehaviour::ReattachOnly,
+                                        "Reattach only",
+                                    );
+                                    ui.selectable_value(
+                                        &mut command.restore,
+                                        RestoreBehaviour::Relaunch,
+                                        "Relaunch",
+                                    );
+                                    ui.selectable_value(
+                                        &mut command.restore,
+                                        RestoreBehaviour::Skip,
+                                        "Skip",
+                                    );
+                                });
+                        });
+                        ui.label(
+                            RichText::new("Cell environment · one NAME=value per line")
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut command.environment)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(2)
+                                .hint_text("PORT=3000"),
+                        );
+                    });
             }
 
             ui.add_space(8.0);
+            egui::CollapsingHeader::new("Template startup & behaviour")
+                .id_salt("template-behaviour")
+                .show(ui, |ui| {
+                    ui.columns(2, |columns| {
+                        columns[0].label(RichText::new("Description").color(theme.text_dim).small());
+                        columns[0].add(
+                            egui::TextEdit::singleline(&mut draft.description)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("What this Template is for"),
+                        );
+                        columns[1].label(RichText::new("Icon").color(theme.text_dim).small());
+                        columns[1].add(
+                            egui::TextEdit::singleline(&mut draft.icon)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Optional icon name"),
+                        );
+                    });
+                    ui.columns(2, |columns| {
+                        columns[0].label(RichText::new("Session name pattern").color(theme.text_dim).small());
+                        columns[0].add(
+                            egui::TextEdit::singleline(&mut draft.name_pattern)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("feature-{n}"),
+                        );
+                        columns[1].label(RichText::new("Hotkey").color(theme.text_dim).small());
+                        columns[1].add(
+                            egui::TextEdit::singleline(&mut draft.hotkey)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Optional chord"),
+                        );
+                    });
+                    ui.columns(2, |columns| {
+                        columns[0].label(
+                            RichText::new("Template environment · NAME=value per line")
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        columns[0].add(
+                            egui::TextEdit::multiline(&mut draft.environment)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .hint_text("RUST_LOG=info"),
+                        );
+                        columns[1].label(
+                            RichText::new("Initial shell actions · one command per line")
+                                .color(theme.text_dim)
+                                .small(),
+                        );
+                        columns[1].add(
+                            egui::TextEdit::multiline(&mut draft.init_commands)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(3)
+                                .hint_text("git status"),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Attention").color(theme.text_dim).small());
+                        if ui.selectable_label(draft.inherit_attention, "Inherit").clicked() {
+                            draft.inherit_attention = true;
+                        }
+                        if ui
+                            .selectable_label(
+                                !draft.inherit_attention && draft.attention == AttentionPolicy::default(),
+                                "Standard",
+                            )
+                            .clicked()
+                        {
+                            draft.inherit_attention = false;
+                            draft.attention = AttentionPolicy::default();
+                        }
+                        if ui
+                            .selectable_label(
+                                !draft.inherit_attention && draft.attention == AttentionPolicy::silent(),
+                                "Quiet",
+                            )
+                            .clicked()
+                        {
+                            draft.inherit_attention = false;
+                            draft.attention = AttentionPolicy::silent();
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut draft.tmux, "Create a tmux Session");
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Permissions are never approved by a Template; Agent requests always remain explicit.",
+                        )
+                        .color(theme.text_faint)
+                        .small(),
+                    );
+                });
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut draft.name)
@@ -5999,20 +6379,20 @@ impl<'a> TurnView<'a> {
                         egui::Button::new(if draft.submitting {
                             "Saving…"
                         } else {
-                            "Save layout"
+                            "Save Template"
                         })
                         .fill(theme.running)
                         .stroke(Stroke::NONE),
                     )
                     .clicked()
                 {
-                    match draft.materialized_layout() {
-                        Ok(layout) => {
+                    match draft.materialized_template() {
+                        Ok(template) => {
                             draft.submitting = true;
                             draft.error = None;
-                            actions.push(ViewAction::CreateLayoutTemplate {
-                                name: draft.name.trim().to_string(),
-                                layout,
+                            actions.push(ViewAction::SaveTemplateDefinition {
+                                template_id: draft.template_id.clone(),
+                                template: Box::new(template),
                             });
                         }
                         Err(error) => draft.error = Some(error),
@@ -6028,6 +6408,175 @@ impl<'a> TurnView<'a> {
                         .small(),
                 );
             }
+        });
+        actions
+    }
+
+    fn save_template_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                540.0_f32.min((full.width() - 32.0).max(280.0)),
+                300.0_f32.min((full.height() - 32.0).max(240.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "save-session-template"), |ui| {
+            let Some(draft) = state.save_template_draft.as_mut() else {
+                return;
+            };
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_label("Save Session as Template");
+                node.set_modal();
+            });
+            ui.label(
+                RichText::new("Save Session as Template")
+                    .size(21.0)
+                    .color(theme.text)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "The current rows, columns, proportions and Pane commands become reusable.",
+                )
+                .color(theme.text_dim)
+                .small(),
+            );
+            ui.add_space(12.0);
+            ui.label(RichText::new("Name").color(theme.text_dim).small());
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Development layout"),
+            );
+            ui.label(
+                RichText::new("Description (optional)")
+                    .color(theme.text_dim)
+                    .small(),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.description)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("What this Template is for"),
+            );
+            if let Some(error) = &draft.error {
+                ui.label(RichText::new(error).color(theme.failure).small());
+            }
+            let connected = matches!(self.connection, Some(ConnectionState::Connected { .. }));
+            let valid = connected && !draft.submitting && !draft.name.trim().is_empty();
+            let submit_from_name =
+                name.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!draft.submitting, egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        actions.push(ViewAction::CloseOverlay);
+                    }
+                    let save = ui
+                        .add_enabled(
+                            valid,
+                            egui::Button::new(if draft.submitting {
+                                "Saving…"
+                            } else {
+                                "Save Template"
+                            })
+                            .fill(theme.running)
+                            .stroke(Stroke::NONE),
+                        )
+                        .clicked();
+                    if valid && (save || submit_from_name) {
+                        draft.submitting = true;
+                        draft.error = None;
+                        actions.push(ViewAction::SaveSessionAsTemplate {
+                            name: draft.name.trim().to_string(),
+                            description: nonempty(draft.description.clone()),
+                        });
+                    }
+                });
+            });
+        });
+        actions
+    }
+
+    fn delete_template_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
+        let Some(confirmation) = state.delete_template_confirmation.clone() else {
+            return actions;
+        };
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                500.0_f32.min((full.width() - 32.0).max(280.0)),
+                250.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "delete-template"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_label("Delete Template");
+                node.set_modal();
+            });
+            ui.label(
+                RichText::new("Delete this Template?")
+                    .size(21.0)
+                    .color(theme.text)
+                    .strong(),
+            );
+            ui.label(RichText::new(&confirmation.name).color(theme.text).strong());
+            ui.label(
+                RichText::new(
+                    "Sessions created from it keep their layout and configuration. Only the reusable Template and any defaults pointing to it are removed.",
+                )
+                .color(theme.text_dim),
+            );
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new("Delete Template").fill(theme.failure))
+                    .clicked()
+                {
+                    state.delete_template_confirmation = None;
+                    actions.push(ViewAction::DeleteTemplate {
+                        template_id: confirmation.template_id.clone(),
+                    });
+                }
+                if ui.button("Cancel").clicked() {
+                    state.delete_template_confirmation = None;
+                }
+            });
         });
         actions
     }
@@ -8141,10 +8690,47 @@ impl<'a> TurnView<'a> {
         &self,
         ui: &mut Ui,
         theme: &Theme,
+        hierarchy: Option<&HierarchySnapshot>,
         state: &mut ViewState,
         full: Rect,
     ) -> Vec<ViewAction> {
         let mut actions = Vec::new();
+        let selected_session_id = self.selected.clone();
+        let selected_workspace_id = hierarchy
+            .and_then(|snapshot| {
+                effective_selection(snapshot, state)
+                    .and_then(|key| workspace_for_key(snapshot, &key))
+            })
+            .or_else(|| {
+                self.workspaces.iter().find_map(|workspace| {
+                    hierarchy
+                        .and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .find(|tree| tree.workspace.id == workspace.id)
+                        })
+                        .and_then(|tree| {
+                            tree.sessions
+                                .iter()
+                                .any(|session| {
+                                    selected_session_id.as_ref() == Some(&session.session.id)
+                                })
+                                .then(|| workspace.id.clone())
+                        })
+                })
+            });
+        let global_default = self
+            .settings
+            .and_then(|settings| settings.entry(DEFAULT_TEMPLATE_KEY))
+            .and_then(|entry| entry.resolution.value.as_str())
+            .map(TemplateId::from_stored);
+        let workspace_default = selected_workspace_id.as_ref().and_then(|workspace_id| {
+            self.workspaces
+                .iter()
+                .find(|workspace| &workspace.id == workspace_id)
+                .and_then(|workspace| workspace.default_template.clone())
+        });
         let panel = Rect::from_center_size(
             full.center(),
             Vec2::new(
@@ -8177,8 +8763,12 @@ impl<'a> TurnView<'a> {
                 });
             });
             ui.add_space(14.0);
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .id_salt("settings-content")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
                     // The preferences first, because they are what "Settings" means to
                     // somebody opening this. The Layout presets and the archived filter below
                     // are about what Turn shows rather than how it behaves.
@@ -8207,15 +8797,21 @@ impl<'a> TurnView<'a> {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new("Layout presets")
+                                RichText::new(if state.template_apply_mode {
+                                    "Apply a Template"
+                                } else {
+                                    "Templates"
+                                })
                                     .size(17.0)
                                     .color(theme.text)
                                     .strong(),
                             );
                             ui.label(
-                                RichText::new(
-                                    "Reusable rows, columns and commands offered when a Session is created.",
-                                )
+                                RichText::new(if state.template_apply_mode {
+                                    "Choose one for the selected stopped Session. Turn starts its safe Pane commands automatically."
+                                } else {
+                                    "Reusable layouts, commands and startup configuration."
+                                })
                                 .color(theme.text_dim)
                                 .small(),
                             );
@@ -8243,6 +8839,12 @@ impl<'a> TurnView<'a> {
                         .id_salt("settings-layout-presets")
                         .max_height(260.0)
                         .show(ui, |ui| {
+                            if self.templates.is_empty() {
+                                ui.label(
+                                    RichText::new("No Templates are available yet.")
+                                        .color(theme.text_dim),
+                                );
+                            }
                             for template in self.templates {
                                 egui::Frame::new()
                                     .fill(theme.raised)
@@ -8252,11 +8854,26 @@ impl<'a> TurnView<'a> {
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.vertical(|ui| {
-                                                ui.label(
-                                                    RichText::new(&template.name)
-                                                        .color(theme.text)
-                                                        .strong(),
-                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new(&template.name)
+                                                            .color(theme.text)
+                                                            .strong(),
+                                                    );
+                                                    if global_default.as_ref() == Some(&template.id) {
+                                                        ui.label(RichText::new("Global default").color(theme.running).small());
+                                                    }
+                                                    if workspace_default.as_ref() == Some(&template.id) {
+                                                        ui.label(RichText::new("Workspace default").color(theme.running).small());
+                                                    }
+                                                });
+                                                if let Some(description) = &template.description {
+                                                    ui.label(
+                                                        RichText::new(description)
+                                                            .color(theme.text_dim)
+                                                            .small(),
+                                                    );
+                                                }
                                                 let command_summary = if template.commands.is_empty()
                                                 {
                                                     format!(
@@ -8272,6 +8889,16 @@ impl<'a> TurnView<'a> {
                                                         .color(theme.text_dim)
                                                         .small(),
                                                 );
+                                                if !template.missing_commands.is_empty() {
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Missing on this machine: {}. Those Panes stay stopped.",
+                                                            template.missing_commands.join(", ")
+                                                        ))
+                                                        .color(theme.failure)
+                                                        .small(),
+                                                    );
+                                                }
                                             });
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -8288,11 +8915,63 @@ impl<'a> TurnView<'a> {
                                                 },
                                             );
                                         });
+                                        ui.add_space(7.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(session_id) = selected_session_id.clone() {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new("Apply to Session")
+                                                            .fill(theme.running)
+                                                            .stroke(Stroke::NONE),
+                                                    )
+                                                    .on_hover_text("The Session must be stopped. Safe commands start automatically; missing commands stay stopped.")
+                                                    .clicked()
+                                                {
+                                                    actions.push(ViewAction::ApplyTemplateToSession {
+                                                        session_id,
+                                                        template_id: template.id.clone(),
+                                                    });
+                                                }
+                                            }
+                                            if let Some(workspace_id) = selected_workspace_id.clone() {
+                                                if ui.button("Workspace default").clicked() {
+                                                    actions.push(ViewAction::SetWorkspaceDefaultTemplate {
+                                                        workspace_id,
+                                                        template_id: Some(template.id.clone()),
+                                                    });
+                                                }
+                                            }
+                                            if ui.button("Global default").clicked() {
+                                                actions.push(ViewAction::SetGlobalDefaultTemplate {
+                                                    template_id: template.id.clone(),
+                                                });
+                                            }
+                                            if ui.button("Duplicate").clicked() {
+                                                actions.push(ViewAction::DuplicateTemplate {
+                                                    template_id: template.id.clone(),
+                                                    name: format!("{} copy", template.name),
+                                                });
+                                            }
+                                            if !template.built_in && ui.button("Edit").clicked() {
+                                                actions.push(ViewAction::EditTemplate {
+                                                    template_id: template.id.clone(),
+                                                });
+                                            }
+                                            if !template.built_in && ui.button("Delete").clicked() {
+                                                state.delete_template_confirmation = Some(
+                                                    DeleteTemplateConfirmation {
+                                                        template_id: template.id.clone(),
+                                                        name: template.name.clone(),
+                                                    },
+                                                );
+                                            }
+                                        });
                                     });
                                 ui.add_space(6.0);
                             }
                         });
-            });
+                    });
+                });
         });
         actions
     }
@@ -10908,6 +11587,7 @@ mod tests {
             CellCommandDraft {
                 program: "npm".into(),
                 arguments: "run test -- --name 'wall to ceiling'".into(),
+                ..CellCommandDraft::default()
             },
         );
 
@@ -10919,5 +11599,73 @@ mod tests {
             ["run", "test", "--", "--name", "wall to ceiling"]
         );
         assert_ne!(pane.command.as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn the_template_editor_round_trips_every_startup_field_without_json() {
+        let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
+        draft.name = "Product work".into();
+        draft.description = "Full configuration".into();
+        draft.icon = "terminal".into();
+        draft.name_pattern = "task-{n}".into();
+        draft.hotkey = "cmd+shift+8".into();
+        draft.environment = "GLOBAL=yes\nPORT=3000".into();
+        draft.init_commands = "git status\nmake setup".into();
+        draft.inherit_attention = false;
+        draft.attention = AttentionPolicy::silent();
+        draft.tmux = true;
+        let selected = draft.selected.clone();
+        draft.cells.insert(
+            selected.clone(),
+            CellCommandDraft {
+                program: "npm".into(),
+                arguments: "run dev -- --port 3000".into(),
+                cwd: "frontend".into(),
+                environment: "CELL=left".into(),
+                restore: RestoreBehaviour::Skip,
+            },
+        );
+
+        let template = draft.materialized_template().unwrap();
+        assert_eq!(template.name, "Product work");
+        assert_eq!(template.description.as_deref(), Some("Full configuration"));
+        assert_eq!(template.icon.as_deref(), Some("terminal"));
+        assert_eq!(template.name_pattern.as_deref(), Some("task-{n}"));
+        assert_eq!(template.hotkey.as_deref(), Some("cmd+shift+8"));
+        assert_eq!(
+            template.env,
+            [
+                ("GLOBAL".into(), "yes".into()),
+                ("PORT".into(), "3000".into())
+            ]
+        );
+        assert_eq!(template.init_commands, ["git status", "make setup"]);
+        assert_eq!(template.attention, Some(AttentionPolicy::silent()));
+        assert!(template.tmux);
+        let pane = template.layout.get(&selected).unwrap();
+        assert_eq!(pane.command.as_deref(), Some("npm"));
+        assert_eq!(pane.args, ["run", "dev", "--", "--port", "3000"]);
+        assert_eq!(pane.cwd.as_deref(), Some("frontend"));
+        assert_eq!(pane.env, [("CELL".into(), "left".into())]);
+        assert_eq!(pane.restore, RestoreBehaviour::Skip);
+
+        let restored = LayoutTemplateDraft::from_template(template, LayoutEditorOrigin::Settings);
+        assert_eq!(restored.description, "Full configuration");
+        assert_eq!(restored.environment, "GLOBAL=yes\nPORT=3000");
+        assert_eq!(restored.init_commands, "git status\nmake setup");
+        assert_eq!(restored.cells[&selected].cwd, "frontend");
+        assert_eq!(restored.cells[&selected].environment, "CELL=left");
+        assert_eq!(restored.cells[&selected].restore, RestoreBehaviour::Skip);
+    }
+
+    #[test]
+    fn the_template_editor_rejects_invalid_environment_rows_before_saving() {
+        assert_eq!(
+            parse_environment("GOOD=yes\nmissing_equals").unwrap_err(),
+            "Environment line 2 needs NAME=value."
+        );
+        assert!(parse_environment("9INVALID=value")
+            .unwrap_err()
+            .contains("invalid variable name"));
     }
 }

@@ -17,7 +17,7 @@ use turn_core::model::{
 use turn_core::state::Lifecycle;
 use turn_proto::{
     CloseDisposition, ErrorCode, EscapedProcess, NewPane, ProtoError, Response, ServerEvent,
-    TemplateSummary,
+    WorkspaceSummary,
 };
 
 impl Core {
@@ -1108,6 +1108,18 @@ impl Core {
     }
 
     /// Captures a session's current arrangement as a template.
+    pub(super) fn get_template(&self, id: &TemplateId) -> Answer {
+        let template = self
+            .templates
+            .get(id)
+            .ok_or_else(|| ProtoError::not_found("template", id.as_str()))?
+            .clone();
+        Ok(Response::TemplateDetails {
+            template: Box::new(template),
+        })
+    }
+
+    /// Creates a Template from the visual editor before a Session exists.
     pub(super) fn create_layout_template(
         &mut self,
         name: String,
@@ -1131,7 +1143,19 @@ impl Core {
         let mut template = Template::from_layout(name, &layout, now_ms);
         template.description = description;
         self.store.templates().save(&template).map_err(store)?;
-        let summary = TemplateSummary::from_template(&template);
+        let summary = self.template_summary(&template);
+        self.templates.insert(template.id.clone(), template);
+        Ok(Response::Template { template: summary })
+    }
+
+    pub(super) fn create_template(&mut self, draft: Template, now_ms: i64) -> Answer {
+        let name = check_name(&draft.name)?;
+        self.require_unique_template_name(&name, None)?;
+        validate_template_layout(&draft.layout)?;
+        let id = TemplateId::new();
+        let template = editable_template(draft, id, name, now_ms);
+        self.store.templates().save(&template).map_err(store)?;
+        let summary = self.template_summary(&template);
         self.templates.insert(template.id.clone(), template);
         Ok(Response::Template { template: summary })
     }
@@ -1146,6 +1170,7 @@ impl Core {
         now_ms: i64,
     ) -> Answer {
         let name = check_name(&name)?;
+        self.require_unique_template_name(&name, None)?;
         let session = self.session(id)?;
         // `from_layout` strips process bindings: a template describes what to start,
         // never which instance it was captured from.
@@ -1156,9 +1181,232 @@ impl Core {
         template.env = session.env.clone();
         template.tmux = session.tmux;
         self.store.templates().save(&template).map_err(store)?;
-        let summary = TemplateSummary::from_template(&template);
+        let summary = self.template_summary(&template);
         self.templates.insert(template.id.clone(), template);
         Ok(Response::Template { template: summary })
+    }
+
+    /// Replaces one user-owned Template with the complete editor draft.
+    pub(super) fn update_template(&mut self, id: &TemplateId, draft: Template) -> Answer {
+        let existing = self
+            .templates
+            .get(id)
+            .ok_or_else(|| ProtoError::not_found("template", id.as_str()))?
+            .clone();
+        if existing.built_in {
+            return Err(ProtoError::refused(
+                "Built-in Templates are read-only; duplicate this one to customise it",
+            ));
+        }
+        let name = check_name(&draft.name)?;
+        self.require_unique_template_name(&name, Some(id))?;
+        validate_template_layout(&draft.layout)?;
+
+        // Construct from the draft Layout to strip any runtime binding supplied by a client,
+        // then copy only editable metadata. Identity, creation time and built-in ownership are
+        // daemon facts and cannot be changed through the editor.
+        let template = editable_template(draft, existing.id.clone(), name, existing.created_ms);
+        self.store.templates().save(&template).map_err(store)?;
+        let summary = self.template_summary(&template);
+        self.templates.insert(id.clone(), template);
+        Ok(Response::Template { template: summary })
+    }
+
+    /// Copies a Template into a new user-owned definition.
+    pub(super) fn duplicate_template(
+        &mut self,
+        id: &TemplateId,
+        name: String,
+        now_ms: i64,
+    ) -> Answer {
+        let source = self
+            .templates
+            .get(id)
+            .ok_or_else(|| ProtoError::not_found("template", id.as_str()))?
+            .clone();
+        let name = check_name(&name)?;
+        self.require_unique_template_name(&name, None)?;
+        let mut copy = Template::from_layout(name, &source.layout, now_ms);
+        copy.description = source.description;
+        copy.icon = source.icon;
+        copy.attention = source.attention;
+        copy.init_commands = source.init_commands;
+        copy.name_pattern = source.name_pattern;
+        copy.hotkey = source.hotkey;
+        copy.env = source.env;
+        copy.tmux = source.tmux;
+        self.store.templates().save(&copy).map_err(store)?;
+        let summary = self.template_summary(&copy);
+        self.templates.insert(copy.id.clone(), copy);
+        Ok(Response::Template { template: summary })
+    }
+
+    /// Deletes a user-owned Template without changing the independent Session configuration
+    /// instantiated from it.
+    pub(super) fn delete_template(&mut self, id: &TemplateId, now_ms: i64) -> Answer {
+        let template = self
+            .templates
+            .get(id)
+            .ok_or_else(|| ProtoError::not_found("template", id.as_str()))?;
+        if template.built_in {
+            return Err(ProtoError::refused(
+                "The portable built-in Template cannot be deleted",
+            ));
+        }
+
+        // Defaults and `template_id` are pointers, not ownership. Clear only pointers to the
+        // deleted row; every Session retains the independent Layout/configuration it was
+        // instantiated with.
+        let changed_workspaces: Vec<_> = self
+            .workspaces
+            .values()
+            .filter(|workspace| workspace.default_template.as_ref() == Some(id))
+            .cloned()
+            .map(|mut workspace| {
+                workspace.default_template = None;
+                workspace
+            })
+            .collect();
+        for workspace in &changed_workspaces {
+            self.store.workspaces().save(workspace).map_err(store)?;
+        }
+        let changed_sessions: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|session| session.template_id.as_ref() == Some(id))
+            .cloned()
+            .map(|mut session| {
+                session.template_id = None;
+                session
+            })
+            .collect();
+        for session in &changed_sessions {
+            self.store.sessions().save(session).map_err(store)?;
+        }
+        if self
+            .setting_for(None, "templates.default")
+            .as_str()
+            .is_some_and(|configured| configured == id.as_str())
+        {
+            self.store
+                .setting_layers()
+                .clear(turn_core::settings::Scope::Global, "", "templates.default")
+                .map_err(store)?;
+        }
+        self.store
+            .setting_layers()
+            .forget_owner(turn_core::settings::Scope::Template, id.as_str())
+            .map_err(store)?;
+        self.store.templates().delete(id).map_err(store)?;
+        for workspace in changed_workspaces {
+            self.workspaces.insert(workspace.id.clone(), workspace);
+        }
+        let changed_session_ids: Vec<_> = changed_sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect();
+        for session in changed_sessions {
+            self.sessions.insert(session.id.clone(), session);
+        }
+        self.templates.remove(id);
+        for session_id in changed_session_ids {
+            self.push_session_state(&session_id, now_ms);
+        }
+        Ok(Response::Templates {
+            templates: self.template_summaries(),
+        })
+    }
+
+    pub(super) fn set_workspace_default_template(
+        &mut self,
+        workspace_id: &WorkspaceId,
+        template_id: Option<TemplateId>,
+        now_ms: i64,
+    ) -> Answer {
+        if let Some(id) = &template_id {
+            if !self.templates.contains_key(id) {
+                return Err(ProtoError::not_found("template", id.as_str()));
+            }
+        }
+        let mut workspace = self.workspace(workspace_id)?.clone();
+        workspace.default_template = template_id;
+        workspace.touch(now_ms);
+        self.store.workspaces().save(&workspace).map_err(store)?;
+        let summary = WorkspaceSummary::from_workspace(
+            &workspace,
+            &self.session_summaries(Some(workspace_id), true, now_ms),
+        );
+        self.workspaces.insert(workspace_id.clone(), workspace);
+        Ok(Response::Workspace { workspace: summary })
+    }
+
+    /// Applies a Template only when doing so cannot stop or orphan a running process.
+    pub(super) fn apply_template_to_session(
+        &mut self,
+        session_id: &SessionId,
+        template_id: &TemplateId,
+        now_ms: i64,
+    ) -> Answer {
+        if !self.still_running(session_id).is_empty() {
+            return Err(ProtoError::refused(
+                "Stop the Session's processes before replacing its layout with a Template",
+            ));
+        }
+        let workspace_id = self.session(session_id)?.workspace_id.clone();
+        let workspace = self.workspace(&workspace_id)?.clone();
+        let template = self
+            .templates
+            .get(template_id)
+            .ok_or_else(|| ProtoError::not_found("template", template_id.as_str()))?
+            .clone();
+        let mut updated = self.session(session_id)?.clone();
+        updated.layout = template.instantiate();
+        updated.template_id = Some(template.id.clone());
+        updated.attention = template
+            .attention
+            .clone()
+            .unwrap_or_else(|| workspace.attention.clone());
+        updated.env = workspace
+            .env
+            .iter()
+            .cloned()
+            .chain(template.env.iter().cloned())
+            .collect();
+        updated.tmux = template.tmux;
+        updated.restore_state = turn_core::model::RestoreState::Live;
+        updated.touch(now_ms);
+        updated.cwd = self.validate_session_definition_cwds(&updated)?;
+        self.store.sessions().save(&updated).map_err(store)?;
+        self.sessions.insert(session_id.clone(), updated);
+
+        let init: Vec<String> = workspace
+            .init_commands
+            .iter()
+            .cloned()
+            .chain(template.init_commands.iter().cloned())
+            .collect();
+        self.run_init_commands(session_id, &init, now_ms);
+        self.materialise_session(session_id, now_ms);
+        self.persist_session(session_id)?;
+        self.push_layout(session_id, None);
+        self.push_session_state(session_id, now_ms);
+        self.answer_session(session_id, now_ms)
+    }
+
+    fn require_unique_template_name(
+        &self,
+        name: &str,
+        except: Option<&TemplateId>,
+    ) -> Result<(), ProtoError> {
+        if self.templates.values().any(|template| {
+            Some(&template.id) != except && template.name.eq_ignore_ascii_case(name)
+        }) {
+            return Err(ProtoError::new(
+                turn_proto::ErrorCode::Conflict,
+                "A layout with that name already exists",
+            ));
+        }
+        Ok(())
     }
 
     /// Runs a workspace's or template's start-up commands.
@@ -1191,6 +1439,21 @@ impl Core {
             session: Box::new(session),
         })
     }
+}
+
+/// Rebuilds an editable Template while keeping daemon-owned identity separate from the client draft.
+fn editable_template(draft: Template, id: TemplateId, name: String, created_ms: i64) -> Template {
+    let mut template = Template::from_layout(name, &draft.layout, created_ms);
+    template.id = id;
+    template.description = draft.description;
+    template.icon = draft.icon;
+    template.attention = draft.attention;
+    template.init_commands = draft.init_commands;
+    template.name_pattern = draft.name_pattern;
+    template.hotkey = draft.hotkey;
+    template.env = draft.env;
+    template.tmux = draft.tmux;
+    template
 }
 
 /// Adds processes to an escaped list without repeating a node already in it.
@@ -2008,6 +2271,192 @@ mod tests {
             a.panes().iter().all(|pane| b.get(&pane.id).is_none()),
             "each Session needs fresh Pane ids"
         );
+    }
+
+    #[tokio::test]
+    async fn template_lifecycle_preserves_configuration_and_never_leaves_dangling_sessions() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_template_lifecycle");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_before_template"),
+            1,
+        );
+        let workspace_id = harness.core.sessions[&session_id].workspace_id.clone();
+
+        let mut draft = Template::two_shells(2);
+        draft.built_in = false;
+        draft.name = "Complete development".into();
+        draft.description = Some("All persisted fields".into());
+        draft.icon = Some("terminal".into());
+        draft.name_pattern = Some("work-{n}".into());
+        draft.hotkey = Some("cmd+shift+7".into());
+        draft.env = vec![("FROM_TEMPLATE".into(), "yes".into())];
+        draft.attention = Some(turn_core::attention::AttentionPolicy::silent());
+        draft.tmux = true;
+        let pane_ids: Vec<_> = draft
+            .layout
+            .panes()
+            .iter()
+            .map(|pane| pane.id.clone())
+            .collect();
+        let first = draft.layout.get_mut(&pane_ids[0]).unwrap();
+        first.cwd = Some(".".into());
+        first.env = vec![("CELL".into(), "left".into())];
+        first.restore = turn_core::model::RestoreBehaviour::Relaunch;
+        let missing = "__turn_acceptance_missing_template_tool__";
+        let second = draft.layout.get_mut(&pane_ids[1]).unwrap();
+        second.kind = PaneKind::Terminal;
+        second.command = Some(missing.into());
+        second.args = vec!["--preserved".into()];
+        second.restore = turn_core::model::RestoreBehaviour::Skip;
+
+        let created = match harness.core.create_template(draft, 3).unwrap() {
+            Response::Template { template } => template,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(created.missing_commands, [missing]);
+        let template_id = created.id.clone();
+
+        let mut edited = match harness.core.get_template(&template_id).unwrap() {
+            Response::TemplateDetails { template } => *template,
+            other => panic!("unexpected {other:?}"),
+        };
+        edited.description = Some("Edited without JSON".into());
+        let updated = match harness.core.update_template(&template_id, edited).unwrap() {
+            Response::Template { template } => template,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(updated.id, template_id);
+        assert_eq!(updated.description.as_deref(), Some("Edited without JSON"));
+
+        let duplicate = match harness
+            .core
+            .duplicate_template(&template_id, "Complete development copy".into(), 4)
+            .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_ne!(duplicate.id, template_id);
+        assert!(!duplicate.built_in);
+        assert_eq!(duplicate.missing_commands, [missing]);
+
+        harness
+            .core
+            .set_workspace_default_template(&workspace_id, Some(template_id.clone()), 5)
+            .unwrap();
+        harness
+            .core
+            .store
+            .setting_layers()
+            .set(
+                turn_core::settings::Scope::Global,
+                "",
+                "templates.default",
+                &serde_json::Value::String(template_id.as_str().into()),
+                5,
+            )
+            .unwrap();
+
+        harness
+            .core
+            .apply_template_to_session(&session_id, &template_id, 6)
+            .unwrap();
+        let applied = &harness.core.sessions[&session_id];
+        assert_eq!(applied.template_id.as_ref(), Some(&template_id));
+        assert_eq!(applied.env, [("FROM_TEMPLATE".into(), "yes".into())]);
+        assert_eq!(
+            applied.attention,
+            turn_core::attention::AttentionPolicy::silent()
+        );
+        assert!(applied.tmux);
+        assert_eq!(applied.layout.pane_count(), 2);
+        let applied_panes = applied.layout.panes();
+        assert_eq!(applied_panes[0].cwd.as_deref(), Some("."));
+        assert_eq!(applied_panes[0].env, [("CELL".into(), "left".into())]);
+        assert_eq!(applied_panes[1].command.as_deref(), Some(missing));
+        assert_eq!(applied_panes[1].args, ["--preserved"]);
+        let turn_core::model::LayoutNode::Split(split) = &applied.layout.root else {
+            panic!("the two-column structure must survive instantiation");
+        };
+        assert_eq!(split.direction, Direction::Horizontal);
+        assert!(split
+            .children
+            .iter()
+            .all(|child| (child.size - 0.5).abs() < 0.001));
+
+        let running_error = harness
+            .core
+            .apply_template_to_session(&session_id, &duplicate.id, 7)
+            .expect_err("applying must never terminate a running Session implicitly");
+        assert_eq!(running_error.code, ErrorCode::Refused);
+
+        harness.core.delete_template(&template_id, 8).unwrap();
+        assert!(!harness.core.templates.contains_key(&template_id));
+        assert!(harness.core.templates.contains_key(&duplicate.id));
+        assert_eq!(
+            harness.core.workspaces[&workspace_id].default_template,
+            None
+        );
+        let preserved = &harness.core.sessions[&session_id];
+        assert_eq!(preserved.template_id, None);
+        assert_eq!(preserved.layout.pane_count(), 2);
+        assert_eq!(
+            preserved.layout.panes()[1].command.as_deref(),
+            Some(missing)
+        );
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .expect("the Session remains independently persisted");
+        assert_eq!(stored.template_id, None);
+        assert_eq!(stored.layout.pane_count(), 2);
+        let global = harness
+            .core
+            .store
+            .setting_layers()
+            .layer(turn_core::settings::Scope::Global, "")
+            .unwrap();
+        assert!(global.get("templates.default").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_safe_template_builtin_is_read_only_but_can_be_duplicated() {
+        let mut harness = Harness::new().await;
+        let built_in = Template::two_shells(1);
+        let id = built_in.id.clone();
+        harness.core.templates.insert(id.clone(), built_in.clone());
+
+        assert_eq!(
+            harness
+                .core
+                .update_template(&id, built_in)
+                .expect_err("built-ins are daemon-owned")
+                .code,
+            ErrorCode::Refused
+        );
+        assert_eq!(
+            harness
+                .core
+                .delete_template(&id, 2)
+                .expect_err("built-ins are portable recovery state")
+                .code,
+            ErrorCode::Refused
+        );
+        let copy = match harness
+            .core
+            .duplicate_template(&id, "My Two Shells".into(), 3)
+            .unwrap()
+        {
+            Response::Template { template } => template,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(!copy.built_in);
+        assert_eq!(copy.pane_count, 2);
     }
 
     #[tokio::test]

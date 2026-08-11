@@ -614,6 +614,9 @@ pub(crate) fn all_requests() -> Vec<Request> {
             handoff_id,
         },
         Request::ListTemplates,
+        Request::GetTemplate {
+            template_id: template_id.clone(),
+        },
         Request::CreateLayoutTemplate {
             name: "Two tools".into(),
             layout: Box::new(turn_core::model::Layout::single(
@@ -621,11 +624,33 @@ pub(crate) fn all_requests() -> Vec<Request> {
             )),
             description: Some("A reusable draft".into()),
         },
+        Request::CreateTemplate {
+            template: Box::new(turn_core::model::Template::two_shells(1_700_000_000_000)),
+        },
         Request::SaveLayoutAsTemplate {
             session_id: session_id.clone(),
             name: "My shape".into(),
             description: None,
             hotkey: Some("cmd+shift+4".into()),
+        },
+        Request::UpdateTemplate {
+            template_id: template_id.clone(),
+            template: Box::new(turn_core::model::Template::two_shells(1_700_000_000_000)),
+        },
+        Request::DuplicateTemplate {
+            template_id: template_id.clone(),
+            name: "Two shells copy".into(),
+        },
+        Request::DeleteTemplate {
+            template_id: template_id.clone(),
+        },
+        Request::SetWorkspaceDefaultTemplate {
+            workspace_id: workspace_id.clone(),
+            template_id: Some(template_id.clone()),
+        },
+        Request::ApplyTemplateToSession {
+            session_id: session_id.clone(),
+            template_id: template_id.clone(),
         },
         Request::SplitPane {
             session_id: session_id.clone(),
@@ -815,7 +840,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 77 operations. The number is asserted so that adding one without documenting it in
+    // 84 operations. The number is asserted so that adding one without documenting it in
     // docs/PROTOCOL.md becomes a deliberate act.
     //
     // What it does *not* do is notice a variant that was added to `Request` and never added
@@ -823,5 +848,5 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
     // absent from both sides of the comparison. The compile-time guards for that are
     // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
     // be left alone when a variant appears. This assertion guards the *documentation*.
-    assert_eq!(names.len(), 77, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 84, "the catalogue changed size: {names:?}");
 }

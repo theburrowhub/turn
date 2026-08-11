@@ -61,6 +61,14 @@ terminal-acceptance: ## Reproduce the complete terminal interaction contract wit
 	$(CARGO) test -p turn-gui --test links --test scrollback -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turnd --test cells -- --test-threads=$(TEST_THREADS)
 
+.PHONY: template-acceptance
+template-acceptance: ## Reproduce the complete Template lifecycle without opening a window
+	$(CARGO) test -p turn-core model::template -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-proto -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-store template -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd template --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui template --lib -- --test-threads=$(TEST_THREADS)
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

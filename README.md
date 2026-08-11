@@ -198,6 +198,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   durable queue triage, notifications, sound and custom action checks.
 - [Terminal interaction acceptance](docs/TERMINAL_ACCEPTANCE.md) — search, safe links, path drop,
   appearance preferences, IME, TUI modes and bounded-output proof.
+- [Template lifecycle acceptance](docs/TEMPLATE_ACCEPTANCE.md) — visual create/edit/capture,
+  defaults, safe application, missing-tool visibility and deletion integrity.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 
