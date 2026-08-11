@@ -46,8 +46,9 @@ use crate::terminal::feed::{Desync, PaneFeed};
 use crate::terminal::PaneAction;
 use crate::transport::{Ask, ConnectionState, Inbound};
 use crate::view::{
-    HierarchyAction, LifecycleConfirmation, PaneContent, PendingPermission, QueueItem,
-    SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView, ViewAction,
+    CloseTurnDraft, CloseTurnSession, EntityEditDraft, HierarchyAction, LifecycleConfirmation,
+    PaneContent, PendingPermission, QueueItem, SessionDraft, SessionRestoreView, SessionRow,
+    TemporaryPaneContent, TurnView, ViewAction,
 };
 
 fn pane_placement_name(placement: PanePlacement) -> &'static str {
@@ -525,6 +526,44 @@ impl Desk {
             .find(|branch| branch.workspace.id == workspace_id)
     }
 
+    pub fn rename_session_draft(&self) -> Result<EntityEditDraft, &'static str> {
+        let Some(session) = self.target_session() else {
+            return Err("select a Session in the tree before renaming it");
+        };
+        Ok(EntityEditDraft::Session {
+            session_id: session.id.clone(),
+            name: session.name.clone(),
+        })
+    }
+
+    pub fn rename_workspace_draft(&self) -> Result<EntityEditDraft, &'static str> {
+        let Some(workspace) = self.target_workspace_branch() else {
+            return Err("select a Workspace, Session or Process before renaming its Workspace");
+        };
+        Ok(EntityEditDraft::Workspace {
+            workspace_id: workspace.workspace.id.clone(),
+            name: workspace.workspace.name.clone(),
+        })
+    }
+
+    pub fn close_turn_draft(&self) -> Option<CloseTurnDraft> {
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|session| session.running_count > 0)
+            .map(|session| CloseTurnSession {
+                session_id: session.id.clone(),
+                name: session.name.clone(),
+                running_count: session.running_count,
+                stop: false,
+            })
+            .collect();
+        (!sessions.is_empty()).then_some(CloseTurnDraft {
+            choice: Default::default(),
+            sessions,
+        })
+    }
+
     /// The confirmation for closing the Session the tree points at, or the reason there is
     /// none.
     ///
@@ -656,6 +695,10 @@ impl Desk {
     /// The pane the daemon says has focus in the selected session.
     pub fn active_pane(&self) -> Option<PaneId> {
         self.layout()?.active.clone()
+    }
+
+    pub fn pane_grid(&self, pane_id: &PaneId) -> Option<&Grid> {
+        self.feeds.get(pane_id).and_then(PaneFeed::peek)
     }
 
     /// The node behind a pane, for a request addressed to the process.
@@ -2781,13 +2824,19 @@ impl Desk {
             }],
             Command::NextSession | Command::PreviousSession => {
                 let Some(current) = session else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "no Session is active yet; create or select one first".into(),
+                    )];
                 };
                 let Some(at) = self.sessions.iter().position(|s| s.id == current) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "the active Session is no longer in the workspace tree".into(),
+                    )];
                 };
                 if self.sessions.is_empty() {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "there are no Sessions to switch to".into(),
+                    )];
                 }
                 let step: i64 = if command == Command::NextSession {
                     1
@@ -2797,7 +2846,9 @@ impl Desk {
                 let next = (at as i64 + step).rem_euclid(self.sessions.len() as i64) as usize;
                 match self.sessions.get(next).map(|s| s.id.clone()) {
                     Some(id) => self.select(id),
-                    None => Vec::new(),
+                    None => vec![Reaction::Notice(
+                        "there is no Pane in that direction".into(),
+                    )],
                 }
             }
             Command::QuickNewSession if self.creation_in_progress() => vec![Reaction::Notice(
@@ -2846,18 +2897,65 @@ impl Desk {
             },
             // These open window-local sheets in `TurnApp`; the Desk never invents form
             // values or silently picks a Template for the non-quick path.
-            Command::NewWorkspace | Command::NewSession => Vec::new(),
+            Command::NewWorkspace
+            | Command::NewSession
+            | Command::RenameWorkspace
+            | Command::RenameSession => Vec::new(),
             Command::SaveLayoutAsTemplate | Command::ApplyTemplate => Vec::new(),
-            Command::RenameSession => match (session, self.selected_summary()) {
-                (Some(session_id), Some(summary)) => {
-                    let name = format!("{} (renamed)", summary.name);
-                    vec![Reaction::Send {
-                        ask: Ask::Action("renaming the session"),
-                        request: Request::RenameSession { session_id, name },
-                    }]
-                }
-                _ => Vec::new(),
-            },
+            Command::DuplicateSession => {
+                let Some(session) = self.target_session() else {
+                    return vec![Reaction::Notice(
+                        "select a Session in the tree before duplicating it".into(),
+                    )];
+                };
+                vec![Reaction::Send {
+                    ask: Ask::Action("duplicating the session"),
+                    request: Request::DuplicateSession {
+                        session_id: session.id.clone(),
+                    },
+                }]
+            }
+            Command::DuplicateWorkspace => {
+                let Some(workspace) = self.target_workspace_branch() else {
+                    return vec![Reaction::Notice(
+                        "select a Workspace, Session or Process before duplicating its Workspace"
+                            .into(),
+                    )];
+                };
+                vec![Reaction::Send {
+                    ask: Ask::Action("duplicating the workspace settings"),
+                    request: Request::DuplicateWorkspace {
+                        workspace_id: workspace.workspace.id.clone(),
+                        name: None,
+                    },
+                }]
+            }
+            Command::ToggleFavouriteSession | Command::TogglePinSession => {
+                let Some(session) = self.target_session() else {
+                    return vec![Reaction::Notice(
+                        "select a Session in the tree before changing its shortcuts".into(),
+                    )];
+                };
+                let request = if command == Command::ToggleFavouriteSession {
+                    Request::SetSessionFavourite {
+                        session_id: session.id.clone(),
+                        favourite: !session.favourite,
+                    }
+                } else {
+                    Request::SetSessionPinned {
+                        session_id: session.id.clone(),
+                        pinned: !session.pinned,
+                    }
+                };
+                vec![Reaction::Send {
+                    ask: Ask::Action(if command == Command::ToggleFavouriteSession {
+                        "changing the Session favorite"
+                    } else {
+                        "changing the Session pin"
+                    }),
+                    request,
+                }]
+            }
             // Archiving acts on the row the user is looking at, which is the tree's
             // selection — not necessarily the Session whose panes are on screen.
             Command::ArchiveSession => {
@@ -2931,6 +3029,40 @@ impl Desk {
                     },
                 }]
             }
+            Command::RestoreSession => {
+                let Some(summary) = self.target_session() else {
+                    return vec![Reaction::Notice(
+                        "show archived rows and select a Session before restoring it".into(),
+                    )];
+                };
+                if summary.status != SessionStatus::Archived {
+                    return vec![Reaction::Notice("this Session is already active".into())];
+                }
+                vec![Reaction::Send {
+                    ask: Ask::ArchiveSession { archived: false },
+                    request: Request::ArchiveSession {
+                        session_id: summary.id.clone(),
+                        archived: false,
+                    },
+                }]
+            }
+            Command::RestoreWorkspace => {
+                let Some(branch) = self.target_workspace_branch() else {
+                    return vec![Reaction::Notice(
+                        "show archived rows and select a Workspace before restoring it".into(),
+                    )];
+                };
+                if !branch.workspace.archived {
+                    return vec![Reaction::Notice("this Workspace is already active".into())];
+                }
+                vec![Reaction::Send {
+                    ask: Ask::ArchiveWorkspace { archived: false },
+                    request: Request::ArchiveWorkspace {
+                        workspace_id: branch.workspace.id.clone(),
+                        archived: false,
+                    },
+                }]
+            }
             // Nothing here. Both of these stop processes, and the only thing allowed to
             // do that is an accepted confirmation, which the window opens from
             // [`Desk::end_session_confirmation`] and [`Desk::stop_workspace_confirmation`]
@@ -2951,7 +3083,9 @@ impl Desk {
                     )];
                 }
                 let Some((session_id, pane_id)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a live Session and Pane before splitting it".into(),
+                    )];
                 };
                 let direction = if command == Command::SplitHorizontal {
                     Direction::Horizontal
@@ -2970,7 +3104,9 @@ impl Desk {
             }
             Command::ClosePane => {
                 let Some((session_id, pane_id)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Pane before closing its view".into(),
+                    )];
                 };
                 vec![Reaction::Send {
                     ask: Ask::Action("closing the pane"),
@@ -2983,7 +3119,9 @@ impl Desk {
             }
             Command::ZoomPane => {
                 let Some((session_id, pane_id)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Pane before maximising it".into(),
+                    )];
                 };
                 vec![Reaction::Send {
                     ask: Ask::Action("zooming the pane"),
@@ -2995,7 +3133,9 @@ impl Desk {
             }
             Command::CyclePane | Command::CyclePaneBack => {
                 let Some(session_id) = session else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Session with more than one Pane before cycling".into(),
+                    )];
                 };
                 let target = if command == Command::CyclePane {
                     FocusTarget::Next
@@ -3012,7 +3152,9 @@ impl Desk {
             | Command::FocusPaneUp
             | Command::FocusPaneDown => {
                 let Some((session_id, from)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Pane before moving focus between Panes".into(),
+                    )];
                 };
                 // Geometric: "the pane to the left" is a question about rectangles, and
                 // the answer comes from the arrangement that was actually drawn.
@@ -3035,7 +3177,9 @@ impl Desk {
             | Command::MovePaneUp
             | Command::MovePaneDown => {
                 let Some((session_id, from)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Pane before rearranging the layout".into(),
+                    )];
                 };
                 // The same request the drag sends, with the target and the zone worked out
                 // from the same geometry the directional focus commands use — so the
@@ -3078,7 +3222,9 @@ impl Desk {
                     })];
                 }
                 let Some((session_id, pane_id)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a live Session and Pane before starting a process".into(),
+                    )];
                 };
                 // A split with something in it, rather than a "run this" verb: a process
                 // starts from a pane definition the user chose.
@@ -3094,7 +3240,9 @@ impl Desk {
             }
             Command::InterruptProcess | Command::StopProcess => {
                 let Some((session_id, pane_id)) = session.zip(pane) else {
-                    return Vec::new();
+                    return vec![Reaction::Notice(
+                        "select a Pane with a running process before signalling it".into(),
+                    )];
                 };
                 let Some(node_id) = self.node_of(&pane_id) else {
                     return vec![Reaction::Notice("no process in this pane".into())];
@@ -3128,6 +3276,16 @@ impl Desk {
             | Command::SwitchSession
             | Command::ToggleAttentionPanel
             | Command::FocusWorkspaceTree
+            | Command::SearchWorkspaceTree
+            | Command::QuickPreview
+            | Command::OpenNode
+            | Command::ToggleAttentionFilter
+            | Command::ToggleRunningFilter
+            | Command::ToggleFailedFilter
+            | Command::ToggleArchivedFilter
+            | Command::ClearWorkspaceTreeFilters
+            | Command::MoveSessionUp
+            | Command::MoveSessionDown
             | Command::ToggleInspector
             | Command::PassContext
             | Command::CopySelection
@@ -3216,6 +3374,17 @@ impl Desk {
                     name,
                 },
             }],
+            ViewAction::RenameWorkspace { workspace_id, name } => vec![Reaction::Send {
+                ask: Ask::Action("renaming the Workspace"),
+                request: Request::RenameWorkspace { workspace_id, name },
+            }],
+            ViewAction::RenameSession { session_id, name } => vec![Reaction::Send {
+                ask: Ask::Action("renaming the Session"),
+                request: Request::RenameSession { session_id, name },
+            }],
+            // The application owns native-window exit and consumes this before it
+            // reaches the I/O-free Desk.
+            ViewAction::CloseTurn { .. } => Vec::new(),
             ViewAction::CorrectRelationship {
                 session_id,
                 node_id,
@@ -5861,6 +6030,144 @@ mod tests {
             }] => assert_eq!(session_id, &session.id),
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_lifecycle_commands_use_real_values_and_typed_operations() {
+        let (session, _, _) = session_with_agent("Keep this exact name");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+
+        assert!(sent(&desk.dispatch(Command::RenameSession, T0)).is_empty());
+        assert_eq!(
+            desk.rename_session_draft().unwrap(),
+            EntityEditDraft::Session {
+                session_id: session.id.clone(),
+                name: "Keep this exact name".into(),
+            },
+            "Rename opens an editor with the current value; it never invents '(renamed)'"
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::RenameSession {
+                    session_id: session.id.clone(),
+                    name: "A name I chose".into(),
+                },
+                T0,
+            )),
+            vec![Request::RenameSession {
+                session_id: session.id.clone(),
+                name: "A name I chose".into(),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.dispatch(Command::DuplicateSession, T0)),
+            vec![Request::DuplicateSession {
+                session_id: session.id.clone(),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.dispatch(Command::ToggleFavouriteSession, T0)),
+            vec![Request::SetSessionFavourite {
+                session_id: session.id.clone(),
+                favourite: true,
+            }]
+        );
+        assert_eq!(
+            sent(&desk.dispatch(Command::TogglePinSession, T0)),
+            vec![Request::SetSessionPinned {
+                session_id: session.id.clone(),
+                pinned: true,
+            }]
+        );
+        assert_eq!(
+            desk.rename_workspace_draft().unwrap(),
+            EntityEditDraft::Workspace {
+                workspace_id: workspace(),
+                name: "project".into(),
+            }
+        );
+        assert_eq!(
+            sent(&desk.dispatch(Command::DuplicateWorkspace, T0)),
+            vec![Request::DuplicateWorkspace {
+                workspace_id: workspace(),
+                name: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn close_turn_defaults_to_preserving_every_running_process() {
+        let (session, _, _) = session_with_agent("Long build");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+
+        let draft = desk.close_turn_draft().expect("one Session is running");
+        assert_eq!(draft.choice, crate::view::CloseTurnChoice::KeepRunning);
+        assert_eq!(draft.sessions.len(), 1);
+        assert_eq!(draft.sessions[0].session_id, session.id);
+        assert!(!draft.sessions[0].stop);
+    }
+
+    #[test]
+    fn palette_hierarchy_commands_reuse_the_typed_tree_actions() {
+        let (session, _, node_id) = session_with_agent("Preview target");
+        let (other, _, _) = session_with_agent("Move target");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(
+                &[&session, &other],
+                Some(HierarchyKey::process(node_id.clone())),
+            ),
+            T0,
+        );
+        let mut state = crate::view::ViewState::default();
+        state.hierarchy = desk.hierarchy().cloned();
+        state.selected_tree = Some(HierarchyKey::process(node_id.clone()));
+
+        assert_eq!(state.run_hierarchy_command(Command::QuickPreview), Ok(true));
+        assert_eq!(
+            state.quick_preview,
+            Some(HierarchyKey::process(node_id.clone()))
+        );
+        assert!(matches!(
+            state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::QuickPreview { node_id: target, .. }] if target == &node_id
+        ));
+
+        assert_eq!(state.run_hierarchy_command(Command::OpenNode), Ok(true));
+        assert!(matches!(
+            state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::OpenTemporaryPane { node_id: target, .. }] if target == &node_id
+        ));
+
+        assert_eq!(
+            state.run_hierarchy_command(Command::ToggleAttentionFilter),
+            Ok(true)
+        );
+        assert!(state.tree_filters.contains(&TreeFilter::Attention));
+        assert!(matches!(
+            state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::SetPresentation { filters, .. }]
+                if filters.contains(&TreeFilter::Attention)
+        ));
+
+        state.selected_tree = Some(HierarchyKey::session(other.id.clone()));
+        assert_eq!(
+            state.run_hierarchy_command(Command::MoveSessionUp),
+            Ok(true)
+        );
+        assert!(matches!(
+            state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::Move { key, .. }]
+                if key == &HierarchyKey::session(other.id.clone())
+        ));
     }
 
     /// A Session with a process from a previous daemon in it can be ended, and the question

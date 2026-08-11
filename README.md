@@ -204,6 +204,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   defaults, safe application, missing-tool visibility and deletion integrity.
 - [Contextual inspector acceptance](docs/INSPECTOR_ACCEPTANCE.md) — complete typed detail,
   redaction, confidence, responsive snapshots and AccessKit coverage.
+- [Command Palette and lifecycle acceptance](docs/LIFECYCLE_ACCEPTANCE.md) — real commands,
+  durable organization, explicit Close Turn policy and process/lease safety.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 

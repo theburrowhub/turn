@@ -396,6 +396,16 @@ pub enum Request {
     DuplicateSession {
         session_id: SessionId,
     },
+    /// Changes the durable shortcut flag without coupling it to tree ordering.
+    SetSessionFavourite {
+        session_id: SessionId,
+        favourite: bool,
+    },
+    /// Keeps a Session at the top of its Workspace until explicitly unpinned.
+    SetSessionPinned {
+        session_id: SessionId,
+        pinned: bool,
+    },
     CloseSession {
         session_id: SessionId,
         disposition: CloseDisposition,
@@ -946,6 +956,8 @@ impl Request {
             Request::RenameSession { .. } => "rename_session",
             Request::ArchiveSession { .. } => "archive_session",
             Request::DuplicateSession { .. } => "duplicate_session",
+            Request::SetSessionFavourite { .. } => "set_session_favourite",
+            Request::SetSessionPinned { .. } => "set_session_pinned",
             Request::CloseSession { .. } => "close_session",
             Request::DeleteSession { .. } => "delete_session",
             Request::GetSession { .. } => "get_session",
@@ -1048,7 +1060,9 @@ impl Request {
             | Request::CreateSessionFromTemplate { .. }
             | Request::RenameSession { .. }
             | Request::ArchiveSession { .. }
-            | Request::DuplicateSession { .. } => "session",
+            | Request::DuplicateSession { .. }
+            | Request::SetSessionFavourite { .. }
+            | Request::SetSessionPinned { .. } => "session",
             Request::CloseSession { .. } | Request::DeleteSession { .. } => "closed",
             Request::GetSession { .. } => "session_details",
             Request::GetProcessTree { .. } => "tree",
@@ -1174,6 +1188,8 @@ impl Request {
             Request::RenameSession { session_id, .. }
             | Request::ArchiveSession { session_id, .. }
             | Request::DuplicateSession { session_id }
+            | Request::SetSessionFavourite { session_id, .. }
+            | Request::SetSessionPinned { session_id, .. }
             | Request::CloseSession { session_id, .. }
             | Request::GetSession { session_id }
             | Request::GetProcessTree { session_id }

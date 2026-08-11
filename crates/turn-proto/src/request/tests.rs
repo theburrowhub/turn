@@ -585,6 +585,14 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::DuplicateSession {
             session_id: session_id.clone(),
         },
+        Request::SetSessionFavourite {
+            session_id: session_id.clone(),
+            favourite: true,
+        },
+        Request::SetSessionPinned {
+            session_id: session_id.clone(),
+            pinned: true,
+        },
         Request::CloseSession {
             session_id: session_id.clone(),
             disposition: CloseDisposition::Terminate,
@@ -847,7 +855,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 85 operations. The number is asserted so that adding one without documenting it in
+    // 87 operations. The number is asserted so that adding one without documenting it in
     // docs/PROTOCOL.md becomes a deliberate act.
     //
     // What it does *not* do is notice a variant that was added to `Request` and never added
@@ -855,5 +863,5 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
     // absent from both sides of the comparison. The compile-time guards for that are
     // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
     // be left alone when a variant appears. This assertion guards the *documentation*.
-    assert_eq!(names.len(), 85, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 87, "the catalogue changed size: {names:?}");
 }

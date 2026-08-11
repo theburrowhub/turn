@@ -13,6 +13,7 @@
 //! 5. Work out when to draw next, which for an idle desk is "never, until something
 //!    happens".
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
@@ -26,7 +27,7 @@ use crate::desk::{Desk, Reaction};
 use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
 use crate::theme::{AppearanceSettings, Theme};
-use crate::transport::{Ask, DaemonLink};
+use crate::transport::{Ask, DaemonLink, Inbound};
 use crate::view::{
     LayoutEditorOrigin, LayoutTemplateDraft, SaveTemplateDraft, ViewAction, ViewState,
 };
@@ -120,6 +121,10 @@ pub struct TurnApp {
     /// The appearance projection already installed into egui. Comparing the small value keeps
     /// a settings sheet from rebuilding font styles and requesting another pass every frame.
     applied_appearance: Option<AppearanceSettings>,
+    /// Native close is allowed only after the explicit Close Turn policy settles.
+    allow_close: bool,
+    /// Terminating Close Turn choices wait for daemon acknowledgements before exit.
+    pending_exit_stops: Option<HashSet<turn_core::ids::SessionId>>,
 }
 
 impl TurnApp {
@@ -186,6 +191,8 @@ impl TurnApp {
             file_overrides,
             applied_bindings: None,
             applied_appearance: None,
+            allow_close: false,
+            pending_exit_stops: None,
         }
     }
 
@@ -602,7 +609,7 @@ impl TurnApp {
         ctx.request_repaint();
     }
 
-    fn handle_locally(&mut self, command: Command) -> bool {
+    fn handle_locally(&mut self, ctx: &egui::Context, command: Command) -> bool {
         let visible_selection = self.state.selected_tree.clone().or_else(|| {
             self.state
                 .hierarchy
@@ -610,6 +617,15 @@ impl TurnApp {
                 .and_then(|hierarchy| hierarchy.tree_state.selected.clone())
         });
         self.desk.set_navigation_hint(visible_selection.clone());
+
+        match self.state.run_hierarchy_command(command) {
+            Ok(true) => return true,
+            Err(reason) => {
+                self.desk.show_notice(reason);
+                return true;
+            }
+            Ok(false) => {}
+        }
 
         let form_submitting = self
             .state
@@ -669,6 +685,20 @@ impl TurnApp {
                 }
                 true
             }
+            Command::RenameSession => {
+                match self.desk.rename_session_draft() {
+                    Ok(draft) => self.state.entity_edit = Some(draft),
+                    Err(reason) => self.desk.show_notice(reason),
+                }
+                true
+            }
+            Command::RenameWorkspace => {
+                match self.desk.rename_workspace_draft() {
+                    Ok(draft) => self.state.entity_edit = Some(draft),
+                    Err(reason) => self.desk.show_notice(reason),
+                }
+                true
+            }
             Command::ToggleAttentionPanel => {
                 self.state.attention_panel_open = !self.state.attention_panel_open;
                 true
@@ -679,6 +709,36 @@ impl TurnApp {
             }
             Command::ToggleInspector => {
                 self.state.inspector_open = !self.state.inspector_open;
+                true
+            }
+            Command::CopySelection => {
+                let text = self.desk.active_pane().and_then(|pane_id| {
+                    self.desk.pane_grid(&pane_id).and_then(|grid| {
+                        self.state
+                            .panes
+                            .get(&pane_id)
+                            .and_then(|pane| pane.selected_text(grid))
+                    })
+                });
+                if let Some(text) = text {
+                    ctx.copy_text(text);
+                } else {
+                    self.desk
+                        .show_notice("select text in the active Pane before copying it");
+                }
+                true
+            }
+            Command::PasteClipboard => {
+                let ready = self
+                    .desk
+                    .active_pane()
+                    .is_some_and(|pane_id| self.desk.pane_grid(&pane_id).is_some());
+                if ready {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                } else {
+                    self.desk
+                        .show_notice("select a running terminal Pane before pasting");
+                }
                 true
             }
             Command::PassContext => {
@@ -754,6 +814,19 @@ impl eframe::App for TurnApp {
         let ctx = ui.ctx().clone();
         let now_ms = turn_core::now_ms();
 
+        if ctx.input(|input| input.viewport().close_requested()) && !self.allow_close {
+            if self.pending_exit_stops.is_some() || self.state.close_turn.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if let Some(draft) = self.desk.close_turn_draft() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.state.close_turn = Some(draft);
+            } else {
+                // Nothing is running. Requiring a policy choice would be an interaction
+                // with no effect, so the native close proceeds immediately.
+                self.allow_close = true;
+            }
+        }
+
         for result in self.folder_dialog.drain() {
             self.apply_folder_dialog_result(result);
         }
@@ -778,9 +851,56 @@ impl eframe::App for TurnApp {
 
         // 1. Whatever arrived from the daemon.
         for message in self.link.drain() {
+            let exit_result = match &message {
+                Inbound::Answer {
+                    ask:
+                        Ask::CloseSession {
+                            session_id,
+                            disposition: turn_proto::CloseDisposition::Terminate,
+                        },
+                    response,
+                } if matches!(response.as_ref(), turn_proto::Response::Closed { .. }) => {
+                    Some((session_id.clone(), true))
+                }
+                Inbound::Failed {
+                    ask:
+                        Ask::CloseSession {
+                            session_id,
+                            disposition: turn_proto::CloseDisposition::Terminate,
+                        },
+                    ..
+                } => Some((session_id.clone(), false)),
+                _ => None,
+            };
             for reaction in self.desk.apply_inbound(message, now_ms) {
                 self.perform(&ctx, reaction);
             }
+            if let Some((session_id, succeeded)) = exit_result {
+                if self
+                    .pending_exit_stops
+                    .as_ref()
+                    .is_some_and(|pending| pending.contains(&session_id))
+                {
+                    if succeeded {
+                        if let Some(pending) = self.pending_exit_stops.as_mut() {
+                            pending.remove(&session_id);
+                        }
+                    } else {
+                        // The Desk has already surfaced the typed failure. Keep the
+                        // window open so the user can retry or choose Keep running.
+                        self.pending_exit_stops = None;
+                    }
+                }
+            }
+        }
+        if self
+            .pending_exit_stops
+            .as_ref()
+            .is_some_and(HashSet::is_empty)
+        {
+            self.pending_exit_stops = None;
+            self.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Clone only when the daemon-owned projection actually changed. Comparing the
         // small revisioned value each frame avoids cloning hundreds of rows while still
@@ -808,7 +928,7 @@ impl eframe::App for TurnApp {
             commands.extend(self.take_commands(&ctx));
         }
         for command in commands {
-            if self.handle_locally(command) {
+            if self.handle_locally(&ctx, command) {
                 continue;
             }
             for reaction in self.desk.dispatch(command, now_ms) {
@@ -838,6 +958,8 @@ impl eframe::App for TurnApp {
                     self.state.template_apply_mode = false;
                     self.state.lifecycle_confirmation = None;
                     self.state.context_handoff = None;
+                    self.state.entity_edit = None;
+                    self.state.close_turn = None;
                     self.pending_folder_request = None;
                     self.state.workspace_picker_pending = false;
                 }
@@ -850,6 +972,28 @@ impl eframe::App for TurnApp {
                 ViewAction::CloseLayoutEditor => {
                     self.state.layout_draft = None;
                 }
+                ViewAction::CloseTurn { stop_sessions } => {
+                    self.state.close_turn = None;
+                    if stop_sessions.is_empty() {
+                        self.allow_close = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        continue;
+                    }
+                    self.pending_exit_stops = Some(stop_sessions.iter().cloned().collect());
+                    self.desk
+                        .show_notice("stopping the selected Sessions before closing Turn…");
+                    for session_id in stop_sessions {
+                        for reaction in self.desk.apply_view_action(
+                            ViewAction::CloseSession {
+                                session_id,
+                                disposition: turn_proto::CloseDisposition::Terminate,
+                            },
+                            now_ms,
+                        ) {
+                            self.perform(&ctx, reaction);
+                        }
+                    }
+                }
                 action @ (ViewAction::CreateWorkspace { .. }
                 | ViewAction::CreateSessionFromTemplate { .. }
                 | ViewAction::CreateLayoutTemplate { .. }) => {
@@ -857,7 +1001,7 @@ impl eframe::App for TurnApp {
                         self.perform(&ctx, reaction);
                     }
                 }
-                ViewAction::Run(command) if self.handle_locally(command) => {}
+                ViewAction::Run(command) if self.handle_locally(&ctx, command) => {}
                 other => {
                     for reaction in self.desk.apply_view_action(other, now_ms) {
                         self.perform(&ctx, reaction);
@@ -949,7 +1093,7 @@ mod tests {
             Keymap::build(&Overrides::new(), Platform::MAC),
         );
 
-        assert!(app.handle_locally(Command::NewSession));
+        assert!(app.handle_locally(&ctx, Command::NewSession));
         let draft = app
             .state
             .workspace_draft
@@ -1011,7 +1155,7 @@ mod tests {
         app.state.hierarchy = app.desk.hierarchy().cloned();
         app.state.selected_tree = Some(turn_proto::HierarchyKey::workspace(second_id.clone()));
 
-        assert!(app.handle_locally(Command::NewSession));
+        assert!(app.handle_locally(&ctx, Command::NewSession));
         assert_eq!(
             app.state
                 .session_draft
@@ -1081,7 +1225,7 @@ mod tests {
         );
         app.state.hierarchy = app.desk.hierarchy().cloned();
 
-        assert!(app.handle_locally(Command::CloseSession));
+        assert!(app.handle_locally(&ctx, Command::CloseSession));
         assert_eq!(
             app.state.lifecycle_confirmation,
             Some(crate::view::LifecycleConfirmation::EndSession {
@@ -1094,7 +1238,7 @@ mod tests {
         );
 
         app.state.lifecycle_confirmation = None;
-        assert!(app.handle_locally(Command::CloseWorkspace));
+        assert!(app.handle_locally(&ctx, Command::CloseWorkspace));
         assert_eq!(
             app.state.lifecycle_confirmation,
             Some(crate::view::LifecycleConfirmation::StopWorkspace {
@@ -1121,10 +1265,10 @@ mod tests {
         );
 
         assert!(
-            !app.handle_locally(Command::ArchiveSession),
+            !app.handle_locally(&ctx, Command::ArchiveSession),
             "archiving is a request, not a sheet the window opens"
         );
-        assert!(!app.handle_locally(Command::ArchiveWorkspace));
+        assert!(!app.handle_locally(&ctx, Command::ArchiveWorkspace));
         assert!(app.state.lifecycle_confirmation.is_none());
     }
 
@@ -1137,7 +1281,7 @@ mod tests {
             Keymap::build(&Overrides::new(), Platform::MAC),
         );
 
-        assert!(app.handle_locally(Command::NewWorkspace));
+        assert!(app.handle_locally(&ctx, Command::NewWorkspace));
         let draft = app.state.workspace_draft.as_ref().unwrap();
         assert!(!draft.continue_to_session);
     }
