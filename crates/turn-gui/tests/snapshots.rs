@@ -2348,12 +2348,23 @@ fn layered_settings() -> turn_proto::SettingsView {
         settable_at,
         hidden: false,
         known: true,
+        default_value: match key {
+            "appearance.font_size" => serde_json::json!(13),
+            "appearance.cursor" => serde_json::json!("block"),
+            "appearance.ligatures" => serde_json::json!(false),
+            _ => serde_json::Value::Null,
+        },
         resolution: Resolution {
             key: key.to_string(),
             ..resolution
         },
     };
-    let everywhere = vec![Scope::Global, Scope::Workspace, Scope::Session];
+    let everywhere = vec![
+        Scope::Global,
+        Scope::Workspace,
+        Scope::Session,
+        Scope::Temporary,
+    ];
     turn_proto::SettingsView {
         session_id: Some(SessionId::from_stored("sess_fixclimbing")),
         levels: vec![
@@ -2368,6 +2379,7 @@ fn layered_settings() -> turn_proto::SettingsView {
                 owner_id: "sess_fixclimbing".into(),
                 label: "Fix climbing bugs".into(),
             },
+            SettingsLevel::temporary(),
         ],
         entries: vec![
             // Set at the level the sheet is writing to: this one offers a reset, and the
@@ -2484,11 +2496,11 @@ fn a_change_is_written_at_the_level_the_selector_names() {
     );
 }
 
-/// Reset is offered only where there is something to remove.
+/// Reset is offered at every level that has something to remove, even when shadowed.
 ///
 /// A greyed-out reset on an inherited value teaches nothing, and one that silently did nothing
-/// would be worse. So the control appears exactly when the chosen level is the level holding
-/// the value — which means switching the selector changes which rows offer it.
+/// would be worse. A Session winner must not make the Workspace value underneath it
+/// impossible to remove.
 #[test]
 fn reset_is_offered_only_at_the_level_that_holds_the_value() {
     let mut fixture = busy_desk();
@@ -2503,6 +2515,25 @@ fn reset_is_offered_only_at_the_level_that_holds_the_value() {
     assert!(
         h.query_by_label("Reset Terminal font size").is_none(),
         "no value here belongs to the Global level"
+    );
+
+    // The Workspace value is shadowed by Session, but it still exists and remains
+    // independently removable without disturbing the Session override.
+    h.state_mut().state.settings_level = Some(turn_core::settings::Scope::Workspace);
+    h.run();
+    h.run();
+    h.state_mut().actions.clear();
+    h.query_by_label("Reset Terminal font size")
+        .expect("the shadowed Workspace value remains resettable")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::ResetSetting {
+            scope: turn_core::settings::Scope::Workspace,
+            owner_id: "ws_spacetroopers".into(),
+            key: "appearance.font_size".into(),
+        }]
     );
 
     // At the Session level the font size is, so exactly that row offers it.

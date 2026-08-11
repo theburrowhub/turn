@@ -289,6 +289,13 @@ fn entry_for(catalogue: &Catalogue, resolution: Resolution, existing: &[Scope]) 
     // Redacted here, on the way out, rather than at rest: the daemon needs the real value in
     // order to use it, and this is the boundary past which nothing does.
     let shown = resolution.for_display();
+    let default_value = if hidden {
+        serde_json::Value::String(turn_core::settings::REDACTED.to_string())
+    } else {
+        definition
+            .map(|definition| definition.default.clone())
+            .unwrap_or(serde_json::Value::Null)
+    };
     SettingsEntry {
         area: definition
             .map(|definition| definition.area)
@@ -328,6 +335,7 @@ fn entry_for(catalogue: &Catalogue, resolution: Resolution, existing: &[Scope]) 
         known: definition.is_some(),
         hidden,
         resolution: shown,
+        default_value,
     }
 }
 
@@ -692,6 +700,11 @@ mod tests {
             entry.resolution.value,
             json!(turn_core::settings::REDACTED),
             "and it arrives already replaced rather than trusted to be hidden"
+        );
+        assert_eq!(
+            entry.default_value,
+            json!(turn_core::settings::REDACTED),
+            "the editing fallback crosses the same redaction boundary"
         );
     }
 
