@@ -487,6 +487,59 @@ impl SessionTree {
         true
     }
 
+    /// Applies an explicit human correction to a parent edge.
+    ///
+    /// Unlike discovery, a correction may also make a node a root. It never
+    /// invents an edge kind for a root and it preserves the same cycle defence as
+    /// automatic relinking.
+    pub fn correct_relationship(
+        &mut self,
+        child: &NodeId,
+        parent: Option<NodeId>,
+        kind: RelationshipKind,
+    ) -> bool {
+        let Some(current) = self.nodes.get(child) else {
+            return false;
+        };
+        if !current.kind.is_agentic() {
+            return false;
+        }
+        match parent {
+            None => {
+                if kind != RelationshipKind::Unknown {
+                    return false;
+                }
+                let node = self
+                    .nodes
+                    .get_mut(child)
+                    .expect("the corrected Agent was checked above");
+                node.parent = None;
+                node.relation = Relation::Unknown;
+                node.relationship = Relationship::default();
+                true
+            }
+            Some(parent) => {
+                if kind == RelationshipKind::Unknown
+                    || !self.nodes.contains_key(&parent)
+                    || self.would_cycle(child, &parent)
+                {
+                    return false;
+                }
+                let node = self
+                    .nodes
+                    .get_mut(child)
+                    .expect("the corrected Agent was checked above");
+                node.parent = Some(parent);
+                node.relation = Relation::Confirmed;
+                node.relationship = Relationship {
+                    kind,
+                    confidence: Confidence::Explicit,
+                };
+                true
+            }
+        }
+    }
+
     /// Whether making `parent` the parent of `child` would create a loop.
     fn would_cycle(&self, child: &NodeId, parent: &NodeId) -> bool {
         if child == parent {
@@ -737,6 +790,34 @@ mod tests {
 
         assert!(!tree.relink(&root, child_id, Relation::Confirmed));
         assert!(!tree.relink(&root, root.clone(), Relation::Confirmed));
+    }
+
+    #[test]
+    fn explicit_agent_relationship_corrections_are_typed_and_cycle_safe() {
+        let (mut tree, root) = tree_with_agent();
+        let session = SessionId::from_stored("sess_a");
+        let mut child = ProcessNode::agent(session.clone(), "reviewer", "/", T0);
+        child.kind = NodeKind::Subagent;
+        child.link_to(root.clone(), Relation::Inferred);
+        let child_id = tree.insert(child);
+        let second_root = tree.insert(ProcessNode::agent(session, "planner", "/", T0));
+
+        assert!(tree.correct_relationship(
+            &child_id,
+            Some(second_root.clone()),
+            RelationshipKind::SpawnedBy,
+        ));
+        let corrected = tree.get(&child_id).unwrap();
+        assert_eq!(corrected.parent.as_ref(), Some(&second_root));
+        assert_eq!(corrected.relation, Relation::Confirmed);
+        assert_eq!(corrected.relationship.confidence, Confidence::Explicit);
+        assert!(!tree.correct_relationship(
+            &second_root,
+            Some(child_id.clone()),
+            RelationshipKind::Related,
+        ));
+        assert!(tree.correct_relationship(&child_id, None, RelationshipKind::Unknown));
+        assert!(tree.get(&child_id).unwrap().parent.is_none());
     }
 
     #[test]

@@ -26,7 +26,8 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RestoreBehaviour,
+    Direction, DropZone, Layout, LayoutPreset, PaneKind, PreviewVisibility, RelationshipKind,
+    RestoreBehaviour, TreeFilter, TreeVisibilityMode,
 };
 use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
@@ -215,6 +216,44 @@ pub enum Request {
         surface_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected: Option<HierarchyKey>,
+    },
+    /// Changes every expandable row in one durable transaction.
+    SetTreeExpandedAll {
+        surface_id: String,
+        expanded: bool,
+    },
+    /// Persists the surface-wide filter, density and viewport anchor.
+    SetTreePresentation {
+        surface_id: String,
+        #[serde(default)]
+        filters: Vec<TreeFilter>,
+        #[serde(default)]
+        visibility_mode: TreeVisibilityMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scroll_anchor: Option<HierarchyKey>,
+    },
+    /// Places one row before a sibling. `None` moves it to the end.
+    MoveTreeNode {
+        surface_id: String,
+        key: HierarchyKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<HierarchyKey>,
+    },
+    /// A durable user name for an Agent. The declared integration name remains
+    /// in provenance and can still be inspected.
+    RenameNode {
+        session_id: SessionId,
+        node_id: NodeId,
+        name: String,
+    },
+    /// Replaces a parent edge with an explicit user correction. `None` makes the
+    /// node a Session root and requires `Unknown` as the relationship kind.
+    CorrectRelationship {
+        session_id: SessionId,
+        node_id: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_node_id: Option<NodeId>,
+        relationship_kind: RelationshipKind,
     },
 
     // --------------------------------------------------------- checkout lease
@@ -781,6 +820,11 @@ impl Request {
             Request::GetHierarchy { .. } => "get_hierarchy",
             Request::SetTreeExpanded { .. } => "set_tree_expanded",
             Request::SelectTreeNode { .. } => "select_tree_node",
+            Request::SetTreeExpandedAll { .. } => "set_tree_expanded_all",
+            Request::SetTreePresentation { .. } => "set_tree_presentation",
+            Request::MoveTreeNode { .. } => "move_tree_node",
+            Request::RenameNode { .. } => "rename_node",
+            Request::CorrectRelationship { .. } => "correct_relationship",
             Request::GetWorkspaceWriteLease { .. } => "get_workspace_write_lease",
             Request::AcquireWorkspaceWriteLease { .. } => "acquire_workspace_write_lease",
             Request::ReleaseWorkspaceWriteLease { .. } => "release_workspace_write_lease",
@@ -864,7 +908,12 @@ impl Request {
             Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "closed",
 
             Request::GetHierarchy { .. } => "hierarchy",
-            Request::SetTreeExpanded { .. } | Request::SelectTreeNode { .. } => "tree_state",
+            Request::SetTreeExpanded { .. }
+            | Request::SelectTreeNode { .. }
+            | Request::SetTreeExpandedAll { .. }
+            | Request::SetTreePresentation { .. }
+            | Request::MoveTreeNode { .. } => "tree_state",
+            Request::RenameNode { .. } | Request::CorrectRelationship { .. } => "node",
             Request::GetWorkspaceWriteLease { .. }
             | Request::AcquireWorkspaceWriteLease { .. }
             | Request::ReleaseWorkspaceWriteLease { .. } => "workspace_write_lease",
@@ -1022,6 +1071,8 @@ impl Request {
             | Request::RelaunchNode { session_id, .. }
             | Request::MuteSession { session_id, .. }
             | Request::CorrectState { session_id, .. } => Some(session_id),
+            Request::RenameNode { session_id, .. }
+            | Request::CorrectRelationship { session_id, .. } => Some(session_id),
             Request::AcquireWorkspaceWriteLease { session_id, .. } => Some(session_id),
             Request::ListAttention { session_id } => session_id.as_ref(),
             _ => None,

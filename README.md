@@ -33,7 +33,7 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 
 | Capability | Turn's approach |
 | --- | --- |
-| Unified navigation | One `Workspace → Session → Agent/Tool → Child` tree; no duplicate persistent navigators |
+| Unified navigation | One searchable `Workspace → Session → Agent/Tool → Child` tree with durable filters, density, ordering and viewport |
 | Background subagents | Discovered under their parent without opening panes, changing layout, or stealing focus |
 | Agent handoffs | Review a bounded, redacted context packet and explicitly pass it to another Agent in the same Session |
 | Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |

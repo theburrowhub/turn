@@ -83,6 +83,8 @@ pub enum Command {
     StopProcess,
 
     FocusWorkspaceTree,
+    ExpandWorkspaceTree,
+    CollapseWorkspaceTree,
 
     CopySelection,
     PasteClipboard,
@@ -132,6 +134,8 @@ impl Command {
         Command::InterruptProcess,
         Command::StopProcess,
         Command::FocusWorkspaceTree,
+        Command::ExpandWorkspaceTree,
+        Command::CollapseWorkspaceTree,
         Command::CopySelection,
         Command::PasteClipboard,
         Command::OpenSettings,
@@ -181,6 +185,8 @@ impl Command {
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
             Command::FocusWorkspaceTree => "view.focusTree",
+            Command::ExpandWorkspaceTree => "view.expandTree",
+            Command::CollapseWorkspaceTree => "view.collapseTree",
             Command::CopySelection => "edit.copy",
             Command::PasteClipboard => "edit.paste",
         }
@@ -240,6 +246,8 @@ impl Command {
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
             Command::FocusWorkspaceTree => "Focus the workspace tree",
+            Command::ExpandWorkspaceTree => "Expand the complete workspace tree",
+            Command::CollapseWorkspaceTree => "Collapse the complete workspace tree",
             Command::CopySelection => "Copy the selection",
             Command::PasteClipboard => "Paste",
         }
@@ -251,7 +259,9 @@ impl Command {
             Command::OpenPalette
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
-            | Command::FocusWorkspaceTree => "View",
+            | Command::FocusWorkspaceTree
+            | Command::ExpandWorkspaceTree
+            | Command::CollapseWorkspaceTree => "View",
             Command::NewWorkspace
             | Command::ArchiveWorkspace
             | Command::CloseWorkspace
@@ -751,6 +761,14 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
     shared(Command::StopProcess, Chord::cmd_shift(Key::Comma)),
     shared(Command::FocusWorkspaceTree, Chord::cmd_shift(Key::T)),
+    shared(
+        Command::ExpandWorkspaceTree,
+        Chord::cmd_alt(Key::ArrowRight),
+    ),
+    shared(
+        Command::CollapseWorkspaceTree,
+        Chord::cmd_alt(Key::ArrowLeft),
+    ),
     // Copy and paste: `Mod+C` is Command+C on a Mac, which no program sees, but
     // Ctrl+C elsewhere, which is the interrupt. Every terminal on Linux solves this
     // the same way, with Shift.

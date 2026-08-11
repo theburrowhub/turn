@@ -211,11 +211,10 @@ The accepted event model reserves these stable names:
 - `agent.preview_updated`, `.preview_redacted`, `.pane_opened`, `.pane_closed`
 - Client audit records `tree.node_expanded`, `.node_collapsed`, `.node_selected`
 
-This list is not a claim that every name is an `EventKind` in the current build. Runtime `agent.spawned` is
-implemented as a `TurnEvent`; previews, Pane bindings, leases and per-surface tree state currently use their
-dedicated typed records/pushes. The `workspace_audit_events` schema reserves pre-Session audit storage, but
-its complete repository/emission path and the remaining rename/correction audit names are planned. A client
-must not fabricate them locally.
+Runtime `agent.spawned`, `agent.renamed` and `agent.relationship_corrected` are implemented as `TurnEvent`s;
+previews, Pane bindings, leases and per-surface tree state use their dedicated typed records/pushes. The
+`workspace_audit_events` schema reserves pre-Session audit storage. A client must never fabricate audit
+records locally.
 
 `agent.spawned` creates or updates an AgentNode under its reported parent, preserves a name only when the
 parent/integration actually declared one, starts preview tracking and pushes a tree change. Claude/Codex
@@ -246,14 +245,15 @@ resolved runtime with stale Attention.
 
 The list below is the accepted product boundary, not a claim that every operation is already exposed by
 protocol v3. The current vertical implements hierarchy list/subscription via revisioned snapshots,
-expand/collapse/select, preview history/visibility, temporary Pane open/focus/close, and lease
-acquire/release plus read-only/worktree creation. Rename, relationship correction, visibility modes,
-explicit redaction, permanent `OpenNodeAsPane`, `ListPanesForNode` and direct preview subscriptions remain
-planned and must not be simulated only in the GUI.
+expand/collapse-all/select, persistent filters/visibility/viewport/manual ordering, audited rename and
+relationship correction, preview history/visibility, temporary Pane open/focus/close, and lease
+acquire/release plus read-only/worktree creation. Explicit redaction, permanent `OpenNodeAsPane`,
+`ListPanesForNode` and direct preview subscriptions remain planned and must not be simulated only in the GUI.
 
 ```text
 Tree:    ListWorkspaceTree, SubscribeTreeChanges, ExpandNode, CollapseNode,
-         SelectNode, CorrectRelationship, RenameNode, SetVisibilityMode
+         SelectNode, ExpandAll, CollapseAll, MoveNode, SetFilters,
+         CorrectRelationship, RenameNode, SetVisibilityMode
 Preview: SubscribeActivityPreviews, GetActivityPreview, GetPreviewHistory,
          SetPreviewVisibility, RedactPreview
 Pane:    OpenNodeAsPane, OpenNodeAsTemporaryPane, FocusPaneForNode,
@@ -298,6 +298,9 @@ and never rewritten, while SQLite/WAL are rebuilt before the marker is cleared. 
 agent titles become display names, with no fabricated declared name. No process is launched, killed,
 moved, or retroactively made read-only by the migration.
 
+Migration 011 adds `tree_surface_preferences` for durable filters, visibility mode and scroll anchor;
+manual sibling ranks remain in `tree_ui_state` so presentation restoration stays surface-scoped.
+
 ## Updated wireframe
 
 ```text
@@ -323,7 +326,11 @@ moved, or retroactively made read-only by the migration.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Keyboard while the tree owns focus: Up/Down visible node, Right expand/first child, Left collapse/parent, Enter activate/focus existing pane, Space Quick Preview, Cmd+Enter temporary pane, Esc close preview/return to tree. Expand/collapse and selection persist.
+Keyboard while the tree owns focus: Up/Down traverses only visible filtered rows, Right expands/visits the
+first visible child, Left collapses/visits the visible parent, Enter activates an existing pane, Space opens
+Quick Preview, Cmd+Enter opens a temporary pane and Esc returns to the tree. Cmd/Ctrl+Alt+Right expands all
+and Cmd/Ctrl+Alt+Left collapses all from any focus. Expansion, selection, filters, visibility, scroll and
+manual order persist.
 
 ## Historical incompatible implementation identified
 
@@ -384,9 +391,10 @@ The deterministic Reviewer fixture has a semantic stream but no independent PTY,
 current subagent hook contract. Its temporary pane therefore renders Preview/Details; a terminal pane is
 only offered when an integration supplies a real attachable stream.
 
-Twenty native GUI tests verify tree keyboard semantics and selection/focus/attention independence; twelve
-of them maintain committed PNG baselines, including an ordinary desk and a dense 30-Session tree. This is
-not a measured 30-Agent performance claim.
+Native GUI tests verify filtered keyboard traversal, selection/focus/attention independence, stable manual
+ordering and a 30-Agent/300-process fixture in Normal and Technical modes. Committed PNG baselines cover the
+ordinary desk and dense layouts; this deterministic scale fixture is functional evidence, not a measured
+performance claim.
 
 Reproduce the vertical and the native UI evidence with:
 

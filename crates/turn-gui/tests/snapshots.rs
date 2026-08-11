@@ -218,6 +218,7 @@ fn workspace_without_sessions() -> Fixture {
                 surface_id: "window-snapshot".into(),
                 selected: Some(HierarchyKey::workspace(workspace.id.clone())),
                 expanded: vec![HierarchyKey::workspace(workspace.id)],
+                ..TreeSurfaceState::empty("window-snapshot")
             },
             workspaces: vec![WorkspaceTreeView {
                 workspace: summary.clone(),
@@ -656,6 +657,7 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
                     HierarchyKey::workspace(turn_workspace.id.clone()),
                     HierarchyKey::session(turn_session.id.clone()),
                 ],
+                ..TreeSurfaceState::empty("window-snapshot")
             },
             workspaces: vec![first_workspace, second_workspace, third_workspace],
         },
@@ -3625,8 +3627,8 @@ fn every_hierarchy_level_is_a_reachable_tree_item() {
     assert!(
         rows.iter()
             .any(|(label, _)| label.contains("Reviewer")
-                && label.contains("Reviewing climb_system.gd")),
-        "stable semantic previews must be audible: {rows:?}"
+                && !label.contains("Reviewing climb_system.gd")),
+        "Normal mode must not announce preview text it deliberately does not draw: {rows:?}"
     );
 
     let selected: Vec<String> = h

@@ -895,6 +895,7 @@ mod tests {
                             surface_id: "main-window".into(),
                             selected: Some(turn_proto::HierarchyKey::workspace(first.id.clone())),
                             expanded: Vec::new(),
+                            ..turn_proto::TreeSurfaceState::empty("main-window")
                         },
                         workspaces: vec![
                             turn_proto::WorkspaceTreeView {
@@ -973,6 +974,7 @@ mod tests {
                             surface_id: "main-window".into(),
                             selected: Some(turn_proto::HierarchyKey::session(session_id.clone())),
                             expanded: Vec::new(),
+                            ..turn_proto::TreeSurfaceState::empty("main-window")
                         },
                         workspaces: vec![turn_proto::WorkspaceTreeView {
                             workspace: turn_proto::WorkspaceSummary::from_workspace(

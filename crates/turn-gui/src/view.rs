@@ -19,7 +19,7 @@
 //! has no window at all. The unified navigation is therefore a real AccessKit `Tree`
 //! whose sensed `TreeItem` rows state their type, state and confidence in words.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use egui::{
     Align2, Color32, FontId, Key, Modifiers, Rect, Response, RichText, Sense, Stroke, Ui, Vec2,
@@ -32,7 +32,7 @@ use turn_core::ids::{
 use turn_core::model::{
     ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
     PaneKind, PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionMode,
-    SessionStatus, WorkspaceWriteLease,
+    SessionStatus, TreeFilter, TreeVisibilityMode, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
@@ -506,6 +506,14 @@ pub struct ViewState {
     pub selected_tree: Option<HierarchyKey>,
     /// One-shot request to reveal a selection whose ancestors were just expanded.
     pub scroll_tree_to: Option<HierarchyKey>,
+    /// Search is deliberately window-ephemeral: unlike the typed filter vocabulary it may
+    /// contain repository names, tasks or preview text and therefore never reaches SQLite.
+    pub tree_query: String,
+    /// Optimistic copies of daemon-owned presentation state, for immediate controls.
+    pub tree_filters: BTreeSet<TreeFilter>,
+    pub tree_visibility: TreeVisibilityMode,
+    pub tree_scroll_anchor: Option<HierarchyKey>,
+    pub tree_manual_order: Vec<HierarchyKey>,
     /// Per-row expansion overrides awaiting acknowledgement from the daemon.
     pub tree_expansion: HashMap<HierarchyKey, bool>,
     /// Whether navigation keys belong to the hierarchy rather than the terminal.
@@ -517,6 +525,8 @@ pub struct ViewState {
     pub lifecycle_confirmation: Option<LifecycleConfirmation>,
     /// Explicit source → destination context review. It is an overlay and never a Pane.
     pub context_handoff: Option<ContextHandoffDraft>,
+    /// Explicit editor for the two audited Agent corrections.
+    pub node_edit: Option<NodeEditDraft>,
     /// Bounded, stable/redacted semantic history fetched on demand for Quick Preview.
     pub preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     /// The inspector is contextual and only occupies space for a selected Process.
@@ -549,6 +559,7 @@ impl ViewState {
             || self.quick_preview.is_some()
             || self.lifecycle_confirmation.is_some()
             || self.context_handoff.is_some()
+            || self.node_edit.is_some()
     }
 
     /// Drains typed hierarchy intents after drawing.
@@ -562,6 +573,40 @@ impl ViewState {
 
     fn push_hierarchy_action(&mut self, action: HierarchyAction) {
         self.hierarchy_actions.push(action);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeEditDraft {
+    Rename {
+        session_id: SessionId,
+        node_id: NodeId,
+        name: String,
+    },
+    Relationship {
+        session_id: SessionId,
+        node_id: NodeId,
+        parent_node_id: Option<NodeId>,
+        relationship_kind: RelationshipKind,
+    },
+}
+
+impl NodeEditDraft {
+    fn rename(node: &TreeNodeView) -> Self {
+        Self::Rename {
+            session_id: node.session_id.clone(),
+            node_id: node.node_id.clone(),
+            name: node.title.clone(),
+        }
+    }
+
+    fn relationship(node: &TreeNodeView) -> Self {
+        Self::Relationship {
+            session_id: node.session_id.clone(),
+            node_id: node.node_id.clone(),
+            parent_node_id: node.parent.clone(),
+            relationship_kind: node.relationship.kind,
+        }
     }
 }
 
@@ -807,6 +852,21 @@ pub enum HierarchyAction {
         key: HierarchyKey,
         expanded: bool,
     },
+    SetExpandedAll {
+        surface_id: String,
+        expanded: bool,
+    },
+    SetPresentation {
+        surface_id: String,
+        filters: Vec<TreeFilter>,
+        visibility_mode: TreeVisibilityMode,
+        scroll_anchor: Option<HierarchyKey>,
+    },
+    Move {
+        surface_id: String,
+        key: HierarchyKey,
+        before: Option<HierarchyKey>,
+    },
     QuickPreview {
         surface_id: String,
         session_id: SessionId,
@@ -868,6 +928,17 @@ pub enum ViewAction {
     TerminateNode {
         session_id: SessionId,
         node_id: NodeId,
+    },
+    RenameNode {
+        session_id: SessionId,
+        node_id: NodeId,
+        name: String,
+    },
+    CorrectRelationship {
+        session_id: SessionId,
+        node_id: NodeId,
+        parent_node_id: Option<NodeId>,
+        relationship_kind: RelationshipKind,
     },
     CloseSession {
         session_id: SessionId,
@@ -1344,15 +1415,19 @@ impl HierarchyRow<'_> {
         }
     }
 
-    fn height(self) -> f32 {
+    fn height(self, visibility: TreeVisibilityMode) -> f32 {
         match self {
             Self::Workspace(_) => 34.0,
             Self::Session { .. } => 46.0,
-            Self::Process { .. } => 56.0,
+            Self::Process { .. } => match visibility {
+                TreeVisibilityMode::Normal => 40.0,
+                TreeVisibilityMode::Expanded => 56.0,
+                TreeVisibilityMode::Technical => 58.0,
+            },
         }
     }
 
-    fn accessible_name(self, focused_pane: bool) -> String {
+    fn accessible_name(self, focused_pane: bool, visibility: TreeVisibilityMode) -> String {
         match self {
             Self::Workspace(workspace) => {
                 let summary = &workspace.workspace;
@@ -1417,7 +1492,19 @@ impl HierarchyRow<'_> {
                     name.push_str(" — title set by the process");
                 }
                 if let Some(preview) = visible_preview(node) {
-                    name.push_str(&format!(" — {}", preview.normalized_text));
+                    if visibility == TreeVisibilityMode::Expanded {
+                        name.push_str(&format!(" — {}", preview.normalized_text));
+                    }
+                }
+                if visibility == TreeVisibilityMode::Technical {
+                    name.push_str(&format!(
+                        " — pid {} — parent pid {} — command {}",
+                        node.pid
+                            .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+                        node.ppid
+                            .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+                        node.command
+                    ));
                 }
                 if focused_pane {
                     name.push_str(" — focused pane");
@@ -1446,6 +1533,37 @@ fn node_kind_label(kind: NodeKind) -> &'static str {
         NodeKind::TmuxPane => "TMUX PANE",
         NodeKind::Unknown => "PROCESS",
     }
+}
+
+fn relationship_kind_label(kind: RelationshipKind) -> &'static str {
+    match kind {
+        RelationshipKind::SpawnedBy => "Spawned by",
+        RelationshipKind::OwnsProcess => "Owns process",
+        RelationshipKind::Related => "Related",
+        RelationshipKind::Unknown => "Session root",
+    }
+}
+
+fn relationship_would_cycle(
+    nodes: &[TreeNodeView],
+    child: &NodeId,
+    candidate_parent: &NodeId,
+) -> bool {
+    let mut cursor = Some(candidate_parent);
+    let mut visited = HashSet::new();
+    while let Some(node_id) = cursor {
+        if node_id == child {
+            return true;
+        }
+        if !visited.insert(node_id.clone()) {
+            return true;
+        }
+        cursor = nodes
+            .iter()
+            .find(|node| &node.node_id == node_id)
+            .and_then(|node| node.parent.as_ref());
+    }
+    false
 }
 
 /// The node's title, as the daemon resolved it.
@@ -1572,47 +1690,354 @@ fn visible_hierarchy_rows<'a>(
     state: &ViewState,
     include_archived: bool,
 ) -> Vec<HierarchyRow<'a>> {
-    let mut rows = Vec::new();
-    for workspace in &snapshot.workspaces {
-        if workspace.workspace.archived && !include_archived {
-            continue;
-        }
-        let workspace_row = HierarchyRow::Workspace(workspace);
-        let workspace_key = workspace_row.key();
-        rows.push(workspace_row);
-        if !row_is_expanded(snapshot, state, &workspace_key) {
-            continue;
-        }
+    let archived_filter = state.tree_filters.contains(&TreeFilter::Archived);
+    let ordered = ordered_hierarchy_rows(
+        snapshot,
+        include_archived || archived_filter,
+        effective_manual_order(snapshot, state),
+    );
+    let query = state.tree_query.trim().to_ascii_lowercase();
+    let filtering = !query.is_empty() || !state.tree_filters.is_empty();
 
-        for session in &workspace.sessions {
-            if session.session.status == SessionStatus::Archived && !include_archived {
-                continue;
-            }
-            let session_row = HierarchyRow::Session { workspace, session };
-            let session_key = session_row.key();
-            rows.push(session_row);
-            if !row_is_expanded(snapshot, state, &session_key) {
-                continue;
-            }
-
-            let mut collapsed_depth = None;
-            for node in &session.nodes {
-                if let Some(depth) = collapsed_depth {
-                    if node.depth > depth {
-                        continue;
-                    }
-                    collapsed_depth = None;
-                }
-                let process_row = HierarchyRow::Process { session, node };
-                let process_key = process_row.key();
-                rows.push(process_row);
-                if node.child_count > 0 && !row_is_expanded(snapshot, state, &process_key) {
-                    collapsed_depth = Some(node.depth);
-                }
+    // Search/filter results are a tree projection, not a flat list: keep every ancestor of
+    // every result. This preserves both spatial context and complete keyboard traversal.
+    let mut parents = HashMap::new();
+    let mut retained = HashSet::new();
+    for row in &ordered {
+        let key = row.key();
+        if let Some(parent) = row.parent_key() {
+            parents.insert(key.clone(), parent);
+        }
+        let ephemeral_hidden = matches!(row, HierarchyRow::Process { node, .. } if node.ephemeral)
+            && state.tree_visibility != TreeVisibilityMode::Technical
+            && query.is_empty();
+        if !ephemeral_hidden
+            && row_matches_query(*row, &query)
+            && row_matches_filters(*row, &state.tree_filters)
+        {
+            retained.insert(key);
+        }
+    }
+    if filtering {
+        let matches: Vec<_> = retained.iter().cloned().collect();
+        for mut key in matches {
+            while let Some(parent) = parents.get(&key).cloned() {
+                retained.insert(parent.clone());
+                key = parent;
             }
         }
     }
+
+    let mut rows = Vec::new();
+    let mut collapsed_depth: Option<usize> = None;
+    let mut hidden_ephemeral_depth: Option<usize> = None;
+    for row in ordered {
+        let depth = row.depth();
+        if let Some(hidden) = hidden_ephemeral_depth {
+            if depth > hidden {
+                continue;
+            }
+            hidden_ephemeral_depth = None;
+        }
+        if let HierarchyRow::Process { node, .. } = row {
+            if node.ephemeral
+                && state.tree_visibility != TreeVisibilityMode::Technical
+                && query.is_empty()
+            {
+                hidden_ephemeral_depth = Some(depth);
+                continue;
+            }
+        }
+        if filtering {
+            if retained.contains(&row.key()) {
+                rows.push(row);
+            }
+            continue;
+        }
+        if let Some(collapsed) = collapsed_depth {
+            if depth > collapsed {
+                continue;
+            }
+            collapsed_depth = None;
+        }
+        let key = row.key();
+        rows.push(row);
+        if row.child_count() > 0 && !row_is_expanded(snapshot, state, &key) {
+            collapsed_depth = Some(depth);
+        }
+    }
     rows
+}
+
+/// Full hierarchy order before expansion/filter projection. Every sibling family uses the
+/// same persisted rank list; unknown/new rows stay in daemon order after ranked siblings.
+fn ordered_hierarchy_rows<'a>(
+    snapshot: &'a HierarchySnapshot,
+    include_archived: bool,
+    manual_order: &[HierarchyKey],
+) -> Vec<HierarchyRow<'a>> {
+    let rank: HashMap<HierarchyKey, usize> = manual_order
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+    let rank_of = |key: &HierarchyKey| rank.get(key).copied().unwrap_or(usize::MAX);
+
+    let mut workspaces: Vec<_> = snapshot.workspaces.iter().enumerate().collect();
+    workspaces.sort_by_key(|(index, workspace)| {
+        (
+            rank_of(&HierarchyKey::workspace(workspace.workspace.id.clone())),
+            *index,
+        )
+    });
+    let mut rows = Vec::new();
+    for (_, workspace) in workspaces {
+        if workspace.workspace.archived && !include_archived {
+            continue;
+        }
+        rows.push(HierarchyRow::Workspace(workspace));
+        let mut sessions: Vec<_> = workspace.sessions.iter().enumerate().collect();
+        sessions.sort_by_key(|(index, session)| {
+            (
+                rank_of(&HierarchyKey::session(session.session.id.clone())),
+                *index,
+            )
+        });
+        for (_, session) in sessions {
+            if session.session.status == SessionStatus::Archived && !include_archived {
+                continue;
+            }
+            rows.push(HierarchyRow::Session { workspace, session });
+            append_ordered_process_rows(session, &rank, &mut rows);
+        }
+    }
+    rows
+}
+
+fn effective_manual_order<'a>(
+    snapshot: &'a HierarchySnapshot,
+    state: &'a ViewState,
+) -> &'a [HierarchyKey] {
+    if state.tree_manual_order.is_empty() {
+        &snapshot.tree_state.manual_order
+    } else {
+        &state.tree_manual_order
+    }
+}
+
+fn append_ordered_process_rows<'a>(
+    session: &'a SessionTreeView,
+    rank: &HashMap<HierarchyKey, usize>,
+    rows: &mut Vec<HierarchyRow<'a>>,
+) {
+    let known: HashSet<_> = session
+        .nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect();
+    let mut children: HashMap<Option<NodeId>, Vec<(usize, &'a TreeNodeView)>> = HashMap::new();
+    for (index, node) in session.nodes.iter().enumerate() {
+        let parent = node.parent.clone().filter(|parent| known.contains(parent));
+        children.entry(parent).or_default().push((index, node));
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by_key(|(index, node)| {
+            (
+                rank.get(&HierarchyKey::process(node.node_id.clone()))
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                *index,
+            )
+        });
+    }
+    let mut stack: Vec<_> = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .map(|(_, node)| *node)
+        .rev()
+        .collect();
+    let mut visited = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.node_id.clone()) {
+            continue;
+        }
+        rows.push(HierarchyRow::Process { session, node });
+        if let Some(descendants) = children.get(&Some(node.node_id.clone())) {
+            stack.extend(descendants.iter().rev().map(|(_, child)| *child));
+        }
+    }
+    // Corrupt/cyclic input remains visible and bounded rather than disappearing.
+    let mut leftovers: Vec<_> = session
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !visited.contains(&node.node_id))
+        .collect();
+    leftovers.sort_by_key(|(index, node)| {
+        (
+            rank.get(&HierarchyKey::process(node.node_id.clone()))
+                .copied()
+                .unwrap_or(usize::MAX),
+            *index,
+        )
+    });
+    rows.extend(
+        leftovers
+            .into_iter()
+            .map(|(_, node)| HierarchyRow::Process { session, node }),
+    );
+}
+
+fn row_matches_query(row: HierarchyRow<'_>, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let contains = |value: &str| value.to_ascii_lowercase().contains(query);
+    match row {
+        HierarchyRow::Workspace(workspace) => {
+            contains(&workspace.workspace.name)
+                || contains(&workspace.workspace.root)
+                || workspace
+                    .workspace
+                    .git_remote
+                    .as_deref()
+                    .is_some_and(contains)
+        }
+        HierarchyRow::Session { session, .. } => {
+            let summary = &session.session;
+            contains(&summary.name)
+                || contains(&summary.cwd)
+                || summary.note.as_deref().is_some_and(contains)
+                || summary.git_branch.as_deref().is_some_and(contains)
+                || summary.tags.iter().any(|tag| contains(tag))
+        }
+        HierarchyRow::Process { node, .. } => {
+            contains(&node.title)
+                || contains(&node.command)
+                || contains(&node.cwd)
+                || node.args.iter().any(|arg| contains(arg))
+                || visible_preview(node).is_some_and(|preview| contains(&preview.normalized_text))
+                || node.agent.as_ref().is_some_and(|agent| {
+                    contains(&agent.name.display_name)
+                        || agent.current_task.as_deref().is_some_and(contains)
+                        || agent.last_message.as_deref().is_some_and(contains)
+                })
+        }
+    }
+}
+
+fn row_matches_filters(row: HierarchyRow<'_>, filters: &BTreeSet<TreeFilter>) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let has_any = |family: &[TreeFilter]| family.iter().any(|filter| filters.contains(filter));
+    let state_family = [
+        TreeFilter::Attention,
+        TreeFilter::Running,
+        TreeFilter::Failed,
+        TreeFilter::Idle,
+        TreeFilter::Completed,
+    ];
+    let kind_family = [TreeFilter::Agents, TreeFilter::Tools];
+    let mode_family = [TreeFilter::Main, TreeFilter::ReadOnly, TreeFilter::Worktree];
+
+    let state_ok = !has_any(&state_family)
+        || state_family
+            .iter()
+            .filter(|filter| filters.contains(filter))
+            .any(|filter| row_matches_state(row, *filter));
+    let kind_ok = !has_any(&kind_family)
+        || kind_family
+            .iter()
+            .filter(|filter| filters.contains(filter))
+            .any(|filter| row_matches_kind(row, *filter));
+    let mode_ok = !has_any(&mode_family)
+        || mode_family
+            .iter()
+            .filter(|filter| filters.contains(filter))
+            .any(|filter| row_matches_mode(row, *filter));
+    let archived_ok = !filters.contains(&TreeFilter::Archived)
+        || match row {
+            HierarchyRow::Workspace(workspace) => workspace.workspace.archived,
+            HierarchyRow::Session { session, .. } | HierarchyRow::Process { session, .. } => {
+                session.session.status == SessionStatus::Archived
+            }
+        };
+    state_ok && kind_ok && mode_ok && archived_ok
+}
+
+fn row_matches_state(row: HierarchyRow<'_>, filter: TreeFilter) -> bool {
+    match row {
+        HierarchyRow::Workspace(workspace) => match filter {
+            TreeFilter::Attention => workspace.workspace.sessions_needing_user > 0,
+            TreeFilter::Running => workspace
+                .sessions
+                .iter()
+                .any(|session| session.session.running_count > 0),
+            TreeFilter::Failed => workspace
+                .sessions
+                .iter()
+                .any(|session| session.session.display_state == DisplayState::Failed),
+            TreeFilter::Idle => workspace
+                .sessions
+                .iter()
+                .all(|session| session.session.running_count == 0),
+            TreeFilter::Completed => false,
+            _ => true,
+        },
+        HierarchyRow::Session { session, .. } => match filter {
+            TreeFilter::Attention => session.session.needs_user || session.session.badge_count > 0,
+            TreeFilter::Running => session.session.running_count > 0,
+            TreeFilter::Failed => session.session.display_state == DisplayState::Failed,
+            TreeFilter::Idle => session.session.display_state == DisplayState::Idle,
+            TreeFilter::Completed => matches!(
+                session.session.display_state,
+                DisplayState::CompletedTurn | DisplayState::CompletedTask | DisplayState::Stopped
+            ),
+            _ => true,
+        },
+        HierarchyRow::Process { node, .. } => match filter {
+            TreeFilter::Attention => node.needs_user,
+            TreeFilter::Running => node.lifecycle.is_running(),
+            TreeFilter::Failed => {
+                node.display_state == DisplayState::Failed || node.lifecycle.is_failure()
+            }
+            TreeFilter::Idle => node.display_state == DisplayState::Idle,
+            TreeFilter::Completed => matches!(
+                node.display_state,
+                DisplayState::CompletedTurn | DisplayState::CompletedTask | DisplayState::Stopped
+            ),
+            _ => true,
+        },
+    }
+}
+
+fn row_matches_kind(row: HierarchyRow<'_>, filter: TreeFilter) -> bool {
+    match row {
+        HierarchyRow::Process { node, .. } => match filter {
+            TreeFilter::Agents => node.is_agentic,
+            TreeFilter::Tools => !node.is_agentic,
+            _ => true,
+        },
+        HierarchyRow::Workspace(_) | HierarchyRow::Session { .. } => false,
+    }
+}
+
+fn row_matches_mode(row: HierarchyRow<'_>, filter: TreeFilter) -> bool {
+    let mode = match row {
+        HierarchyRow::Session { session, .. } | HierarchyRow::Process { session, .. } => {
+            session.session.mode
+        }
+        HierarchyRow::Workspace(_) => return false,
+    };
+    matches!(
+        (filter, mode),
+        (TreeFilter::Main, SessionMode::MainCheckout)
+            | (TreeFilter::ReadOnly, SessionMode::ReadOnly)
+            | (TreeFilter::Worktree, SessionMode::IsolatedWorktree)
+    )
 }
 
 fn selected_process<'a>(
@@ -1710,6 +2135,7 @@ impl<'a> TurnView<'a> {
             .as_ref()
             .map(|snapshot| snapshot.tree_state.clone());
         if incoming_tree_state != state.observed_tree_state {
+            let first_observation = state.observed_tree_state.is_none();
             let previous_selection = state
                 .observed_tree_state
                 .as_ref()
@@ -1717,11 +2143,22 @@ impl<'a> TurnView<'a> {
             let next_selection = incoming_tree_state
                 .as_ref()
                 .and_then(|tree| tree.selected.as_ref());
-            if previous_selection != next_selection {
+            if first_observation {
+                state.scroll_tree_to = incoming_tree_state
+                    .as_ref()
+                    .and_then(|tree| tree.scroll_anchor.clone())
+                    .or_else(|| next_selection.cloned());
+            } else if previous_selection != next_selection {
                 state.scroll_tree_to = next_selection.cloned();
             }
             state.selected_tree = None;
             state.tree_expansion.clear();
+            if let Some(tree) = &incoming_tree_state {
+                state.tree_filters = tree.filters.iter().copied().collect();
+                state.tree_visibility = tree.visibility_mode;
+                state.tree_scroll_anchor = tree.scroll_anchor.clone();
+                state.tree_manual_order = tree.manual_order.clone();
+            }
             state.observed_tree_state = incoming_tree_state;
         }
         let temporary_pane_id = self
@@ -1910,7 +2347,13 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.context_handoff.is_some() {
+        if state.node_edit.is_some() {
+            if let Some(snapshot) = hierarchy.as_ref() {
+                actions.extend(self.node_edit_overlay(ui, theme, snapshot, state, full));
+            } else {
+                state.node_edit = None;
+            }
+        } else if state.context_handoff.is_some() {
             if let Some(snapshot) = hierarchy.as_ref() {
                 actions.extend(self.context_handoff_overlay(ui, theme, snapshot, state, full));
             } else {
@@ -1939,6 +2382,196 @@ impl<'a> TurnView<'a> {
         }
         state.hierarchy = hierarchy;
         actions
+    }
+
+    fn node_edit_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        snapshot: &HierarchySnapshot,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let Some(mut draft) = state.node_edit.take() else {
+            return Vec::new();
+        };
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        let mut submit = false;
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                480.0_f32.min((full.width() - 32.0).max(300.0)),
+                286.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "agent-node-editor"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_modal();
+                node.set_label(match &draft {
+                    NodeEditDraft::Rename { .. } => "Rename Agent",
+                    NodeEditDraft::Relationship { .. } => "Correct Agent relationship",
+                });
+            });
+            ui.heading(match &draft {
+                NodeEditDraft::Rename { .. } => "Rename Agent",
+                NodeEditDraft::Relationship { .. } => "Correct relationship",
+            });
+            ui.label(
+                RichText::new(
+                    "This is a durable user correction. Turn keeps the original integration fact in the audit log.",
+                )
+                .color(theme.text_dim),
+            );
+            ui.add_space(12.0);
+            match &mut draft {
+                NodeEditDraft::Rename { name, .. } => {
+                    ui.label("Display name");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Agent name"),
+                    );
+                    response.request_focus();
+                    submit = !name.trim().is_empty()
+                        && response.has_focus()
+                        && ui.input(|input| input.key_pressed(Key::Enter));
+                }
+                NodeEditDraft::Relationship {
+                    session_id,
+                    node_id,
+                    parent_node_id,
+                    relationship_kind,
+                } => {
+                    let candidates = snapshot
+                        .workspaces
+                        .iter()
+                        .flat_map(|workspace| &workspace.sessions)
+                        .find(|session| &session.session.id == session_id)
+                        .map(|session| &session.nodes[..])
+                        .unwrap_or_default();
+                    ui.label("Parent Agent");
+                    egui::ComboBox::from_id_salt("correct-relationship-parent")
+                        .selected_text(
+                            parent_node_id
+                                .as_ref()
+                                .and_then(|parent| {
+                                    candidates.iter().find(|node| &node.node_id == parent)
+                                })
+                                .map(|node| node.title.clone())
+                                .unwrap_or_else(|| "Session root".into()),
+                        )
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(parent_node_id.is_none(), "Session root")
+                                .clicked()
+                            {
+                                *parent_node_id = None;
+                                *relationship_kind = RelationshipKind::Unknown;
+                            }
+                            for candidate in candidates.iter().filter(|candidate| {
+                                candidate.is_agentic
+                                    && &candidate.node_id != node_id
+                                    && !relationship_would_cycle(candidates, node_id, &candidate.node_id)
+                            }) {
+                                if ui
+                                    .selectable_label(
+                                        parent_node_id.as_ref() == Some(&candidate.node_id),
+                                        &candidate.title,
+                                    )
+                                    .clicked()
+                                {
+                                    *parent_node_id = Some(candidate.node_id.clone());
+                                    if *relationship_kind == RelationshipKind::Unknown {
+                                        *relationship_kind = RelationshipKind::SpawnedBy;
+                                    }
+                                }
+                            }
+                        });
+                    ui.label("Relationship");
+                    ui.add_enabled_ui(parent_node_id.is_some(), |ui| {
+                        egui::ComboBox::from_id_salt("correct-relationship-kind")
+                            .selected_text(relationship_kind_label(*relationship_kind))
+                            .show_ui(ui, |ui| {
+                                for kind in [
+                                    RelationshipKind::SpawnedBy,
+                                    RelationshipKind::OwnsProcess,
+                                    RelationshipKind::Related,
+                                ] {
+                                    ui.selectable_value(
+                                        relationship_kind,
+                                        kind,
+                                        relationship_kind_label(kind),
+                                    );
+                                }
+                            });
+                    });
+                }
+            }
+            let can_submit = match &draft {
+                NodeEditDraft::Rename { name, .. } => !name.trim().is_empty(),
+                NodeEditDraft::Relationship {
+                    parent_node_id,
+                    relationship_kind,
+                    ..
+                } => match parent_node_id {
+                    Some(_) => *relationship_kind != RelationshipKind::Unknown,
+                    None => *relationship_kind == RelationshipKind::Unknown,
+                },
+            };
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add_enabled(can_submit, egui::Button::new("Save correction"))
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                });
+            });
+        });
+
+        if cancel {
+            return Vec::new();
+        }
+        if submit {
+            return vec![match draft {
+                NodeEditDraft::Rename {
+                    session_id,
+                    node_id,
+                    name,
+                } => ViewAction::RenameNode {
+                    session_id,
+                    node_id,
+                    name: name.trim().to_string(),
+                },
+                NodeEditDraft::Relationship {
+                    session_id,
+                    node_id,
+                    parent_node_id,
+                    relationship_kind,
+                } => ViewAction::CorrectRelationship {
+                    session_id,
+                    node_id,
+                    parent_node_id,
+                    relationship_kind,
+                },
+            }];
+        }
+        state.node_edit = Some(draft);
+        Vec::new()
     }
 
     /// The top bar: what Turn is talking to, what the user can do, and which build this
@@ -3048,51 +3681,107 @@ impl<'a> TurnView<'a> {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.panel);
 
-        // Buttons occupy the first row; keyboard help gets a separate baseline below
-        // them. Keeping both inside the old 44px header made them overlap at the normal
-        // 344px sidebar width on Retina displays.
-        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 50.0));
-        ui.painter().text(
-            header.min + Vec2::new(10.0, 6.0),
-            Align2::LEFT_TOP,
-            "WORKSPACES",
-            FontId::new(11.0, egui::FontFamily::Monospace),
-            theme.text_dim,
-        );
-        ui.painter().text(
-            header.min + Vec2::new(10.0, 34.0),
-            Align2::LEFT_TOP,
-            // Spelled for the keyboard in front of the user rather than hard-coded to a
-            // Mac, and in words rather than in glyphs the bundled fonts draw on top of
-            // each other.
-            if keymap.platform().uses_command_key {
-                "Space preview · Enter focus · Cmd+Enter temporary"
-            } else {
-                "Space preview · Enter focus · Ctrl+Enter temporary"
-            },
-            FontId::new(10.0, egui::FontFamily::Monospace),
-            theme.text_faint,
-        );
+        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 116.0));
+        ui.painter().rect_filled(header, 0.0, theme.panel);
         ui.painter().hline(
             header.x_range(),
             header.max.y,
             Stroke::new(1.0, theme.border),
         );
-        // Only `+ Workspace` lives up here now. A Session is created *in* a Workspace, and
-        // a global button could not say which one, so it moved to the right of each
-        // Workspace row where the answer is unambiguous. The archived filter left the bar
-        // entirely: it is a preference about what the list contains, not an action.
-        let action_rect = Rect::from_min_size(
-            header.right_top() + Vec2::new(-128.0, 4.0),
-            Vec2::new(118.0, 26.0),
+        let mut presentation_changed = false;
+        ui.scope_builder(
+            region(header.shrink2(Vec2::new(8.0, 4.0)), "hierarchy-header"),
+            |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("WORKSPACES")
+                                .monospace()
+                                .size(11.0)
+                                .color(theme.text_dim),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("+ Workspace").clicked() {
+                                state.workspace_draft = Some(WorkspaceDraft::new(false));
+                            }
+                            if ui
+                                .small_button("Collapse")
+                                .on_hover_text("Collapse all")
+                                .clicked()
+                            {
+                                set_hierarchy_expanded_all(state, snapshot, false);
+                            }
+                            if ui
+                                .small_button("Expand")
+                                .on_hover_text("Expand all")
+                                .clicked()
+                            {
+                                set_hierarchy_expanded_all(state, snapshot, true);
+                            }
+                        });
+                    });
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut state.tree_query)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Search workspace, session, agent, process or preview"),
+                    );
+                    search.ctx.accesskit_node_builder(search.id, |node| {
+                        node.set_role(egui::accesskit::Role::SearchInput);
+                        node.set_label("Search workspace tree");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.menu_button(format!("Filters ({})", state.tree_filters.len()), |ui| {
+                            for filter in TreeFilter::ALL {
+                                let mut enabled = state.tree_filters.contains(filter);
+                                if ui.checkbox(&mut enabled, filter.label()).changed() {
+                                    if enabled {
+                                        state.tree_filters.insert(*filter);
+                                    } else {
+                                        state.tree_filters.remove(filter);
+                                    }
+                                    presentation_changed = true;
+                                }
+                            }
+                            if !state.tree_filters.is_empty()
+                                && ui.button("Clear filters").clicked()
+                            {
+                                state.tree_filters.clear();
+                                presentation_changed = true;
+                            }
+                        });
+                        egui::ComboBox::from_id_salt("tree-visibility-mode")
+                            .selected_text(state.tree_visibility.label())
+                            .show_ui(ui, |ui| {
+                                for mode in TreeVisibilityMode::ALL {
+                                    if ui
+                                        .selectable_value(
+                                            &mut state.tree_visibility,
+                                            *mode,
+                                            mode.label(),
+                                        )
+                                        .changed()
+                                    {
+                                        presentation_changed = true;
+                                    }
+                                }
+                            });
+                        ui.label(
+                            RichText::new(if keymap.platform().uses_command_key {
+                                "Cmd+Opt+←/→ all"
+                            } else {
+                                "Ctrl+Alt+←/→ all"
+                            })
+                            .monospace()
+                            .size(9.0)
+                            .color(theme.text_faint),
+                        );
+                    });
+                });
+            },
         );
-        ui.scope_builder(region(action_rect, "hierarchy-create-actions"), |ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("+ Workspace").clicked() {
-                    state.workspace_draft = Some(WorkspaceDraft::new(false));
-                }
-            });
-        });
+        if presentation_changed {
+            push_tree_presentation(state, snapshot);
+        }
         ui.advance_cursor_after_rect(header);
 
         let rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
@@ -3138,10 +3827,12 @@ impl<'a> TurnView<'a> {
         }
 
         let selected = effective_selection(snapshot, state);
+        let restoring_scroll = state.scroll_tree_to.is_some();
+        let mut first_visible = None;
         egui::ScrollArea::vertical()
             .id_salt("hierarchy-rows")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_viewport(ui, |ui, viewport| {
                 ui.add_space(4.0);
                 // One width for every row, measured before the first one is placed. Asking
                 // for `available_width()` per row instead let each row inherit the previous
@@ -3175,6 +3866,7 @@ impl<'a> TurnView<'a> {
                         theme,
                         *row,
                         row_width,
+                        state.tree_visibility,
                         RowState {
                             selected: is_selected,
                             expanded,
@@ -3188,6 +3880,12 @@ impl<'a> TurnView<'a> {
                             },
                         },
                     );
+                    if first_visible.is_none()
+                        && response.rect.max.y >= viewport.min.y
+                        && response.rect.min.y <= viewport.max.y
+                    {
+                        first_visible = Some(key.clone());
+                    }
                     if state.scroll_tree_to.as_ref() == Some(&key) {
                         response.scroll_to_me(Some(egui::Align::Center));
                         state.scroll_tree_to = None;
@@ -3246,6 +3944,7 @@ impl<'a> TurnView<'a> {
                     }
                     match row {
                         HierarchyRow::Workspace(workspace) => response.context_menu(|ui| {
+                            hierarchy_reorder_menu(ui, state, snapshot, *row);
                             if workspace.workspace.archived {
                                 if ui.button("Restore workspace").clicked() {
                                     actions.push(ViewAction::ArchiveWorkspace {
@@ -3309,6 +4008,7 @@ impl<'a> TurnView<'a> {
                             }
                         }),
                         HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
+                            hierarchy_reorder_menu(ui, state, snapshot, *row);
                             if session.session.status == SessionStatus::Archived {
                                 if ui
                                     .add_enabled(
@@ -3407,6 +4107,7 @@ impl<'a> TurnView<'a> {
                             }
                         }),
                         HierarchyRow::Process { session, node } => response.context_menu(|ui| {
+                            hierarchy_reorder_menu(ui, state, snapshot, *row);
                             let workspace = snapshot.workspaces.iter().find(|workspace| {
                                 workspace.workspace.id == session.session.workspace_id
                             });
@@ -3438,6 +4139,14 @@ impl<'a> TurnView<'a> {
                                 ui.close();
                             }
                             if node.is_agentic {
+                                if ui.button("Rename Agent…").clicked() {
+                                    state.node_edit = Some(NodeEditDraft::rename(node));
+                                    ui.close();
+                                }
+                                if ui.button("Correct relationship…").clicked() {
+                                    state.node_edit = Some(NodeEditDraft::relationship(node));
+                                    ui.close();
+                                }
                                 let has_target = session.nodes.iter().any(|candidate| {
                                     candidate.is_agentic && candidate.node_id != node.node_id
                                 });
@@ -3555,6 +4264,11 @@ impl<'a> TurnView<'a> {
                     }
                 }
             });
+
+        if !restoring_scroll && first_visible != state.tree_scroll_anchor {
+            state.tree_scroll_anchor = first_visible;
+            push_tree_presentation(state, snapshot);
+        }
 
         if hierarchy_accepts_keyboard(state) {
             let updated_rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
@@ -7237,6 +7951,7 @@ fn hierarchy_row(
     theme: &Theme,
     row: HierarchyRow<'_>,
     width: f32,
+    visibility: TreeVisibilityMode,
     state: RowState,
 ) -> Response {
     let RowState {
@@ -7249,7 +7964,8 @@ fn hierarchy_row(
     // The width is passed in rather than read from the `Ui`, so every row in the tree is
     // the same width and the column its controls occupy is in the same place on all of
     // them. See the note where it is measured.
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, row.height()), Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, row.height(visibility)), Sense::click());
     if selected {
         ui.painter().rect_filled(rect, 0.0, theme.selection);
     } else if response.hovered() {
@@ -7472,33 +8188,44 @@ fn hierarchy_row(
                     colour
                 },
             );
-            // The third line is what the node last said. For a worker an agent is managing,
-            // a long silence replaces it: "nothing for six minutes" is the fact worth having
-            // there, and the preview it would otherwise repeat is six minutes old anyway.
-            let idle = idle_note.filter(|idle| idle.worth_saying);
-            let (preview_text, preview_colour) = match &idle {
-                Some(idle) => (
-                    format!(
-                        "nothing for {} — click to see its pane",
-                        crate::spotlight::describe_silence(idle.silent_ms)
-                    ),
-                    theme.attention,
-                ),
-                None => (
-                    visible_preview(node)
-                        .map(|preview| preview.normalized_text.clone())
-                        .unwrap_or_else(|| "no activity preview".into()),
-                    theme.text_faint,
-                ),
-            };
-            paint_line(
-                &painter,
-                egui::pos2(text_x, rect.min.y + 39.0),
-                detail_width,
-                &preview_text,
-                FontId::new(10.0, egui::FontFamily::Proportional),
-                preview_colour,
-            );
+            if visibility != TreeVisibilityMode::Normal {
+                let idle = idle_note.filter(|idle| idle.worth_saying);
+                let (third_line, third_colour) = if visibility == TreeVisibilityMode::Technical {
+                    (
+                        format!(
+                            "pid {} · ppid {} · {}",
+                            node.pid.map_or_else(|| "—".into(), |pid| pid.to_string()),
+                            node.ppid.map_or_else(|| "—".into(), |pid| pid.to_string()),
+                            node.command
+                        ),
+                        theme.text_faint,
+                    )
+                } else {
+                    match &idle {
+                        Some(idle) => (
+                            format!(
+                                "nothing for {} — click to see its pane",
+                                crate::spotlight::describe_silence(idle.silent_ms)
+                            ),
+                            theme.attention,
+                        ),
+                        None => (
+                            visible_preview(node)
+                                .map(|preview| preview.normalized_text.clone())
+                                .unwrap_or_else(|| "no activity preview".into()),
+                            theme.text_faint,
+                        ),
+                    }
+                };
+                paint_line(
+                    &painter,
+                    egui::pos2(text_x, rect.min.y + 39.0),
+                    detail_width,
+                    &third_line,
+                    FontId::new(10.0, egui::FontFamily::Proportional),
+                    third_colour,
+                );
+            }
         }
     }
 
@@ -7511,7 +8238,7 @@ fn hierarchy_row(
         );
     }
 
-    let accessible_name = row.accessible_name(focused_pane);
+    let accessible_name = row.accessible_name(focused_pane, visibility);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &accessible_name)
     });
@@ -7582,6 +8309,79 @@ fn set_hierarchy_expanded(
         surface_id: snapshot.tree_state.surface_id.clone(),
         key,
         expanded,
+    });
+}
+
+fn set_hierarchy_expanded_all(state: &mut ViewState, snapshot: &HierarchySnapshot, expanded: bool) {
+    for row in ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state)) {
+        if row.child_count() > 0 {
+            state.tree_expansion.insert(row.key(), expanded);
+        }
+    }
+    state.push_hierarchy_action(HierarchyAction::SetExpandedAll {
+        surface_id: snapshot.tree_state.surface_id.clone(),
+        expanded,
+    });
+}
+
+fn hierarchy_reorder_menu(
+    ui: &mut Ui,
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    row: HierarchyRow<'_>,
+) {
+    let parent = row.parent_key();
+    let key = row.key();
+    let siblings: Vec<_> =
+        ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
+            .into_iter()
+            .filter(|candidate| candidate.parent_key() == parent)
+            .map(HierarchyRow::key)
+            .collect();
+    let Some(index) = siblings.iter().position(|candidate| candidate == &key) else {
+        return;
+    };
+    let move_up = ui
+        .add_enabled(index > 0, egui::Button::new("Move up"))
+        .clicked();
+    let move_down = ui
+        .add_enabled(index + 1 < siblings.len(), egui::Button::new("Move down"))
+        .clicked();
+    if !move_up && !move_down {
+        ui.separator();
+        return;
+    }
+
+    let mut reordered = siblings.clone();
+    let target = if move_up { index - 1 } else { index + 1 };
+    reordered.swap(index, target);
+    let before = if move_up {
+        Some(siblings[index - 1].clone())
+    } else {
+        siblings.get(index + 2).cloned()
+    };
+    let sibling_set: HashSet<_> = siblings.into_iter().collect();
+    let mut optimistic: Vec<_> = effective_manual_order(snapshot, state)
+        .iter()
+        .filter(|candidate| !sibling_set.contains(*candidate))
+        .cloned()
+        .collect();
+    optimistic.extend(reordered);
+    state.tree_manual_order = optimistic;
+    state.push_hierarchy_action(HierarchyAction::Move {
+        surface_id: snapshot.tree_state.surface_id.clone(),
+        key,
+        before,
+    });
+    ui.close();
+}
+
+fn push_tree_presentation(state: &mut ViewState, snapshot: &HierarchySnapshot) {
+    state.push_hierarchy_action(HierarchyAction::SetPresentation {
+        surface_id: snapshot.tree_state.surface_id.clone(),
+        filters: state.tree_filters.iter().copied().collect(),
+        visibility_mode: state.tree_visibility,
+        scroll_anchor: state.tree_scroll_anchor.clone(),
     });
 }
 
@@ -7685,6 +8485,15 @@ fn handle_hierarchy_keyboard(
     let Some(keypress) = keypress else {
         return Vec::new();
     };
+    apply_hierarchy_keypress(snapshot, state, rows, keypress)
+}
+
+fn apply_hierarchy_keypress(
+    snapshot: &HierarchySnapshot,
+    state: &mut ViewState,
+    rows: &[HierarchyRow<'_>],
+    keypress: HierarchyKeypress,
+) -> Vec<ViewAction> {
     if matches!(keypress, HierarchyKeypress::Blur) {
         state.tree_has_focus = false;
         return Vec::new();
@@ -8451,6 +9260,7 @@ mod tests {
                     HierarchyKey::workspace(workspace.id.clone()),
                     HierarchyKey::session(session.id),
                 ],
+                ..TreeSurfaceState::empty("window-test")
             },
             workspaces: vec![WorkspaceTreeView {
                 workspace: workspace_summary,
@@ -8504,7 +9314,7 @@ mod tests {
             session: &snapshot.workspaces[0].sessions[0],
         };
         assert!(row
-            .accessible_name(false)
+            .accessible_name(false, TreeVisibilityMode::Expanded)
             .contains("read-only guard unavailable; processes disabled"));
     }
 
@@ -8563,6 +9373,207 @@ mod tests {
         assert!(expanded
             .iter()
             .any(|row| row.key() == HierarchyKey::process(child_id.clone())));
+    }
+
+    #[test]
+    fn search_keeps_ancestors_and_keyboard_navigation_stays_inside_the_projection() {
+        let (snapshot, root_id, child_id, _) = hierarchy_fixture();
+        let workspace_key = HierarchyKey::workspace(snapshot.workspaces[0].workspace.id.clone());
+        let session_key =
+            HierarchyKey::session(snapshot.workspaces[0].sessions[0].session.id.clone());
+        let mut state = ViewState {
+            tree_query: "navigation projection".into(),
+            selected_tree: Some(workspace_key.clone()),
+            ..ViewState::default()
+        };
+        let rows = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            rows.iter().map(|row| row.key()).collect::<Vec<_>>(),
+            [
+                workspace_key,
+                session_key.clone(),
+                HierarchyKey::process(root_id.clone()),
+            ],
+            "a preview hit keeps its Workspace and Session but not an unrelated child"
+        );
+
+        apply_hierarchy_keypress(&snapshot, &mut state, &rows, HierarchyKeypress::Down);
+        assert_eq!(state.selected_tree, Some(session_key));
+        apply_hierarchy_keypress(&snapshot, &mut state, &rows, HierarchyKeypress::Down);
+        assert_eq!(state.selected_tree, Some(HierarchyKey::process(root_id)));
+        assert_ne!(state.selected_tree, Some(HierarchyKey::process(child_id)));
+    }
+
+    #[test]
+    fn filter_families_or_within_the_family_and_and_across_families() {
+        let (snapshot, _, _, _) = hierarchy_fixture();
+        let mut state = ViewState::default();
+        state.tree_filters.extend([
+            TreeFilter::Agents,
+            TreeFilter::ReadOnly,
+            TreeFilter::Running,
+            TreeFilter::Failed,
+        ]);
+        let rows = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            rows.len(),
+            4,
+            "Running OR Failed, intersected with Agents and Read-only"
+        );
+
+        state.tree_filters.remove(&TreeFilter::ReadOnly);
+        state.tree_filters.insert(TreeFilter::Main);
+        assert!(
+            visible_hierarchy_rows(&snapshot, &state, false).is_empty(),
+            "a Read-only Session cannot leak through the Main mode filter"
+        );
+    }
+
+    fn loaded_hierarchy_fixture() -> (HierarchySnapshot, Vec<NodeId>) {
+        let workspace = Workspace::new("scale", "/repo/scale", T0);
+        let mut session = Session::new(
+            workspace.id.clone(),
+            "Thirty workers",
+            "/repo/scale",
+            Layout::single(Pane::new(PaneKind::Agent)),
+            T0,
+        );
+        let mut agent_ids = Vec::new();
+        for worker in 0..30 {
+            let mut agent = ProcessNode::agent(
+                session.id.clone(),
+                format!("worker-{worker}"),
+                "/repo/scale",
+                T0 + worker,
+            );
+            agent.lifecycle = Lifecycle::Alive;
+            agent.turn = Some(Turn::Active);
+            agent.pid = Some(20_000 + worker as u32);
+            let agent_id = session.tree.insert(agent);
+            agent_ids.push(agent_id.clone());
+            for tool in 0..10 {
+                let mut process = ProcessNode::process(
+                    session.id.clone(),
+                    NodeKind::Background,
+                    format!("worker-{worker}-tool-{tool}"),
+                    "/repo/scale",
+                    T0 + 100 + worker * 10 + tool,
+                );
+                process.lifecycle = Lifecycle::Alive;
+                process.pid = Some(30_000 + (worker * 10 + tool) as u32);
+                process.ppid = Some(20_000 + worker as u32);
+                process.link_to(agent_id.clone(), Relation::Confirmed);
+                session.tree.insert(process);
+            }
+        }
+        let summary = SessionSummary::from_session(&session, 0, false, T0 + 1_000);
+        let workspace_summary =
+            WorkspaceSummary::from_workspace(&workspace, std::slice::from_ref(&summary));
+        let mut nodes = TreeNodeView::for_session(&session, T0 + 1_000);
+        for node in &mut nodes {
+            node.ephemeral = node.kind == NodeKind::Background;
+        }
+        let mut expanded = vec![
+            HierarchyKey::workspace(workspace.id.clone()),
+            HierarchyKey::session(session.id.clone()),
+        ];
+        expanded.extend(agent_ids.iter().cloned().map(HierarchyKey::process));
+        (
+            HierarchySnapshot {
+                revision: 1,
+                tree_state: TreeSurfaceState {
+                    surface_id: "window-scale".into(),
+                    expanded,
+                    ..TreeSurfaceState::empty("window-scale")
+                },
+                workspaces: vec![WorkspaceTreeView {
+                    workspace: workspace_summary,
+                    checkouts: Vec::new(),
+                    write_lease: None,
+                    sessions: vec![SessionTreeView {
+                        session: summary,
+                        nodes,
+                    }],
+                }],
+            },
+            agent_ids,
+        )
+    }
+
+    #[test]
+    fn thirty_agents_and_hundreds_of_discovered_processes_have_reproducible_projection() {
+        let (mut snapshot, agent_ids) = loaded_hierarchy_fixture();
+        let mut state = ViewState {
+            tree_visibility: TreeVisibilityMode::Technical,
+            ..ViewState::default()
+        };
+        let technical = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            technical.len(),
+            332,
+            "Workspace + Session + 30 Agents + 300 processes"
+        );
+        let last_process = technical.last().copied().expect("last discovered process");
+        assert!(last_process
+            .accessible_name(false, TreeVisibilityMode::Technical)
+            .contains("pid 30299"));
+
+        state.tree_visibility = TreeVisibilityMode::Normal;
+        let normal = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            normal.len(),
+            32,
+            "Normal hides all 300 ephemeral process-table rows"
+        );
+
+        state.tree_query = "worker-29-tool-9".into();
+        let searched = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            searched.len(),
+            4,
+            "search reveals one ephemeral hit and its ancestors"
+        );
+        assert_eq!(searched.last().map(|row| row.depth()), Some(3));
+
+        state.tree_query.clear();
+        state.tree_filters.insert(TreeFilter::Agents);
+        state.tree_filters.insert(TreeFilter::Running);
+        let filtered = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(filtered.len(), 32);
+
+        // Manual ordering changes sibling order only; selection remains the exact stable key.
+        let selected = HierarchyKey::process(agent_ids[0].clone());
+        state.selected_tree = Some(selected.clone());
+        snapshot.tree_state.manual_order = vec![
+            HierarchyKey::process(agent_ids[1].clone()),
+            selected.clone(),
+        ];
+        state.tree_manual_order.clear();
+        let manually_ordered = visible_hierarchy_rows(&snapshot, &state, false);
+        let agent_positions: Vec<_> = manually_ordered
+            .iter()
+            .filter_map(|row| match row {
+                HierarchyRow::Process { node, .. } if node.is_agentic => Some(node.node_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(agent_positions[0], agent_ids[1]);
+        assert_eq!(agent_positions[1], agent_ids[0]);
+        assert_eq!(state.selected_tree, Some(selected));
+    }
+
+    #[test]
+    fn expand_and_collapse_all_are_single_durable_actions() {
+        let (snapshot, _, _, _) = hierarchy_fixture();
+        let mut state = ViewState::default();
+        set_hierarchy_expanded_all(&mut state, &snapshot, true);
+        assert!(state.tree_expansion.values().all(|expanded| *expanded));
+        assert!(matches!(
+            state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::SetExpandedAll { expanded: true, .. }]
+        ));
+        set_hierarchy_expanded_all(&mut state, &snapshot, false);
+        assert!(state.tree_expansion.values().all(|expanded| !*expanded));
     }
 
     #[test]
@@ -8665,7 +9676,7 @@ mod tests {
         let (snapshot, root_id, _, _) = hierarchy_fixture();
         let workspace = HierarchyRow::Workspace(&snapshot.workspaces[0]);
         assert!(workspace
-            .accessible_name(false)
+            .accessible_name(false, TreeVisibilityMode::Expanded)
             .contains("1 sessions need attention"));
 
         let session = &snapshot.workspaces[0].sessions[0];
@@ -8683,7 +9694,7 @@ mod tests {
             workspace: &snapshot.workspaces[0],
             session,
         }
-        .accessible_name(false)
+        .accessible_name(false, TreeVisibilityMode::Expanded)
         .contains("1 attention demand"));
     }
 

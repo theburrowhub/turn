@@ -28,7 +28,7 @@ use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, Direction, Layout, LeaseState, Pane, PaneKind, PreviewVisibility,
-    SessionStatus,
+    SessionStatus, TreeFilter,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
@@ -1745,6 +1745,19 @@ impl Desk {
                 display_state,
                 ..
             } => {
+                let became_attention = display_state.demands_user()
+                    && self
+                        .hierarchy
+                        .as_ref()
+                        .and_then(|snapshot| {
+                            snapshot
+                                .workspaces
+                                .iter()
+                                .flat_map(|workspace| &workspace.sessions)
+                                .flat_map(|session| &session.nodes)
+                                .find(|node| node.node_id == node_id)
+                        })
+                        .is_some_and(|node| !node.needs_user);
                 self.update_hierarchy_node(&session_id, &node_id, |node| {
                     node.lifecycle = lifecycle.clone();
                     node.turn = turn.clone();
@@ -1754,7 +1767,21 @@ impl Desk {
                     node.needs_user = display_state.demands_user();
                 });
                 let _ = now_ms;
-                Vec::new()
+                if became_attention {
+                    self.attention_ancestor_keys(&session_id, &node_id)
+                        .into_iter()
+                        .map(|key| Reaction::Send {
+                            ask: Ask::Action("revealing an Agent that needs attention"),
+                            request: Request::SetTreeExpanded {
+                                surface_id: self.surface_id.clone(),
+                                key,
+                                expanded: true,
+                            },
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
             }
             E::TurnEventEmitted { .. } => Vec::new(),
         }
@@ -2360,6 +2387,59 @@ impl Desk {
                     expanded,
                 },
             }],
+            HierarchyAction::SetExpandedAll {
+                surface_id,
+                expanded,
+            } => vec![Reaction::Send {
+                ask: Ask::Action(if expanded {
+                    "expanding the complete workspace tree"
+                } else {
+                    "collapsing the complete workspace tree"
+                }),
+                request: Request::SetTreeExpandedAll {
+                    surface_id,
+                    expanded,
+                },
+            }],
+            HierarchyAction::SetPresentation {
+                surface_id,
+                filters,
+                visibility_mode,
+                scroll_anchor,
+            } => {
+                let wants_archived = filters.contains(&TreeFilter::Archived);
+                let mut reactions = vec![Reaction::Send {
+                    ask: Ask::Action("saving workspace tree presentation"),
+                    request: Request::SetTreePresentation {
+                        surface_id: surface_id.clone(),
+                        filters,
+                        visibility_mode,
+                        scroll_anchor,
+                    },
+                }];
+                if wants_archived {
+                    reactions.push(Reaction::Send {
+                        ask: Ask::Hierarchy,
+                        request: Request::GetHierarchy {
+                            surface_id,
+                            include_archived: true,
+                        },
+                    });
+                }
+                reactions
+            }
+            HierarchyAction::Move {
+                surface_id,
+                key,
+                before,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("reordering workspace tree siblings"),
+                request: Request::MoveTreeNode {
+                    surface_id,
+                    key,
+                    before,
+                },
+            }],
             HierarchyAction::QuickPreview {
                 session_id,
                 node_id,
@@ -2531,6 +2611,20 @@ impl Desk {
         let session = self.selected.clone();
         let pane = self.active_pane();
         match command {
+            Command::ExpandWorkspaceTree | Command::CollapseWorkspaceTree => {
+                let expanded = command == Command::ExpandWorkspaceTree;
+                vec![Reaction::Send {
+                    ask: Ask::Action(if expanded {
+                        "expanding the complete workspace tree"
+                    } else {
+                        "collapsing the complete workspace tree"
+                    }),
+                    request: Request::SetTreeExpandedAll {
+                        surface_id: self.surface_id.clone(),
+                        expanded,
+                    },
+                }]
+            }
             Command::NextAttention => vec![Reaction::Send {
                 ask: Ask::Action("going to the next demand"),
                 // No id: the daemon picks, because it owns the order. Pressing the
@@ -2962,6 +3056,32 @@ impl Desk {
                     },
                 }]
             }
+            ViewAction::RenameNode {
+                session_id,
+                node_id,
+                name,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("renaming an Agent"),
+                request: Request::RenameNode {
+                    session_id,
+                    node_id,
+                    name,
+                },
+            }],
+            ViewAction::CorrectRelationship {
+                session_id,
+                node_id,
+                parent_node_id,
+                relationship_kind,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("correcting an Agent relationship"),
+                request: Request::CorrectRelationship {
+                    session_id,
+                    node_id,
+                    parent_node_id,
+                    relationship_kind,
+                },
+            }],
             ViewAction::CloseSession {
                 session_id,
                 disposition,
@@ -4338,6 +4458,52 @@ mod tests {
     }
 
     #[test]
+    fn newly_attention_worthy_node_expands_ancestors_without_moving_selection() {
+        let (mut session, _, root_id) = session_with_agent("Attention branch");
+        let mut child = ProcessNode::agent(session.id.clone(), "reviewer", "/repo", T0 + 1);
+        child.kind = NodeKind::Subagent;
+        child.lifecycle = Lifecycle::Alive;
+        child.turn = Some(Turn::Active);
+        child.link_to(root_id.clone(), Relation::Confirmed);
+        let child_id = session.tree.insert(child);
+        let selected = HierarchyKey::process(root_id.clone());
+        let mut desk = Desk::new();
+        desk.apply_inbound(hierarchy_of(&[&session], Some(selected.clone())), T0);
+
+        let reactions = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::NodeStateChanged {
+                session_id: session.id.clone(),
+                node_id: child_id.clone(),
+                lifecycle: Lifecycle::Alive,
+                turn: Some(Turn::AwaitingUser {
+                    reason: AwaitingReason::Permission,
+                }),
+                display_state: turn_core::state::DisplayState::NeedsPermission,
+                caused_by: None,
+            })),
+            T0 + 2,
+        );
+        let requests = sent(&reactions);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, Request::SetTreeExpanded { .. }))
+                .count(),
+            3,
+            "Workspace, Session and parent Agent are revealed"
+        );
+        assert!(!requests.iter().any(|request| matches!(
+            request,
+            Request::SelectTreeNode { .. } | Request::FocusPaneForAttention { .. }
+        )));
+        assert_eq!(
+            desk.hierarchy().unwrap().tree_state.selected,
+            Some(selected),
+            "passive Attention revelation never moves the user's selection"
+        );
+    }
+
+    #[test]
     fn semantic_attention_selects_the_child_but_focuses_its_runtime_owner_pane() {
         let (session, pane_id, runtime_owner) = session_with_agent("Fix climbing bugs");
         let subject = NodeId::from_stored("proc_reviewer_semantic");
@@ -5137,6 +5303,7 @@ mod tests {
                     surface_id: "main-window".into(),
                     selected,
                     expanded: vec![HierarchyKey::workspace(project.id.clone())],
+                    ..TreeSurfaceState::empty("main-window")
                 },
                 workspaces: vec![WorkspaceTreeView {
                     workspace: WorkspaceSummary::from_workspace(&project, &summaries),
@@ -6900,6 +7067,7 @@ mod tests {
                         // already paints B as selected.
                         selected: Some(HierarchyKey::workspace(first_id)),
                         expanded: Vec::new(),
+                        ..TreeSurfaceState::empty("main-window")
                     },
                     workspaces: vec![
                         WorkspaceTreeView {

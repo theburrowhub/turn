@@ -36,4 +36,5 @@ pub use hierarchy::{
 pub use session::{AgentSummary, SessionDetails, SessionSummary};
 pub use settings::{SettingsControl, SettingsEntry, SettingsLevel, SettingsView};
 pub use tree::TreeNodeView;
+pub use turn_core::model::{TreeFilter, TreeVisibilityMode};
 pub use workspace::{TemplateSummary, WorkspaceSummary};

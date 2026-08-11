@@ -473,6 +473,32 @@ pub(crate) fn all_requests() -> Vec<Request> {
             surface_id: "window-a".into(),
             selected: Some(HierarchyKey::process(node_id.clone())),
         },
+        Request::SetTreeExpandedAll {
+            surface_id: "window-a".into(),
+            expanded: true,
+        },
+        Request::SetTreePresentation {
+            surface_id: "window-a".into(),
+            filters: vec![turn_core::model::TreeFilter::Attention],
+            visibility_mode: turn_core::model::TreeVisibilityMode::Technical,
+            scroll_anchor: Some(HierarchyKey::process(node_id.clone())),
+        },
+        Request::MoveTreeNode {
+            surface_id: "window-a".into(),
+            key: HierarchyKey::process(node_id.clone()),
+            before: None,
+        },
+        Request::RenameNode {
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            name: "Reviewer".into(),
+        },
+        Request::CorrectRelationship {
+            session_id: session_id.clone(),
+            node_id: node_id.clone(),
+            parent_node_id: None,
+            relationship_kind: turn_core::model::RelationshipKind::Unknown,
+        },
         Request::GetWorkspaceWriteLease {
             workspace_id: workspace_id.clone(),
         },
@@ -785,7 +811,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 71 operations. The number is asserted so that adding one without documenting it in
+    // 76 operations. The number is asserted so that adding one without documenting it in
     // docs/PROTOCOL.md becomes a deliberate act.
     //
     // What it does *not* do is notice a variant that was added to `Request` and never added
@@ -793,5 +819,5 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
     // absent from both sides of the comparison. The compile-time guards for that are
     // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
     // be left alone when a variant appears. This assertion guards the *documentation*.
-    assert_eq!(names.len(), 71, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 76, "the catalogue changed size: {names:?}");
 }

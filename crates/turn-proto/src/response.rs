@@ -640,6 +640,7 @@ pub(crate) mod tests {
                     surface_id: "window-a".into(),
                     selected: Some(crate::HierarchyKey::session(s.id.clone())),
                     expanded: vec![crate::HierarchyKey::workspace(s.workspace_id.clone())],
+                    ..TreeSurfaceState::empty("window-a")
                 },
             },
             Response::WorkspaceWriteLease {

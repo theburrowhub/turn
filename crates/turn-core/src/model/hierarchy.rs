@@ -355,6 +355,111 @@ pub enum HierarchyNodeKind {
     Process,
 }
 
+/// A durable, composable filter for one tree surface.
+///
+/// Filters in the same family are alternatives (for example `Main` or
+/// `ReadOnly`); different families combine. Keeping the vocabulary typed means
+/// a newer UI can add controls without persisting free-form predicates that an
+/// older daemon would interpret differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeFilter {
+    Attention,
+    Running,
+    Failed,
+    Idle,
+    Agents,
+    Tools,
+    Main,
+    ReadOnly,
+    Worktree,
+    Completed,
+    Archived,
+}
+
+impl TreeFilter {
+    pub const ALL: &'static [Self] = &[
+        Self::Attention,
+        Self::Running,
+        Self::Failed,
+        Self::Idle,
+        Self::Agents,
+        Self::Tools,
+        Self::Main,
+        Self::ReadOnly,
+        Self::Worktree,
+        Self::Completed,
+        Self::Archived,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Attention => "Attention",
+            Self::Running => "Running",
+            Self::Failed => "Failed",
+            Self::Idle => "Idle",
+            Self::Agents => "Agents",
+            Self::Tools => "Tools",
+            Self::Main => "Main",
+            Self::ReadOnly => "Read-only",
+            Self::Worktree => "Worktree",
+            Self::Completed => "Completed",
+            Self::Archived => "Archived",
+        }
+    }
+}
+
+/// How much process detail the unified tree reveals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeVisibilityMode {
+    /// Compact rows and no short-lived process-table plumbing.
+    #[default]
+    Normal,
+    /// Activity previews and every durable semantic tool.
+    Expanded,
+    /// Every discovered process plus pid, parent pid and command detail.
+    Technical,
+}
+
+impl TreeVisibilityMode {
+    pub const ALL: &'static [Self] = &[Self::Normal, Self::Expanded, Self::Technical];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Expanded => "Expanded",
+            Self::Technical => "Technical",
+        }
+    }
+}
+
+/// Surface-wide tree presentation stored independently from per-node expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreeSurfacePreferences {
+    pub surface_id: String,
+    #[serde(default)]
+    pub filters: Vec<TreeFilter>,
+    #[serde(default)]
+    pub visibility_mode: TreeVisibilityMode,
+    pub scroll_anchor_kind: Option<HierarchyNodeKind>,
+    pub scroll_anchor_id: Option<String>,
+    pub updated_ms: i64,
+}
+
+impl TreeSurfacePreferences {
+    pub fn normal(surface_id: impl Into<String>) -> Self {
+        Self {
+            surface_id: surface_id.into(),
+            filters: Vec::new(),
+            visibility_mode: TreeVisibilityMode::Normal,
+            scroll_anchor_kind: None,
+            scroll_anchor_id: None,
+            updated_ms: 0,
+        }
+    }
+}
+
 /// Per-window tree interaction. It is not broadcast and is not a TurnEvent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeUiState {
