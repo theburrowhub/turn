@@ -88,6 +88,14 @@ lifecycle-acceptance: ## Reproduce Command Palette and Workspace/Session lifecyc
 	$(CARGO) test -p turn-gui close_turn_defaults -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turn-gui palette_hierarchy_commands --lib -- --test-threads=$(TEST_THREADS)
 
+.PHONY: adapter-acceptance
+adapter-acceptance: ## Reproduce dedicated Agent adapters and external-app discovery
+	$(CARGO) test -p turn-agents --test contract_gemini --test contract_opencode -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-agents registry::tests --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-pty supervisor::tests --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd a_discovered_graphical_app_stays_under_its_parent_without_a_pane --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd an_authenticated_callback_promotes_inference_without_resetting_the_turn --lib -- --test-threads=$(TEST_THREADS)
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

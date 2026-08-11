@@ -36,10 +36,8 @@ use turn_pty::ScreenSnapshot;
 /// would produce confident nonsense, so anything unlisted gets the terminal and
 /// no claims (see [`crate::registry`]).
 pub const HEURISTIC_EXECUTABLES: &[&str] = &[
-    "gemini",
     "aider",
     "cursor-agent",
-    "opencode",
     "crush",
     "goose",
     "amp",
@@ -578,7 +576,7 @@ jamuriano@studio ~/personal-workspace/turn %
     #[test]
     fn the_adapter_claims_only_the_agent_clis_it_knows_by_name() {
         let adapter = HeuristicAdapter::new();
-        assert!(adapter.handles("gemini"));
+        assert!(adapter.handles("aider"));
         assert!(adapter.handles("/opt/homebrew/bin/aider --model sonnet"));
         assert!(!adapter.handles("claude"), "claude has a real contract");
         assert!(!adapter.handles("codex"));
@@ -596,8 +594,8 @@ jamuriano@studio ~/personal-workspace/turn %
             session_id: SessionId::from_stored("sess_heur01"),
             node_id: NodeId::from_stored("proc_heur01"),
             cwd: "/repo".into(),
-            command: "gemini".into(),
-            user_args: vec!["--model".into(), "gemini-3-pro".into()],
+            command: "aider".into(),
+            user_args: vec!["--model".into(), "sonnet".into()],
             endpoint: crate::adapter::HookEndpoint {
                 base_url: "http://127.0.0.1:1".into(),
                 token: "t".into(),
@@ -606,7 +604,7 @@ jamuriano@studio ~/personal-workspace/turn %
             scratch_dir: std::path::PathBuf::from("/tmp/turn-scratch"),
         };
         let plan = HeuristicAdapter::new().prepare(&ctx).unwrap();
-        assert_eq!(plan.command, "gemini");
+        assert_eq!(plan.command, "aider");
         assert_eq!(plan.args, ctx.user_args);
         assert_eq!(plan.level, IntegrationLevel::Heuristic);
         assert!(plan.note.contains("inferred"));

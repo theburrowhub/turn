@@ -21,7 +21,9 @@
 pub mod adapter;
 pub mod claude;
 pub mod codex;
+pub mod gemini;
 pub mod heuristic;
+pub mod opencode;
 pub mod registry;
 pub mod risk;
 pub mod server;
@@ -33,6 +35,8 @@ pub use adapter::{
 };
 pub use claude::{ClaudeCodeAdapter, HookTransport};
 pub use codex::{CodexAdapter, CodexTransport};
+pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
+pub use opencode::OpenCodeAdapter;
 pub use registry::{AdapterRegistry, GenericTerminalAdapter, Selection};
 pub use server::{HookServer, HookStats, ServerError};

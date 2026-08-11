@@ -334,6 +334,7 @@ mod tests {
     use super::super::{MAX_DISCOVERED_ARGS, MAX_DISCOVERED_ARGV_CHARS, MAX_DISCOVERED_ARG_CHARS};
     use super::*;
     use crate::core::testing::Harness;
+    use turn_agents::{IntegrationLevel, OutputHeuristic};
     use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::PaneId;
 
@@ -692,6 +693,134 @@ mod tests {
         assert_safe_and_bounded(&restored_node.cwd, MAX_DISCOVERED_CWD_CHARS);
         assert_safe_and_bounded(&restored_node.title, turn_pty::MAX_TITLE_CHARS);
         assert_eq!(restored_node.args, args);
+    }
+
+    #[tokio::test]
+    async fn a_discovered_graphical_app_stays_under_its_parent_without_a_pane() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_external_app");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_external_app"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "gemini", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        parent.pid = Some(42_000);
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+
+        let child_id = NodeId::from_stored("proc_external_godot");
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::ProcessSpawnedChild {
+                    child: child_id.clone(),
+                    pid: 42_001,
+                    ppid: Some(42_000),
+                    command: "/Applications/Godot.app/Godot --editor project.godot".into(),
+                    args: vec!["--editor".into(), "project.godot".into()],
+                    cwd: Some("/tmp/game".into()),
+                    confirmed_parent: false,
+                },
+                EventSource::Supervisor,
+                Confidence::InferredHigh,
+                NOW + 1,
+            )
+            .with_node(parent_id.clone()),
+            NOW + 1,
+        );
+
+        let child = harness.core.sessions[&session_id]
+            .tree
+            .get(&child_id)
+            .unwrap();
+        assert_eq!(child.kind, NodeKind::ExternalApp);
+        assert_eq!(child.parent.as_ref(), Some(&parent_id));
+        assert_eq!(child.relation, Relation::Inferred);
+        assert!(
+            harness.core.sessions[&session_id]
+                .layout
+                .panes()
+                .iter()
+                .all(|pane| pane.node_id.as_ref() != Some(&child_id)),
+            "discovering desktop UI must not create or focus a Turn pane"
+        );
+        assert!(!harness.core.processes.contains_key(&child_id));
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_callback_promotes_inference_without_resetting_the_turn() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_live_adapter_promotion");
+        let pane_id = PaneId::from_stored("pane_live_adapter_promotion");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let node_id = harness.spawn_process(&session_id, &pane_id, NOW).await;
+        {
+            let process = harness.core.processes.get_mut(&node_id).unwrap();
+            process.level = IntegrationLevel::Heuristic;
+            process.heuristic = Some(OutputHeuristic::new());
+            process.adapter_id = "gemini-cli".into();
+        }
+        {
+            let node = harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .get_mut(&node_id)
+                .unwrap();
+            node.kind = NodeKind::Agent;
+            node.turn = Some(Turn::Active);
+            node.agent = Some(Default::default());
+            node.env_highlights
+                .insert("TURN_INTEGRATION".into(), "inferred".into());
+        }
+
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentStarted {
+                    tool: "gemini-cli".into(),
+                    model: Some("gemini-2.5-pro".into()),
+                    external_id: Some("gemini-session-1".into()),
+                },
+                EventSource::Hook {
+                    tool: "gemini-cli".into(),
+                    event_name: "BeforeModel".into(),
+                },
+                Confidence::Explicit,
+                NOW + 1,
+            )
+            .with_node(node_id.clone()),
+            NOW + 1,
+        );
+
+        let process = &harness.core.processes[&node_id];
+        assert_eq!(process.level, IntegrationLevel::Structured);
+        assert!(process.heuristic.is_none());
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap();
+        assert_eq!(node.turn, Some(Turn::Active));
+        assert_eq!(
+            node.agent.as_ref().unwrap().agent.model.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        assert_eq!(
+            node.env_highlights
+                .get("TURN_INTEGRATION")
+                .map(String::as_str),
+            Some("native")
+        );
     }
 
     #[tokio::test]

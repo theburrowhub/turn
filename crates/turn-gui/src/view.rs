@@ -2029,6 +2029,7 @@ fn node_kind_label(kind: NodeKind) -> &'static str {
         NodeKind::Background => "BACKGROUND",
         NodeKind::TmuxSession => "TMUX SESSION",
         NodeKind::TmuxPane => "TMUX PANE",
+        NodeKind::ExternalApp => "EXTERNAL APP",
         NodeKind::Unknown => "PROCESS",
     }
 }
@@ -8364,6 +8365,14 @@ impl<'a> TurnView<'a> {
         }
 
         inspector_section(ui, theme, "PROCESS");
+        if node.kind == NodeKind::ExternalApp {
+            ui.label(
+                RichText::new(
+                    "Its interface is outside Turn. Selecting this node never activates or raises the application.",
+                )
+                .color(theme.text_dim),
+            );
+        }
         inspector_value(ui, theme, "Session", session_name);
         inspector_value(
             ui,
