@@ -194,6 +194,31 @@ pub fn classify(command_line: &str) -> NodeKind {
 
     let is_word = |needle: &str| executable == needle;
 
+    // These processes matter to the parent agent's lifecycle, but their user
+    // interface belongs to the desktop. Classifying only explicit executable
+    // names keeps a repository path containing "godot" from becoming an app.
+    if [
+        "godot",
+        "godot4",
+        "blender",
+        "unity",
+        "unityhub",
+        "unrealeditor",
+        "xcode",
+        "code",
+        "cursor",
+        "zed",
+        "subl",
+        "idea",
+        "pycharm",
+        "webstorm",
+        "rustrover",
+    ]
+    .contains(&executable)
+    {
+        return NodeKind::ExternalApp;
+    }
+
     if is_word("claude")
         || is_word("codex")
         || is_word("gemini")
@@ -294,8 +319,19 @@ mod tests {
             NodeKind::Unknown
         );
         assert_eq!(classify(""), NodeKind::Unknown);
-        // Case I from the brief: a graphical app an agent launched still shows up.
-        assert_eq!(classify("/Applications/Godot.app/Godot"), NodeKind::Unknown);
+    }
+
+    #[test]
+    fn graphical_apps_are_explicit_external_nodes() {
+        for command in [
+            "/Applications/Godot.app/Godot --editor project.godot",
+            "blender scene.blend",
+            "code /repo",
+            "UnrealEditor Game.uproject",
+        ] {
+            assert_eq!(classify(command), NodeKind::ExternalApp, "{command}");
+        }
+        assert_eq!(classify("echo open blender later"), NodeKind::Unknown);
     }
 
     #[test]

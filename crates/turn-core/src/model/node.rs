@@ -30,6 +30,8 @@ pub enum NodeKind {
     Background,
     TmuxSession,
     TmuxPane,
+    /// A graphical application whose UI lives outside Turn.
+    ExternalApp,
     /// Seen in the process table, purpose unknown.
     Unknown,
 }

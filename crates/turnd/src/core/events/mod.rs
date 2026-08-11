@@ -22,7 +22,8 @@ mod exit;
 mod tree;
 
 use super::{Core, DeferredRuntimeInput, FailedIngestCheckpoint};
-use turn_core::event::{Confidence, EventKind, TurnEvent};
+use turn_agents::IntegrationLevel;
+use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::NodeId;
 use turn_core::model::{NodeKind, PendingPermission, ProcessNode};
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
@@ -219,6 +220,7 @@ impl Core {
         }
         self.correlate_unbound_agent_event(&mut event);
         self.correlate_lifecycle_subject(&mut event);
+        self.promote_authenticated_integration(&event);
         let policy = self.attention_policy_for_session(&session_id);
 
         let mut changed = self.apply(&event, now_ms);
@@ -326,6 +328,44 @@ impl Core {
                 confidence = event.confidence.label(),
                 "kept the existing state: the event was less trustworthy than what set it"
             );
+        }
+    }
+
+    /// A configured hook is only a promise. The first authenticated event is the
+    /// evidence that promotes a launch and retires its output heuristic.
+    fn promote_authenticated_integration(&mut self, event: &TurnEvent) {
+        let promoted = match &event.source {
+            EventSource::Hook { .. } => IntegrationLevel::Structured,
+            EventSource::SideChannel { .. } => IntegrationLevel::Wrapper,
+            _ => return,
+        };
+        let candidates = [event.node_id.as_ref(), event.parent_node_id.as_ref()];
+        let runtime_id = candidates.into_iter().flatten().find_map(|candidate| {
+            self.processes
+                .iter()
+                .find(|(runtime_id, process)| {
+                    *runtime_id == candidate || process.hosted.as_ref() == Some(candidate)
+                })
+                .map(|(runtime_id, _)| runtime_id.clone())
+        });
+        let Some(runtime_id) = runtime_id else {
+            return;
+        };
+        let Some(process) = self.processes.get_mut(&runtime_id) else {
+            return;
+        };
+        if process.level >= promoted {
+            return;
+        }
+        process.level = promoted;
+        process.heuristic = None;
+
+        let semantic_id = process.hosted.as_ref().unwrap_or(&runtime_id).clone();
+        if let Some(session) = self.sessions.get_mut(&process.session_id) {
+            if let Some(node) = session.tree.get_mut(&semantic_id) {
+                node.env_highlights
+                    .insert("TURN_INTEGRATION".into(), promoted.label().to_string());
+            }
         }
     }
 
@@ -743,7 +783,11 @@ impl Core {
                 model,
                 external_id,
             } => {
-                node.turn = Some(Turn::Idle);
+                // SessionStart initialises a fresh node; later callbacks may use
+                // this event to refresh model/session metadata mid-turn.
+                if node.turn.is_none() {
+                    node.turn = Some(Turn::Idle);
+                }
                 let agent = node.agent.get_or_insert_with(Default::default);
                 agent.agent.tool = Some(tool.clone());
                 if model.is_some() {
@@ -753,6 +797,7 @@ impl Core {
                 // later hook callback identifies itself by.
                 if external_id.is_some() {
                     agent.external_id = external_id.clone();
+                    agent.agent.external_id = external_id.clone();
                 }
             }
             EventKind::AgentTurnStarted { prompt_excerpt } => {

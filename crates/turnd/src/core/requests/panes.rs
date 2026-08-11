@@ -1043,6 +1043,7 @@ fn pane_kind_for_node(kind: NodeKind, has_terminal: bool) -> PaneKind {
         NodeKind::Server => PaneKind::Server,
         NodeKind::TestRunner | NodeKind::Build => PaneKind::TestOutput,
         NodeKind::TmuxSession | NodeKind::TmuxPane => PaneKind::TmuxTerminal,
+        NodeKind::ExternalApp => PaneKind::ProcessDetails,
         NodeKind::Terminal | NodeKind::Watcher | NodeKind::Background | NodeKind::Unknown => {
             PaneKind::Terminal
         }

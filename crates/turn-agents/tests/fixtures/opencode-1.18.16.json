@@ -1,0 +1,71 @@
+{
+  "SessionCreated": {
+    "id": "evt_1",
+    "type": "session.created",
+    "properties": {
+      "sessionID": "ses_root",
+      "info": {
+        "id": "ses_root",
+        "title": "Turn adapter work",
+        "version": "1.18.16",
+        "model": { "providerID": "openai", "id": "gpt-5.2", "variant": "high" }
+      }
+    }
+  },
+  "SessionBusy": {
+    "id": "evt_2",
+    "type": "session.status",
+    "properties": { "sessionID": "ses_root", "status": { "type": "busy" } }
+  },
+  "PermissionAsked": {
+    "id": "evt_3",
+    "type": "permission.asked",
+    "properties": {
+      "id": "per_1",
+      "sessionID": "ses_root",
+      "permission": "bash",
+      "patterns": ["cargo test"],
+      "metadata": { "command": "cargo test" },
+      "always": [],
+      "tool": { "messageID": "msg_1", "callID": "call_1" }
+    }
+  },
+  "PermissionReplied": {
+    "id": "evt_4",
+    "type": "permission.replied",
+    "properties": { "sessionID": "ses_root", "requestID": "per_1", "reply": "once" }
+  },
+  "QuestionAsked": {
+    "id": "evt_5",
+    "type": "question.asked",
+    "properties": {
+      "id": "que_1",
+      "sessionID": "ses_root",
+      "questions": [{ "question": "Which database?", "header": "Database", "options": [] }]
+    }
+  },
+  "ChildCreated": {
+    "id": "evt_6",
+    "type": "session.created",
+    "properties": {
+      "sessionID": "ses_child",
+      "info": {
+        "id": "ses_child",
+        "parentID": "ses_root",
+        "title": "Review the patch",
+        "version": "1.18.16",
+        "model": { "providerID": "anthropic", "id": "claude-sonnet-4-5", "variant": "" }
+      }
+    }
+  },
+  "SessionError": {
+    "id": "evt_7",
+    "type": "session.error",
+    "properties": { "sessionID": "ses_root", "error": { "data": { "message": "Provider unavailable" } } }
+  },
+  "SessionIdle": {
+    "id": "evt_8",
+    "type": "session.status",
+    "properties": { "sessionID": "ses_root", "status": { "type": "idle" } }
+  }
+}

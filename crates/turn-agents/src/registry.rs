@@ -18,7 +18,9 @@ use crate::adapter::{
 };
 use crate::claude::ClaudeCodeAdapter;
 use crate::codex::CodexAdapter;
+use crate::gemini::GeminiCliAdapter;
 use crate::heuristic::HeuristicAdapter;
+use crate::opencode::OpenCodeAdapter;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -145,13 +147,15 @@ impl Default for AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    /// Claude Code, then Codex, then output inference, with the generic terminal
-    /// behind all of them.
+    /// Dedicated structured adapters, then output inference, with the generic
+    /// terminal behind all of them.
     pub fn with_builtin() -> Self {
         Self {
             adapters: vec![
                 Arc::new(ClaudeCodeAdapter::new()),
                 Arc::new(CodexAdapter::new()),
+                Arc::new(GeminiCliAdapter::new()),
+                Arc::new(OpenCodeAdapter::new()),
                 Arc::new(HeuristicAdapter::new()),
             ],
             fallback: Arc::new(GenericTerminalAdapter::new()),
@@ -316,24 +320,17 @@ mod tests {
     /// with `gemini` installed and fail in CI, which is the wrong way round for a
     /// test to behave.
     #[test]
-    fn a_known_agent_cli_with_no_contract_gets_output_inference() {
+    fn gemini_and_opencode_have_dedicated_structured_adapters() {
         let selection = registry().select("gemini");
-        assert_eq!(selection.adapter.id(), "terminal-heuristic");
-        assert_eq!(selection.level, IntegrationLevel::Heuristic);
+        assert_eq!(selection.adapter.id(), "gemini-cli");
+        assert_eq!(selection.level, IntegrationLevel::Structured);
+        assert!(selection.capabilities.permission_events);
+        assert!(selection.capabilities.resumable);
 
-        if selection.is_installed() {
-            assert!(
-                selection.note.contains("guess"),
-                "an installed tool with no contract must be told to the user as inferred: {}",
-                selection.note
-            );
-        } else {
-            assert!(
-                selection.note.contains("PATH"),
-                "a tool that is not installed must say so rather than promise detection: {}",
-                selection.note
-            );
-        }
+        let selection = registry().select("opencode");
+        assert_eq!(selection.adapter.id(), "opencode");
+        assert_eq!(selection.level, IntegrationLevel::Structured);
+        assert!(selection.capabilities.subagent_events);
     }
 
     /// The heuristic wording itself, with no dependency on the environment: a
@@ -468,9 +465,9 @@ mod tests {
 
         // And the real multi-command adapter: whatever it finds is the command
         // that was asked for, on a machine with any subset of them installed.
-        let inferred = registry().select("gemini");
-        assert_eq!(inferred.adapter.id(), "terminal-heuristic");
-        if let Some(path) = &inferred.executable {
+        let gemini = registry().select("gemini");
+        assert_eq!(gemini.adapter.id(), "gemini-cli");
+        if let Some(path) = &gemini.executable {
             assert_eq!(
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned()),
