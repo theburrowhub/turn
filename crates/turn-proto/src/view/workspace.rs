@@ -90,6 +90,10 @@ pub struct TemplateSummary {
     /// so choosing a template is an informed decision rather than a surprise —
     /// materialising one launches processes.
     pub commands: Vec<String>,
+    /// Executables from `commands` that the daemon could not resolve on its current PATH.
+    /// Shown before creation so a partially empty desk is never a surprise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_commands: Vec<String>,
     pub name_pattern: Option<String>,
     pub tmux: bool,
     pub created_ms: i64,
@@ -111,6 +115,7 @@ impl TemplateSummary {
                 .iter()
                 .filter_map(|p| p.command.clone())
                 .collect(),
+            missing_commands: Vec::new(),
             name_pattern: template.name_pattern.clone(),
             tmux: template.tmux,
             created_ms: template.created_ms,

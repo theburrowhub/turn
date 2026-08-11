@@ -281,6 +281,19 @@ impl Catalogue {
                 },
                 // ------------------------------------------------------- layout
                 Definition {
+                    key: "templates.default",
+                    area: Area::Layout,
+                    title: "Default layout preset",
+                    description:
+                        "Template id preselected when a Workspace has no default of its own. \
+                                  The Templates section sets this for you; an empty value uses the \
+                                  portable first preset.",
+                    kind: ValueKind::Text,
+                    default: Value::Null,
+                    sensitivity: Sensitivity::Plain,
+                    scopes: GLOBAL_ONLY,
+                },
+                Definition {
                     key: "layout.open_pane_placement",
                     area: Area::Layout,
                     title: "Open Process panes",

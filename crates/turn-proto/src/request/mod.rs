@@ -27,7 +27,8 @@ use turn_core::ids::{
 };
 use turn_core::model::{
     Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind, PanePlacement,
-    PreviewVisibility, RelationshipKind, RestoreBehaviour, TreeFilter, TreeVisibilityMode,
+    PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
+    TreeVisibilityMode,
 };
 use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
@@ -457,6 +458,11 @@ pub enum Request {
 
     // ----------------------------------------------------------------- templates
     ListTemplates,
+    /// Loads the complete editable definition only when an editor asks for it. The ordinary
+    /// list remains a bounded, non-secret summary suitable for pickers.
+    GetTemplate {
+        template_id: TemplateId,
+    },
     /// Creates a reusable layout before any Session exists. The daemon strips
     /// runtime bindings, validates the bounded tree and stores its own Template.
     CreateLayoutTemplate {
@@ -464,6 +470,11 @@ pub enum Request {
         layout: Box<Layout>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+    },
+    /// Creates the complete definition produced by the Template editor. Client-supplied id,
+    /// creation time and built-in ownership are ignored by the daemon.
+    CreateTemplate {
+        template: Box<Template>,
     },
     /// Captures a session's current pane arrangement as a reusable template.
     /// Process bindings are stripped; a template describes what to start.
@@ -474,6 +485,34 @@ pub enum Request {
         description: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hotkey: Option<String>,
+    },
+    /// Replaces one user-owned Template with the complete draft shown in the editor. The
+    /// daemon preserves identity/creation time and refuses attempts to modify a built-in.
+    UpdateTemplate {
+        template_id: TemplateId,
+        template: Box<Template>,
+    },
+    /// Copies a Template without carrying any live process identity.
+    DuplicateTemplate {
+        template_id: TemplateId,
+        name: String,
+    },
+    /// Deletes a user-owned Template. Existing Sessions deliberately keep their own Layout.
+    DeleteTemplate {
+        template_id: TemplateId,
+    },
+    /// Chooses the Template preselected for one Workspace. `None` restores the Global/fallback
+    /// choice rather than copying that choice into every Workspace.
+    SetWorkspaceDefaultTemplate {
+        workspace_id: WorkspaceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template_id: Option<TemplateId>,
+    },
+    /// Applies a Template to a stopped Session. A running Session is refused so changing a
+    /// layout can never become implicit process termination.
+    ApplyTemplateToSession {
+        session_id: SessionId,
+        template_id: TemplateId,
     },
 
     // --------------------------------------------------------------------- panes
@@ -910,8 +949,15 @@ impl Request {
             Request::PrepareContextHandoff { .. } => "prepare_context_handoff",
             Request::DeliverContextHandoff { .. } => "deliver_context_handoff",
             Request::ListTemplates => "list_templates",
+            Request::GetTemplate { .. } => "get_template",
             Request::CreateLayoutTemplate { .. } => "create_layout_template",
+            Request::CreateTemplate { .. } => "create_template",
             Request::SaveLayoutAsTemplate { .. } => "save_layout_as_template",
+            Request::UpdateTemplate { .. } => "update_template",
+            Request::DuplicateTemplate { .. } => "duplicate_template",
+            Request::DeleteTemplate { .. } => "delete_template",
+            Request::SetWorkspaceDefaultTemplate { .. } => "set_workspace_default_template",
+            Request::ApplyTemplateToSession { .. } => "apply_template_to_session",
             Request::SplitPane { .. } => "split_pane",
             Request::CreatePane { .. } => "create_pane",
             Request::ClosePane { .. } => "close_pane",
@@ -1005,9 +1051,15 @@ impl Request {
             Request::DeliverContextHandoff { .. } => "ack",
 
             Request::ListTemplates => "templates",
-            Request::CreateLayoutTemplate { .. } | Request::SaveLayoutAsTemplate { .. } => {
-                "template"
-            }
+            Request::GetTemplate { .. } => "template_details",
+            Request::CreateLayoutTemplate { .. }
+            | Request::CreateTemplate { .. }
+            | Request::SaveLayoutAsTemplate { .. }
+            | Request::UpdateTemplate { .. }
+            | Request::DuplicateTemplate { .. } => "template",
+            Request::DeleteTemplate { .. } => "templates",
+            Request::SetWorkspaceDefaultTemplate { .. } => "workspace",
+            Request::ApplyTemplateToSession { .. } => "session",
 
             // Every pane operation answers with the layout it produced, so the UI
             // re-renders from the daemon's version rather than its own optimistic
@@ -1088,6 +1140,7 @@ impl Request {
                 | Request::GetProcessTree { .. }
                 | Request::GetPreviewHistory { .. }
                 | Request::ListTemplates
+                | Request::GetTemplate { .. }
                 | Request::NextAttention
                 | Request::ListAttention { .. }
                 // Asking for the screen again changes nothing about it: the daemon
@@ -1121,6 +1174,7 @@ impl Request {
             | Request::PrepareContextHandoff { session_id, .. }
             | Request::DeliverContextHandoff { session_id, .. }
             | Request::SaveLayoutAsTemplate { session_id, .. }
+            | Request::ApplyTemplateToSession { session_id, .. }
             | Request::SplitPane { session_id, .. }
             | Request::CreatePane { session_id, .. }
             | Request::ClosePane { session_id, .. }

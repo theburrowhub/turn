@@ -634,13 +634,31 @@ remain the explicit blank/shell path.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `list_templates` | — | `templates` |
+| `get_template` | `template_id` | `template_details` |
 | `create_layout_template` | `name`, `layout`, `description?` | `template` |
+| `create_template` | complete `template` draft | `template` |
 | `save_layout_as_template` | `session_id`, `name`, `description?`, `hotkey?` | `template` |
+| `update_template` | `template_id`, complete `template` draft | `template` |
+| `duplicate_template` | `template_id`, `name` | `template` |
+| `delete_template` | `template_id` | `templates` |
+| `set_workspace_default_template` | `workspace_id`, `template_id?` | `workspace` |
+| `apply_template_to_session` | `session_id`, `template_id` | `session` |
 
 Both creation paths strip process bindings: a template describes what to start, never which
 instance it was captured from. `create_layout_template` is the visual editor path. Its bounded
 Layout is validated and normalised by the daemon before persistence; the client-side Pane ids are
 draft identity only, and every Session instantiation mints a fresh set.
+
+Built-in Templates are immutable but may be duplicated. Rich create/update drafts preserve Layout
+geometry, Pane command/argv/cwd/environment/restore behaviour, Template environment and init actions,
+Attention policy, naming metadata and tmux preference. Client-supplied identity, timestamps, built-in
+ownership and runtime bindings are ignored. `TemplateSummary.missing_commands` names unresolved
+executables using the daemon's PATH so a picker can warn before launch.
+
+Applying refuses a Session that still has a running process; it never turns layout replacement into an
+implicit stop operation. A successful application materialises the complete Template and starts safe
+Pane commands without a second confirmation. Deleting clears Global/Workspace defaults and Session
+references to that Template, but Sessions retain their independently persisted layout and configuration.
 
 ### Panes
 
@@ -963,6 +981,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `session_details` | `details: SessionDetails` |
 | `templates` | `templates: [TemplateSummary]` |
 | `template` | `template: TemplateSummary` |
+| `template_details` | `template: Template` |
 | `layout` | `session_id`, `layout: Layout` |
 | `attached` | `attachment: PaneAttachment` |
 | `screen` | `session_id`, `pane_id`, `node_id?`, `next_seq`, `grid: Grid` |

@@ -89,7 +89,7 @@ impl Core {
         let mut out: Vec<TemplateSummary> = self
             .templates
             .values()
-            .map(TemplateSummary::from_template)
+            .map(|template| self.template_summary(template))
             .collect();
         // Built-ins first, then by name, so the picker is stable between runs.
         out.sort_by(|a, b| {
@@ -98,6 +98,24 @@ impl Core {
                 .then_with(|| a.name.cmp(&b.name))
         });
         out
+    }
+
+    pub(crate) fn template_summary(
+        &self,
+        template: &turn_core::model::Template,
+    ) -> TemplateSummary {
+        let mut summary = TemplateSummary::from_template(template);
+        summary.missing_commands = template
+            .layout
+            .panes()
+            .iter()
+            .filter_map(|pane| pane.command.as_deref())
+            .filter(|command| turn_agents::adapter::which(command).is_none())
+            .map(str::to_string)
+            .collect();
+        summary.missing_commands.sort();
+        summary.missing_commands.dedup();
+        summary
     }
 
     /// A session's process tree in draw order.

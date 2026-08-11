@@ -55,6 +55,7 @@ pub enum Command {
     CloseSession,
     DeleteSession,
     SaveLayoutAsTemplate,
+    ApplyTemplate,
 
     NextAttention,
     ToggleAttentionPanel,
@@ -121,6 +122,7 @@ impl Command {
         Command::LaunchTui,
         Command::PassContext,
         Command::SaveLayoutAsTemplate,
+        Command::ApplyTemplate,
         Command::RenameSession,
         // The Session pair before the Workspace pair, so a search for `archive` or
         // `close` offers the narrower target first: closing a Workspace stops every
@@ -162,6 +164,7 @@ impl Command {
             Command::CloseSession => "session.close",
             Command::DeleteSession => "session.delete",
             Command::SaveLayoutAsTemplate => "layout.saveAsTemplate",
+            Command::ApplyTemplate => "layout.applyTemplate",
             Command::NextAttention => "attention.next",
             Command::ToggleAttentionPanel => "attention.togglePanel",
             Command::SplitHorizontal => "pane.splitHorizontal",
@@ -223,6 +226,7 @@ impl Command {
                 "Delete session — stop it and remove it from Turn for good, your files untouched"
             }
             Command::SaveLayoutAsTemplate => "Save this layout as a template",
+            Command::ApplyTemplate => "Apply a template to this stopped session…",
             Command::NextAttention => "Go to the next session that needs you",
             Command::ToggleAttentionPanel => "Show or hide the attention queue",
             Command::SplitHorizontal => "Split pane left / right",
@@ -275,7 +279,8 @@ impl Command {
             | Command::ArchiveSession
             | Command::CloseSession
             | Command::DeleteSession
-            | Command::SaveLayoutAsTemplate => "Session",
+            | Command::SaveLayoutAsTemplate
+            | Command::ApplyTemplate => "Session",
             Command::NextAttention | Command::ToggleAttentionPanel => "Attention",
             Command::SplitHorizontal
             | Command::SplitVertical

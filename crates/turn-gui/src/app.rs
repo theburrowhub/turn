@@ -27,7 +27,9 @@ use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
 use crate::theme::{AppearanceSettings, Theme};
 use crate::transport::{Ask, DaemonLink};
-use crate::view::{LayoutEditorOrigin, LayoutTemplateDraft, ViewAction, ViewState};
+use crate::view::{
+    LayoutEditorOrigin, LayoutTemplateDraft, SaveTemplateDraft, ViewAction, ViewState,
+};
 
 #[derive(Debug)]
 struct FolderDialogResult {
@@ -243,17 +245,36 @@ impl TurnApp {
             Reaction::TemplateCreated { template_id } => {
                 let origin = self.state.layout_draft.as_ref().map(|draft| draft.origin);
                 self.state.layout_draft = None;
+                self.state.save_template_draft = None;
                 if origin == Some(LayoutEditorOrigin::NewSession) {
                     if let Some(session) = self.state.session_draft.as_mut() {
                         session.template_id = Some(template_id);
                     }
+                } else if origin == Some(LayoutEditorOrigin::Settings) {
+                    self.state.settings_open = true;
                 }
             }
             Reaction::TemplateCreationFailed(message) => {
                 if let Some(draft) = self.state.layout_draft.as_mut() {
                     draft.submitting = false;
+                    draft.error = Some(message.clone());
+                }
+                if let Some(draft) = self.state.save_template_draft.as_mut() {
+                    draft.submitting = false;
                     draft.error = Some(message);
                 }
+            }
+            Reaction::TemplateLoaded(template) => {
+                self.state.layout_draft = Some(LayoutTemplateDraft::from_template(
+                    *template,
+                    LayoutEditorOrigin::Settings,
+                ));
+                self.state.settings_open = false;
+                self.state.template_apply_mode = false;
+            }
+            Reaction::TemplateApplied => {
+                self.state.settings_open = false;
+                self.state.template_apply_mode = false;
             }
             Reaction::ContextHandoffPrepared(handoff) => {
                 if let Some(draft) = self.state.context_handoff.as_mut().filter(|draft| {
@@ -440,6 +461,12 @@ impl TurnApp {
                     .is_some_and(|draft| !draft.submitting)
                 || self
                     .state
+                    .save_template_draft
+                    .as_ref()
+                    .is_some_and(|draft| !draft.submitting)
+                || self.state.delete_template_confirmation.is_some()
+                || self
+                    .state
                     .context_handoff
                     .as_ref()
                     .is_some_and(|draft| !draft.preparing && !draft.delivering)
@@ -456,8 +483,11 @@ impl TurnApp {
                         self.state.layout_draft = None;
                         return Vec::new();
                     }
+                    self.state.save_template_draft = None;
+                    self.state.delete_template_confirmation = None;
                     self.state.shortcuts_open = false;
                     self.state.settings_open = false;
+                    self.state.template_apply_mode = false;
                     self.state.attention_panel_open = false;
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
@@ -617,6 +647,26 @@ impl TurnApp {
             }
             Command::OpenSettings => {
                 self.state.settings_open = !self.state.settings_open;
+                self.state.template_apply_mode = false;
+                true
+            }
+            Command::SaveLayoutAsTemplate => {
+                if let Some(name) = self.desk.selected_session_name() {
+                    self.state.save_template_draft = Some(SaveTemplateDraft::new(name));
+                } else {
+                    self.desk
+                        .show_notice("select a Session before saving its layout as a Template");
+                }
+                true
+            }
+            Command::ApplyTemplate => {
+                if self.desk.selected().is_some() {
+                    self.state.settings_open = true;
+                    self.state.template_apply_mode = true;
+                } else {
+                    self.desk
+                        .show_notice("select a Session before applying a Template");
+                }
                 true
             }
             Command::ToggleAttentionPanel => {
@@ -779,6 +829,9 @@ impl eframe::App for TurnApp {
                     self.state.workspace_draft = None;
                     self.state.session_draft = None;
                     self.state.layout_draft = None;
+                    self.state.save_template_draft = None;
+                    self.state.delete_template_confirmation = None;
+                    self.state.template_apply_mode = false;
                     self.state.lifecycle_confirmation = None;
                     self.state.context_handoff = None;
                     self.pending_folder_request = None;

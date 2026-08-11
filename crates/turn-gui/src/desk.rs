@@ -86,7 +86,9 @@ pub enum Reaction {
     TemplateCreated {
         template_id: TemplateId,
     },
+    TemplateLoaded(Box<turn_core::model::Template>),
     TemplateCreationFailed(String),
+    TemplateApplied,
     ContextHandoffPrepared(ContextHandoffView),
     ContextHandoffDelivered {
         handoff_id: HandoffId,
@@ -262,6 +264,10 @@ impl Desk {
 
     pub fn selected(&self) -> Option<&SessionId> {
         self.selected.as_ref()
+    }
+
+    pub fn selected_session_name(&self) -> Option<&str> {
+        self.selected_summary().map(|session| session.name.as_str())
     }
 
     pub fn hierarchy(&self) -> Option<&HierarchySnapshot> {
@@ -443,13 +449,23 @@ impl Desk {
     }
 
     fn preferred_template(&self, workspace_id: &WorkspaceId) -> Option<&TemplateSummary> {
-        let configured = self
+        let workspace_default = self
             .workspaces
             .iter()
             .find(|workspace| &workspace.id == workspace_id)
             .and_then(|workspace| workspace.default_template.as_ref());
-        configured
+        let global_default = self
+            .settings()
+            .and_then(|settings| settings.entry(crate::view::DEFAULT_TEMPLATE_KEY))
+            .and_then(|entry| entry.resolution.value.as_str())
+            .map(TemplateId::from_stored);
+        workspace_default
             .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            .or_else(|| {
+                global_default
+                    .as_ref()
+                    .and_then(|id| self.templates.iter().find(|template| &template.id == id))
+            })
             .or_else(|| self.templates.first())
     }
 
@@ -1128,6 +1144,14 @@ impl Desk {
                 self.templates = templates;
                 Vec::new()
             }
+            (Ask::TemplateDetails(expected), Response::TemplateDetails { template }) => {
+                if template.id != expected {
+                    return vec![Reaction::Notice(
+                        "the daemon returned a different Template to the editor".into(),
+                    )];
+                }
+                vec![Reaction::TemplateLoaded(template)]
+            }
             // A Workspace or Template write can affect several Sessions, so its immediate
             // response may intentionally contain only Global plus that owner. Never replace
             // the selected Session's complete sheet with that narrower view: ask the daemon
@@ -1200,6 +1224,22 @@ impl Desk {
                 reactions.extend(self.select(session_id.clone()));
                 reactions.push(Reaction::SessionCreated { session_id });
                 reactions
+            }
+            (Ask::ApplyTemplate(session_id), Response::Session { session }) => {
+                if session.id != session_id {
+                    return vec![Reaction::Notice(
+                        "the daemon applied the Template to a different Session".into(),
+                    )];
+                }
+                self.upsert_session(*session);
+                vec![
+                    self.hierarchy_request(),
+                    Reaction::Send {
+                        ask: Ask::Details(session_id.clone()),
+                        request: Request::GetSession { session_id },
+                    },
+                    Reaction::TemplateApplied,
+                ]
             }
             (_, Response::Session { session }) => {
                 self.upsert_session(*session);
@@ -2786,18 +2826,7 @@ impl Desk {
             // These open window-local sheets in `TurnApp`; the Desk never invents form
             // values or silently picks a Template for the non-quick path.
             Command::NewWorkspace | Command::NewSession => Vec::new(),
-            Command::SaveLayoutAsTemplate => match session {
-                Some(session_id) => vec![Reaction::Send {
-                    ask: Ask::Action("saving the layout as a template"),
-                    request: Request::SaveLayoutAsTemplate {
-                        session_id,
-                        name: format!("Layout {}", self.templates.len() + 1),
-                        description: None,
-                        hotkey: None,
-                    },
-                }],
-                None => Vec::new(),
-            },
+            Command::SaveLayoutAsTemplate | Command::ApplyTemplate => Vec::new(),
             Command::RenameSession => match (session, self.selected_summary()) {
                 (Some(session_id), Some(summary)) => {
                     let name = format!("{} (renamed)", summary.name);
@@ -3440,6 +3469,76 @@ impl Desk {
                     name,
                     layout: Box::new(layout),
                     description: Some("Created in Turn's visual layout editor".into()),
+                },
+            }],
+            ViewAction::SaveSessionAsTemplate { name, description } => self
+                .selected
+                .clone()
+                .map(|session_id| Reaction::Send {
+                    ask: Ask::CreateTemplate,
+                    request: Request::SaveLayoutAsTemplate {
+                        session_id,
+                        name,
+                        description,
+                        hotkey: None,
+                    },
+                })
+                .into_iter()
+                .collect(),
+            ViewAction::SaveTemplateDefinition {
+                template_id,
+                template,
+            } => vec![Reaction::Send {
+                ask: Ask::CreateTemplate,
+                request: match template_id {
+                    Some(template_id) => Request::UpdateTemplate {
+                        template_id,
+                        template,
+                    },
+                    None => Request::CreateTemplate { template },
+                },
+            }],
+            ViewAction::EditTemplate { template_id } => vec![Reaction::Send {
+                ask: Ask::TemplateDetails(template_id.clone()),
+                request: Request::GetTemplate { template_id },
+            }],
+            ViewAction::DuplicateTemplate { template_id, name } => vec![Reaction::Send {
+                ask: Ask::CreateTemplate,
+                request: Request::DuplicateTemplate { template_id, name },
+            }],
+            ViewAction::DeleteTemplate { template_id } => vec![Reaction::Send {
+                ask: Ask::Action("deleting the layout preset"),
+                request: Request::DeleteTemplate { template_id },
+            }],
+            ViewAction::SetGlobalDefaultTemplate { template_id } => vec![Reaction::Send {
+                ask: Ask::WriteSetting {
+                    key: crate::view::DEFAULT_TEMPLATE_KEY.into(),
+                },
+                request: Request::SetSetting {
+                    scope: turn_core::settings::Scope::Global,
+                    owner_id: None,
+                    key: crate::view::DEFAULT_TEMPLATE_KEY.into(),
+                    value: serde_json::Value::String(template_id.as_str().to_string()),
+                },
+            }],
+            ViewAction::SetWorkspaceDefaultTemplate {
+                workspace_id,
+                template_id,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("setting the Workspace layout preset"),
+                request: Request::SetWorkspaceDefaultTemplate {
+                    workspace_id,
+                    template_id,
+                },
+            }],
+            ViewAction::ApplyTemplateToSession {
+                session_id,
+                template_id,
+            } => vec![Reaction::Send {
+                ask: Ask::ApplyTemplate(session_id.clone()),
+                request: Request::ApplyTemplateToSession {
+                    session_id,
+                    template_id,
                 },
             }],
             ViewAction::ReleaseWorkspaceLease {
@@ -7334,6 +7433,180 @@ mod tests {
         assert!(
             desk.view(T0).notice.is_none(),
             "retrying must clear a stale creation failure"
+        );
+    }
+
+    #[test]
+    fn every_template_ui_action_maps_to_an_explicit_daemon_operation() {
+        let (session, _, _) = session_with_agent("Template target");
+        let session_id = session.id.clone();
+        let workspace_id = session.workspace_id.clone();
+        let template = Template::from_layout("UI draft", &session.layout, T0);
+        let template_id = template.id.clone();
+        let mut desk = Desk::new();
+        desk.sessions.push(summary(&session, 0));
+        desk.selected = Some(session_id.clone());
+
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::SaveSessionAsTemplate {
+                    name: "Renamed capture".into(),
+                    description: Some("Named before saving".into()),
+                },
+                T0,
+            )),
+            vec![Request::SaveLayoutAsTemplate {
+                session_id: session_id.clone(),
+                name: "Renamed capture".into(),
+                description: Some("Named before saving".into()),
+                hotkey: None,
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::SaveTemplateDefinition {
+                    template_id: None,
+                    template: Box::new(template.clone()),
+                },
+                T0,
+            )),
+            vec![Request::CreateTemplate {
+                template: Box::new(template.clone())
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::SaveTemplateDefinition {
+                    template_id: Some(template_id.clone()),
+                    template: Box::new(template.clone()),
+                },
+                T0,
+            )),
+            vec![Request::UpdateTemplate {
+                template_id: template_id.clone(),
+                template: Box::new(template.clone()),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::DuplicateTemplate {
+                    template_id: template_id.clone(),
+                    name: "UI draft copy".into(),
+                },
+                T0,
+            )),
+            vec![Request::DuplicateTemplate {
+                template_id: template_id.clone(),
+                name: "UI draft copy".into(),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::SetWorkspaceDefaultTemplate {
+                    workspace_id: workspace_id.clone(),
+                    template_id: Some(template_id.clone()),
+                },
+                T0,
+            )),
+            vec![Request::SetWorkspaceDefaultTemplate {
+                workspace_id,
+                template_id: Some(template_id.clone()),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::SetGlobalDefaultTemplate {
+                    template_id: template_id.clone(),
+                },
+                T0,
+            )),
+            vec![Request::SetSetting {
+                scope: turn_core::settings::Scope::Global,
+                owner_id: None,
+                key: crate::view::DEFAULT_TEMPLATE_KEY.into(),
+                value: serde_json::Value::String(template_id.as_str().into()),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::ApplyTemplateToSession {
+                    session_id: session_id.clone(),
+                    template_id: template_id.clone(),
+                },
+                T0,
+            )),
+            vec![Request::ApplyTemplateToSession {
+                session_id,
+                template_id: template_id.clone(),
+            }]
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::DeleteTemplate {
+                    template_id: template_id.clone(),
+                },
+                T0,
+            )),
+            vec![Request::DeleteTemplate { template_id }]
+        );
+    }
+
+    #[test]
+    fn a_workspace_template_default_overrides_the_global_template_default() {
+        let global = Template::from_layout(
+            "Global choice",
+            &turn_core::model::Layout::single(turn_core::model::Pane::new(PaneKind::Shell)),
+            T0,
+        );
+        let workspace_choice = Template::two_shells(T0);
+        let mut workspace = Workspace::new("turn", "/repo/turn", T0);
+        let workspace_id = workspace.id.clone();
+        let catalogue = turn_core::settings::Catalogue::built_in();
+        let definition = catalogue
+            .get(crate::view::DEFAULT_TEMPLATE_KEY)
+            .expect("the Global Template default setting");
+        let settings = turn_proto::SettingsView {
+            session_id: None,
+            levels: vec![turn_proto::SettingsLevel::global()],
+            entries: vec![turn_proto::SettingsEntry {
+                resolution: turn_core::settings::Resolution {
+                    key: crate::view::DEFAULT_TEMPLATE_KEY.into(),
+                    value: serde_json::Value::String(global.id.as_str().into()),
+                    origin: Some(turn_core::settings::Scope::Global),
+                    shadowed: Vec::new(),
+                    sensitivity: definition.sensitivity,
+                },
+                default_value: definition.default.clone(),
+                area: definition.area,
+                area_title: definition.area.title().into(),
+                title: definition.title.into(),
+                description: definition.description.into(),
+                accepts: definition.kind.describe(),
+                control: turn_proto::SettingsControl::from_kind(&definition.kind),
+                settable_at: definition.scopes.to_vec(),
+                hidden: false,
+                known: true,
+            }],
+        };
+        let mut desk = Desk::new();
+        desk.templates = vec![
+            TemplateSummary::from_template(&workspace_choice),
+            TemplateSummary::from_template(&global),
+        ];
+        desk.settings = Some(Box::new(settings));
+        desk.workspaces = vec![WorkspaceSummary::from_workspace(&workspace, &[])];
+
+        assert_eq!(
+            desk.preferred_template(&workspace_id)
+                .map(|template| &template.id),
+            Some(&global.id)
+        );
+        workspace.default_template = Some(workspace_choice.id.clone());
+        desk.workspaces = vec![WorkspaceSummary::from_workspace(&workspace, &[])];
+        assert_eq!(
+            desk.preferred_template(&workspace_id)
+                .map(|template| &template.id),
+            Some(&workspace_choice.id)
         );
     }
 

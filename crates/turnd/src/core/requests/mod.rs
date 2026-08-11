@@ -318,17 +318,35 @@ impl Core {
             Request::ListTemplates => Ok(Response::Templates {
                 templates: self.template_summaries(),
             }),
+            Request::GetTemplate { template_id } => self.get_template(&template_id),
             Request::CreateLayoutTemplate {
                 name,
                 layout,
                 description,
             } => self.create_layout_template(name, *layout, description, now_ms),
+            Request::CreateTemplate { template } => self.create_template(*template, now_ms),
             Request::SaveLayoutAsTemplate {
                 session_id,
                 name,
                 description,
                 hotkey,
             } => self.save_layout_as_template(&session_id, name, description, hotkey, now_ms),
+            Request::UpdateTemplate {
+                template_id,
+                template,
+            } => self.update_template(&template_id, *template),
+            Request::DuplicateTemplate { template_id, name } => {
+                self.duplicate_template(&template_id, name, now_ms)
+            }
+            Request::DeleteTemplate { template_id } => self.delete_template(&template_id, now_ms),
+            Request::SetWorkspaceDefaultTemplate {
+                workspace_id,
+                template_id,
+            } => self.set_workspace_default_template(&workspace_id, template_id, now_ms),
+            Request::ApplyTemplateToSession {
+                session_id,
+                template_id,
+            } => self.apply_template_to_session(&session_id, &template_id, now_ms),
 
             // --------------------------------------------------------------- panes
             Request::SplitPane {
