@@ -378,11 +378,25 @@ impl Catalogue {
                     scopes: EVERYWHERE,
                 },
                 Definition {
+                    key: "appearance.contrast",
+                    area: Area::Appearance,
+                    title: "Contrast",
+                    description: "Standard keeps Turn's dense palette. High raises text and \
+                                  control boundaries to accessible contrast. An empty value \
+                                  follows Increase Contrast on macOS.",
+                    kind: ValueKind::Choice {
+                        options: &["standard", "high"],
+                    },
+                    default: Value::Null,
+                    sensitivity: Sensitivity::Plain,
+                    scopes: GLOBAL_ONLY,
+                },
+                Definition {
                     key: "appearance.reduced_motion",
                     area: Area::Appearance,
                     title: "Reduce motion",
-                    description: "Stops Turn's own animation and cursor blink. Follows the \
-                                  operating system when unset.",
+                    description: "Stops Turn's own animation and cursor blink. An empty value \
+                                  follows Reduce Motion on macOS.",
                     kind: ValueKind::Bool,
                     default: Value::Null,
                     sensitivity: Sensitivity::Plain,

@@ -103,6 +103,19 @@ performance-acceptance: ## Measure the 30-Session/100-Process envelope without o
 	$(CARGO) test -p turnd thirty_sessions_keep_active_and_background_preview_cadence_bounded --lib -- --test-threads=1
 	$(CARGO) test -p turn-gui --test performance -- --nocapture --test-threads=1
 
+.PHONY: accessibility-acceptance
+accessibility-acceptance: ## Reproduce zoom, motion, contrast, AccessKit and IME acceptance without opening a window
+	$(CARGO) test -p turn-gui theme::tests --lib -- --test-threads=1
+	$(CARGO) test -p turn-gui terminal::tests::a_compo --lib -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots accessibility_ -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots every_hierarchy_level_is_a_reachable_tree_item -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots maximum_zoom_keeps_the_minimum_window_navigable -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots reduced_motion_keeps_loading_static_and_allows_the_window_to_settle -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots the_command_palette_lists_commands_with_their_shortcuts -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots closing_a_modal_returns_accessibility_focus_to_the_selected_tree_row -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots the_custom_pane_editor_is_a_named_modal_dialog -- --test-threads=1
+	$(CARGO) test -p turn-gui --test snapshots a_write_lease_conflict_offers_only_explicit_safe_alternatives -- --test-threads=1
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

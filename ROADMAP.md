@@ -320,7 +320,10 @@ and the Attention Queue is an explicit overlay with open/snooze/mute/priority/di
 policies are editable per field through Global → Workspace → Template → Session settings; OS sound,
 notification and user-configured custom actions all cross a tested UI boundary. GPU snapshots render
 the real widget tree and AccessKit tests require `Tree`/`TreeItem` semantics with no duplicate `ListItem`
-navigator.
+navigator. Named modal Dialog/AlertDialog nodes constrain focus; separate live regions announce
+connection, application state, selection, pane focus and attention. High contrast is measured, reduced
+motion removes transitions/spinners/cursor blink, macOS preferences are inherited live when unset, and
+the 300% zoom/native-minimum layout retains both hierarchy and terminal access.
 
 **What is verified.** The cell model against a real `vt100` stream, including the cases that are easy to get
 silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
@@ -335,8 +338,9 @@ tests, including 62 committed PNG baselines such as `a_busy_desk_with_a_pending_
 `an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
-**What is not.** IME sign-off remains. Snapshot baselines are native GPU output and still need platform CI
-coverage. No manual authenticated Claude session has been accepted.
+**What is not.** Packaged VoiceOver, Orca and input-method checklist runs remain. Snapshot baselines are
+native GPU output and still need platform CI coverage. No manual authenticated Claude session has been
+accepted.
 
 **Exit criterion.** The automated first-vertical form is met. Human live-CLI acceptance remains open.
 
@@ -589,9 +593,13 @@ work rather than a platform service.
 
 *Mitigated by:* `eframe` built with AccessKit and automated tests that require the unified navigator to
 expose one `Tree`, reachable `TreeItem`s at every hierarchy level and no duplicate legacy `ListItem`
-navigator. State and confidence are included in accessible names rather than encoded only by colour.
-*Still missing:* manual VoiceOver/Orca acceptance and complete terminal IME composition tests. Structural
-AccessKit coverage is necessary but does not prove the whole assistive-technology workflow. Both were free
+navigator. State and confidence have words/glyphs in addition to colour; live regions separate state,
+selection, pane focus and attention; custom sheets expose modal Dialog/AlertDialog roles. A measured
+high-contrast palette, desktop-aware reduced motion, 300% zoom acceptance and terminal commit/preedit tests
+are reproduced by `make accessibility-acceptance`.
+*Still missing:* recorded packaged VoiceOver/Orca and real input-method runs from
+`docs/ACCESSIBILITY_ACCEPTANCE.md`. Structural AccessKit and deterministic IME coverage are necessary but
+do not prove the current platform bridge and assistive-technology releases end to end. Both were free
 before and are now Turn's maintenance responsibility.
 
 ### 3. Memory and throughput at the design point are unmeasured

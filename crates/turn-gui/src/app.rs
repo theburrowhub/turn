@@ -26,7 +26,7 @@ use crate::companion::{CompanionEvent, CompanionMonitor};
 use crate::desk::{Desk, Reaction};
 use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
-use crate::theme::{AppearanceSettings, Theme};
+use crate::theme::{AppearanceSettings, SystemAccessibility, Theme};
 use crate::transport::{Ask, DaemonLink, Inbound};
 use crate::view::{
     LayoutEditorOrigin, LayoutTemplateDraft, SaveTemplateDraft, ViewAction, ViewState,
@@ -599,7 +599,10 @@ impl TurnApp {
         let Some(settings) = self.desk.settings() else {
             return;
         };
-        let appearance = AppearanceSettings::from_view(Some(settings));
+        let appearance = AppearanceSettings::from_view_with_system(
+            Some(settings),
+            SystemAccessibility::detect(),
+        );
         if self.applied_appearance.as_ref() == Some(&appearance) {
             return;
         }
@@ -921,6 +924,9 @@ impl eframe::App for TurnApp {
         self.observe_activity(&ctx, now_ms);
 
         // 3. Keystrokes: the sheets first, then the keymap.
+        let modal_was_open = self.state.is_sensitive()
+            || self.desk.write_conflict().is_some()
+            || self.desk.link_confirmation().is_some();
         let mut commands = self.steer_overlays(&ctx);
         // Modal sheets own the keyboard. Resolving the global keymap behind them could
         // otherwise stop a process, archive a Session, or open another sheet while a
@@ -964,6 +970,8 @@ impl eframe::App for TurnApp {
                     self.state.close_turn = None;
                     self.pending_folder_request = None;
                     self.state.workspace_picker_pending = false;
+                    self.state.tree_has_focus = true;
+                    self.state.request_tree_focus = true;
                 }
                 ViewAction::ChooseWorkspaceDirectory => {
                     self.open_workspace_directory_chooser(&ctx, frame);
@@ -1015,6 +1023,17 @@ impl eframe::App for TurnApp {
             for reaction in self.desk.apply_hierarchy_action(action) {
                 self.perform(&ctx, reaction);
             }
+        }
+        self.state.write_conflict_open = self.desk.write_conflict().is_some();
+        let modal_is_open = self.state.is_sensitive()
+            || self.desk.write_conflict().is_some()
+            || self.desk.link_confirmation().is_some();
+        if modal_was_open && !modal_is_open {
+            // Custom modal contents disappear as a group, so their last focused widget
+            // disappears too. Return to the one persistent navigator instead of leaving
+            // keyboard and screen-reader focus on a dead id.
+            self.state.tree_has_focus = true;
+            self.state.request_tree_focus = true;
         }
 
         // 5. The activity report, on a change and not on a timer.
@@ -1559,6 +1578,8 @@ mod tests {
                         ("appearance.cursor", serde_json::json!("bar")),
                         ("appearance.cursor_blink", serde_json::json!(false)),
                         ("appearance.ligatures", serde_json::json!(true)),
+                        ("appearance.contrast", serde_json::json!("high")),
+                        ("appearance.reduced_motion", serde_json::json!(true)),
                     ])),
                 }),
             },
@@ -1576,6 +1597,8 @@ mod tests {
         assert_eq!(app.theme.cursor_style, crate::theme::CursorStyle::Bar);
         assert!(!app.theme.cursor_blink);
         assert!(app.theme.ligatures);
+        assert_eq!(app.theme.contrast, crate::theme::ContrastMode::High);
+        assert!(app.theme.reduced_motion);
         assert_eq!(ctx.zoom_factor(), 1.5);
     }
 
