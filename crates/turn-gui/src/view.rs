@@ -108,6 +108,8 @@ pub struct PendingPermission {
     pub command: Option<String>,
     pub cwd: String,
     pub tool: String,
+    pub agent: String,
+    pub process: String,
     pub risk: Risk,
     pub blocked_secs: u64,
     /// True when a heuristic inferred this rather than a hook reporting it.
@@ -126,6 +128,7 @@ pub struct QueueItem {
     /// A snoozed demand is still listed — hiding it would make a snooze feel like a
     /// deletion — and drawn as unavailable.
     pub actionable: bool,
+    pub priority_boost: i16,
 }
 
 impl QueueItem {
@@ -1005,6 +1008,10 @@ pub enum ViewAction {
     SnoozeAttention {
         attention_id: AttentionId,
         until_ms: i64,
+    },
+    SetAttentionPriority {
+        attention_id: AttentionId,
+        priority_boost: i16,
     },
     MuteAttentionSession {
         session_id: SessionId,
@@ -3958,7 +3965,7 @@ impl<'a> TurnView<'a> {
             Risk::Medium => (theme.attention, "MEDIUM RISK"),
             Risk::Low => (theme.text_dim, "LOW RISK"),
         };
-        let height = 132.0;
+        let height = 148.0;
         let rect = Rect::from_min_size(
             ui.available_rect_before_wrap().min,
             Vec2::new(ui.available_width(), height),
@@ -3999,6 +4006,11 @@ impl<'a> TurnView<'a> {
                 }
                 ui.label(
                     RichText::new(format!("in {}   ·   tool: {}", p.cwd, p.tool))
+                        .color(theme.text_dim)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(format!("Agent: {}   ·   Process: {}", p.agent, p.process))
                         .color(theme.text_dim)
                         .small(),
                 );
@@ -6150,6 +6162,23 @@ impl<'a> TurnView<'a> {
                                         until_ms: Some(self.now_ms.saturating_add(MUTE_MS)),
                                     });
                                 }
+                                if ui.button("Priority −").clicked() {
+                                    actions.push(ViewAction::SetAttentionPriority {
+                                        attention_id: item.attention_id.clone(),
+                                        priority_boost: item.priority_boost.saturating_sub(10).max(-100),
+                                    });
+                                }
+                                ui.label(
+                                    RichText::new(format!("{:+}", item.priority_boost))
+                                        .monospace()
+                                        .color(theme.text_dim),
+                                );
+                                if ui.button("Priority +").clicked() {
+                                    actions.push(ViewAction::SetAttentionPriority {
+                                        attention_id: item.attention_id.clone(),
+                                        priority_boost: item.priority_boost.saturating_add(10).min(100),
+                                    });
+                                }
                                 if ui.button("Dismiss").clicked() {
                                     actions.push(ViewAction::DismissAttention(
                                         item.attention_id.clone(),
@@ -8263,48 +8292,6 @@ impl<'a> TurnView<'a> {
                                 ui.add_space(6.0);
                             }
                         });
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.label(
-                        RichText::new("Current Session attention")
-                            .color(theme.text)
-                            .strong(),
-                    );
-            match &self.policy {
-                Some(policy) => {
-                    // Shown, not edited here: the policy belongs to the session and the
-                    // daemon owns it. Displaying it read-only is honest; a control that
-                    // pretended to change it would not be.
-                    ui.label(
-                        RichText::new("Attention policy for this session")
-                            .color(theme.text_dim)
-                            .small(),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "never interrupt while typing: {}",
-                            policy.do_not_interrupt_while_typing
-                        ))
-                        .monospace()
-                        .color(theme.text),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "focus only when idle: {}",
-                            policy.focus_only_if_idle
-                        ))
-                        .monospace()
-                        .color(theme.text),
-                    );
-                }
-                None => {
-                    ui.label(
-                        RichText::new("select a session to see its attention policy")
-                            .color(theme.text_faint)
-                            .small(),
-                    );
-                }
-            }
             });
         });
         actions
@@ -8396,6 +8383,33 @@ fn settings_control(
                         }
                     }
                 });
+        }
+        SettingsControl::MultiChoice { options } => {
+            let selected = editing_value.as_array().cloned().unwrap_or_default();
+            let selected_strings = selected
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            ui.vertical(|ui| {
+                for option in options {
+                    let mut enabled = selected_strings.contains(option);
+                    let response = ui.checkbox(&mut enabled, option.replace('_', " "));
+                    if response.changed() {
+                        let mut next = selected_strings.clone();
+                        if enabled {
+                            if !next.contains(option) {
+                                next.push(option.clone());
+                            }
+                        } else {
+                            next.retain(|value| value != option);
+                        }
+                        actions.push(set(serde_json::Value::Array(
+                            next.into_iter().map(serde_json::Value::String).collect(),
+                        )));
+                    }
+                }
+            });
         }
         SettingsControl::Text | SettingsControl::TextList | SettingsControl::TextMap => {
             // The stored value as text the user can edit, and back again on commit. One
@@ -8540,7 +8554,10 @@ fn describe_control(response: &Response, role: egui::accesskit::Role, label: &st
 fn settings_text_of(value: &serde_json::Value, control: &turn_proto::SettingsControl) -> String {
     use turn_proto::SettingsControl;
     match (control, value) {
-        (SettingsControl::TextList, serde_json::Value::Array(items)) => items
+        (
+            SettingsControl::TextList | SettingsControl::MultiChoice { .. },
+            serde_json::Value::Array(items),
+        ) => items
             .iter()
             .filter_map(|item| item.as_str())
             .collect::<Vec<_>>()
@@ -8569,14 +8586,16 @@ fn settings_value_of(typed: &str, control: &turn_proto::SettingsControl) -> serd
         return serde_json::Value::Null;
     }
     match control {
-        SettingsControl::TextList => serde_json::Value::Array(
-            typed
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| serde_json::Value::String(line.to_string()))
-                .collect(),
-        ),
+        SettingsControl::TextList | SettingsControl::MultiChoice { .. } => {
+            serde_json::Value::Array(
+                typed
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::Value::String(line.to_string()))
+                    .collect(),
+            )
+        }
         SettingsControl::TextMap => {
             let mut pairs = serde_json::Map::new();
             for line in typed.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -10585,6 +10604,7 @@ mod tests {
                 summary: None,
                 provisional: false,
                 actionable: true,
+                priority_boost: 0,
             };
             assert!(!item.reason_label().is_empty(), "{reason:?} has no word");
         }

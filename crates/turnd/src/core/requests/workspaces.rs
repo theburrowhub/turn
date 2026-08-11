@@ -266,6 +266,26 @@ impl Core {
         }
 
         self.store.workspaces().delete(id).map_err(store)?;
+        if let Err(error) = self
+            .store
+            .setting_layers()
+            .forget_owner(turn_core::settings::Scope::Workspace, id.as_str())
+        {
+            tracing::warn!(%error, workspace = %id, "could not remove obsolete Workspace settings");
+        }
+        // A failed per-Session cleanup above cannot leave an active row after the Workspace
+        // deletion cascades through SQLite, but its key/value preferences have no foreign key.
+        // Remove those inert owners here as a final best-effort sweep.
+        for session in &sessions {
+            let _ = self
+                .store
+                .settings()
+                .remove(&crate::core::attention::mute_setting_key(session));
+            let _ = self
+                .store
+                .setting_layers()
+                .forget_owner(turn_core::settings::Scope::Session, session.as_str());
+        }
         self.workspaces.remove(id);
         tracing::info!(workspace = %id, %name, sessions = sessions.len(), "deleted");
         self.bump_hierarchy();

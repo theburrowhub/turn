@@ -23,6 +23,7 @@
 use super::Answer;
 use crate::core::Core;
 use serde_json::Value;
+use turn_core::attention::{Action, AttentionPolicy, Sound};
 use turn_core::ids::{SessionId, TemplateId, WorkspaceId};
 use turn_core::settings::{Catalogue, Layer, Refusal, Resolution, Scope, Settings};
 use turn_proto::{ErrorCode, ProtoError, Response, SettingsEntry, SettingsLevel, SettingsView};
@@ -114,6 +115,103 @@ impl Core {
         let levels = self.settings_levels(session_id).unwrap_or_default();
         let layers = self.settings_layers(&levels).unwrap_or_default();
         Settings::new(&catalogue, layers.iter()).resolve(key).value
+    }
+
+    /// The live Attention policy for a Session.
+    ///
+    /// Old Session documents contain a complete policy snapshot because that was the only
+    /// representation before policies became editable. It remains the fallback for keys with
+    /// no stored setting, preserving those Sessions exactly. Each setting with an opinion is
+    /// then overlaid independently through Global → Workspace → Template → Session, so a
+    /// narrower change does not freeze the rest of the inherited policy.
+    pub(crate) fn attention_policy_for_session(&self, session_id: &SessionId) -> AttentionPolicy {
+        let Some(session) = self.sessions.get(session_id) else {
+            return AttentionPolicy::default();
+        };
+        let mut policy = session.attention.clone();
+        let built_in = AttentionPolicy::default();
+        let levels = self.settings_levels(Some(session_id)).unwrap_or_default();
+        let layers = self.settings_layers(&levels).unwrap_or_default();
+        let catalogue = self.settings_catalogue();
+        let settings = Settings::new(&catalogue, layers.iter());
+
+        apply_actions(
+            &settings,
+            "attention.on_turn_complete",
+            &mut policy.on_turn_complete,
+            &built_in.on_turn_complete,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_question",
+            &mut policy.on_question,
+            &built_in.on_question,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_permission_required",
+            &mut policy.on_permission_required,
+            &built_in.on_permission_required,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_task_complete",
+            &mut policy.on_task_complete,
+            &built_in.on_task_complete,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_failure",
+            &mut policy.on_failure,
+            &built_in.on_failure,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_waiting_for_user",
+            &mut policy.on_waiting_for_user,
+            &built_in.on_waiting_for_user,
+        );
+        apply_actions(
+            &settings,
+            "attention.on_subagent_appeared",
+            &mut policy.on_subagent_appeared,
+            &built_in.on_subagent_appeared,
+        );
+        apply_bool(
+            &settings,
+            "attention.do_not_interrupt_while_typing",
+            &mut policy.do_not_interrupt_while_typing,
+            built_in.do_not_interrupt_while_typing,
+        );
+        apply_bool(
+            &settings,
+            "attention.focus_only_if_idle",
+            &mut policy.focus_only_if_idle,
+            built_in.focus_only_if_idle,
+        );
+        if let Some(value) = opinion(&settings, "attention.cooldown_seconds") {
+            policy.cooldown_seconds = value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(built_in.cooldown_seconds);
+        }
+        if let Some(value) = opinion(&settings, "attention.sound") {
+            policy.sound = serde_json::from_value::<Sound>(value).unwrap_or(built_in.sound);
+        }
+        if let Some(value) = opinion(&settings, "attention.custom_command") {
+            policy.custom_command = value
+                .as_str()
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(str::to_string);
+        }
+        if let Some(value) = opinion(&settings, "attention.priority_boost") {
+            policy.priority_boost = value
+                .as_i64()
+                .and_then(|value| i16::try_from(value).ok())
+                .unwrap_or(built_in.priority_boost);
+        }
+        policy
     }
 
     /// The levels that exist for this Session, weakest first.
@@ -277,6 +375,28 @@ impl Core {
     }
 }
 
+fn opinion(settings: &Settings<'_>, key: &str) -> Option<Value> {
+    let resolution = settings.resolve(key);
+    resolution.origin.map(|_| resolution.value)
+}
+
+fn apply_actions(
+    settings: &Settings<'_>,
+    key: &str,
+    target: &mut Vec<Action>,
+    built_in: &[Action],
+) {
+    if let Some(value) = opinion(settings, key) {
+        *target = serde_json::from_value(value).unwrap_or_else(|_| built_in.to_vec());
+    }
+}
+
+fn apply_bool(settings: &Settings<'_>, key: &str, target: &mut bool, built_in: bool) {
+    if let Some(value) = opinion(settings, key) {
+        *target = value.as_bool().unwrap_or(built_in);
+    }
+}
+
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
     let first = values.next()?;
     values.next().is_none().then_some(first)
@@ -366,7 +486,9 @@ mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use serde_json::json;
+    use turn_core::attention::Action;
     use turn_core::ids::PaneId;
+    use turn_core::model::Template;
     use turn_proto::ErrorCode;
 
     const T0: i64 = 1_700_000_000_000;
@@ -376,6 +498,101 @@ mod tests {
             Response::Settings { settings } => *settings,
             other => panic!("expected settings, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn attention_policy_resolves_all_four_persistent_levels_and_sessions_can_differ() {
+        let mut harness = Harness::new().await;
+        let first = SessionId::from_stored("sess_attention_layers_first");
+        let second = SessionId::from_stored("sess_attention_layers_second");
+        harness.add_session(first.clone(), PaneId::new(), T0);
+        harness.add_session(second.clone(), PaneId::new(), T0 + 1);
+        let workspace_id = harness.core.sessions[&first].workspace_id.clone();
+
+        harness
+            .core
+            .set_setting(
+                Scope::Global,
+                None,
+                "attention.on_question".into(),
+                json!(["badge"]),
+                T0 + 2,
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .core
+                .attention_policy_for_session(&first)
+                .on_question,
+            vec![Action::Badge]
+        );
+
+        harness
+            .core
+            .set_setting(
+                Scope::Workspace,
+                Some(workspace_id.as_str().to_string()),
+                "attention.on_question".into(),
+                json!(["notify"]),
+                T0 + 3,
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .core
+                .attention_policy_for_session(&first)
+                .on_question,
+            vec![Action::Notify]
+        );
+
+        let template = Template::blank(T0);
+        let template_id = template.id.clone();
+        harness.core.store.templates().save(&template).unwrap();
+        harness.core.templates.insert(template_id.clone(), template);
+        harness.core.sessions.get_mut(&first).unwrap().template_id = Some(template_id.clone());
+        harness
+            .core
+            .set_setting(
+                Scope::Template,
+                Some(template_id.as_str().to_string()),
+                "attention.on_question".into(),
+                json!(["sound"]),
+                T0 + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .core
+                .attention_policy_for_session(&first)
+                .on_question,
+            vec![Action::Sound]
+        );
+
+        harness
+            .core
+            .set_setting(
+                Scope::Session,
+                Some(first.as_str().to_string()),
+                "attention.on_question".into(),
+                json!(["enqueue", "custom"]),
+                T0 + 5,
+            )
+            .unwrap();
+        assert_eq!(
+            harness
+                .core
+                .attention_policy_for_session(&first)
+                .on_question,
+            vec![Action::Enqueue, Action::Custom]
+        );
+        assert_eq!(
+            harness
+                .core
+                .attention_policy_for_session(&second)
+                .on_question,
+            vec![Action::Notify],
+            "the other Session keeps the Workspace policy while the first overrides it"
+        );
     }
 
     /// The levels offered are the ones that exist, and no more.

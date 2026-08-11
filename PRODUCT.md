@@ -250,7 +250,8 @@ requirement rather than an aspiration.
 - The Attention Queue: deduplication, priority, ageing without starvation, snooze, acknowledge,
   dismiss, and a `next-attention` command that is deterministic rather than a lottery.
 - Focus governance: typing guard, rate limit, ping-pong guard, per-Session cooldown, mute.
-- Per-Session Attention policy with quiet defaults.
+- Hierarchical Attention policy with quiet defaults, independently overridable at Global, Workspace,
+  Template and Session levels.
 
 **Agent integration**
 - Claude Code at Integration Level `Structured`: turn boundaries, permission requests with a risk

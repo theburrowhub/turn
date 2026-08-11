@@ -115,6 +115,9 @@ pub enum SettingsControl {
     Choice {
         options: Vec<String>,
     },
+    MultiChoice {
+        options: Vec<String>,
+    },
     /// A list of lines, edited as text: one per line, which is how the user already thinks of
     /// init commands.
     TextList,
@@ -141,6 +144,9 @@ impl SettingsControl {
             },
             ValueKind::Text => SettingsControl::Text,
             ValueKind::Choice { options } => SettingsControl::Choice {
+                options: options.iter().map(|option| option.to_string()).collect(),
+            },
+            ValueKind::ChoiceList { options } => SettingsControl::MultiChoice {
                 options: options.iter().map(|option| option.to_string()).collect(),
             },
             ValueKind::TextList => SettingsControl::TextList,

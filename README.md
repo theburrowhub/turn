@@ -194,6 +194,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   write leases, previews, and persistence contracts.
 - [Authenticated Reviewer acceptance](docs/REVIEWER_ACCEPTANCE.md) — local macOS bundle,
   opt-in live-Claude harness, manual checklist, and honest run record.
+- [Attention policy acceptance](docs/ATTENTION_ACCEPTANCE.md) — hierarchical policy, focus,
+  durable queue triage, notifications, sound and custom action checks.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 

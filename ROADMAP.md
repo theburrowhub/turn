@@ -316,7 +316,9 @@ Temporary panes can be promoted without restarting their process; active panes c
 retyped, floated with persistent geometry and docked again. Selection, pane focus and Attention are
 separate. The right inspector is contextual and collapsible. Typed checkout conflicts offer
 focus/read-only/worktree/cancel, first run can create a Workspace, Quick New chooses the Coding Template,
-and the Attention Queue is an explicit overlay with open/snooze/mute/dismiss actions. GPU snapshots render
+and the Attention Queue is an explicit overlay with open/snooze/mute/priority/dismiss actions. Attention
+policies are editable per field through Global → Workspace → Template → Session settings; OS sound,
+notification and user-configured custom actions all cross a tested UI boundary. GPU snapshots render
 the real widget tree and AccessKit tests require `Tree`/`TreeItem` semantics with no duplicate `ListItem`
 navigator.
 

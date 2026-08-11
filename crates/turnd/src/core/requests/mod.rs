@@ -549,6 +549,10 @@ impl Core {
                 attention_id,
                 until_ms,
             } => self.snooze_attention(&attention_id, until_ms, now_ms),
+            Request::SetAttentionPriority {
+                attention_id,
+                priority_boost,
+            } => self.set_attention_priority(&attention_id, priority_boost, now_ms),
             Request::DismissAttention { attention_id } => {
                 self.dismiss_attention(&attention_id, now_ms)
             }

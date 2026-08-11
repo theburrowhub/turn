@@ -106,6 +106,11 @@ pub enum ValueKind {
     Choice {
         options: &'static [&'static str],
     },
+    /// Any subset of a fixed set. Used when several independent behaviours may be enabled
+    /// together, while still refusing misspelled values at the daemon boundary.
+    ChoiceList {
+        options: &'static [&'static str],
+    },
     /// A list of strings — init commands, shared paths.
     TextList,
     /// A string-to-string map — environment variables, keyboard overrides.
@@ -134,6 +139,11 @@ impl ValueKind {
             ValueKind::Choice { options } => {
                 value.as_str().is_some_and(|text| options.contains(&text))
             }
+            ValueKind::ChoiceList { options } => value.as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(|text| options.contains(&text)))
+            }),
             ValueKind::TextList => value
                 .as_array()
                 .is_some_and(|items| items.iter().all(Value::is_string)),
@@ -153,6 +163,9 @@ impl ValueKind {
             ValueKind::Number { min, max } => format!("a number from {min} to {max}"),
             ValueKind::Text => "text".to_string(),
             ValueKind::Choice { options } => format!("one of {}", options.join(", ")),
+            ValueKind::ChoiceList { options } => {
+                format!("any of {}", options.join(", "))
+            }
             ValueKind::TextList => "a list of lines".to_string(),
             ValueKind::TextMap => "a set of name/value pairs".to_string(),
         }
@@ -200,6 +213,18 @@ const PERSISTED: &[Scope] = &[
 ];
 /// The user's own, the same everywhere.
 const GLOBAL_ONLY: &[Scope] = &[Scope::Global];
+
+const ATTENTION_ACTIONS: &[&str] = &[
+    "badge",
+    "highlight",
+    "sound",
+    "notify",
+    "enqueue",
+    "focus",
+    "focus_if_idle",
+    "focus_if_background",
+    "custom",
+];
 
 /// Every preference this build knows about.
 #[derive(Debug, Clone)]
@@ -362,6 +387,159 @@ impl Catalogue {
                     default: json!({}),
                     sensitivity: Sensitivity::Plain,
                     scopes: GLOBAL_ONLY,
+                },
+                // ------------------------------------------------------- attention
+                Definition {
+                    key: "attention.on_turn_complete",
+                    area: Area::Attention,
+                    title: "Turn completed",
+                    description: "Actions performed when an Agent finishes a turn.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge", "enqueue"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_question",
+                    area: Area::Attention,
+                    title: "Question asked",
+                    description: "Actions performed when an Agent asks a question.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge", "enqueue", "notify"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_permission_required",
+                    area: Area::Attention,
+                    title: "Permission required",
+                    description: "Actions performed when an Agent is blocked on permission.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["enqueue", "focus_if_idle", "sound"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_task_complete",
+                    area: Area::Attention,
+                    title: "Task completed",
+                    description: "Actions performed when an Agent reports task completion.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge", "enqueue", "notify"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_failure",
+                    area: Area::Attention,
+                    title: "Failure",
+                    description: "Actions performed when an Agent or Process fails.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge", "enqueue", "notify", "highlight"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_waiting_for_user",
+                    area: Area::Attention,
+                    title: "Waiting for you",
+                    description: "Actions performed when a Session explicitly needs input.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge", "enqueue"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.on_subagent_appeared",
+                    area: Area::Attention,
+                    title: "Subagent appeared",
+                    description: "Actions performed when an Agent starts a subagent.",
+                    kind: ValueKind::ChoiceList {
+                        options: ATTENTION_ACTIONS,
+                    },
+                    default: json!(["badge"]),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.do_not_interrupt_while_typing",
+                    area: Area::Attention,
+                    title: "Typing guard",
+                    description:
+                        "Never move focus while you are typing, even if a trigger asks to focus.",
+                    kind: ValueKind::Bool,
+                    default: json!(true),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.focus_only_if_idle",
+                    area: Area::Attention,
+                    title: "Focus only when idle",
+                    description: "Treat every focus action as requiring an idle user.",
+                    kind: ValueKind::Bool,
+                    default: json!(false),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.cooldown_seconds",
+                    area: Area::Attention,
+                    title: "Interruption cooldown",
+                    description: "Minimum seconds between attention effects for one Session.",
+                    kind: ValueKind::Integer { min: 0, max: 3600 },
+                    default: json!(10),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.sound",
+                    area: Area::Attention,
+                    title: "Sound",
+                    description: "Sound used by trigger action ‘sound’; none keeps it silent.",
+                    kind: ValueKind::Choice {
+                        options: &["none", "subtle", "alert"],
+                    },
+                    default: json!("subtle"),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.custom_command",
+                    area: Area::Attention,
+                    title: "Custom action command",
+                    description:
+                        "Shell command spawned by trigger action ‘custom’. Empty disables it.",
+                    kind: ValueKind::Text,
+                    default: Value::Null,
+                    sensitivity: Sensitivity::Secret,
+                    scopes: PERSISTED,
+                },
+                Definition {
+                    key: "attention.priority_boost",
+                    area: Area::Attention,
+                    title: "Default queue priority",
+                    description:
+                        "Signed ranking adjustment applied when this Session enters the queue.",
+                    kind: ValueKind::Integer {
+                        min: -100,
+                        max: 100,
+                    },
+                    default: json!(0),
+                    sensitivity: Sensitivity::Plain,
+                    scopes: PERSISTED,
                 },
                 // ---------------------------------------------- records
                 Definition {

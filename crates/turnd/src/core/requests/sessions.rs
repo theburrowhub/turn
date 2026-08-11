@@ -1076,6 +1076,20 @@ impl Core {
         };
 
         self.store.sessions().delete(id).map_err(store)?;
+        if let Err(error) = self
+            .store
+            .settings()
+            .remove(&crate::core::attention::mute_setting_key(id))
+        {
+            tracing::warn!(%error, session = %id, "could not remove an obsolete Attention mute");
+        }
+        if let Err(error) = self
+            .store
+            .setting_layers()
+            .forget_owner(turn_core::settings::Scope::Session, id.as_str())
+        {
+            tracing::warn!(%error, session = %id, "could not remove obsolete Session settings");
+        }
         self.sessions.remove(id);
         self.attention.forget_session(id);
         for node in &nodes {

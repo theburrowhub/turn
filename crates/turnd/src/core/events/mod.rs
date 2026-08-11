@@ -219,7 +219,7 @@ impl Core {
         }
         self.correlate_unbound_agent_event(&mut event);
         self.correlate_lifecycle_subject(&mut event);
-        let policy = session.attention.clone();
+        let policy = self.attention_policy_for_session(&session_id);
 
         let mut changed = self.apply(&event, now_ms);
         if matches!(&event.kind, EventKind::AgentSubagentStopped { .. }) && event.node_id.is_none()

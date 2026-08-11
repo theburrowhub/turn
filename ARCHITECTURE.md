@@ -393,7 +393,10 @@ Details that are easy to get wrong and are pinned by tests:
 - `goto_next` / `goto_after` bypass the governor entirely — pressing the shortcut is consent — but
   reset the rate limiter so automatic focus does not immediately fight manual navigation.
 - A muted Session yields exactly one `Badge` and nothing else, so the sidebar still shows something
-  happened.
+  happened. Its deadline is stored outside the transient manager and hydrated after daemon restart.
+- Attention policy fields resolve independently through Global → Workspace → Template → Session before
+  every event is ingested. The daemon emits `RunCustom` but never shells out; only the foreground UI
+  process spawns the user's configured command, detached from Turn's stdin/stdout/stderr.
 - Response resolution and lifecycle cleanup are different operations. A response closes only its exact
   node or parent/external-id flow. A terminal runtime additionally owns node-less flows anchored on itself;
   its exit removes those and their deferred focus without erasing exact live children. `ProcessFailed`

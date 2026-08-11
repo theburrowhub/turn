@@ -123,6 +123,7 @@ impl Core {
         // After the verdicts, so a demand raised by a process that turned out to be gone
         // is not put back in front of the user.
         self.restore_queue()?;
+        self.restore_attention_mutes(now_ms)?;
         // Written straight back, so the demands this start-up decided against do not sit
         // on disk waiting to be reconsidered by the next one.
         let _ = self.persist_attention();
@@ -146,6 +147,20 @@ impl Core {
             terminal_histories_pruned,
             "restored"
         );
+        Ok(())
+    }
+
+    pub(crate) fn restore_attention_mutes(&mut self, now_ms: i64) -> Result<()> {
+        for session_id in self.sessions.keys() {
+            let key = crate::core::attention::mute_setting_key(session_id);
+            if let Some(until_ms) = self.store.settings().get::<i64>(&key)? {
+                if until_ms > now_ms {
+                    self.attention.mute_session(session_id, until_ms);
+                } else {
+                    self.store.settings().remove(&key)?;
+                }
+            }
+        }
         Ok(())
     }
 

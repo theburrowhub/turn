@@ -298,6 +298,8 @@ fn permission(risk: Risk, provisional: bool) -> PendingPermission {
         command: Some("cargo test -p physics -- --nocapture".into()),
         cwd: "/Users/x/space-troopers".into(),
         tool: "Bash".into(),
+        agent: "Claude".into(),
+        process: "claude".into(),
         risk,
         blocked_secs: 47,
         provisional,
@@ -318,6 +320,7 @@ fn queue_item(
         summary: Some("waiting on you".into()),
         provisional,
         actionable,
+        priority_boost: 0,
     }
 }
 
