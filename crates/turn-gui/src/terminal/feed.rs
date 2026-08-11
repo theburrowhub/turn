@@ -386,21 +386,24 @@ impl PaneFeed {
             }
         }
 
+        // One snapshot, not two. This is the hot path for a noisy terminal: keep
+        // the previous screen for history/recovery and apply the validated diff in
+        // place. On malformed input the previous clone restores atomicity.
         let previous = self.screen.clone();
-        let mut next = self.screen.clone();
-        update
-            .apply(&mut next)
-            .map_err(|error| Desync::Malformed(error.to_string()))?;
+        if let Err(error) = update.apply(&mut self.screen) {
+            self.screen = previous;
+            return Err(Desync::Malformed(error.to_string()));
+        }
 
-        self.absorb(&previous, &next);
-        self.screen = next;
+        self.absorb(&previous);
         self.next_seq = seq.saturating_add(1);
         self.view = None;
         Ok(())
     }
 
     /// Caches what left the top of the screen, and keeps the viewport where it was.
-    fn absorb(&mut self, previous: &Grid, next: &Grid) {
+    fn absorb(&mut self, previous: &Grid) {
+        let next = &self.screen;
         if next.alternate_screen || previous.alternate_screen {
             // A full-screen program owns its viewport. Its redraws are not history, and
             // Turn stands down entirely: no scrolling, no recording. The daemon reports no

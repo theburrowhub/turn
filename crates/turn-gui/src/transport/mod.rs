@@ -39,6 +39,20 @@ use turn_proto::{
 pub use backoff::{ConnectionState, DaemonIdentity};
 pub use link::LinkError;
 
+/// UI intents waiting for the connection thread. A stalled daemon must cost a
+/// retryable request failure, never an ever-growing allocation on the render thread.
+pub const OUTBOUND_INTENT_CAPACITY: usize = 256;
+
+/// Requests written to a live socket but not yet answered. Once this fills, the
+/// connection thread stops draining intents until replies make room, propagating
+/// bounded backpressure to [`OUTBOUND_INTENT_CAPACITY`].
+pub const PENDING_REQUEST_CAPACITY: usize = 512;
+
+/// Decoded daemon messages waiting for the next frame. At the protocol maximum this
+/// is also a hard memory bound; normal screen diffs are much smaller and are drained
+/// together once per frame.
+pub const INBOUND_MESSAGE_CAPACITY: usize = 64;
+
 /// Something the window can be told to do when a frame arrives.
 ///
 /// A trait object rather than an `egui::Context` so the transport can be tested with
@@ -224,8 +238,8 @@ struct Outbound {
 /// The window's handle on the daemon.
 pub struct DaemonLink {
     socket: PathBuf,
-    outbound: tokio_mpsc::UnboundedSender<Outbound>,
-    inbound_sender: sync_mpsc::Sender<Inbound>,
+    outbound: tokio_mpsc::Sender<Outbound>,
+    inbound_sender: sync_mpsc::SyncSender<Inbound>,
     inbound: sync_mpsc::Receiver<Inbound>,
     wake: Waker,
     /// Zero while disconnected; otherwise the generation accepted by `serve`.
@@ -242,8 +256,8 @@ impl DaemonLink {
     /// they open Turn before `turnd` has finished binding.
     pub fn spawn(socket: PathBuf, client_version: impl Into<String>, wake: Waker) -> DaemonLink {
         let client_version = client_version.into();
-        let (outbound, outbound_rx) = tokio_mpsc::unbounded_channel::<Outbound>();
-        let (inbound_tx, inbound) = sync_mpsc::channel::<Inbound>();
+        let (outbound, outbound_rx) = tokio_mpsc::channel::<Outbound>(OUTBOUND_INTENT_CAPACITY);
+        let (inbound_tx, inbound) = sync_mpsc::sync_channel::<Inbound>(INBOUND_MESSAGE_CAPACITY);
         let path = socket.clone();
         let inbound_sender = inbound_tx.clone();
         let link_wake = Arc::clone(&wake);
@@ -261,10 +275,11 @@ impl DaemonLink {
                     Err(error) => {
                         // Reported rather than panicked: a window that says why it
                         // cannot connect is better than one that vanishes.
-                        let _ = inbound_tx.send(Inbound::Status(ConnectionState::Disconnected {
-                            message: format!("could not start the connection thread: {error}"),
-                            retrying: false,
-                        }));
+                        let _ =
+                            inbound_tx.try_send(Inbound::Status(ConnectionState::Disconnected {
+                                message: format!("could not start the connection thread: {error}"),
+                                retrying: false,
+                            }));
                         wake();
                         return;
                     }
@@ -318,12 +333,18 @@ impl DaemonLink {
             self.reject_offline(ask);
             return;
         }
-        if let Err(error) = self.outbound.send(Outbound {
+        match self.outbound.try_send(Outbound {
             generation,
             ask,
             request,
         }) {
-            self.reject_offline(error.0.ask);
+            Ok(()) => {}
+            Err(tokio_mpsc::error::TrySendError::Full(outbound)) => {
+                self.reject_saturated(outbound.ask);
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(outbound)) => {
+                self.reject_offline(outbound.ask);
+            }
         }
     }
 
@@ -336,13 +357,34 @@ impl DaemonLink {
             return;
         }
         let error = disconnected_request_error(&ask);
-        if self
-            .inbound_sender
-            .send(Inbound::Failed { ask, error })
-            .is_ok()
-        {
-            (self.wake)();
+        let _ = deliver_inbound(
+            &self.inbound_sender,
+            &self.wake,
+            Inbound::Failed { ask, error },
+        );
+    }
+
+    fn reject_saturated(&self, ask: Ask) {
+        tracing::warn!(
+            intent = ask.describing(),
+            capacity = OUTBOUND_INTENT_CAPACITY,
+            "the GUI-to-daemon queue reached its fixed capacity"
+        );
+        if !ask.is_worth_reporting() {
+            return;
         }
+        let error = ProtoError::new(
+            turn_proto::ErrorCode::RateLimited,
+            format!(
+                "Turn is still responsive, but its daemon connection is not accepting requests fast enough to {}. Try again",
+                ask.describing()
+            ),
+        );
+        let _ = deliver_inbound(
+            &self.inbound_sender,
+            &self.wake,
+            Inbound::Failed { ask, error },
+        );
     }
 
     /// Everything that arrived since the last call.
@@ -363,8 +405,8 @@ impl DaemonLink {
 async fn supervise(
     socket: PathBuf,
     client_version: String,
-    mut outbound: tokio_mpsc::UnboundedReceiver<Outbound>,
-    inbound: sync_mpsc::Sender<Inbound>,
+    mut outbound: tokio_mpsc::Receiver<Outbound>,
+    inbound: sync_mpsc::SyncSender<Inbound>,
     wake: Waker,
     connection_generation: Arc<AtomicU64>,
 ) {
@@ -500,8 +542,8 @@ async fn supervise(
 /// Returns false when the *window* has gone, which is the one reason not to reconnect.
 async fn serve(
     connection: &mut link::Connection,
-    outbound: &mut tokio_mpsc::UnboundedReceiver<Outbound>,
-    inbound: &sync_mpsc::Sender<Inbound>,
+    outbound: &mut tokio_mpsc::Receiver<Outbound>,
+    inbound: &sync_mpsc::SyncSender<Inbound>,
     wake: &Waker,
     generation: u64,
 ) -> bool {
@@ -529,12 +571,19 @@ async fn serve(
                     link::Frame::Event(event) => Inbound::Event(event),
                     link::Frame::Undecodable(error) => Inbound::Notice(error),
                 };
-                if inbound.send(message).is_err() {
-                    return false;
+                match deliver_inbound(inbound, wake, message) {
+                    InboundDelivery::Delivered => {}
+                    InboundDelivery::Full => {
+                        tracing::warn!(
+                            capacity = INBOUND_MESSAGE_CAPACITY,
+                            "the daemon-to-GUI queue reached capacity; reconnecting for a fresh projection"
+                        );
+                        break;
+                    }
+                    InboundDelivery::Closed => return false,
                 }
-                wake();
             }
-            request = outbound.recv() => {
+            request = outbound.recv(), if pending.len() < PENDING_REQUEST_CAPACITY => {
                 let Some(Outbound { generation: request_generation, ask, request }) = request else {
                     // The window dropped its handle.
                     return false;
@@ -542,10 +591,11 @@ async fn serve(
                 if request_generation != generation {
                     if ask.is_worth_reporting() {
                         let error = disconnected_request_error(&ask);
-                        if inbound.send(Inbound::Failed { ask, error }).is_err() {
-                            return false;
+                        match deliver_inbound(inbound, wake, Inbound::Failed { ask, error }) {
+                            InboundDelivery::Delivered => {}
+                            InboundDelivery::Full => break,
+                            InboundDelivery::Closed => return false,
                         }
-                        wake();
                     }
                     continue;
                 }
@@ -557,10 +607,11 @@ async fn serve(
                     }
                     Err(error) => {
                         let failure = Inbound::Failed { ask, error: error.to_proto_error() };
-                        if inbound.send(failure).is_err() {
-                            return false;
+                        match deliver_inbound(inbound, wake, failure) {
+                            InboundDelivery::Delivered => {}
+                            InboundDelivery::Full => break,
+                            InboundDelivery::Closed => return false,
                         }
-                        wake();
                         if !error.is_retryable() {
                             continue;
                         }
@@ -584,11 +635,12 @@ async fn serve(
                 ask.describing()
             ),
         );
-        if inbound.send(Inbound::Failed { ask, error }).is_err() {
-            return false;
+        match deliver_inbound(inbound, wake, Inbound::Failed { ask, error }) {
+            InboundDelivery::Delivered => {}
+            InboundDelivery::Full => break,
+            InboundDelivery::Closed => return false,
         }
     }
-    wake();
     true
 }
 
@@ -607,7 +659,7 @@ fn disconnected_request_error(ask: &Ask) -> ProtoError {
 /// Re-announcing "connecting, attempt 4" every four seconds would make the status
 /// line flicker for no new information. Returns false when the window has gone.
 fn publish(
-    inbound: &sync_mpsc::Sender<Inbound>,
+    inbound: &sync_mpsc::SyncSender<Inbound>,
     wake: &Waker,
     last: &mut ConnectionState,
     state: ConnectionState,
@@ -615,12 +667,42 @@ fn publish(
     if *last == state {
         return true;
     }
-    *last = state.clone();
-    if inbound.send(Inbound::Status(state)).is_err() {
-        return false;
+    match deliver_inbound(inbound, wake, Inbound::Status(state.clone())) {
+        InboundDelivery::Delivered => {
+            *last = state;
+            true
+        }
+        InboundDelivery::Full => {
+            tracing::warn!(
+                capacity = INBOUND_MESSAGE_CAPACITY,
+                "the GUI status queue is full; retaining the previous published state"
+            );
+            true
+        }
+        InboundDelivery::Closed => false,
     }
-    wake();
-    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundDelivery {
+    Delivered,
+    Full,
+    Closed,
+}
+
+fn deliver_inbound(
+    inbound: &sync_mpsc::SyncSender<Inbound>,
+    wake: &Waker,
+    message: Inbound,
+) -> InboundDelivery {
+    match inbound.try_send(message) {
+        Ok(()) => {
+            wake();
+            InboundDelivery::Delivered
+        }
+        Err(sync_mpsc::TrySendError::Full(_)) => InboundDelivery::Full,
+        Err(sync_mpsc::TrySendError::Disconnected(_)) => InboundDelivery::Closed,
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +740,51 @@ mod tests {
             }),
             count,
         )
+    }
+
+    #[test]
+    fn both_gui_boundary_queues_have_hard_capacity() {
+        let (inbound, _inbound_receiver) =
+            sync_mpsc::sync_channel::<Inbound>(INBOUND_MESSAGE_CAPACITY);
+        for index in 0..INBOUND_MESSAGE_CAPACITY {
+            inbound
+                .try_send(Inbound::Notice(ProtoError::new(
+                    turn_proto::ErrorCode::Unavailable,
+                    format!("synthetic inbound {index}"),
+                )))
+                .unwrap();
+        }
+        assert!(matches!(
+            inbound.try_send(Inbound::Notice(ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "over capacity"
+            ))),
+            Err(sync_mpsc::TrySendError::Full(_))
+        ));
+
+        let (outbound, _outbound_receiver) =
+            tokio_mpsc::channel::<Outbound>(OUTBOUND_INTENT_CAPACITY);
+        for _ in 0..OUTBOUND_INTENT_CAPACITY {
+            outbound
+                .try_send(Outbound {
+                    generation: 1,
+                    ask: Ask::Activity,
+                    request: Request::ListWorkspaces {
+                        include_archived: false,
+                    },
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            outbound.try_send(Outbound {
+                generation: 1,
+                ask: Ask::Activity,
+                request: Request::ListWorkspaces {
+                    include_archived: false,
+                },
+            }),
+            Err(tokio_mpsc::error::TrySendError::Full(_))
+        ));
     }
 
     /// Collects statuses until one matches, or gives up.

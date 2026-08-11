@@ -1873,6 +1873,15 @@ enum HierarchyRow<'a> {
     },
 }
 
+/// Keep a couple of rows warm above and below the viewport so a wheel tick never
+/// reveals an unbuilt seam. Everything farther away advances layout only: text,
+/// controls and accessibility nodes are created when the row approaches the view.
+const HIERARCHY_ROW_OVERSCAN: f32 = 120.0;
+
+fn hierarchy_row_needs_render(row: Rect, viewport: Rect, reveal_target: bool) -> bool {
+    reveal_target || row.intersects(viewport.expand2(Vec2::new(0.0, HIERARCHY_ROW_OVERSCAN)))
+}
+
 impl HierarchyRow<'_> {
     fn key(self) -> HierarchyKey {
         match self {
@@ -4867,8 +4876,12 @@ impl<'a> TurnView<'a> {
         egui::ScrollArea::vertical()
             .id_salt("hierarchy-rows")
             .auto_shrink([false, false])
-            .show_viewport(ui, |ui, viewport| {
+            .show_viewport(ui, |ui, _content_viewport| {
                 ui.add_space(4.0);
+                // `show_viewport` reports a content-space rectangle, while row
+                // responses use screen-space coordinates. The clip rectangle is the
+                // screen-space viewport that can be compared with row rectangles.
+                let visible_viewport = ui.clip_rect();
                 // One width for every row, measured before the first one is placed. Asking
                 // for `available_width()` per row instead let each row inherit the previous
                 // one's overhang — a control placed at the right-hand end expands the used
@@ -4878,6 +4891,17 @@ impl<'a> TurnView<'a> {
                 let row_width = ui.available_width();
                 for row in &rows {
                     let key = row.key();
+                    let row_size = Vec2::new(row_width, row.height(state.tree_visibility));
+                    let row_rect = Rect::from_min_size(ui.cursor().min, row_size);
+                    let reveal_target = state.scroll_tree_to.as_ref() == Some(&key);
+                    if !hierarchy_row_needs_render(row_rect, visible_viewport, reveal_target) {
+                        // `allocate_space` preserves exact scroll geometry without
+                        // paying for text layout, controls, hit-testing or painting.
+                        // Selection and keyboard traversal still use the complete
+                        // `rows` projection above.
+                        ui.allocate_space(row_size);
+                        continue;
+                    }
                     let is_selected = selected.as_ref() == Some(&key);
                     let expanded = row_is_expanded(snapshot, state, &key);
                     let focused_pane = match row {
@@ -4916,8 +4940,8 @@ impl<'a> TurnView<'a> {
                         },
                     );
                     if first_visible.is_none()
-                        && response.rect.max.y >= viewport.min.y
-                        && response.rect.min.y <= viewport.max.y
+                        && response.rect.max.y >= visible_viewport.min.y
+                        && response.rect.min.y <= visible_viewport.max.y
                     {
                         first_visible = Some(key.clone());
                     }
@@ -12306,6 +12330,31 @@ mod tests {
                 "{count} buttons need {needed} points but were given {width}"
             );
         }
+    }
+
+    #[test]
+    fn a_large_hierarchy_builds_only_viewport_rows_and_the_reveal_target() {
+        let viewport = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(320.0, 500.0));
+        let rendered = (0..180)
+            .filter(|index| {
+                let row = Rect::from_min_size(
+                    egui::pos2(0.0, *index as f32 * 40.0),
+                    Vec2::new(320.0, 40.0),
+                );
+                hierarchy_row_needs_render(row, viewport, false)
+            })
+            .count();
+        assert!(
+            rendered <= 17,
+            "a 500px viewport built {rendered} of 180 rows"
+        );
+
+        let far_target = Rect::from_min_size(egui::pos2(0.0, 7_000.0), Vec2::new(320.0, 40.0));
+        assert!(!hierarchy_row_needs_render(far_target, viewport, false));
+        assert!(
+            hierarchy_row_needs_render(far_target, viewport, true),
+            "keyboard/search reveal must materialise an off-screen target before scrolling"
+        );
     }
 
     /// The rows gained controls, and the thing that goes wrong when a row runs out of room
