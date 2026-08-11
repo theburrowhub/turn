@@ -492,6 +492,9 @@ pub struct ViewState {
     /// would be a round trip per character, and every intermediate value would be refused as
     /// out of range on the way to a valid one.
     pub settings_drafts: std::collections::BTreeMap<String, String>,
+    /// Replacement text for secret settings. Its `Debug` implementation reports only a
+    /// count, so a diagnostic dump of window state cannot become a credential leak.
+    secret_settings_drafts: SecretSettingsDrafts,
     /// First-run workspace form. It is window-local until the user submits it;
     /// no half-written path enters daemon state.
     pub workspace_draft: Option<WorkspaceDraft>,
@@ -544,6 +547,18 @@ pub struct ViewState {
     hierarchy_actions: Vec<HierarchyAction>,
     observed_tree_state: Option<TreeSurfaceState>,
     observed_temporary_pane: Option<PaneId>,
+}
+
+#[derive(Default)]
+struct SecretSettingsDrafts(std::collections::BTreeMap<String, String>);
+
+impl std::fmt::Debug for SecretSettingsDrafts {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretSettingsDrafts")
+            .field("entries", &self.0.len())
+            .finish()
+    }
 }
 
 impl ViewState {
@@ -7871,8 +7886,16 @@ impl<'a> TurnView<'a> {
                 if ui
                     .selectable_label(
                         selected,
-                        RichText::new(format!("{} · {}", level.scope.label(), level.label))
-                            .color(if selected { theme.text } else { theme.text_dim }),
+                        RichText::new(match level.scope {
+                            turn_core::settings::Scope::Global
+                            | turn_core::settings::Scope::Temporary => level.label.clone(),
+                            _ => format!("{} · {}", level.scope.label(), level.label),
+                        })
+                        .color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_dim
+                        }),
                     )
                     .on_hover_text(match level.scope {
                         turn_core::settings::Scope::Global => {
@@ -7940,9 +7963,10 @@ impl<'a> TurnView<'a> {
         // Whether this key can be written at the level the user picked. A control drawn where
         // the write would be refused is a control that lies, so it is disabled and says why.
         let settable = entry.settable_at.contains(&chosen);
-        // Whether *this* level is the one holding the value, which is the only case where
-        // "reset" has anything to remove.
-        let set_here = entry.resolution.origin == Some(chosen);
+        // A narrower winner can hide this level's own value. It is still present and must
+        // remain independently editable/resettable rather than disappearing from the sheet.
+        let set_here = entry.override_at(chosen).is_some();
+        let editing_value = entry.value_for_editing_at(chosen).clone();
 
         egui::Frame::new()
             .fill(theme.raised)
@@ -7962,26 +7986,45 @@ impl<'a> TurnView<'a> {
                         // Where it came from, always. Sentence rather than a badge: "from the
                         // Workspace" is what the user needs to know before changing it.
                         let (origin, colour) = match entry.resolution.origin {
-                            None => ("Turn's default".to_string(), theme.text_faint),
+                            None => ("Effective · Turn's default".to_string(), theme.text_faint),
                             Some(scope) if scope == chosen => {
-                                (format!("set here · {}", scope.label()), theme.running)
+                                (format!("Effective · set here · {}", scope.label()), theme.running)
                             }
                             Some(scope) => (
-                                format!("inherited from {}", scope.label()),
+                                format!("Effective · from {}", scope.label()),
                                 theme.provisional,
                             ),
                         };
                         ui.label(RichText::new(origin).color(colour).small());
+                        let overrides = entry
+                            .override_scopes()
+                            .into_iter()
+                            .map(|scope| scope.label())
+                            .collect::<Vec<_>>();
+                        ui.label(
+                            RichText::new(if overrides.is_empty() {
+                                "Overrides · none".to_string()
+                            } else {
+                                format!("Overrides · {}", overrides.join(" → "))
+                            })
+                            .color(theme.text_faint)
+                            .small(),
+                        );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Reset first in right-to-left order, so it sits at the far edge and
                         // the control the user came for is next to its own value.
                         if set_here {
-                            let reveals = match entry.resolution.inherited() {
-                                Some(shadowed) => format!(
+                            let reveals = match entry.origin_without(chosen) {
+                                Some(scope) if entry.resolution.origin != Some(chosen) => format!(
+                                    "Remove this {} value; {} remains effective",
+                                    chosen.label(),
+                                    scope.label()
+                                ),
+                                Some(scope) => format!(
                                     "Remove this {} value; {} takes over again",
                                     chosen.label(),
-                                    shadowed.scope.label()
+                                    scope.label()
                                 ),
                                 None => format!(
                                     "Remove this {} value and go back to Turn's default",
@@ -7994,6 +8037,9 @@ impl<'a> TurnView<'a> {
                                 &format!("Reset {}", entry.title),
                             );
                             if response.clicked() {
+                                let draft_key = settings_draft_key(chosen, &key);
+                                state.settings_drafts.remove(&draft_key);
+                                state.secret_settings_drafts.0.remove(&draft_key);
                                 actions.push(ViewAction::ResetSetting {
                                     scope: chosen,
                                     owner_id: owner.to_string(),
@@ -8001,18 +8047,33 @@ impl<'a> TurnView<'a> {
                                 });
                             }
                         }
-                        ui.add_enabled_ui(settable && !entry.hidden, |ui| {
-                            actions.extend(settings_control(
-                                ui, theme, state, entry, chosen, owner, &key,
+                        if entry.hidden && entry.known && settable {
+                            actions.extend(secret_settings_control(
+                                ui, state, entry, chosen, owner, &key,
                             ));
-                        });
+                        } else {
+                            ui.add_enabled_ui(settable && !entry.hidden, |ui| {
+                                actions.extend(settings_control(
+                                    ui,
+                                    theme,
+                                    state,
+                                    entry,
+                                    &editing_value,
+                                    SettingsWriteTarget {
+                                        scope: chosen,
+                                        owner,
+                                        key: &key,
+                                    },
+                                ));
+                            });
+                        }
                     });
                 });
                 if entry.hidden {
                     if entry.known {
                         ui.label(
                             RichText::new(
-                                "Not shown, and not editable here: Turn does not display a value that may be a credential.",
+                                "The current value is never shown. Type the complete replacement and choose Replace; Reset removes this level's copy.",
                             )
                             .color(theme.text_faint)
                             .small(),
@@ -8267,14 +8328,14 @@ fn settings_control(
     theme: &Theme,
     state: &mut ViewState,
     entry: &turn_proto::SettingsEntry,
-    chosen: turn_core::settings::Scope,
-    owner: &str,
-    key: &str,
+    editing_value: &serde_json::Value,
+    target: SettingsWriteTarget<'_>,
 ) -> Vec<ViewAction> {
     use turn_proto::SettingsControl;
+    let SettingsWriteTarget { scope, owner, key } = target;
     let mut actions = Vec::new();
     let set = |value: serde_json::Value| ViewAction::SetSetting {
-        scope: chosen,
+        scope,
         owner_id: owner.to_string(),
         key: key.to_string(),
         value,
@@ -8285,7 +8346,7 @@ fn settings_control(
     // so the name is set on the widget rather than drawn again.
     match &entry.control {
         SettingsControl::Toggle => {
-            let mut on = entry.resolution.value.as_bool().unwrap_or(false);
+            let mut on = editing_value.as_bool().unwrap_or(false);
             let response = ui.checkbox(&mut on, "");
             describe_control(&response, egui::accesskit::Role::CheckBox, &entry.title);
             if response.changed() {
@@ -8293,7 +8354,7 @@ fn settings_control(
             }
         }
         SettingsControl::Integer { min, max } => {
-            let mut number = entry.resolution.value.as_i64().unwrap_or(*min);
+            let mut number = editing_value.as_i64().unwrap_or(*min);
             let response = ui
                 .add(egui::DragValue::new(&mut number).range(*min..=*max))
                 .on_hover_text(&entry.accepts);
@@ -8303,7 +8364,7 @@ fn settings_control(
             }
         }
         SettingsControl::Number { min, max } => {
-            let mut number = entry.resolution.value.as_f64().unwrap_or(*min);
+            let mut number = editing_value.as_f64().unwrap_or(*min);
             let response = ui
                 .add(
                     egui::DragValue::new(&mut number)
@@ -8317,13 +8378,8 @@ fn settings_control(
             }
         }
         SettingsControl::Choice { options } => {
-            let current = entry
-                .resolution
-                .value
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            egui::ComboBox::from_id_salt(("setting-choice", key))
+            let current = editing_value.as_str().unwrap_or_default().to_string();
+            egui::ComboBox::from_id_salt(("setting-choice", scope, key))
                 .selected_text(if current.is_empty() {
                     "—".to_string()
                 } else {
@@ -8345,10 +8401,11 @@ fn settings_control(
             // The stored value as text the user can edit, and back again on commit. One
             // line per item for a list, `NAME=value` per line for a map — which is how the
             // user already writes both of these everywhere else.
-            let stored = settings_text_of(&entry.resolution.value, &entry.control);
+            let stored = settings_text_of(editing_value, &entry.control);
+            let draft_key = settings_draft_key(scope, key);
             let draft = state
                 .settings_drafts
-                .entry(key.to_string())
+                .entry(draft_key.clone())
                 .or_insert_with(|| stored.clone());
             let multiline = !matches!(entry.control, SettingsControl::Text);
             let response = if multiline {
@@ -8374,7 +8431,7 @@ fn settings_control(
                     && ui.input(|input| input.key_pressed(egui::Key::Enter)));
             if committed {
                 let typed = draft.clone();
-                state.settings_drafts.remove(key);
+                state.settings_drafts.remove(&draft_key);
                 if typed != stored {
                     actions.push(set(settings_value_of(&typed, &entry.control)));
                 }
@@ -8393,6 +8450,65 @@ fn settings_control(
         }
     }
     actions
+}
+
+#[derive(Clone, Copy)]
+struct SettingsWriteTarget<'a> {
+    scope: turn_core::settings::Scope,
+    owner: &'a str,
+    key: &'a str,
+}
+
+fn settings_draft_key(scope: turn_core::settings::Scope, key: &str) -> String {
+    format!("{}:{key}", scope.label())
+}
+
+/// Blind replacement for a secret: the existing value never enters an editable widget and
+/// focus changes never commit half a credential. The explicit button is the only write.
+fn secret_settings_control(
+    ui: &mut Ui,
+    state: &mut ViewState,
+    entry: &turn_proto::SettingsEntry,
+    chosen: turn_core::settings::Scope,
+    owner: &str,
+    key: &str,
+) -> Vec<ViewAction> {
+    let draft_key = settings_draft_key(chosen, key);
+    let draft = state
+        .secret_settings_drafts
+        .0
+        .entry(draft_key.clone())
+        .or_default();
+    let response = ui.add(
+        egui::TextEdit::multiline(draft)
+            .password(true)
+            .desired_rows(2)
+            .desired_width(180.0)
+            .hint_text("NAME=value"),
+    );
+    describe_control(
+        &response,
+        egui::accesskit::Role::TextInput,
+        &format!("Replacement for {}", entry.title),
+    );
+    let replace = ui
+        .add_enabled(!draft.trim().is_empty(), egui::Button::new("Replace"))
+        .on_hover_text("Replace the complete hidden value at this level");
+    crate::icons::describe(&replace, &format!("Replace {}", entry.title));
+    if !replace.clicked() {
+        return Vec::new();
+    }
+    let typed = state
+        .secret_settings_drafts
+        .0
+        .remove(&draft_key)
+        .unwrap_or_default();
+    vec![ViewAction::SetSetting {
+        scope: chosen,
+        owner_id: owner.to_string(),
+        key: key.to_string(),
+        value: settings_value_of(&typed, &entry.control),
+    }]
 }
 
 /// Puts a settings control into the accessibility tree under its own name and role.
@@ -10727,6 +10843,22 @@ mod tests {
             state.pane(&second).selection.is_none(),
             "two panes must hold separate selections"
         );
+    }
+
+    #[test]
+    fn a_secret_draft_is_redacted_from_window_diagnostics() {
+        let secret = "token-that-must-never-reach-a-log";
+        let mut state = ViewState::default();
+        state
+            .secret_settings_drafts
+            .0
+            .insert("Global:environment.variables".into(), secret.into());
+        let diagnostic = format!("{state:?}");
+        assert!(
+            !diagnostic.contains(secret),
+            "diagnostic leaked {diagnostic}"
+        );
+        assert!(diagnostic.contains("entries: 1"));
     }
 
     #[test]

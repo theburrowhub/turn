@@ -1323,6 +1323,7 @@ mod tests {
                 settable_at: vec![turn_core::settings::Scope::Global],
                 hidden: false,
                 known: true,
+                default_value: serde_json::json!({}),
                 resolution: turn_core::settings::Resolution {
                     key: crate::keymap::BINDINGS_KEY.to_string(),
                     value: bindings,

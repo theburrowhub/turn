@@ -163,12 +163,16 @@ pub struct Desk {
     /// A link from a pane whose visible text disagreed with its target, waiting to be
     /// confirmed. Window-local: nothing outside this window is affected by a question.
     link_confirmation: Option<crate::terminal::links::LinkRequest>,
-    /// The preferences in force, as the daemon resolved them.
+    /// The four persistent levels exactly as the daemon resolved them.
+    daemon_settings: Option<Box<turn_proto::SettingsView>>,
+    /// The preferences in force after the window's one owned layer is applied.
     ///
-    /// Held whole rather than merged into anything: the window renders what it is told and
-    /// applies no precedence of its own, so there is nothing here to keep in step. `None`
-    /// until the first answer arrives, which is what the sheet shows as "loading".
+    /// This is a projection, not another settings authority: persistent precedence remains
+    /// daemon-owned. The only local operation is putting the explicitly non-persistent
+    /// Temporary layer above that already-resolved answer.
     settings: Option<Box<turn_proto::SettingsView>>,
+    /// Overrides that live exactly as long as this window and never cross the protocol.
+    temporary_settings: turn_core::settings::Layer,
     reclaiming_leases: HashSet<WorkspaceId>,
     temporary_pane: Option<NodePaneView>,
     write_conflict: Option<ProtoErrorContext>,
@@ -220,7 +224,11 @@ impl Desk {
             relaunching: HashSet::new(),
             auto_started: HashSet::new(),
             link_confirmation: None,
+            daemon_settings: None,
             settings: None,
+            temporary_settings: turn_core::settings::Layer::new(
+                turn_core::settings::Scope::Temporary,
+            ),
             reclaiming_leases: HashSet::new(),
             temporary_pane: None,
             write_conflict: None,
@@ -782,6 +790,7 @@ impl Desk {
         self.temporary_pane = None;
         self.write_conflict = None;
         self.link_confirmation = None;
+        self.daemon_settings = None;
         self.settings = None;
         self.pending_workspace_creation = false;
         self.pending_session = None;
@@ -1132,7 +1141,8 @@ impl Desk {
             // Whole settings answers replace the sheet. A reset can move several keys at
             // once, so there is nothing safe for the window to patch locally.
             (_, Response::Settings { settings }) => {
-                self.settings = Some(settings);
+                self.daemon_settings = Some(settings);
+                self.rebuild_settings();
                 Vec::new()
             }
             (Ask::CreateTemplate, Response::Template { template }) => {
@@ -2372,6 +2382,47 @@ impl Desk {
         self.settings.as_deref()
     }
 
+    /// Rebuilds the display projection from the daemon answer plus this window's layer.
+    ///
+    /// The daemon has already resolved Global through Session. Re-running those four levels
+    /// here would create a second precedence implementation able to disagree with it, so the
+    /// window does only the operation the daemon deliberately cannot: append Temporary as
+    /// the strongest opinion.
+    fn rebuild_settings(&mut self) {
+        let Some(base) = self.daemon_settings.as_deref() else {
+            self.settings = None;
+            return;
+        };
+        let mut effective = base.clone();
+        if effective
+            .levels
+            .iter()
+            .all(|level| level.scope != turn_core::settings::Scope::Temporary)
+        {
+            effective
+                .levels
+                .push(turn_proto::SettingsLevel::temporary());
+        }
+        for entry in &mut effective.entries {
+            let Some(value) = self.temporary_settings.get(&entry.resolution.key) else {
+                continue;
+            };
+            if let Some(origin) = entry.resolution.origin {
+                entry
+                    .resolution
+                    .shadowed
+                    .push(turn_core::settings::Shadowed {
+                        scope: origin,
+                        value: entry.resolution.value.clone(),
+                    });
+            }
+            entry.resolution.origin = Some(turn_core::settings::Scope::Temporary);
+            entry.resolution.value = value.clone();
+            entry.resolution = entry.resolution.for_display();
+        }
+        self.settings = Some(Box::new(effective));
+    }
+
     /// Routes typed intents from the unified tree. Selection, Pane focus and opening a
     /// view stay separate protocol operations, so selecting a waiting subagent neither
     /// resolves its Attention nor changes the Layout.
@@ -3482,15 +3533,28 @@ impl Desk {
                 owner_id,
                 key,
                 value,
-            } => vec![Reaction::Send {
-                ask: Ask::WriteSetting { key: key.clone() },
-                request: Request::SetSetting {
-                    scope,
-                    owner_id: Some(owner_id),
-                    key,
-                    value,
-                },
-            }],
+            } => {
+                if scope == turn_core::settings::Scope::Temporary {
+                    if let Err(refusal) =
+                        turn_core::settings::Catalogue::built_in().check(&key, scope, &value)
+                    {
+                        return vec![Reaction::Notice(refusal.to_string())];
+                    }
+                    self.temporary_settings.set(key, value);
+                    self.rebuild_settings();
+                    Vec::new()
+                } else {
+                    vec![Reaction::Send {
+                        ask: Ask::WriteSetting { key: key.clone() },
+                        request: Request::SetSetting {
+                            scope,
+                            owner_id: Some(owner_id),
+                            key,
+                            value,
+                        },
+                    }]
+                }
+            }
             // One command's chord, written into the whole `keyboard.bindings` map.
             //
             // The map is one preference rather than one per command, so a rebind is a
@@ -3530,14 +3594,22 @@ impl Desk {
                 scope,
                 owner_id,
                 key,
-            } => vec![Reaction::Send {
-                ask: Ask::WriteSetting { key: key.clone() },
-                request: Request::ResetSetting {
-                    scope,
-                    owner_id: Some(owner_id),
-                    key,
-                },
-            }],
+            } => {
+                if scope == turn_core::settings::Scope::Temporary {
+                    self.temporary_settings.clear(&key);
+                    self.rebuild_settings();
+                    Vec::new()
+                } else {
+                    vec![Reaction::Send {
+                        ask: Ask::WriteSetting { key: key.clone() },
+                        request: Request::ResetSetting {
+                            scope,
+                            owner_id: Some(owner_id),
+                            key,
+                        },
+                    }]
+                }
+            }
             ViewAction::ConfirmLink => self.confirm_link(),
             ViewAction::DismissLink => {
                 self.dismiss_link();
@@ -8194,6 +8266,143 @@ mod tests {
         }
     }
 
+    /// Temporary settings belong to the window: no request or SQLite write is involved,
+    /// and removing one reveals the daemon-resolved Session value byte for byte.
+    #[test]
+    fn a_temporary_override_is_local_reversible_and_survives_a_daemon_reconnect() {
+        use turn_core::settings::{Scope, Sensitivity, Shadowed};
+
+        let persistent = turn_proto::SettingsView {
+            session_id: Some(SessionId::from_stored("sess_temporary_setting")),
+            levels: vec![
+                turn_proto::SettingsLevel::global(),
+                turn_proto::SettingsLevel::workspace(
+                    &WorkspaceId::from_stored("ws_temporary_setting"),
+                    "turn",
+                ),
+                turn_proto::SettingsLevel::session(
+                    &SessionId::from_stored("sess_temporary_setting"),
+                    "Settings",
+                ),
+            ],
+            entries: vec![turn_proto::SettingsEntry {
+                resolution: turn_core::settings::Resolution {
+                    key: "appearance.font_size".into(),
+                    value: serde_json::json!(19),
+                    origin: Some(Scope::Session),
+                    shadowed: vec![Shadowed {
+                        scope: Scope::Workspace,
+                        value: serde_json::json!(15),
+                    }],
+                    sensitivity: Sensitivity::Plain,
+                },
+                default_value: serde_json::json!(13),
+                area: turn_core::settings::Area::Appearance,
+                area_title: "Theme, fonts, cursor and zoom".into(),
+                title: "Terminal font size".into(),
+                description: String::new(),
+                accepts: "a whole number from 6 to 32".into(),
+                control: turn_proto::SettingsControl::Integer { min: 6, max: 32 },
+                settable_at: Scope::ALL.to_vec(),
+                hidden: false,
+                known: true,
+            }],
+        };
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Settings {
+                settings: Box::new(persistent.clone()),
+            }),
+            T0,
+        );
+        assert!(desk
+            .settings()
+            .is_some_and(|settings| settings.level(Scope::Temporary).is_some()));
+
+        let reactions = desk.apply_view_action(
+            ViewAction::SetSetting {
+                scope: Scope::Temporary,
+                owner_id: String::new(),
+                key: "appearance.font_size".into(),
+                value: serde_json::json!(24),
+            },
+            T0,
+        );
+        assert!(
+            reactions.is_empty(),
+            "temporary writes never reach the daemon"
+        );
+        let entry = desk
+            .settings()
+            .unwrap()
+            .entry("appearance.font_size")
+            .unwrap();
+        assert_eq!(entry.resolution.value, serde_json::json!(24));
+        assert_eq!(entry.resolution.origin, Some(Scope::Temporary));
+        assert_eq!(
+            entry.override_scopes(),
+            vec![Scope::Workspace, Scope::Session, Scope::Temporary]
+        );
+
+        // A daemon restart clears its projection but not the window-owned layer. Once the
+        // fresh authoritative answer arrives, the same trial value is in force again.
+        desk.apply_inbound(connected(), T0 + 1);
+        assert!(desk.settings().is_none());
+        desk.apply_inbound(
+            answer(Response::Settings {
+                settings: Box::new(persistent),
+            }),
+            T0 + 2,
+        );
+        assert_eq!(
+            desk.settings()
+                .unwrap()
+                .entry("appearance.font_size")
+                .unwrap()
+                .resolution
+                .value,
+            serde_json::json!(24)
+        );
+
+        let reactions = desk.apply_view_action(
+            ViewAction::ResetSetting {
+                scope: Scope::Temporary,
+                owner_id: String::new(),
+                key: "appearance.font_size".into(),
+            },
+            T0 + 3,
+        );
+        assert!(reactions.is_empty());
+        let entry = desk
+            .settings()
+            .unwrap()
+            .entry("appearance.font_size")
+            .unwrap();
+        assert_eq!(entry.resolution.value, serde_json::json!(19));
+        assert_eq!(entry.resolution.origin, Some(Scope::Session));
+        assert_eq!(
+            entry.override_at(Scope::Workspace),
+            Some(&serde_json::json!(15))
+        );
+    }
+
+    #[test]
+    fn a_temporary_write_is_validated_before_it_touches_window_state() {
+        let mut desk = Desk::new();
+        let reactions = desk.apply_view_action(
+            ViewAction::SetSetting {
+                scope: turn_core::settings::Scope::Temporary,
+                owner_id: String::new(),
+                key: "environment.variables".into(),
+                value: serde_json::json!({"TOKEN": "never log me"}),
+            },
+            T0,
+        );
+        assert!(matches!(reactions.as_slice(), [Reaction::Notice(message)]
+            if message.contains("cannot be set")));
+        assert!(desk.temporary_settings.is_empty());
+    }
+
     /// A `SettingsView` holding one `keyboard.bindings` value, which is all these tests need.
     fn settings_with_bindings(bindings: serde_json::Value) -> turn_proto::SettingsView {
         turn_proto::SettingsView {
@@ -8209,6 +8418,7 @@ mod tests {
                 settable_at: vec![turn_core::settings::Scope::Global],
                 hidden: false,
                 known: true,
+                default_value: serde_json::json!({}),
                 resolution: turn_core::settings::Resolution {
                     key: crate::keymap::BINDINGS_KEY.to_string(),
                     value: bindings,
