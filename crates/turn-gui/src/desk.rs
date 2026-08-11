@@ -3121,6 +3121,7 @@ impl Desk {
                 session_id,
                 source_node_id,
                 target_node_id,
+                mode,
                 instruction,
             } => vec![Reaction::Send {
                 ask: Ask::PrepareContextHandoff {
@@ -3132,7 +3133,20 @@ impl Desk {
                     session_id,
                     source_node_id,
                     target_node_id,
+                    mode,
                     instruction: instruction.map(ContextHandoffText::new),
+                },
+            }],
+            ViewAction::CreateContextHandoffTarget {
+                session_id,
+                pane_id,
+            } => vec![Reaction::Send {
+                ask: Ask::Action("creating an Agent for the context handoff"),
+                request: Request::SplitPane {
+                    session_id,
+                    pane_id,
+                    direction: Direction::Horizontal,
+                    pane: NewPane::new(PaneKind::Agent),
                 },
             }],
             ViewAction::DeliverContextHandoff {
@@ -3872,8 +3886,8 @@ mod tests {
     use turn_core::state::{AwaitingReason, Lifecycle, Turn};
     use turn_core::Effect;
     use turn_proto::{
-        AttentionView, PaneAttachment, PaneFocusView, PaneStream, ScreenUpdate, ServerEvent,
-        SessionTreeView, TerminalBytes, TreeSurfaceState, Welcome, WorkspaceTreeView,
+        AttentionView, ContextHandoffMode, PaneAttachment, PaneFocusView, PaneStream, ScreenUpdate,
+        ServerEvent, SessionTreeView, TerminalBytes, TreeSurfaceState, Welcome, WorkspaceTreeView,
     };
 
     const T0: i64 = 1_700_000_000_000;
@@ -7210,6 +7224,35 @@ mod tests {
     }
 
     #[test]
+    fn creating_a_handoff_target_adds_an_agent_to_the_same_session() {
+        let session_id = SessionId::from_stored("sess_handoff_target");
+        let pane_id = PaneId::from_stored("pane_handoff_anchor");
+        let mut desk = Desk::new();
+
+        let reactions = desk.apply_view_action(
+            ViewAction::CreateContextHandoffTarget {
+                session_id: session_id.clone(),
+                pane_id: pane_id.clone(),
+            },
+            T0,
+        );
+        assert!(matches!(
+            reactions.as_slice(),
+            [Reaction::Send {
+                request: Request::SplitPane {
+                    session_id: requested_session,
+                    pane_id: requested_pane,
+                    direction: Direction::Horizontal,
+                    pane,
+                },
+                ..
+            }] if requested_session == &session_id
+                && requested_pane == &pane_id
+                && pane.kind == PaneKind::Agent
+        ));
+    }
+
+    #[test]
     fn preparing_context_handoff_sends_only_the_typed_prepare_request() {
         let session_id = SessionId::from_stored("sess_handoff001");
         let source_node_id = NodeId::from_stored("proc_source001");
@@ -7221,6 +7264,7 @@ mod tests {
                 session_id: session_id.clone(),
                 source_node_id: source_node_id.clone(),
                 target_node_id: target_node_id.clone(),
+                mode: ContextHandoffMode::SecondOpinion,
                 instruction: Some("Concentrate on the failing invariant".into()),
             },
             T0,
@@ -7239,6 +7283,7 @@ mod tests {
                         session_id: requested_session_id,
                         source_node_id: requested_source_node_id,
                         target_node_id: requested_target_node_id,
+                        mode,
                         instruction,
                     },
             }] => {
@@ -7248,6 +7293,7 @@ mod tests {
                 assert_eq!(requested_session_id, &session_id);
                 assert_eq!(requested_source_node_id, &source_node_id);
                 assert_eq!(requested_target_node_id, &target_node_id);
+                assert_eq!(*mode, ContextHandoffMode::SecondOpinion);
                 assert_eq!(
                     instruction.as_ref().map(ContextHandoffText::as_str),
                     Some("Concentrate on the failing invariant")
@@ -7270,10 +7316,13 @@ mod tests {
             session_id: session_id.clone(),
             source_node_id: source_node_id.clone(),
             target_node_id: target_node_id.clone(),
+            mode: ContextHandoffMode::ContinueWith,
             source_label: "Reviewer".into(),
             target_label: "Implementer".into(),
             body: ContextHandoffText::new("[Turn context handoff]\nSafe fact"),
             preview_count: 1,
+            history_count: 0,
+            repository_included: true,
             redacted: true,
         };
         let mut desk = Desk::new();
@@ -7308,10 +7357,13 @@ mod tests {
             session_id: session_id.clone(),
             source_node_id: source_node_id.clone(),
             target_node_id: target_node_id.clone(),
+            mode: ContextHandoffMode::ReviewHandoff,
             source_label: "Source".into(),
             target_label: "Target".into(),
             body: ContextHandoffText::new("bounded context"),
             preview_count: 1,
+            history_count: 0,
+            repository_included: false,
             redacted: false,
         };
         let mismatched = [
@@ -7483,6 +7535,7 @@ mod tests {
                 session_id: SessionId::from_stored("sess_handoff006"),
                 source_node_id: NodeId::from_stored("proc_source006"),
                 target_node_id: NodeId::from_stored("proc_target006"),
+                mode: ContextHandoffMode::ContinueWith,
                 instruction: None,
             },
             T0,

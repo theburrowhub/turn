@@ -752,13 +752,16 @@ process may be shown in more than one place.
 
 | `op` | Fields | Answers with |
 | --- | --- | --- |
-| `prepare_context_handoff` | `session_id`, `source_node_id`, `target_node_id`, `instruction?` | `context_handoff` |
+| `prepare_context_handoff` | `session_id`, `source_node_id`, `target_node_id`, `mode`, `instruction?` | `context_handoff` |
 | `deliver_context_handoff` | `session_id`, `handoff_id` | `ack` |
 
 This is a two-request, review-before-send capability. `prepare_context_handoff` verifies two distinct
-agentic nodes in one active Session, assembles a bounded packet from the source's stable Activity Preview
-history plus an optional user instruction, redacts secrets, and returns the **exact** text the daemon retains.
-It never reads raw terminal scrollback and never writes a PTY. Hidden previews remain hidden.
+agentic nodes in one active Session and one of four explicit intents: `continue_with`, `review_handoff`,
+`second_opinion` or `promote_to_main`. It assembles a bounded packet containing Session objective/summary,
+real Git root/branch/HEAD/status/diff evidence, relevant files, stable Activity Preview decisions, pending
+work, commands and exit codes, tests, subagents, recent events, active processes and prior handoff metadata.
+Secrets are redacted and the response carries the **exact** text the daemon retains. It never reads raw
+terminal scrollback and never writes a PTY. Hidden previews remain hidden.
 
 The returned `handoff_id` is an opaque, short-lived capability bound to the preparing client, Session and
 destination. `deliver_context_handoff` accepts only that id; a client cannot replace the reviewed body on
@@ -770,7 +773,8 @@ A successful same-connection retry is idempotent. A possibly partial PTY write i
 is never replayed automatically. Drafts expire after ten minutes and are discarded when their client
 disconnects. Success means the payload was submitted to the PTY; it is not proof that the Agent accepted or
 acted on it. Handoffs deliberately cannot answer permission or question prompts; those remain explicit
-`write_pty` input.
+`write_pty` input. A metadata-only `context_handoff.finished` event records source, destination, intent and
+submitted/uncertain outcome under normal event-retention policy; the reviewed body is never persisted.
 
 ### Node control
 
@@ -898,6 +902,7 @@ after daemon loss, so timeout or daemon death alone never authorises takeover.
 {"v":4,"type":"request","id":"r-7","request":{
   "op":"prepare_context_handoff","session_id":"sess_4b71e0",
   "source_node_id":"proc_source","target_node_id":"proc_reviewer",
+  "mode":"review_handoff",
   "instruction":"Check the assumptions before continuing."}}
 
 // After displaying the exact context_handoff.body and receiving explicit consent:
@@ -940,7 +945,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `attention_list` | `entries: [AttentionView]` |
 | `effects` | `effects: [Effect]` |
 | `preview_history` | `session_id`, `node_id`, `entries: [ActivityPreview]` (newest first) |
-| `context_handoff` | `handoff: ContextHandoffView` — ids, safe labels, exact redacted `body`, fact count and redaction flag |
+| `context_handoff` | `handoff: ContextHandoffView` — ids, mode, safe labels, exact redacted `body`, preview/history counts, repository evidence flag and redaction flag |
 
 ```jsonc
 {"v":4,"type":"response","id":"r-3","response":{"result":"ack"}}

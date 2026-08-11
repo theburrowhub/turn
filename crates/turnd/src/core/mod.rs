@@ -52,7 +52,7 @@ use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
 use turn_core::ids::{HandoffId, LeaseId, NodeId, SessionId, TemplateId, WorkspaceId};
-use turn_core::model::{Session, Template, Workspace};
+use turn_core::model::{ContextHandoffOutcome, Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
 use turn_pty::{ExitInfo, ProcessSupervisor, PtyProcess, ScreenSize, TerminalBuffer};
@@ -153,17 +153,10 @@ pub(crate) struct PendingContextHandoff {
     pub session_id: SessionId,
     pub source_node_id: NodeId,
     pub target_node_id: NodeId,
+    pub mode: turn_core::model::ContextHandoffMode,
     pub body: turn_proto::ContextHandoffText,
     pub includes_activity: bool,
     pub created_ms: i64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ContextHandoffOutcome {
-    Submitted,
-    /// A PTY write failed after it may have accepted a prefix. Retrying would risk
-    /// duplicate or interleaved context, so this capability is permanently fenced.
-    Uncertain,
 }
 
 pub(crate) struct FinishedContextHandoff {

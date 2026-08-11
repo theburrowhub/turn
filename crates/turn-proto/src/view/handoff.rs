@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use turn_core::ids::{HandoffId, NodeId, SessionId};
+pub use turn_core::model::ContextHandoffMode;
 
 /// Sensitive free text carried over the local protocol without exposing it through
 /// derived `Debug` output, tracing fields or assertion diagnostics.
@@ -51,12 +52,21 @@ pub struct ContextHandoffView {
     pub session_id: SessionId,
     pub source_node_id: NodeId,
     pub target_node_id: NodeId,
+    /// The exact user-selected purpose represented in the reviewed body.
+    #[serde(default)]
+    pub mode: ContextHandoffMode,
     pub source_label: String,
     pub target_label: String,
     /// The complete, already sanitised and redacted text awaiting confirmation.
     pub body: ContextHandoffText,
     /// Number of stable activity facts represented in `body`.
     pub preview_count: usize,
+    /// Number of prior metadata-only handoffs represented in `body`.
+    #[serde(default)]
+    pub history_count: usize,
+    /// True when branch/HEAD/status/diff were read from the real checkout.
+    #[serde(default)]
+    pub repository_included: bool,
     /// True when at least one secret-shaped value was replaced.
     pub redacted: bool,
 }
