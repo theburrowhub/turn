@@ -118,9 +118,12 @@ cargo run -p turn-gui
 5. Use **Next Attention** to jump to the next agent that actually needs you.
 
 To pass useful context without copying a terminal transcript, right-click an Agent in the hierarchy and
-choose **Pass context to Agent…**, or search for it in the Command Palette. Select an idle destination Agent in the same Session, optionally add an
-instruction, review the exact redacted payload, then send it. Preparing the handoff writes nothing; sending
-submits it once to the destination Agent without opening a pane or changing the layout.
+choose **Pass context to Agent…**, or search for it in the Command Palette. Choose **Continue with**,
+**Review handoff**, **Ask for second opinion** or **Promote to main**, then select an idle destination Agent
+in the same Session (or create one from the dialog). Turn composes bounded repository, process, test,
+subagent and event evidence; review that exact redacted payload, then send it. Preparing writes nothing and
+sending submits it once. The source remains in history, and the destination inherits no permissions or
+claims of authority.
 
 To finish work, choose **Session → End session…** or press **⌘⇧K**. This stops Turn-owned processes while
 keeping the Session's layout and history. **Detach all views · keep running** only closes the views.

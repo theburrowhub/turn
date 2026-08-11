@@ -37,10 +37,10 @@ use turn_core::model::{
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
 use turn_proto::{
-    CloseDisposition, ContextHandoffView, HierarchyKey, HierarchySnapshot, NodePaneCapability,
-    NodePaneView, PaneRestoreOutcome, ProtoErrorContext, SessionConflictAlternative,
-    SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState,
-    WorkspaceSummary, WorkspaceTreeView,
+    CloseDisposition, ContextHandoffMode, ContextHandoffView, HierarchyKey, HierarchySnapshot,
+    NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext,
+    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
+    TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };
 
 use crate::icons;
@@ -236,6 +236,7 @@ pub struct ContextHandoffDraft {
     pub session_id: SessionId,
     pub source_node_id: NodeId,
     pub target_node_id: Option<NodeId>,
+    pub mode: ContextHandoffMode,
     pub instruction: String,
     pub prepared: Option<ContextHandoffView>,
     pub preparing: bool,
@@ -265,6 +266,7 @@ impl ContextHandoffDraft {
             session_id: session.session.id.clone(),
             source_node_id: source.node_id.clone(),
             target_node_id,
+            mode: ContextHandoffMode::ContinueWith,
             instruction: String::new(),
             prepared: None,
             preparing: false,
@@ -920,7 +922,12 @@ pub enum ViewAction {
         session_id: SessionId,
         source_node_id: NodeId,
         target_node_id: NodeId,
+        mode: ContextHandoffMode,
         instruction: Option<String>,
+    },
+    CreateContextHandoffTarget {
+        session_id: SessionId,
+        pane_id: PaneId,
     },
     DeliverContextHandoff {
         session_id: SessionId,
@@ -6029,6 +6036,12 @@ impl<'a> TurnView<'a> {
             .context_handoff
             .as_mut()
             .expect("the handoff identity came from this draft");
+        if draft.target_node_id.is_none() {
+            draft.target_node_id = candidates
+                .iter()
+                .find(|candidate| context_target_unavailable_reason(candidate).is_none())
+                .map(|candidate| candidate.node_id.clone());
+        }
         ui.scope_builder(region(panel.shrink(18.0), "context-handoff"), |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -6089,6 +6102,12 @@ impl<'a> TurnView<'a> {
                     );
                     ui.label(
                         RichText::new(format!("{} stable facts", handoff.preview_count))
+                            .monospace()
+                            .color(theme.text_dim)
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new(handoff.mode.label())
                             .monospace()
                             .color(theme.text_dim)
                             .small(),
@@ -6158,6 +6177,30 @@ impl<'a> TurnView<'a> {
                     });
                 }
             } else {
+                ui.label(
+                    RichText::new("MODE")
+                        .monospace()
+                        .color(theme.text_dim)
+                        .small(),
+                );
+                let previous_mode = draft.mode;
+                egui::ComboBox::from_id_salt("context-handoff-mode")
+                    .selected_text(draft.mode.label())
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            ContextHandoffMode::ContinueWith,
+                            ContextHandoffMode::ReviewHandoff,
+                            ContextHandoffMode::SecondOpinion,
+                            ContextHandoffMode::PromoteToMain,
+                        ] {
+                            ui.selectable_value(&mut draft.mode, mode, mode.label());
+                        }
+                    });
+                if draft.mode != previous_mode {
+                    draft.invalidate_review();
+                }
+                ui.add_space(10.0);
                 ui.label(RichText::new("FROM").monospace().color(theme.text_dim).small());
                 ui.label(
                     RichText::new(process_title(source))
@@ -6205,6 +6248,26 @@ impl<'a> TurnView<'a> {
                     .and_then(|node| context_target_unavailable_reason(node))
                 {
                     ui.label(RichText::new(reason).color(theme.attention).small());
+                }
+                let anchor_pane = source
+                    .pane_bindings
+                    .iter()
+                    .find(|binding| !binding.temporary)
+                    .or_else(|| {
+                        session
+                            .nodes
+                            .iter()
+                            .flat_map(|node| &node.pane_bindings)
+                            .find(|binding| !binding.temporary)
+                    })
+                    .map(|binding| binding.pane_id.clone());
+                if let Some(pane_id) = anchor_pane {
+                    if ui.small_button("+ Create Agent in this Session").clicked() {
+                        actions.push(ViewAction::CreateContextHandoffTarget {
+                            session_id: draft.session_id.clone(),
+                            pane_id,
+                        });
+                    }
                 }
                 ui.add_space(10.0);
                 ui.label(
@@ -6259,6 +6322,7 @@ impl<'a> TurnView<'a> {
                         session_id: draft.session_id.clone(),
                         source_node_id: draft.source_node_id.clone(),
                         target_node_id,
+                        mode: draft.mode,
                         instruction,
                     });
                 }
@@ -8413,6 +8477,7 @@ mod tests {
         assert_eq!(draft.session_id, session_id);
         assert_eq!(draft.source_node_id, root_id);
         assert_eq!(draft.target_node_id, Some(child_id));
+        assert_eq!(draft.mode, ContextHandoffMode::ContinueWith);
         assert!(ContextHandoffDraft::from_selection(
             &snapshot,
             Some(&HierarchyKey::session(draft.session_id))

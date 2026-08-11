@@ -237,6 +237,7 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
         session_id: session(),
         source_node_id: node(),
         target_node_id: NodeId::from_stored("proc_target"),
+        mode: crate::ContextHandoffMode::ContinueWith,
         instruction: None,
     }
     .is_mutating());
@@ -400,6 +401,24 @@ fn a_new_pane_omits_everything_it_was_not_given() {
     );
 }
 
+#[test]
+fn a_legacy_handoff_request_defaults_to_continue_with() {
+    let request: Request = serde_json::from_value(serde_json::json!({
+        "op": "prepare_context_handoff",
+        "session_id": "sess_legacy_handoff",
+        "source_node_id": "proc_legacy_source",
+        "target_node_id": "proc_legacy_target"
+    }))
+    .expect("the additive mode field must preserve older clients");
+    assert!(matches!(
+        request,
+        Request::PrepareContextHandoff {
+            mode: crate::ContextHandoffMode::ContinueWith,
+            ..
+        }
+    ));
+}
+
 /// One of each variant, used by the catalogue-wide tests above. Adding a
 /// variant without adding it here makes `every_variant_is_covered` fail.
 pub(crate) fn all_requests() -> Vec<Request> {
@@ -561,6 +580,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
             session_id: session_id.clone(),
             source_node_id: node_id.clone(),
             target_node_id: NodeId::from_stored("proc_req00002"),
+            mode: crate::ContextHandoffMode::ReviewHandoff,
             instruction: Some(ContextHandoffText::new("Summarise the reviewed findings")),
         },
         Request::DeliverContextHandoff {

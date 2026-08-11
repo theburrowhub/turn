@@ -5,7 +5,8 @@
 //! consumers (state machine, attention manager, store) never learn which tool
 //! produced an event, only how much to trust it.
 
-use crate::ids::{EventId, NodeId, SessionId, WorkspaceId};
+use crate::ids::{EventId, HandoffId, NodeId, SessionId, WorkspaceId};
+use crate::model::{ContextHandoffMode, ContextHandoffOutcome};
 use crate::state::AwaitingReason;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -76,6 +77,9 @@ pub enum EventSource {
     Supervisor,
     /// The user corrected a wrong state by hand.
     UserCorrection,
+    /// The user explicitly invoked a product action rather than correcting an
+    /// inferred runtime fact.
+    UserAction,
 }
 
 impl EventSource {
@@ -89,6 +93,7 @@ impl EventSource {
             EventSource::SideChannel { .. } => Confidence::Explicit,
             EventSource::Supervisor => Confidence::Explicit,
             EventSource::UserCorrection => Confidence::Explicit,
+            EventSource::UserAction => Confidence::Explicit,
             EventSource::PtyHeuristic { .. } => Confidence::InferredHigh,
         }
     }
@@ -193,6 +198,16 @@ pub enum EventKind {
     },
     #[serde(rename = "agent.subagent_stopped")]
     AgentSubagentStopped { agent_id: Option<String> },
+
+    /// Metadata-only audit record for a reviewed continuity package. The exact
+    /// body remains ephemeral and never enters the event log.
+    #[serde(rename = "context_handoff.finished")]
+    ContextHandoffFinished {
+        handoff_id: HandoffId,
+        target_node_id: NodeId,
+        mode: ContextHandoffMode,
+        outcome: ContextHandoffOutcome,
+    },
 
     #[serde(rename = "session.needs_attention")]
     SessionNeedsAttention { reason: AwaitingReason },
@@ -393,6 +408,7 @@ fn default_severity(kind: &EventKind) -> Severity {
         | EventKind::AgentStarted { .. }
         | EventKind::AgentSpawned { .. }
         | EventKind::AgentSubagentStopped { .. }
+        | EventKind::ContextHandoffFinished { .. }
         | EventKind::AgentPermissionResolved { .. }
         | EventKind::SessionAttentionResolved => Severity::Info,
         EventKind::AgentTurnStarted { .. } | EventKind::AgentIdle => Severity::Debug,
@@ -418,6 +434,7 @@ fn kind_slug(kind: &EventKind) -> Cow<'static, str> {
         EventKind::AgentIdle => "agent.idle".into(),
         EventKind::AgentSpawned { .. } => "agent.spawned".into(),
         EventKind::AgentSubagentStopped { .. } => "agent.subagent_stopped".into(),
+        EventKind::ContextHandoffFinished { .. } => "context_handoff.finished".into(),
         EventKind::SessionNeedsAttention { .. } => "session.needs_attention".into(),
         EventKind::SessionAttentionResolved => "session.attention_resolved".into(),
     }

@@ -28,7 +28,7 @@ mod tree;
 mod workspace;
 
 pub use attention::AttentionView;
-pub use handoff::{ContextHandoffText, ContextHandoffView};
+pub use handoff::{ContextHandoffMode, ContextHandoffText, ContextHandoffView};
 pub use hierarchy::{
     HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
     SessionTreeView, TreeSurfaceState, WorkspaceTreeView,

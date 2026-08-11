@@ -35,7 +35,7 @@ use crate::bytes::TerminalBytes;
 use crate::geometry::PtySize;
 use crate::screen::PaneStream;
 use crate::search::SearchQuery;
-use crate::view::{ContextHandoffText, HierarchyKey};
+use crate::view::{ContextHandoffMode, ContextHandoffText, HierarchyKey};
 
 /// A client-supplied correlation id.
 ///
@@ -402,6 +402,8 @@ pub enum Request {
         session_id: SessionId,
         source_node_id: NodeId,
         target_node_id: NodeId,
+        #[serde(default)]
+        mode: ContextHandoffMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instruction: Option<ContextHandoffText>,
     },

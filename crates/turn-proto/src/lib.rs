@@ -137,8 +137,9 @@ pub use search::{
     SearchQuery, MAX_MATCHES, MAX_MATCHES_PER_ROW, MAX_QUERY_CHARS, MAX_SEARCH_ROWS,
 };
 pub use view::{
-    AgentSummary, AttentionView, ContextHandoffText, ContextHandoffView, HierarchyKey,
-    HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView, SessionDetails,
-    SessionSummary, SessionTreeView, SettingsControl, SettingsEntry, SettingsLevel, SettingsView,
-    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
+    AgentSummary, AttentionView, ContextHandoffMode, ContextHandoffText, ContextHandoffView,
+    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
+    SessionDetails, SessionSummary, SessionTreeView, SettingsControl, SettingsEntry, SettingsLevel,
+    SettingsView, TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
+    WorkspaceTreeView,
 };
