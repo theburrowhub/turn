@@ -45,13 +45,15 @@ struct FolderDialogResult {
 /// so an open chooser causes neither a blocked renderer nor an idle repaint loop.
 struct FolderDialog {
     next_request_id: u64,
-    sender: mpsc::Sender<FolderDialogResult>,
+    sender: mpsc::SyncSender<FolderDialogResult>,
     results: mpsc::Receiver<FolderDialogResult>,
 }
 
 impl Default for FolderDialog {
     fn default() -> Self {
-        let (sender, results) = mpsc::channel();
+        // Only one native sheet may be outstanding. Keep the completion path
+        // bounded too, so every cross-thread GUI queue has an explicit ceiling.
+        let (sender, results) = mpsc::sync_channel(1);
         Self {
             next_request_id: 1,
             sender,

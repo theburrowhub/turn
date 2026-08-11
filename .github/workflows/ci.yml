@@ -81,7 +81,7 @@ jobs:
 
       - name: Test (Linux — turn-gui's logic tests, which need no GPU)
         if: runner.os == 'Linux'
-        run: cargo test -p turn-gui --lib --bins --test links --test onboarding --test scrollback
+        run: cargo test -p turn-gui --lib --bins --test links --test onboarding --test performance --test scrollback
 
       # The two steps above name what they run, which means they can stop running
       # something without anyone noticing: `--exclude turn-gui` drops *every* integration
@@ -92,7 +92,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           found=$(cd crates/turn-gui/tests && ls *.rs | tr '\n' ' ' | sed 's/ $//')
-          if [ "$found" != "links.rs onboarding.rs scrollback.rs snapshots.rs" ]; then
+          if [ "$found" != "links.rs onboarding.rs performance.rs scrollback.rs snapshots.rs" ]; then
             echo "::error::turn-gui integration targets differ from the explicit Linux allowlist: $found"
             echo "The Linux job runs '--exclude turn-gui' plus an explicit headless target list, so a new target"
             echo "would not run on Linux at all. Either name it in the Linux test step above,"

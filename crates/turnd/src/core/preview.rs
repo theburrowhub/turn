@@ -305,4 +305,37 @@ mod tests {
         assert_eq!(preview.chars().count(), MAX_PREVIEW_CHARS);
         assert!(preview.ends_with('…'));
     }
+
+    #[test]
+    fn thirty_sessions_keep_active_and_background_preview_cadence_bounded() {
+        const START: i64 = 1_700_000_000_000;
+        let mut probes: Vec<PreviewProbe> = (0..30).map(|_| PreviewProbe::default()).collect();
+        for (index, probe) in probes.iter_mut().enumerate() {
+            probe.defer(index < 3, START);
+        }
+
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|probe| probe.due(START + ACTIVE_PREVIEW_INTERVAL_MS - 1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|probe| probe.due(START + ACTIVE_PREVIEW_INTERVAL_MS))
+                .count(),
+            3,
+            "only the three watched panes sample at the active cadence"
+        );
+        assert_eq!(
+            probes
+                .iter()
+                .filter(|probe| probe.due(START + BACKGROUND_PREVIEW_INTERVAL_MS))
+                .count(),
+            30,
+            "background panes are delayed, not starved"
+        );
+    }
 }

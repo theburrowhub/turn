@@ -76,7 +76,9 @@ impl CompanionMonitor {
     /// Waits off the UI thread and wakes the window if the process actually fails.
     /// Contention is not a failure: another UI may have won the same startup race.
     pub fn watch(mut self, wake: Arc<dyn Fn() + Send + Sync>) -> mpsc::Receiver<CompanionEvent> {
-        let (send, receive) = mpsc::channel();
+        // A companion exits once and therefore produces at most one event. Giving
+        // that fact a channel capacity makes the GUI audit mechanically complete.
+        let (send, receive) = mpsc::sync_channel(1);
         let thread_send = send.clone();
         let thread_wake = Arc::clone(&wake);
         let fallback_log = self.log_path.clone();
@@ -778,7 +780,7 @@ mod tests {
             EnsureOutcome::Started(launch) => launch,
             other => panic!("expected a launch, got {other:?}"),
         };
-        let (wake_send, wake_events) = mpsc::channel();
+        let (wake_send, wake_events) = mpsc::sync_channel(1);
         let events = launch.monitor.watch(Arc::new(move || {
             let _ = wake_send.send(());
         }));

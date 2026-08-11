@@ -96,6 +96,13 @@ adapter-acceptance: ## Reproduce dedicated Agent adapters and external-app disco
 	$(CARGO) test -p turnd a_discovered_graphical_app_stays_under_its_parent_without_a_pane --lib -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turnd an_authenticated_callback_promotes_inference_without_resetting_the_turn --lib -- --test-threads=$(TEST_THREADS)
 
+.PHONY: performance-acceptance
+performance-acceptance: ## Measure the 30-Session/100-Process envelope without opening a window
+	$(CARGO) test -p turn-gui both_gui_boundary_queues_have_hard_capacity --lib -- --test-threads=1
+	$(CARGO) test -p turn-gui a_large_hierarchy_builds_only_viewport_rows_and_the_reveal_target --lib -- --test-threads=1
+	$(CARGO) test -p turnd thirty_sessions_keep_active_and_background_preview_cadence_bounded --lib -- --test-threads=1
+	$(CARGO) test -p turn-gui --test performance -- --nocapture --test-threads=1
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }
