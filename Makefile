@@ -144,6 +144,18 @@ privacy-acceptance: ## Reproduce local-data inventory, export, retention and del
 	$(CARGO) test -p turnd --test binary offline_installation_deletion_ -- --test-threads=1
 	$(CARGO) test -p turn-gui --bin turn release_commands_are_windowless_and_update_status_parses_both_socket_spellings -- --test-threads=1
 
+.PHONY: mvp-acceptance
+mvp-acceptance: ## Run the complete functional v0.1.0 release gate, serially
+	@test -s PRODUCT.md
+	@test -s docs/MVP_ACCEPTANCE.md
+	@test -s docs/REVIEWER_ACCEPTANCE.md
+	@test -s docs/ACCESSIBILITY_ACCEPTANCE.md
+	@$(MAKE) --no-print-directory verify TEST_THREADS=1
+	@$(MAKE) --no-print-directory performance-acceptance
+	@$(MAKE) --no-print-directory privacy-acceptance
+	@$(MAKE) --no-print-directory release-acceptance
+	@echo "mvp-acceptance: functional v0.1.0 gate passed"
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

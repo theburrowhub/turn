@@ -448,7 +448,7 @@ Ranked by severity, worst first.
    `AgentTurnStarted.prompt_excerpt` — a command with a bearer token in it, a
    prompt with a pasted key — were written verbatim. Redaction now covers the structured kind and matches
    credential shapes as well as key names; ADR-040 additionally requires untouched raw payload to stay out
-   of durable product storage, with the M6 integration proof still pending.
+   of durable product storage, now covered by the M6 integration and on-disk adversarial suites.
 5. **File contents reached the database.** A `Write` permission request carries
    the whole file in `tool_input.content` (confirmed in the captured fixture), and
    the whole payload was stored. Bulk members are dropped for transient diagnostics; M6 must prove the

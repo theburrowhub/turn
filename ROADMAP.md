@@ -13,8 +13,8 @@ this document says what happens next and how we will know it worked.
 **The frontend was replaced.** The Tauri shell and the TypeScript/`xterm.js` window were built, rejected by
 the product owner on sight, and deleted: `ui/` and `crates/turn-ui` no longer exist and `turn-ui` is out of
 the workspace. The window is now native Rust drawn on the GPU (`crates/turn-gui`, `eframe`/`egui` over
-`wgpu`). ADR-039 records the decision, its cost and its downsides. The window milestone is therefore
-**reopened** as M7 below, and the tests it used to count are gone rather than renamed.
+`wgpu`). ADR-039 records the decision, its cost and its downsides. The window milestone was consequently
+reopened as M7, rebuilt natively, and is now complete for the functional v0.1.0 baseline.
 
 There is one Rust test runner and one lockfile. The reproducible source of truth is
 `cargo test --workspace --all-targets -- --test-threads=1`; this roadmap no longer hard-codes a total that becomes false
@@ -25,10 +25,9 @@ The upgraded first vertical now runs through the production daemon, store, proto
 model: Workspace and fenced main Session, explicit Reviewer spawn, stable preview, Quick Preview,
 temporary Pane close without process termination, and UI reconnect to the same live daemon. Separate
 daemon-restart coverage restores durable state as `Orphaned`/`Lost` and proves no relaunch. Another integration test sends
-the event through the real loopback Claude hook transport and production normaliser. This is reproducible
-without a paid external service. A manual smoke test against an authenticated, currently installed Claude
-Code CLI is still pending and must not be conflated with the deterministic proof; current Claude hook
-payloads may provide a role/external id without a parent-declared display name.
+the event through the real loopback Claude hook transport and production normaliser. The separate packaged
+acceptance also passed against authenticated Claude Code 2.1.226, including the UI-only close/reopen boundary;
+the exact observations and reproducible harness are in `docs/REVIEWER_ACCEPTANCE.md`.
 
 The hardening pass also proves two authority boundaries that the happy-path vertical did not: only one
 daemon may own a canonical data directory even when configured with another socket, and ambiguous or
@@ -42,11 +41,11 @@ restart instead of being attributed or resolved session-wide.
 | M2 — Agent integration | `turn-agents` + `turn-hook`: adapters, hook server, heuristics, registry | **Done** |
 | M3 — Persistence | `turn-store`: SQLite, migrations, redaction, eight repositories | **Done** |
 | M4 — Protocol | `turn-proto`: framing, requests, responses, pushes, view models | **Done** |
-| M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Built for automated vertical**; live CLI acceptance pending |
-| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented and audited for the first vertical**; broader hardening remains |
-| M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
-| M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
-| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; measured performance, restart fencing, durable projections, authenticated IPC and the macOS release/update pipeline are built; Linux visual/release sign-off remains |
+| M5 — The daemon | `turnd`: assembles everything, owns the ptys | **Done for v0.1.0**; deterministic and authenticated packaged verticals passed |
+| M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v4 | **Done for v0.1.0**; hierarchy, safety and lifecycle hardening landed |
+| M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Done for v0.1.0**; tree management, terminal UX and accessibility contract landed |
+| M8 — First vertical | One Session and background Reviewer, end to end | **Done**; packaged Claude Code 2.1.226 run and UI reconnect passed |
+| M9 — Hardening | Measurement, restore semantics, packaging and release gates | **Functional baseline done**; public distribution and broad platform sign-off continue post-MVP |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -235,13 +234,13 @@ live in `tests/{desk,agents,surface,restart,attention,binary,cells}.rs`.
 **Verified by.** `tests/agents.rs::the_reviewer_vertical_crosses_the_real_claude_hook_and_survives_a_ui_restart`
 crosses the real loopback hook server and production Claude normaliser; `tests/desk.rs` covers PTY input,
 output and reconnect replay; `tests/restart.rs` proves a daemon restart relaunches nothing; the child-process,
-exit/attention and socket lifecycle cases have dedicated integration tests. The one missing class of evidence
-is an authenticated external Claude Code binary driven from the native packaged window. That remains M8/M9
-live acceptance, not something the deterministic stand-in proves.
+exit/attention and socket lifecycle cases have dedicated integration tests. An authenticated external Claude
+Code binary also passed from the packaged native window, followed by a UI close/reopen against the surviving
+daemon and PTY. `docs/REVIEWER_ACCEPTANCE.md` keeps that evidence separate from the deterministic CI floor.
 
 ---
 
-## M6 — Unified hierarchy foundation · **Implemented for the first vertical**
+## M6 — Unified hierarchy foundation · **Done for v0.1.0**
 
 This milestone makes ADR-040 true below the UI before M7 builds on it.
 
@@ -339,20 +338,21 @@ silently wrong — `a_parsed_screen_becomes_the_grid_the_client_paints`,
 `a_full_screen_program_reports_its_alternate_screen_and_its_input_modes`,
 `the_indexed_palette_matches_the_xterm_cube_and_greys` — plus
 `every_state_has_a_glyph_as_well_as_a_colour` and
-`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 95
-tests, including 62 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
+`the_attention_colour_is_reserved_for_states_that_block_the_user`. The snapshot integration target has 105
+tests, including 65 committed PNG baselines such as `a_busy_desk_with_a_pending_permission` and
 `an_empty_window_says_so_rather_than_looking_broken`. The snapshots are a capability, not a formality: the first one caught two labels drawn on top of each
 other, which no logic test could see.
 
-**What is not.** Packaged VoiceOver, Orca and input-method checklist runs remain. Snapshot baselines are
-native GPU output and still need platform CI coverage. No manual authenticated Claude session has been
-accepted.
+**What is not.** Broad packaged VoiceOver, Orca and current input-method sign-off remains release hardening.
+Snapshot baselines are native GPU output and still need reviewed Linux platform coverage. The functional
+keyboard, AccessKit, zoom, contrast, motion and IME contract is automated, and the packaged authenticated
+Claude session has passed.
 
-**Exit criterion.** The automated first-vertical form is met. Human live-CLI acceptance remains open.
+**Exit criterion.** Met for the functional v0.1.0 native window; the broader platform matrix remains post-MVP.
 
 ---
 
-## M8 — First vertical · **Automated vertical complete; live smoke pending**
+## M8 — First vertical · **Done**
 
 The deterministic vertical crosses the production daemon/store model and, separately, the real loopback
 Claude hook server and production normaliser. The live-runtime proof reconnects a replacement UI to the
@@ -361,19 +361,14 @@ stable/redacted, a temporary Pane can close without stopping it and Layout stays
 tests make the narrower claim that relationship/preview/process metadata survives as `Orphaned`/`Lost` and
 nothing is relaunched.
 
-**The true remaining gap.** Nobody has yet completed the same scenario by launching an authenticated
-external Claude Code binary from the packaged native window. That smoke test may expose installed-version,
-credentials, signing, notification or Metal/Vulkan behaviour the deterministic proof cannot. It also must
-record exactly which current hook fields Claude supplies; the test fixture's explicit `Reviewer` name/task
-is a supported payload shape, not evidence that every installed Claude release emits those fields.
+The same scenario passed against authenticated Claude Code 2.1.226 from the packaged native window. It
+recorded the real hook shapes and terminal modes, verified a uniquely named Reviewer with no invented PID or
+Pane, closed a temporary Pane without changing Layout, closed only the GUI, and reopened against the same
+daemon, socket, PTY, Session and write lease. `docs/REVIEWER_ACCEPTANCE.md` records the exact environment and
+deviations from Claude Code 2.1.224.
 
-To be clear about the other direction too: this is not the *only* thing between the code and a working
-product. M9 holds the unmeasured performance budget, the unfinished restore semantics, Linux sign-off and
-packaging, and none of that is optional for something a person installs. M8 is the milestone that turns
-"built" into "seen to work once".
-
-**Acceptance target.** Seven scenarios define completion. Their deterministic core is automated; the
-external-CLI and both-platform manual runs below remain open:
+**Acceptance target.** Seven scenarios define completion. Their deterministic core is automated and the
+packaged external-Claude vertical has passed:
 
 1. **One Agent.** New Workspace, new Session from the `Coding` Template, `claude` runs, output renders,
    input works, state is correct throughout — `Running` → `NeedsPermission` → `Running` → `CompletedTurn`.
@@ -392,41 +387,38 @@ external-CLI and both-platform manual runs below remain open:
 7. **Checkout conflict.** A second main writer is refused before external side effects; the chooser focuses
    the owner or creates read-only/worktree. Restart and a stale heartbeat do not steal the first lease.
 
-**Verified by.** A scripted end-to-end harness where possible, and a written manual checklist for the rest,
-run on macOS and Linux before the milestone closes.
+**Verified by.** The opt-in packaged live harness and its passing run record, plus deterministic Agent,
+Attention, hierarchy, terminal, lease, restart and snapshot suites in the ordinary release gate.
 
 ---
 
-## M9 — Hardening · **In progress**
+## M9 — Hardening · **Functional v0.1.0 baseline done**
 
 Authority fencing, atomic event checkpoints, restore diagnostics, durable redaction, measured performance,
-local quality gates and the macOS release/update pipeline have landed. Linux visual/manual acceptance and
-the first credentialed production tag are still open.
+local privacy controls, accessibility contracts, local quality gates and the macOS release/update machinery
+have landed. `make mvp-acceptance` is the single serial release gate and `docs/MVP_ACCEPTANCE.md` maps every
+global criterion to its evidence.
 
-**Delivers.**
+**Delivered for the functional baseline.**
 
-- **Measurement, replacing the unmeasured budget.** Resident memory at 30 live Panes; keystroke-to-pty
-  latency; output-to-glass at the 95th percentile; idle daemon CPU; and the base64 protocol overhead under a
-  build firehose. Then tune `TerminalBuffer::with_capacity` per `PaneKind` if the numbers say so — a build
-  log does not need an Agent conversation's scrollback.
-- **Restore semantics finished.** Current PID/command corroboration must remain conservative, the relaunch
-  offer flow must stay explicit, and a real persistent backend must prove PTY reattachment before
-  `Reconnected` can be emitted.
-- **Linux parity signed off** — one GPU stack checked on both backends deliberately rather than hoped for:
-  the window opened and used under Vulkan, and the snapshot baselines recorded on Linux so CI compares them
-  there too instead of only on macOS/Metal.
-- **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and the
-  full Rust suite, all green on both runners. There is no Node/UI job in the current native-Rust frontend;
-  Linux still needs reviewed visual baselines rather than a silently skipped comparison.
-- **Packaging**: `turn`, `turnd` and `turn-hook` are explicit version-checked siblings in `Turn.app`.
-  The tag workflow produces Developer ID signed, hardened, notarized arm64/Intel archives and stable-channel
-  manifests; CI builds and verifies the same bundle ad-hoc on every PR. The updater preserves a compatible
-  live daemon and refuses any incompatible transition while it owns PTYs. A Linux archive remains open.
-- **Contract-drift monitoring**: re-record the Claude Code fixture against the current release, add a Codex
-  fixture recorded live rather than shaped from documentation, and verify the two Codex assumptions still
-  outstanding (§Open decisions).
+- 30 Workspaces, 30 Sessions and 120 Processes are measured with enforced response, memory, queue, cadence
+  and storage budgets; hardware and before/after profiles live in `docs/PERFORMANCE.md`.
+- Restore remains honest: UI replacement reuses the live daemon and PTYs, daemon restart relaunches nothing,
+  and no path fabricates `Reconnected` without ownership of the PTY master.
+- macOS CI builds the final three-sibling bundle topology on every PR. Version/protocol skew is rejected,
+  compatible UI updates preserve the daemon, and incompatible daemon replacement is deferred while PTYs live.
+- SQLite and private files have complete redacted inventory/export, scoped deletion, bounded retention,
+  lock-protected offline purge and explicit zero-telemetry reporting.
+- macOS and Ubuntu enforce format, all-target Clippy, the applicable full test surface and release binaries;
+  macOS additionally verifies the ad-hoc bundle and GPU snapshot baselines.
 
-**Exit criterion.** Every box in `PRODUCT.md` §7 is checked, or explicitly waived with a reason.
+**Still post-MVP.** Publishing the first credentialed Developer ID/notarized tag, clean-machine channel
+operation, a Linux archive/update channel and reviewed Linux GPU baselines remain distribution work. Broad
+packaged VoiceOver/Orca/current-IME sign-off remains platform acceptance. Surviving daemon death with a live
+PTY, tmux and the other scopes listed under Post-MVP are not silently claimed by v0.1.0.
+
+**Exit criterion.** Met for the functional baseline: every required row in `PRODUCT.md` §7 is checked, and
+every unchecked row is explicitly classified outside issue #21's MVP scope.
 
 ---
 
@@ -609,27 +601,25 @@ are reproduced by `make accessibility-acceptance`.
 do not prove the current platform bridge and assistive-technology releases end to end. Both were free
 before and are now Turn's maintenance responsibility.
 
-### 3. Memory and throughput at the design point are unmeasured
+### 3. Memory and throughput at the design point are measured and regression-gated
 
-The budget names 30 Panes across 10 Sessions with one producing build-volume output. Per-Pane byte rings are
-a hard 2 MiB, so 30 Panes is ~60 MiB of ring — fine. The vt100 grid grows toward its 5,000-row cap and its
-per-cell cost has never been measured here; at 80 columns that is 400,000 cells per Pane at full scrollback.
-On top of that, base64 on the protocol inflates output by 33% plus a pass each way, which is irrelevant for
-keystrokes and not irrelevant for a `cargo build` firehose.
+The harness models 30 Workspaces, 30 active/recent Sessions, 120 relevant Processes and a noisy 40×120
+terminal. Per-Pane byte rings remain a hard 2 MiB; terminal/image storage has a deterministic 600 MiB ceiling,
+GUI queues are bounded, and viewport-lazy row construction caps expensive work. The optimised reference run
+measured a 32 MiB process peak RSS, 320 µs Session-switch p95 and 55 µs output-apply p95.
 
 *Mitigated by:* every buffer bounded rather than unbounded; `TerminalBuffer::with_capacity` taking both
 bounds so they can be tuned per `PaneKind`; `MAX_OUTPUT_CHUNK_BYTES` capping a frame; backpressure that
 degrades to "you lagged, here is a replay" rather than to stutter; and `OutputEncoding` already negotiated in
 the handshake so a binary channel is additive.
-*Still missing:* an actual measurement. It is an M9 deliverable and the numbers could force a redesign of the
-output path, which is why it should not wait until M9 if a cheap benchmark can be built earlier.
+*Still missing:* long-running profiler and compositor evidence across GPU/driver combinations. The release
+gate measures and fails the production model/protocol/UI application path, not photons or idle energy use.
 
 ADR-039 changed the shape of this risk without shrinking it. Sending cells rather than bytes to the client
 removes the base64 inflation from the pane path and removes the second parse entirely, which should help. It
 adds a cost the webview did not have: a GPU frontend repaints, so the per-frame work scales with **painted
-cells** rather than with bytes received, and thirty panes of dense colour cost something at 60 fps even when
-nothing changed. Nothing here is measured either, and "we replaced a measured-nothing with a different
-measured-nothing" is the accurate summary.
+cells** rather than with bytes received. The deterministic harness now guards settle frames and viewport
+work; platform compositor profiling remains a narrower post-MVP measurement.
 
 ### 4. The join is the riskiest code in the system — **implemented and adversarially covered**
 

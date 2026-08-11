@@ -25,7 +25,7 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
 | `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
 | `turnd` | Built | reproduce | Atomic Session/lease lifecycle, PTYs, hierarchy projection and restore vertical. |
-| `turn-gui` | Built for first vertical | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
+| `turn-gui` | Built for v0.1.0 MVP | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
 
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
 `vitest` and no second lockfile.
@@ -819,7 +819,7 @@ start in microseconds and cannot afford an async runtime. The HTTP request is bu
 
 ### 5.2 `turnd` — the daemon
 
-**Status: built for the automated first vertical.** `main.rs` is a real entry point that parses
+**Status: built and accepted for the v0.1.0 functional vertical.** `main.rs` is a real entry point that parses
 options, initialises logging, resolves a `Config` and calls `turnd::start`. The library declares `config`,
 `paths`, `instance`, `logging`, `options`, `error`, `server` and `core`, with `core` split into `spawn`,
 `supervise`, `restore`, `events`, `requests`, `views`, `attention`, `clients`, `command` and `output`.
@@ -828,9 +828,9 @@ attention,binary,cells}.rs`; counts are intentionally reproduced rather than fro
 
 The release audit runs `cargo test -p turnd -- --test-threads=1` and the full workspace with all targets
 serially. The exact
-Reviewer tests cross both the production reducer and the real loopback Claude hook transport. An
-authenticated external Claude Code session in the packaged native window remains a separate acceptance
-gate; deterministic coverage is not evidence that credentials, signing or the installed release work.
+Reviewer tests cross both the production reducer and the real loopback Claude hook transport. The separate
+authenticated external-Claude gate also passed from the packaged native window; its exact tool version,
+terminal modes, hook observations and UI close/reopen evidence live in `docs/REVIEWER_ACCEPTANCE.md`.
 
 #### Desktop bootstrap and process lifetime
 
@@ -1272,14 +1272,15 @@ testable without a test mutating process-global state every other test in the bi
 
 ### 6.3 The UI
 
-**Status: built for the upgraded first vertical.** `crates/turn-gui` is a native window drawn on the GPU — `eframe`/`egui` over
+**Status: built for the v0.1.0 functional MVP.** `crates/turn-gui` is a native window drawn on the GPU — `eframe`/`egui` over
 `wgpu`, one binary named `turn`, no webview, HTML or TypeScript. ADR-039 records the stack decision;
 ADR-040 defines the accepted information architecture.
 
 The persistent left surface is one Workspace hierarchy: Workspace → Session → Agent/Tool → child. It is
 the only navigation home for those identities. There is no parallel Session tab strip, permanent overview,
 permanent Attention Queue navigator or optional second Agent tree. Collapse and stable row ordering make
-the same projection work at 3, 10 and 30 Sessions; search, state filters and virtualisation remain planned.
+the same projection work at 3, 10 and 30 Sessions; search, compound state filters and viewport-lazy row
+construction are implemented and performance-gated.
 The centre contains only the
 user/template-selected Layout. The right side is an optional contextual inspector, and Quick Preview is a
 non-layout overlay.
@@ -1532,9 +1533,10 @@ marker, so it must not present their age as fresh activity.
 
 ### 8.1 Budget
 
-Targets are for the design point: **30 concurrent panes across 10 sessions, one of them producing
-build-volume output.** Values marked *enforced* are constants in the code today; values marked *target*
-are not yet measured in a release-build profiling run.
+The v0.1.0 design point is **30 Workspaces, 30 active/recent Sessions and 120 relevant Processes**, including
+a noisy 40×120 terminal, simultaneous Previews and Attention. Hard bounds are constants; latency, hierarchy
+size and peak-RSS budgets are enforced by `make performance-acceptance`. Optimised reference measurements,
+hardware and before/after profiles are recorded in `docs/PERFORMANCE.md`.
 
 | Property | Value | Status |
 | --- | --- | --- |
@@ -1551,29 +1553,27 @@ are not yet measured in a release-build profiling run.
 | Process-table scans | on demand only, never on a timer | enforced by absence |
 | Supervisor walk depth | 32 (`MAX_DEPTH`) | enforced |
 | Focus changes | ≤ 3 per 10 s, ≥ 2 s apart | enforced |
-| Keystroke to pty write | < 5 ms | target |
-| Output to glass | < 50 ms at the 95th percentile | target |
-| Idle daemon CPU | < 1% with 30 live panes and no output | target |
-| Resident memory, 30 panes | to be measured — see below | **unmeasured** |
+| Terminal input enqueue | p95 < 1 ms in debug CI | measured and enforced |
+| One 40×120 output update | p95 < 5 ms; 1,024 updates < 3 s | measured and enforced |
+| Quiet terminal after noisy burst | < 20 ms | measured and enforced |
+| Session switch | p95 < 50 ms and ≤ 6 settle frames | measured and enforced |
+| Resident memory | raw rings 60 MiB; terminal/image aggregate < 600 MiB | bounded and enforced |
 
-The memory figure is deliberately left open rather than guessed. Per-Pane byte rings are a hard 2 MiB
-each, so 30 Panes is ~60 MiB of ring. The vt100 grid grows toward its 5,000-row cap as output arrives
-and its per-cell cost has not been measured in this workspace; at 80 columns that is 400,000 cells per
-Pane at full scrollback. If the measured figure is uncomfortable, the levers already exist:
-`TerminalBuffer::with_capacity` takes both bounds, so they can be tuned per `PaneKind` — a build log
-does not need the same scrollback as an Agent conversation. Tracked as a risk in `ROADMAP.md`, not as a
-solved problem.
+The optimised reference run measured a 32 MiB process peak RSS, 320 µs Session-switch p95, 55 µs output
+apply p95 and sub-microsecond input enqueue. Those numbers are observations, while the looser CI ceilings
+above are regression budgets that tolerate shared runners. Per-Pane byte rings remain hard-capped at 2 MiB,
+and `TerminalBuffer::with_capacity` keeps the tuning lever explicit if future Pane kinds need different
+scrollback trade-offs.
 
 Base64 on the protocol is the other known cost, quantified in `turn-proto`'s own docs: 33% inflation
 plus a pass each way, with `OutputEncoding` already negotiated in the handshake as the escape hatch.
 
-Two of these targets were set against a webview and now are not (ADR-039). "Output to glass" no longer
+Two of the original targets were set against a webview and now are not (ADR-039). "Output to glass" no longer
 includes a JavaScript event loop, a DOM write or a canvas composite — a native client paints cells straight
 into a GPU frame — and ADR-001's assumption that the renderer bounds throughput no longer applies. That
-should make the target easier, not harder. It is still a **target**: nothing here has been measured, and a
-GPU frontend has its own failure mode the webview did not, namely a per-frame cost that scales with painted
-cells rather than with bytes received. Thirty panes of dense colour at 60 fps is the measurement to take, and
-it has not been taken.
+leaves rapidly changing compositor cost as a release-profiler concern rather than a claim made by the
+deterministic harness. The MVP gate instead measures the production model/protocol/UI application path,
+bounds row construction to the viewport and fails on regressions at the agreed workload shape.
 
 ### 8.2 Backpressure
 
