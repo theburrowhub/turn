@@ -677,6 +677,10 @@ impl TurnApp {
                 self.state.tree_has_focus = true;
                 true
             }
+            Command::ToggleInspector => {
+                self.state.inspector_open = !self.state.inspector_open;
+                true
+            }
             Command::PassContext => {
                 self.state.context_handoff = self.state.hierarchy.as_ref().and_then(|snapshot| {
                     crate::view::ContextHandoffDraft::from_selection(

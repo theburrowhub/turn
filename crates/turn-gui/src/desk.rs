@@ -34,9 +34,9 @@ use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
 use turn_proto::{
     AttentionView, CloseDisposition, ContextHandoffText, ContextHandoffView, EscapedProcess,
-    FocusTarget, HierarchyKey, HierarchySnapshot, NewPane, NodePaneCapability, NodePaneView,
-    ProtoErrorContext, PtySize, Request, Response, SessionConflictAlternative, SessionSummary,
-    TemplateSummary, TerminalBytes, TreeNodeView, WorkspaceSummary,
+    FocusTarget, HierarchyKey, HierarchySnapshot, InspectorDetails, NewPane, NodePaneCapability,
+    NodePaneView, ProtoErrorContext, PtySize, Request, Response, SessionConflictAlternative,
+    SessionSummary, TemplateSummary, TerminalBytes, TreeNodeView, WorkspaceSummary,
 };
 
 use crate::announce::Announcement;
@@ -150,6 +150,9 @@ pub struct Desk {
     /// the daemon yet. Creation commands must follow what the user can see, not the
     /// previous persisted row.
     navigation_hint: Option<HierarchyKey>,
+    /// Last on-demand inspector response. It is rendered only when its key still
+    /// matches the visible selection, so a late reply cannot label the next row.
+    inspector: Option<Box<InspectorDetails>>,
     preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     /// Per-Session recovery offers emitted after a daemon restart. Kept structured so
     /// one Session cannot overwrite another with a global red string.
@@ -221,6 +224,7 @@ impl Desk {
             include_archived: false,
             surface_id: "main-window".to_string(),
             navigation_hint: None,
+            inspector: None,
             preview_history: HashMap::new(),
             restores: HashMap::new(),
             relaunching: HashSet::new(),
@@ -279,6 +283,10 @@ impl Desk {
             .get(node)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn inspector(&self) -> Option<&InspectorDetails> {
+        self.inspector.as_deref()
     }
 
     pub fn preview_histories(&self) -> &HashMap<NodeId, Vec<ActivityPreview>> {
@@ -1072,6 +1080,15 @@ impl Desk {
                 // leaves, or comes back, as a consequence of the same request that decides
                 // what the tree contains.
                 vec![self.hierarchy_request()]
+            }
+            (Ask::Inspector(expected), Response::Inspector { details }) => {
+                if details.key() != expected {
+                    return vec![Reaction::Notice(
+                        "the daemon returned details for a different hierarchy row".into(),
+                    )];
+                }
+                self.inspector = Some(details);
+                Vec::new()
             }
             (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot, true),
             (_, Response::TreeState { state }) => {
@@ -2468,6 +2485,10 @@ impl Desk {
     /// resolves its Attention nor changes the Layout.
     pub fn apply_hierarchy_action(&mut self, action: HierarchyAction) -> Vec<Reaction> {
         match action {
+            HierarchyAction::Inspect { key } => vec![Reaction::Send {
+                ask: Ask::Inspector(key.clone()),
+                request: Request::GetInspector { key },
+            }],
             HierarchyAction::Select { surface_id, key } => vec![Reaction::Send {
                 ask: Ask::Action("selecting a node in the workspace tree"),
                 request: Request::SelectTreeNode {
@@ -3107,6 +3128,7 @@ impl Desk {
             | Command::SwitchSession
             | Command::ToggleAttentionPanel
             | Command::FocusWorkspaceTree
+            | Command::ToggleInspector
             | Command::PassContext
             | Command::CopySelection
             | Command::PasteClipboard => {
@@ -4131,6 +4153,7 @@ impl Desk {
             layout: self.layout().cloned(),
             panes,
             temporary_pane,
+            inspector: self.inspector(),
             restore,
             recovery_lease,
             unreachable_processes,
@@ -4908,6 +4931,62 @@ mod tests {
                 | Request::DismissAttention { .. }
                 | Request::GotoAttention { .. }
         )));
+    }
+
+    #[test]
+    fn an_inspector_request_for_a_hierarchy_row_is_one_typed_read_only_request() {
+        let key = HierarchyKey::process(NodeId::from_stored("proc_inspector_target"));
+        let mut desk = Desk::new();
+        let reactions = desk.apply_hierarchy_action(HierarchyAction::Inspect { key: key.clone() });
+
+        assert!(matches!(
+            reactions.as_slice(),
+            [Reaction::Send {
+                ask: Ask::Inspector(expected),
+                request: Request::GetInspector { key: requested },
+            }] if expected == &key && requested == &key
+        ));
+        assert!(!Request::GetInspector { key }.is_mutating());
+    }
+
+    #[test]
+    fn an_inspector_answer_must_match_the_row_that_was_requested() {
+        let workspace = Workspace::new("turn", "/repo/turn", T0);
+        let expected = HierarchyKey::workspace(workspace.id.clone());
+        let wrong = HierarchyKey::session(SessionId::from_stored("sess_wrong_inspector"));
+        let details = InspectorDetails::Workspace {
+            workspace: Box::new(WorkspaceSummary::from_workspace(&workspace, &[])),
+            checkouts: Vec::new(),
+            write_lease: None,
+            environment_keys: Vec::new(),
+            init_commands: Vec::new(),
+            attention: Default::default(),
+        };
+        let mut desk = Desk::new();
+        let reactions = desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::Inspector(wrong),
+                response: Box::new(Response::Inspector {
+                    details: Box::new(details.clone()),
+                }),
+            },
+            T0,
+        );
+        assert!(matches!(reactions.as_slice(), [Reaction::Notice(_)]));
+        assert!(desk.inspector().is_none());
+
+        assert!(desk
+            .apply_inbound(
+                Inbound::Answer {
+                    ask: Ask::Inspector(expected.clone()),
+                    response: Box::new(Response::Inspector {
+                        details: Box::new(details),
+                    }),
+                },
+                T0,
+            )
+            .is_empty());
+        assert_eq!(desk.inspector().map(InspectorDetails::key), Some(expected));
     }
 
     #[test]

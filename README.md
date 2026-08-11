@@ -66,6 +66,8 @@ Implemented today:
 - Visual layout editor and reusable layout presets.
 - Persistent PTYs, terminal panes, process hierarchy, subagent previews, and temporary panes that can be
   promoted into remembered permanent placement without restarting their process.
+- Optional contextual inspectors for Workspace, Session, Agent, and Process rows, with safe bounded
+  history, readable parent links, confidence labels, runtime facts, and contextual actions.
 - Review-before-send context handoffs between controllable Agents in one Session.
 - Claude Code and Codex adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
@@ -200,6 +202,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   appearance preferences, IME, TUI modes and bounded-output proof.
 - [Template lifecycle acceptance](docs/TEMPLATE_ACCEPTANCE.md) — visual create/edit/capture,
   defaults, safe application, missing-tool visibility and deletion integrity.
+- [Contextual inspector acceptance](docs/INSPECTOR_ACCEPTANCE.md) — complete typed detail,
+  redaction, confidence, responsive snapshots and AccessKit coverage.
 - [Protocol](docs/PROTOCOL.md) — versioned daemon/client wire contract.
 - [Contributing](CONTRIBUTING.md) — project conventions and invariant-preserving workflow.
 

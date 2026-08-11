@@ -22,6 +22,7 @@
 mod attention;
 mod handoff;
 mod hierarchy;
+mod inspector;
 mod session;
 mod settings;
 mod tree;
@@ -32,6 +33,10 @@ pub use handoff::{ContextHandoffMode, ContextHandoffText, ContextHandoffView};
 pub use hierarchy::{
     HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
     SessionTreeView, TreeSurfaceState, WorkspaceTreeView,
+};
+pub use inspector::{
+    InspectorDetails, InspectorEventView, InspectorHandoffView, InspectorOriginView,
+    InspectorParentView,
 };
 pub use session::{AgentSummary, SessionDetails, SessionSummary};
 pub use settings::{SettingsControl, SettingsEntry, SettingsLevel, SettingsView};

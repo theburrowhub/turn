@@ -9,6 +9,7 @@
 mod attention;
 mod handoff;
 mod hierarchy;
+mod inspector;
 mod nodes;
 mod panes;
 mod scrollback;
@@ -75,6 +76,7 @@ impl Core {
                 surface_id,
                 include_archived,
             } => self.get_hierarchy_for_client(client, surface_id, include_archived, now_ms),
+            Request::GetInspector { key } => self.get_inspector(key, now_ms),
             Request::SetTreeExpanded {
                 surface_id,
                 key,
