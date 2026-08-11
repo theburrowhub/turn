@@ -866,7 +866,9 @@ impl Core {
             // Session-level events say nothing about a particular node.
             EventKind::SessionNeedsAttention { .. }
             | EventKind::SessionAttentionResolved
-            | EventKind::ContextHandoffFinished { .. } => return Changed::default(),
+            | EventKind::ContextHandoffFinished { .. }
+            | EventKind::AgentRenamed { .. }
+            | EventKind::AgentRelationshipCorrected { .. } => return Changed::default(),
 
             // Handled above, before the mutable borrow.
             EventKind::AgentSpawned { .. }

@@ -78,10 +78,11 @@ const TABLES_THIS_TEST_WRITES: [&str; 11] = [
 /// nevertheless planted above. Pane bindings are ids. Workspace audit events are
 /// restricted to structured lease/tree facts. The `events` table stores typed facts
 /// and provenance, never raw hook callbacks.
-const TABLES_WITH_NOTHING_TO_LEAK: [&str; 5] = [
+const TABLES_WITH_NOTHING_TO_LEAK: [&str; 6] = [
     "checkout_write_fences",
     "pane_node_bindings",
     "tree_ui_state",
+    "tree_surface_preferences",
     "workspace_audit_events",
     "workspace_write_leases",
 ];
@@ -874,15 +875,17 @@ fn historical_v8_fixture(
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         // Built with the current schema and then walked back, so what is here has to be
-        // walked back too: a real v8 database predates `setting_layers`, and leaving the
-        // table behind while claiming to be v8 would make the migration under test fail on
-        // "table already exists" — a fixture bug that would read as a broken migration.
+        // walked back too: a real v8 database predates `setting_layers` and
+        // `tree_surface_preferences`. Leaving either table behind while claiming to be v8
+        // would make the migration under test fail on "table already exists" — a fixture
+        // bug that would read as a broken migration.
         "PRAGMA journal_mode = WAL; \
          DELETE FROM settings WHERE key IN ( \
              'security.hook_raw_purge_pending', \
              'security.legacy_free_text_purge_pending' \
          ); \
          DROP TABLE IF EXISTS setting_layers; \
+         DROP TABLE IF EXISTS tree_surface_preferences; \
          PRAGMA user_version = 8;",
     )
     .unwrap();

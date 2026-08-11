@@ -8,16 +8,18 @@
 use std::collections::{HashMap, HashSet};
 
 use super::workspaces::store;
-use super::Answer;
+use super::{check_name, Answer};
 use crate::core::Core;
+use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     HierarchyNodeKind, LeaseState, PaneNodeBinding, PreviewVisibility, ProcessNode,
-    RelationshipKind, SessionMode, TreeUiState, WorkspaceWriteLease,
+    RelationshipKind, SessionMode, TreeFilter, TreeSurfacePreferences, TreeUiState,
+    TreeVisibilityMode, WorkspaceWriteLease,
 };
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
-    PaneStream, ProtoError, ProtoErrorContext, Response, SessionConflictAlternative,
+    PaneStream, ProtoError, ProtoErrorContext, Response, ServerEvent, SessionConflictAlternative,
     SessionTreeView, TreeNodeView, TreeSurfaceState, WorkspaceTreeView, WriteLeaseOwnerView,
 };
 
@@ -200,6 +202,272 @@ impl Core {
         }
         Ok(Response::TreeState {
             state: self.tree_surface_state(&surface_id)?,
+        })
+    }
+
+    pub(super) fn set_tree_expanded_all(
+        &self,
+        surface_id: String,
+        expanded: bool,
+        now_ms: i64,
+    ) -> Answer {
+        let surface_id = validate_surface_id(&surface_id)?;
+        let snapshot = self.hierarchy_snapshot(&surface_id, true, now_ms)?;
+        let mut keys = Vec::new();
+        for workspace in &snapshot.workspaces {
+            if !workspace.sessions.is_empty() {
+                keys.push(HierarchyKey::workspace(workspace.workspace.id.clone()));
+            }
+            for session in &workspace.sessions {
+                if session.nodes.iter().any(|node| node.depth == 0) {
+                    keys.push(HierarchyKey::session(session.session.id.clone()));
+                }
+                keys.extend(
+                    session
+                        .nodes
+                        .iter()
+                        .filter(|node| node.child_count > 0)
+                        .map(|node| HierarchyKey::process(node.node_id.clone())),
+                );
+            }
+        }
+        let previous = self
+            .store
+            .hierarchy()
+            .tree_state(&surface_id)
+            .map_err(store)?;
+        let states: Vec<_> = keys
+            .iter()
+            .map(|key| {
+                tree_state_with(&surface_id, key, &previous, now_ms, |state| {
+                    state.expanded = expanded;
+                })
+            })
+            .collect();
+        self.store
+            .hierarchy()
+            .save_tree_states(&states)
+            .map_err(store)?;
+        Ok(Response::TreeState {
+            state: self.tree_surface_state(&surface_id)?,
+        })
+    }
+
+    pub(super) fn set_tree_presentation(
+        &self,
+        surface_id: String,
+        mut filters: Vec<TreeFilter>,
+        visibility_mode: TreeVisibilityMode,
+        scroll_anchor: Option<HierarchyKey>,
+        now_ms: i64,
+    ) -> Answer {
+        let surface_id = validate_surface_id(&surface_id)?;
+        filters.sort_unstable();
+        filters.dedup();
+        if let Some(anchor) = &scroll_anchor {
+            self.require_hierarchy_key(anchor)?;
+        }
+        let (scroll_anchor_kind, scroll_anchor_id) = scroll_anchor
+            .as_ref()
+            .map(key_parts)
+            .map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
+        self.store
+            .hierarchy()
+            .save_tree_surface_preferences(&TreeSurfacePreferences {
+                surface_id: surface_id.clone(),
+                filters,
+                visibility_mode,
+                scroll_anchor_kind,
+                scroll_anchor_id,
+                updated_ms: now_ms,
+            })
+            .map_err(store)?;
+        Ok(Response::TreeState {
+            state: self.tree_surface_state(&surface_id)?,
+        })
+    }
+
+    pub(super) fn move_tree_node(
+        &self,
+        surface_id: String,
+        key: HierarchyKey,
+        before: Option<HierarchyKey>,
+        now_ms: i64,
+    ) -> Answer {
+        let surface_id = validate_surface_id(&surface_id)?;
+        self.require_hierarchy_key(&key)?;
+        if let Some(before) = &before {
+            self.require_hierarchy_key(before)?;
+            if before == &key {
+                return Err(ProtoError::invalid(
+                    "A tree row cannot be moved before itself",
+                ));
+            }
+        }
+        let snapshot = self.hierarchy_snapshot(&surface_id, true, now_ms)?;
+        let mut siblings = hierarchy_siblings(&snapshot, &key)
+            .ok_or_else(|| ProtoError::not_found("hierarchy node", &key_id(&key)))?;
+        if let Some(before) = &before {
+            if !siblings.contains(before) {
+                return Err(ProtoError::invalid(
+                    "A tree row can only be moved among siblings",
+                ));
+            }
+        }
+        let previous = self
+            .store
+            .hierarchy()
+            .tree_state(&surface_id)
+            .map_err(store)?;
+        let manual: HashMap<HierarchyKey, i32> = previous
+            .iter()
+            .filter_map(|state| {
+                state
+                    .manual_order
+                    .map(|order| (state_key(state.node_kind, &state.node_id), order))
+            })
+            .collect();
+        let natural: HashMap<HierarchyKey, usize> = siblings
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect();
+        siblings.sort_by_key(|candidate| {
+            (
+                manual.get(candidate).copied().unwrap_or(i32::MAX),
+                natural.get(candidate).copied().unwrap_or(usize::MAX),
+            )
+        });
+        siblings.retain(|candidate| candidate != &key);
+        let destination = before
+            .as_ref()
+            .and_then(|before| siblings.iter().position(|candidate| candidate == before))
+            .unwrap_or(siblings.len());
+        siblings.insert(destination, key);
+        let states: Vec<_> = siblings
+            .iter()
+            .enumerate()
+            .map(|(order, key)| {
+                tree_state_with(&surface_id, key, &previous, now_ms, |state| {
+                    state.manual_order = Some(order as i32);
+                })
+            })
+            .collect();
+        self.store
+            .hierarchy()
+            .save_tree_states(&states)
+            .map_err(store)?;
+        Ok(Response::TreeState {
+            state: self.tree_surface_state(&surface_id)?,
+        })
+    }
+
+    pub(super) fn rename_node(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        name: String,
+        now_ms: i64,
+    ) -> Answer {
+        let name = check_name(&name)?;
+        let mut updated = self.session(session_id)?.clone();
+        let node = updated
+            .tree
+            .get_mut(node_id)
+            .ok_or_else(|| ProtoError::not_found("Agent", node_id.as_str()))?;
+        if !node.kind.is_agentic() {
+            return Err(ProtoError::invalid("Only an Agent can be renamed"));
+        }
+        let previous_name = node.resolved_title().0;
+        if previous_name == name {
+            let view = self
+                .node_view(session_id, node_id, now_ms)
+                .ok_or_else(|| ProtoError::internal("the Agent disappeared"))?;
+            return Ok(Response::Node {
+                node: Box::new(view),
+            });
+        }
+        node.agent
+            .as_mut()
+            .ok_or_else(|| ProtoError::internal("the Agent has no naming record"))?
+            .name
+            .rename(name.clone());
+        let event = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentRenamed {
+                previous_name,
+                display_name: name,
+            },
+            EventSource::UserCorrection,
+            Confidence::Explicit,
+            now_ms,
+        )
+        .with_node(node_id.clone());
+        self.store
+            .checkpoint_event_session_attention(&updated, &event, self.attention.queue())
+            .map_err(store)?;
+        self.sessions.insert(session_id.clone(), updated);
+        self.finish_tree_correction(session_id, node_id, event, now_ms)
+    }
+
+    pub(super) fn correct_relationship(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        parent_node_id: Option<NodeId>,
+        relationship_kind: RelationshipKind,
+        now_ms: i64,
+    ) -> Answer {
+        let mut updated = self.session(session_id)?.clone();
+        let previous_parent_node_id = updated
+            .tree
+            .get(node_id)
+            .ok_or_else(|| ProtoError::not_found("Agent", node_id.as_str()))?
+            .parent
+            .clone();
+        if !updated
+            .tree
+            .correct_relationship(node_id, parent_node_id.clone(), relationship_kind)
+        {
+            return Err(ProtoError::invalid(
+                "The corrected Agent relationship must stay inside the Session and cannot form a cycle",
+            ));
+        }
+        let event = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentRelationshipCorrected {
+                previous_parent_node_id,
+                parent_node_id: parent_node_id.clone(),
+                relationship_kind,
+            },
+            EventSource::UserCorrection,
+            Confidence::Explicit,
+            now_ms,
+        )
+        .with_node(node_id.clone());
+        self.store
+            .checkpoint_event_session_attention(&updated, &event, self.attention.queue())
+            .map_err(store)?;
+        self.sessions.insert(session_id.clone(), updated);
+        self.finish_tree_correction(session_id, node_id, event, now_ms)
+    }
+
+    fn finish_tree_correction(
+        &mut self,
+        session_id: &SessionId,
+        node_id: &NodeId,
+        event: TurnEvent,
+        now_ms: i64,
+    ) -> Answer {
+        self.bump_hierarchy();
+        self.push_all(ServerEvent::TurnEventEmitted { turn_event: event });
+        self.push_hierarchy_all(now_ms);
+        let view = self
+            .node_view(session_id, node_id, now_ms)
+            .ok_or_else(|| ProtoError::internal("the corrected Agent disappeared"))?;
+        Ok(Response::Node {
+            node: Box::new(view),
         })
     }
 
@@ -691,6 +959,17 @@ impl Core {
         include_archived: bool,
         now_ms: i64,
     ) -> Result<HierarchySnapshot, ProtoError> {
+        // A persisted Archived filter must survive a UI restart. The first request from a
+        // fresh window cannot know that preference yet, so the daemon widens the snapshot
+        // before returning the preference and the rows it needs in the same response.
+        let include_archived = include_archived
+            || self
+                .store
+                .hierarchy()
+                .tree_surface_preferences(surface_id)
+                .map_err(store)?
+                .filters
+                .contains(&TreeFilter::Archived);
         let summaries = self.session_summaries(None, include_archived, now_ms);
         let mut branches = Vec::new();
         let mut workspaces: Vec<_> = self
@@ -868,7 +1147,13 @@ impl Core {
             .hierarchy()
             .tree_state(surface_id)
             .map_err(store)?;
+        let preferences = self
+            .store
+            .hierarchy()
+            .tree_surface_preferences(surface_id)
+            .map_err(store)?;
         let mut expanded = Vec::new();
+        let mut manual_order = Vec::new();
         let mut selected = None;
         for row in rows {
             let key = state_key(row.node_kind, &row.node_id);
@@ -879,13 +1164,25 @@ impl Core {
                 expanded.push(key.clone());
             }
             if row.selected {
-                selected = Some(key);
+                selected = Some(key.clone());
+            }
+            if row.manual_order.is_some() {
+                manual_order.push(key);
             }
         }
+        let scroll_anchor = preferences
+            .scroll_anchor_kind
+            .zip(preferences.scroll_anchor_id.as_deref())
+            .map(|(kind, id)| state_key(kind, id))
+            .filter(|key| self.hierarchy_key_exists(key));
         Ok(TreeSurfaceState {
             surface_id: surface_id.to_string(),
             selected,
             expanded,
+            manual_order,
+            filters: preferences.filters,
+            visibility_mode: preferences.visibility_mode,
+            scroll_anchor,
         })
     }
 
@@ -1070,13 +1367,82 @@ fn state_key(kind: HierarchyNodeKind, id: &str) -> HierarchyKey {
     }
 }
 
+fn tree_state_with(
+    surface_id: &str,
+    key: &HierarchyKey,
+    previous: &[TreeUiState],
+    now_ms: i64,
+    update: impl FnOnce(&mut TreeUiState),
+) -> TreeUiState {
+    let (kind, node_id) = key_parts(key);
+    let mut state = previous
+        .iter()
+        .find(|state| state.node_kind == kind && state.node_id == node_id)
+        .cloned()
+        .unwrap_or_else(|| TreeUiState {
+            surface_id: surface_id.to_string(),
+            node_kind: kind,
+            node_id,
+            expanded: false,
+            selected: false,
+            manual_order: None,
+            visibility_mode: None,
+            updated_ms: now_ms,
+        });
+    state.updated_ms = now_ms;
+    update(&mut state);
+    state
+}
+
+fn hierarchy_siblings(
+    snapshot: &HierarchySnapshot,
+    key: &HierarchyKey,
+) -> Option<Vec<HierarchyKey>> {
+    match key {
+        HierarchyKey::Workspace { .. } => Some(
+            snapshot
+                .workspaces
+                .iter()
+                .map(|workspace| HierarchyKey::workspace(workspace.workspace.id.clone()))
+                .collect(),
+        ),
+        HierarchyKey::Session { session_id } => snapshot.workspaces.iter().find_map(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .any(|session| &session.session.id == session_id)
+                .then(|| {
+                    workspace
+                        .sessions
+                        .iter()
+                        .map(|session| HierarchyKey::session(session.session.id.clone()))
+                        .collect()
+                })
+        }),
+        HierarchyKey::Process { node_id } => snapshot.workspaces.iter().find_map(|workspace| {
+            workspace.sessions.iter().find_map(|session| {
+                let selected = session.nodes.iter().find(|node| &node.node_id == node_id)?;
+                Some(
+                    session
+                        .nodes
+                        .iter()
+                        .filter(|node| node.parent == selected.parent)
+                        .map(|node| HierarchyKey::process(node.node_id.clone()))
+                        .collect(),
+                )
+            })
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::testing::Harness;
     use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
     use turn_core::model::{
-        Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, Session, WorkspaceCheckout,
+        Layout, Pane, PaneKind, PreviewVisibility, ProcessNode, RelationshipKind, Session,
+        TreeFilter, TreeVisibilityMode, WorkspaceCheckout,
     };
     use turn_core::state::Lifecycle;
     use turn_proto::{CloseDisposition, NewPane, Request, ServerEvent, ServerMessage};
@@ -1259,6 +1625,142 @@ mod tests {
             std::slice::from_ref(&right_pane),
             std::slice::from_ref(&left_pane),
         );
+    }
+
+    #[tokio::test]
+    async fn tree_management_persists_and_agent_corrections_are_audited() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_tree_management");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut first = ProcessNode::agent(session_id.clone(), "first", "/tmp", NOW);
+        first.lifecycle = Lifecycle::Alive;
+        let first_id = first.id.clone();
+        let mut second = ProcessNode::agent(session_id.clone(), "second", "/tmp", NOW + 1);
+        second.lifecycle = Lifecycle::Alive;
+        let second_id = second.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(first);
+            session.tree.insert(second);
+        }
+        harness.core.persist_session(&session_id).unwrap();
+
+        harness
+            .core
+            .select_tree_node(
+                "window-managed".into(),
+                Some(HierarchyKey::process(first_id.clone())),
+                NOW + 2,
+            )
+            .unwrap();
+        harness
+            .core
+            .set_tree_presentation(
+                "window-managed".into(),
+                vec![
+                    TreeFilter::Agents,
+                    TreeFilter::Attention,
+                    TreeFilter::Agents,
+                ],
+                TreeVisibilityMode::Technical,
+                Some(HierarchyKey::process(second_id.clone())),
+                NOW + 3,
+            )
+            .unwrap();
+        harness
+            .core
+            .set_tree_expanded_all("window-managed".into(), true, NOW + 4)
+            .unwrap();
+        harness
+            .core
+            .move_tree_node(
+                "window-managed".into(),
+                HierarchyKey::process(second_id.clone()),
+                Some(HierarchyKey::process(first_id.clone())),
+                NOW + 5,
+            )
+            .unwrap();
+        harness
+            .core
+            .rename_node(&session_id, &second_id, "Release reviewer".into(), NOW + 6)
+            .unwrap();
+        harness
+            .core
+            .correct_relationship(
+                &session_id,
+                &second_id,
+                Some(first_id.clone()),
+                RelationshipKind::SpawnedBy,
+                NOW + 7,
+            )
+            .unwrap();
+
+        let snapshot = harness
+            .core
+            .hierarchy_snapshot("window-managed", false, NOW + 8)
+            .unwrap();
+        assert_eq!(
+            snapshot.tree_state.selected,
+            Some(HierarchyKey::process(first_id.clone())),
+            "ordering and corrections must not move selection"
+        );
+        assert_eq!(
+            snapshot.tree_state.filters,
+            [TreeFilter::Attention, TreeFilter::Agents],
+            "presentation filters are canonical and deduplicated"
+        );
+        assert_eq!(
+            snapshot.tree_state.visibility_mode,
+            TreeVisibilityMode::Technical
+        );
+        assert_eq!(
+            snapshot.tree_state.scroll_anchor,
+            Some(HierarchyKey::process(second_id.clone()))
+        );
+        let second = snapshot.workspaces[0].sessions[0]
+            .nodes
+            .iter()
+            .find(|node| node.node_id == second_id)
+            .unwrap();
+        assert_eq!(second.title, "Release reviewer");
+        assert_eq!(second.parent.as_ref(), Some(&first_id));
+        assert_eq!(second.relationship.kind, RelationshipKind::SpawnedBy);
+        assert_eq!(second.relationship.confidence, Confidence::Explicit);
+
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.tree.get(&second_id).unwrap().parent,
+            Some(first_id.clone())
+        );
+        let audit = harness
+            .core
+            .store
+            .events()
+            .list_for_session(&session_id, 10)
+            .unwrap();
+        assert!(audit
+            .iter()
+            .any(|event| matches!(&event.kind, EventKind::AgentRenamed { .. })));
+        assert!(audit
+            .iter()
+            .any(|event| matches!(&event.kind, EventKind::AgentRelationshipCorrected { .. })));
+
+        assert!(harness
+            .core
+            .correct_relationship(
+                &session_id,
+                &first_id,
+                Some(second_id),
+                RelationshipKind::Related,
+                NOW + 9,
+            )
+            .is_err());
     }
 
     #[tokio::test]

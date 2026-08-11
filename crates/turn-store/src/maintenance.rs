@@ -259,6 +259,27 @@ const INVARIANT_COLUMNS: &[InvariantColumn] = &[
     InvariantColumn::new("tree_ui_state", "node_kind", "tree node kind"),
     InvariantColumn::new("tree_ui_state", "node_id", "tree node id"),
     InvariantColumn::new("tree_ui_state", "visibility_mode", "tree visibility mode"),
+    InvariantColumn::new("tree_surface_preferences", "surface_id", "surface id"),
+    InvariantColumn::new(
+        "tree_surface_preferences",
+        "filters_json",
+        "tree filter vocabulary",
+    ),
+    InvariantColumn::new(
+        "tree_surface_preferences",
+        "visibility_mode",
+        "tree visibility mode",
+    ),
+    InvariantColumn::new(
+        "tree_surface_preferences",
+        "scroll_node_kind",
+        "tree scroll node kind",
+    ),
+    InvariantColumn::new(
+        "tree_surface_preferences",
+        "scroll_node_id",
+        "tree scroll node id",
+    ),
     InvariantColumn::new("workspace_audit_events", "id", "Workspace audit Event id"),
     InvariantColumn::new("workspace_audit_events", "workspace_id", "Workspace id"),
     InvariantColumn::new(

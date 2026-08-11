@@ -6,7 +6,7 @@
 //! produced an event, only how much to trust it.
 
 use crate::ids::{EventId, HandoffId, NodeId, SessionId, WorkspaceId};
-use crate::model::{ContextHandoffMode, ContextHandoffOutcome};
+use crate::model::{ContextHandoffMode, ContextHandoffOutcome, RelationshipKind};
 use crate::state::AwaitingReason;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -198,6 +198,17 @@ pub enum EventKind {
     },
     #[serde(rename = "agent.subagent_stopped")]
     AgentSubagentStopped { agent_id: Option<String> },
+    #[serde(rename = "agent.renamed")]
+    AgentRenamed {
+        previous_name: String,
+        display_name: String,
+    },
+    #[serde(rename = "agent.relationship_corrected")]
+    AgentRelationshipCorrected {
+        previous_parent_node_id: Option<NodeId>,
+        parent_node_id: Option<NodeId>,
+        relationship_kind: RelationshipKind,
+    },
 
     /// Metadata-only audit record for a reviewed continuity package. The exact
     /// body remains ephemeral and never enters the event log.
@@ -408,6 +419,8 @@ fn default_severity(kind: &EventKind) -> Severity {
         | EventKind::AgentStarted { .. }
         | EventKind::AgentSpawned { .. }
         | EventKind::AgentSubagentStopped { .. }
+        | EventKind::AgentRenamed { .. }
+        | EventKind::AgentRelationshipCorrected { .. }
         | EventKind::ContextHandoffFinished { .. }
         | EventKind::AgentPermissionResolved { .. }
         | EventKind::SessionAttentionResolved => Severity::Info,
@@ -434,6 +447,8 @@ fn kind_slug(kind: &EventKind) -> Cow<'static, str> {
         EventKind::AgentIdle => "agent.idle".into(),
         EventKind::AgentSpawned { .. } => "agent.spawned".into(),
         EventKind::AgentSubagentStopped { .. } => "agent.subagent_stopped".into(),
+        EventKind::AgentRenamed { .. } => "agent.renamed".into(),
+        EventKind::AgentRelationshipCorrected { .. } => "agent.relationship_corrected".into(),
         EventKind::ContextHandoffFinished { .. } => "context_handoff.finished".into(),
         EventKind::SessionNeedsAttention { .. } => "session.needs_attention".into(),
         EventKind::SessionAttentionResolved => "session.attention_resolved".into(),

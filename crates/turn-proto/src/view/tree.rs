@@ -80,6 +80,10 @@ pub struct TreeNodeView {
     /// What an explicit open action may render. It is independent of whether a
     /// Pane is already bound.
     pub pane_capability: NodePaneCapability,
+    /// Short-lived process-table plumbing is hidden in Normal/Expanded modes,
+    /// but remains searchable and is always visible in Technical mode.
+    #[serde(default)]
+    pub ephemeral: bool,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     /// How long it has been running, or how long it ran.
@@ -133,6 +137,7 @@ impl TreeNodeView {
             preview_visibility: node.preview_visibility,
             pane_bindings: Vec::new(),
             pane_capability: NodePaneCapability::default(),
+            ephemeral: false,
             started_ms: node.started_ms,
             ended_ms: node.ended_ms,
             runtime_ms: node.runtime_ms(now_ms),
@@ -208,6 +213,8 @@ impl TreeNodeView {
             if let Some(capability) = capabilities.get(&row.node_id) {
                 row.pane_capability = capability.clone();
             }
+            row.ephemeral = row.pane_bindings.is_empty()
+                && matches!(row.kind, NodeKind::Background | NodeKind::Unknown);
         }
         rows
     }

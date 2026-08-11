@@ -15,7 +15,8 @@ pub use handoff::{ContextHandoffMode, ContextHandoffOutcome};
 pub use hierarchy::{
     ActivityPreview, AgentName, HierarchyNodeKind, LeaseMode, LeaseState, NameSource,
     PaneNodeBinding, PreviewSource, PreviewVisibility, Relationship, RelationshipKind, SessionMode,
-    TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
+    TreeFilter, TreeSurfacePreferences, TreeUiState, TreeVisibilityMode, WorkspaceCheckout,
+    WorkspaceWriteLease,
 };
 pub use layout::{
     Child, Direction, DropZone, Layout, LayoutNode, LayoutPreset, Pane, PaneKind, RestoreBehaviour,

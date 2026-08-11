@@ -78,6 +78,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "setting_layers",
         statements: MIGRATION_010_SETTING_LAYERS,
     },
+    Migration {
+        version: 11,
+        name: "tree_surface_preferences",
+        statements: MIGRATION_011_TREE_SURFACE_PREFERENCES,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -883,6 +888,25 @@ CREATE TABLE setting_layers (
 CREATE INDEX idx_setting_layers_owner ON setting_layers (scope, owner_id);
 "#;
 
+/// Presentation shared by every row on one UI surface.
+///
+/// Expansion, selection and manual order remain in `tree_ui_state` because they
+/// belong to a node. Filters, density and scroll position do not; putting copies
+/// on arbitrary rows made an empty tree impossible to restore and allowed the
+/// copies to disagree. The two optional scroll columns form one typed anchor and
+/// are checked together.
+const MIGRATION_011_TREE_SURFACE_PREFERENCES: &str = r#"
+CREATE TABLE tree_surface_preferences (
+    surface_id         TEXT PRIMARY KEY,
+    filters_json       TEXT NOT NULL DEFAULT '[]',
+    visibility_mode    TEXT NOT NULL DEFAULT 'normal',
+    scroll_node_kind   TEXT,
+    scroll_node_id     TEXT,
+    updated_ms         INTEGER NOT NULL,
+    CHECK ((scroll_node_kind IS NULL) = (scroll_node_id IS NULL))
+) STRICT;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,7 +972,8 @@ mod tests {
                 "attention_correlation_scope",
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
-                "setting_layers"
+                "setting_layers",
+                "tree_surface_preferences"
             ]
         );
 
@@ -965,6 +990,7 @@ mod tests {
             "settings",
             "templates",
             "tree_ui_state",
+            "tree_surface_preferences",
             "workspace_audit_events",
             "workspace_checkouts",
             "workspace_write_leases",
@@ -1084,7 +1110,11 @@ mod tests {
         let applied = apply(&conn).unwrap();
         assert_eq!(
             applied.names,
-            vec!["purge_legacy_durable_secrets", "setting_layers"]
+            vec![
+                "purge_legacy_durable_secrets",
+                "setting_layers",
+                "tree_surface_preferences"
+            ]
         );
         // What this test is about is that v9 schedules work rather than rebuilding anything,
         // so the assertion is that **no existing table changed**. Later migrations may add
@@ -1143,7 +1173,8 @@ mod tests {
                 "attention_correlation_scope",
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
-                "setting_layers"
+                "setting_layers",
+                "tree_surface_preferences"
             ]
         );
 
@@ -1191,7 +1222,8 @@ mod tests {
                 "attention_correlation_scope",
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
-                "setting_layers"
+                "setting_layers",
+                "tree_surface_preferences"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1332,7 +1364,8 @@ mod tests {
                 "attention_correlation_scope",
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
-                "setting_layers"
+                "setting_layers",
+                "tree_surface_preferences"
             ]
         );
         let (required, state): (bool, String) = conn

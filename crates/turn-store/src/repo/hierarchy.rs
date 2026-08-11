@@ -1,6 +1,6 @@
 //! ADR-040 persistence: checkout leases, view bindings, previews and per-surface tree state.
 
-use crate::codec::{from_tag, json, tag};
+use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
 use crate::redact::{checkout_for_persistence, redact_secrets};
 use crate::repo::session::SessionRepo;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use turn_core::ids::{CheckoutId, LeaseId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, HierarchyNodeKind, LeaseState, PaneNodeBinding, Session, SessionMode,
-    SessionStatus, TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
+    SessionStatus, TreeSurfacePreferences, TreeUiState, WorkspaceCheckout, WorkspaceWriteLease,
 };
 
 pub struct HierarchyRepo<'a> {
@@ -1113,33 +1113,20 @@ impl<'a> HierarchyRepo<'a> {
 
     pub fn save_tree_state(&self, state: &TreeUiState) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        if state.selected {
-            tx.execute(
-                "UPDATE tree_ui_state SET selected = 0, updated_ms = ?2 \
-                 WHERE surface_id = ?1 AND selected = 1",
-                params![state.surface_id, state.updated_ms],
-            )?;
+        save_tree_state_in(&tx, state)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves one complete batch of tree decisions atomically.
+    ///
+    /// Expand-all and sibling reordering use this path so a replacement UI can
+    /// never observe half the branch in its old state and half in its new state.
+    pub fn save_tree_states(&self, states: &[TreeUiState]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for state in states {
+            save_tree_state_in(&tx, state)?;
         }
-        tx.execute(
-            "INSERT INTO tree_ui_state \
-                 (surface_id, node_kind, node_id, expanded, selected, manual_order, \
-                  visibility_mode, updated_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-             ON CONFLICT(surface_id, node_kind, node_id) DO UPDATE SET \
-                 expanded = excluded.expanded, selected = excluded.selected, \
-                 manual_order = excluded.manual_order, \
-                 visibility_mode = excluded.visibility_mode, updated_ms = excluded.updated_ms",
-            params![
-                state.surface_id,
-                tag("hierarchy node kind", &state.node_kind)?,
-                state.node_id,
-                state.expanded,
-                state.selected,
-                state.manual_order,
-                state.visibility_mode,
-                state.updated_ms,
-            ],
-        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1169,6 +1156,101 @@ impl<'a> HierarchyRepo<'a> {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    pub fn save_tree_surface_preferences(&self, state: &TreeSurfacePreferences) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tree_surface_preferences \
+                 (surface_id, filters_json, visibility_mode, scroll_node_kind, \
+                  scroll_node_id, updated_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(surface_id) DO UPDATE SET \
+                 filters_json = excluded.filters_json, \
+                 visibility_mode = excluded.visibility_mode, \
+                 scroll_node_kind = excluded.scroll_node_kind, \
+                 scroll_node_id = excluded.scroll_node_id, \
+                 updated_ms = excluded.updated_ms",
+            params![
+                state.surface_id,
+                json("tree filters", &state.filters)?,
+                tag("tree visibility mode", &state.visibility_mode)?,
+                state
+                    .scroll_anchor_kind
+                    .as_ref()
+                    .map(|kind| tag("hierarchy node kind", kind))
+                    .transpose()?,
+                state.scroll_anchor_id,
+                state.updated_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn tree_surface_preferences(&self, surface_id: &str) -> Result<TreeSurfacePreferences> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT surface_id, filters_json, visibility_mode, scroll_node_kind, \
+                        scroll_node_id, updated_ms \
+                 FROM tree_surface_preferences WHERE surface_id = ?1",
+                params![surface_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>("surface_id")?,
+                        row.get::<_, String>("filters_json")?,
+                        row.get::<_, String>("visibility_mode")?,
+                        row.get::<_, Option<String>>("scroll_node_kind")?,
+                        row.get::<_, Option<String>>("scroll_node_id")?,
+                        row.get::<_, i64>("updated_ms")?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((surface_id, filters, visibility, anchor_kind, anchor_id, updated_ms)) = row
+        else {
+            return Ok(TreeSurfacePreferences::normal(surface_id));
+        };
+        Ok(TreeSurfacePreferences {
+            filters: from_json("tree filters", &surface_id, &filters)?,
+            visibility_mode: from_tag("tree visibility mode", &surface_id, &visibility)?,
+            scroll_anchor_kind: anchor_kind
+                .map(|kind| from_tag("hierarchy node kind", &surface_id, &kind))
+                .transpose()?,
+            scroll_anchor_id: anchor_id,
+            surface_id,
+            updated_ms,
+        })
+    }
+}
+
+fn save_tree_state_in(tx: &Transaction<'_>, state: &TreeUiState) -> Result<()> {
+    if state.selected {
+        tx.execute(
+            "UPDATE tree_ui_state SET selected = 0, updated_ms = ?2 \
+             WHERE surface_id = ?1 AND selected = 1",
+            params![state.surface_id, state.updated_ms],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO tree_ui_state \
+             (surface_id, node_kind, node_id, expanded, selected, manual_order, \
+              visibility_mode, updated_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(surface_id, node_kind, node_id) DO UPDATE SET \
+             expanded = excluded.expanded, selected = excluded.selected, \
+             manual_order = excluded.manual_order, \
+             visibility_mode = excluded.visibility_mode, updated_ms = excluded.updated_ms",
+        params![
+            state.surface_id,
+            tag("hierarchy node kind", &state.node_kind)?,
+            state.node_id,
+            state.expanded,
+            state.selected,
+            state.manual_order,
+            state.visibility_mode,
+            state.updated_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn checkout_from_row(row: &Row<'_>) -> rusqlite::Result<WorkspaceCheckout> {
@@ -1251,7 +1333,7 @@ mod tests {
     use turn_core::event::Confidence;
     use turn_core::model::{
         ActivityPreview, HierarchyNodeKind, Layout, Pane, PaneKind, PreviewSource, ProcessNode,
-        Session, SessionMode, Workspace,
+        Session, SessionMode, TreeFilter, TreeSurfacePreferences, TreeVisibilityMode, Workspace,
     };
 
     const T0: i64 = 1_700_000_000_000;
@@ -2726,5 +2808,69 @@ mod tests {
         }
         assert_eq!(store.hierarchy().tree_state("window-a").unwrap().len(), 1);
         assert_eq!(store.hierarchy().tree_state("window-b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tree_presentation_and_manual_order_survive_reopening_sqlite() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let store = Store::open_in(directory.path()).unwrap();
+            store
+                .hierarchy()
+                .save_tree_surface_preferences(&TreeSurfacePreferences {
+                    surface_id: "window-restart".into(),
+                    filters: vec![TreeFilter::Attention, TreeFilter::Agents],
+                    visibility_mode: TreeVisibilityMode::Technical,
+                    scroll_anchor_kind: Some(HierarchyNodeKind::Process),
+                    scroll_anchor_id: Some("proc_217".into()),
+                    updated_ms: T0,
+                })
+                .unwrap();
+            store
+                .hierarchy()
+                .save_tree_states(&[
+                    TreeUiState {
+                        surface_id: "window-restart".into(),
+                        node_kind: HierarchyNodeKind::Process,
+                        node_id: "proc_217".into(),
+                        expanded: true,
+                        selected: true,
+                        manual_order: Some(0),
+                        visibility_mode: None,
+                        updated_ms: T0,
+                    },
+                    TreeUiState {
+                        surface_id: "window-restart".into(),
+                        node_kind: HierarchyNodeKind::Process,
+                        node_id: "proc_216".into(),
+                        expanded: false,
+                        selected: false,
+                        manual_order: Some(1),
+                        visibility_mode: None,
+                        updated_ms: T0,
+                    },
+                ])
+                .unwrap();
+        }
+
+        let reopened = Store::open_in(directory.path()).unwrap();
+        let preferences = reopened
+            .hierarchy()
+            .tree_surface_preferences("window-restart")
+            .unwrap();
+        assert_eq!(
+            preferences.filters,
+            [TreeFilter::Attention, TreeFilter::Agents]
+        );
+        assert_eq!(preferences.visibility_mode, TreeVisibilityMode::Technical);
+        assert_eq!(preferences.scroll_anchor_id.as_deref(), Some("proc_217"));
+        let order = reopened.hierarchy().tree_state("window-restart").unwrap();
+        assert_eq!(
+            order
+                .iter()
+                .map(|row| (row.node_id.as_str(), row.manual_order, row.selected))
+                .collect::<Vec<_>>(),
+            [("proc_217", Some(0), true), ("proc_216", Some(1), false)]
+        );
     }
 }

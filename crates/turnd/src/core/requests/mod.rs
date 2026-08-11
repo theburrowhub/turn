@@ -90,6 +90,53 @@ impl Core {
                 self.require_client_surface(client, &surface_id)?;
                 self.select_tree_node(surface_id, selected, now_ms)
             }
+            Request::SetTreeExpandedAll {
+                surface_id,
+                expanded,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.set_tree_expanded_all(surface_id, expanded, now_ms)
+            }
+            Request::SetTreePresentation {
+                surface_id,
+                filters,
+                visibility_mode,
+                scroll_anchor,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.set_tree_presentation(
+                    surface_id,
+                    filters,
+                    visibility_mode,
+                    scroll_anchor,
+                    now_ms,
+                )
+            }
+            Request::MoveTreeNode {
+                surface_id,
+                key,
+                before,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.move_tree_node(surface_id, key, before, now_ms)
+            }
+            Request::RenameNode {
+                session_id,
+                node_id,
+                name,
+            } => self.rename_node(&session_id, &node_id, name, now_ms),
+            Request::CorrectRelationship {
+                session_id,
+                node_id,
+                parent_node_id,
+                relationship_kind,
+            } => self.correct_relationship(
+                &session_id,
+                &node_id,
+                parent_node_id,
+                relationship_kind,
+                now_ms,
+            ),
 
             // ----------------------------------------------------- checkout lease
             Request::GetWorkspaceWriteLease { workspace_id } => {

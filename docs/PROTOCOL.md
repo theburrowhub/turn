@@ -293,7 +293,8 @@ Version 3 adds:
 
 - `get_hierarchy` and `HierarchySnapshot { revision, tree_state, workspaces }` as the only navigation
   bootstrap; the stable `surface_id` lives inside `tree_state`;
-- per-surface `set_tree_expanded` and `select_tree_node`, which are acknowledged but not broadcast;
+- per-surface tree expansion, selection, filters, visibility, viewport and manual ordering, which are
+  acknowledged but not broadcast;
 - closed `SessionMode` values `main_checkout`, `read_only`, `isolated_worktree` and checkout/lease operations;
 - typed `workspace_write_lease_conflict` and `stale_lease_generation` error context;
 - relationship kind plus confidence, lossless Agent naming, safe Activity Preview and zero-to-many Pane
@@ -468,7 +469,12 @@ kind matters.
 | --- | --- | --- |
 | `get_hierarchy` | `surface_id`, `include_archived?` | `hierarchy` |
 | `set_tree_expanded` | `surface_id`, `key: HierarchyKey`, `expanded` | `tree_state` |
+| `set_tree_expanded_all` | `surface_id`, `expanded` | `tree_state` |
 | `select_tree_node` | `surface_id`, `selected: HierarchyKey?` | `tree_state` |
+| `set_tree_presentation` | `surface_id`, `filters: [TreeFilter]`, `visibility_mode`, `scroll_anchor?` | `tree_state` |
+| `move_tree_node` | `surface_id`, `key`, `before?` | `tree_state` |
+| `rename_node` | `session_id`, `node_id`, `name` | `node` |
+| `correct_relationship` | `session_id`, `node_id`, `parent_node_id?`, `relationship_kind` | `node` |
 | `get_preview_history` | `session_id`, `node_id`, `limit?` (clamped to 20) | `preview_history` |
 | `set_preview_visibility` | `session_id`, `node_id`, `visibility` | `ack` |
 | `open_node_as_temporary_pane` | `surface_id`, `session_id`, `node_id` | `node_pane` |
@@ -480,8 +486,9 @@ kind matters.
 navigation tree is a client bug. `HierarchySnapshot.revision` is monotonic for the daemon lifetime; after a
 revision gap or daemon identity change, request a full snapshot.
 
-Expansion/selection writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active
-Session or Pane focus, and do not produce a broadcast. There is deliberately no unconstrained `move_node`.
+Presentation writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active Session or
+Pane focus, and do not produce a broadcast. `move_tree_node` changes only the stable order of siblings; it
+cannot reparent a node or move selection.
 
 `surface_id` is immutable for one connected client. The first `get_hierarchy` on a replacement connection
 claims that surface, retires any older connection's surface ownership and removes its temporary Pane before
@@ -489,11 +496,10 @@ the snapshot is built. Permanent Layout bindings and tree expansion/selection re
 are also removed when their last client disconnects and when the daemon restarts; they are ephemeral view
 state, not restorable process state.
 
-`rename_node`, audited `correct_relationship` and tree visibility/filter mutations are accepted product
-APIs but are **not protocol-v4 operations in this build**. A client must not send those operation names or
-pretend a local rename changed daemon state. Their eventual contracts must verify the old edge, refuse
-cycles and cross-Session moves, and record the user's correction at explicit confidence before this table
-can list them as implemented.
+`rename_node` and `correct_relationship` are daemon-authoritative Agent mutations. They reject non-Agent
+targets; relationship correction additionally refuses cycles, cross-Session parents and invalid root edge
+kinds. Both preserve integration provenance and append a durable audited `TurnEvent`; corrected edges carry
+explicit confidence. Clients update from the returned projection and never pretend a local edit succeeded.
 
 `set_preview_visibility: hide` is enforced at the daemon projection and history boundaries: hierarchy
 snapshots omit the current activity preview and `get_preview_history` returns no entries. It does not erase
@@ -1351,8 +1357,10 @@ otherwise need a copy of the rules to compute.
 
 `revision`, `tree_state`, `workspaces`. There is no duplicate top-level `surface_id`.
 
-`tree_state` is `TreeSurfaceState { surface_id, selected?, expanded }`. Keys are tagged
-`workspace`/`session`/`process`; expansion and selection from another surface are never merged into it.
+`tree_state` is `TreeSurfaceState { surface_id, selected?, expanded, manual_order, filters,
+visibility_mode, scroll_anchor? }`. Keys are tagged `workspace`/`session`/`process`; interaction state from
+another surface is never merged into it. The search query is intentionally transient; the durable fields
+restore the navigational context without persisting arbitrary repository or task text.
 
 Each `WorkspaceTreeView` contains `workspace`, `checkouts`, `write_lease?` and ordered `sessions`. Each
 `SessionTreeView` contains `session` and ordered node rows. The daemon supplies parent/depth/order, derived
@@ -1422,7 +1430,8 @@ Placement: `node_id`, `session_id`, `parent`, `relationship { kind, confidence }
 `relationship_is_provisional`, `depth`, `child_count`.
 Event confidence does not substitute for `relationship.confidence`.
 
-Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`.
+Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`, `ephemeral`. Ephemeral
+process-table plumbing remains searchable but is hidden outside Technical mode unless a search reveals it.
 
 State: `lifecycle`, `turn` (absent for a non-agent), `display_state`,
 `state_label`, `severity`, `needs_user`, `interaction_pending`.

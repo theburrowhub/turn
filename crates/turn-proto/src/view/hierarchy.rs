@@ -8,7 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
-use turn_core::model::{PaneNodeBinding, WorkspaceCheckout, WorkspaceWriteLease};
+use turn_core::model::{
+    PaneNodeBinding, TreeFilter, TreeVisibilityMode, WorkspaceCheckout, WorkspaceWriteLease,
+};
 
 use crate::screen::PaneStream;
 
@@ -54,6 +56,19 @@ pub struct TreeSurfaceState {
     pub selected: Option<HierarchyKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded: Vec<HierarchyKey>,
+    /// Stable manual order. Keys absent from this list retain daemon order after
+    /// the listed siblings, so discovering a process cannot reshuffle the row the
+    /// user is currently reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_order: Vec<HierarchyKey>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filters: Vec<TreeFilter>,
+    #[serde(default)]
+    pub visibility_mode: TreeVisibilityMode,
+    /// The first visible row when the surface last scrolled. This restores the
+    /// viewport independently from selection and Pane focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_anchor: Option<HierarchyKey>,
 }
 
 impl TreeSurfaceState {
@@ -62,6 +77,10 @@ impl TreeSurfaceState {
             surface_id: surface_id.into(),
             selected: None,
             expanded: Vec::new(),
+            manual_order: Vec::new(),
+            filters: Vec::new(),
+            visibility_mode: TreeVisibilityMode::Normal,
+            scroll_anchor: None,
         }
     }
 }
@@ -278,6 +297,7 @@ mod tests {
                     HierarchyKey::workspace(workspace.id.clone()),
                     HierarchyKey::session(session.id.clone()),
                 ],
+                ..TreeSurfaceState::empty("window-a")
             },
             workspaces: vec![WorkspaceTreeView {
                 workspace: workspace_summary,
