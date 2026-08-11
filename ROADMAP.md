@@ -145,6 +145,12 @@ and credential-shaped Workspace/checkout paths are rejected rather than rewritte
 plants one token across Workspace, Session, Layout/Pane, Template, process/Agent, settings, Attention,
 Preview and event fields and scans both database and WAL.
 
+Local-data governance is now built as well: the schema has a closed redacted export catalogue, future files
+are surfaced as unclassified rather than omitted, Settings controls event/preview/terminal/log retention,
+and authenticated scope operations cover report, export, deletion and compaction. Installation-wide purge
+is an offline lock-protected command which preserves checkout work. Turn has no telemetry endpoint. Reproduce
+the privacy contract with `make privacy-acceptance`; see `docs/PRIVACY.md`.
+
 The line that matters most: `SessionRepo::load_for_restore` **downgrades anything stored as running to
 `Lifecycle::Orphaned`**, because a stored `Alive` only ever meant "alive when we last wrote".
 

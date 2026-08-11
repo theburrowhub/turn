@@ -104,18 +104,37 @@ fn handle_release_command() -> bool {
             true
         }
         Ok(Some(ReleaseCommand::UpdateStatus { socket })) => {
-            let socket = match socket {
-                Some(socket) => absolute_argument(socket),
-                None => match socket::startup_paths(None) {
-                    Ok(paths) => paths.socket,
+            let socket = resolve_command_socket(socket);
+            match turn_gui::update::query_update_status(&socket) {
+                Ok(report) => println!("{}", update_status_line(&report)),
+                Err(error) if error.is_unavailable() => {
+                    eprintln!("turn: {error}");
+                    std::process::exit(3);
+                }
+                Err(error) => {
+                    eprintln!("turn: {error}");
+                    std::process::exit(2);
+                }
+            }
+            true
+        }
+        Ok(Some(ReleaseCommand::Privacy { socket, action })) => {
+            let socket = resolve_command_socket(socket);
+            let request = match privacy_request(action) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("turn: {error}");
+                    std::process::exit(2);
+                }
+            };
+            match turn_gui::update::query_daemon(&socket, request) {
+                Ok((_, response)) => match serde_json::to_string_pretty(&response) {
+                    Ok(json) => println!("{json}"),
                     Err(error) => {
-                        eprintln!("turn: could not resolve the daemon socket: {error}");
+                        eprintln!("turn: could not encode the daemon response: {error}");
                         std::process::exit(2);
                     }
                 },
-            };
-            match turn_gui::update::query_update_status(&socket) {
-                Ok(report) => println!("{}", update_status_line(&report)),
                 Err(error) if error.is_unavailable() => {
                     eprintln!("turn: {error}");
                     std::process::exit(3);
@@ -150,7 +169,29 @@ fn update_status_line(report: &turn_gui::update::DaemonUpdateReport) -> String {
 enum ReleaseCommand {
     Version,
     BuildInfo,
-    UpdateStatus { socket: Option<PathBuf> },
+    UpdateStatus {
+        socket: Option<PathBuf>,
+    },
+    Privacy {
+        socket: Option<PathBuf>,
+        action: PrivacyAction,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrivacyAction {
+    Report {
+        scope: Option<String>,
+    },
+    Export {
+        path: PathBuf,
+        scope: Option<String>,
+    },
+    Delete {
+        scope: String,
+        kill: bool,
+    },
+    Compact,
 }
 
 fn release_command(arguments: &[std::ffi::OsString]) -> Result<Option<ReleaseCommand>, String> {
@@ -160,11 +201,26 @@ fn release_command(arguments: &[std::ffi::OsString]) -> Result<Option<ReleaseCom
     if arguments.len() == 1 && arguments[0] == "--build-info" {
         return Ok(Some(ReleaseCommand::BuildInfo));
     }
+    if !arguments.iter().any(|argument| {
+        matches!(
+            argument.to_str(),
+            Some(
+                "--update-status"
+                    | "--privacy-report"
+                    | "--privacy-export"
+                    | "--privacy-delete"
+                    | "--privacy-compact"
+            )
+        )
+    }) {
+        return Ok(None);
+    }
+
     if !arguments
         .iter()
         .any(|argument| argument == "--update-status")
     {
-        return Ok(None);
+        return parse_privacy_command(arguments).map(Some);
     }
 
     let mut socket = None;
@@ -203,6 +259,190 @@ fn release_command(arguments: &[std::ffi::OsString]) -> Result<Option<ReleaseCom
         ));
     }
     Ok(Some(ReleaseCommand::UpdateStatus { socket }))
+}
+
+fn parse_privacy_command(arguments: &[std::ffi::OsString]) -> Result<ReleaseCommand, String> {
+    let command_flags: Vec<_> = arguments
+        .iter()
+        .filter_map(|argument| match argument.to_str() {
+            Some(
+                flag @ ("--privacy-report" | "--privacy-export" | "--privacy-delete"
+                | "--privacy-compact"),
+            ) => Some(flag),
+            _ => None,
+        })
+        .collect();
+    if command_flags.len() != 1 {
+        return Err("choose exactly one privacy command".into());
+    }
+    let command = command_flags[0];
+    let mut socket = None;
+    let mut scope = None;
+    let mut operand: Option<std::ffi::OsString> = None;
+    let mut kill = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument.to_str() == Some(command) {
+            index += 1;
+            continue;
+        }
+        if argument == "--socket" || argument == "--scope" {
+            let flag = argument.to_string_lossy();
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| format!("`{flag}` needs a value"))?;
+            if value.to_string_lossy().starts_with('-') {
+                return Err(format!("`{flag}` needs a value"));
+            }
+            if argument == "--socket" {
+                socket = Some(PathBuf::from(value));
+            } else {
+                scope = Some(value.to_string_lossy().into_owned());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(raw) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--socket="))
+        {
+            if raw.is_empty() {
+                return Err("`--socket` needs a path".into());
+            }
+            socket = Some(PathBuf::from(raw));
+            index += 1;
+            continue;
+        }
+        if let Some(raw) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--scope="))
+        {
+            if raw.is_empty() {
+                return Err("`--scope` needs a value".into());
+            }
+            scope = Some(raw.to_string());
+            index += 1;
+            continue;
+        }
+        if argument == "--kill" {
+            kill = true;
+            index += 1;
+            continue;
+        }
+        if argument.to_string_lossy().starts_with('-') {
+            return Err(format!(
+                "unrecognised privacy argument `{}`",
+                argument.to_string_lossy()
+            ));
+        }
+        if operand.replace(argument.clone()).is_some() {
+            return Err("a privacy command received too many values".into());
+        }
+        index += 1;
+    }
+
+    let action = match command {
+        "--privacy-report" => {
+            if scope.is_some() && operand.is_some() {
+                return Err("provide the report scope once, positionally or with `--scope`".into());
+            }
+            PrivacyAction::Report {
+                scope: scope.or_else(|| operand.map(|value| value.to_string_lossy().into_owned())),
+            }
+        }
+        "--privacy-export" => PrivacyAction::Export {
+            path: operand
+                .map(PathBuf::from)
+                .ok_or_else(|| "`--privacy-export` needs a destination path".to_string())?,
+            scope,
+        },
+        "--privacy-delete" => {
+            if scope.is_some() && operand.is_some() {
+                return Err(
+                    "provide the deletion scope once, positionally or with `--scope`".into(),
+                );
+            }
+            PrivacyAction::Delete {
+                scope: scope
+                    .or_else(|| operand.map(|value| value.to_string_lossy().into_owned()))
+                    .ok_or_else(|| "`--privacy-delete` needs a scope".to_string())?,
+                kill,
+            }
+        }
+        "--privacy-compact" => {
+            if scope.is_some() || operand.is_some() || kill {
+                return Err("`--privacy-compact` takes no scope or disposition".into());
+            }
+            PrivacyAction::Compact
+        }
+        _ => unreachable!(),
+    };
+    if kill && !matches!(action, PrivacyAction::Delete { .. }) {
+        return Err("`--kill` is only valid with `--privacy-delete`".into());
+    }
+    Ok(ReleaseCommand::Privacy { socket, action })
+}
+
+fn privacy_request(action: PrivacyAction) -> Result<turn_proto::Request, String> {
+    use turn_proto::{CloseDisposition, Request};
+    Ok(match action {
+        PrivacyAction::Report { scope } => Request::GetPrivacyReport {
+            scope: parse_privacy_scope(scope.as_deref().unwrap_or("installation"))?,
+        },
+        PrivacyAction::Export { path, scope } => Request::ExportPrivacyData {
+            scope: parse_privacy_scope(scope.as_deref().unwrap_or("installation"))?,
+            path: absolute_argument(path).display().to_string(),
+        },
+        PrivacyAction::Delete { scope, kill } => Request::DeletePrivacyData {
+            scope: parse_privacy_scope(&scope)?,
+            disposition: if kill {
+                CloseDisposition::Kill
+            } else {
+                CloseDisposition::Terminate
+            },
+        },
+        PrivacyAction::Compact => Request::CompactPrivacyData,
+    })
+}
+
+fn parse_privacy_scope(raw: &str) -> Result<turn_proto::PrivacyScope, String> {
+    use turn_proto::PrivacyScope;
+    if raw == "installation" {
+        return Ok(PrivacyScope::Installation);
+    }
+    let parts: Vec<&str> = raw.split(':').collect();
+    match parts.as_slice() {
+        ["workspace", id] if !id.is_empty() => Ok(PrivacyScope::Workspace {
+            workspace_id: turn_core::ids::WorkspaceId::from_stored(*id),
+        }),
+        ["session", id] if !id.is_empty() => Ok(PrivacyScope::Session {
+            session_id: turn_core::ids::SessionId::from_stored(*id),
+        }),
+        ["agent", session, node] if !session.is_empty() && !node.is_empty() => {
+            Ok(PrivacyScope::Agent {
+                session_id: turn_core::ids::SessionId::from_stored(*session),
+                node_id: turn_core::ids::NodeId::from_stored(*node),
+            })
+        }
+        _ => Err(
+            "scope must be installation, workspace:<id>, session:<id>, or agent:<session-id>:<node-id>"
+                .into(),
+        ),
+    }
+}
+
+fn resolve_command_socket(socket_path: Option<PathBuf>) -> PathBuf {
+    match socket_path {
+        Some(socket) => absolute_argument(socket),
+        None => match socket::startup_paths(None) {
+            Ok(paths) => paths.socket,
+            Err(error) => {
+                eprintln!("turn: could not resolve the daemon socket: {error}");
+                std::process::exit(2);
+            }
+        },
+    }
 }
 
 fn absolute_argument(path: PathBuf) -> PathBuf {
@@ -366,5 +606,52 @@ mod tests {
             None,
             "the ordinary GUI socket argument is still handled by startup"
         );
+
+        assert_eq!(
+            release_command(&[
+                OsString::from("--privacy-report"),
+                OsString::from("session:sess_a"),
+                OsString::from("--socket=/tmp/turn.sock"),
+            ])
+            .unwrap(),
+            Some(ReleaseCommand::Privacy {
+                socket: Some(PathBuf::from("/tmp/turn.sock")),
+                action: PrivacyAction::Report {
+                    scope: Some("session:sess_a".into()),
+                },
+            })
+        );
+        assert_eq!(
+            release_command(&[
+                OsString::from("--privacy-export"),
+                OsString::from("export.json"),
+                OsString::from("--scope"),
+                OsString::from("workspace:ws_a"),
+            ])
+            .unwrap(),
+            Some(ReleaseCommand::Privacy {
+                socket: None,
+                action: PrivacyAction::Export {
+                    path: PathBuf::from("export.json"),
+                    scope: Some("workspace:ws_a".into()),
+                },
+            })
+        );
+        assert!(matches!(
+            privacy_request(PrivacyAction::Delete {
+                scope: "agent:sess_a:proc_a".into(),
+                kill: true,
+            })
+            .unwrap(),
+            turn_proto::Request::DeletePrivacyData {
+                disposition: turn_proto::CloseDisposition::Kill,
+                ..
+            }
+        ));
+        assert!(release_command(&[
+            OsString::from("--privacy-compact"),
+            OsString::from("--scope=installation"),
+        ])
+        .is_err());
     }
 }

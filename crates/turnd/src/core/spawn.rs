@@ -976,11 +976,12 @@ impl Core {
         #[cfg(not(unix))]
         let preserved_fds = Vec::new();
         let result = match &journal_dir {
-            Some(dir) => PtyProcess::spawn_persisted_with_preserved_fds(
+            Some(dir) => PtyProcess::spawn_persisted_with_config_and_preserved_fds(
                 node_id.clone(),
                 spec,
                 now_ms,
                 dir,
+                self.journal_config(),
                 &preserved_fds,
             ),
             None => {
@@ -1237,7 +1238,7 @@ impl Core {
         drop(process);
         if self.terminal_history_enabled(&session_id) {
             let dir = paths::node_terminal_history(&self.data_dir, &session_id, node);
-            match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+            match turn_pty::TerminalJournal::recover(&dir, self.journal_config()) {
                 Ok(Some(recovered)) => {
                     self.recovered_terminals
                         .insert(node.clone(), recovered.buffer);

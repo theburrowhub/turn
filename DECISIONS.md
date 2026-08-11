@@ -3532,3 +3532,44 @@ rolls back a failed rename. The new on-disk daemon is used only after the old da
   retained so an installer never learns to terminate runtime state silently.
 - **Downside:** preserving PTYs across a genuinely incompatible daemon update remains impossible without a
   future descriptor-transfer or external multiplexer design.
+
+---
+
+<a id="adr-057"></a>
+## ADR-057 — Local-data control is complete, inspectable and daemon-authoritative
+
+**Status:** Accepted and implemented.
+
+### Context
+
+SQLite was bounded and redacted, terminal journals were private, and scratch configuration was removed on
+normal lifecycle paths, but those separate properties did not let a user answer “what does Turn have?”,
+export it for review, delete one ownership boundary, or prove a complete installation purge. A best-effort
+list would become false as soon as a migration or new journal format landed. Deleting an open database from
+the daemon would also race its own SQLite connection and any concurrent process.
+
+### Decision
+
+The domain defines one typed `PrivacyScope` and report/export/deletion vocabulary. The store maintains a
+closed catalogue of every SQLite table and fails export when the schema contains an undeclared table. The
+daemon adds filesystem metadata; payloads likely to contain terminal output, logs or injected configuration
+are never copied into exports. Unknown future data-directory entries are explicitly inventoried. Every
+export row carries origin, type, nullable timestamp, size and redacted content.
+
+Authenticated daemon requests implement report, create-new owner-only export, Workspace/Session/Agent
+deletion and compaction. The Settings hierarchy owns bounded Event, Preview, terminal-history and diagnostic
+log policy; writes enforce it immediately and a periodic pass prevents drift. There is no telemetry
+transport, and reports say so explicitly.
+
+Installation purge is a separate `turnd --delete-installation-data` mode. It acquires the canonical
+data-directory lock before touching files, follows no symlink, removes known and unclassified Turn-owned
+entries, and retains only the stable lock inode and `worktrees/` user work.
+
+### Consequences
+
+- A migration or new filesystem root cannot be silently absent from a reviewable inventory.
+- Selective operations remain serialized through the daemon that owns SQLite and PTYs.
+- Full deletion deterministically refuses a live daemon and has a reproducible binary-level test.
+- Terminal/log payloads are not included in export; review shows their existence, timestamp and size instead.
+- Turning history back on affects newly launched Panes because a process spawned without a journal has no
+  background journal writer to activate safely.

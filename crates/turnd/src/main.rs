@@ -34,6 +34,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
+    if options.delete_installation_data {
+        return delete_installation_data(&options);
+    }
+
     logging::init(options.log_level.as_deref());
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -56,6 +60,40 @@ fn main() -> std::process::ExitCode {
         daemon.run_until_signal().await;
         std::process::ExitCode::SUCCESS
     })
+}
+
+/// Performs the one deletion the live daemon must never attempt against its own
+/// open database. The same lock used by normal start-up makes this an atomic
+/// answer to "is any daemon still using these files?".
+fn delete_installation_data(options: &Options) -> std::process::ExitCode {
+    if options.no_persist {
+        eprintln!("turnd: --delete-installation-data cannot be combined with --no-persist");
+        return std::process::ExitCode::from(2);
+    }
+    let config = match Config::from_options(options) {
+        Ok(config) => config,
+        Err(error) => return report(error),
+    };
+    if let Err(error) = turnd::paths::ensure_dir(&config.data_dir) {
+        return report(error);
+    }
+    let lock = match turnd::instance::DataDirLock::acquire(&config.data_dir) {
+        Ok(lock) => lock,
+        Err(error) => return report(error),
+    };
+    match turnd::privacy::purge_installation_data(lock.data_dir(), &config.socket_path) {
+        Ok(purge) => {
+            match serde_json::to_string_pretty(&purge) {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    eprintln!("turnd: could not encode the deletion report: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        Err(error) => report(error),
+    }
 }
 
 /// Prints a start-up failure and picks an exit code that means something.

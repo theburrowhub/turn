@@ -1149,6 +1149,14 @@ tests do not validate prose or example field lists; the release audit checks tho
 
 ### 6.2 turn-store — SQLite persistence
 
+`turn-store::privacy` is the closed inventory boundary for durable rows. Every non-internal SQLite table must
+declare its ownership filter and timestamp source before report/export succeeds; a future migration cannot
+silently disappear from privacy output. Values cross the ordinary write-time redaction boundary and are
+redacted again during export, while unknown/secret Setting values are never projected. `turnd` joins that
+logical catalogue with metadata-only filesystem inventory, including an explicit unclassified category for
+future data-directory entries. The live daemon remains the only selective writer; full physical deletion is
+offline behind the canonical data-directory lock and retains user checkout roots.
+
 **Status: built, including the hierarchy repository and append-only migrations through 009.** Modules: `migrations`,
 `codec`, `redact`, `maintenance`, `location`, `error`,
 `repo/{workspace, session, node, event, attention, template, settings, hierarchy}`, behind a `Store` facade

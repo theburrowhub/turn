@@ -142,9 +142,74 @@ fn the_binary_reports_its_version_and_its_usage() {
         .expect("turnd --help must run");
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for flag in ["--socket", "--data-dir", "--log-level", "--no-persist"] {
+    for flag in [
+        "--socket",
+        "--data-dir",
+        "--log-level",
+        "--no-persist",
+        "--delete-installation-data",
+    ] {
         assert!(text.contains(flag), "the help must mention {flag}: {text}");
     }
+}
+
+#[test]
+fn offline_installation_deletion_removes_private_data_and_keeps_checkout_work() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let worktree = dir.path().join(turnd::paths::WORKTREES_DIR).join("ws_keep");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("work.txt"), b"keep").unwrap();
+    std::fs::create_dir_all(dir.path().join(turnd::paths::SCRATCH_DIR)).unwrap();
+    std::fs::write(dir.path().join(turnd::privacy::DAEMON_LOG_FILE), b"private").unwrap();
+    let store = turn_store::Store::open_in(dir.path()).unwrap();
+    drop(store);
+
+    let output = Command::new(TURND)
+        .args(["--data-dir", dir.path().to_str().unwrap()])
+        .arg("--delete-installation-data")
+        .output()
+        .expect("the offline deletion must run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: turn_core::privacy::InstallationPurgeReport =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report.files_deleted >= 2);
+    assert_eq!(std::fs::read(worktree.join("work.txt")).unwrap(), b"keep");
+    assert!(!dir.path().join("turn.db").exists());
+    assert!(!dir.path().join(turnd::paths::SCRATCH_DIR).exists());
+    assert!(dir.path().join(".turnd.lock").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_installation_deletion_refuses_a_live_daemon_without_removing_anything() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let socket = dir.path().join("turnd.sock");
+    let mut daemon = spawn_daemon(dir.path());
+    wait_until_serving(&socket, daemon.id()).await;
+    let sentinel = dir.path().join(turnd::paths::SCRATCH_DIR).join("keep");
+    std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+    std::fs::write(&sentinel, b"private").unwrap();
+
+    let output = Command::new(TURND)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--delete-installation-data")
+        .output()
+        .expect("the contending deletion must run");
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"private");
+
+    send_signal(daemon.id(), SIGTERM);
+    let status = tokio::task::spawn_blocking(move || daemon.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]

@@ -275,19 +275,10 @@ pub(crate) fn upsert_node(conn: &Connection, node: &ProcessNode, seq: i64) -> Re
                     preview.updated_ms,
                 ],
             )?;
-            // A preview is navigation state, not scrollback. Bound both per node
-            // and globally so a noisy agent cannot grow the database forever.
-            conn.execute(
-                "DELETE FROM activity_previews WHERE node_id = ?1 AND id NOT IN ( \
-                     SELECT id FROM activity_previews WHERE node_id = ?1 \
-                     ORDER BY created_ms DESC, id DESC LIMIT 20)",
-                params![node.id.as_str()],
-            )?;
-            conn.execute(
-                "DELETE FROM activity_previews WHERE id NOT IN ( \
-                     SELECT id FROM activity_previews ORDER BY created_ms DESC, id DESC LIMIT 2000)",
-                [],
-            )?;
+            // A preview is navigation state, not scrollback. The global privacy
+            // policy supplies both bounds; applying it on the same write prevents
+            // a noisy agent from growing the database between maintenance ticks.
+            crate::privacy::prune_previews_for_write(conn, preview.updated_ms)?;
         }
     }
     Ok(())

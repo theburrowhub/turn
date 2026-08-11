@@ -30,6 +30,7 @@ use turn_core::model::{
     PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
     TreeVisibilityMode,
 };
+use turn_core::privacy::PrivacyScope;
 use turn_core::settings::Scope as SettingsScope;
 use turn_core::state::{Lifecycle, Turn};
 
@@ -149,6 +150,25 @@ pub enum Request {
     /// the live PTY handles. This read is the authoritative preflight used before an
     /// installed UI is replaced.
     GetUpdateStatus,
+
+    // ------------------------------------------------------------- local privacy
+    /// Inventories every local record in the requested ownership boundary.
+    GetPrivacyReport {
+        scope: PrivacyScope,
+    },
+    /// Writes a create-new, owner-only JSON export after secret redaction.
+    ExportPrivacyData {
+        scope: PrivacyScope,
+        path: String,
+    },
+    /// Removes all Turn-owned local records in the scope. Installation-wide
+    /// deletion is deliberately an offline `turnd` operation.
+    DeletePrivacyData {
+        scope: PrivacyScope,
+        disposition: CloseDisposition,
+    },
+    /// Applies retention immediately and compacts the durable store and log.
+    CompactPrivacyData,
 
     // ---------------------------------------------------------------- workspaces
     ListWorkspaces {
@@ -932,6 +952,10 @@ impl Request {
     pub fn op(&self) -> &'static str {
         match self {
             Request::GetUpdateStatus => "get_update_status",
+            Request::GetPrivacyReport { .. } => "get_privacy_report",
+            Request::ExportPrivacyData { .. } => "export_privacy_data",
+            Request::DeletePrivacyData { .. } => "delete_privacy_data",
+            Request::CompactPrivacyData => "compact_privacy_data",
             Request::ListWorkspaces { .. } => "list_workspaces",
             Request::CreateWorkspace { .. } => "create_workspace",
             Request::RenameWorkspace { .. } => "rename_workspace",
@@ -1042,6 +1066,10 @@ impl Request {
     pub fn expected_result(&self) -> &'static str {
         match self {
             Request::GetUpdateStatus => "update_status",
+            Request::GetPrivacyReport { .. } => "privacy_report",
+            Request::ExportPrivacyData { .. } => "privacy_exported",
+            Request::DeletePrivacyData { .. } => "privacy_deleted",
+            Request::CompactPrivacyData => "privacy_compacted",
             Request::ListWorkspaces { .. } => "workspaces",
             Request::CreateWorkspace { .. }
             | Request::RenameWorkspace { .. }
@@ -1164,6 +1192,7 @@ impl Request {
         !matches!(
             self,
             Request::GetUpdateStatus
+                | Request::GetPrivacyReport { .. }
                 | Request::ListWorkspaces { .. }
                 | Request::GetHierarchy { .. }
                 | Request::GetInspector { .. }
@@ -1245,6 +1274,17 @@ impl Request {
             | Request::RelaunchNode { session_id, .. }
             | Request::MuteSession { session_id, .. }
             | Request::CorrectState { session_id, .. } => Some(session_id),
+            Request::GetPrivacyReport {
+                scope: PrivacyScope::Session { session_id } | PrivacyScope::Agent { session_id, .. },
+            }
+            | Request::ExportPrivacyData {
+                scope: PrivacyScope::Session { session_id } | PrivacyScope::Agent { session_id, .. },
+                ..
+            }
+            | Request::DeletePrivacyData {
+                scope: PrivacyScope::Session { session_id } | PrivacyScope::Agent { session_id, .. },
+                ..
+            } => Some(session_id),
             Request::RenameNode { session_id, .. }
             | Request::CorrectRelationship { session_id, .. } => Some(session_id),
             Request::AcquireWorkspaceWriteLease { session_id, .. } => Some(session_id),

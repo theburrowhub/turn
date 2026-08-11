@@ -136,6 +136,10 @@ pub use search::{
     search_grid, viewport_offset, viewport_row, PaneMatch, SearchError, SearchMode, SearchOutcome,
     SearchQuery, MAX_MATCHES, MAX_MATCHES_PER_ROW, MAX_QUERY_CHARS, MAX_SEARCH_ROWS,
 };
+pub use turn_core::privacy::{
+    InstallationPurgeReport, PrivacyCategory, PrivacyDatum, PrivacyDeletionReport,
+    PrivacyExportDocument, PrivacyExportResult, PrivacyPolicy, PrivacyReport, PrivacyScope,
+};
 pub use view::{
     AgentSummary, AttentionView, ContextHandoffMode, ContextHandoffText, ContextHandoffView,
     HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView, InspectorHandoffView,

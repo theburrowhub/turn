@@ -135,6 +135,15 @@ release-acceptance: ## Prove version matching, update safety and the final macOS
 		echo "release-acceptance: macOS bundle/signature check runs in the macOS CI job"; \
 	fi
 
+.PHONY: privacy-acceptance
+privacy-acceptance: ## Reproduce local-data inventory, export, retention and deletion without a window
+	$(CARGO) test -p turn-store privacy::tests -- --test-threads=1
+	$(CARGO) test -p turn-proto --lib contract:: -- --test-threads=1
+	$(CARGO) test -p turnd privacy::tests -- --test-threads=1
+	$(CARGO) test -p turnd core::requests::privacy::tests -- --test-threads=1
+	$(CARGO) test -p turnd --test binary offline_installation_deletion_ -- --test-threads=1
+	$(CARGO) test -p turn-gui --bin turn release_commands_are_windowless_and_update_status_parses_both_socket_spellings -- --test-threads=1
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

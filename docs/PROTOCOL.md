@@ -541,6 +541,27 @@ may replace only the UI while the release and daemon protocol windows overlap. I
 overlap, any positive PTY count defers the update, and a zero count still requires an explicit daemon stop —
 there is no protocol request which silently restarts the daemon for an installer.
 
+### Local-data privacy
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `get_privacy_report` | `scope: PrivacyScope` | `privacy_report` |
+| `export_privacy_data` | `scope: PrivacyScope`, absolute `path` | `privacy_exported` |
+| `delete_privacy_data` | `scope: PrivacyScope`, `disposition` | `privacy_deleted` |
+| `compact_privacy_data` | — | `privacy_compacted` |
+
+`PrivacyScope` is tagged as `installation`, `workspace { workspace_id }`, `session { session_id }` or
+`agent { session_id, node_id }`. Reports enumerate counts and bytes by stored type, the resolved retention
+policy, and the explicit no-telemetry facts. Exports are owner-only, create-new JSON documents; every datum
+names its origin/type/timestamp and carries redacted content or an explanation that its filesystem payload
+was omitted. Existing destinations and symlinks are refused.
+
+Selective deletion stops the named work according to the required disposition, removes Turn-owned database
+and filesystem records, compacts SQLite and reports any escaped process ids. `keep_processes` is invalid.
+Installation scope is refused by the live daemon and must use the lock-protected offline
+`turnd --delete-installation-data` operation. Compact applies retention, bounds/scrubs the diagnostic log,
+checkpoints the WAL and vacuums the database.
+
 ### Workspaces
 
 | `op` | Fields | Answers with |

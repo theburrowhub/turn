@@ -69,6 +69,7 @@ impl Core {
             .setting_layers()
             .set(scope, &owner, &key, &value, now_ms)
             .map_err(super::workspaces::store)?;
+        self.privacy_setting_changed(&key, now_ms);
         tracing::info!(scope = ?scope, owner = %owner, %key, "a preference was set");
         // Answered with the whole resolved set rather than an ack: one write can move what is
         // in force for a Session in a different Workspace, and a client patching its own copy
@@ -82,6 +83,7 @@ impl Core {
         scope: Scope,
         owner_id: Option<String>,
         key: String,
+        now_ms: i64,
     ) -> Answer {
         let owner = owner_id.unwrap_or_default();
         // Deliberately not checked against the catalogue. Resetting a key this build does not
@@ -95,6 +97,7 @@ impl Core {
         if removed {
             tracing::info!(scope = ?scope, owner = %owner, %key, "a preference was reset to inherited");
         }
+        self.privacy_setting_changed(&key, now_ms);
         self.answer_settings_for_owner(scope, &owner)
     }
 
@@ -746,6 +749,7 @@ mod tests {
                 Scope::Session,
                 Some(session_id.as_str().to_string()),
                 "appearance.font_size".into(),
+                T0 + 1,
             )
             .expect("resetting is always allowed");
 
@@ -877,7 +881,7 @@ mod tests {
 
         harness
             .core
-            .reset_setting(Scope::Global, None, "adapters.from_the_future".into())
+            .reset_setting(Scope::Global, None, "adapters.from_the_future".into(), T0)
             .expect("resetting anything at all is allowed");
     }
 
@@ -980,6 +984,7 @@ mod tests {
                 Scope::Session,
                 Some(session_id.as_str().to_string()),
                 "shell.command".into(),
+                T0 + 2,
             )
             .expect("resetting is allowed");
         assert_eq!(harness.core.shell_for(Some(&session_id)), "/bin/ksh");

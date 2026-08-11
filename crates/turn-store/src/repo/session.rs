@@ -205,11 +205,22 @@ impl<'a> SessionRepo<'a> {
     /// there would be no way to name in the UI.
     pub fn delete(&self, id: &SessionId) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
         tx.execute(
-            "DELETE FROM tree_ui_state WHERE node_kind = 'session' AND node_id = ?1",
+            "DELETE FROM tree_ui_state WHERE \
+                 (node_kind = 'session' AND node_id = ?1) OR \
+                 (node_kind IN ('agent', 'process') AND node_id IN (\
+                     SELECT id FROM process_nodes WHERE session_id = ?1))",
             params![id.as_str()],
         )?;
+        tx.execute(
+            "UPDATE tree_surface_preferences \
+             SET scroll_node_kind = NULL, scroll_node_id = NULL \
+             WHERE (scroll_node_kind = 'session' AND scroll_node_id = ?1) OR \
+                   scroll_node_id IN (\
+                       SELECT id FROM process_nodes WHERE session_id = ?1)",
+            params![id.as_str()],
+        )?;
+        let changed = tx.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(changed > 0)
     }
@@ -480,7 +491,10 @@ mod tests {
     fn deleting_a_session_leaves_no_trace_of_it_in_any_table() {
         let store = testing::store();
         let ws = testing::saved_workspace(&store, "turn");
-        let session = session_with_three_panes(&ws.id);
+        let mut session = session_with_three_panes(&ws.id);
+        let node = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
+        let node_id = node.id.clone();
+        session.tree.insert(node);
         store.sessions().save(&session).unwrap();
         // Tree state is per-window and has no foreign key, so it is the row most likely to
         // survive a delete — which is why it is set up here explicitly.
@@ -497,6 +511,23 @@ mod tests {
                 updated_ms: T0,
             })
             .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tree_ui_state \
+                 (surface_id, node_kind, node_id, updated_ms) VALUES ('window-1', 'process', ?1, ?2)",
+                params![node_id.as_str(), T0],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tree_surface_preferences \
+                 (surface_id, scroll_node_kind, scroll_node_id, updated_ms) \
+                 VALUES ('window-1', 'process', ?1, ?2)",
+                params![node_id.as_str(), T0],
+            )
+            .unwrap();
 
         assert!(store.sessions().delete(&session.id).unwrap());
         assert!(store.sessions().get(&session.id).unwrap().is_none());
@@ -511,6 +542,15 @@ mod tests {
             tree_state.is_empty(),
             "the per-window tree state outlived the session: {tree_state:?}"
         );
+        let anchor: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT scroll_node_id FROM tree_surface_preferences WHERE surface_id = 'window-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(anchor.is_none(), "the scroll anchor outlived its Session");
     }
 
     /// Deleting is not archiving, and the difference is that it does not come back.

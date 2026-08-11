@@ -191,7 +191,7 @@ impl Core {
             );
             for node_id in nodes {
                 let dir = paths::node_terminal_history(&self.data_dir, &session_id, &node_id);
-                match turn_pty::TerminalJournal::recover(&dir, turn_pty::JournalConfig::default()) {
+                match turn_pty::TerminalJournal::recover(&dir, self.journal_config()) {
                     Ok(Some(recovered)) => {
                         self.recovered_terminals
                             .insert(node_id.clone(), recovered.buffer);
