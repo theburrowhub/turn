@@ -8,12 +8,14 @@
 //! rectangles instead of a hundred and twenty.
 //!
 //! Its *glyphs* are painted one cell at a time, each at its own place on the pixel grid.
-//! Drawing a run as a single string is cheaper and it is what Turn used to do, but it
-//! hands the column positions to the font's advances: the text then drifts away from the
-//! grid the borders are drawn on, and a box-drawing frame comes out as loose doubled
-//! pipes — which is exactly the report this module was rewritten for. A blank cell costs
-//! nothing at all, and a terminal screen is mostly blank, so the price of being right is
-//! a text shape per visible character.
+//! The optional programming ligatures are the sole exception: an explicit two-cell
+//! operator is replaced visually by one centred symbol, while both source cells remain
+//! intact. Drawing a whole run as one string is cheaper and it is what Turn used to do,
+//! but it hands the column positions to the font's advances: the text then drifts away
+//! from the grid the borders are drawn on, and a box-drawing frame comes out as loose
+//! doubled pipes — which is exactly the report this module was rewritten for. A blank
+//! cell costs nothing at all, and a terminal screen is mostly blank, so the price of
+//! being right is a text shape per visible character.
 //!
 //! Two passes per row, backgrounds before glyphs, because a wide glyph reaches into the
 //! column after it and the background of that column must not be painted over its right
@@ -56,7 +58,7 @@ use turn_proto::PtySize;
 
 use crate::panes::size_in_cells;
 use crate::repaint::cursor_visible;
-use crate::theme::Theme;
+use crate::theme::{CursorStyle, Theme};
 use geometry::CellGrid;
 use images::ImageCache;
 use links::{FsPaths, Link, LinkMap, LinkRequest};
@@ -742,8 +744,26 @@ fn paint_glyphs(
     }
     if !span.run.text.is_empty() {
         let columns = glyph_columns(span.run);
-        for col in span.from..span.to {
+        let mut col = span.from;
+        while col < span.to {
+            if theme.ligatures && col + 1 < span.to {
+                let left = glyph_at(span.run, span.run_start, col);
+                let right = glyph_at(span.run, span.run_start, col + 1);
+                if let Some(joined) = operator_ligature(left, right) {
+                    let cells = lattice.span(row, col, 2);
+                    painter.text(
+                        cells.center(),
+                        Align2::CENTER_CENTER,
+                        joined,
+                        theme.mono.clone(),
+                        colour,
+                    );
+                    col += 2;
+                    continue;
+                }
+            }
             let Some(text) = glyph_at(span.run, span.run_start, col) else {
+                col += 1;
                 continue;
             };
             let cell = lattice.span(row, col, columns);
@@ -755,6 +775,7 @@ fn paint_glyphs(
                 colour,
                 lattice.pixels_per_point(),
             );
+            col += 1;
         }
     }
     if span.run.attrs.has(CellAttrs::UNDERLINE) {
@@ -772,6 +793,25 @@ fn paint_glyphs(
             extent.min.y + 1.0,
             Stroke::new(1.0, colour.gamma_multiply(0.4)),
         );
+    }
+}
+
+/// A deliberately small set of visual programming ligatures.
+///
+/// They are substitutions only on glass. The grid, search result, selection and clipboard
+/// keep the two original cells, and the replacement is centred across exactly those cells.
+/// That is the terminal-safe distinction from handing an entire row to a shaping engine,
+/// which is free to change advances and would move every column after the first ligature.
+fn operator_ligature(left: Option<&str>, right: Option<&str>) -> Option<&'static str> {
+    match (left?, right?) {
+        ("-", ">") => Some("→"),
+        ("<", "-") => Some("←"),
+        ("=", ">") => Some("⇒"),
+        ("!", "=") => Some("≠"),
+        ("<", "=") => Some("≤"),
+        (">", "=") => Some("≥"),
+        ("=", "=") => Some("≡"),
+        _ => None,
     }
 }
 
@@ -866,7 +906,7 @@ fn paint_cursor(
     }
     // Only a focused pane blinks. Thirty blinking cursors would be a distraction, and a
     // repaint every half second per pane.
-    if options.focused && !cursor_visible(options.now_ms, true) {
+    if options.focused && !cursor_visible(options.now_ms, theme.cursor_blink) {
         return;
     }
     let under = grid.cell(row, col);
@@ -878,19 +918,22 @@ fn paint_cursor(
     };
     let at = lattice.span(row, col, columns);
     if options.focused {
-        // A filled block with the character knocked out of it, which is what a terminal
-        // cursor looks like and is legible at any font size.
-        painter.rect_filled(at, 0.0, theme.cursor);
-        if let Some(under) = under {
-            if !under.text.is_empty() {
-                paint_glyph(
-                    painter,
-                    theme,
-                    &under.text,
-                    at,
-                    theme.background,
-                    lattice.pixels_per_point(),
-                );
+        let mark = cursor_mark(theme.cursor_style, at, lattice.pixels_per_point());
+        painter.rect_filled(mark, 0.0, theme.cursor);
+        if theme.cursor_style == CursorStyle::Block {
+            // A block knocks the character out of its fill. A bar and underline leave the
+            // character alone, as native terminal cursors do.
+            if let Some(under) = under {
+                if !under.text.is_empty() {
+                    paint_glyph(
+                        painter,
+                        theme,
+                        &under.text,
+                        at,
+                        theme.background,
+                        lattice.pixels_per_point(),
+                    );
+                }
             }
         }
     } else {
@@ -902,6 +945,27 @@ fn paint_cursor(
             Stroke::new(1.0, theme.text_faint),
             egui::StrokeKind::Inside,
         );
+    }
+}
+
+/// The filled part of a focused cursor, snapped to a two-physical-pixel stroke.
+fn cursor_mark(style: CursorStyle, cell: Rect, pixels_per_point: f32) -> Rect {
+    let scale = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let thickness = (2.0 / scale)
+        .max(1.0 / scale)
+        .min(cell.width().min(cell.height()));
+    match style {
+        CursorStyle::Block => cell,
+        CursorStyle::Bar => {
+            Rect::from_min_max(cell.min, egui::pos2(cell.min.x + thickness, cell.max.y))
+        }
+        CursorStyle::Underline => {
+            Rect::from_min_max(egui::pos2(cell.min.x, cell.max.y - thickness), cell.max)
+        }
     }
 }
 
@@ -2278,6 +2342,37 @@ mod tests {
             ..cluster
         };
         assert_eq!(glyph_at(&blank, 0, 0), None);
+    }
+
+    #[test]
+    fn ligatures_join_only_known_pairs_and_never_change_the_grid_text() {
+        assert_eq!(operator_ligature(Some("-"), Some(">")), Some("→"));
+        assert_eq!(operator_ligature(Some("!"), Some("=")), Some("≠"));
+        assert_eq!(operator_ligature(Some("a"), Some("b")), None);
+        assert_eq!(operator_ligature(Some("-"), None), None);
+
+        let grid = Grid::from_lines(&["a -> b != c"], 12);
+        assert_eq!(
+            grid.row_text(0),
+            "a -> b != c",
+            "ligatures are a paint preference; search, selection and copy keep the source"
+        );
+    }
+
+    #[test]
+    fn every_cursor_preference_stays_inside_the_cell_and_has_two_physical_pixels() {
+        let cell = Rect::from_min_max(Pos2::new(10.0, 20.0), Pos2::new(18.0, 37.0));
+        assert_eq!(cursor_mark(CursorStyle::Block, cell, 2.0), cell);
+
+        let bar = cursor_mark(CursorStyle::Bar, cell, 2.0);
+        assert_eq!(bar.min, cell.min);
+        assert_eq!(bar.height(), cell.height());
+        assert_eq!(bar.width() * 2.0, 2.0, "two physical pixels");
+
+        let underline = cursor_mark(CursorStyle::Underline, cell, 2.0);
+        assert_eq!(underline.max, cell.max);
+        assert_eq!(underline.width(), cell.width());
+        assert_eq!(underline.height() * 2.0, 2.0, "two physical pixels");
     }
 
     /// A wide glyph gets both of its columns, and its trailer none: that is what stops an

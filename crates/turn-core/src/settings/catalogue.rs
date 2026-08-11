@@ -332,8 +332,8 @@ impl Catalogue {
                     key: "appearance.cursor",
                     area: Area::Appearance,
                     title: "Cursor",
-                    description: "The shape Turn draws when the program in the pane has not \
-                                  asked for a particular one.",
+                    description: "The shape Turn draws at the live prompt: a filled block, \
+                                  narrow bar or underline.",
                     kind: ValueKind::Choice {
                         options: &["block", "bar", "underline"],
                     },
@@ -356,10 +356,9 @@ impl Catalogue {
                     key: "appearance.ligatures",
                     area: Area::Appearance,
                     title: "Font ligatures",
-                    description: "Joins sequences like -> into one glyph. Off by default: a \
-                                  ligature makes two characters occupy one cell's worth of \
-                                  reading, which is a problem in a terminal where columns are \
-                                  load-bearing.",
+                    description: "Visually joins programming operators such as -> and != \
+                                  without changing their cells, search text or clipboard. Off \
+                                  by default so every character remains visually explicit.",
                     kind: ValueKind::Bool,
                     default: json!(false),
                     sensitivity: Sensitivity::Plain,

@@ -238,6 +238,9 @@ requirement rather than an aspiration.
   rendering and stable-preview extraction.
 - Backpressure that degrades cleanly: a slow consumer is told it lost data and resynchronises from a
   replay rather than growing an unbounded queue.
+- Search over the live screen and retained scrollback, safely validated hyperlinks, quoted path
+  drops, IME/dead-key input, program-owned mouse/alternate-screen modes and live appearance
+  preferences. Reproduce the whole interaction contract with `make terminal-acceptance`.
 - Process supervision: discovery of what the processes Turn started went on to start, scanned on
   demand rather than polled.
 
