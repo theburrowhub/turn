@@ -3976,6 +3976,7 @@ dependencies = [
  "egui_kittest",
  "libc",
  "notify-rust",
+ "objc2-app-kit 0.3.2",
  "pollster 0.4.0",
  "rfd",
  "serde",

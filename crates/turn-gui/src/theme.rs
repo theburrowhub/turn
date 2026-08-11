@@ -37,6 +37,55 @@ impl CursorStyle {
     }
 }
 
+/// The palette contract selected explicitly or inherited from the desktop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContrastMode {
+    #[default]
+    Standard,
+    High,
+}
+
+impl ContrastMode {
+    fn from_setting(value: Option<&serde_json::Value>, system_increased: bool) -> Self {
+        match value.and_then(serde_json::Value::as_str) {
+            Some("standard") => Self::Standard,
+            Some("high") => Self::High,
+            _ if system_increased => Self::High,
+            _ => Self::Standard,
+        }
+    }
+}
+
+/// Accessibility choices owned by the desktop rather than Turn's settings database.
+///
+/// macOS exposes these through `NSWorkspace`; Linux desktop environments do not share
+/// one native API, so the explicit Turn controls remain the portable path there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemAccessibility {
+    pub reduced_motion: bool,
+    pub increased_contrast: bool,
+}
+
+impl SystemAccessibility {
+    /// Reads the live platform preference. This is a pair of in-process AppKit property
+    /// reads on macOS, not a shell command or a cached startup guess.
+    pub fn detect() -> Self {
+        #[cfg(target_os = "macos")]
+        let detected = {
+            let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
+            Self {
+                reduced_motion: workspace.accessibilityDisplayShouldReduceMotion(),
+                increased_contrast: workspace.accessibilityDisplayShouldIncreaseContrast(),
+            }
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let detected = Self::default();
+
+        detected
+    }
+}
+
 /// Appearance preferences resolved for the Session currently on screen.
 ///
 /// The daemon owns Global → Workspace → Template → Session resolution and the Desk appends
@@ -51,6 +100,8 @@ pub struct AppearanceSettings {
     pub cursor: CursorStyle,
     pub cursor_blink: bool,
     pub ligatures: bool,
+    pub contrast: ContrastMode,
+    pub reduced_motion: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -62,14 +113,28 @@ impl Default for AppearanceSettings {
             cursor: CursorStyle::Block,
             cursor_blink: true,
             ligatures: false,
+            contrast: ContrastMode::Standard,
+            reduced_motion: false,
         }
     }
 }
 
 impl AppearanceSettings {
     pub fn from_view(settings: Option<&turn_proto::SettingsView>) -> Self {
+        Self::from_view_with_system(settings, SystemAccessibility::default())
+    }
+
+    pub fn from_view_with_system(
+        settings: Option<&turn_proto::SettingsView>,
+        system: SystemAccessibility,
+    ) -> Self {
         let mut appearance = Self::default();
         let Some(settings) = settings else {
+            appearance.contrast = ContrastMode::from_setting(None, system.increased_contrast);
+            appearance.reduced_motion = system.reduced_motion;
+            if appearance.reduced_motion {
+                appearance.cursor_blink = false;
+            }
             return appearance;
         };
         let value = |key: &str| settings.entry(key).map(|entry| &entry.resolution.value);
@@ -98,10 +163,12 @@ impl AppearanceSettings {
         appearance.ligatures = value("appearance.ligatures")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if value("appearance.reduced_motion")
+        appearance.contrast =
+            ContrastMode::from_setting(value("appearance.contrast"), system.increased_contrast);
+        appearance.reduced_motion = value("appearance.reduced_motion")
             .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(system.reduced_motion);
+        if appearance.reduced_motion {
             appearance.cursor_blink = false;
         }
         appearance
@@ -134,6 +201,8 @@ pub struct Theme {
     /// Joins a small, explicit set of programming operators visually while keeping their
     /// original cells, selection and copied text intact.
     pub ligatures: bool,
+    pub contrast: ContrastMode,
+    pub reduced_motion: bool,
 }
 
 /// The glyph the terminal cell is measured from.
@@ -205,18 +274,55 @@ impl Theme {
             cursor_style: CursorStyle::Block,
             cursor_blink: true,
             ligatures: false,
+            contrast: ContrastMode::Standard,
+            reduced_motion: false,
+        }
+    }
+
+    /// A deliberately spare palette whose text and semantic colours clear WCAG AA
+    /// against the surfaces on which Turn paints them. Control outlines clear the 3:1
+    /// non-text threshold as well.
+    pub fn high_contrast() -> Self {
+        Self {
+            background: Color32::BLACK,
+            panel: Color32::from_rgb(0x06, 0x08, 0x0b),
+            raised: Color32::from_rgb(0x0d, 0x12, 0x18),
+            border: Color32::from_rgb(0x8b, 0x98, 0xa8),
+            text: Color32::WHITE,
+            text_dim: Color32::from_rgb(0xd2, 0xd9, 0xe1),
+            text_faint: Color32::from_rgb(0xae, 0xba, 0xc7),
+            attention: Color32::from_rgb(0xff, 0xd2, 0x4a),
+            failure: Color32::from_rgb(0xff, 0x8a, 0x80),
+            running: Color32::from_rgb(0x91, 0xcb, 0xff),
+            done: Color32::from_rgb(0x8d, 0xe5, 0xa1),
+            provisional: Color32::from_rgb(0xd5, 0xc1, 0xff),
+            selection: Color32::from_rgb(0x1f, 0x3f, 0x69),
+            cursor: Color32::WHITE,
+            mono: FontId::new(13.0, FontFamily::Monospace),
+            ui_font: FontId::new(13.0, FontFamily::Proportional),
+            cursor_style: CursorStyle::Block,
+            cursor_blink: true,
+            ligatures: false,
+            contrast: ContrastMode::High,
+            reduced_motion: false,
         }
     }
 
     /// Resolves the fixed palette with the appearance values currently in force.
     pub fn with_appearance(appearance: &AppearanceSettings) -> Self {
+        let palette = match appearance.contrast {
+            ContrastMode::Standard => Self::dark(),
+            ContrastMode::High => Self::high_contrast(),
+        };
         Self {
             mono: FontId::new(appearance.terminal_font_size, FontFamily::Monospace),
             ui_font: FontId::new(appearance.ui_font_size, FontFamily::Proportional),
             cursor_style: appearance.cursor,
             cursor_blink: appearance.cursor_blink,
             ligatures: appearance.ligatures,
-            ..Self::dark()
+            contrast: appearance.contrast,
+            reduced_motion: appearance.reduced_motion,
+            ..palette
         }
     }
 
@@ -254,15 +360,40 @@ impl Theme {
         let theme = egui::Theme::Dark;
         let mut style = (*ctx.style_of(theme)).clone();
         let radius = CornerRadius::same(6);
-        let input = Color32::from_rgb(0x0a, 0x0d, 0x11);
-        let inactive = Color32::from_rgb(0x17, 0x1b, 0x21);
-        let hovered = Color32::from_rgb(0x20, 0x27, 0x30);
-        let active = Color32::from_rgb(0x18, 0x22, 0x2e);
-        let open = Color32::from_rgb(0x1c, 0x21, 0x29);
-        let inactive_border = Color32::from_rgb(0x34, 0x3b, 0x46);
-        let hovered_border = Color32::from_rgb(0x4a, 0x56, 0x65);
-        let active_border = Color32::from_rgb(0x74, 0x86, 0x9c);
-        let open_border = Color32::from_rgb(0x56, 0x64, 0x77);
+        let (
+            input,
+            inactive,
+            hovered,
+            active,
+            open,
+            inactive_border,
+            hovered_border,
+            active_border,
+            open_border,
+        ) = match self.contrast {
+            ContrastMode::Standard => (
+                Color32::from_rgb(0x0a, 0x0d, 0x11),
+                Color32::from_rgb(0x17, 0x1b, 0x21),
+                Color32::from_rgb(0x20, 0x27, 0x30),
+                Color32::from_rgb(0x18, 0x22, 0x2e),
+                Color32::from_rgb(0x1c, 0x21, 0x29),
+                Color32::from_rgb(0x34, 0x3b, 0x46),
+                Color32::from_rgb(0x4a, 0x56, 0x65),
+                Color32::from_rgb(0x74, 0x86, 0x9c),
+                Color32::from_rgb(0x56, 0x64, 0x77),
+            ),
+            ContrastMode::High => (
+                Color32::BLACK,
+                Color32::from_rgb(0x0b, 0x10, 0x16),
+                Color32::from_rgb(0x16, 0x25, 0x34),
+                Color32::from_rgb(0x18, 0x32, 0x4d),
+                Color32::from_rgb(0x12, 0x22, 0x33),
+                self.border,
+                Color32::from_rgb(0xb8, 0xc7, 0xd9),
+                Color32::WHITE,
+                Color32::from_rgb(0xd2, 0xdc, 0xe8),
+            ),
+        };
 
         style.visuals.dark_mode = true;
         style.visuals.panel_fill = self.background;
@@ -312,6 +443,9 @@ impl Theme {
         style.visuals.selection.stroke = Stroke::new(1.0, self.text);
         style.visuals.window_corner_radius = radius;
         style.visuals.menu_corner_radius = radius;
+        if self.reduced_motion {
+            style.animation_time = 0.0;
+        }
 
         // macOS-sized targets without turning a dense terminal workspace into a touch UI.
         style.spacing.interact_size = egui::vec2(44.0, 28.0);
@@ -410,6 +544,8 @@ mod tests {
             ("appearance.cursor", json!("underline")),
             ("appearance.cursor_blink", json!(false)),
             ("appearance.ligatures", json!(true)),
+            ("appearance.contrast", json!("high")),
+            ("appearance.reduced_motion", json!(true)),
         ]);
         let appearance = AppearanceSettings::from_view(Some(&view));
         assert_eq!(appearance.terminal_font_size, 21.0);
@@ -418,6 +554,8 @@ mod tests {
         assert_eq!(appearance.cursor, CursorStyle::Underline);
         assert!(!appearance.cursor_blink);
         assert!(appearance.ligatures);
+        assert_eq!(appearance.contrast, ContrastMode::High);
+        assert!(appearance.reduced_motion);
 
         let theme = Theme::with_appearance(&appearance);
         assert_eq!(theme.mono.size, 21.0);
@@ -425,6 +563,8 @@ mod tests {
         assert_eq!(theme.cursor_style, CursorStyle::Underline);
         assert!(!theme.cursor_blink);
         assert!(theme.ligatures);
+        assert_eq!(theme.contrast, ContrastMode::High);
+        assert!(theme.reduced_motion);
     }
 
     #[test]
@@ -441,6 +581,87 @@ mod tests {
         assert_eq!(appearance.zoom, 1.0);
         assert_eq!(appearance.cursor, CursorStyle::Block);
         assert!(!appearance.cursor_blink);
+        assert!(appearance.reduced_motion);
+    }
+
+    #[test]
+    fn explicit_accessibility_values_override_the_live_desktop_preferences() {
+        let system = SystemAccessibility {
+            reduced_motion: true,
+            increased_contrast: true,
+        };
+        let inherited = AppearanceSettings::from_view_with_system(None, system);
+        assert!(inherited.reduced_motion);
+        assert_eq!(inherited.contrast, ContrastMode::High);
+        assert!(!inherited.cursor_blink);
+
+        let explicit = appearance_view(&[
+            ("appearance.reduced_motion", json!(false)),
+            ("appearance.contrast", json!("standard")),
+        ]);
+        let explicit = AppearanceSettings::from_view_with_system(Some(&explicit), system);
+        assert!(!explicit.reduced_motion);
+        assert_eq!(explicit.contrast, ContrastMode::Standard);
+        assert!(explicit.cursor_blink);
+    }
+
+    fn relative_luminance(colour: Color32) -> f32 {
+        let linear = |component: u8| {
+            let component = f32::from(component) / 255.0;
+            if component <= 0.04045 {
+                component / 12.92
+            } else {
+                ((component + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(colour.r()) + 0.7152 * linear(colour.g()) + 0.0722 * linear(colour.b())
+    }
+
+    fn contrast_ratio(left: Color32, right: Color32) -> f32 {
+        let (bright, dark) = {
+            let left = relative_luminance(left);
+            let right = relative_luminance(right);
+            if left >= right {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        };
+        (bright + 0.05) / (dark + 0.05)
+    }
+
+    #[test]
+    fn the_high_contrast_palette_clears_text_and_control_thresholds() {
+        let theme = Theme::high_contrast();
+        for (name, colour) in [
+            ("text", theme.text),
+            ("dim text", theme.text_dim),
+            ("faint text", theme.text_faint),
+            ("attention", theme.attention),
+            ("failure", theme.failure),
+            ("running", theme.running),
+            ("done", theme.done),
+            ("provisional", theme.provisional),
+        ] {
+            let ratio = contrast_ratio(colour, theme.panel);
+            assert!(ratio >= 4.5, "{name} contrast was only {ratio:.2}:1");
+        }
+        assert!(
+            contrast_ratio(theme.border, theme.panel) >= 3.0,
+            "control boundaries need at least 3:1 contrast"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_removes_egui_transitions_from_the_installed_style() {
+        let theme = Theme::with_appearance(&AppearanceSettings {
+            reduced_motion: true,
+            cursor_blink: false,
+            ..AppearanceSettings::default()
+        });
+        let context = egui::Context::default();
+        theme.install(&context);
+        assert_eq!(context.style_of(egui::Theme::Dark).animation_time, 0.0);
     }
 
     /// The rule is structural: every state must have a glyph, so nothing is ever

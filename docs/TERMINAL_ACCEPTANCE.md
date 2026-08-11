@@ -19,7 +19,7 @@ desktop automation would add timing noise. It covers the following contract.
 | OSC-8 and detected links are clickable without treating output as markup or a command | `turn-gui/tests/links.rs`, `terminal::links` and `turn-pty::links` |
 | Refuse executable schemes, normalise confusable hosts and confirm declared text that names a different host | `a_hyperlink_pointing_at_a_scheme_that_executes_is_refused_the_whole_way_through` and the malicious-link cases in `terminal::links` |
 | Drop paths as one non-submitting bracketed paste, quoted for zsh/bash/fish syntax; refuse filenames containing a newline | `terminal::paths` and `collect_dropped_paths` |
-| Apply terminal/UI font size, zoom, block/bar/underline cursor, cursor blink/reduced motion and optional programming ligatures live | `theme::tests::every_appearance_control_changes_the_values_the_renderer_reads`, `app::tests::appearance_settings_are_installed_into_the_live_context_without_a_restart` and the cursor/ligature renderer tests |
+| Apply terminal/UI font size, zoom, high contrast, block/bar/underline cursor, cursor blink/reduced motion and optional programming ligatures live | `theme::tests::every_appearance_control_changes_the_values_the_renderer_reads`, `app::tests::appearance_settings_are_installed_into_the_live_context_without_a_restart` and the cursor/ligature renderer tests |
 | Preserve original cells, search text and clipboard while ligatures are enabled | `terminal::tests::ligatures_join_only_known_pairs_and_never_change_the_grid_text` |
 | IME commits and dead-key composition reach the PTY once, while an in-progress composition reaches it zero times | `terminal::tests::a_composed_accent_reaches_the_program` and `a_composition_in_progress_is_not_sent_to_the_program` |
 | Mouse press/drag/hover reporting, bracketed paste and alternate-screen ownership follow the program's advertised modes | `terminal::mouse`, `terminal::keys`, `terminal::feed` and `turn-proto::cells` |
@@ -39,7 +39,8 @@ The authenticated packaged-Claude vertical remains separately reproducible in
 [`REVIEWER_ACCEPTANCE.md`](REVIEWER_ACCEPTANCE.md). A release candidate should additionally smoke-test
 whatever current vendor binaries and shells are installed on both supported desktop platforms; that
 manual smoke is evidence about packaging and upstream releases, not a second implementation of the
-terminal contract.
+terminal contract. Screen-reader, contrast, motion and zoom evidence is recorded separately in
+[`ACCESSIBILITY_ACCEPTANCE.md`](ACCESSIBILITY_ACCEPTANCE.md).
 
 ## Manual release smoke
 
@@ -55,4 +56,3 @@ On a packaged build, open one pane for each installed shell/agent/TUI and check:
    not submitted.
 5. Change each Appearance control at the temporary level. The visible pane updates without a
    restart; resetting it restores the inherited value.
-

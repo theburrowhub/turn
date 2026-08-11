@@ -541,6 +541,8 @@ pub struct ViewState {
     pub tree_expansion: HashMap<HierarchyKey, bool>,
     /// Whether navigation keys belong to the hierarchy rather than the terminal.
     pub tree_has_focus: bool,
+    /// One-shot AccessKit/egui focus restoration after a modal sheet disappears.
+    pub request_tree_focus: bool,
     /// One-shot focus request used by the palette's Search command.
     pub request_tree_search_focus: bool,
     /// A read-only overlay. Opening it never changes the pane layout or terminal focus.
@@ -2811,7 +2813,8 @@ impl<'a> TurnView<'a> {
             .vline(centre.min.x, body.y_range(), Stroke::new(1.0, theme.border));
 
         let context_height = if active_context.is_some() {
-            46.0_f32.min(centre.height())
+            let wanted: f32 = if centre.height() < 120.0 { 24.0 } else { 46.0 };
+            wanted.min(centre.height())
         } else {
             0.0
         };
@@ -2913,70 +2916,96 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        // Our overlays are custom-drawn rather than `egui::Window`s, so they need an
-        // explicit hit-test shield. Registered after the background and before the
-        // sheet's own controls, it swallows clicks/drags aimed through the dimmed layer
-        // while leaving the foreground controls interactive.
-        if state.is_sensitive() || self.write_conflict.is_some() {
-            ui.interact(
-                full,
-                ui.id().with("modal-input-shield"),
-                Sense::click_and_drag(),
-            );
-        }
+        // Custom sheets share one foreground modal layer. This is the keyboard half of
+        // modality: egui keeps Tab and AccessKit focus above the background while the Area's
+        // full-window sense blocks pointer input. The individual sheets still own their
+        // visual geometry and their Dialog/AlertDialog semantics.
+        let modal_open = state.is_sensitive()
+            || self.write_conflict.is_some()
+            || self.link_confirmation.is_some();
+        if modal_open {
+            let area = egui::Area::new(ui.id().with("turn-modal-layer"))
+                .kind(egui::UiKind::Modal)
+                .order(egui::Order::Foreground)
+                .fixed_pos(full.min)
+                .sense(Sense::click_and_drag());
+            let layer = area.layer();
+            ui.ctx().memory_mut(|memory| memory.set_modal_layer(layer));
+            let modal_actions = area
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_size(full.size());
+                    let mut modal_actions = Vec::new();
+                    if let (Some(snapshot), Some(key)) =
+                        (hierarchy.as_ref(), state.quick_preview.clone())
+                    {
+                        if let Some(node) = selected_process(snapshot, Some(&key)) {
+                            self.quick_preview_overlay(ui, theme, snapshot, node, state, full);
+                        } else {
+                            state.quick_preview = None;
+                        }
+                    }
 
-        if let (Some(snapshot), Some(key)) = (hierarchy.as_ref(), state.quick_preview.clone()) {
-            if let Some(node) = selected_process(snapshot, Some(&key)) {
-                self.quick_preview_overlay(ui, theme, snapshot, node, state, full);
-            } else {
-                state.quick_preview = None;
-            }
-        }
-
-        if state.close_turn.is_some() {
-            actions.extend(self.close_turn_overlay(ui, theme, state, full));
-        } else if state.pane_placement.is_some() {
-            actions.extend(self.pane_placement_overlay(ui, theme, state, full));
-        } else if state.new_pane.is_some() {
-            actions.extend(self.new_pane_overlay(ui, theme, state, full));
-        } else if state.node_edit.is_some() {
-            if let Some(snapshot) = hierarchy.as_ref() {
-                actions.extend(self.node_edit_overlay(ui, theme, snapshot, state, full));
-            } else {
-                state.node_edit = None;
-            }
-        } else if state.entity_edit.is_some() {
-            actions.extend(self.entity_edit_overlay(ui, theme, state, full));
-        } else if state.context_handoff.is_some() {
-            if let Some(snapshot) = hierarchy.as_ref() {
-                actions.extend(self.context_handoff_overlay(ui, theme, snapshot, state, full));
-            } else {
-                state.context_handoff = None;
-            }
-        } else if state.lifecycle_confirmation.is_some() {
-            actions.extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
-        } else if let Some(link) = self.link_confirmation {
-            actions.extend(self.link_confirmation_overlay(ui, theme, link, full));
-        } else if state.delete_template_confirmation.is_some() {
-            actions.extend(self.delete_template_overlay(ui, theme, state, full));
-        } else if state.save_template_draft.is_some() {
-            actions.extend(self.save_template_overlay(ui, theme, state, full));
-        } else if state.layout_draft.is_some() {
-            actions.extend(self.layout_editor_overlay(ui, theme, state, full));
-        } else if state.workspace_draft.is_some() {
-            actions.extend(self.workspace_creator_overlay(ui, theme, state, full));
-        } else if let Some(conflict) = self.write_conflict {
-            actions.extend(self.write_conflict_overlay(ui, theme, conflict, full));
-        } else if state.session_draft.is_some() {
-            actions.extend(self.session_creator_overlay(ui, theme, state, full));
-        } else if state.attention_panel_open {
-            actions.extend(self.attention_queue_overlay(ui, theme, full));
-        } else if state.palette.open {
-            actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
-        } else if state.shortcuts_open {
-            actions.extend(self.shortcuts_sheet(ui, theme, keymap, state, full));
-        } else if state.settings_open {
-            actions.extend(self.settings_sheet(ui, theme, hierarchy.as_ref(), state, full));
+                    if state.close_turn.is_some() {
+                        modal_actions.extend(self.close_turn_overlay(ui, theme, state, full));
+                    } else if state.pane_placement.is_some() {
+                        modal_actions.extend(self.pane_placement_overlay(ui, theme, state, full));
+                    } else if state.new_pane.is_some() {
+                        modal_actions.extend(self.new_pane_overlay(ui, theme, state, full));
+                    } else if state.node_edit.is_some() {
+                        if let Some(snapshot) = hierarchy.as_ref() {
+                            modal_actions
+                                .extend(self.node_edit_overlay(ui, theme, snapshot, state, full));
+                        } else {
+                            state.node_edit = None;
+                        }
+                    } else if state.entity_edit.is_some() {
+                        modal_actions.extend(self.entity_edit_overlay(ui, theme, state, full));
+                    } else if state.context_handoff.is_some() {
+                        if let Some(snapshot) = hierarchy.as_ref() {
+                            modal_actions.extend(
+                                self.context_handoff_overlay(ui, theme, snapshot, state, full),
+                            );
+                        } else {
+                            state.context_handoff = None;
+                        }
+                    } else if state.lifecycle_confirmation.is_some() {
+                        modal_actions
+                            .extend(self.lifecycle_confirmation_overlay(ui, theme, state, full));
+                    } else if let Some(link) = self.link_confirmation {
+                        modal_actions.extend(self.link_confirmation_overlay(ui, theme, link, full));
+                    } else if state.delete_template_confirmation.is_some() {
+                        modal_actions.extend(self.delete_template_overlay(ui, theme, state, full));
+                    } else if state.save_template_draft.is_some() {
+                        modal_actions.extend(self.save_template_overlay(ui, theme, state, full));
+                    } else if state.layout_draft.is_some() {
+                        modal_actions.extend(self.layout_editor_overlay(ui, theme, state, full));
+                    } else if state.workspace_draft.is_some() {
+                        modal_actions
+                            .extend(self.workspace_creator_overlay(ui, theme, state, full));
+                    } else if let Some(conflict) = self.write_conflict {
+                        modal_actions
+                            .extend(self.write_conflict_overlay(ui, theme, conflict, full));
+                    } else if state.session_draft.is_some() {
+                        modal_actions.extend(self.session_creator_overlay(ui, theme, state, full));
+                    } else if state.attention_panel_open {
+                        modal_actions.extend(self.attention_queue_overlay(ui, theme, full));
+                    } else if state.palette.open {
+                        modal_actions.extend(self.palette_overlay(ui, theme, keymap, state, full));
+                    } else if state.shortcuts_open {
+                        modal_actions.extend(self.shortcuts_sheet(ui, theme, keymap, state, full));
+                    } else if state.settings_open {
+                        modal_actions.extend(self.settings_sheet(
+                            ui,
+                            theme,
+                            hierarchy.as_ref(),
+                            state,
+                            full,
+                        ));
+                    }
+                    modal_actions
+                })
+                .inner;
+            actions.extend(modal_actions);
         }
         state.hierarchy = hierarchy;
         actions
@@ -3012,11 +3041,13 @@ impl<'a> TurnView<'a> {
         );
         ui.scope_builder(region(panel.shrink(20.0), "pane-placement"), |ui| {
             let promotion = matches!(draft.source, PanePlacementSource::Temporary { .. });
-            ui.heading(if promotion {
+            let title = if promotion {
                 "Keep this Pane in the layout"
             } else {
                 "Open as Pane"
-            });
+            };
+            describe_dialog(ui, title, false);
+            ui.heading(title);
             ui.label(
                 RichText::new(
                     "Choose the placement once. Turn will reuse it next time unless you change it here.",
@@ -3114,6 +3145,7 @@ impl<'a> TurnView<'a> {
             egui::StrokeKind::Outside,
         );
         ui.scope_builder(region(panel.shrink(20.0), "new-pane"), |ui| {
+            describe_dialog(ui, "New Pane", false);
             ui.heading("New Pane");
             ui.label(
                 RichText::new("Run any executable directly; arguments are parsed without a shell.")
@@ -3805,6 +3837,28 @@ impl<'a> TurnView<'a> {
             node.set_role(egui::accesskit::Role::Group);
             node.set_label(announced);
         });
+        ui.ctx()
+            .accesskit_node_builder(ui.id().with("window-connection-announcement"), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(egui::accesskit::Live::Polite);
+                node.set_label(format!(
+                    "Connection: {} — {} — Turn {version_value}",
+                    connection.word(),
+                    connection_detail
+                ));
+            });
+        ui.ctx()
+            .accesskit_node_builder(ui.id().with("window-attention-announcement"), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(egui::accesskit::Live::Assertive);
+                node.set_label(if waiting == 1 {
+                    "Attention: 1 session needs you".to_string()
+                } else if waiting > 0 {
+                    format!("Attention: {waiting} sessions need you")
+                } else {
+                    "Attention: nothing waiting".to_string()
+                });
+            });
         ui.advance_cursor_after_rect(rect);
         actions
     }
@@ -3978,6 +4032,10 @@ impl<'a> TurnView<'a> {
         }
 
         let focused = self.panes.iter().find(|pane| pane.focused);
+        let focus_announcement = focused.map_or_else(
+            || "Focus: no pane focused".to_string(),
+            |pane| format!("Focus: {}", pane.title),
+        );
         let (sentence, colour) =
             if let Some(notice) = self.notice.as_deref() {
                 (notice.to_string(), theme.failure)
@@ -4069,6 +4127,22 @@ impl<'a> TurnView<'a> {
             node.set_role(egui::accesskit::Role::Group);
             node.set_label(announced);
         });
+        ui.ctx()
+            .accesskit_node_builder(ui.id().with("window-focus-announcement"), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(egui::accesskit::Live::Polite);
+                node.set_label(focus_announcement);
+            });
+        ui.ctx()
+            .accesskit_node_builder(ui.id().with("window-runtime-announcement"), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(if status_alert {
+                    egui::accesskit::Live::Assertive
+                } else {
+                    egui::accesskit::Live::Polite
+                });
+                node.set_label(format!("Application state: {sentence}"));
+            });
         actions
     }
 
@@ -4529,6 +4603,7 @@ impl<'a> TurnView<'a> {
         );
 
         ui.scope_builder(region(panel.shrink(18.0), "write-lease-conflict"), |ui| {
+            describe_dialog(ui, "Primary checkout already has a writer", true);
             ui.label(
                 RichText::new("PRIMARY CHECKOUT ALREADY HAS A WRITER")
                     .monospace()
@@ -4631,7 +4706,12 @@ impl<'a> TurnView<'a> {
             Risk::Medium => (theme.attention, "MEDIUM RISK"),
             Risk::Low => (theme.text_dim, "LOW RISK"),
         };
-        let height = 148.0;
+        // At maximum zoom the native minimum window is only a few logical rows high.
+        // Keep the permission actionable without consuming the entire navigator and
+        // terminal: the full evidence remains in one live AccessKit status, while the
+        // compact visual keeps both actions under their complete accessible names.
+        let compact = ui.available_height() < 280.0;
+        let height = if compact { 44.0 } else { 148.0 };
         let rect = Rect::from_min_size(
             ui.available_rect_before_wrap().min,
             Vec2::new(ui.available_width(), height),
@@ -4649,6 +4729,56 @@ impl<'a> TurnView<'a> {
         ui.scope_builder(
             region(rect.shrink2(Vec2::new(14.0, 8.0)), "permission"),
             |ui| {
+                ui.ctx().accesskit_node_builder(
+                    ui.id().with("permission-announcement"),
+                    |node| {
+                        node.set_role(egui::accesskit::Role::Status);
+                        node.set_live(egui::accesskit::Live::Assertive);
+                        node.set_label(format!(
+                            "Permission: {risk_word}; {}; {}; command {}; in {}; tool {}; agent {}; process {}",
+                            p.session,
+                            p.summary,
+                            p.command.as_deref().unwrap_or("not supplied"),
+                            p.cwd,
+                            p.tool,
+                            p.agent,
+                            p.process
+                        ));
+                    },
+                );
+                if compact {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("!").color(risk_colour).strong());
+                        ui.label(RichText::new("PERMISSION").color(theme.attention).small());
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if let Some(id) = &p.attention_id {
+                                    let dismiss = ui.small_button("Dismiss");
+                                    if dismiss.clicked() {
+                                        actions.push(ViewAction::DismissAttention(id.clone()));
+                                    }
+                                }
+                                let go = ui.small_button("Go");
+                                describe_control(
+                                    &go,
+                                    egui::accesskit::Role::Button,
+                                    "Go to this session",
+                                );
+                                if go.clicked() {
+                                    match &p.attention_id {
+                                        Some(id) => {
+                                            actions.push(ViewAction::GotoAttention(id.clone()))
+                                        }
+                                        None => actions
+                                            .push(ViewAction::SelectSession(p.session_id.clone())),
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    return;
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("!").color(risk_colour).strong());
                     ui.label(RichText::new("PERMISSION").color(theme.attention).small());
@@ -4720,7 +4850,18 @@ impl<'a> TurnView<'a> {
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.panel);
 
-        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), 116.0));
+        let compact_header = area.height() < 180.0 || area.width() < 180.0;
+        let compact_search = state.request_tree_search_focus || !state.tree_query.is_empty();
+        let header_height = if compact_header {
+            if compact_search {
+                70.0
+            } else {
+                38.0
+            }
+        } else {
+            116.0
+        };
+        let header = Rect::from_min_size(area.min, Vec2::new(area.width(), header_height));
         ui.painter().rect_filled(header, 0.0, theme.panel);
         ui.painter().hline(
             header.x_range(),
@@ -4728,74 +4869,51 @@ impl<'a> TurnView<'a> {
             Stroke::new(1.0, theme.border),
         );
         let mut presentation_changed = false;
-        ui.scope_builder(
-            region(header.shrink2(Vec2::new(8.0, 4.0)), "hierarchy-header"),
-            |ui| {
-                ui.vertical(|ui| {
+        if compact_header {
+            ui.scope_builder(
+                region(
+                    header.shrink2(Vec2::new(6.0, 3.0)),
+                    "hierarchy-header-compact",
+                ),
+                |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("WORKSPACES")
                                 .monospace()
-                                .size(11.0)
+                                .size(9.0)
                                 .color(theme.text_dim),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("+ Workspace").clicked() {
-                                state.workspace_draft = Some(WorkspaceDraft::new(false));
-                            }
-                            if ui
-                                .small_button("Collapse")
-                                .on_hover_text("Collapse all")
-                                .clicked()
-                            {
-                                set_hierarchy_expanded_all(state, snapshot, false);
-                            }
-                            if ui
-                                .small_button("Expand")
-                                .on_hover_text("Expand all")
-                                .clicked()
-                            {
-                                set_hierarchy_expanded_all(state, snapshot, true);
-                            }
-                        });
-                    });
-                    let search = ui.add(
-                        egui::TextEdit::singleline(&mut state.tree_query)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Search workspace, session, agent, process or preview"),
-                    );
-                    search.ctx.accesskit_node_builder(search.id, |node| {
-                        node.set_role(egui::accesskit::Role::SearchInput);
-                        node.set_label("Search workspace tree");
-                    });
-                    if state.request_tree_search_focus {
-                        search.request_focus();
-                        state.tree_has_focus = true;
-                        state.request_tree_search_focus = false;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.menu_button(format!("Filters ({})", state.tree_filters.len()), |ui| {
-                            for filter in TreeFilter::ALL {
-                                let mut enabled = state.tree_filters.contains(filter);
-                                if ui.checkbox(&mut enabled, filter.label()).changed() {
-                                    if enabled {
-                                        state.tree_filters.insert(*filter);
-                                    } else {
-                                        state.tree_filters.remove(filter);
-                                    }
-                                    presentation_changed = true;
+                            ui.menu_button("Actions", |ui| {
+                                if ui.button("New Workspace").clicked() {
+                                    state.workspace_draft = Some(WorkspaceDraft::new(false));
+                                    ui.close();
                                 }
-                            }
-                            if !state.tree_filters.is_empty()
-                                && ui.button("Clear filters").clicked()
-                            {
-                                state.tree_filters.clear();
-                                presentation_changed = true;
-                            }
-                        });
-                        egui::ComboBox::from_id_salt("tree-visibility-mode")
-                            .selected_text(state.tree_visibility.label())
-                            .show_ui(ui, |ui| {
+                                if ui.button("Search hierarchy").clicked() {
+                                    state.request_tree_search_focus = true;
+                                    ui.close();
+                                }
+                                if ui.button("Expand all").clicked() {
+                                    set_hierarchy_expanded_all(state, snapshot, true);
+                                    ui.close();
+                                }
+                                if ui.button("Collapse all").clicked() {
+                                    set_hierarchy_expanded_all(state, snapshot, false);
+                                    ui.close();
+                                }
+                                ui.separator();
+                                for filter in TreeFilter::ALL {
+                                    let mut enabled = state.tree_filters.contains(filter);
+                                    if ui.checkbox(&mut enabled, filter.label()).changed() {
+                                        if enabled {
+                                            state.tree_filters.insert(*filter);
+                                        } else {
+                                            state.tree_filters.remove(filter);
+                                        }
+                                        presentation_changed = true;
+                                    }
+                                }
+                                ui.separator();
                                 for mode in TreeVisibilityMode::ALL {
                                     if ui
                                         .selectable_value(
@@ -4809,20 +4927,129 @@ impl<'a> TurnView<'a> {
                                     }
                                 }
                             });
-                        ui.label(
-                            RichText::new(if keymap.platform().uses_command_key {
-                                "Cmd+Opt+←/→ all"
-                            } else {
-                                "Ctrl+Alt+←/→ all"
-                            })
-                            .monospace()
-                            .size(9.0)
-                            .color(theme.text_faint),
-                        );
+                        });
                     });
-                });
-            },
-        );
+                    if compact_search {
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut state.tree_query)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Search hierarchy"),
+                        );
+                        search.ctx.accesskit_node_builder(search.id, |node| {
+                            node.set_role(egui::accesskit::Role::SearchInput);
+                            node.set_label("Search workspace tree");
+                        });
+                        if state.request_tree_search_focus {
+                            search.request_focus();
+                            state.tree_has_focus = true;
+                            state.request_tree_search_focus = false;
+                        }
+                    }
+                },
+            );
+        } else {
+            ui.scope_builder(
+                region(header.shrink2(Vec2::new(8.0, 4.0)), "hierarchy-header"),
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("WORKSPACES")
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(theme.text_dim),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("+ Workspace").clicked() {
+                                        state.workspace_draft = Some(WorkspaceDraft::new(false));
+                                    }
+                                    if ui
+                                        .small_button("Collapse")
+                                        .on_hover_text("Collapse all")
+                                        .clicked()
+                                    {
+                                        set_hierarchy_expanded_all(state, snapshot, false);
+                                    }
+                                    if ui
+                                        .small_button("Expand")
+                                        .on_hover_text("Expand all")
+                                        .clicked()
+                                    {
+                                        set_hierarchy_expanded_all(state, snapshot, true);
+                                    }
+                                },
+                            );
+                        });
+                        let search = ui.add(
+                            egui::TextEdit::singleline(&mut state.tree_query)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("Search workspace, session, agent, process or preview"),
+                        );
+                        search.ctx.accesskit_node_builder(search.id, |node| {
+                            node.set_role(egui::accesskit::Role::SearchInput);
+                            node.set_label("Search workspace tree");
+                        });
+                        if state.request_tree_search_focus {
+                            search.request_focus();
+                            state.tree_has_focus = true;
+                            state.request_tree_search_focus = false;
+                        }
+                        ui.horizontal(|ui| {
+                            ui.menu_button(
+                                format!("Filters ({})", state.tree_filters.len()),
+                                |ui| {
+                                    for filter in TreeFilter::ALL {
+                                        let mut enabled = state.tree_filters.contains(filter);
+                                        if ui.checkbox(&mut enabled, filter.label()).changed() {
+                                            if enabled {
+                                                state.tree_filters.insert(*filter);
+                                            } else {
+                                                state.tree_filters.remove(filter);
+                                            }
+                                            presentation_changed = true;
+                                        }
+                                    }
+                                    if !state.tree_filters.is_empty()
+                                        && ui.button("Clear filters").clicked()
+                                    {
+                                        state.tree_filters.clear();
+                                        presentation_changed = true;
+                                    }
+                                },
+                            );
+                            egui::ComboBox::from_id_salt("tree-visibility-mode")
+                                .selected_text(state.tree_visibility.label())
+                                .show_ui(ui, |ui| {
+                                    for mode in TreeVisibilityMode::ALL {
+                                        if ui
+                                            .selectable_value(
+                                                &mut state.tree_visibility,
+                                                *mode,
+                                                mode.label(),
+                                            )
+                                            .changed()
+                                        {
+                                            presentation_changed = true;
+                                        }
+                                    }
+                                });
+                            ui.label(
+                                RichText::new(if keymap.platform().uses_command_key {
+                                    "Cmd+Opt+←/→ all"
+                                } else {
+                                    "Ctrl+Alt+←/→ all"
+                                })
+                                .monospace()
+                                .size(9.0)
+                                .color(theme.text_faint),
+                            );
+                        });
+                    });
+                },
+            );
+        }
         if presentation_changed {
             push_tree_presentation(state, snapshot);
         }
@@ -4871,6 +5098,26 @@ impl<'a> TurnView<'a> {
         }
 
         let selected = effective_selection(snapshot, state);
+        let selection_announcement = selected.as_ref().and_then(|selected| {
+            rows.iter()
+                .copied()
+                .find(|row| row.key() == selected.clone())
+                .map(|row| {
+                    format!(
+                        "Selection: {}",
+                        row.accessible_name(false, state.tree_visibility)
+                    )
+                })
+        });
+        ui.ctx()
+            .accesskit_node_builder(ui.id().with("hierarchy-selection-announcement"), |node| {
+                node.set_role(egui::accesskit::Role::Status);
+                node.set_live(egui::accesskit::Live::Polite);
+                node.set_label(
+                    selection_announcement
+                        .unwrap_or_else(|| "Selection: nothing selected".to_string()),
+                );
+            });
         let restoring_scroll = state.scroll_tree_to.is_some();
         let mut first_visible = None;
         egui::ScrollArea::vertical()
@@ -4939,6 +5186,10 @@ impl<'a> TurnView<'a> {
                             },
                         },
                     );
+                    if is_selected && state.request_tree_focus {
+                        response.request_focus();
+                        state.request_tree_focus = false;
+                    }
                     if first_visible.is_none()
                         && response.rect.max.y >= visible_viewport.min.y
                         && response.rect.min.y <= visible_viewport.max.y
@@ -7135,6 +7386,7 @@ impl<'a> TurnView<'a> {
         );
 
         ui.scope_builder(region(panel.shrink(14.0), "attention-queue"), |ui| {
+            describe_dialog(ui, "Attention Queue", false);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("ATTENTION QUEUE").color(theme.text).strong());
                 ui.label(
@@ -8270,7 +8522,11 @@ impl<'a> TurnView<'a> {
                     }
                     None => {
                         inspector_title(ui, theme, hierarchy_key_kind(target), "Loading…", None);
-                        ui.spinner();
+                        if theme.reduced_motion {
+                            ui.label(RichText::new("Loading").color(theme.text_dim));
+                        } else {
+                            ui.spinner();
+                        }
                         inspector_empty(ui, theme, "Fetching safe contextual details");
                     }
                 }
@@ -8580,6 +8836,11 @@ impl<'a> TurnView<'a> {
         );
 
         ui.scope_builder(region(panel.shrink(14.0), "quick-preview"), |ui| {
+            describe_dialog(
+                ui,
+                format!("Quick Preview for {}", process_title(node)),
+                false,
+            );
             ui.horizontal(|ui| {
                 ui.label(RichText::new("QUICK PREVIEW").color(theme.text_dim).small());
                 ui.label(
@@ -9073,6 +9334,7 @@ impl<'a> TurnView<'a> {
         let chosen = state.palette.selected.min(rows.len().saturating_sub(1));
 
         ui.scope_builder(region(panel.shrink(10.0), "palette"), |ui| {
+            describe_dialog(ui, "Command Palette", false);
             let field = ui.add(
                 egui::TextEdit::singleline(&mut state.palette.query)
                     .hint_text("Type a command")
@@ -9116,6 +9378,7 @@ impl<'a> TurnView<'a> {
         ui.painter().rect_filled(panel, 0.0, theme.panel);
 
         ui.scope_builder(region(panel.shrink(14.0), "shortcuts"), |ui| {
+            describe_dialog(ui, "Keyboard shortcuts", false);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("KEYBOARD").color(theme.text).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -9578,6 +9841,7 @@ impl<'a> TurnView<'a> {
         );
 
         ui.scope_builder(region(panel.shrink(20.0), "settings"), |ui| {
+            describe_dialog(ui, "Settings", false);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Settings")
@@ -9874,7 +10138,7 @@ fn settings_control(
         }
         SettingsControl::Choice { options } => {
             let current = editing_value.as_str().unwrap_or_default().to_string();
-            egui::ComboBox::from_id_salt(("setting-choice", scope, key))
+            let response = egui::ComboBox::from_id_salt(("setting-choice", scope, key))
                 .selected_text(if current.is_empty() {
                     "—".to_string()
                 } else {
@@ -9890,7 +10154,9 @@ fn settings_control(
                             actions.push(set(serde_json::Value::String(option.clone())));
                         }
                     }
-                });
+                })
+                .response;
+            describe_control(&response, egui::accesskit::Role::ComboBox, &entry.title);
         }
         SettingsControl::MultiChoice { options } => {
             let selected = editing_value.as_array().cloned().unwrap_or_default();
@@ -10055,6 +10321,19 @@ fn describe_control(response: &Response, role: egui::accesskit::Role, label: &st
         node.set_role(role);
         node.set_label(label.to_string());
         node.add_action(egui::accesskit::Action::Click);
+    });
+}
+
+/// Gives a custom-painted sheet the semantics a native dialog would have supplied.
+fn describe_dialog(ui: &Ui, label: impl Into<String>, alert: bool) {
+    ui.ctx().accesskit_node_builder(ui.id(), |node| {
+        node.set_role(if alert {
+            egui::accesskit::Role::AlertDialog
+        } else {
+            egui::accesskit::Role::Dialog
+        });
+        node.set_label(label.into());
+        node.set_modal();
     });
 }
 

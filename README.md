@@ -71,6 +71,9 @@ Implemented today:
 - Review-before-send context handoffs between controllable Agents in one Session.
 - Claude Code and Codex adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
+- Live font/zoom controls, a measured high-contrast palette, reduced-motion support,
+  modal AccessKit semantics, separate state/selection/focus/attention announcements, and
+  terminal IME composition coverage.
 - SQLite persistence, write leases, safe restart recovery, and explicit process relaunch.
 - macOS-enforced read-only Sessions: shells, Agents and child processes can inspect a checkout while
   Seatbelt blocks writes to it and its external Git metadata; unsupported platforms keep processes stopped.
@@ -80,8 +83,7 @@ Still before a release-quality build:
 
 - Signed installers, packaging, automatic updates, and a supported upgrade channel.
 - Broad authenticated acceptance against current agent CLI releases.
-- Measured performance acceptance at the full 30-session target.
-- Manual VoiceOver, Orca, and IME sign-off.
+- Manual packaged VoiceOver, Orca, and IME sign-off using the recorded accessibility checklist.
 
 The detailed delivery state and remaining risks live in [ROADMAP.md](ROADMAP.md).
 
@@ -200,6 +202,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   durable queue triage, notifications, sound and custom action checks.
 - [Terminal interaction acceptance](docs/TERMINAL_ACCEPTANCE.md) — search, safe links, path drop,
   appearance preferences, IME, TUI modes and bounded-output proof.
+- [Accessibility acceptance](docs/ACCESSIBILITY_ACCEPTANCE.md) — zoom, contrast, reduced motion,
+  AccessKit/keyboard proof and reproducible VoiceOver/Orca/IME checklists.
 - [Template lifecycle acceptance](docs/TEMPLATE_ACCEPTANCE.md) — visual create/edit/capture,
   defaults, safe application, missing-tool visibility and deletion integrity.
 - [Contextual inspector acceptance](docs/INSPECTOR_ACCEPTANCE.md) — complete typed detail,

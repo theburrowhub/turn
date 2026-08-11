@@ -43,6 +43,11 @@ pollster = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# AppKit exposes the user's live Reduce Motion and Increase Contrast choices. Reading
+# them directly avoids a shell process and lets the app compare the current values live.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibility", "NSWorkspace"] }
+
 [dev-dependencies]
 # `eframe` lets the harness run the real `TurnApp` rather than only its view, which is
 # what makes the idle-repaint measurement a test of the application.

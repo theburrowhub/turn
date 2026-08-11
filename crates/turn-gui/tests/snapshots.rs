@@ -44,13 +44,13 @@ use turn_gui::keymap::{Keymap, Overrides, Platform};
 use turn_gui::terminal::menu::{MenuItem, PaneCommand, PaneContext, PaneMenu, PaneShortcuts};
 use turn_gui::terminal::selection::{CellPos, Selection, SelectionKind};
 use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
-use turn_gui::theme::Theme;
+use turn_gui::theme::{AppearanceSettings, Theme};
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
     CloseTurnChoice, CloseTurnDraft, CloseTurnSession, LayoutEditorOrigin, LayoutTemplateDraft,
-    LifecycleConfirmation, PaneContent, PanePlacementDraft, PanePlacementSource, PendingPermission,
-    QueueItem, SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView,
-    ViewAction, ViewState, WorkspaceDraft,
+    LifecycleConfirmation, NewPaneDraft, PaneContent, PanePlacementDraft, PanePlacementSource,
+    PendingPermission, QueueItem, SessionDraft, SessionRestoreView, SessionRow,
+    TemporaryPaneContent, TurnView, ViewAction, ViewState, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -949,9 +949,15 @@ fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout
         .find(|label| label.contains("Reviewer"))
         .unwrap_or_else(|| panic!("the fixture has a subagent row: {rows:?}"))
         .clone();
+    let click_tree_row = |h: &Harness<'static, Window>, label: &str| {
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .find(|node| node.accesskit_node().label().as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("missing tree row {label:?}"))
+            .click();
+    };
 
     h.state_mut().actions.clear();
-    h.get_by_label_contains(&subagent).click();
+    click_tree_row(&h, &subagent);
     h.run_steps(1);
     let zoomed: Vec<&ViewAction> = h
         .state()
@@ -983,7 +989,7 @@ fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout
     // second click on a row already being shown would un-maximise the pane and the tree would
     // flicker instead of holding still.
     h.state_mut().actions.clear();
-    h.get_by_label_contains(&subagent).click();
+    click_tree_row(&h, &subagent);
     h.run_steps(1);
     assert!(
         !h.state()
@@ -1001,7 +1007,7 @@ fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout
         .expect("the fixture has the owning agent")
         .clone();
     h.state_mut().actions.clear();
-    h.get_by_label_contains(&owner).click();
+    click_tree_row(&h, &owner);
     h.run_steps(1);
     let restored: Vec<&ViewAction> = h
         .state()
@@ -1117,6 +1123,14 @@ fn group_labels(h: &Harness<'static, Window>) -> Vec<String> {
     h.query_all_by_role(egui::accesskit::Role::Group)
         .filter_map(|node| node.accesskit_node().label())
         .collect()
+}
+
+fn assert_modal(h: &Harness<'static, Window>, role: egui::accesskit::Role, label: &str) {
+    let dialog = h
+        .query_all_by_role(role)
+        .find(|node| node.accesskit_node().label().as_deref() == Some(label))
+        .unwrap_or_else(|| panic!("missing {role:?} named {label:?}"));
+    assert!(dialog.accesskit_node().is_modal(), "{label:?} is not modal");
 }
 
 #[test]
@@ -1331,6 +1345,31 @@ fn the_top_bar_carries_a_toolbar_of_named_actions_and_the_version() {
         "the same version must not be shown twice: {top_status:?}"
     );
     h.snapshot("chrome_toolbar");
+}
+
+#[test]
+fn the_custom_pane_editor_is_a_named_modal_dialog() {
+    let fixture = busy_desk();
+    let target_pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("an active pane");
+    let mut h = harness(fixture);
+    h.state_mut().state.new_pane = Some(NewPaneDraft {
+        target_pane_id,
+        kind: PaneKind::Shell,
+        title: String::new(),
+        program: String::new(),
+        arguments: String::new(),
+        cwd: String::new(),
+        placement: PanePlacement::SplitRight,
+        error: None,
+    });
+    h.run();
+    h.run();
+
+    assert_modal(&h, egui::accesskit::Role::Dialog, "New Pane");
 }
 
 #[test]
@@ -2692,6 +2731,7 @@ fn the_settings_sheet_says_where_every_value_came_from() {
     h.state_mut().state.settings_open = true;
     h.run();
     h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Settings");
     h.snapshot("settings_levels");
 }
 
@@ -2816,6 +2856,7 @@ fn the_keyboard_sheet_names_a_chord_bound_to_two_commands() {
     h.state_mut().state.shortcuts_open = true;
     h.run();
     h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Keyboard shortcuts");
     h.snapshot("keyboard_conflict");
 }
 
@@ -2860,6 +2901,7 @@ fn the_attention_queue_is_an_explicit_overlay_not_a_second_navigator() {
     let mut h = harness(busy_desk());
     h.state_mut().state.attention_panel_open = true;
     h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Attention Queue");
     h.snapshot("attention_queue");
 }
 
@@ -3563,6 +3605,13 @@ fn quick_preview_is_semantic_and_does_not_replace_the_layout() {
         expected_layout,
         "quick preview must not mutate the saved layout"
     );
+    assert!(h
+        .query_all_by_role(egui::accesskit::Role::Dialog)
+        .any(|dialog| dialog
+            .accesskit_node()
+            .label()
+            .is_some_and(|label| label.starts_with("Quick Preview for Reviewer"))
+            && dialog.accesskit_node().is_modal()));
     h.snapshot("quick_preview");
 }
 
@@ -3655,6 +3704,7 @@ fn permanent_pane_placement_is_an_explicit_visual_choice() {
         remember: true,
     });
     h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Open as Pane");
     h.snapshot("permanent_pane_placement");
 }
 
@@ -3719,6 +3769,11 @@ fn a_write_lease_conflict_offers_only_explicit_safe_alternatives() {
     let mut h = harness(fixture);
     h.run();
     h.run();
+    assert_modal(
+        &h,
+        egui::accesskit::Role::AlertDialog,
+        "Primary checkout already has a writer",
+    );
     let buttons: Vec<String> = h
         .query_all_by_role(egui::accesskit::Role::Button)
         .filter_map(|node| node.accesskit_node().label())
@@ -3744,7 +3799,47 @@ fn the_command_palette_lists_commands_with_their_shortcuts() {
     h.state_mut().state.palette.set_query("pane");
     // The text cursor blinks, so this one is stepped rather than run to quiescence.
     h.run_steps(3);
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Command Palette");
     h.snapshot("palette");
+
+    let background = h
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
+        .next()
+        .expect("the hierarchy is still represented behind the modal");
+    background.focus();
+    h.run_steps(2);
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TextInput)
+            .any(|node| node.accesskit_node().is_focused()),
+        "focus must remain inside the modal command palette"
+    );
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .all(|node| !node.accesskit_node().is_focused()),
+        "a background hierarchy row took focus through the modal layer"
+    );
+}
+
+#[test]
+fn closing_a_modal_returns_accessibility_focus_to_the_selected_tree_row() {
+    let mut h = harness(busy_desk());
+    h.state_mut().state.settings_open = true;
+    h.run();
+    h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Settings");
+
+    h.state_mut().state.settings_open = false;
+    h.state_mut().state.tree_has_focus = true;
+    h.state_mut().state.request_tree_focus = true;
+    h.run();
+    h.run();
+
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .any(|node| node.accesskit_node().is_selected() == Some(true)
+                && node.accesskit_node().is_focused()),
+        "closing a modal left assistive-technology focus on a dead dialog widget"
+    );
 }
 
 /// The keyboard half of the row controls, in the place a user goes looking for a command
@@ -3891,6 +3986,96 @@ fn an_idle_window_settles_instead_of_repainting_in_a_loop() {
     );
 }
 
+#[test]
+fn reduced_motion_keeps_loading_static_and_allows_the_window_to_settle() {
+    let fixture = busy_desk();
+    let target = fixture
+        .hierarchy
+        .as_ref()
+        .and_then(|hierarchy| hierarchy.tree_state.selected.clone())
+        .expect("the fixture has a selected hierarchy node");
+    let mut window = window(fixture);
+    window.state.inspector_open = true;
+    window.state.inspector_key = Some(target);
+    window.theme = Theme::with_appearance(&AppearanceSettings {
+        reduced_motion: true,
+        cursor_blink: false,
+        ..AppearanceSettings::default()
+    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window,
+        );
+
+    let steps = h.run();
+    assert!(
+        steps <= 6,
+        "reduced-motion loading took {steps} frames to settle"
+    );
+    assert!(all_text(&h).iter().any(|text| text == "Loading"));
+    let delay = h
+        .output()
+        .viewport_output
+        .values()
+        .map(|viewport| viewport.repaint_delay)
+        .min()
+        .unwrap_or(std::time::Duration::MAX);
+    assert!(
+        delay > std::time::Duration::ZERO,
+        "a reduced-motion loading state requested immediate animation"
+    );
+}
+
+#[test]
+fn maximum_zoom_keeps_the_minimum_window_navigable() {
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(900.0, 560.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                ui.ctx().set_zoom_factor(3.0);
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window(busy_desk()),
+        );
+    h.run_steps(3);
+
+    assert_eq!(h.query_all_by_role(egui::accesskit::Role::Tree).count(), 1);
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .next()
+            .is_some(),
+        "the hierarchy disappeared at maximum zoom: {:?}",
+        all_text(&h)
+    );
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::Terminal)
+            .next()
+            .is_some(),
+        "the active terminal disappeared at maximum zoom: {:?}",
+        all_text(&h)
+    );
+}
+
 /// The accessibility tree is not a nice-to-have here: a terminal UI drawn on a GPU has no
 /// DOM, so if this is empty the window does not exist for a screen reader.
 ///
@@ -3972,6 +4157,41 @@ fn every_hierarchy_level_is_a_reachable_tree_item() {
     assert!(
         selected.iter().any(|label| label.contains("Claude Code")),
         "selection is independent and belongs to the selected AgentNode; found {selected:?}"
+    );
+}
+
+#[test]
+fn accessibility_announces_state_selection_focus_and_attention_separately() {
+    let mut h = harness(busy_desk());
+    h.run();
+    h.run();
+
+    let statuses = h
+        .query_all_by_role(egui::accesskit::Role::Status)
+        .filter_map(|node| {
+            node.accesskit_node()
+                .label()
+                .map(|label| (label, node.accesskit_node().live()))
+        })
+        .collect::<Vec<_>>();
+    for (prefix, live) in [
+        ("Connection:", egui::accesskit::Live::Polite),
+        ("Attention:", egui::accesskit::Live::Assertive),
+        ("Selection:", egui::accesskit::Live::Polite),
+        ("Focus:", egui::accesskit::Live::Polite),
+        ("Application state:", egui::accesskit::Live::Polite),
+    ] {
+        assert!(
+            statuses
+                .iter()
+                .any(|(label, announced)| label.starts_with(prefix) && *announced == live),
+            "missing {live:?} live region {prefix:?}; found {statuses:?}"
+        );
+    }
+    assert!(
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .any(|node| node.accesskit_node().is_selected() == Some(true)),
+        "selection state must remain on the selected tree item, independently of announcements"
     );
 }
 
