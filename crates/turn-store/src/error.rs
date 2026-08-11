@@ -180,6 +180,18 @@ pub enum StoreError {
         cause: std::io::Error,
     },
 
+    /// A schema table was added without declaring how privacy export scopes it.
+    /// Refusing is safer than producing an export that silently omits durable data.
+    #[error("privacy inventory does not account for these SQLite tables: {tables:?}")]
+    PrivacyInventoryIncomplete { tables: Vec<String> },
+
+    #[error("could not write privacy export {path}: {cause}")]
+    PrivacyExport {
+        path: String,
+        #[source]
+        cause: std::io::Error,
+    },
+
     /// No platform data directory could be resolved (a stripped container, a
     /// user with no home). The message names the escape hatch.
     #[error("no platform data directory could be resolved; set TURN_DATA_DIR")]

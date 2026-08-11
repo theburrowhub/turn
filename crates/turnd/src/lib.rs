@@ -42,6 +42,7 @@ pub mod instance;
 pub mod logging;
 pub mod options;
 pub mod paths;
+pub mod privacy;
 pub mod server;
 
 pub use config::Config;

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use turn_core::attention::Effect;
 use turn_core::ids::{NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{ActivityPreview, Layout, Template, WorkspaceWriteLease};
+use turn_core::privacy::{PrivacyDeletionReport, PrivacyExportResult, PrivacyReport};
 
 use crate::bytes::TerminalBytes;
 use crate::cells::{Grid, Scrollback};
@@ -125,6 +126,19 @@ pub enum Response {
     /// Authoritative release/update preflight from the running daemon.
     UpdateStatus {
         status: RuntimeUpdateStatus,
+    },
+    PrivacyReport {
+        report: Box<PrivacyReport>,
+    },
+    PrivacyExported {
+        export: PrivacyExportResult,
+    },
+    PrivacyDeleted {
+        report: PrivacyDeletionReport,
+    },
+    PrivacyCompacted {
+        before_bytes: u64,
+        after_bytes: u64,
     },
 
     /// The request succeeded and has nothing to report.
@@ -322,6 +336,10 @@ impl Response {
     pub fn result_name(&self) -> &'static str {
         match self {
             Response::UpdateStatus { .. } => "update_status",
+            Response::PrivacyReport { .. } => "privacy_report",
+            Response::PrivacyExported { .. } => "privacy_exported",
+            Response::PrivacyDeleted { .. } => "privacy_deleted",
+            Response::PrivacyCompacted { .. } => "privacy_compacted",
             Response::Ack => "ack",
             Response::Closed { .. } => "closed",
             Response::Workspaces { .. } => "workspaces",
@@ -359,6 +377,10 @@ impl Response {
     /// mapping is complete.
     pub const RESULT_NAMES: &'static [&'static str] = &[
         "update_status",
+        "privacy_report",
+        "privacy_exported",
+        "privacy_deleted",
+        "privacy_compacted",
         "ack",
         "closed",
         "workspaces",
@@ -609,9 +631,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 31 result shapes. Asserted so adding one without documenting it in
+        // 35 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 31, "the response catalogue changed size");
+        assert_eq!(declared.len(), 35, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -659,6 +681,39 @@ pub(crate) mod tests {
                     protocol_max: crate::PROTOCOL_VERSION,
                     active_ptys: 3,
                 },
+            },
+            Response::PrivacyReport {
+                report: Box::new(PrivacyReport {
+                    generated_ms: T0,
+                    scope: turn_core::privacy::PrivacyScope::Installation,
+                    policy: turn_core::privacy::PrivacyPolicy::default(),
+                    telemetry_enabled: false,
+                    telemetry_endpoints: 0,
+                    total_items: 0,
+                    total_bytes: 0,
+                    categories: Vec::new(),
+                }),
+            },
+            Response::PrivacyExported {
+                export: PrivacyExportResult {
+                    path: "/tmp/turn-export.json".into(),
+                    items: 0,
+                    bytes: 2,
+                },
+            },
+            Response::PrivacyDeleted {
+                report: PrivacyDeletionReport {
+                    scope: turn_core::privacy::PrivacyScope::Installation,
+                    records_deleted: 0,
+                    files_deleted: 0,
+                    bytes_freed: 0,
+                    database_compacted: true,
+                    escaped_processes: Vec::new(),
+                },
+            },
+            Response::PrivacyCompacted {
+                before_bytes: 4_096,
+                after_bytes: 4_096,
             },
             Response::Ack,
             Response::Closed {

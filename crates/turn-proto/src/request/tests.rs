@@ -438,6 +438,23 @@ pub(crate) fn all_requests() -> Vec<Request> {
 
     vec![
         Request::GetUpdateStatus,
+        Request::GetPrivacyReport {
+            scope: PrivacyScope::Installation,
+        },
+        Request::ExportPrivacyData {
+            scope: PrivacyScope::Workspace {
+                workspace_id: workspace_id.clone(),
+            },
+            path: "/tmp/turn-export.json".into(),
+        },
+        Request::DeletePrivacyData {
+            scope: PrivacyScope::Agent {
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+            },
+            disposition: CloseDisposition::Terminate,
+        },
+        Request::CompactPrivacyData,
         Request::ListWorkspaces {
             include_archived: true,
         },
@@ -856,7 +873,7 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
         all_requests().len(),
         "the fixture has two requests with the same op"
     );
-    // 88 operations. The number is asserted so that adding one without documenting it in
+    // 92 operations. The number is asserted so that adding one without documenting it in
     // docs/PROTOCOL.md becomes a deliberate act.
     //
     // What it does *not* do is notice a variant that was added to `Request` and never added
@@ -864,5 +881,5 @@ fn every_variant_is_covered_by_the_catalogue_fixture() {
     // absent from both sides of the comparison. The compile-time guards for that are
     // `Request::op` and `Request::expected_result`, which are exhaustive matches and cannot
     // be left alone when a variant appears. This assertion guards the *documentation*.
-    assert_eq!(names.len(), 88, "the catalogue changed size: {names:?}");
+    assert_eq!(names.len(), 92, "the catalogue changed size: {names:?}");
 }

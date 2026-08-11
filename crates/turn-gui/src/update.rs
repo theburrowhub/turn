@@ -111,6 +111,32 @@ impl UpdateStatusError {
 
 /// Queries a daemon without launching, stopping or adopting it.
 pub fn query_update_status(socket: &Path) -> Result<DaemonUpdateReport, UpdateStatusError> {
+    let (welcome, response) = query_daemon(socket, Request::GetUpdateStatus)?;
+    let status = match response {
+        Response::UpdateStatus { status } => status,
+        other => {
+            return Err(UpdateStatusError::Unexpected(format!(
+                "{} response",
+                other.result_name()
+            )))
+        }
+    };
+    validate_status(&welcome, &status)?;
+    Ok(DaemonUpdateReport {
+        daemon_running: true,
+        daemon_version: status.daemon_version,
+        daemon_pid: welcome.daemon_pid,
+        protocol_min: status.protocol_min,
+        protocol_max: status.protocol_max,
+        active_ptys: status.active_ptys,
+    })
+}
+
+/// Sends one authenticated, windowless request without starting or adopting a daemon.
+pub fn query_daemon(
+    socket: &Path,
+    operation: Request,
+) -> Result<(Welcome, Response), UpdateStatusError> {
     let mut stream =
         UnixStream::connect(socket).map_err(|cause| UpdateStatusError::Unavailable {
             socket: socket.to_path_buf(),
@@ -124,7 +150,7 @@ pub fn query_update_status(socket: &Path) -> Result<DaemonUpdateReport, UpdateSt
             socket: socket.to_path_buf(),
             cause,
         })?;
-    let hello = ClientFrame::hello(Hello::new("turn-updater", env!("CARGO_PKG_VERSION"), token));
+    let hello = ClientFrame::hello(Hello::new("turn-cli", env!("CARGO_PKG_VERSION"), token));
     stream.write_all(&turn_proto::encode_checked(&hello, MAX_LINE_BYTES)?)?;
 
     let mut decoder = LineDecoder::new();
@@ -140,25 +166,17 @@ pub fn query_update_status(socket: &Path) -> Result<DaemonUpdateReport, UpdateSt
         }
     };
 
-    let request_id = RequestId::new("update-preflight");
-    let request = ClientFrame::request(request_id.clone(), Request::GetUpdateStatus);
+    let request_id = RequestId::new("windowless-command");
+    let request = ClientFrame::request(request_id.clone(), operation);
     stream.write_all(&turn_proto::encode_checked(
         &request,
         welcome.limits.max_line_bytes,
     )?)?;
 
-    let status = loop {
+    let response = loop {
         let frame = read_frame(&mut stream, &mut decoder)?;
         match frame.message {
-            ServerMessage::Response { id, response } if id == request_id => match response {
-                Response::UpdateStatus { status } => break status,
-                other => {
-                    return Err(UpdateStatusError::Unexpected(format!(
-                        "{} response",
-                        other.result_name()
-                    )))
-                }
-            },
+            ServerMessage::Response { id, response } if id == request_id => break response,
             ServerMessage::Error {
                 id: Some(id),
                 error,
@@ -172,15 +190,7 @@ pub fn query_update_status(socket: &Path) -> Result<DaemonUpdateReport, UpdateSt
         }
     };
 
-    validate_status(&welcome, &status)?;
-    Ok(DaemonUpdateReport {
-        daemon_running: true,
-        daemon_version: status.daemon_version,
-        daemon_pid: welcome.daemon_pid,
-        protocol_min: status.protocol_min,
-        protocol_max: status.protocol_max,
-        active_ptys: status.active_ptys,
-    })
+    Ok((welcome, response))
 }
 
 fn validate_status(

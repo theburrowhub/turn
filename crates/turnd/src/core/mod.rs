@@ -100,6 +100,9 @@ pub const FINISHED_PTY_RETENTION_MS: i64 = 5 * 60 * 1_000;
 /// ends it for its own reasons.
 pub const EXPECTED_EXIT_GRACE_MS: i64 = 30 * 1_000;
 
+/// Retention is enforced in the background as well as immediately after a setting write.
+pub const PRIVACY_MAINTENANCE_INTERVAL_MS: i64 = 60 * 1_000;
+
 /// A live process and what Turn knows about how it was launched.
 pub struct Process {
     pub pty: PtyProcess,
@@ -272,6 +275,10 @@ pub struct Core {
     /// workload. The core tick uses this timestamp to coalesce writes.
     pub(crate) last_lease_heartbeat_ms: i64,
 
+    /// Last bounded retention pass. Kept separate from lease/process clocks so a
+    /// failure in one subsystem cannot postpone privacy enforcement indefinitely.
+    pub(crate) last_privacy_maintenance_ms: i64,
+
     /// Kernel ownership independent of the configured SQLite data directory. Each
     /// active durable lease must have exactly one matching host-wide checkout lock.
     pub(crate) checkout_write_locks: HashMap<LeaseId, CheckoutWriteLock>,
@@ -338,6 +345,7 @@ impl Core {
             finished_context_handoffs: HashMap::new(),
             hierarchy_revision: 1,
             last_lease_heartbeat_ms: 0,
+            last_privacy_maintenance_ms: 0,
             checkout_write_locks: HashMap::new(),
             checkout_lock_dir,
             expected_exits: HashMap::new(),
@@ -348,7 +356,9 @@ impl Core {
             last_sweep_ms: turn_core::now_ms(),
             sweep_due_ms: None,
         };
-        core.restore(turn_core::now_ms())?;
+        let now_ms = turn_core::now_ms();
+        core.restore(now_ms)?;
+        core.maintain_privacy(now_ms);
         Ok(core)
     }
 
@@ -449,6 +459,11 @@ impl Core {
         self.observe_process_titles(now_ms);
         self.observe_activity_previews(now_ms);
         self.heartbeat_workspace_leases(now_ms);
+        if now_ms.saturating_sub(self.last_privacy_maintenance_ms)
+            >= PRIVACY_MAINTENANCE_INTERVAL_MS
+        {
+            self.maintain_privacy(now_ms);
+        }
         self.resync_clients(now_ms);
         self.forget_stale_stop_requests(now_ms);
         self.reap_finished_processes(now_ms);
@@ -565,13 +580,27 @@ impl Core {
         let Some(session) = self.sessions.get(id) else {
             return false;
         };
-        !session.env.iter().any(|(key, value)| {
-            key.eq_ignore_ascii_case("TURN_TERMINAL_HISTORY")
-                && matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no" | "disabled"
-                )
-        })
+        let configured = self
+            .setting_for(Some(id), turn_core::privacy::TERMINAL_HISTORY_KEY)
+            .as_bool()
+            .unwrap_or(true);
+        configured
+            && !session.env.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("TURN_TERMINAL_HISTORY")
+                    && matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "0" | "false" | "off" | "no" | "disabled"
+                    )
+            })
+    }
+
+    pub(crate) fn journal_config(&self) -> turn_pty::JournalConfig {
+        let policy = self.privacy_policy();
+        turn_pty::JournalConfig {
+            max_journal_bytes: policy.terminal_journal_bytes,
+            max_checkpoint_bytes: usize::try_from(policy.terminal_checkpoint_bytes)
+                .unwrap_or(usize::MAX),
+        }
     }
 
     pub(crate) fn session_mut(

@@ -21,6 +21,8 @@ pub struct Options {
     pub log_level: Option<String>,
     /// Run with an in-memory store. Nothing survives the process.
     pub no_persist: bool,
+    /// Acquire the installation lock, delete all Turn-owned local records, and exit.
+    pub delete_installation_data: bool,
     /// Print help and exit.
     pub help: bool,
     /// Print the version and exit.
@@ -43,6 +45,9 @@ Options:
       --log-level <LEVEL> error | warn | info | debug | trace, or a RUST_LOG filter
                           (default: $RUST_LOG, or info)
       --no-persist        Keep state in memory only; nothing survives this process
+      --delete-installation-data
+                          Delete Turn's database, logs, scratch and terminal history,
+                          retaining user checkout roots; refuses a live daemon
   -h, --help              Print this help
   -V, --version           Print the version
       --build-info        Print component, version and protocol compatibility
@@ -66,6 +71,7 @@ impl Options {
                 }
                 "--log-level" => options.log_level = Some(value(&mut args, "--log-level")?),
                 "--no-persist" => options.no_persist = true,
+                "--delete-installation-data" => options.delete_installation_data = true,
                 "-h" | "--help" => options.help = true,
                 "-V" | "--version" => options.version = true,
                 "--build-info" => options.build_info = true,
@@ -159,6 +165,11 @@ mod tests {
         assert!(Options::parse(["--version"]).unwrap().version);
         assert!(Options::parse(["--build-info"]).unwrap().build_info);
         assert!(Options::parse(["--no-persist"]).unwrap().no_persist);
+        assert!(
+            Options::parse(["--delete-installation-data"])
+                .unwrap()
+                .delete_installation_data
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod hierarchy;
 mod inspector;
 mod nodes;
 mod panes;
+mod privacy;
 mod scrollback;
 mod sessions;
 mod settings;
@@ -62,6 +63,14 @@ impl Core {
                     .unwrap_or(u32::MAX),
                 },
             }),
+            Request::GetPrivacyReport { scope } => self.get_privacy_report(scope, now_ms),
+            Request::ExportPrivacyData { scope, path } => {
+                self.export_privacy_data(scope, path, now_ms)
+            }
+            Request::DeletePrivacyData { scope, disposition } => {
+                self.delete_privacy_data(scope, disposition, now_ms)
+            }
+            Request::CompactPrivacyData => self.compact_privacy_data(now_ms),
 
             // ---------------------------------------------------------- workspaces
             Request::ListWorkspaces { include_archived } => {
@@ -636,7 +645,7 @@ impl Core {
                 scope,
                 owner_id,
                 key,
-            } => self.reset_setting(scope, owner_id, key),
+            } => self.reset_setting(scope, owner_id, key, now_ms),
         }
     }
 }

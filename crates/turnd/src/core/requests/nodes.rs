@@ -485,7 +485,7 @@ impl Core {
     /// Takes a replaced node and everything under it out of the tree, and takes its
     /// launch with it: the hook token, the configuration Turn injected, the attention it
     /// raised and the state the daemon kept about it.
-    fn retire_replaced_node(
+    pub(super) fn retire_replaced_node(
         &mut self,
         session_id: &SessionId,
         node_id: &NodeId,

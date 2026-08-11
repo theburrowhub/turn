@@ -61,6 +61,7 @@ pub mod error;
 pub mod location;
 mod maintenance;
 pub mod migrations;
+pub mod privacy;
 pub mod redact;
 pub mod repo;
 

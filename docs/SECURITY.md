@@ -217,11 +217,27 @@ bounded checkpoint and append-only journal under `terminal-history/<session>/<no
 reconstruct the display. Directories are owner-only (`0700`), files are `0600`, symlinked paths are refused,
 records are CRC-checked, and journal/checkpoint size is capped per Pane.
 
-The archive may contain secrets exactly as they appeared on screen. A sensitive Workspace or Session must
-set `TURN_TERMINAL_HISTORY=disabled` before launching its processes; `0`, `false`, `off` and `no` are also
-accepted. `--no-persist` disables archives globally. Opt-out deletes any retained Session archive during
-restore. A recovered archive is never a process capability: its node remains `Orphaned` or `Lost`, cannot
-accept input and is replaced/deleted when the user explicitly relaunches that Pane.
+The archive may contain secrets exactly as they appeared on screen. A sensitive Workspace or Session can
+set `records.terminal_history` off at its Settings level; this immediately stops recording and removes its
+retained archive without stopping the process. The launch environment override
+`TURN_TERMINAL_HISTORY=disabled` remains supported (`0`, `false`, `off` and `no` are aliases), and
+`--no-persist` disables archives globally. A recovered archive is never a process capability: its node
+remains `Orphaned` or `Lost`, cannot accept input and is replaced/deleted when the user explicitly
+relaunches that Pane.
+
+### 3.6.2 Local-data export and deletion
+
+Privacy export is an authenticated daemon operation. SQLite text is passed through secret redaction again,
+unknown/secret Setting values are hidden, and terminal/log/scratch payloads are metadata-only. Destinations
+are absolute, owner-only and create-new with `O_NOFOLLOW`; an existing file or symlink is never replaced.
+The table inventory is closed, so a migration that is not privacy-classified fails rather than emitting an
+incomplete report. Future filesystem entries are visible as unclassified.
+
+Selective deletion stays inside the daemon's single-writer task. Full installation deletion cannot operate
+through the live daemon: `turnd --delete-installation-data` must first acquire the canonical data-directory
+lock. Its recursive walk uses `symlink_metadata` and removes a symlink as an entry, never its target. The
+stable lock inode and checkout roots are retained because unlinking the former splits the lock domain and
+deleting the latter would destroy user work.
 
 ### 3.7 `turn-hook`
 

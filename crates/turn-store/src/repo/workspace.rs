@@ -215,32 +215,34 @@ impl<'a> WorkspaceRepo<'a> {
     /// the user chose and Turn does not own: nothing on disk is removed, no branch and no
     /// worktree is touched, and that promise is what makes this action safe to offer at all.
     ///
-    /// The per-window tree state of the workspace and of every session under it is cleared
-    /// here, because `tree_ui_state` has no foreign key to cascade through — see
-    /// [`super::session::SessionRepo::delete`]. The session rows are read before the delete,
-    /// since after it there is nothing left to ask.
+    /// The per-window tree state and scroll anchors of the Workspace, its Sessions and their
+    /// process nodes are cleared here because the presentation tables have no foreign keys to
+    /// cascade through — see [`super::session::SessionRepo::delete`]. They are removed before
+    /// the Workspace row, while the ownership subqueries can still identify every descendant.
     pub fn delete(&self, id: &WorkspaceId) -> Result<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        let sessions: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE workspace_id = ?1")?;
-            let mut rows = stmt.query(params![id.as_str()])?;
-            let mut out = Vec::new();
-            while let Some(row) = rows.next()? {
-                out.push(row.get(0)?);
-            }
-            out
-        };
-        let changed = tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
         tx.execute(
-            "DELETE FROM tree_ui_state WHERE node_kind = 'workspace' AND node_id = ?1",
+            "DELETE FROM tree_ui_state WHERE \
+                 (node_kind = 'workspace' AND node_id = ?1) OR \
+                 (node_kind = 'session' AND node_id IN (\
+                     SELECT id FROM sessions WHERE workspace_id = ?1)) OR \
+                 (node_kind IN ('agent', 'process') AND node_id IN (\
+                     SELECT id FROM process_nodes WHERE session_id IN (\
+                         SELECT id FROM sessions WHERE workspace_id = ?1)))",
             params![id.as_str()],
         )?;
-        for session in &sessions {
-            tx.execute(
-                "DELETE FROM tree_ui_state WHERE node_kind = 'session' AND node_id = ?1",
-                params![session],
-            )?;
-        }
+        tx.execute(
+            "UPDATE tree_surface_preferences \
+             SET scroll_node_kind = NULL, scroll_node_id = NULL \
+             WHERE (scroll_node_kind = 'workspace' AND scroll_node_id = ?1) OR \
+                   (scroll_node_kind = 'session' AND scroll_node_id IN (\
+                       SELECT id FROM sessions WHERE workspace_id = ?1)) OR \
+                   scroll_node_id IN (\
+                       SELECT id FROM process_nodes WHERE session_id IN (\
+                           SELECT id FROM sessions WHERE workspace_id = ?1))",
+            params![id.as_str()],
+        )?;
+        let changed = tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(changed > 0)
     }
@@ -679,9 +681,40 @@ mod tests {
     fn deleting_a_workspace_takes_its_sessions_with_it() {
         let store = testing::store();
         let ws = testing::saved_workspace(&store, "turn");
-        let session = testing::saved_session(&store, &ws.id, "Fix bug");
+        let mut session = testing::saved_session(&store, &ws.id, "Fix bug");
+        let node = turn_core::model::ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
+        let node_id = node.id.clone();
+        session.tree.insert(node);
+        store.sessions().save(&session).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tree_ui_state \
+                 (surface_id, node_kind, node_id, updated_ms) VALUES ('window', 'process', ?1, ?2)",
+                params![node_id.as_str(), T0],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tree_surface_preferences \
+                 (surface_id, scroll_node_kind, scroll_node_id, updated_ms) \
+                 VALUES ('window', 'process', ?1, ?2)",
+                params![node_id.as_str(), T0],
+            )
+            .unwrap();
 
         assert!(store.workspaces().delete(&ws.id).unwrap());
         assert!(store.sessions().get(&session.id).unwrap().is_none());
+        assert!(testing::rows_mentioning(&store, "node_id", node_id.as_str()).is_empty());
+        let anchor: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT scroll_node_id FROM tree_surface_preferences WHERE surface_id = 'window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(anchor.is_none(), "the scroll anchor outlived its Workspace");
     }
 }

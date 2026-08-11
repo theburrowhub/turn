@@ -433,13 +433,42 @@ impl PtyProcess {
         journal_dir: impl AsRef<Path>,
         preserved_fds: &[i32],
     ) -> Result<Self, PtyError> {
+        Self::spawn_persisted_with_config_and_preserved_fds(
+            node_id,
+            spec,
+            now_ms,
+            journal_dir,
+            JournalConfig::default(),
+            preserved_fds,
+        )
+    }
+
+    /// Spawns with caller-selected durable bounds. The daemon resolves these from
+    /// the settings hierarchy; library callers retain the conservative defaults.
+    pub fn spawn_persisted_with_config_and_preserved_fds(
+        node_id: NodeId,
+        spec: ProcessSpec,
+        now_ms: i64,
+        journal_dir: impl AsRef<Path>,
+        journal_config: JournalConfig,
+        preserved_fds: &[i32],
+    ) -> Result<Self, PtyError> {
         Self::spawn_internal(
             node_id,
             spec,
             now_ms,
-            Some((journal_dir.as_ref().to_path_buf(), JournalConfig::default())),
+            Some((journal_dir.as_ref().to_path_buf(), journal_config)),
             preserved_fds,
         )
+    }
+
+    /// Stops recording immediately without touching the live PTY or screen.
+    pub fn disable_journal(&self) {
+        if let Some(journal) = &self.journal {
+            if let Ok(mut journal) = journal.lock() {
+                *journal = None;
+            }
+        }
     }
 
     fn spawn_internal(

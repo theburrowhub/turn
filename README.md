@@ -75,6 +75,7 @@ Implemented today:
   modal AccessKit semantics, separate state/selection/focus/attention announcements, and
   terminal IME composition coverage.
 - SQLite persistence, write leases, safe restart recovery, and explicit process relaunch.
+- Reviewable local-data inventory/export, scoped deletion, configurable retention and zero telemetry.
 - macOS-enforced read-only Sessions: shells, Agents and child processes can inspect a checkout while
   Seatbelt blocks writes to it and its external Git metadata; unsupported platforms keep processes stopped.
 - Automated macOS and Linux builds plus native UI snapshot coverage.
@@ -144,6 +145,14 @@ process survived but the new daemon cannot control it, stop that process outside
 **Check & confirm access**. The daemon revalidates ownership at that moment.
 
 Archiving Sessions or Workspaces never deletes the project directory.
+
+## Local data
+
+`turn --privacy-report` and `turn --privacy-export /absolute/path/export.json` inspect local records without
+opening a window. Scoped deletion is available for Workspace, Session and Agent identities; the offline
+`turnd --delete-installation-data` command removes all Turn-owned installation data while retaining checkout
+work. Turn has no telemetry transport. See [docs/PRIVACY.md](docs/PRIVACY.md) for the complete inventory,
+retention controls, command syntax and reproducible acceptance proof.
 
 ## Architecture
 
