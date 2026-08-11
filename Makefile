@@ -69,6 +69,14 @@ template-acceptance: ## Reproduce the complete Template lifecycle without openin
 	$(CARGO) test -p turnd template --lib -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turn-gui template --lib -- --test-threads=$(TEST_THREADS)
 
+.PHONY: inspector-acceptance
+inspector-acceptance: ## Reproduce contextual Workspace, Session, Agent and Process inspection
+	$(CARGO) test -p turn-proto -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-store redact::tests -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd inspector --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui inspector --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui --test snapshots inspector -- --test-threads=$(TEST_THREADS)
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

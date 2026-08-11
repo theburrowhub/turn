@@ -547,6 +547,13 @@ document. Unchecked items say what evidence or implementation is still missing, 
   background Reviewer remains selected and owns the demand; only an integrated/explicit ancestor runtime
   with an existing Pane may receive keyboard focus. No provisional edge is followed and no Pane opens as a
   side effect. `semantic_attention_selects_the_child_but_focuses_its_runtime_owner_pane` and the hook E2E.
+- [x] **Every hierarchy level has one optional contextual inspector rather than another navigation tree.**
+  Workspace exposes paths, repositories, checkouts, shared resources, write authority and configuration;
+  Session exposes checkout/mode/Template, Attention, process counts and safe history; Agent and Process
+  expose identity, work, readable parent navigation, relationship/origin confidence, runtime facts,
+  metrics and handoff/event metadata where applicable. Values from inference stay visibly provisional and
+  secrets are redacted at the daemon boundary. The panel collapses, becomes an overlay on narrow windows
+  and has an explicit AccessKit context. Reproduce the contract with `make inspector-acceptance`.
 
 ### Checkout safety
 

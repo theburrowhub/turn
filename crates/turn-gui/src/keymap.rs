@@ -84,6 +84,7 @@ pub enum Command {
     StopProcess,
 
     FocusWorkspaceTree,
+    ToggleInspector,
     ExpandWorkspaceTree,
     CollapseWorkspaceTree,
 
@@ -136,6 +137,7 @@ impl Command {
         Command::InterruptProcess,
         Command::StopProcess,
         Command::FocusWorkspaceTree,
+        Command::ToggleInspector,
         Command::ExpandWorkspaceTree,
         Command::CollapseWorkspaceTree,
         Command::CopySelection,
@@ -188,6 +190,7 @@ impl Command {
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
             Command::FocusWorkspaceTree => "view.focusTree",
+            Command::ToggleInspector => "view.toggleInspector",
             Command::ExpandWorkspaceTree => "view.expandTree",
             Command::CollapseWorkspaceTree => "view.collapseTree",
             Command::CopySelection => "edit.copy",
@@ -250,6 +253,7 @@ impl Command {
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
             Command::FocusWorkspaceTree => "Focus the workspace tree",
+            Command::ToggleInspector => "Show or hide the contextual inspector",
             Command::ExpandWorkspaceTree => "Expand the complete workspace tree",
             Command::CollapseWorkspaceTree => "Collapse the complete workspace tree",
             Command::CopySelection => "Copy the selection",
@@ -264,6 +268,7 @@ impl Command {
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
             | Command::FocusWorkspaceTree
+            | Command::ToggleInspector
             | Command::ExpandWorkspaceTree
             | Command::CollapseWorkspaceTree => "View",
             Command::NewWorkspace
@@ -766,6 +771,7 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
     shared(Command::StopProcess, Chord::cmd_shift(Key::Comma)),
     shared(Command::FocusWorkspaceTree, Chord::cmd_shift(Key::T)),
+    shared(Command::ToggleInspector, Chord::cmd_shift(Key::I)),
     shared(
         Command::ExpandWorkspaceTree,
         Chord::cmd_alt(Key::ArrowRight),

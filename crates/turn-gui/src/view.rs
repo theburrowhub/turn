@@ -39,9 +39,10 @@ use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
 use turn_proto::{
     CloseDisposition, ContextHandoffMode, ContextHandoffView, HierarchyKey, HierarchySnapshot,
-    NewPane, NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext,
-    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
-    TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
+    InspectorDetails, InspectorEventView, InspectorHandoffView, InspectorOriginView,
+    InspectorParentView, NewPane, NodePaneCapability, NodePaneView, PaneRestoreOutcome,
+    ProtoErrorContext, SessionConflictAlternative, SessionSummary, SessionTreeView,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };
 
 use crate::icons;
@@ -406,6 +407,9 @@ pub struct TurnView<'a> {
     /// At most one explicit temporary Pane for this window. Rendering it must never
     /// insert its PaneId into `layout`.
     pub temporary_pane: Option<TemporaryPaneContent<'a>>,
+    /// On-demand details for the optional right inspector. A mismatched key is
+    /// ignored while the newly selected row loads.
+    pub inspector: Option<&'a turn_proto::InspectorDetails>,
     /// Recovery state for the selected Session. Safe panes relaunch automatically in the Desk;
     /// this remains here to explain any safety gate while that happens.
     pub restore: Option<&'a SessionRestoreView>,
@@ -553,8 +557,11 @@ pub struct ViewState {
     pub new_pane: Option<NewPaneDraft>,
     /// Bounded, stable/redacted semantic history fetched on demand for Quick Preview.
     pub preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
-    /// The inspector is contextual and only occupies space for a selected Process.
+    /// The optional contextual inspector follows any selected hierarchy row.
     pub inspector_open: bool,
+    /// The row whose on-demand details have been requested. Distinct from the
+    /// response cache so a selection change emits exactly one request.
+    pub inspector_key: Option<HierarchyKey>,
     hierarchy_actions: Vec<HierarchyAction>,
     observed_tree_state: Option<TreeSurfaceState>,
     observed_temporary_pane: Option<PaneId>,
@@ -1102,6 +1109,9 @@ impl SessionDraft {
 /// Selection, opening and focus are intentionally different operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HierarchyAction {
+    Inspect {
+        key: HierarchyKey,
+    },
     Select {
         surface_id: String,
         key: HierarchyKey,
@@ -2393,6 +2403,26 @@ fn selected_process<'a>(
         .find(|node| &node.node_id == node_id)
 }
 
+fn hierarchy_contains_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> bool {
+    match key {
+        HierarchyKey::Workspace { workspace_id } => snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| &workspace.workspace.id == workspace_id),
+        HierarchyKey::Session { session_id } => snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .any(|session| &session.session.id == session_id),
+        HierarchyKey::Process { node_id } => snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .any(|node| &node.node_id == node_id),
+    }
+}
+
 fn active_session_context<'a>(
     snapshot: &'a HierarchySnapshot,
     active: Option<&SessionId>,
@@ -2572,15 +2602,28 @@ impl<'a> TurnView<'a> {
         let current_tree_selection = hierarchy
             .as_ref()
             .and_then(|snapshot| effective_selection(snapshot, state));
-        let selected_node = hierarchy
-            .as_ref()
-            .and_then(|snapshot| selected_process(snapshot, current_tree_selection.as_ref()));
+        let inspector_target = hierarchy.as_ref().and_then(|snapshot| {
+            current_tree_selection
+                .clone()
+                .filter(|key| hierarchy_contains_key(snapshot, key))
+        });
+        if state.inspector_open && state.inspector_key != inspector_target {
+            state.inspector_key = inspector_target.clone();
+            if let Some(key) = inspector_target.clone() {
+                state.push_hierarchy_action(HierarchyAction::Inspect { key });
+            }
+        }
+        let inspector_details = self.inspector.filter(|details| {
+            inspector_target
+                .as_ref()
+                .is_some_and(|target| details.key() == *target)
+        });
         let active_context = hierarchy
             .as_ref()
             .and_then(|snapshot| active_session_context(snapshot, self.selected.as_ref()));
         let inspector_is_overlay = body.width() < 960.0;
         let inspector_width =
-            if state.inspector_open && selected_node.is_some() && !inspector_is_overlay {
+            if state.inspector_open && inspector_target.is_some() && !inspector_is_overlay {
                 INSPECTOR_WIDTH.min((body.width() - sidebar_width).max(0.0) * 0.4)
             } else {
                 0.0
@@ -2678,14 +2721,35 @@ impl<'a> TurnView<'a> {
                 body.y_range(),
                 Stroke::new(1.0, theme.border),
             );
-            ui.scope_builder(region(inspector.shrink(1.0), "inspector"), |ui| {
-                if let Some(node) = selected_node {
-                    self.process_inspector(ui, theme, node, state);
-                }
-            });
+            let inspector_actions = ui
+                .scope_builder(region(inspector.shrink(1.0), "inspector"), |ui| {
+                    self.contextual_inspector(
+                        ui,
+                        theme,
+                        hierarchy
+                            .as_ref()
+                            .expect("an inspector target has a hierarchy"),
+                        inspector_target
+                            .as_ref()
+                            .expect("the inspector target exists"),
+                        inspector_details,
+                        state,
+                    )
+                })
+                .inner;
+            actions.extend(inspector_actions);
         } else if state.inspector_open && inspector_is_overlay {
-            if let Some(node) = selected_node {
-                self.inspector_overlay(ui, theme, node, state, body);
+            if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), inspector_target.as_ref())
+            {
+                actions.extend(self.inspector_overlay(
+                    ui,
+                    theme,
+                    snapshot,
+                    target,
+                    inspector_details,
+                    state,
+                    body,
+                ));
             }
         }
 
@@ -4538,6 +4602,13 @@ impl<'a> TurnView<'a> {
                     match row {
                         HierarchyRow::Workspace(workspace) => response.context_menu(|ui| {
                             hierarchy_reorder_menu(ui, state, snapshot, *row);
+                            if ui.button("Show details").clicked() {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                state.inspector_open = true;
+                                state.inspector_key = None;
+                                ui.close();
+                            }
+                            ui.separator();
                             if workspace.workspace.archived {
                                 if ui.button("Restore workspace").clicked() {
                                     actions.push(ViewAction::ArchiveWorkspace {
@@ -4602,6 +4673,13 @@ impl<'a> TurnView<'a> {
                         }),
                         HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
                             hierarchy_reorder_menu(ui, state, snapshot, *row);
+                            if ui.button("Show details").clicked() {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                state.inspector_open = true;
+                                state.inspector_key = None;
+                                ui.close();
+                            }
+                            ui.separator();
                             if session.session.status == SessionStatus::Archived {
                                 if ui
                                     .add_enabled(
@@ -4796,7 +4874,9 @@ impl<'a> TurnView<'a> {
                                 ui.close();
                             }
                             if ui.button("Show details").clicked() {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
                                 state.inspector_open = true;
+                                state.inspector_key = None;
                                 ui.close();
                             }
                             let previews_hidden =
@@ -7510,25 +7590,24 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    fn process_inspector(
+    fn contextual_inspector(
         &self,
         ui: &mut Ui,
         theme: &Theme,
-        node: &TreeNodeView,
+        snapshot: &HierarchySnapshot,
+        target: &HierarchyKey,
+        details: Option<&InspectorDetails>,
         state: &mut ViewState,
-    ) {
+    ) -> Vec<ViewAction> {
+        let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.panel);
         ui.add_space(7.0);
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            ui.label(
-                RichText::new("PROCESS DETAILS")
-                    .color(theme.text_dim)
-                    .small(),
-            );
+            ui.label(RichText::new("INSPECTOR").color(theme.text_dim).small());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Close").clicked() {
+                if ui.small_button("Close inspector").clicked() {
                     state.inspector_open = false;
                 }
             });
@@ -7536,174 +7615,465 @@ impl<'a> TurnView<'a> {
         ui.separator();
 
         egui::ScrollArea::vertical()
-            .id_salt("process-inspector-scroll")
+            .id_salt("contextual-inspector-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(process_title(node))
-                        .color(theme.text)
-                        .strong(),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(node_kind_label(node.kind))
-                            .monospace()
-                            .color(theme.text_dim)
-                            .small(),
-                    );
-                    let (state_colour, glyph) = theme.state_marker(node.display_state);
-                    ui.label(
-                        RichText::new(format!("{glyph} {}", node.state_label))
-                            .monospace()
-                            .color(state_colour)
-                            .small(),
-                    );
-                    if node.relationship_is_provisional {
-                        ui.label(
-                            RichText::new("inferred")
-                                .monospace()
-                                .color(theme.provisional)
-                                .small(),
+                match details {
+                    Some(InspectorDetails::Workspace {
+                        workspace,
+                        checkouts,
+                        write_lease,
+                        environment_keys,
+                        init_commands,
+                        attention,
+                    }) => {
+                        inspector_title(ui, theme, "Workspace", &workspace.name, None);
+                        inspector_section(ui, theme, "PATHS & REPOSITORIES");
+                        inspector_value(ui, theme, "root", &workspace.root);
+                        if let Some(remote) = &workspace.git_remote {
+                            inspector_value(ui, theme, "remote", remote);
+                        }
+                        for checkout in checkouts {
+                            let label = if checkout.primary {
+                                "primary"
+                            } else {
+                                "worktree"
+                            };
+                            inspector_value(ui, theme, label, &checkout.path);
+                            if let Some(branch) = &checkout.branch {
+                                inspector_value(ui, theme, "branch", branch);
+                            }
+                            for resource in &checkout.shared_resources {
+                                inspector_value(ui, theme, "shared resource", resource);
+                            }
+                        }
+                        inspector_section(ui, theme, "WRITE LEASE");
+                        if let Some(lease) = write_lease {
+                            let owner = session_name(snapshot, &lease.session_id)
+                                .unwrap_or_else(|| lease.session_id.as_str().to_string());
+                            inspector_value(ui, theme, "owner", &owner);
+                            inspector_value(ui, theme, "state", &format!("{:?}", lease.state));
+                            inspector_value(ui, theme, "generation", &lease.generation.to_string());
+                        } else {
+                            inspector_empty(ui, theme, "No active write lease");
+                        }
+                        inspector_section(ui, theme, "CONFIGURATION");
+                        inspector_optional(
+                            ui,
+                            theme,
+                            "default Agent",
+                            workspace.default_agent.as_deref(),
                         );
-                    }
-                });
-
-                inspector_section(ui, theme, "ACTIVITY");
-                match visible_preview(node) {
-                    Some(preview) => {
-                        ui.label(RichText::new(&preview.normalized_text).color(theme.text));
-                        ui.label(
-                            RichText::new(format!(
-                                "{} · {} · {}",
-                                preview_source_label(preview.source),
-                                preview.confidence.label(),
-                                if preview.stable { "stable" } else { "updating" }
-                            ))
-                            .monospace()
-                            .color(theme.text_faint)
-                            .small(),
+                        inspector_optional(
+                            ui,
+                            theme,
+                            "default shell",
+                            workspace.default_shell.as_deref(),
                         );
-                    }
-                    None => {
-                        ui.label(
-                            RichText::new("No safe activity preview")
-                                .color(theme.text_faint)
-                                .small(),
+                        inspector_optional(
+                            ui,
+                            theme,
+                            "default Template",
+                            workspace.default_template.as_ref().map(|id| id.as_str()),
                         );
+                        inspector_value(ui, theme, "tmux", yes_no(workspace.tmux_enabled));
+                        if !environment_keys.is_empty() {
+                            inspector_value(
+                                ui,
+                                theme,
+                                "environment keys",
+                                &environment_keys.join(", "),
+                            );
+                        }
+                        for command in init_commands {
+                            inspector_value(ui, theme, "init", command);
+                        }
+                        inspector_attention(ui, theme, attention);
+                        inspector_section(ui, theme, "ACTIONS");
+                        if ui.button("New session in this Workspace…").clicked() {
+                            state.session_draft = Some(SessionDraft::new(
+                                workspace.id.clone(),
+                                self.preferred_template_id(&workspace.id),
+                            ));
+                        }
                     }
-                }
-                let (preview_label, visibility) =
-                    if matches!(node.preview_visibility, PreviewVisibility::Hide) {
-                        ("Show activity preview", PreviewVisibility::Inherit)
-                    } else {
-                        ("Hide activity preview", PreviewVisibility::Hide)
-                    };
-                if ui.small_button(preview_label).clicked() {
-                    if matches!(visibility, PreviewVisibility::Hide) {
-                        state.quick_preview = None;
-                    }
-                    state.push_hierarchy_action(HierarchyAction::SetPreviewVisibility {
-                        session_id: node.session_id.clone(),
-                        node_id: node.node_id.clone(),
-                        visibility,
-                    });
-                }
-
-                inspector_section(ui, theme, "RELATIONSHIP");
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}",
-                        relationship_label(node.relationship.kind),
-                        node.relationship.confidence.label()
-                    ))
-                    .monospace()
-                    .color(if node.relationship_is_provisional {
-                        theme.provisional
-                    } else {
-                        theme.text_dim
-                    }),
-                );
-                if let Some(parent) = &node.parent {
-                    ui.label(
-                        RichText::new(format!("parent {}", parent.as_str()))
-                            .monospace()
-                            .color(theme.text_faint)
-                            .small(),
-                    );
-                }
-
-                inspector_section(ui, theme, "PROCESS");
-                inspector_value(ui, theme, "command", &node.command);
-                inspector_value(ui, theme, "cwd", &node.cwd);
-                inspector_value(ui, theme, "lifecycle", lifecycle_label(&node.lifecycle));
-                if let Some(pid) = node.pid {
-                    inspector_value(ui, theme, "pid", &pid.to_string());
-                }
-                if let Some(ppid) = node.ppid {
-                    inspector_value(ui, theme, "ppid", &ppid.to_string());
-                }
-                inspector_value(ui, theme, "runtime", &format_duration(node.runtime_ms));
-                if let Some(code) = node.exit_code {
-                    inspector_value(ui, theme, "exit", &code.to_string());
-                }
-
-                if let Some(agent) = &node.agent {
-                    inspector_section(ui, theme, "AGENT");
-                    if let Some(declared) = &agent.name.declared_name {
-                        inspector_value(ui, theme, "declared", declared);
-                    }
-                    if let Some(tool) = &agent.agent.tool {
-                        inspector_value(ui, theme, "tool", tool);
-                    }
-                    if let Some(model) = &agent.agent.model {
-                        inspector_value(ui, theme, "model", model);
-                    }
-                    if let Some(branch) = &agent.git_branch {
-                        inspector_value(ui, theme, "branch", branch);
-                    }
-                    if let Some(task) = &agent.current_task {
-                        inspector_value(ui, theme, "task", task);
-                    }
-                }
-
-                inspector_section(ui, theme, "PANE");
-                if node.pane_bindings.is_empty() {
-                    ui.label(
-                        RichText::new("Not open in a pane")
-                            .color(theme.text_faint)
-                            .small(),
-                    );
-                } else {
-                    for binding in &node.pane_bindings {
+                    Some(InspectorDetails::Session {
+                        workspace_name,
+                        session,
+                        checkout,
+                        attention,
+                        environment_keys,
+                        history,
+                    }) => {
+                        inspector_title(
+                            ui,
+                            theme,
+                            "Session",
+                            &session.name,
+                            Some(&session.state_label),
+                        );
+                        inspector_section(ui, theme, "CONTEXT");
+                        inspector_value(ui, theme, "Workspace", workspace_name);
+                        inspector_value(ui, theme, "mode", session.mode.label());
+                        inspector_value(ui, theme, "cwd", &session.cwd);
+                        inspector_value(ui, theme, "checkout", session.checkout_id.as_str());
+                        if let Some(checkout) = checkout {
+                            inspector_value(ui, theme, "checkout path", &checkout.path);
+                        }
+                        inspector_optional(ui, theme, "branch", session.git_branch.as_deref());
+                        inspector_optional(
+                            ui,
+                            theme,
+                            "Template",
+                            session.template_id.as_ref().map(|id| id.as_str()),
+                        );
+                        inspector_section(ui, theme, "PROCESSES & ATTENTION");
+                        inspector_value(ui, theme, "Processes", &session.node_count.to_string());
+                        inspector_value(ui, theme, "running", &session.running_count.to_string());
+                        inspector_value(ui, theme, "Agents", &session.subagent_count.to_string());
+                        inspector_value(ui, theme, "demands", &session.badge_count.to_string());
+                        inspector_value(ui, theme, "muted", yes_no(session.muted));
                         inspector_value(
                             ui,
                             theme,
-                            if binding.temporary {
-                                "temporary"
-                            } else {
-                                "layout"
-                            },
-                            binding.pane_id.as_str(),
+                            "restore",
+                            &format!("{:?}", session.restore_state),
+                        );
+                        if !environment_keys.is_empty() {
+                            inspector_value(
+                                ui,
+                                theme,
+                                "environment keys",
+                                &environment_keys.join(", "),
+                            );
+                        }
+                        inspector_attention(ui, theme, attention);
+                        inspector_history(ui, theme, history, self.now_ms);
+                        inspector_section(ui, theme, "ACTIONS");
+                        if self.selected.as_ref() == Some(&session.id) {
+                            inspector_empty(ui, theme, "This Session is active");
+                        } else if ui.button("Show this Session's panes").clicked() {
+                            actions.push(ViewAction::SelectSession(session.id.clone()));
+                        }
+                    }
+                    Some(InspectorDetails::Agent {
+                        session_name,
+                        node,
+                        parent,
+                        process_group,
+                        origin,
+                        history,
+                        handoffs,
+                    }) => {
+                        inspector_title(
+                            ui,
+                            theme,
+                            "Agent",
+                            process_title(node),
+                            Some(&node.state_label),
+                        );
+                        self.runtime_inspector(
+                            ui,
+                            theme,
+                            snapshot,
+                            session_name,
+                            node,
+                            parent.as_ref(),
+                            *process_group,
+                            origin,
+                            history,
+                            Some(handoffs),
+                            state,
+                            &mut actions,
                         );
                     }
+                    Some(InspectorDetails::Process {
+                        session_name,
+                        node,
+                        parent,
+                        process_group,
+                        origin,
+                        history,
+                    }) => {
+                        inspector_title(
+                            ui,
+                            theme,
+                            "Process",
+                            process_title(node),
+                            Some(&node.state_label),
+                        );
+                        self.runtime_inspector(
+                            ui,
+                            theme,
+                            snapshot,
+                            session_name,
+                            node,
+                            parent.as_ref(),
+                            *process_group,
+                            origin,
+                            history,
+                            None,
+                            state,
+                            &mut actions,
+                        );
+                    }
+                    None => {
+                        inspector_title(ui, theme, hierarchy_key_kind(target), "Loading…", None);
+                        ui.spinner();
+                        inspector_empty(ui, theme, "Fetching safe contextual details");
+                    }
                 }
-                ui.label(
-                    RichText::new(pane_capability_label(&node.pane_capability))
-                        .color(theme.text_dim)
-                        .small(),
-                );
             });
+        let accessible = ui.id().with("contextual-inspector-accessibility");
+        ui.ctx().accesskit_node_builder(accessible, |node| {
+            node.set_role(egui::accesskit::Role::Group);
+            node.set_label(format!(
+                "Contextual inspector for {}",
+                hierarchy_key_kind(target)
+            ));
+        });
+        actions
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn runtime_inspector(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        snapshot: &HierarchySnapshot,
+        session_name: &str,
+        node: &TreeNodeView,
+        parent: Option<&InspectorParentView>,
+        process_group: Option<u32>,
+        origin: &InspectorOriginView,
+        history: &[InspectorEventView],
+        handoffs: Option<&[InspectorHandoffView]>,
+        state: &mut ViewState,
+        actions: &mut Vec<ViewAction>,
+    ) {
+        if let Some(agent) = &node.agent {
+            inspector_section(ui, theme, "IDENTITY & WORK");
+            inspector_optional(ui, theme, "provider", agent.agent.provider.as_deref());
+            inspector_optional(ui, theme, "tool", agent.agent.tool.as_deref());
+            inspector_optional(ui, theme, "model", agent.agent.model.as_deref());
+            inspector_optional(
+                ui,
+                theme,
+                "declared name",
+                agent.name.declared_name.as_deref(),
+            );
+            inspector_optional(ui, theme, "Agent type", agent.agent_type.as_deref());
+            inspector_optional(ui, theme, "task", agent.current_task.as_deref());
+            inspector_optional(ui, theme, "last context", agent.last_message.as_deref());
+            inspector_optional(ui, theme, "question", agent.pending_question.as_deref());
+            inspector_optional(
+                ui,
+                theme,
+                "permission mode",
+                agent.permission_mode.as_deref(),
+            );
+            inspector_optional(ui, theme, "branch", agent.git_branch.as_deref());
+            inspector_value(ui, theme, "resumable", yes_no(agent.resumable));
+            if let Some(permission) = &agent.pending_permission {
+                inspector_value(ui, theme, "permission", &permission.summary);
+                inspector_value(ui, theme, "risk", &format!("{:?}", permission.risk));
+                inspector_optional(
+                    ui,
+                    theme,
+                    "permission command",
+                    permission.command.as_deref(),
+                );
+                inspector_optional(ui, theme, "permission cwd", permission.cwd.as_deref());
+            }
+            inspector_section(ui, theme, "METRICS");
+            inspector_optional_owned(
+                ui,
+                theme,
+                "tokens",
+                agent.tokens_used.map(|tokens| tokens.to_string()),
+            );
+            inspector_optional_owned(
+                ui,
+                theme,
+                "cost",
+                agent.cost_usd.map(|cost| format!("${cost:.4}")),
+            );
+        }
+
+        inspector_section(ui, theme, "RELATIONSHIP");
+        if let Some(parent) = parent {
+            let colour = if parent.provisional {
+                theme.provisional
+            } else {
+                theme.text_dim
+            };
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}{}",
+                    relationship_label(parent.relationship.kind),
+                    parent.relationship.confidence.label(),
+                    if parent.provisional {
+                        " · inferred"
+                    } else {
+                        ""
+                    }
+                ))
+                .monospace()
+                .color(colour)
+                .small(),
+            );
+            if ui
+                .button(format!("Go to parent · {}", parent.name))
+                .clicked()
+            {
+                state.selected_tree = Some(parent.key.clone());
+                state.scroll_tree_to = Some(parent.key.clone());
+                state.push_hierarchy_action(HierarchyAction::Select {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    key: parent.key.clone(),
+                });
+            }
+        } else {
+            inspector_empty(ui, theme, "No parent relationship is known");
+        }
+
+        inspector_section(ui, theme, "PROCESS");
+        inspector_value(ui, theme, "Session", session_name);
+        inspector_value(
+            ui,
+            theme,
+            "origin",
+            &format!(
+                "{} · {}{}",
+                origin.label,
+                origin.confidence.label(),
+                if origin.confidence.is_provisional() {
+                    " · inferred"
+                } else {
+                    ""
+                }
+            ),
+        );
+        inspector_value(ui, theme, "command", &node.command);
+        if !node.args.is_empty() {
+            inspector_value(ui, theme, "argv", &node.args.join(" ␠ "));
+        }
+        inspector_value(ui, theme, "cwd", &node.cwd);
+        inspector_value(ui, theme, "lifecycle", lifecycle_label(&node.lifecycle));
+        inspector_optional_owned(ui, theme, "pid", node.pid.map(|pid| pid.to_string()));
+        inspector_optional_owned(ui, theme, "ppid", node.ppid.map(|pid| pid.to_string()));
+        inspector_optional_owned(
+            ui,
+            theme,
+            "process group",
+            process_group.map(|pid| pid.to_string()),
+        );
+        inspector_value(ui, theme, "runtime", &format_duration(node.runtime_ms));
+        inspector_optional_owned(
+            ui,
+            theme,
+            "exit",
+            node.exit_code.map(|code| code.to_string()),
+        );
+
+        inspector_section(ui, theme, "ACTIVITY");
+        if let Some(preview) = visible_preview(node) {
+            ui.label(RichText::new(&preview.normalized_text).color(theme.text));
+            ui.label(
+                RichText::new(format!(
+                    "{} · {}{}",
+                    preview_source_label(preview.source),
+                    preview.confidence.label(),
+                    if preview.redacted { " · redacted" } else { "" }
+                ))
+                .monospace()
+                .color(theme.text_faint)
+                .small(),
+            );
+        } else {
+            inspector_empty(ui, theme, "No safe activity preview");
+        }
+        if let Some(handoffs) = handoffs {
+            inspector_handoffs(ui, theme, handoffs, self.now_ms);
+        }
+        inspector_history(ui, theme, history, self.now_ms);
+
+        inspector_section(ui, theme, "ACTIONS");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Quick Preview").clicked() {
+                state.quick_preview = Some(HierarchyKey::process(node.node_id.clone()));
+                state.push_hierarchy_action(HierarchyAction::QuickPreview {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+            if !node.pane_bindings.is_empty() && ui.button("Focus open pane").clicked() {
+                state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+            if ui.button("Open temporary pane").clicked() {
+                state.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                    surface_id: snapshot.tree_state.surface_id.clone(),
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+            if node.is_agentic && ui.button("Rename Agent…").clicked() {
+                state.node_edit = Some(NodeEditDraft::rename(node));
+            }
+            if node.is_agentic && ui.button("Correct relationship…").clicked() {
+                state.node_edit = Some(NodeEditDraft::relationship(node));
+            }
+            if !node.lifecycle.is_terminal()
+                && node.lifecycle != Lifecycle::Orphaned
+                && ui.button("Stop Process").clicked()
+            {
+                actions.push(ViewAction::TerminateNode {
+                    session_id: node.session_id.clone(),
+                    node_id: node.node_id.clone(),
+                });
+            }
+        });
+        inspector_section(ui, theme, "PANE BINDINGS");
+        if node.pane_bindings.is_empty() {
+            inspector_empty(ui, theme, "Not open in a Pane");
+        } else {
+            for binding in &node.pane_bindings {
+                inspector_value(
+                    ui,
+                    theme,
+                    if binding.temporary {
+                        "temporary"
+                    } else {
+                        "layout"
+                    },
+                    binding.pane_id.as_str(),
+                );
+            }
+        }
+        ui.label(
+            RichText::new(pane_capability_label(&node.pane_capability))
+                .color(theme.text_dim)
+                .small(),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn inspector_overlay(
         &self,
         ui: &mut Ui,
         theme: &Theme,
-        node: &TreeNodeView,
+        snapshot: &HierarchySnapshot,
+        target: &HierarchyKey,
+        details: Option<&InspectorDetails>,
         state: &mut ViewState,
         body: Rect,
-    ) {
+    ) -> Vec<ViewAction> {
         let width = INSPECTOR_WIDTH.min((body.width() - 20.0).max(0.0));
         let panel = Rect::from_min_size(
             body.right_top() + Vec2::new(-width - 10.0, 10.0),
@@ -7717,8 +8087,9 @@ impl<'a> TurnView<'a> {
             egui::StrokeKind::Outside,
         );
         ui.scope_builder(region(panel.shrink(1.0), "inspector-overlay"), |ui| {
-            self.process_inspector(ui, theme, node, state);
-        });
+            self.contextual_inspector(ui, theme, snapshot, target, details, state)
+        })
+        .inner
     }
 
     fn quick_preview_overlay(
@@ -10001,6 +10372,154 @@ fn inspector_section(ui: &mut Ui, theme: &Theme, title: &str) {
             .color(theme.text_faint)
             .small(),
     );
+}
+
+fn hierarchy_key_kind(key: &HierarchyKey) -> &'static str {
+    match key {
+        HierarchyKey::Workspace { .. } => "Workspace",
+        HierarchyKey::Session { .. } => "Session",
+        HierarchyKey::Process { .. } => "Process or Agent",
+    }
+}
+
+fn inspector_title(ui: &mut Ui, theme: &Theme, kind: &str, title: &str, state: Option<&str>) {
+    ui.label(RichText::new(title).color(theme.text).strong().size(16.0));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(kind)
+                .monospace()
+                .color(theme.text_dim)
+                .small(),
+        );
+        if let Some(state) = state {
+            ui.label(
+                RichText::new(state)
+                    .monospace()
+                    .color(theme.text_faint)
+                    .small(),
+            );
+        }
+    });
+}
+
+fn inspector_empty(ui: &mut Ui, theme: &Theme, value: &str) {
+    ui.label(RichText::new(value).color(theme.text_faint).small());
+}
+
+fn inspector_optional(ui: &mut Ui, theme: &Theme, label: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        inspector_value(ui, theme, label, value);
+    }
+}
+
+fn inspector_optional_owned(ui: &mut Ui, theme: &Theme, label: &str, value: Option<String>) {
+    if let Some(value) = value {
+        inspector_value(ui, theme, label, &value);
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn inspector_attention(ui: &mut Ui, theme: &Theme, policy: &AttentionPolicy) {
+    inspector_value(
+        ui,
+        theme,
+        "typing guard",
+        yes_no(policy.do_not_interrupt_while_typing),
+    );
+    inspector_value(
+        ui,
+        theme,
+        "focus only if idle",
+        yes_no(policy.focus_only_if_idle),
+    );
+    inspector_value(
+        ui,
+        theme,
+        "cooldown",
+        &format!("{}s", policy.cooldown_seconds),
+    );
+    inspector_value(ui, theme, "sound", &format!("{:?}", policy.sound));
+    inspector_value(
+        ui,
+        theme,
+        "failure actions",
+        &format!("{:?}", policy.on_failure),
+    );
+}
+
+fn inspector_history(ui: &mut Ui, theme: &Theme, history: &[InspectorEventView], now_ms: i64) {
+    inspector_section(ui, theme, "EVENT LOG & RECENT HISTORY");
+    if history.is_empty() {
+        inspector_empty(ui, theme, "No retained events for this context");
+        return;
+    }
+    for event in history {
+        ui.group(|ui| {
+            ui.label(RichText::new(&event.name).color(theme.text_dim).small());
+            if let Some(summary) = &event.summary {
+                ui.label(RichText::new(summary).color(theme.text).small());
+            }
+            let subject = event
+                .subject
+                .as_ref()
+                .map(|subject| format!(" · {subject}"))
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(format!(
+                    "{} ago · {} · {}{}",
+                    format_duration(now_ms.saturating_sub(event.timestamp_ms)),
+                    event.source,
+                    event.confidence.label(),
+                    subject
+                ))
+                .monospace()
+                .color(if event.confidence.is_provisional() {
+                    theme.provisional
+                } else {
+                    theme.text_faint
+                })
+                .small(),
+            );
+        });
+    }
+}
+
+fn inspector_handoffs(ui: &mut Ui, theme: &Theme, handoffs: &[InspectorHandoffView], now_ms: i64) {
+    inspector_section(ui, theme, "HANDOFFS");
+    if handoffs.is_empty() {
+        inspector_empty(ui, theme, "No retained handoff metadata");
+        return;
+    }
+    for handoff in handoffs {
+        inspector_value(
+            ui,
+            theme,
+            &handoff.direction,
+            &format!(
+                "{} · {} · {} · {} ago",
+                handoff.peer_name,
+                handoff.mode,
+                handoff.outcome,
+                format_duration(now_ms.saturating_sub(handoff.timestamp_ms))
+            ),
+        );
+    }
+}
+
+fn session_name(snapshot: &HierarchySnapshot, session_id: &SessionId) -> Option<String> {
+    snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| &session.session.id == session_id)
+        .map(|session| session.session.name.clone())
 }
 
 fn inspector_value(ui: &mut Ui, theme: &Theme, label: &str, value: &str) {

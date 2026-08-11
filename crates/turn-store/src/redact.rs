@@ -617,6 +617,13 @@ fn redact_strings(values: &[String]) -> Vec<String> {
 /// other user- or tool-supplied string is scanned here. Identifiers remain byte-for-byte
 /// stable so redaction can never break foreign keys.
 pub(crate) fn workspace_for_persistence(workspace: &Workspace) -> Workspace {
+    workspace_for_inspection(workspace)
+}
+
+/// Returns the free text a Workspace may expose in an inspector.
+/// Structural filesystem identity is preserved; configuration values and commands
+/// cross the same secret boundary as durable storage.
+pub fn workspace_for_inspection(workspace: &Workspace) -> Workspace {
     let mut safe = workspace.clone();
     safe.name = redact_secrets(&safe.name);
     safe.git_remote = redact_optional(&safe.git_remote);
@@ -632,6 +639,11 @@ pub(crate) fn workspace_for_persistence(workspace: &Workspace) -> Workspace {
 
 /// Returns the Session document that is allowed to cross the durable boundary.
 pub(crate) fn session_for_persistence(session: &Session) -> Session {
+    session_for_inspection(session)
+}
+
+/// Returns a Session safe to project into the contextual inspector.
+pub fn session_for_inspection(session: &Session) -> Session {
     let mut safe = session.clone();
     safe.name = redact_secrets(&safe.name);
     safe.note = redact_optional(&safe.note);
@@ -645,7 +657,7 @@ pub(crate) fn session_for_persistence(session: &Session) -> Session {
     safe.linked_ref = redact_optional(&safe.linked_ref);
     let mut tree = SessionTree::new();
     for node in safe.tree.iter() {
-        tree.insert(node_for_persistence(node));
+        tree.insert(node_for_inspection(node));
     }
     safe.tree = tree;
     safe
@@ -682,6 +694,13 @@ pub(crate) fn checkout_for_persistence(checkout: &WorkspaceCheckout) -> Workspac
 /// Returns a ProcessNode whose structural identity is intact and whose durable free
 /// text has been scanned for credentials.
 pub(crate) fn node_for_persistence(node: &ProcessNode) -> ProcessNode {
+    node_for_inspection(node)
+}
+
+/// Returns a Process/Agent record safe for the inspector. This intentionally
+/// shares the durable redaction boundary so a value cannot be safe in SQLite but
+/// leak through the window (or vice versa).
+pub fn node_for_inspection(node: &ProcessNode) -> ProcessNode {
     let mut safe = node.clone();
     safe.title = redact_secrets(&safe.title);
     safe.command = redact_secrets(&safe.command);
@@ -694,6 +713,8 @@ pub(crate) fn node_for_persistence(node: &ProcessNode) -> ProcessNode {
         .activity_preview
         .as_ref()
         .map(activity_preview_for_persistence);
+    safe.process_title = redact_optional(&safe.process_title);
+    safe.user_title = redact_optional(&safe.user_title);
     safe.env_highlights = redact_map(&safe.env_highlights);
     safe
 }

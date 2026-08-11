@@ -138,7 +138,8 @@ pub use search::{
 };
 pub use view::{
     AgentSummary, AttentionView, ContextHandoffMode, ContextHandoffText, ContextHandoffView,
-    HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
+    HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView, InspectorHandoffView,
+    InspectorOriginView, InspectorParentView, NodePaneCapability, NodePaneView, PaneFocusView,
     SessionDetails, SessionSummary, SessionTreeView, SettingsControl, SettingsEntry, SettingsLevel,
     SettingsView, TemplateSummary, TreeNodeView, TreeSurfaceState, WorkspaceSummary,
     WorkspaceTreeView,

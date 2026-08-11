@@ -205,6 +205,11 @@ pub enum Request {
         #[serde(default)]
         include_archived: bool,
     },
+    /// Fetches the optional contextual panel for exactly one hierarchy row.
+    /// Logs and configuration stay out of the always-live tree snapshot.
+    GetInspector {
+        key: HierarchyKey,
+    },
     /// Persists one expansion decision without broadcasting it to other windows.
     SetTreeExpanded {
         surface_id: String,
@@ -916,6 +921,7 @@ impl Request {
             Request::CloseWorkspace { .. } => "close_workspace",
             Request::DeleteWorkspace { .. } => "delete_workspace",
             Request::GetHierarchy { .. } => "get_hierarchy",
+            Request::GetInspector { .. } => "get_inspector",
             Request::SetTreeExpanded { .. } => "set_tree_expanded",
             Request::SelectTreeNode { .. } => "select_tree_node",
             Request::SetTreeExpandedAll { .. } => "set_tree_expanded_all",
@@ -1022,6 +1028,7 @@ impl Request {
             Request::CloseWorkspace { .. } | Request::DeleteWorkspace { .. } => "closed",
 
             Request::GetHierarchy { .. } => "hierarchy",
+            Request::GetInspector { .. } => "inspector",
             Request::SetTreeExpanded { .. }
             | Request::SelectTreeNode { .. }
             | Request::SetTreeExpandedAll { .. }
@@ -1134,6 +1141,7 @@ impl Request {
             self,
             Request::ListWorkspaces { .. }
                 | Request::GetHierarchy { .. }
+                | Request::GetInspector { .. }
                 | Request::GetWorkspaceWriteLease { .. }
                 | Request::ListSessions { .. }
                 | Request::GetSession { .. }

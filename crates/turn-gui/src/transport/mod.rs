@@ -32,7 +32,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc as tokio_mpsc;
 use turn_core::ids::{CheckoutId, HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
-use turn_proto::{CloseDisposition, ProtoError, Request, RequestId, Response, ServerEvent};
+use turn_proto::{
+    CloseDisposition, HierarchyKey, ProtoError, Request, RequestId, Response, ServerEvent,
+};
 
 pub use backoff::{ConnectionState, DaemonIdentity};
 pub use link::LinkError;
@@ -52,6 +54,7 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ask {
     Hierarchy,
+    Inspector(HierarchyKey),
     Workspaces,
     Sessions,
     Details(SessionId),
@@ -157,6 +160,7 @@ impl Ask {
     pub fn describing(&self) -> &str {
         match self {
             Ask::Hierarchy => "loading the workspace hierarchy",
+            Ask::Inspector(_) => "loading contextual details",
             Ask::Workspaces => "loading workspaces",
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",

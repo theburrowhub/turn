@@ -468,6 +468,7 @@ kind matters.
 | `op` | Fields | Answers with |
 | --- | --- | --- |
 | `get_hierarchy` | `surface_id`, `include_archived?` | `hierarchy` |
+| `get_inspector` | `key: HierarchyKey` | `inspector` |
 | `set_tree_expanded` | `surface_id`, `key: HierarchyKey`, `expanded` | `tree_state` |
 | `set_tree_expanded_all` | `surface_id`, `expanded` | `tree_state` |
 | `select_tree_node` | `surface_id`, `selected: HierarchyKey?` | `tree_state` |
@@ -487,6 +488,13 @@ kind matters.
 `get_process_tree` remain useful to administration, search and details, but composing them into a second
 navigation tree is a client bug. `HierarchySnapshot.revision` is monotonic for the daemon lifetime; after a
 revision gap or daemon identity change, request a full snapshot.
+
+`get_inspector` is an on-demand read for the selected hierarchy row. Its response identity must equal the
+requested `HierarchyKey`; a client discards a late answer after selection changes. Inspector history is
+bounded and redacted, environment values are never projected, and an inferred parent or origin retains its
+confidence instead of becoming a fact merely because it appears in a detail panel. Inspector data is not
+part of `HierarchySnapshot`, so opening one row does not make every hierarchy refresh carry logs and
+configuration.
 
 Presentation writes are per stable `surface_id`. They are not `TurnEvent`s, do not change active Session or
 Pane focus, and do not produce a broadcast. `move_tree_node` changes only the stable order of siblings; it
@@ -974,6 +982,7 @@ that might be stale. Failures never arrive as a response; they arrive as an
 | `workspaces` | `workspaces: [WorkspaceSummary]` |
 | `workspace` | `workspace: WorkspaceSummary` |
 | `hierarchy` | `snapshot: HierarchySnapshot` |
+| `inspector` | `details: InspectorDetails` |
 | `tree_state` | `state: TreeSurfaceState` |
 | `workspace_write_lease` | `workspace_id`, `lease?: WorkspaceWriteLease` |
 | `sessions` | `sessions: [SessionSummary]` |
@@ -1409,6 +1418,25 @@ Each `WorkspaceTreeView` contains `workspace`, `checkouts`, `write_lease?` and o
 state and badges, relationship confidence, preview, bindings and capability; the GUI does not join separate
 lists or infer missing values. A snapshot is a full replacement. `revision` rejects stale/out-of-order
 delivery and tells a client when to resynchronise.
+
+### `InspectorDetails` — optional contextual detail
+
+Tagged `workspace`, `session`, `agent` or `process`, and always returned only for one typed
+`HierarchyKey`:
+
+- Workspace detail carries the summary, checkout paths/branches/shared resources, write lease,
+  configuration, environment **names** and Attention policy.
+- Session detail carries mode, checkout, branch, Template, process/Attention counts, environment names and
+  bounded recent event history.
+- Agent detail carries the exact `TreeNodeView`, provider/tool/model/name, work and permission context,
+  metrics, a readable parent link, relationship confidence, process facts, origin, handoff metadata and
+  bounded recent event history.
+- Process detail carries the exact `TreeNodeView`, readable parent and confidence, PID/PPID/process group,
+  argv, cwd, lifecycle/exit, origin and bounded recent event history.
+
+Raw hook bodies, raw PTY output and environment values are not representable here. Parent links and origins
+carry `Confidence`; clients must label provisional values as inferred and navigate through the accompanying
+stable key rather than guessing from a display name.
 
 ### `SessionSummary` — one Session projection
 

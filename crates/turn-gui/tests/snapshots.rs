@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
-use turn_core::event::{AgentRef, Confidence, Risk};
+use turn_core::event::{AgentRef, Confidence, Risk, Severity};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
     ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane,
@@ -34,10 +34,10 @@ use turn_core::model::{
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
-    CloseDisposition, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView,
-    PaneRestoreOutcome, ProtoErrorContext, PtySize, SessionConflictAlternative, SessionSummary,
-    SessionTreeView, TemplateSummary, TreeNodeView, TreeSurfaceState, Welcome, WorkspaceSummary,
-    WorkspaceTreeView, WriteLeaseOwnerView,
+    CloseDisposition, HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView,
+    NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext, PtySize,
+    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
+    TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
@@ -89,6 +89,7 @@ struct Fixture {
     preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     temporary_pane: Option<NodePaneView>,
     temporary_previews: Vec<ActivityPreview>,
+    inspector: Option<InspectorDetails>,
     write_conflict: Option<ProtoErrorContext>,
     link_confirmation: Option<turn_gui::terminal::links::LinkRequest>,
     settings: Option<turn_proto::SettingsView>,
@@ -141,6 +142,7 @@ impl Fixture {
             layout: self.layout.clone(),
             panes,
             temporary_pane,
+            inspector: self.inspector.as_ref(),
             restore: self.restore.as_ref(),
             recovery_lease: self.recovery_lease.as_ref(),
             unreachable_processes: 0,
@@ -748,6 +750,58 @@ fn busy_desk() -> Fixture {
     }
 }
 
+fn workspace_inspector(fixture: &Fixture) -> InspectorDetails {
+    let branch = &fixture.hierarchy.as_ref().expect("hierarchy").workspaces[0];
+    let mut workspace = branch.workspace.clone();
+    workspace.git_remote = Some("github.com/theburrowhub/turn".into());
+    InspectorDetails::Workspace {
+        workspace: Box::new(workspace),
+        checkouts: branch.checkouts.clone(),
+        write_lease: branch.write_lease.clone(),
+        environment_keys: vec!["ANTHROPIC_API_KEY".into(), "RUST_LOG".into()],
+        init_commands: vec!["mise trust".into(), "cargo fetch".into()],
+        attention: Default::default(),
+    }
+}
+
+fn session_inspector(fixture: &Fixture) -> InspectorDetails {
+    let branch = &fixture.hierarchy.as_ref().expect("hierarchy").workspaces[0];
+    let session = branch.sessions[0].session.clone();
+    let checkout = branch
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == session.checkout_id)
+        .cloned();
+    InspectorDetails::Session {
+        workspace_name: branch.workspace.name.clone(),
+        session: Box::new(session.clone()),
+        checkout,
+        attention: Default::default(),
+        environment_keys: vec!["RUST_BACKTRACE".into()],
+        history: vec![InspectorEventView {
+            timestamp_ms: T0 + 12_000,
+            name: "agent.permission_required".into(),
+            subject: Some("Claude Code".into()),
+            summary: Some("Run cargo test -p physics".into()),
+            source: "claude-code hook · PermissionRequest".into(),
+            confidence: Confidence::Explicit,
+            severity: Severity::Warning,
+        }],
+    }
+}
+
+fn show_inspector(fixture: &mut Fixture, details: InspectorDetails) -> HierarchyKey {
+    let key = details.key();
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(key.clone());
+    fixture.inspector = Some(details);
+    key
+}
+
 fn restored_desk() -> Fixture {
     let mut fixture = busy_desk();
     fixture.permission = None;
@@ -1063,6 +1117,158 @@ fn group_labels(h: &Harness<'static, Window>) -> Vec<String> {
     h.query_all_by_role(egui::accesskit::Role::Group)
         .filter_map(|node| node.accesskit_node().label())
         .collect()
+}
+
+#[test]
+fn workspace_contextual_inspector_is_optional_accessible_and_not_a_second_tree() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let details = workspace_inspector(&fixture);
+    let key = show_inspector(&mut fixture, details);
+    let mut h = harness(fixture);
+    h.state_mut().state.inspector_open = true;
+    h.state_mut().state.inspector_key = Some(key);
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.query_all_by_role(egui::accesskit::Role::Tree).count(),
+        1,
+        "the inspector supplements the unified hierarchy; it never duplicates it"
+    );
+    let groups = group_labels(&h);
+    assert!(
+        groups
+            .iter()
+            .any(|label| label == "Contextual inspector for Workspace"),
+        "the optional panel is an explicitly named AccessKit context: {groups:?}"
+    );
+    let text = all_text(&h).join("\n");
+    for fact in [
+        "space-troopers",
+        "/Users/x/personal-workspace/space-troopers",
+        "github.com/theburrowhub/turn",
+        "Docker daemon",
+        "Fix climbing bugs",
+        "ANTHROPIC_API_KEY",
+    ] {
+        assert!(
+            text.contains(fact),
+            "missing Workspace fact {fact:?}: {text}"
+        );
+    }
+    assert!(h.query_by_label("Close inspector").is_some());
+    assert!(h.query_by_label("New session in this Workspace…").is_some());
+    h.snapshot("workspace_contextual_inspector");
+
+    h.query_by_label("Close inspector")
+        .expect("the panel is collapsible without leaving its context")
+        .click();
+    h.run_steps(1);
+    assert!(!h.state().state.inspector_open);
+}
+
+#[test]
+fn session_contextual_inspector_exposes_context_attention_and_safe_history() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let details = session_inspector(&fixture);
+    let key = show_inspector(&mut fixture, details);
+    let mut h = harness(fixture);
+    h.state_mut().state.inspector_open = true;
+    h.state_mut().state.inspector_key = Some(key);
+    h.run();
+    h.run();
+
+    assert_eq!(h.query_all_by_role(egui::accesskit::Role::Tree).count(), 1);
+    let groups = group_labels(&h);
+    assert!(
+        groups
+            .iter()
+            .any(|label| label == "Contextual inspector for Session"),
+        "the Session inspector has a navigable AccessKit context: {groups:?}"
+    );
+    let text = all_text(&h).join("\n");
+    for fact in [
+        "Fix climbing bugs",
+        "space-troopers",
+        "MAIN",
+        "fix/climbing-bugs",
+        "agent.permission_required",
+        "Claude Code",
+        "PermissionRequest",
+    ] {
+        assert!(text.contains(fact), "missing Session fact {fact:?}: {text}");
+    }
+    assert!(h.query_by_label("Close inspector").is_some());
+    h.snapshot("session_contextual_inspector");
+}
+
+#[test]
+fn a_narrow_contextual_inspector_becomes_an_accessible_overlay() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let details = session_inspector(&fixture);
+    let key = show_inspector(&mut fixture, details);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(820.0, 640.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window(fixture),
+        );
+    h.state_mut().state.inspector_open = true;
+    h.state_mut().state.inspector_key = Some(key);
+    h.run();
+    h.run();
+
+    assert!(group_labels(&h)
+        .iter()
+        .any(|label| label == "Contextual inspector for Session"));
+    assert!(h.query_by_label("Close inspector").is_some());
+    h.snapshot("session_contextual_inspector_narrow");
+}
+
+#[test]
+fn a_late_inspector_answer_is_never_presented_as_the_current_selection() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    fixture.inspector = Some(workspace_inspector(&fixture));
+    let session_id = fixture.hierarchy.as_ref().expect("hierarchy").workspaces[0].sessions[0]
+        .session
+        .id
+        .clone();
+    let selected = HierarchyKey::session(session_id);
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(selected.clone());
+    let mut h = harness(fixture);
+    h.state_mut().state.inspector_open = true;
+    h.state_mut().state.inspector_key = Some(selected);
+    h.run_steps(2);
+
+    let text = all_text(&h).join("\n");
+    assert!(text.contains("Loading…"));
+    assert!(
+        !text.contains("github.com/theburrowhub/turn"),
+        "a late Workspace response must not be relabelled as Session detail: {text}"
+    );
 }
 
 /// The toolbar that took the place of the `RESTORED SAFELY` strip.

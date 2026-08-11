@@ -22,9 +22,9 @@ use crate::geometry::PtySize;
 use crate::screen::PaneStream;
 use crate::search::SearchOutcome;
 use crate::view::{
-    AttentionView, ContextHandoffView, HierarchySnapshot, NodePaneView, PaneFocusView,
-    SessionDetails, SessionSummary, SettingsView, TemplateSummary, TreeNodeView, TreeSurfaceState,
-    WorkspaceSummary,
+    AttentionView, ContextHandoffView, HierarchySnapshot, InspectorDetails, NodePaneView,
+    PaneFocusView, SessionDetails, SessionSummary, SettingsView, TemplateSummary, TreeNodeView,
+    TreeSurfaceState, WorkspaceSummary,
 };
 
 /// What a client needs to rebuild a terminal on attach.
@@ -132,6 +132,10 @@ pub enum Response {
     /// Full replacement for the unified navigation projection.
     Hierarchy {
         snapshot: Box<HierarchySnapshot>,
+    },
+    /// On-demand detail for the optional contextual inspector.
+    Inspector {
+        details: Box<InspectorDetails>,
     },
     /// The daemon-authoritative state for one surface after expand/select.
     TreeState {
@@ -303,6 +307,7 @@ impl Response {
             Response::Workspaces { .. } => "workspaces",
             Response::Workspace { .. } => "workspace",
             Response::Hierarchy { .. } => "hierarchy",
+            Response::Inspector { .. } => "inspector",
             Response::TreeState { .. } => "tree_state",
             Response::WorkspaceWriteLease { .. } => "workspace_write_lease",
             Response::Sessions { .. } => "sessions",
@@ -338,6 +343,7 @@ impl Response {
         "workspaces",
         "workspace",
         "hierarchy",
+        "inspector",
         "tree_state",
         "workspace_write_lease",
         "sessions",
@@ -582,9 +588,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 29 result shapes. Asserted so adding one without documenting it in
+        // 30 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 29, "the response catalogue changed size");
+        assert_eq!(declared.len(), 30, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -637,9 +643,21 @@ pub(crate) mod tests {
             Response::Workspaces {
                 workspaces: vec![workspace.clone()],
             },
-            Response::Workspace { workspace },
+            Response::Workspace {
+                workspace: workspace.clone(),
+            },
             Response::Hierarchy {
                 snapshot: Box::new(HierarchySnapshot::empty("window-a", 7)),
+            },
+            Response::Inspector {
+                details: Box::new(InspectorDetails::Workspace {
+                    workspace: Box::new(workspace),
+                    checkouts: Vec::new(),
+                    write_lease: None,
+                    environment_keys: Vec::new(),
+                    init_commands: Vec::new(),
+                    attention: turn_core::attention::AttentionPolicy::default(),
+                }),
             },
             Response::TreeState {
                 state: TreeSurfaceState {
