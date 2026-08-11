@@ -15,6 +15,9 @@ const APP_ID: &str = "io.github.theburrowhub.turn";
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/turn-icon.png");
 
 fn main() -> eframe::Result {
+    if handle_release_command() {
+        return Ok(());
+    }
     turn_gui::logging::install();
 
     let explicit_socket = socket_from_arguments();
@@ -77,6 +80,139 @@ fn main() -> eframe::Result {
             )))
         }),
     )
+}
+
+/// Small non-window commands used by packaging and the installed updater.
+///
+/// They are handled before logging, companion discovery and `eframe`, so asking a
+/// bundle what it contains can never start a daemon or flash a window.
+fn handle_release_command() -> bool {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    match release_command(&arguments) {
+        Ok(None) => false,
+        Ok(Some(ReleaseCommand::Version)) => {
+            println!("turn {}", env!("CARGO_PKG_VERSION"));
+            true
+        }
+        Ok(Some(ReleaseCommand::BuildInfo)) => {
+            println!(
+                "component=turn version={} protocol_min={} protocol_max={}",
+                env!("CARGO_PKG_VERSION"),
+                turn_proto::MIN_PROTOCOL_VERSION,
+                turn_proto::PROTOCOL_VERSION
+            );
+            true
+        }
+        Ok(Some(ReleaseCommand::UpdateStatus { socket })) => {
+            let socket = match socket {
+                Some(socket) => absolute_argument(socket),
+                None => match socket::startup_paths(None) {
+                    Ok(paths) => paths.socket,
+                    Err(error) => {
+                        eprintln!("turn: could not resolve the daemon socket: {error}");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            match turn_gui::update::query_update_status(&socket) {
+                Ok(report) => println!("{}", update_status_line(&report)),
+                Err(error) if error.is_unavailable() => {
+                    eprintln!("turn: {error}");
+                    std::process::exit(3);
+                }
+                Err(error) => {
+                    eprintln!("turn: {error}");
+                    std::process::exit(2);
+                }
+            }
+            true
+        }
+        Err(error) => {
+            eprintln!("turn: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn update_status_line(report: &turn_gui::update::DaemonUpdateReport) -> String {
+    format!(
+        "daemon_running={} daemon_version={} daemon_pid={} protocol_min={} protocol_max={} active_ptys={}",
+        report.daemon_running,
+        report.daemon_version,
+        report.daemon_pid,
+        report.protocol_min,
+        report.protocol_max,
+        report.active_ptys
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseCommand {
+    Version,
+    BuildInfo,
+    UpdateStatus { socket: Option<PathBuf> },
+}
+
+fn release_command(arguments: &[std::ffi::OsString]) -> Result<Option<ReleaseCommand>, String> {
+    if arguments.len() == 1 && matches!(arguments[0].to_str(), Some("-V" | "--version")) {
+        return Ok(Some(ReleaseCommand::Version));
+    }
+    if arguments.len() == 1 && arguments[0] == "--build-info" {
+        return Ok(Some(ReleaseCommand::BuildInfo));
+    }
+    if !arguments
+        .iter()
+        .any(|argument| argument == "--update-status")
+    {
+        return Ok(None);
+    }
+
+    let mut socket = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--update-status" {
+            index += 1;
+            continue;
+        }
+        if argument == "--socket" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or_else(|| "`--socket` needs a path".to_string())?;
+            if value.to_string_lossy().starts_with('-') {
+                return Err("`--socket` needs a path".to_string());
+            }
+            socket = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(raw) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--socket="))
+        {
+            if raw.is_empty() {
+                return Err("`--socket` needs a path".to_string());
+            }
+            socket = Some(PathBuf::from(raw));
+            index += 1;
+            continue;
+        }
+        return Err(format!(
+            "unrecognised update-status argument `{}`",
+            argument.to_string_lossy()
+        ));
+    }
+    Ok(Some(ReleaseCommand::UpdateStatus { socket }))
+}
+
+fn absolute_argument(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(&path))
+            .unwrap_or(path)
+    }
 }
 
 fn native_options() -> eframe::NativeOptions {
@@ -174,6 +310,61 @@ mod tests {
         assert!(
             icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255),
             "the icon artwork must contain fully opaque pixels"
+        );
+    }
+
+    #[test]
+    fn release_commands_are_windowless_and_update_status_parses_both_socket_spellings() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            release_command(&[OsString::from("--build-info")]).unwrap(),
+            Some(ReleaseCommand::BuildInfo)
+        );
+
+        let status = update_status_line(&turn_gui::update::DaemonUpdateReport {
+            daemon_running: true,
+            daemon_version: "0.1.0".into(),
+            daemon_pid: 42,
+            protocol_min: 4,
+            protocol_max: 4,
+            active_ptys: 3,
+        });
+        assert_eq!(
+            status,
+            "daemon_running=true daemon_version=0.1.0 daemon_pid=42 protocol_min=4 protocol_max=4 active_ptys=3"
+        );
+        assert_eq!(
+            release_command(&[
+                OsString::from("--update-status"),
+                OsString::from("--socket"),
+                OsString::from("/tmp/turn.sock"),
+            ])
+            .unwrap(),
+            Some(ReleaseCommand::UpdateStatus {
+                socket: Some(PathBuf::from("/tmp/turn.sock")),
+            })
+        );
+        assert_eq!(
+            release_command(&[
+                OsString::from("--socket=/tmp/turn.sock"),
+                OsString::from("--update-status"),
+            ])
+            .unwrap(),
+            Some(ReleaseCommand::UpdateStatus {
+                socket: Some(PathBuf::from("/tmp/turn.sock")),
+            })
+        );
+        assert!(release_command(&[
+            OsString::from("--update-status"),
+            OsString::from("--socket"),
+        ])
+        .is_err());
+        assert_eq!(
+            release_command(&[OsString::from("--socket"), OsString::from("/tmp/gui.sock")])
+                .unwrap(),
+            None,
+            "the ordinary GUI socket argument is still handled by startup"
         );
     }
 }

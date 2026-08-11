@@ -78,10 +78,12 @@ Implemented today:
 - macOS-enforced read-only Sessions: shells, Agents and child processes can inspect a checkout while
   Seatbelt blocks writes to it and its external Git metadata; unsupported platforms keep processes stopped.
 - Automated macOS and Linux builds plus native UI snapshot coverage.
+- A version-checked macOS app bundle, hardened-runtime signing/notarization workflow,
+  arm64 and Intel release channels, and an updater that leaves compatible live daemons and PTYs alone.
 
-Still before a release-quality build:
+Still before a broadly signed-off release:
 
-- Signed installers, packaging, automatic updates, and a supported upgrade channel.
+- Publish and exercise the first Developer ID/notarized tag from a clean machine.
 - Broad authenticated acceptance against current agent CLI releases.
 - Manual packaged VoiceOver, Orca, and IME sign-off using the recorded accessibility checklist.
 
@@ -204,6 +206,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   appearance preferences, IME, TUI modes and bounded-output proof.
 - [Accessibility acceptance](docs/ACCESSIBILITY_ACCEPTANCE.md) — zoom, contrast, reduced motion,
   AccessKit/keyboard proof and reproducible VoiceOver/Orca/IME checklists.
+- [macOS release acceptance](docs/RELEASE.md) — bundle/sign/notarize pipeline, version checks,
+  architecture channels and daemon-safe updates.
 - [Template lifecycle acceptance](docs/TEMPLATE_ACCEPTANCE.md) — visual create/edit/capture,
   defaults, safe application, missing-tool visibility and deletion integrity.
 - [Contextual inspector acceptance](docs/INSPECTOR_ACCEPTANCE.md) — complete typed detail,

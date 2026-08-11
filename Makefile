@@ -116,6 +116,25 @@ accessibility-acceptance: ## Reproduce zoom, motion, contrast, AccessKit and IME
 	$(CARGO) test -p turn-gui --test snapshots the_custom_pane_editor_is_a_named_modal_dialog -- --test-threads=1
 	$(CARGO) test -p turn-gui --test snapshots a_write_lease_conflict_offers_only_explicit_safe_alternatives -- --test-threads=1
 
+.PHONY: release-acceptance
+release-acceptance: ## Prove version matching, update safety and the final macOS bundle
+	$(CARGO) test -p turn-proto request::tests -- --test-threads=1
+	$(CARGO) test -p turn-proto response::tests -- --test-threads=1
+	$(CARGO) test -p turn-gui update::tests --lib -- --test-threads=1
+	$(CARGO) test -p turnd update_status --lib -- --test-threads=1
+	bash -n scripts/package-macos-app.sh scripts/verify-macos-app.sh scripts/release-macos.sh scripts/install-macos-update.sh scripts/local-update-acceptance.sh
+	TURN_INSTALLER_VERSION_SELF_TEST=1 ./scripts/install-macos-update.sh
+	@if [ "$$(uname -s)" = Darwin ]; then \
+		set -e; \
+		tmp="$$(mktemp -d /tmp/turn-release-acceptance.XXXXXX)"; \
+		trap 'rm -rf "$$tmp"' EXIT; \
+		./scripts/package-macos-app.sh "$$tmp/Turn.app"; \
+		./scripts/verify-macos-app.sh "$$tmp/Turn.app"; \
+		./scripts/local-update-acceptance.sh "$$tmp/Turn.app" "$$tmp/update"; \
+	else \
+		echo "release-acceptance: macOS bundle/signature check runs in the macOS CI job"; \
+	fi
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }
@@ -143,10 +162,19 @@ release: ## Release build of the three binaries
 	@ls -la target/release/turnd target/release/turn target/release/turn-hook
 
 MACOS_APP ?= $(CURDIR)/dist/Turn.app
+MACOS_RELEASE_DIR ?= $(CURDIR)/dist
 
 .PHONY: macos-app
 macos-app: ## Build an ad-hoc signed local Turn.app for macOS acceptance
 	./scripts/package-macos-app.sh "$(MACOS_APP)"
+
+.PHONY: macos-release
+macos-release: ## Build, Developer ID sign, notarize and publish channel metadata locally
+	./scripts/release-macos.sh "$(MACOS_RELEASE_DIR)"
+
+.PHONY: install-macos-update
+install-macos-update: ## Install the stable macOS update without stopping a live daemon
+	./scripts/install-macos-update.sh
 
 # --- running it ---------------------------------------------------------------
 

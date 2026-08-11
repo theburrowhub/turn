@@ -37,10 +37,10 @@ cargo test --workspace --all-targets -- --test-threads=1
 Counts are intentionally not pinned here: every regression proof changes them. The release audit runs the
 workspace serially because PTY and loopback-hook tests allocate real operating-system resources.
 
-What is **not** done, so “built” is not read as “shippable”: the deterministic Reviewer vertical crosses
-daemon/store/protocol/GUI state and the real loopback Claude hook transport, but an authenticated installed
-Claude Code binary has not completed the manual native-window smoke test. Advanced tree management,
-performance measurement, packaging, Linux visual sign-off and IME remain; see `ROADMAP.md`.
+What is **not** done, so “built” is not read as “shippable”: measured performance, the authenticated
+packaged Claude vertical and the macOS release/update machinery now exist, but the first credentialed
+Developer ID tag, packaged assistive-technology sign-off and Linux visual/release acceptance remain; see
+`ROADMAP.md`.
 
 ---
 
@@ -53,8 +53,9 @@ because the whole point of the daemon is that the UI can go away.
 The desktop executable is also the zero-state bootstrapper, but not the daemon owner. It resolves one
 absolute data-directory/socket pair, reuses a reachable endpoint or starts a detached sibling `turnd`, then
 connects through the same protocol either way. The companion has an independent process lifetime: closing
-the window drops only its monitor, never the daemon or its PTYs. ADR-042 records the launch and packaging
-contract.
+or compatibly updating the window drops only its monitor, never the daemon or its PTYs. The installed bundle
+carries all three version-checked siblings and an authenticated `get_update_status` preflight; ADR-042
+records bootstrap and ADR-056 the release/update contract.
 
 ```
                      ┌──────────────────────────────────────────────────┐
@@ -1332,10 +1333,10 @@ never derives a state, hierarchy edge, rank, score or preview confidence; those 
 models (ADR-032). Only `Effect::focus` may move the user;
 `focus_deferred` and `focus_denied` are verdicts to report.
 
-Not built yet, stated plainly: tree search/filter/manual order, daemon-authoritative rename and relationship
-correction, permanent Pane placement choices, complete context menus, IME sign-off and packaging. AccessKit
-tests now require `Tree`/`TreeItem` roles for every hierarchy level and explicitly reject duplicate legacy
-`ListItem` navigation; screen-reader acceptance on real macOS/Linux assistive technology remains.
+Built now: tree search/filter/manual order, daemon-authoritative rename and relationship correction,
+permanent Pane placement, contextual actions, IME composition coverage and the macOS package/update path.
+AccessKit tests require `Tree`/`TreeItem` roles for every hierarchy level and explicitly reject duplicate
+legacy `ListItem` navigation. Screen-reader acceptance on real macOS/Linux assistive technology remains.
 
 ---
 

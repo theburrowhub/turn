@@ -7,13 +7,12 @@ for this run.
 
 ## Local macOS bundle
 
-`make macos-app` builds all three release binaries, lays them out as packaged siblings,
-copies the checked-in icon and `Info.plist`, ad-hoc signs the development bundle and
-verifies its nested signatures. The default output is `dist/Turn.app`; an existing
-bundle is never overwritten.
-
-This is deliberately an acceptance artifact, not the release artifact tracked by
-#19. It is not Developer ID signed or notarized and has no updater.
+`make macos-app` builds all three release binaries, verifies their versions/protocols,
+lays them out as packaged siblings, copies the checked-in icon and `Info.plist`, applies
+ad-hoc hardened-runtime signatures and verifies the sealed bundle. The default output
+is `dist/Turn.app`; an existing bundle is never overwritten. This is the credential-free
+acceptance form of the same topology the Developer ID/notarized tag workflow publishes;
+see [RELEASE.md](RELEASE.md) for the production archive and updater contract.
 
 ```sh
 make macos-app

@@ -25,6 +25,8 @@ pub struct Options {
     pub help: bool,
     /// Print the version and exit.
     pub version: bool,
+    /// Print machine-readable release compatibility and exit.
+    pub build_info: bool,
 }
 
 /// The usage text, printed for `--help` and for a bad invocation.
@@ -43,6 +45,7 @@ Options:
       --no-persist        Keep state in memory only; nothing survives this process
   -h, --help              Print this help
   -V, --version           Print the version
+      --build-info        Print component, version and protocol compatibility
 ";
 
 impl Options {
@@ -65,6 +68,7 @@ impl Options {
                 "--no-persist" => options.no_persist = true,
                 "-h" | "--help" => options.help = true,
                 "-V" | "--version" => options.version = true,
+                "--build-info" => options.build_info = true,
                 // `--flag=value` as well as `--flag value`, because both are what
                 // people type and rejecting one is a pointless surprise.
                 other => match other.split_once('=') {
@@ -153,6 +157,7 @@ mod tests {
         assert!(Options::parse(["--help"]).unwrap().help);
         assert!(Options::parse(["-V"]).unwrap().version);
         assert!(Options::parse(["--version"]).unwrap().version);
+        assert!(Options::parse(["--build-info"]).unwrap().build_info);
         assert!(Options::parse(["--no-persist"]).unwrap().no_persist);
     }
 

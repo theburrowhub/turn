@@ -128,7 +128,7 @@ pub use images::{
     MAX_IMAGE_CELL_ROWS, MAX_IMAGE_PIXELS, MAX_PLACED_IMAGES,
 };
 pub use request::{CloseDisposition, FocusTarget, NewPane, Request, RequestId};
-pub use response::{EscapedProcess, PaneAttachment, Response};
+pub use response::{EscapedProcess, PaneAttachment, Response, RuntimeUpdateStatus};
 pub use screen::{GridRow, PaneStream, ScreenUpdate};
 #[cfg(feature = "vt100")]
 pub use search::{history_grid, history_len, search_screen};

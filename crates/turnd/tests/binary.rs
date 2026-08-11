@@ -122,6 +122,20 @@ fn the_binary_reports_its_version_and_its_usage() {
     assert!(text.starts_with("turnd "), "got {text:?}");
     assert!(text.contains(env!("CARGO_PKG_VERSION")));
 
+    let build_info = Command::new(TURND)
+        .arg("--build-info")
+        .output()
+        .expect("turnd --build-info must run");
+    assert!(build_info.status.success());
+    let text = String::from_utf8_lossy(&build_info.stdout);
+    assert!(text.contains("component=turnd"), "got {text:?}");
+    assert!(text.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))));
+    assert!(text.contains(&format!(
+        "protocol_min={}",
+        turn_proto::MIN_PROTOCOL_VERSION
+    )));
+    assert!(text.contains(&format!("protocol_max={}", turn_proto::PROTOCOL_VERSION)));
+
     let help = Command::new(TURND)
         .arg("--help")
         .output()

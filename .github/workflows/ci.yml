@@ -135,3 +135,13 @@ jobs:
       # contract used by the Claude/Codex adapters.
       - name: Build release binaries
         run: cargo build --release --bin turnd --bin turn --bin turn-hook
+
+      # This is the exact bundle layout the Developer ID release job signs and
+      # notarizes. CI uses an ad-hoc identity so forks need no Apple secrets, but it
+      # still exercises hardened runtime signing, companion/version checks, the
+      # sealed release manifest and LaunchServices metadata on every PR.
+      - name: Package and verify the macOS app
+        if: runner.os == 'macOS'
+        run: |
+          ./scripts/package-macos-app.sh "$RUNNER_TEMP/Turn.app"
+          ./scripts/verify-macos-app.sh "$RUNNER_TEMP/Turn.app"

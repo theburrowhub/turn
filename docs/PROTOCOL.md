@@ -528,6 +528,19 @@ relationship or creates a Pane. `PaneFocusView.node_id` names the node represent
 not an input channel; a client may close that ephemeral view with `keep_processes` before focusing the
 resolved runtime Pane.
 
+### Release/update preflight
+
+| `op` | Fields | Answers with |
+| --- | --- | --- |
+| `get_update_status` | — | `update_status` |
+
+`update_status` carries `daemon_version`, `protocol_min`, `protocol_max` and `active_ptys`.
+It is an authenticated read used before replacing an installed app bundle. `active_ptys` counts the live
+PTY handles owned by this daemon; it is not reconstructed from saved Session or lifecycle state. An updater
+may replace only the UI while the release and daemon protocol windows overlap. If the windows do not
+overlap, any positive PTY count defers the update, and a zero count still requires an explicit daemon stop —
+there is no protocol request which silently restarts the daemon for an installer.
+
 ### Workspaces
 
 | `op` | Fields | Answers with |

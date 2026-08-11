@@ -31,6 +31,7 @@ pub mod spotlight;
 pub mod terminal;
 pub mod theme;
 pub mod transport;
+pub mod update;
 pub mod view;
 
 pub use theme::Theme;
