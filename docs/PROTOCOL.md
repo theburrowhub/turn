@@ -568,6 +568,8 @@ the process exited: its `Lifecycle` stays `orphaned`.
 | `rename_session` | `session_id`, `name` | `session` |
 | `archive_session` | `session_id`, `archived` | `session` |
 | `duplicate_session` | `session_id` — same shape, new identity, no processes | `session` |
+| `set_session_favourite` | `session_id`, `favourite` | `session` |
+| `set_session_pinned` | `session_id`, `pinned` | `session` |
 | `close_session` | `session_id`, `disposition` | `closed` |
 | `delete_session` | `session_id`, `disposition` | `closed` |
 | `get_session` | `session_id` | `session_details` |

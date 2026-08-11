@@ -47,10 +47,10 @@ use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    LayoutEditorOrigin, LayoutTemplateDraft, LifecycleConfirmation, PaneContent,
-    PanePlacementDraft, PanePlacementSource, PendingPermission, QueueItem, SessionDraft,
-    SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState,
-    WorkspaceDraft,
+    CloseTurnChoice, CloseTurnDraft, CloseTurnSession, LayoutEditorOrigin, LayoutTemplateDraft,
+    LifecycleConfirmation, PaneContent, PanePlacementDraft, PanePlacementSource, PendingPermission,
+    QueueItem, SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView,
+    ViewAction, ViewState, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -2459,6 +2459,35 @@ fn ending_a_session_requires_confirmation_and_requests_process_termination() {
         vec![ViewAction::CloseSession {
             session_id,
             disposition: CloseDisposition::Terminate,
+        }]
+    );
+}
+
+#[test]
+fn close_turn_defaults_to_closing_only_the_window() {
+    let fixture = busy_desk();
+    let session_id = fixture.selected.clone().expect("selected Session");
+    let mut h = harness(fixture);
+    h.state_mut().state.close_turn = Some(CloseTurnDraft {
+        choice: CloseTurnChoice::KeepRunning,
+        sessions: vec![CloseTurnSession {
+            session_id,
+            name: "Fix climbing bugs".into(),
+            running_count: 6,
+            stop: false,
+        }],
+    });
+    h.run();
+    h.state_mut().actions.clear();
+
+    h.query_by_label("Close · keep running")
+        .expect("the default action explicitly preserves work")
+        .click();
+    h.run_steps(1);
+    assert_eq!(
+        h.state().actions,
+        vec![ViewAction::CloseTurn {
+            stop_sessions: Vec::new(),
         }]
     );
 }

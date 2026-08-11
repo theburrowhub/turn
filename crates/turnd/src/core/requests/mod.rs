@@ -263,6 +263,13 @@ impl Core {
                 archived,
             } => self.archive_session(&session_id, archived, now_ms),
             Request::DuplicateSession { session_id } => self.duplicate_session(&session_id, now_ms),
+            Request::SetSessionFavourite {
+                session_id,
+                favourite,
+            } => self.set_session_favourite(&session_id, favourite, now_ms),
+            Request::SetSessionPinned { session_id, pinned } => {
+                self.set_session_pinned(&session_id, pinned, now_ms)
+            }
             Request::CloseSession {
                 session_id,
                 disposition,

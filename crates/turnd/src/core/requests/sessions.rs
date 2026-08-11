@@ -817,6 +817,30 @@ impl Core {
         self.answer_session(&new_id, now_ms)
     }
 
+    pub(super) fn set_session_favourite(
+        &mut self,
+        id: &SessionId,
+        favourite: bool,
+        now_ms: i64,
+    ) -> Answer {
+        self.session_mut(id)?.favourite = favourite;
+        self.persist_session(id)?;
+        self.push_session_state(id, now_ms);
+        self.answer_session(id, now_ms)
+    }
+
+    pub(super) fn set_session_pinned(
+        &mut self,
+        id: &SessionId,
+        pinned: bool,
+        now_ms: i64,
+    ) -> Answer {
+        self.session_mut(id)?.pinned = pinned;
+        self.persist_session(id)?;
+        self.push_session_state(id, now_ms);
+        self.answer_session(id, now_ms)
+    }
+
     /// Closes a session, doing exactly what the disposition says.
     ///
     /// There is no default for a reason: the whole point of the daemon is that
@@ -2543,6 +2567,45 @@ mod tests {
             .expect("unarchiving must replace the navigation projection");
         assert_eq!(restored.revision, archived.revision + 1);
         assert_eq!(restored.workspaces[0].sessions[0].session.id, session_id);
+    }
+
+    #[tokio::test]
+    async fn favourite_and_pin_are_durable_independent_session_choices() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_shortcuts");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_shortcuts"),
+            10,
+        );
+
+        let favourite = harness
+            .core
+            .set_session_favourite(&session_id, true, 11)
+            .unwrap();
+        let Response::Session { session } = favourite else {
+            panic!("favorite must return the changed Session")
+        };
+        assert!(session.favourite);
+        assert!(!session.pinned);
+
+        let pinned = harness
+            .core
+            .set_session_pinned(&session_id, true, 12)
+            .unwrap();
+        let Response::Session { session } = pinned else {
+            panic!("pin must return the changed Session")
+        };
+        assert!(session.favourite && session.pinned);
+
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .expect("the Session stays durable");
+        assert!(stored.favourite && stored.pinned);
     }
 
     #[tokio::test]

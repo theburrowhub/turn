@@ -77,6 +77,17 @@ inspector-acceptance: ## Reproduce contextual Workspace, Session, Agent and Proc
 	$(CARGO) test -p turn-gui inspector --lib -- --test-threads=$(TEST_THREADS)
 	$(CARGO) test -p turn-gui --test snapshots inspector -- --test-threads=$(TEST_THREADS)
 
+.PHONY: lifecycle-acceptance
+lifecycle-acceptance: ## Reproduce Command Palette and Workspace/Session lifecycle behaviour
+	$(CARGO) test -p turn-proto request::tests -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd favourite_and_pin_are_durable --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd ending_a_session --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd outlived --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turnd lease --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui session_lifecycle_commands --lib -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui close_turn_defaults -- --test-threads=$(TEST_THREADS)
+	$(CARGO) test -p turn-gui palette_hierarchy_commands --lib -- --test-threads=$(TEST_THREADS)
+
 .PHONY: test-crate
 test-crate: ## Test one crate: make test-crate CRATE=turn-core
 	@test -n "$(CRATE)" || { echo "set CRATE, e.g. make test-crate CRATE=turn-core"; exit 1; }

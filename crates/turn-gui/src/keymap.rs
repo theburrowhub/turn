@@ -42,7 +42,10 @@ pub enum Command {
     OpenSettings,
 
     NewWorkspace,
+    RenameWorkspace,
+    DuplicateWorkspace,
     ArchiveWorkspace,
+    RestoreWorkspace,
     CloseWorkspace,
     DeleteWorkspace,
     NewSession,
@@ -51,7 +54,13 @@ pub enum Command {
     NextSession,
     PreviousSession,
     RenameSession,
+    DuplicateSession,
     ArchiveSession,
+    RestoreSession,
+    ToggleFavouriteSession,
+    TogglePinSession,
+    MoveSessionUp,
+    MoveSessionDown,
     CloseSession,
     DeleteSession,
     SaveLayoutAsTemplate,
@@ -84,6 +93,14 @@ pub enum Command {
     StopProcess,
 
     FocusWorkspaceTree,
+    SearchWorkspaceTree,
+    QuickPreview,
+    OpenNode,
+    ToggleAttentionFilter,
+    ToggleRunningFilter,
+    ToggleFailedFilter,
+    ToggleArchivedFilter,
+    ClearWorkspaceTreeFilters,
     ToggleInspector,
     ExpandWorkspaceTree,
     CollapseWorkspaceTree,
@@ -97,6 +114,8 @@ impl Command {
     pub const ALL: &'static [Command] = &[
         Command::OpenPalette,
         Command::NewWorkspace,
+        Command::RenameWorkspace,
+        Command::DuplicateWorkspace,
         Command::NewSession,
         Command::QuickNewSession,
         Command::SwitchSession,
@@ -125,18 +144,33 @@ impl Command {
         Command::SaveLayoutAsTemplate,
         Command::ApplyTemplate,
         Command::RenameSession,
+        Command::DuplicateSession,
+        Command::ToggleFavouriteSession,
+        Command::TogglePinSession,
+        Command::MoveSessionUp,
+        Command::MoveSessionDown,
         // The Session pair before the Workspace pair, so a search for `archive` or
         // `close` offers the narrower target first: closing a Workspace stops every
         // Session in it, and the palette should not put that at the top of the list.
         Command::ArchiveSession,
+        Command::RestoreSession,
         Command::CloseSession,
         Command::DeleteSession,
         Command::ArchiveWorkspace,
+        Command::RestoreWorkspace,
         Command::CloseWorkspace,
         Command::DeleteWorkspace,
         Command::InterruptProcess,
         Command::StopProcess,
         Command::FocusWorkspaceTree,
+        Command::SearchWorkspaceTree,
+        Command::QuickPreview,
+        Command::OpenNode,
+        Command::ToggleAttentionFilter,
+        Command::ToggleRunningFilter,
+        Command::ToggleFailedFilter,
+        Command::ToggleArchivedFilter,
+        Command::ClearWorkspaceTreeFilters,
         Command::ToggleInspector,
         Command::ExpandWorkspaceTree,
         Command::CollapseWorkspaceTree,
@@ -153,7 +187,10 @@ impl Command {
             Command::ShowKeyboardShortcuts => "help.keys",
             Command::OpenSettings => "app.settings",
             Command::NewWorkspace => "workspace.new",
+            Command::RenameWorkspace => "workspace.rename",
+            Command::DuplicateWorkspace => "workspace.duplicate",
             Command::ArchiveWorkspace => "workspace.archive",
+            Command::RestoreWorkspace => "workspace.restore",
             Command::CloseWorkspace => "workspace.close",
             Command::DeleteWorkspace => "workspace.delete",
             Command::NewSession => "session.new",
@@ -162,7 +199,13 @@ impl Command {
             Command::NextSession => "session.next",
             Command::PreviousSession => "session.previous",
             Command::RenameSession => "session.rename",
+            Command::DuplicateSession => "session.duplicate",
             Command::ArchiveSession => "session.archive",
+            Command::RestoreSession => "session.restore",
+            Command::ToggleFavouriteSession => "session.toggleFavourite",
+            Command::TogglePinSession => "session.togglePin",
+            Command::MoveSessionUp => "session.moveUp",
+            Command::MoveSessionDown => "session.moveDown",
             Command::CloseSession => "session.close",
             Command::DeleteSession => "session.delete",
             Command::SaveLayoutAsTemplate => "layout.saveAsTemplate",
@@ -190,6 +233,14 @@ impl Command {
             Command::InterruptProcess => "process.interrupt",
             Command::StopProcess => "process.stop",
             Command::FocusWorkspaceTree => "view.focusTree",
+            Command::SearchWorkspaceTree => "view.searchTree",
+            Command::QuickPreview => "view.quickPreview",
+            Command::OpenNode => "view.openNode",
+            Command::ToggleAttentionFilter => "view.filterAttention",
+            Command::ToggleRunningFilter => "view.filterRunning",
+            Command::ToggleFailedFilter => "view.filterFailed",
+            Command::ToggleArchivedFilter => "view.filterArchived",
+            Command::ClearWorkspaceTreeFilters => "view.clearTreeFilters",
             Command::ToggleInspector => "view.toggleInspector",
             Command::ExpandWorkspaceTree => "view.expandTree",
             Command::CollapseWorkspaceTree => "view.collapseTree",
@@ -205,9 +256,12 @@ impl Command {
             Command::ShowKeyboardShortcuts => "Keyboard shortcuts",
             Command::OpenSettings => "Settings",
             Command::NewWorkspace => "New workspace",
+            Command::RenameWorkspace => "Rename workspace…",
+            Command::DuplicateWorkspace => "Duplicate workspace settings",
             Command::ArchiveWorkspace => {
                 "Archive workspace — take it out of the tree, stop nothing"
             }
+            Command::RestoreWorkspace => "Restore workspace to the tree",
             Command::CloseWorkspace => {
                 "Stop all sessions in workspace — the Workspace itself stays in the tree"
             }
@@ -221,7 +275,13 @@ impl Command {
             Command::NextSession => "Next session",
             Command::PreviousSession => "Previous session",
             Command::RenameSession => "Rename session",
+            Command::DuplicateSession => "Duplicate session — same layout, no live processes",
             Command::ArchiveSession => "Archive session — take it out of the tree, stop nothing",
+            Command::RestoreSession => "Restore session to the tree",
+            Command::ToggleFavouriteSession => "Favorite or unfavorite session",
+            Command::TogglePinSession => "Pin or unpin session",
+            Command::MoveSessionUp => "Move session up in its workspace",
+            Command::MoveSessionDown => "Move session down in its workspace",
             Command::CloseSession => {
                 "End session — stop its processes and take its row out of the tree"
             }
@@ -253,6 +313,14 @@ impl Command {
             Command::InterruptProcess => "Interrupt the process in this pane",
             Command::StopProcess => "Stop the process in this pane",
             Command::FocusWorkspaceTree => "Focus the workspace tree",
+            Command::SearchWorkspaceTree => "Search the workspace tree",
+            Command::QuickPreview => "Quick Preview the selected process",
+            Command::OpenNode => "Open the selected process in a temporary pane",
+            Command::ToggleAttentionFilter => "Toggle the Attention tree filter",
+            Command::ToggleRunningFilter => "Toggle the Running tree filter",
+            Command::ToggleFailedFilter => "Toggle the Failed tree filter",
+            Command::ToggleArchivedFilter => "Toggle the Archived tree filter",
+            Command::ClearWorkspaceTreeFilters => "Clear all workspace tree filters",
             Command::ToggleInspector => "Show or hide the contextual inspector",
             Command::ExpandWorkspaceTree => "Expand the complete workspace tree",
             Command::CollapseWorkspaceTree => "Collapse the complete workspace tree",
@@ -268,11 +336,22 @@ impl Command {
             | Command::ShowKeyboardShortcuts
             | Command::OpenSettings
             | Command::FocusWorkspaceTree
+            | Command::SearchWorkspaceTree
+            | Command::QuickPreview
+            | Command::OpenNode
+            | Command::ToggleAttentionFilter
+            | Command::ToggleRunningFilter
+            | Command::ToggleFailedFilter
+            | Command::ToggleArchivedFilter
+            | Command::ClearWorkspaceTreeFilters
             | Command::ToggleInspector
             | Command::ExpandWorkspaceTree
             | Command::CollapseWorkspaceTree => "View",
             Command::NewWorkspace
+            | Command::RenameWorkspace
+            | Command::DuplicateWorkspace
             | Command::ArchiveWorkspace
+            | Command::RestoreWorkspace
             | Command::CloseWorkspace
             | Command::DeleteWorkspace => "Workspace",
             Command::NewSession
@@ -281,7 +360,13 @@ impl Command {
             | Command::NextSession
             | Command::PreviousSession
             | Command::RenameSession
+            | Command::DuplicateSession
             | Command::ArchiveSession
+            | Command::RestoreSession
+            | Command::ToggleFavouriteSession
+            | Command::TogglePinSession
+            | Command::MoveSessionUp
+            | Command::MoveSessionDown
             | Command::CloseSession
             | Command::DeleteSession
             | Command::SaveLayoutAsTemplate
@@ -713,6 +798,8 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
         Chord::cmd_alt(Key::N),
     ),
     shared(Command::QuickNewSession, Chord::cmd_shift(Key::N)),
+    shared(Command::RenameWorkspace, Chord::cmd_alt_shift(Key::R)),
+    shared(Command::DuplicateWorkspace, Chord::cmd_alt_shift(Key::D)),
     // Ctrl+P is previous-history.
     split(
         Command::SwitchSession,
@@ -757,7 +844,16 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     shared(Command::LaunchTui, Chord::cmd_shift(Key::U)),
     shared(Command::SaveLayoutAsTemplate, Chord::cmd_shift(Key::S)),
     shared(Command::RenameSession, Chord::cmd_shift(Key::R)),
+    shared(Command::DuplicateSession, Chord::cmd_shift(Key::D)),
+    shared(
+        Command::ToggleFavouriteSession,
+        Chord::cmd_alt_shift(Key::F),
+    ),
+    shared(Command::TogglePinSession, Chord::cmd_alt_shift(Key::P)),
+    shared(Command::MoveSessionUp, Chord::alt_shift(Key::PageUp)),
+    shared(Command::MoveSessionDown, Chord::alt_shift(Key::PageDown)),
     shared(Command::ArchiveSession, Chord::cmd_shift(Key::Y)),
+    shared(Command::RestoreSession, Chord::cmd_shift(Key::H)),
     shared(Command::CloseSession, Chord::cmd_shift(Key::K)),
     // One level up is the same gesture plus Option: whatever `Mod+Shift+…` does to the
     // selected Session, `Mod+Opt+Shift+…` does to its whole Workspace. Nothing to learn
@@ -765,12 +861,28 @@ pub const DEFAULT_BINDINGS: &[Binding] = &[
     // `the_workspace_level_of_a_lifecycle_command_is_the_session_chord_plus_option` keeps
     // the pairing true.
     shared(Command::ArchiveWorkspace, Chord::cmd_alt_shift(Key::Y)),
+    shared(Command::RestoreWorkspace, Chord::cmd_alt_shift(Key::U)),
     shared(Command::CloseWorkspace, Chord::cmd_alt_shift(Key::K)),
     // Not Ctrl+C: that belongs to the process and always will. This sends the
     // interrupt through the tty to the whole foreground group.
     shared(Command::InterruptProcess, Chord::cmd_shift(Key::Period)),
     shared(Command::StopProcess, Chord::cmd_shift(Key::Comma)),
     shared(Command::FocusWorkspaceTree, Chord::cmd_shift(Key::T)),
+    split(
+        Command::SearchWorkspaceTree,
+        Chord::cmd(Key::F),
+        Chord::cmd_alt(Key::F),
+    ),
+    shared(Command::QuickPreview, Chord::cmd_alt(Key::Space)),
+    shared(Command::OpenNode, Chord::cmd_alt(Key::Enter)),
+    shared(Command::ToggleAttentionFilter, Chord::cmd_alt_shift(Key::A)),
+    shared(Command::ToggleRunningFilter, Chord::cmd_alt_shift(Key::G)),
+    shared(Command::ToggleFailedFilter, Chord::cmd_alt_shift(Key::E)),
+    shared(Command::ToggleArchivedFilter, Chord::cmd_alt_shift(Key::H)),
+    shared(
+        Command::ClearWorkspaceTreeFilters,
+        Chord::cmd_alt_shift(Key::C),
+    ),
     shared(Command::ToggleInspector, Chord::cmd_shift(Key::I)),
     shared(
         Command::ExpandWorkspaceTree,

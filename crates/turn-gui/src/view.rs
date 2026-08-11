@@ -541,6 +541,8 @@ pub struct ViewState {
     pub tree_expansion: HashMap<HierarchyKey, bool>,
     /// Whether navigation keys belong to the hierarchy rather than the terminal.
     pub tree_has_focus: bool,
+    /// One-shot focus request used by the palette's Search command.
+    pub request_tree_search_focus: bool,
     /// A read-only overlay. Opening it never changes the pane layout or terminal focus.
     pub quick_preview: Option<HierarchyKey>,
     /// Confirmation for stopping a whole Session or Workspace. Process-row stop remains
@@ -550,6 +552,10 @@ pub struct ViewState {
     pub context_handoff: Option<ContextHandoffDraft>,
     /// Explicit editor for the two audited Agent corrections.
     pub node_edit: Option<NodeEditDraft>,
+    /// Real Workspace/Session naming form. Names are never invented by a command.
+    pub entity_edit: Option<EntityEditDraft>,
+    /// Explicit policy choice when the native window asks to close while work runs.
+    pub close_turn: Option<CloseTurnDraft>,
     /// One placement decision shared by opening a Process and promoting its
     /// temporary view. It is local until Open is pressed.
     pub pane_placement: Option<PanePlacementDraft>,
@@ -605,6 +611,8 @@ impl ViewState {
             || self.lifecycle_confirmation.is_some()
             || self.context_handoff.is_some()
             || self.node_edit.is_some()
+            || self.entity_edit.is_some()
+            || self.close_turn.is_some()
             || self.pane_placement.is_some()
             || self.new_pane.is_some()
     }
@@ -621,6 +629,103 @@ impl ViewState {
     fn push_hierarchy_action(&mut self, action: HierarchyAction) {
         self.hierarchy_actions.push(action);
     }
+
+    /// Executes the hierarchy commands shared by shortcuts and the palette.
+    /// Returns `Ok(false)` for commands owned by another surface.
+    pub fn run_hierarchy_command(&mut self, command: Command) -> Result<bool, String> {
+        if command == Command::SearchWorkspaceTree {
+            self.request_tree_search_focus = true;
+            self.tree_has_focus = true;
+            return Ok(true);
+        }
+        if !matches!(
+            command,
+            Command::QuickPreview
+                | Command::OpenNode
+                | Command::ToggleAttentionFilter
+                | Command::ToggleRunningFilter
+                | Command::ToggleFailedFilter
+                | Command::ToggleArchivedFilter
+                | Command::ClearWorkspaceTreeFilters
+                | Command::MoveSessionUp
+                | Command::MoveSessionDown
+        ) {
+            return Ok(false);
+        }
+        let Some(snapshot) = self.hierarchy.clone() else {
+            return Err("the workspace tree is still loading".into());
+        };
+        let selected = self
+            .selected_tree
+            .clone()
+            .or_else(|| snapshot.tree_state.selected.clone());
+        match command {
+            Command::QuickPreview | Command::OpenNode => {
+                let Some(node) = selected_process(&snapshot, selected.as_ref()) else {
+                    return Err("select an Agent or Process in the tree first".into());
+                };
+                let key = HierarchyKey::process(node.node_id.clone());
+                if command == Command::QuickPreview {
+                    self.quick_preview = Some(key);
+                    self.push_hierarchy_action(HierarchyAction::QuickPreview {
+                        surface_id: snapshot.tree_state.surface_id.clone(),
+                        session_id: node.session_id.clone(),
+                        node_id: node.node_id.clone(),
+                    });
+                } else {
+                    self.push_hierarchy_action(HierarchyAction::OpenTemporaryPane {
+                        surface_id: snapshot.tree_state.surface_id.clone(),
+                        session_id: node.session_id.clone(),
+                        node_id: node.node_id.clone(),
+                    });
+                }
+                Ok(true)
+            }
+            Command::ToggleAttentionFilter
+            | Command::ToggleRunningFilter
+            | Command::ToggleFailedFilter
+            | Command::ToggleArchivedFilter => {
+                let filter = match command {
+                    Command::ToggleAttentionFilter => TreeFilter::Attention,
+                    Command::ToggleRunningFilter => TreeFilter::Running,
+                    Command::ToggleFailedFilter => TreeFilter::Failed,
+                    Command::ToggleArchivedFilter => TreeFilter::Archived,
+                    _ => unreachable!(),
+                };
+                if !self.tree_filters.remove(&filter) {
+                    self.tree_filters.insert(filter);
+                }
+                push_tree_presentation(self, &snapshot);
+                Ok(true)
+            }
+            Command::ClearWorkspaceTreeFilters => {
+                self.tree_filters.clear();
+                push_tree_presentation(self, &snapshot);
+                Ok(true)
+            }
+            Command::MoveSessionUp | Command::MoveSessionDown => {
+                let key = match selected {
+                    Some(key @ HierarchyKey::Session { .. }) => key,
+                    Some(key @ HierarchyKey::Process { .. }) => {
+                        selected_process(&snapshot, Some(&key))
+                            .map(|node| HierarchyKey::session(node.session_id.clone()))
+                            .ok_or_else(|| "select a Session in the tree first".to_string())?
+                    }
+                    _ => return Err("select a Session in the tree first".into()),
+                };
+                if !move_hierarchy_key(self, &snapshot, key, command == Command::MoveSessionUp) {
+                    return Err(if command == Command::MoveSessionUp {
+                        "this Session is already first in its Workspace"
+                    } else {
+                        "this Session is already last in its Workspace"
+                    }
+                    .into());
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -636,6 +741,40 @@ pub enum NodeEditDraft {
         parent_node_id: Option<NodeId>,
         relationship_kind: RelationshipKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityEditDraft {
+    Workspace {
+        workspace_id: WorkspaceId,
+        name: String,
+    },
+    Session {
+        session_id: SessionId,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseTurnSession {
+    pub session_id: SessionId,
+    pub name: String,
+    pub running_count: usize,
+    pub stop: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CloseTurnChoice {
+    #[default]
+    KeepRunning,
+    StopAll,
+    AskPerSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseTurnDraft {
+    pub choice: CloseTurnChoice,
+    pub sessions: Vec<CloseTurnSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1213,6 +1352,17 @@ pub enum ViewAction {
         session_id: SessionId,
         node_id: NodeId,
         name: String,
+    },
+    RenameWorkspace {
+        workspace_id: WorkspaceId,
+        name: String,
+    },
+    RenameSession {
+        session_id: SessionId,
+        name: String,
+    },
+    CloseTurn {
+        stop_sessions: Vec<SessionId>,
     },
     CorrectRelationship {
         session_id: SessionId,
@@ -2773,7 +2923,9 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.pane_placement.is_some() {
+        if state.close_turn.is_some() {
+            actions.extend(self.close_turn_overlay(ui, theme, state, full));
+        } else if state.pane_placement.is_some() {
             actions.extend(self.pane_placement_overlay(ui, theme, state, full));
         } else if state.new_pane.is_some() {
             actions.extend(self.new_pane_overlay(ui, theme, state, full));
@@ -2783,6 +2935,8 @@ impl<'a> TurnView<'a> {
             } else {
                 state.node_edit = None;
             }
+        } else if state.entity_edit.is_some() {
+            actions.extend(self.entity_edit_overlay(ui, theme, state, full));
         } else if state.context_handoff.is_some() {
             if let Some(snapshot) = hierarchy.as_ref() {
                 actions.extend(self.context_handoff_overlay(ui, theme, snapshot, state, full));
@@ -3033,6 +3187,224 @@ impl<'a> TurnView<'a> {
         if !cancel {
             state.new_pane = Some(draft);
         }
+        Vec::new()
+    }
+
+    fn close_turn_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let Some(mut draft) = state.close_turn.take() else {
+            return Vec::new();
+        };
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        let mut submit = false;
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                560.0_f32.min((full.width() - 32.0).max(320.0)),
+                430.0_f32.min((full.height() - 32.0).max(280.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "close-turn"), |ui| {
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_modal();
+                node.set_label("Close Turn");
+            });
+            ui.heading("Close Turn?");
+            ui.label(
+                RichText::new(
+                    "Closing the window never has to end your work. Choose what happens to the running Sessions.",
+                )
+                .color(theme.text_dim),
+            );
+            ui.add_space(10.0);
+            ui.radio_value(
+                &mut draft.choice,
+                CloseTurnChoice::KeepRunning,
+                "Keep everything running",
+            )
+            .on_hover_text("The window closes; the daemon and every process continue.");
+            ui.radio_value(
+                &mut draft.choice,
+                CloseTurnChoice::StopAll,
+                "Stop all running Sessions",
+            );
+            ui.radio_value(
+                &mut draft.choice,
+                CloseTurnChoice::AskPerSession,
+                "Choose per Session",
+            );
+            if draft.choice == CloseTurnChoice::AskPerSession {
+                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("close-turn-sessions")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        for session in &mut draft.sessions {
+                            ui.checkbox(
+                                &mut session.stop,
+                                format!(
+                                    "Stop {} · {} running process{}",
+                                    session.name,
+                                    session.running_count,
+                                    if session.running_count == 1 { "" } else { "es" }
+                                ),
+                            );
+                        }
+                    });
+            } else {
+                ui.add_space(18.0);
+                let running: usize = draft.sessions.iter().map(|session| session.running_count).sum();
+                ui.label(
+                    RichText::new(format!(
+                        "{} Session{} · {} running process{}",
+                        draft.sessions.len(),
+                        if draft.sessions.len() == 1 { "" } else { "s" },
+                        running,
+                        if running == 1 { "" } else { "es" }
+                    ))
+                    .color(theme.text_faint),
+                );
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    let label = match draft.choice {
+                        CloseTurnChoice::KeepRunning => "Close · keep running",
+                        CloseTurnChoice::StopAll => "Stop all, then close",
+                        CloseTurnChoice::AskPerSession => "Apply choices, then close",
+                    };
+                    if ui.button(label).clicked() {
+                        submit = true;
+                    }
+                });
+            });
+        });
+
+        if cancel {
+            return Vec::new();
+        }
+        if submit {
+            let stop_sessions = match draft.choice {
+                CloseTurnChoice::KeepRunning => Vec::new(),
+                CloseTurnChoice::StopAll => draft
+                    .sessions
+                    .into_iter()
+                    .map(|session| session.session_id)
+                    .collect(),
+                CloseTurnChoice::AskPerSession => draft
+                    .sessions
+                    .into_iter()
+                    .filter(|session| session.stop)
+                    .map(|session| session.session_id)
+                    .collect(),
+            };
+            return vec![ViewAction::CloseTurn { stop_sessions }];
+        }
+        state.close_turn = Some(draft);
+        Vec::new()
+    }
+
+    fn entity_edit_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let Some(mut draft) = state.entity_edit.take() else {
+            return Vec::new();
+        };
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        let mut submit = false;
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                460.0_f32.min((full.width() - 32.0).max(300.0)),
+                220.0_f32.min((full.height() - 32.0).max(190.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "entity-name-editor"), |ui| {
+            let title = match &draft {
+                EntityEditDraft::Workspace { .. } => "Rename Workspace",
+                EntityEditDraft::Session { .. } => "Rename Session",
+            };
+            ui.ctx().accesskit_node_builder(ui.id(), |node| {
+                node.set_role(egui::accesskit::Role::Dialog);
+                node.set_modal();
+                node.set_label(title);
+            });
+            ui.heading(title);
+            ui.label(RichText::new("Name").color(theme.text_dim));
+            let name = match &mut draft {
+                EntityEditDraft::Workspace { name, .. } | EntityEditDraft::Session { name, .. } => {
+                    name
+                }
+            };
+            let response = ui.add(
+                egui::TextEdit::singleline(name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Name"),
+            );
+            response.request_focus();
+            submit = !name.trim().is_empty()
+                && response.has_focus()
+                && ui.input(|input| input.key_pressed(Key::Enter));
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    if ui
+                        .add_enabled(!name.trim().is_empty(), egui::Button::new("Rename"))
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                });
+            });
+        });
+        if cancel {
+            return Vec::new();
+        }
+        if submit {
+            return vec![match draft {
+                EntityEditDraft::Workspace { workspace_id, name } => ViewAction::RenameWorkspace {
+                    workspace_id,
+                    name: name.trim().to_string(),
+                },
+                EntityEditDraft::Session { session_id, name } => ViewAction::RenameSession {
+                    session_id,
+                    name: name.trim().to_string(),
+                },
+            }];
+        }
+        state.entity_edit = Some(draft);
         Vec::new()
     }
 
@@ -4386,6 +4758,11 @@ impl<'a> TurnView<'a> {
                         node.set_role(egui::accesskit::Role::SearchInput);
                         node.set_label("Search workspace tree");
                     });
+                    if state.request_tree_search_focus {
+                        search.request_focus();
+                        state.tree_has_focus = true;
+                        state.request_tree_search_focus = false;
+                    }
                     ui.horizontal(|ui| {
                         ui.menu_button(format!("Filters ({})", state.tree_filters.len()), |ui| {
                             for filter in TreeFilter::ALL {
@@ -4608,6 +4985,18 @@ impl<'a> TurnView<'a> {
                                 state.inspector_key = None;
                                 ui.close();
                             }
+                            if ui.button("Rename workspace…").clicked() {
+                                state.entity_edit = Some(EntityEditDraft::Workspace {
+                                    workspace_id: workspace.workspace.id.clone(),
+                                    name: workspace.workspace.name.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Duplicate workspace settings").clicked() {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                actions.push(ViewAction::Run(Command::DuplicateWorkspace));
+                                ui.close();
+                            }
                             ui.separator();
                             if workspace.workspace.archived {
                                 if ui.button("Restore workspace").clicked() {
@@ -4677,6 +5066,42 @@ impl<'a> TurnView<'a> {
                                 actions.extend(select_hierarchy_row(state, snapshot, *row));
                                 state.inspector_open = true;
                                 state.inspector_key = None;
+                                ui.close();
+                            }
+                            if ui.button("Rename session…").clicked() {
+                                state.entity_edit = Some(EntityEditDraft::Session {
+                                    session_id: session.session.id.clone(),
+                                    name: session.session.name.clone(),
+                                });
+                                ui.close();
+                            }
+                            if ui.button("Duplicate session").clicked() {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                actions.push(ViewAction::Run(Command::DuplicateSession));
+                                ui.close();
+                            }
+                            if ui
+                                .button(if session.session.favourite {
+                                    "Remove from favorites"
+                                } else {
+                                    "Add to favorites"
+                                })
+                                .clicked()
+                            {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                actions.push(ViewAction::Run(Command::ToggleFavouriteSession));
+                                ui.close();
+                            }
+                            if ui
+                                .button(if session.session.pinned {
+                                    "Unpin session"
+                                } else {
+                                    "Pin session"
+                                })
+                                .clicked()
+                            {
+                                actions.extend(select_hierarchy_row(state, snapshot, *row));
+                                actions.push(ViewAction::Run(Command::TogglePinSession));
                                 ui.close();
                             }
                             ui.separator();
@@ -10076,14 +10501,8 @@ fn hierarchy_reorder_menu(
     snapshot: &HierarchySnapshot,
     row: HierarchyRow<'_>,
 ) {
-    let parent = row.parent_key();
     let key = row.key();
-    let siblings: Vec<_> =
-        ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
-            .into_iter()
-            .filter(|candidate| candidate.parent_key() == parent)
-            .map(HierarchyRow::key)
-            .collect();
+    let siblings = hierarchy_siblings(snapshot, state, &key);
     let Some(index) = siblings.iter().position(|candidate| candidate == &key) else {
         return;
     };
@@ -10098,6 +10517,39 @@ fn hierarchy_reorder_menu(
         return;
     }
 
+    move_hierarchy_key(state, snapshot, key, move_up);
+    ui.close();
+}
+
+fn hierarchy_siblings(
+    snapshot: &HierarchySnapshot,
+    state: &ViewState,
+    key: &HierarchyKey,
+) -> Vec<HierarchyKey> {
+    let parent = ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
+        .into_iter()
+        .find(|candidate| candidate.key() == *key)
+        .and_then(HierarchyRow::parent_key);
+    ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
+        .into_iter()
+        .filter(|candidate| candidate.parent_key() == parent)
+        .map(HierarchyRow::key)
+        .collect()
+}
+
+fn move_hierarchy_key(
+    state: &mut ViewState,
+    snapshot: &HierarchySnapshot,
+    key: HierarchyKey,
+    move_up: bool,
+) -> bool {
+    let siblings = hierarchy_siblings(snapshot, state, &key);
+    let Some(index) = siblings.iter().position(|candidate| candidate == &key) else {
+        return false;
+    };
+    if (move_up && index == 0) || (!move_up && index + 1 >= siblings.len()) {
+        return false;
+    }
     let mut reordered = siblings.clone();
     let target = if move_up { index - 1 } else { index + 1 };
     reordered.swap(index, target);
@@ -10119,7 +10571,7 @@ fn hierarchy_reorder_menu(
         key,
         before,
     });
-    ui.close();
+    true
 }
 
 fn push_tree_presentation(state: &mut ViewState, snapshot: &HierarchySnapshot) {
