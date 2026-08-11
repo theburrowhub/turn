@@ -337,6 +337,19 @@ impl Core {
                 direction,
                 pane,
             } => self.split_pane(client, &session_id, &pane_id, direction, pane, now_ms),
+            Request::CreatePane {
+                session_id,
+                target_pane_id,
+                placement,
+                pane,
+            } => self.create_pane(
+                client,
+                &session_id,
+                &target_pane_id,
+                placement,
+                pane,
+                now_ms,
+            ),
             Request::ClosePane {
                 session_id,
                 pane_id,
@@ -387,6 +400,66 @@ impl Core {
                 self.require_client_surface(client, &surface_id)?;
                 self.open_node_as_temporary_pane(surface_id, &session_id, &node_id, now_ms)
             }
+            Request::OpenNodeAsPane {
+                surface_id,
+                session_id,
+                node_id,
+                target_pane_id,
+                placement,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.open_node_as_pane(
+                    client,
+                    &session_id,
+                    &node_id,
+                    &target_pane_id,
+                    placement,
+                    now_ms,
+                )
+            }
+            Request::PromoteTemporaryPane {
+                surface_id,
+                session_id,
+                pane_id,
+                target_pane_id,
+                placement,
+            } => {
+                self.require_client_surface(client, &surface_id)?;
+                self.promote_temporary_pane(
+                    client,
+                    &surface_id,
+                    &session_id,
+                    &pane_id,
+                    panes::PaneDestination {
+                        target: &target_pane_id,
+                        placement,
+                    },
+                    now_ms,
+                )
+            }
+            Request::DuplicatePane {
+                session_id,
+                pane_id,
+            } => self.duplicate_pane(client, &session_id, &pane_id, now_ms),
+            Request::ChangePaneKind {
+                session_id,
+                pane_id,
+                kind,
+            } => self.change_pane_kind(client, &session_id, &pane_id, kind),
+            Request::FloatPane {
+                session_id,
+                pane_id,
+                geometry,
+            } => self.float_pane(client, &session_id, &pane_id, geometry),
+            Request::DockPane {
+                session_id,
+                pane_id,
+            } => self.dock_pane(client, &session_id, &pane_id),
+            Request::SetFloatingPaneGeometry {
+                session_id,
+                pane_id,
+                geometry,
+            } => self.set_floating_pane_geometry(client, &session_id, &pane_id, geometry),
             Request::FocusPaneForNode {
                 surface_id,
                 session_id,

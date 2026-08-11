@@ -6,14 +6,367 @@ use super::Answer;
 use crate::core::clients::Attachment;
 use crate::core::{ClientId, Core};
 use turn_core::ids::{PaneId, SessionId};
-use turn_core::model::{Direction, DropZone, LayoutPreset};
+use turn_core::model::{
+    Direction, DropZone, LayoutPreset, NodeKind, Pane, PaneGeometry, PaneKind, PaneNodeBinding,
+    PanePlacement,
+};
 use turn_proto::{
     CloseDisposition, ErrorCode, FocusTarget, NewPane, PaneAttachment, PaneStream, ProtoError,
     PtySize, Response, ServerEvent,
 };
 use turn_pty::ScreenSize;
 
+pub(super) struct PaneDestination<'a> {
+    pub target: &'a PaneId,
+    pub placement: PanePlacement,
+}
+
 impl Core {
+    pub(super) fn create_pane(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        target: &PaneId,
+        placement: PanePlacement,
+        spec: NewPane,
+        now_ms: i64,
+    ) -> Answer {
+        if placement == PanePlacement::Temporary {
+            return Err(ProtoError::invalid(
+                "A new command Pane must be placed in the saved Layout",
+            ));
+        }
+        self.validate_pane_definition_cwd(session_id, spec.cwd.as_deref())?;
+        let pane = pane_from_spec(&spec);
+        let new_pane = pane.id.clone();
+        if self.session(session_id)?.layout.get(target).is_none() {
+            return Err(ProtoError::not_found("pane", target.as_str()));
+        }
+        let replaced = {
+            let session = self.session_mut(session_id)?;
+            match placement {
+                PanePlacement::ReplaceCurrent => session.layout.replace(target, pane),
+                PanePlacement::SplitRight => {
+                    if !session.layout.split(target, Direction::Horizontal, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That Pane could not be opened to the right",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::SplitBelow => {
+                    if !session.layout.split(target, Direction::Vertical, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That Pane could not be opened below",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::Temporary => unreachable!("refused above"),
+            }
+        };
+        if let Some(replaced) = replaced {
+            self.detach_everyone(session_id, &replaced.id);
+        }
+        // `persist_session` synchronises the complete durable binding set in the same
+        // SQLite transaction as the Layout. In particular, replacing a Pane cannot
+        // leave a binding gap if persistence fails halfway through.
+        self.persist_session(session_id)?;
+        if let Err(error) = self.materialise_pane(session_id, &new_pane, now_ms) {
+            tracing::warn!(%session_id, %new_pane, %error, "the new pane's process could not start");
+        }
+        self.persist_session(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.push_session_state(session_id, now_ms);
+        self.answer_layout(session_id)
+    }
+
+    /// Opens a second, explicit view of an existing Process/Agent.
+    ///
+    /// This never materialises a Pane command: the runtime already exists and the
+    /// Pane merely points at it. That separation is what guarantees that opening,
+    /// replacing, promoting or later closing this view cannot restart or stop work.
+    pub(super) fn open_node_as_pane(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        node_id: &turn_core::ids::NodeId,
+        target: &PaneId,
+        placement: PanePlacement,
+        now_ms: i64,
+    ) -> Answer {
+        if placement == PanePlacement::Temporary {
+            return Err(ProtoError::invalid(
+                "Use open_node_as_temporary_pane for a surface-scoped Pane",
+            ));
+        }
+        let node = self
+            .session(session_id)?
+            .tree
+            .get(node_id)
+            .cloned()
+            .ok_or_else(|| ProtoError::not_found("process node", node_id.as_str()))?;
+        if self.session(session_id)?.layout.get(target).is_none() {
+            return Err(ProtoError::not_found("pane", target.as_str()));
+        }
+
+        let kind = pane_kind_for_node(node.kind, self.terminal_node(node_id).is_some());
+        let mut pane = Pane::new(kind).with_title(node.resolved_title().0);
+        pane.node_id = Some(node_id.clone());
+        let pane_id = pane.id.clone();
+        let replaced = {
+            let session = self.session_mut(session_id)?;
+            match placement {
+                PanePlacement::ReplaceCurrent => session.layout.replace(target, pane),
+                PanePlacement::SplitRight => {
+                    if !session.layout.split(target, Direction::Horizontal, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That Process view could not be opened to the right",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::SplitBelow => {
+                    if !session.layout.split(target, Direction::Vertical, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That Process view could not be opened below",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::Temporary => unreachable!("handled above"),
+            }
+        };
+
+        if let Some(replaced) = replaced {
+            self.detach_everyone(session_id, &replaced.id);
+        }
+        self.persist_session(session_id)?;
+        self.store
+            .hierarchy()
+            .bind_pane(&PaneNodeBinding {
+                pane_id,
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+                temporary: false,
+                surface_id: None,
+                opened_ms: now_ms,
+            })
+            .map_err(store)?;
+        self.bump_hierarchy();
+        self.push_layout(session_id, Some(client));
+        self.push_pane_bindings(session_id, node_id, now_ms);
+        self.answer_layout(session_id)
+    }
+
+    /// Turns the surface-scoped view into a durable Layout Pane in-place.
+    pub(super) fn promote_temporary_pane(
+        &mut self,
+        client: ClientId,
+        surface_id: &str,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        destination: PaneDestination<'_>,
+        now_ms: i64,
+    ) -> Answer {
+        let PaneDestination { target, placement } = destination;
+        if placement == PanePlacement::Temporary {
+            return Err(ProtoError::invalid(
+                "A temporary Pane must be placed in the Layout to promote it",
+            ));
+        }
+        let binding = self
+            .store
+            .hierarchy()
+            .bindings_for_session(session_id)
+            .map_err(store)?
+            .into_iter()
+            .find(|binding| {
+                binding.pane_id == *pane_id
+                    && binding.temporary
+                    && binding.surface_id.as_deref() == Some(surface_id)
+            })
+            .ok_or_else(|| ProtoError::not_found("temporary pane", pane_id.as_str()))?;
+        let node = self
+            .session(session_id)?
+            .tree
+            .get(&binding.node_id)
+            .cloned()
+            .ok_or_else(|| ProtoError::not_found("process node", binding.node_id.as_str()))?;
+        if self.session(session_id)?.layout.get(target).is_none() {
+            return Err(ProtoError::not_found("pane", target.as_str()));
+        }
+
+        let mut pane = Pane::new(pane_kind_for_node(
+            node.kind,
+            self.terminal_node(&node.id).is_some(),
+        ))
+        .with_title(node.resolved_title().0);
+        pane.id = pane_id.clone();
+        pane.node_id = Some(binding.node_id.clone());
+        let replaced = {
+            let session = self.session_mut(session_id)?;
+            match placement {
+                PanePlacement::ReplaceCurrent => session.layout.replace(target, pane),
+                PanePlacement::SplitRight => {
+                    if !session.layout.split(target, Direction::Horizontal, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That temporary Pane could not be promoted to the right",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::SplitBelow => {
+                    if !session.layout.split(target, Direction::Vertical, pane) {
+                        return Err(ProtoError::new(
+                            ErrorCode::Conflict,
+                            "That temporary Pane could not be promoted below",
+                        ));
+                    }
+                    None
+                }
+                PanePlacement::Temporary => unreachable!("refused above"),
+            }
+        };
+        if let Some(replaced) = replaced {
+            self.detach_everyone(session_id, &replaced.id);
+        }
+        self.persist_session(session_id)?;
+        let mut durable = binding;
+        durable.temporary = false;
+        durable.surface_id = None;
+        self.store.hierarchy().bind_pane(&durable).map_err(store)?;
+        self.bump_hierarchy();
+        self.push_layout(session_id, Some(client));
+        self.push_pane_bindings(session_id, &durable.node_id, now_ms);
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn duplicate_pane(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        now_ms: i64,
+    ) -> Answer {
+        let node_id = self
+            .session(session_id)?
+            .layout
+            .get(pane_id)
+            .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?
+            .node_id
+            .clone();
+        let duplicate = self
+            .session_mut(session_id)?
+            .layout
+            .duplicate(pane_id)
+            .ok_or_else(|| {
+                ProtoError::new(ErrorCode::Conflict, "That Pane could not be duplicated")
+            })?;
+        self.persist_session(session_id)?;
+        if let Some(node_id) = node_id {
+            self.store
+                .hierarchy()
+                .bind_pane(&PaneNodeBinding {
+                    pane_id: duplicate,
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                    temporary: false,
+                    surface_id: None,
+                    opened_ms: now_ms,
+                })
+                .map_err(store)?;
+            self.bump_hierarchy();
+            self.push_pane_bindings(session_id, &node_id, now_ms);
+        }
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn change_pane_kind(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        kind: PaneKind,
+    ) -> Answer {
+        if !self
+            .session_mut(session_id)?
+            .layout
+            .change_kind(pane_id, kind)
+        {
+            return Err(ProtoError::not_found("pane", pane_id.as_str()));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn float_pane(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        geometry: PaneGeometry,
+    ) -> Answer {
+        if !geometry.is_valid() {
+            return Err(ProtoError::invalid("Floating Pane geometry is not usable"));
+        }
+        if !self
+            .session_mut(session_id)?
+            .layout
+            .float(pane_id, geometry)
+        {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "Keep at least one Pane docked in the Session",
+            ));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn dock_pane(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+    ) -> Answer {
+        if !self.session_mut(session_id)?.layout.dock(pane_id) {
+            return Err(ProtoError::not_found("floating pane", pane_id.as_str()));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn set_floating_pane_geometry(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+        geometry: PaneGeometry,
+    ) -> Answer {
+        if !self
+            .session_mut(session_id)?
+            .layout
+            .set_floating_geometry(pane_id, geometry)
+        {
+            return Err(ProtoError::invalid(
+                "That floating Pane or its geometry is not usable",
+            ));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
     pub(super) fn split_pane(
         &mut self,
         client: ClientId,
@@ -165,6 +518,14 @@ impl Core {
         }
         let restore_update = self.resolve_restore_pane(session_id, pane_id);
         self.persist_session(session_id)?;
+        self.store
+            .hierarchy()
+            .unbind_pane(session_id, pane_id)
+            .map_err(store)?;
+        if let Some(node_id) = node.as_ref() {
+            self.bump_hierarchy();
+            self.push_pane_bindings(session_id, node_id, now_ms);
+        }
         if let Some(update) = restore_update {
             self.push_all(update);
         }
@@ -382,7 +743,16 @@ impl Core {
 
         let session = self.session(session_id)?;
         let node_id = match session.layout.get(pane_id) {
-            Some(pane) => pane.node_id.clone(),
+            // A permanent Agent Pane binds to the semantic Agent identity even
+            // when its screen belongs to the hosting shell. Resolve the terminal
+            // at attach time, exactly as temporary panes already do.
+            Some(pane) => pane.node_id.as_ref().map(|node| {
+                // Hosted Agents resolve to their shell's PTY. A direct binding remains
+                // direct even when its process is currently absent: attachments carry
+                // identity as well as bytes, and dropping it here would make two
+                // Sessions with the same PaneId indistinguishable to the client.
+                self.terminal_node(node).unwrap_or_else(|| node.clone())
+            }),
             None => {
                 let surface_id = self
                     .clients
@@ -662,6 +1032,23 @@ fn validate_resize_delta(delta: f32) -> Result<(), ProtoError> {
     Ok(())
 }
 
+fn pane_kind_for_node(kind: NodeKind, has_terminal: bool) -> PaneKind {
+    if !has_terminal {
+        return PaneKind::ProcessDetails;
+    }
+    match kind {
+        NodeKind::Agent | NodeKind::Subagent => PaneKind::Agent,
+        NodeKind::Shell => PaneKind::Shell,
+        NodeKind::Tui => PaneKind::Tui,
+        NodeKind::Server => PaneKind::Server,
+        NodeKind::TestRunner | NodeKind::Build => PaneKind::TestOutput,
+        NodeKind::TmuxSession | NodeKind::TmuxPane => PaneKind::TmuxTerminal,
+        NodeKind::Terminal | NodeKind::Watcher | NodeKind::Background | NodeKind::Unknown => {
+            PaneKind::Terminal
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1223,247 @@ mod tests {
             "the moved pane kept showing the same process"
         );
         assert_eq!(session.layout.pane_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_open_duplicate_float_and_close_never_control_the_process() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_permanent_node_panes");
+        let target = PaneId::from_stored("pane_permanent_target");
+        harness.add_session(session_id.clone(), target.clone(), 10);
+        let mut agent =
+            ProcessNode::process(session_id.clone(), NodeKind::Agent, "claude", "/tmp", 10);
+        agent.lifecycle = Lifecycle::Alive;
+        agent.pid = Some(54_321);
+        let node_id = agent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(agent);
+
+        let opened = harness
+            .core
+            .open_node_as_pane(
+                ClientId(3),
+                &session_id,
+                &node_id,
+                &target,
+                PanePlacement::SplitRight,
+                11,
+            )
+            .expect("an explicit permanent open succeeds");
+        let layout = match opened {
+            Response::Layout { layout, .. } => layout,
+            other => panic!("expected Layout, got {other:?}"),
+        };
+        let opened_id = layout.active.clone().expect("new Pane is active");
+        assert_eq!(
+            layout.get(&opened_id).unwrap().node_id.as_ref(),
+            Some(&node_id)
+        );
+        let binding = harness
+            .core
+            .store
+            .hierarchy()
+            .bindings_for_session(&session_id)
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.pane_id == opened_id)
+            .expect("durable binding persisted");
+        assert!(!binding.temporary);
+
+        harness
+            .core
+            .duplicate_pane(ClientId(3), &session_id, &opened_id, 12)
+            .expect("a bound view duplicates");
+        let duplicate = harness.core.sessions[&session_id]
+            .layout
+            .active
+            .clone()
+            .unwrap();
+        assert_ne!(duplicate, opened_id);
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .layout
+                .get(&duplicate)
+                .unwrap()
+                .node_id
+                .as_ref(),
+            Some(&node_id)
+        );
+        let geometry = PaneGeometry {
+            x: 60.0,
+            y: 70.0,
+            width: 640.0,
+            height: 400.0,
+        };
+        harness
+            .core
+            .float_pane(ClientId(3), &session_id, &duplicate, geometry)
+            .expect("the duplicate may float");
+        let stored = harness
+            .core
+            .store
+            .sessions()
+            .layout(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.floating_geometry(&duplicate), Some(geometry));
+
+        harness
+            .core
+            .close_pane(
+                ClientId(3),
+                &session_id,
+                &opened_id,
+                CloseDisposition::KeepProcesses,
+                13,
+            )
+            .expect("closing one view keeps the Process");
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap();
+        assert_eq!(node.pid, Some(54_321));
+        assert_eq!(node.lifecycle, Lifecycle::Alive);
+    }
+
+    #[tokio::test]
+    async fn replacing_a_pane_removes_only_the_old_view() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_replace_view_only");
+        let target = PaneId::from_stored("pane_replace_view_only");
+        harness.add_session(session_id.clone(), target.clone(), 10);
+        let mut old_process = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Shell,
+            "long-running-shell",
+            "/tmp",
+            10,
+        );
+        old_process.lifecycle = Lifecycle::Alive;
+        old_process.pid = Some(44_444);
+        let old_node_id = old_process.id.clone();
+        let mut agent =
+            ProcessNode::process(session_id.clone(), NodeKind::Agent, "claude", "/tmp", 10);
+        agent.lifecycle = Lifecycle::Alive;
+        agent.pid = Some(55_555);
+        let agent_id = agent.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(old_process);
+            session.tree.insert(agent);
+            session.layout.get_mut(&target).unwrap().node_id = Some(old_node_id.clone());
+        }
+        harness.core.persist_session(&session_id).unwrap();
+
+        let response = harness
+            .core
+            .open_node_as_pane(
+                ClientId(3),
+                &session_id,
+                &agent_id,
+                &target,
+                PanePlacement::ReplaceCurrent,
+                11,
+            )
+            .expect("the visible Pane can be replaced");
+        let layout = match response {
+            Response::Layout { layout, .. } => layout,
+            other => panic!("expected Layout, got {other:?}"),
+        };
+
+        assert_eq!(layout.pane_count(), 1);
+        assert!(layout.get(&target).is_none(), "the old view was removed");
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&old_node_id)
+                .unwrap()
+                .pid,
+            Some(44_444),
+            "replacing a view must not stop its Process"
+        );
+        assert_eq!(
+            harness.core.sessions[&session_id]
+                .tree
+                .get(&agent_id)
+                .unwrap()
+                .pid,
+            Some(55_555)
+        );
+    }
+
+    #[tokio::test]
+    async fn promoting_a_temporary_pane_keeps_its_identity_and_process() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_promote_temporary");
+        let target = PaneId::from_stored("pane_promote_target");
+        harness.add_session(session_id.clone(), target.clone(), 10);
+        let mut process = ProcessNode::process(
+            session_id.clone(),
+            NodeKind::Background,
+            "worker",
+            "/tmp",
+            10,
+        );
+        process.lifecycle = Lifecycle::Alive;
+        process.pid = Some(65_432);
+        let node_id = process.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(process);
+        harness.core.persist_session(&session_id).unwrap();
+        let temporary = harness
+            .core
+            .open_node_as_temporary_pane("main-window".into(), &session_id, &node_id, 11)
+            .expect("temporary view opens");
+        let pane_id = match temporary {
+            Response::NodePane { pane } => pane.binding.pane_id,
+            other => panic!("expected NodePane, got {other:?}"),
+        };
+
+        harness
+            .core
+            .promote_temporary_pane(
+                ClientId(3),
+                "main-window",
+                &session_id,
+                &pane_id,
+                PaneDestination {
+                    target: &target,
+                    placement: PanePlacement::SplitBelow,
+                },
+                12,
+            )
+            .expect("the view promotes");
+        let session = &harness.core.sessions[&session_id];
+        assert_eq!(
+            session.layout.get(&pane_id).unwrap().node_id.as_ref(),
+            Some(&node_id)
+        );
+        let binding = harness
+            .core
+            .store
+            .hierarchy()
+            .bindings_for_session(&session_id)
+            .unwrap()
+            .into_iter()
+            .find(|binding| binding.pane_id == pane_id)
+            .unwrap();
+        assert!(!binding.temporary);
+        assert!(binding.surface_id.is_none());
+        assert_eq!(session.tree.get(&node_id).unwrap().pid, Some(65_432));
+        assert_eq!(
+            session.tree.get(&node_id).unwrap().lifecycle,
+            Lifecycle::Alive
+        );
     }
 }

@@ -317,7 +317,9 @@ pub fn arrange(layout: &Layout, area: Rect) -> Arrangement {
         // reason to draw nothing. Fall through to the whole layout.
     }
 
-    place(&layout.root, area, &mut arrangement);
+    if let Some(root) = layout.tiled_root() {
+        place(&root, area, &mut arrangement);
+    }
     arrangement
 }
 
@@ -1239,6 +1241,7 @@ mod tests {
             }),
             active: None,
             zoomed: None,
+            floating: Vec::new(),
         };
         let arrangement = arrange(&layout, area());
         assert_eq!(arrangement.panes.len(), 1);

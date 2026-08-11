@@ -26,9 +26,10 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane, PaneKind,
-    PaneNodeBinding, PreviewSource, ProcessNode, Relation, RestoreState, Session, SessionMode,
-    Template, Workspace, WorkspaceCheckout, WorkspaceWriteLease,
+    ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane,
+    PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement, PreviewSource, ProcessNode, Relation,
+    RestoreState, Session, SessionMode, Template, Workspace, WorkspaceCheckout,
+    WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
@@ -46,9 +47,10 @@ use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
 use turn_gui::theme::Theme;
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    LayoutEditorOrigin, LayoutTemplateDraft, LifecycleConfirmation, PaneContent, PendingPermission,
-    QueueItem, SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView,
-    ViewAction, ViewState, WorkspaceDraft,
+    LayoutEditorOrigin, LayoutTemplateDraft, LifecycleConfirmation, PaneContent,
+    PanePlacementDraft, PanePlacementSource, PendingPermission, QueueItem, SessionDraft,
+    SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState,
+    WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -3347,6 +3349,68 @@ fn a_temporary_reviewer_pane_is_visually_distinct_from_the_saved_layout() {
         "assistive technology must distinguish a temporary view from process lifetime"
     );
     h.snapshot("temporary_reviewer_pane");
+}
+
+#[test]
+fn permanent_pane_placement_is_an_explicit_visual_choice() {
+    let fixture = busy_desk();
+    let (surface_id, session_id, node_id) = {
+        let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+        let node = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| node.agent.is_some())
+            .expect("agent");
+        (
+            snapshot.tree_state.surface_id.clone(),
+            node.session_id.clone(),
+            node.node_id.clone(),
+        )
+    };
+    let target_pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("active Pane");
+    let mut h = harness(fixture);
+    h.state_mut().state.pane_placement = Some(PanePlacementDraft {
+        source: PanePlacementSource::Node {
+            surface_id,
+            session_id,
+            node_id,
+        },
+        target_pane_id,
+        placement: PanePlacement::SplitRight,
+        remember: true,
+    });
+    h.run();
+    h.snapshot("permanent_pane_placement");
+}
+
+#[test]
+fn a_detached_pane_restores_as_a_floating_view() {
+    let mut fixture = busy_desk();
+    let pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("active Pane");
+    let geometry = PaneGeometry {
+        x: 430.0,
+        y: 110.0,
+        width: 520.0,
+        height: 310.0,
+    };
+    assert!(fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .float(&pane_id, geometry));
+    let mut h = harness(fixture);
+    h.run_steps(2);
+    h.snapshot("floating_pane");
 }
 
 #[test]

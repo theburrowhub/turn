@@ -31,14 +31,14 @@ use turn_core::ids::{
 };
 use turn_core::model::{
     ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
-    PaneKind, PreviewVisibility, RelationshipKind, RestoreBehaviour, RestoreState, SessionMode,
-    SessionStatus, TreeFilter, TreeVisibilityMode, WorkspaceWriteLease,
+    PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour,
+    RestoreState, SessionMode, SessionStatus, TreeFilter, TreeVisibilityMode, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
 use turn_proto::{
     CloseDisposition, ContextHandoffMode, ContextHandoffView, HierarchyKey, HierarchySnapshot,
-    NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext,
+    NewPane, NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext,
     SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
     TreeSurfaceState, WorkspaceSummary, WorkspaceTreeView,
 };
@@ -50,6 +50,8 @@ use crate::panes::{self, Arrangement, Divider, DropTarget, Side};
 use crate::terminal::{self, PaneAction, PaneInteraction, PaneOptions};
 use crate::theme::Theme;
 use crate::transport::ConnectionState;
+
+pub const OPEN_PANE_PLACEMENT_KEY: &str = "layout.open_pane_placement";
 
 /// One row in the session list. The daemon supplies these already derived; the client
 /// never computes a state.
@@ -465,6 +467,9 @@ pub struct ViewState {
     /// stored: it is recomputed from the pointer every frame, so a layout arriving from
     /// the daemon mid-drag cannot leave a landing spot on screen that no longer exists.
     pub dragged_pane: Option<PaneId>,
+    /// Last floating rectangle already sent to the daemon, preventing one write
+    /// per immediate-mode frame while a window is stationary.
+    pub floating_geometry: HashMap<PaneId, PaneGeometry>,
     /// Which command sheet is open, if any.
     pub shortcuts_open: bool,
     pub settings_open: bool,
@@ -527,6 +532,11 @@ pub struct ViewState {
     pub context_handoff: Option<ContextHandoffDraft>,
     /// Explicit editor for the two audited Agent corrections.
     pub node_edit: Option<NodeEditDraft>,
+    /// One placement decision shared by opening a Process and promoting its
+    /// temporary view. It is local until Open is pressed.
+    pub pane_placement: Option<PanePlacementDraft>,
+    /// Explicit command/kind form for a new permanent Pane.
+    pub new_pane: Option<NewPaneDraft>,
     /// Bounded, stable/redacted semantic history fetched on demand for Quick Preview.
     pub preview_history: HashMap<NodeId, Vec<ActivityPreview>>,
     /// The inspector is contextual and only occupies space for a selected Process.
@@ -560,6 +570,8 @@ impl ViewState {
             || self.lifecycle_confirmation.is_some()
             || self.context_handoff.is_some()
             || self.node_edit.is_some()
+            || self.pane_placement.is_some()
+            || self.new_pane.is_some()
     }
 
     /// Drains typed hierarchy intents after drawing.
@@ -589,6 +601,58 @@ pub enum NodeEditDraft {
         parent_node_id: Option<NodeId>,
         relationship_kind: RelationshipKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanePlacementSource {
+    Node {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+    },
+    Temporary {
+        surface_id: String,
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanePlacementDraft {
+    pub source: PanePlacementSource,
+    pub target_pane_id: PaneId,
+    pub placement: PanePlacement,
+    pub remember: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewPaneDraft {
+    pub target_pane_id: PaneId,
+    pub kind: PaneKind,
+    pub title: String,
+    pub program: String,
+    pub arguments: String,
+    pub cwd: String,
+    pub placement: PanePlacement,
+    pub error: Option<String>,
+}
+
+impl NewPaneDraft {
+    fn new(target_pane_id: PaneId, placement: PanePlacement) -> Self {
+        Self {
+            target_pane_id,
+            kind: PaneKind::Shell,
+            title: String::new(),
+            program: String::new(),
+            arguments: String::new(),
+            cwd: String::new(),
+            placement: match placement {
+                PanePlacement::Temporary => PanePlacement::SplitRight,
+                placement => placement,
+            },
+            error: None,
+        }
+    }
 }
 
 impl NodeEditDraft {
@@ -882,6 +946,13 @@ pub enum HierarchyAction {
         session_id: SessionId,
         node_id: NodeId,
     },
+    OpenPane {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+    },
     FocusPaneForNode {
         surface_id: String,
         session_id: SessionId,
@@ -1048,6 +1119,45 @@ pub enum ViewAction {
         moved: PaneId,
         target: PaneId,
         zone: DropZone,
+    },
+    OpenNodePane {
+        surface_id: String,
+        session_id: SessionId,
+        node_id: NodeId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+        remember: bool,
+    },
+    PromoteTemporaryPane {
+        surface_id: String,
+        session_id: SessionId,
+        pane_id: PaneId,
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+        remember: bool,
+    },
+    CreatePane {
+        target_pane_id: PaneId,
+        placement: PanePlacement,
+        pane: NewPane,
+    },
+    DuplicatePane {
+        pane_id: PaneId,
+    },
+    ChangePaneKind {
+        pane_id: PaneId,
+        kind: PaneKind,
+    },
+    FloatPane {
+        pane_id: PaneId,
+        geometry: PaneGeometry,
+    },
+    DockPane {
+        pane_id: PaneId,
+    },
+    SetFloatingPaneGeometry {
+        pane_id: PaneId,
+        geometry: PaneGeometry,
     },
     /// Closing a temporary view always keeps the Agent/Process alive.
     CloseTemporaryPane {
@@ -2070,6 +2180,19 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    fn preferred_pane_placement(&self) -> PanePlacement {
+        match self
+            .settings
+            .and_then(|settings| settings.entry(OPEN_PANE_PLACEMENT_KEY))
+            .and_then(|entry| entry.resolution.value.as_str())
+        {
+            Some("replace_current") => PanePlacement::ReplaceCurrent,
+            Some("split_below") => PanePlacement::SplitBelow,
+            Some("temporary") => PanePlacement::Temporary,
+            _ => PanePlacement::SplitRight,
+        }
+    }
+
     fn preferred_template_id(&self, workspace_id: &WorkspaceId) -> Option<TemplateId> {
         let configured = self
             .workspaces
@@ -2274,6 +2397,7 @@ impl<'a> TurnView<'a> {
             }
             actions.extend(pane_actions);
         });
+        actions.extend(self.floating_panes(ui, theme, keymap, state));
         if let Some(temporary) = &self.temporary_pane {
             ui.scope_builder(region(pane_rect.shrink(8.0), "temporary-pane"), |ui| {
                 let temporary_actions = self.temporary_pane_overlay(ui, theme, state, temporary);
@@ -2347,7 +2471,11 @@ impl<'a> TurnView<'a> {
             }
         }
 
-        if state.node_edit.is_some() {
+        if state.pane_placement.is_some() {
+            actions.extend(self.pane_placement_overlay(ui, theme, state, full));
+        } else if state.new_pane.is_some() {
+            actions.extend(self.new_pane_overlay(ui, theme, state, full));
+        } else if state.node_edit.is_some() {
             if let Some(snapshot) = hierarchy.as_ref() {
                 actions.extend(self.node_edit_overlay(ui, theme, snapshot, state, full));
             } else {
@@ -2382,6 +2510,224 @@ impl<'a> TurnView<'a> {
         }
         state.hierarchy = hierarchy;
         actions
+    }
+
+    fn pane_placement_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let Some(mut draft) = state.pane_placement.take() else {
+            return Vec::new();
+        };
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        let mut submit = false;
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                460.0_f32.min((full.width() - 32.0).max(300.0)),
+                292.0_f32.min((full.height() - 32.0).max(220.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "pane-placement"), |ui| {
+            let promotion = matches!(draft.source, PanePlacementSource::Temporary { .. });
+            ui.heading(if promotion {
+                "Keep this Pane in the layout"
+            } else {
+                "Open as Pane"
+            });
+            ui.label(
+                RichText::new(
+                    "Choose the placement once. Turn will reuse it next time unless you change it here.",
+                )
+                .color(theme.text_dim),
+            );
+            ui.add_space(10.0);
+            for (label, placement) in [
+                ("Replace current", PanePlacement::ReplaceCurrent),
+                ("Split right", PanePlacement::SplitRight),
+                ("Split below", PanePlacement::SplitBelow),
+            ] {
+                ui.radio_value(&mut draft.placement, placement, label);
+            }
+            if !promotion {
+                ui.radio_value(
+                    &mut draft.placement,
+                    PanePlacement::Temporary,
+                    "Temporary — do not change the saved layout",
+                );
+            }
+            ui.add_space(6.0);
+            ui.checkbox(&mut draft.remember, "Remember this placement");
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button(if promotion { "Keep Pane" } else { "Open" }).clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if submit {
+            return vec![match draft.source {
+                PanePlacementSource::Node {
+                    surface_id,
+                    session_id,
+                    node_id,
+                } => ViewAction::OpenNodePane {
+                    surface_id,
+                    session_id,
+                    node_id,
+                    target_pane_id: draft.target_pane_id,
+                    placement: draft.placement,
+                    remember: draft.remember,
+                },
+                PanePlacementSource::Temporary {
+                    surface_id,
+                    session_id,
+                    pane_id,
+                } => ViewAction::PromoteTemporaryPane {
+                    surface_id,
+                    session_id,
+                    pane_id,
+                    target_pane_id: draft.target_pane_id,
+                    placement: draft.placement,
+                    remember: draft.remember,
+                },
+            }];
+        }
+        if !cancel {
+            state.pane_placement = Some(draft);
+        }
+        Vec::new()
+    }
+
+    fn new_pane_overlay(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        state: &mut ViewState,
+        full: Rect,
+    ) -> Vec<ViewAction> {
+        let Some(mut draft) = state.new_pane.take() else {
+            return Vec::new();
+        };
+        let mut cancel = ui.input(|input| input.key_pressed(Key::Escape));
+        let mut submit = false;
+        let panel = Rect::from_center_size(
+            full.center(),
+            Vec2::new(
+                560.0_f32.min((full.width() - 32.0).max(320.0)),
+                440.0_f32.min((full.height() - 32.0).max(300.0)),
+            ),
+        );
+        ui.painter()
+            .rect_filled(full, 0.0, Color32::from_black_alpha(165));
+        ui.painter().rect_filled(panel, 10.0, theme.panel);
+        ui.painter().rect_stroke(
+            panel,
+            10.0,
+            Stroke::new(1.0, theme.border),
+            egui::StrokeKind::Outside,
+        );
+        ui.scope_builder(region(panel.shrink(20.0), "new-pane"), |ui| {
+            ui.heading("New Pane");
+            ui.label(
+                RichText::new("Run any executable directly; arguments are parsed without a shell.")
+                    .color(theme.text_dim),
+            );
+            ui.add_space(8.0);
+            egui::ComboBox::from_label("View type")
+                .selected_text(format!("{:?}", draft.kind))
+                .show_ui(ui, |ui| {
+                    for (label, kind) in pane_kind_choices() {
+                        ui.selectable_value(&mut draft.kind, kind, label);
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Title");
+                ui.text_edit_singleline(&mut draft.title);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Program");
+                ui.text_edit_singleline(&mut draft.program);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Arguments");
+                ui.text_edit_singleline(&mut draft.arguments);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Working directory");
+                ui.text_edit_singleline(&mut draft.cwd);
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut draft.placement,
+                    PanePlacement::ReplaceCurrent,
+                    "Replace current",
+                );
+                ui.radio_value(
+                    &mut draft.placement,
+                    PanePlacement::SplitRight,
+                    "Split right",
+                );
+                ui.radio_value(
+                    &mut draft.placement,
+                    PanePlacement::SplitBelow,
+                    "Split below",
+                );
+            });
+            if let Some(error) = &draft.error {
+                ui.label(RichText::new(error).color(theme.failure));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Create Pane").clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+        if submit {
+            match shell_words::split(draft.arguments.trim()) {
+                Ok(args) => {
+                    let mut pane = NewPane::new(draft.kind);
+                    pane.title =
+                        (!draft.title.trim().is_empty()).then(|| draft.title.trim().to_string());
+                    pane.command = (!draft.program.trim().is_empty())
+                        .then(|| draft.program.trim().to_string());
+                    pane.args = args;
+                    pane.cwd = (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().to_string());
+                    return vec![ViewAction::CreatePane {
+                        target_pane_id: draft.target_pane_id,
+                        placement: draft.placement,
+                        pane,
+                    }];
+                }
+                Err(error) => draft.error = Some(format!("Arguments: {error}")),
+            }
+        }
+        if !cancel {
+            state.new_pane = Some(draft);
+        }
+        Vec::new()
     }
 
     fn node_edit_overlay(
@@ -4173,6 +4519,25 @@ impl<'a> TurnView<'a> {
                                 });
                                 ui.close();
                             }
+                            if let Some(target_pane_id) = self
+                                .layout
+                                .as_ref()
+                                .and_then(|layout| layout.active.clone())
+                            {
+                                if ui.button("Open as pane…").clicked() {
+                                    state.pane_placement = Some(PanePlacementDraft {
+                                        source: PanePlacementSource::Node {
+                                            surface_id: snapshot.tree_state.surface_id.clone(),
+                                            session_id: node.session_id.clone(),
+                                            node_id: node.node_id.clone(),
+                                        },
+                                        target_pane_id,
+                                        placement: self.preferred_pane_placement(),
+                                        remember: true,
+                                    });
+                                    ui.close();
+                                }
+                            }
                             if !node.pane_bindings.is_empty()
                                 && ui.button("Focus open pane").clicked()
                             {
@@ -4690,6 +5055,20 @@ impl<'a> TurnView<'a> {
                         ui.separator();
                         if ui.button("Agent · split right").clicked() {
                             actions.push(ViewAction::Run(Command::LaunchAgent));
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Custom command or view…").clicked() {
+                            if let Some(target) = self
+                                .layout
+                                .as_ref()
+                                .and_then(|layout| layout.active.clone())
+                            {
+                                state.new_pane = Some(NewPaneDraft::new(
+                                    target,
+                                    self.preferred_pane_placement(),
+                                ));
+                            }
                             ui.close();
                         }
                     });
@@ -5969,7 +6348,7 @@ impl<'a> TurnView<'a> {
 
             // The close control owns the right-hand end of the header. Everything else in
             // the header is measured against it rather than drawn on top of it.
-            let mut title_limit = pane_close_slot(header).min.x - 6.0;
+            let mut title_limit = pane_menu_slot(header).min.x - 6.0;
             if arrangement.zoomed {
                 title_limit = ui
                     .painter()
@@ -6203,6 +6582,140 @@ impl<'a> TurnView<'a> {
         actions
     }
 
+    fn floating_panes(
+        &self,
+        ui: &mut Ui,
+        theme: &Theme,
+        _keymap: &Keymap,
+        state: &mut ViewState,
+    ) -> Vec<ViewAction> {
+        let Some(layout) = &self.layout else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        let live_ids: HashSet<PaneId> = layout
+            .floating
+            .iter()
+            .map(|floating| floating.pane_id.clone())
+            .collect();
+        state
+            .floating_geometry
+            .retain(|pane_id, _| live_ids.contains(pane_id));
+
+        for floating in &layout.floating {
+            let Some(pane) = layout.get(&floating.pane_id) else {
+                continue;
+            };
+            let pane_id = pane.id.clone();
+            let title = self
+                .panes
+                .iter()
+                .find(|content| content.pane_id == pane_id)
+                .map(|content| content.title.clone())
+                .or_else(|| pane.title.clone())
+                .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase());
+            let geometry = state
+                .floating_geometry
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(floating.geometry);
+            let content = self.panes.iter().find(|content| content.pane_id == pane_id);
+            let mut window_actions = Vec::new();
+            let shown = egui::Window::new(title.clone())
+                .id(ui.id().with(("floating-pane", pane_id.as_str())))
+                .default_pos(egui::pos2(geometry.x, geometry.y))
+                .default_size(Vec2::new(geometry.width, geometry.height))
+                .min_size(Vec2::new(160.0, 100.0))
+                .collapsible(false)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Dock").clicked() {
+                            window_actions.push(ViewAction::DockPane {
+                                pane_id: pane_id.clone(),
+                            });
+                        }
+                        if ui.small_button("Duplicate").clicked() {
+                            window_actions.push(ViewAction::DuplicatePane {
+                                pane_id: pane_id.clone(),
+                            });
+                        }
+                        ui.menu_button("View type", |ui| {
+                            for (label, kind) in pane_kind_choices() {
+                                if ui.selectable_label(pane.kind == kind, label).clicked() {
+                                    window_actions.push(ViewAction::ChangePaneKind {
+                                        pane_id: pane_id.clone(),
+                                        kind,
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if layout.pane_count() > 1 && ui.small_button("Close view").clicked() {
+                            window_actions.push(ViewAction::ClosePane {
+                                pane_id: pane_id.clone(),
+                            });
+                        }
+                    });
+                    ui.separator();
+                    let body = ui.available_rect_before_wrap();
+                    if let Some(content) = content {
+                        let options = PaneOptions {
+                            focused: layout.active.as_ref() == Some(&pane_id),
+                            accepts_input: !state.is_sensitive()
+                                && self.write_conflict.is_none()
+                                && self.link_confirmation.is_none(),
+                            now_ms: self.now_ms,
+                            scrolled: content.scrolled,
+                            history_complete: content.history_complete,
+                        };
+                        let pane_actions = terminal::show(
+                            ui,
+                            theme,
+                            body,
+                            content.grid,
+                            state.pane(&pane_id),
+                            options,
+                            ui.id().with(("floating-terminal", pane_id.as_str())),
+                        );
+                        window_actions.extend(pane_actions.into_iter().map(|action| {
+                            ViewAction::Pane {
+                                pane_id: pane_id.clone(),
+                                action,
+                            }
+                        }));
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new(format!("{:?} view", pane.kind))
+                                    .color(theme.text_dim),
+                            );
+                        });
+                    }
+                });
+            actions.extend(window_actions);
+
+            if let Some(shown) = shown {
+                let rect = shown.response.rect;
+                let next = PaneGeometry {
+                    x: rect.min.x,
+                    y: rect.min.y,
+                    width: rect.width(),
+                    height: rect.height(),
+                };
+                let released = ui.input(|input| input.pointer.any_released());
+                if released && next.is_valid() && next != geometry {
+                    state.floating_geometry.insert(pane_id.clone(), next);
+                    actions.push(ViewAction::SetFloatingPaneGeometry {
+                        pane_id: pane_id.clone(),
+                        geometry: next,
+                    });
+                }
+            }
+        }
+        actions
+    }
+
     /// Draws the one surface-scoped temporary Pane over the explicit Layout. Its
     /// geometry is intentionally absent from `Layout`; replacing or closing it cannot
     /// move a divider or stop the underlying Agent.
@@ -6255,6 +6768,35 @@ impl<'a> TurnView<'a> {
                 session_id: temporary.pane.binding.session_id.clone(),
                 pane_id: temporary.pane.binding.pane_id.clone(),
             });
+        }
+        if let (Some(surface_id), Some(target_pane_id)) = (
+            temporary.pane.binding.surface_id.clone(),
+            self.layout
+                .as_ref()
+                .and_then(|layout| layout.active.clone()),
+        ) {
+            let keep_rect = Rect::from_min_size(
+                close_rect.left_top() - Vec2::new(122.0, 0.0),
+                Vec2::new(116.0, 24.0),
+            );
+            if ui
+                .put(keep_rect, egui::Button::new("Keep in layout…"))
+                .clicked()
+            {
+                state.pane_placement = Some(PanePlacementDraft {
+                    source: PanePlacementSource::Temporary {
+                        surface_id,
+                        session_id: temporary.pane.binding.session_id.clone(),
+                        pane_id: temporary.pane.binding.pane_id.clone(),
+                    },
+                    target_pane_id,
+                    placement: match self.preferred_pane_placement() {
+                        PanePlacement::Temporary => PanePlacement::SplitRight,
+                        placement => placement,
+                    },
+                    remember: true,
+                });
+            }
         }
 
         let body = Rect::from_min_max(header.left_bottom(), panel.max).shrink(10.0);
@@ -6682,6 +7224,25 @@ impl<'a> TurnView<'a> {
                             session_id: node.session_id.clone(),
                             node_id: node.node_id.clone(),
                         });
+                    }
+                    if let Some(target_pane_id) = self
+                        .layout
+                        .as_ref()
+                        .and_then(|layout| layout.active.clone())
+                    {
+                        if ui.button("Open as pane…").clicked() {
+                            state.pane_placement = Some(PanePlacementDraft {
+                                source: PanePlacementSource::Node {
+                                    surface_id: snapshot.tree_state.surface_id.clone(),
+                                    session_id: node.session_id.clone(),
+                                    node_id: node.node_id.clone(),
+                                },
+                                target_pane_id,
+                                placement: self.preferred_pane_placement(),
+                                remember: true,
+                            });
+                            state.quick_preview = None;
+                        }
                     }
                     if ui.button("Show details").clicked() {
                         state.inspector_open = true;
@@ -8877,6 +9438,14 @@ fn pane_close_slot(header: Rect) -> Rect {
     )
 }
 
+fn pane_menu_slot(header: Rect) -> Rect {
+    let close = pane_close_slot(header);
+    Rect::from_min_size(
+        close.left_top() - Vec2::new(PANE_CLOSE_WIDTH + 2.0, 0.0),
+        close.size(),
+    )
+}
+
 /// What a drop zone does, said in words.
 ///
 /// Spelled here rather than at the two places that paint it so the region the user sees
@@ -9011,10 +9580,11 @@ fn pane_header_controls(
     let mut actions = Vec::new();
     let header = pane_header_rect(placed.rect);
     let close_slot = pane_close_slot(header);
+    let menu_slot = pane_menu_slot(header);
 
     let grip = Rect::from_min_max(
         header.min,
-        egui::pos2((close_slot.min.x - 2.0).max(header.min.x), header.max.y),
+        egui::pos2((menu_slot.min.x - 2.0).max(header.min.x), header.max.y),
     );
     let grip_response = ui.interact(
         grip,
@@ -9101,6 +9671,48 @@ fn pane_header_controls(
         "{title} — drag this header onto another pane: its edges put this pane beside it, its middle swaps the two. Or press {move_shortcut}"
     ));
 
+    ui.scope_builder(
+        keyed_region(menu_slot, "pane-menu", placed.pane_id.as_str()),
+        |ui| {
+            ui.menu_button("...", |ui| {
+                if ui.button("Duplicate view").clicked() {
+                    actions.push(ViewAction::DuplicatePane {
+                        pane_id: placed.pane_id.clone(),
+                    });
+                    ui.close();
+                }
+                ui.menu_button("View type", |ui| {
+                    for (label, kind) in pane_kind_choices() {
+                        if ui.selectable_label(placed.kind == kind, label).clicked() {
+                            actions.push(ViewAction::ChangePaneKind {
+                                pane_id: placed.pane_id.clone(),
+                                kind,
+                            });
+                            ui.close();
+                        }
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add_enabled(movable, egui::Button::new("Detach as floating Pane"))
+                    .on_disabled_hover_text("Keep at least one Pane docked in the Session.")
+                    .clicked()
+                {
+                    actions.push(ViewAction::FloatPane {
+                        pane_id: placed.pane_id.clone(),
+                        geometry: PaneGeometry {
+                            x: placed.rect.min.x + 32.0,
+                            y: placed.rect.min.y + 32.0,
+                            width: placed.rect.width().max(480.0),
+                            height: placed.rect.height().max(320.0),
+                        },
+                    });
+                    ui.close();
+                }
+            });
+        },
+    );
+
     let close_shortcut = keymap
         .chord_for(Command::ClosePane)
         .map(|chord| chord.describe(keymap.platform()));
@@ -9137,6 +9749,24 @@ fn pane_header_controls(
         },
     );
     actions
+}
+
+fn pane_kind_choices() -> [(&'static str, PaneKind); 13] {
+    [
+        ("Terminal", PaneKind::Terminal),
+        ("Agent terminal", PaneKind::Agent),
+        ("Shell", PaneKind::Shell),
+        ("Terminal app", PaneKind::Tui),
+        ("Logs", PaneKind::Logs),
+        ("Test output", PaneKind::TestOutput),
+        ("Server", PaneKind::Server),
+        ("Event log", PaneKind::EventLog),
+        ("Agent tree", PaneKind::AgentTree),
+        ("Process details", PaneKind::ProcessDetails),
+        ("Preview", PaneKind::Preview),
+        ("tmux terminal", PaneKind::TmuxTerminal),
+        ("Placeholder", PaneKind::Placeholder),
+    ]
 }
 
 /// What a pane calls itself, for a sentence about it.

@@ -27,8 +27,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use turn_core::attention::{AttentionPolicy, Effect};
 use turn_core::ids::{HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, Direction, Layout, LeaseState, Pane, PaneKind, PreviewVisibility,
-    SessionStatus, TreeFilter,
+    ActivityPreview, Direction, Layout, LeaseState, Pane, PaneKind, PanePlacement,
+    PreviewVisibility, SessionStatus, TreeFilter,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::cells::Grid;
@@ -49,6 +49,15 @@ use crate::view::{
     HierarchyAction, LifecycleConfirmation, PaneContent, PendingPermission, QueueItem,
     SessionDraft, SessionRestoreView, SessionRow, TemporaryPaneContent, TurnView, ViewAction,
 };
+
+fn pane_placement_name(placement: PanePlacement) -> &'static str {
+    match placement {
+        PanePlacement::ReplaceCurrent => "replace_current",
+        PanePlacement::SplitRight => "split_right",
+        PanePlacement::SplitBelow => "split_below",
+        PanePlacement::Temporary => "temporary",
+    }
+}
 
 /// Something the application must do as a result.
 ///
@@ -2484,6 +2493,33 @@ impl Desk {
                     node_id,
                 },
             }],
+            HierarchyAction::OpenPane {
+                surface_id,
+                session_id,
+                node_id,
+                target_pane_id,
+                placement,
+            } => vec![if placement == PanePlacement::Temporary {
+                Reaction::Send {
+                    ask: Ask::NodePane,
+                    request: Request::OpenNodeAsTemporaryPane {
+                        surface_id,
+                        session_id,
+                        node_id,
+                    },
+                }
+            } else {
+                Reaction::Send {
+                    ask: Ask::Action("opening a Process as a Pane"),
+                    request: Request::OpenNodeAsPane {
+                        surface_id,
+                        session_id,
+                        node_id,
+                        target_pane_id,
+                        placement,
+                    },
+                }
+            }],
             HierarchyAction::FocusPaneForNode {
                 surface_id,
                 session_id,
@@ -3549,6 +3585,162 @@ impl Desk {
                         zone,
                     },
                 }]
+            }
+            ViewAction::OpenNodePane {
+                surface_id,
+                session_id,
+                node_id,
+                target_pane_id,
+                placement,
+                remember,
+            } => {
+                let mut reactions = Vec::new();
+                if remember {
+                    reactions.push(Reaction::Send {
+                        ask: Ask::WriteSetting {
+                            key: crate::view::OPEN_PANE_PLACEMENT_KEY.to_string(),
+                        },
+                        request: Request::SetSetting {
+                            scope: turn_core::settings::Scope::Global,
+                            owner_id: None,
+                            key: crate::view::OPEN_PANE_PLACEMENT_KEY.to_string(),
+                            value: serde_json::Value::String(pane_placement_name(placement).into()),
+                        },
+                    });
+                }
+                reactions.push(if placement == PanePlacement::Temporary {
+                    Reaction::Send {
+                        ask: Ask::NodePane,
+                        request: Request::OpenNodeAsTemporaryPane {
+                            surface_id,
+                            session_id,
+                            node_id,
+                        },
+                    }
+                } else {
+                    Reaction::Send {
+                        ask: Ask::Action("opening a Process as a Pane"),
+                        request: Request::OpenNodeAsPane {
+                            surface_id,
+                            session_id,
+                            node_id,
+                            target_pane_id,
+                            placement,
+                        },
+                    }
+                });
+                reactions
+            }
+            ViewAction::PromoteTemporaryPane {
+                surface_id,
+                session_id,
+                pane_id,
+                target_pane_id,
+                placement,
+                remember,
+            } => {
+                if self.temporary_pane.as_ref().is_some_and(|temporary| {
+                    temporary.binding.session_id == session_id
+                        && temporary.binding.pane_id == pane_id
+                }) {
+                    self.temporary_pane = None;
+                }
+                let mut reactions = Vec::new();
+                if remember {
+                    reactions.push(Reaction::Send {
+                        ask: Ask::WriteSetting {
+                            key: crate::view::OPEN_PANE_PLACEMENT_KEY.to_string(),
+                        },
+                        request: Request::SetSetting {
+                            scope: turn_core::settings::Scope::Global,
+                            owner_id: None,
+                            key: crate::view::OPEN_PANE_PLACEMENT_KEY.to_string(),
+                            value: serde_json::Value::String(pane_placement_name(placement).into()),
+                        },
+                    });
+                }
+                reactions.push(Reaction::Send {
+                    ask: Ask::Action("keeping a temporary Pane in the Layout"),
+                    request: Request::PromoteTemporaryPane {
+                        surface_id,
+                        session_id,
+                        pane_id,
+                        target_pane_id,
+                        placement,
+                    },
+                });
+                reactions
+            }
+            ViewAction::CreatePane {
+                target_pane_id,
+                placement,
+                pane,
+            } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("creating a Pane"),
+                    request: Request::CreatePane {
+                        session_id,
+                        target_pane_id,
+                        placement,
+                        pane,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::DuplicatePane { pane_id } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("duplicating a Pane view"),
+                    request: Request::DuplicatePane {
+                        session_id,
+                        pane_id,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::ChangePaneKind { pane_id, kind } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("changing a Pane view type"),
+                    request: Request::ChangePaneKind {
+                        session_id,
+                        pane_id,
+                        kind,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::FloatPane { pane_id, geometry } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("detaching a Pane from the tiled Layout"),
+                    request: Request::FloatPane {
+                        session_id,
+                        pane_id,
+                        geometry,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::DockPane { pane_id } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("docking a floating Pane"),
+                    request: Request::DockPane {
+                        session_id,
+                        pane_id,
+                    },
+                }],
+                None => Vec::new(),
+            },
+            ViewAction::SetFloatingPaneGeometry { pane_id, geometry } => {
+                match self.selected.clone() {
+                    Some(session_id) => vec![Reaction::Send {
+                        ask: Ask::Action("saving floating Pane geometry"),
+                        request: Request::SetFloatingPaneGeometry {
+                            session_id,
+                            pane_id,
+                            geometry,
+                        },
+                    }],
+                    None => Vec::new(),
+                }
             }
             ViewAction::ChooseWorkspaceDirectory
             | ViewAction::OpenLayoutEditor(_)
@@ -8116,5 +8308,72 @@ mod tests {
             got: 4
         }));
         assert!(is_worth_reporting(&Desync::Malformed("a bad run".into())));
+    }
+
+    #[test]
+    fn opening_a_node_remembers_placement_and_sends_the_explicit_layout_action() {
+        let mut desk = Desk::new();
+        let session_id = SessionId::from_stored("sess_open_node_pane");
+        let node_id = NodeId::from_stored("node_open_node_pane");
+        let target = PaneId::from_stored("pane_open_node_target");
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::OpenNodePane {
+                surface_id: "main-window".into(),
+                session_id: session_id.clone(),
+                node_id: node_id.clone(),
+                target_pane_id: target.clone(),
+                placement: PanePlacement::SplitBelow,
+                remember: true,
+            },
+            T0,
+        ));
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                Request::SetSetting { key, value, .. },
+                Request::OpenNodeAsPane {
+                    session_id: opened_session,
+                    node_id: opened_node,
+                    target_pane_id,
+                    placement: PanePlacement::SplitBelow,
+                    ..
+                }
+            ] if key == crate::view::OPEN_PANE_PLACEMENT_KEY
+                && value == "split_below"
+                && opened_session == &session_id
+                && opened_node == &node_id
+                && target_pane_id == &target
+        ));
+    }
+
+    #[test]
+    fn custom_pane_creation_preserves_the_program_and_argv_without_a_shell() {
+        let mut desk = Desk::new();
+        let session_id = SessionId::from_stored("sess_custom_pane");
+        let target = PaneId::from_stored("pane_custom_target");
+        desk.selected = Some(session_id.clone());
+        let mut pane = NewPane::new(PaneKind::Logs);
+        pane.command = Some("tail".into());
+        pane.args = vec!["-f".into(), "file with spaces.log".into()];
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::CreatePane {
+                target_pane_id: target.clone(),
+                placement: PanePlacement::ReplaceCurrent,
+                pane,
+            },
+            T0,
+        ));
+        assert!(matches!(
+            requests.as_slice(),
+            [Request::CreatePane {
+                session_id: created_session,
+                target_pane_id,
+                placement: PanePlacement::ReplaceCurrent,
+                pane,
+            }] if created_session == &session_id
+                && target_pane_id == &target
+                && pane.command.as_deref() == Some("tail")
+                && pane.args == ["-f", "file with spaces.log"]
+        ));
     }
 }
