@@ -3470,3 +3470,65 @@ collide, whereas distinct checkout/worktree directory inodes may write concurren
   sandbox against malicious same-user code.
 - **Downside:** unsupported platforms fail closed for main-checkout authority rather than silently falling
   back to SQLite-only exclusion.
+
+---
+
+<a id="adr-056"></a>
+## ADR-056 — A compatible app update replaces files, never the live daemon
+
+**Status:** Accepted and implemented for macOS packaging, release channels and update preflight.
+
+### Context
+
+The product is deliberately split: `turnd` owns PTYs and the window does not. A conventional app updater
+that terminates every executable shipped in `Turn.app` would erase that advantage at release time. Merely
+copying a new bundle is not enough either: an already-running daemon continues executing its old mapped
+image, so the new UI must know whether it can speak to it. Saved Session state cannot answer whether a PTY
+handle is still alive, and process-table guesses are not authority.
+
+### Alternatives considered
+
+**Stop `turnd` whenever `Turn.app` is replaced.** Rejected. It kills the PTYs the daemon exists to preserve,
+including work the user may not be watching.
+
+**Replace the bundle and hope protocol compatibility holds.** Rejected. A partially compatible UI can draw
+a plausible terminal while silently misunderstanding hierarchy or control state.
+
+**Infer liveness from saved lifecycle labels or `ps`.** Rejected. Stored `Alive` is downgraded on restart,
+and an observed pid does not prove ownership of a PTY handle.
+
+**Make the daemon self-update.** Rejected for this milestone. Replacing the process which owns PTY masters
+requires descriptor transfer or a persistent multiplexer; exec/restart alone cannot preserve them.
+
+### Decision
+
+Every packaged component exposes machine-readable `--build-info`. Packaging requires one semantic version
+for `turn`, `turnd` and `turn-hook`, and the UI/daemon protocol windows must be identical before anything is
+signed. `Turn.app` carries a sealed `release.plist`; signed companion hashes prevent a mixed helper set.
+Developer ID releases use hardened runtime, notarization, stapling and Gatekeeper verification on both
+native macOS architectures.
+
+The authenticated protocol adds read-only `get_update_status`. Its `active_ptys` is counted from live
+`PtyProcess` handles inside the daemon. The updater intersects the new release's protocol window with the
+daemon's:
+
+- overlap: atomically replace the bundle, leave `turnd` and every PTY alone, and let the user reopen only
+  the UI when convenient;
+- no overlap plus active PTYs: defer and replace nothing;
+- no overlap plus no active PTYs: require an explicit daemon stop, then retry.
+
+The installer itself has no stop or kill path. It authenticates the daemon query, verifies the channel
+checksum, notarized bundle, bundle id and signing team, rejects downgrades, stages beside the destination and
+rolls back a failed rename. The new on-disk daemon is used only after the old daemon has ended normally.
+
+### Consequences
+
+- UI updates preserve live work whenever the protocol contract says they can.
+- An incompatible binary is refused with the existing directional recovery message instead of half working.
+- Release tags produce architecture-specific stable manifests and archives through `gh release create`.
+- **Downside:** an incompatible update may wait indefinitely for long-lived PTYs; Turn chooses work
+  preservation over urgency.
+- **Downside:** an idle incompatible daemon still needs a separate explicit stop. This is one extra action,
+  retained so an installer never learns to terminate runtime state silently.
+- **Downside:** preserving PTYs across a genuinely incompatible daemon update remains impossible without a
+  future descriptor-transfer or external multiplexer design.

@@ -46,7 +46,7 @@ restart instead of being attributed or resolved session-wide.
 | M6 — Unified hierarchy foundation | ADR-040: checkout leases, Agent/View split, safe previews, protocol v3 | **Implemented and audited for the first vertical**; broader hardening remains |
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Implemented for the first vertical**; advanced tree management remains |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Automated vertical complete**; authenticated live-CLI smoke test pending |
-| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; restart fencing, durable projections and bounded authenticated IPC are built; measurement/packaging remain |
+| M9 — Hardening | Measurement, restore semantics, Linux parity, packaging | **In progress**; measured performance, restart fencing, durable projections, authenticated IPC and the macOS release/update pipeline are built; Linux visual/release sign-off remains |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -393,9 +393,9 @@ run on macOS and Linux before the milestone closes.
 
 ## M9 — Hardening · **In progress**
 
-Authority fencing, atomic event checkpoints, restore diagnostics, durable redaction and local quality gates
-have landed. Everything that needs measuring is still unmeasured; Linux visual/manual acceptance and
-packaging are still open.
+Authority fencing, atomic event checkpoints, restore diagnostics, durable redaction, measured performance,
+local quality gates and the macOS release/update pipeline have landed. Linux visual/manual acceptance and
+the first credentialed production tag are still open.
 
 **Delivers.**
 
@@ -412,9 +412,10 @@ packaging are still open.
 - **A clean CI run**: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` and the
   full Rust suite, all green on both runners. There is no Node/UI job in the current native-Rust frontend;
   Linux still needs reviewed visual baselines rather than a silently skipped comparison.
-- **Packaging**: the runtime topology and first-run bootstrap are implemented — `turn` reuses or starts a
-  detached sibling `turnd`, and `turnd` locates a sibling `turn-hook`. What remains is a signed macOS bundle,
-  a Linux archive, an explicit cross-binary version check and release acceptance of that sibling set.
+- **Packaging**: `turn`, `turnd` and `turn-hook` are explicit version-checked siblings in `Turn.app`.
+  The tag workflow produces Developer ID signed, hardened, notarized arm64/Intel archives and stable-channel
+  manifests; CI builds and verifies the same bundle ad-hoc on every PR. The updater preserves a compatible
+  live daemon and refuses any incompatible transition while it owns PTYs. A Linux archive remains open.
 - **Contract-drift monitoring**: re-record the Claude Code fixture against the current release, add a Codex
   fixture recorded live rather than shaped from documentation, and verify the two Codex assumptions still
   outstanding (§Open decisions).
@@ -468,7 +469,7 @@ global or per-Workspace navigator.
 | 6 | ~~**Where does the daemon live, who starts it, and what is the single-instance rule?**~~ **Settled:** `turn` resolves one absolute data-dir/socket pair, reuses a reachable endpoint or starts a detached sibling `turnd`; a debug source build uses its fixed Cargo workspace. The daemon's canonical data-directory lock — not socket occupancy — is the store/PTY ownership authority, so concurrent windows and socket aliases cannot create two owners. See ADR-042. | Done. |
 | 8 | **Per-`PaneKind` buffer bounds.** `with_capacity` takes both bounds; nothing uses them non-default yet. | M9 measurement. |
 | 9 | **Does `TerminalBuffer::replay()` need scrollback, or is the visible screen enough?** Today a re-attached Pane starts with no history above the fold (ADR-023). | M8 scenario 5, with real users. |
-| 10 | ~~**How is `turn-hook` located at runtime?**~~ **Settled:** it is a packaged sibling located beside `turnd`, never an arbitrary `PATH` result; source bootstrap builds both together. **Open remainder:** add an explicit version-skew check and define the user-facing degraded state for a mismatched sibling. | M9 packaging. |
+| 10 | ~~**How is `turn-hook` located and versioned at runtime?**~~ **Settled:** it is a packaged sibling beside `turnd`, never an arbitrary `PATH` result; source bootstrap builds both together. Packaging executes `--build-info` for all three siblings and refuses any version/protocol skew before signing. | Done. |
 
 ---
 
@@ -761,10 +762,10 @@ Concrete, verified items. Each is real today.
 
 ### Missing artefacts
 
-4. **The sibling package is not yet a signed/distributed artefact.** Runtime location is implemented:
-   release builds expect `turn`, `turnd` and `turn-hook` beside one another, `turnd` locates the helper beside
-   itself, and source bootstrap builds both companions. A signed bundle/archive and an explicit version-skew
-   check are still missing.
+4. **The Linux sibling package is not yet a distributed artefact.** The macOS contract is complete:
+   the three binaries are version checked, sealed into a hardened `Turn.app`, notarized by the tag workflow,
+   published for arm64/Intel and consumed through daemon-safe channel manifests. Linux still has builds and
+   tests but no equivalent archive/update channel.
 5. **`docs/PROTOCOL.md` is not checked against the code by CI.** `turn-proto`'s catalogue tests keep
    `Request::expected_result` honest, but nothing asserts the prose document still matches it.
 

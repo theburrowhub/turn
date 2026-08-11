@@ -6,6 +6,16 @@
 use turn_hook::{run, Options};
 
 fn main() {
+    let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if arguments.len() == 1 && matches!(arguments[0].to_str(), Some("-V" | "--version")) {
+        println!("turn-hook {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if arguments.len() == 1 && arguments[0] == "--build-info" {
+        println!("component=turn-hook version={}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let options = Options::from_process();
     let mut stdin = std::io::stdin().lock();
 

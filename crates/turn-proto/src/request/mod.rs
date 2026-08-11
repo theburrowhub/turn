@@ -142,6 +142,14 @@ impl NewPane {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    // ------------------------------------------------------------- release/update
+    /// Reports whether replacing the app bundle may leave the current daemon alive.
+    ///
+    /// An updater must not infer this from saved Session state: only the daemon owns
+    /// the live PTY handles. This read is the authoritative preflight used before an
+    /// installed UI is replaced.
+    GetUpdateStatus,
+
     // ---------------------------------------------------------------- workspaces
     ListWorkspaces {
         #[serde(default)]
@@ -923,6 +931,7 @@ impl Request {
     /// The stable wire name of the operation.
     pub fn op(&self) -> &'static str {
         match self {
+            Request::GetUpdateStatus => "get_update_status",
             Request::ListWorkspaces { .. } => "list_workspaces",
             Request::CreateWorkspace { .. } => "create_workspace",
             Request::RenameWorkspace { .. } => "rename_workspace",
@@ -1032,6 +1041,7 @@ impl Request {
     /// documented pairing cannot drift from the code.
     pub fn expected_result(&self) -> &'static str {
         match self {
+            Request::GetUpdateStatus => "update_status",
             Request::ListWorkspaces { .. } => "workspaces",
             Request::CreateWorkspace { .. }
             | Request::RenameWorkspace { .. }
@@ -1153,7 +1163,8 @@ impl Request {
     pub fn is_mutating(&self) -> bool {
         !matches!(
             self,
-            Request::ListWorkspaces { .. }
+            Request::GetUpdateStatus
+                | Request::ListWorkspaces { .. }
                 | Request::GetHierarchy { .. }
                 | Request::GetInspector { .. }
                 | Request::GetWorkspaceWriteLease { .. }

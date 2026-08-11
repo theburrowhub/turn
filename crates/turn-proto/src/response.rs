@@ -104,10 +104,29 @@ pub struct EscapedProcess {
     pub pid: Option<u32>,
 }
 
+/// Live daemon facts an updater must know before touching an installed bundle.
+///
+/// This is deliberately much smaller than a hierarchy snapshot. Saved lifecycle
+/// labels are not proof that a PTY handle is alive; the daemon counts the handles it
+/// currently owns and answers that fact directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RuntimeUpdateStatus {
+    pub daemon_version: String,
+    pub protocol_min: u32,
+    pub protocol_max: u32,
+    pub active_ptys: u32,
+}
+
 /// A successful result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    /// Authoritative release/update preflight from the running daemon.
+    UpdateStatus {
+        status: RuntimeUpdateStatus,
+    },
+
     /// The request succeeded and has nothing to report.
     Ack,
 
@@ -302,6 +321,7 @@ impl Response {
     /// The stable `result` tag.
     pub fn result_name(&self) -> &'static str {
         match self {
+            Response::UpdateStatus { .. } => "update_status",
             Response::Ack => "ack",
             Response::Closed { .. } => "closed",
             Response::Workspaces { .. } => "workspaces",
@@ -338,6 +358,7 @@ impl Response {
     /// Every tag this catalogue defines. Used to check the request-to-response
     /// mapping is complete.
     pub const RESULT_NAMES: &'static [&'static str] = &[
+        "update_status",
         "ack",
         "closed",
         "workspaces",
@@ -588,9 +609,9 @@ pub(crate) mod tests {
             Response::RESULT_NAMES.len(),
             "duplicate tag"
         );
-        // 30 result shapes. Asserted so adding one without documenting it in
+        // 31 result shapes. Asserted so adding one without documenting it in
         // docs/PROTOCOL.md becomes a deliberate act.
-        assert_eq!(declared.len(), 30, "the response catalogue changed size");
+        assert_eq!(declared.len(), 31, "the response catalogue changed size");
     }
 
     /// One of each variant, shared with the crate-wide contract tests.
@@ -631,6 +652,14 @@ pub(crate) mod tests {
         };
 
         vec![
+            Response::UpdateStatus {
+                status: RuntimeUpdateStatus {
+                    daemon_version: "0.1.0".into(),
+                    protocol_min: crate::MIN_PROTOCOL_VERSION,
+                    protocol_max: crate::PROTOCOL_VERSION,
+                    active_ptys: 3,
+                },
+            },
             Response::Ack,
             Response::Closed {
                 escaped: vec![EscapedProcess {

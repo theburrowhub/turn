@@ -24,6 +24,15 @@ fn main() -> std::process::ExitCode {
         println!("turnd {}", turnd::DAEMON_VERSION);
         return std::process::ExitCode::SUCCESS;
     }
+    if options.build_info {
+        println!(
+            "component=turnd version={} protocol_min={} protocol_max={}",
+            turnd::DAEMON_VERSION,
+            turn_proto::MIN_PROTOCOL_VERSION,
+            turn_proto::PROTOCOL_VERSION
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
 
     logging::init(options.log_level.as_deref());
 

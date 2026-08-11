@@ -47,6 +47,22 @@ impl Core {
             ));
         }
         match request {
+            // ---------------------------------------------------- release/update
+            Request::GetUpdateStatus => Ok(Response::UpdateStatus {
+                status: turn_proto::RuntimeUpdateStatus {
+                    daemon_version: crate::DAEMON_VERSION.to_string(),
+                    protocol_min: turn_proto::MIN_PROTOCOL_VERSION,
+                    protocol_max: turn_proto::PROTOCOL_VERSION,
+                    active_ptys: u32::try_from(
+                        self.processes
+                            .values()
+                            .filter(|process| process.pty.is_running())
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX),
+                },
+            }),
+
             // ---------------------------------------------------------- workspaces
             Request::ListWorkspaces { include_archived } => {
                 self.list_workspaces(include_archived, now_ms)
@@ -671,6 +687,41 @@ mod tests {
     use turn_proto::{ErrorCode, Request};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn update_status_counts_live_pty_handles_instead_of_saved_labels() {
+        let mut harness = Harness::new().await;
+        let (client, _frames) = harness.add_client(16);
+        let status = harness
+            .core
+            .dispatch(client, Request::GetUpdateStatus, NOW)
+            .unwrap();
+        assert!(matches!(
+            status,
+            turn_proto::Response::UpdateStatus {
+                status: turn_proto::RuntimeUpdateStatus { active_ptys: 0, .. }
+            }
+        ));
+
+        let session_id = SessionId::from_stored("sess_update_status");
+        let pane_id = PaneId::from_stored("pane_update_status");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let node_id = harness.spawn_process(&session_id, &pane_id, NOW + 1).await;
+        let status = harness
+            .core
+            .dispatch(client, Request::GetUpdateStatus, NOW + 2)
+            .unwrap();
+        match status {
+            turn_proto::Response::UpdateStatus { status } => {
+                assert_eq!(status.daemon_version, crate::DAEMON_VERSION);
+                assert_eq!(status.protocol_min, turn_proto::MIN_PROTOCOL_VERSION);
+                assert_eq!(status.protocol_max, turn_proto::PROTOCOL_VERSION);
+                assert_eq!(status.active_ptys, 1);
+            }
+            other => panic!("expected update status, got {other:?}"),
+        }
+        let _ = harness.core.processes[&node_id].pty.kill();
+    }
 
     #[test]
     fn navigation_names_reject_adversarial_text_instead_of_rewriting_it() {
