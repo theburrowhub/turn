@@ -82,7 +82,9 @@ Implemented today:
 - A version-checked macOS app bundle, hardened-runtime signing/notarization workflow,
   arm64 and Intel release channels, and an updater that leaves compatible live daemons and PTYs alone.
 
-Still before a broadly signed-off release:
+The functional v0.1.0 baseline is complete and reproducible with `make mvp-acceptance`;
+see [docs/MVP_ACCEPTANCE.md](docs/MVP_ACCEPTANCE.md) for the evidence map and explicit scope.
+Still before a broadly signed-off public release:
 
 - Publish and exercise the first Developer ID/notarized tag from a clean machine.
 - Broad authenticated acceptance against current agent CLI releases.
@@ -217,6 +219,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   AccessKit/keyboard proof and reproducible VoiceOver/Orca/IME checklists.
 - [macOS release acceptance](docs/RELEASE.md) — bundle/sign/notarize pipeline, version checks,
   architecture channels and daemon-safe updates.
+- [functional v0.1.0 acceptance](docs/MVP_ACCEPTANCE.md) — the consolidated release gate,
+  evidence matrix and post-MVP boundary.
 - [Template lifecycle acceptance](docs/TEMPLATE_ACCEPTANCE.md) — visual create/edit/capture,
   defaults, safe application, missing-tool visibility and deletion integrity.
 - [Contextual inspector acceptance](docs/INSPECTOR_ACCEPTANCE.md) — complete typed detail,

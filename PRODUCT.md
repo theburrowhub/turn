@@ -725,7 +725,7 @@ document. Unchecked items say what evidence or implementation is still missing, 
   type definition. `request::tests`.
 - [x] **A subagent appearing pushes a tree the client can draw without guessing.**
   `conversation::a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing`.
-- [x] **Protocol v3 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
+- [x] **Protocol v4 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
   revision triggers full resync; the client never applies a hierarchy diff to stale state.
   `a_delayed_full_hierarchy_snapshot_cannot_rewind_navigation` and protocol conversation tests.
 - [x] **Lease conflicts are typed.** The wire payload carries owner Workspace/Session/checkout and recovery
@@ -734,21 +734,27 @@ document. Unchecked items say what evidence or implementation is still missing, 
   expansion and selection are scoped requests/acks, not broadcast domain events.
   `tree_selection_is_private_to_a_surface` and hierarchy push/coalescing tests.
 
-### Manual and release acceptance still pending
+### Functional acceptance and post-MVP release work
 
-The deterministic vertical is demonstrated; these are deliberately narrower claims that automated tests
-do not settle:
+The functional v0.1.0 gate is defined in `docs/MVP_ACCEPTANCE.md`. Completed rows below
+have current reproducible evidence; unchecked rows are explicit post-MVP scope and do
+not weaken or block that functional baseline.
 
-- [ ] **Authenticated Claude Code in the packaged native app.** Complete Workspace creation, leased main
+- [x] **Authenticated Claude Code in the packaged native app.** Complete Workspace creation, leased main
   Session, PTY interaction, named Reviewer spawn, Quick Preview, temporary Pane, close-without-stop and UI
-  restart using the currently installed external binary and a real user account.
+  restart passed against Claude Code 2.1.226 and a real authenticated account. The exact environment,
+  observed hook/terminal behaviour and repeatable harness are recorded in `docs/REVIEWER_ACCEPTANCE.md`.
 - [ ] **Successful live-process reattachment after daemon death.** UI restart over a still-running daemon is
   covered. A PTY master cannot survive its owning daemon today, and `Lifecycle::Reconnected` is not forged.
+  Issue #21 explicitly places daemon-crash survival outside the MVP.
 - [ ] **Manual desktop acceptance.** Verify sound and OS notification delivery, VoiceOver/Orca, terminal
-  IME/dead keys, clipboard and alternate-screen TUIs on packaged macOS/Linux builds.
-- [ ] **Measured performance envelope.** Record CPU, memory, output latency and preview cadence with 30
-  Sessions and more than 100 relevant processes; budgets remain targets until measured.
+  IME/dead keys, clipboard and alternate-screen TUIs on packaged macOS/Linux builds. The application-owned
+  accessibility/IME contract and reproducible checklist are complete; broad packaged platform sign-off is
+  release hardening.
+- [x] **Measured performance envelope.** CPU/wall time, peak RSS, input/output latency, hierarchy size,
+  lazy rendering and preview cadence are enforced with 30 Sessions and 120 relevant Processes. Reference
+  hardware and before/after profiles live in `docs/PERFORMANCE.md`.
 - [ ] **tmux-backed Sessions.** Flags and node kinds exist; no backend exists in the MVP. This is deliberate
-  optional persistence work, not a substitute for Turn's hierarchy.
+  post-MVP persistence work, not a substitute for Turn's hierarchy.
 - [x] **Clean format and lint gates.** Reproduce with `cargo fmt --all -- --check` and
   `cargo clippy --workspace --all-targets -- -D warnings`; the audit report records the observed run.

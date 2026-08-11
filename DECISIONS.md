@@ -3573,3 +3573,41 @@ entries, and retains only the stable lock inode and `worktrees/` user work.
 - Terminal/log payloads are not included in export; review shows their existence, timestamp and size instead.
 - Turning history back on affects newly launched Panes because a process spawned without a journal has no
   background journal writer to activate safely.
+
+---
+
+<a id="adr-058"></a>
+## ADR-058 — Functional v0.1.0 has one evidence-backed release gate
+
+**Status:** Accepted and implemented.
+
+### Context
+
+Issues #1–#20 delivered the consolidated MVP backlog, but the repository still described completed live
+Claude and performance acceptance as pending in some places. Conversely, treating a functional MVP as a
+broadly signed-off public release would overclaim Developer ID publication, Linux distribution, packaged
+assistive-technology coverage and PTY survival after daemon death. A tracking issue is not evidence by
+itself, and a pile of focused targets is easy to run selectively.
+
+### Decision
+
+`make mvp-acceptance` is the serial functional-v0.1.0 gate. It runs the complete format/lint/test suite and
+adds the production-shaped performance, privacy and package/update proofs not fully reproduced by the
+ordinary workspace tests. `docs/MVP_ACCEPTANCE.md` maps every global completion criterion to automated or
+recorded manual evidence, including the authenticated packaged Claude Code run.
+
+The gate is deliberately named **functional**, not public-release or platform-complete. Daemon-crash PTY
+survival, the first credentialed notarized tag, Linux archive/update distribution and reviewed GPU baselines,
+broad packaged VoiceOver/Orca/current-IME sign-off, tmux and the other declared post-MVP platforms remain
+visible exclusions. An unchecked post-MVP row cannot be used to imply that the implemented MVP is partial,
+and a checked functional row cannot be used to imply that those distribution claims passed.
+
+### Consequences
+
+- One command reproduces the code-owned v0.1.0 release decision without opening a desktop window.
+- The live external-service proof remains a dated, versioned run record plus an opt-in repeatable harness;
+  deterministic fixtures are never relabelled as authenticated evidence.
+- `PRODUCT.md`, `ROADMAP.md` and `ARCHITECTURE.md` must distinguish completed functional scope from public
+  distribution and broad platform sign-off.
+- Future release criteria belong in the gate or its evidence map; closing another tracker without either is
+  not sufficient proof.
