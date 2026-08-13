@@ -63,12 +63,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # The pty tests spawn real processes and open real ptys. Limiting concurrency
-      # keeps a runner from exhausting the pty table, which surfaces as a confusing
-      # openpty failure rather than a test failure.
+      # The pty tests spawn real processes, reader threads and real ptys. Four test
+      # threads still allowed a noisy process test to starve an unrelated pty reader
+      # on a loaded macOS runner. The release gate is intentionally serial, so CI is
+      # serial too rather than accepting a PR and then failing the same SHA on main.
       - name: Test (macOS — the whole workspace, GPU snapshots included)
         if: runner.os == 'macOS'
-        run: cargo test --workspace -- --test-threads=4
+        run: cargo test --workspace -- --test-threads=1
 
       # Two commands rather than one, so the log states plainly what ran and what did
       # not. `--exclude turn-gui` drops that package's test binaries; the step after
@@ -77,7 +78,7 @@ jobs:
       # being left as a silent gap.
       - name: Test (Linux — everything except the GPU snapshot tests)
         if: runner.os == 'Linux'
-        run: cargo test --workspace --exclude turn-gui -- --test-threads=4
+        run: cargo test --workspace --exclude turn-gui -- --test-threads=1
 
       - name: Test (Linux — turn-gui's logic tests, which need no GPU)
         if: runner.os == 'Linux'

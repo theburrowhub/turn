@@ -722,10 +722,11 @@ been decided on.
   `0700`, SQLite and sidecars to `0600`, and the on-disk security suite checks the real files. Keep the test:
   a relaxed mode would expose commands, cwd, lease metadata and Activity Previews even though raw hooks are
   excluded.
-- **The pty tests are load-sensitive, and more of them than was thought.**
-  `turn_pty::process::a_process_sees_the_size_we_gave_it` failed once with `OpenPty(Os { code: -6 })` while
-  other cargo builds saturated the machine, then passed on rerun — a third test beyond the two already known
-  to flake this way. They spawn real ptys; CI parallelism will find this.
+- **The pty tests are load-sensitive, so the release audit is serial.**
+  Real PTYs and their reader threads previously raced for runner resources across four test threads: one run
+  failed opening a PTY and another starved a quiet process behind a concurrent output flood, while immediate
+  reruns passed. Local `make verify`, macOS CI and Linux CI now all use one test thread; concurrency inside
+  each production-shaped test remains intact without introducing unrelated cross-test contention.
 - **Automatic relaunch remains forbidden and is now test-proven.** Restart may offer recovery metadata but
   never launches by itself; only the explicit `RelaunchNode` request crosses the launch boundary. Keep the
   daemon restart and protocol conversation regressions because this is a safety invariant, not a UI choice.
