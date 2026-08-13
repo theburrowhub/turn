@@ -3,10 +3,10 @@
 # The point of this file is that nobody has to remember which flags matter. Two
 # of them are not obvious and are easy to get wrong:
 #
-#   * `--test-threads=4` on the test target. The pty tests open real pseudo-
-#     terminals, a finite kernel resource that recycles slowly. Unbounded
-#     parallelism exhausts it and you get an opaque `openpty` failure that looks
-#     like a bug in the code rather than in the harness.
+#   * `--test-threads=1` on the test target. The pty tests open real pseudo-
+#     terminals and schedule real reader threads. Running them serially keeps one
+#     load-sensitive integration test from starving another and makes the local
+#     gate identical to the release audit.
 #   * `--all-targets` on lint. Without it, clippy never looks at test code, and
 #     the snapshot tests stop compiling without anyone noticing.
 #
@@ -16,7 +16,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 CARGO ?= cargo
-TEST_THREADS ?= 4
+TEST_THREADS ?= 1
 # Everything except the GUI, whose snapshot tests need a GPU.
 HEADLESS_CRATES := -p turn-core -p turn-proto -p turn-store -p turn-pty \
                    -p turn-agents -p turn-hook -p turnd
