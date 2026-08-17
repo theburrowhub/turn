@@ -5,6 +5,10 @@ whole scenario below passes against an installed, authenticated Claude Code. Fix
 and recorded-payload tests remain the deterministic CI floor; they are not substitutes
 for this run.
 
+This document proves one historical provider vertical only. It is not evidence of cross-provider parity,
+the ADR-064 capability set or completion of the operator control plane. Provider-specific observations below
+must remain scoped to the recorded adapter/version/account rather than becoming product-wide claims.
+
 ## Local macOS bundle
 
 `make macos-app` builds all three release binaries, verifies their versions/protocols,
@@ -27,6 +31,10 @@ Use a disposable Git repository so the run leaves no project history behind. The
 keeps Claude in `default` permission mode, never bypasses its permission system, and
 enables experimental Agent Teams only in the launched Pane's environment. The project
 root is test-data isolation, not a host security boundary.
+
+The harness submits no permission response. ADR-064's separately accepted remote typed-response path does
+not weaken that property: it must use an exact foreground-desktop-issued single-use grant and provider
+evidence, and must never masquerade as raw PTY input or a bypass mode.
 
 ```sh
 acceptance_root="$(mktemp -d /tmp/turn-reviewer.XXXXXX)"
@@ -97,6 +105,32 @@ Automation does not replace the visible interaction check. During the same run:
    rendering remain intact.
 9. Close only Turn.app. Confirm `turnd` and Claude remain alive, then reopen the bundle.
 10. Confirm the same tree edge, Layout, preview, write lease and live terminal return.
+
+## Accepted successor live-capability matrix
+
+ADR-064 adds a provider-neutral acceptance layer above this historical vertical. Every adapter for Claude
+Code, Codex, Gemini, OpenCode, future/custom agents and the generic terminal fallback runs the same
+deterministic capability contract. Each capability that depends on a live provider additionally needs one
+current authenticated packaged smoke for that exact adapter/CLI/provider/AccountProfile/ExecutionTarget;
+one provider's pass cannot bless another provider or an unknown version.
+
+The successor record must include:
+
+| Capability area | Required packaged evidence |
+| --- | --- |
+| Foreground activation | Select one inactive safe Session once and observe exactly one idempotent activation, restored/attached attempts and at most one configured default Shell with no second action. Repeat with changed account/target/command/authority and observe zero launch plus one recovery action. Selecting child/history/resource rows remains launch-free. |
+| WorkItemSource | Project one externally sourced card through bounded pages; preserve exact source/project/item identity, mapping, assignee and field authority; exercise compare-and-swap update, conflict and timeout reconciliation. Dismiss/archive/local deletion sends no source close/delete. Credentials never enter evidence. |
+| Native jobs | Enumerate a stable Job and ordered iterations, correlate one exact runtime/result and record provider schedule/revision/survival evidence. Advertised pause/resume/run-now/cancel/delete operations each produce their own receipt; local hide/delete and daemon restart send none. A Turn Flow is visibly different. |
+| Conversation inventory | Query bounded private history/search for two profiles/targets with truncation and similar titles. Search creates no Nodes or runtimes. Adopt creates one stopped exact-key owner and sends no input; separately preflighted resume creates one new attempt. Cross-endpoint duplicate ownership is refused installation-wide. |
+| Title and profile observations | Exercise `title_read` with rename absent and rename with read stale/absent, proving independent capability and failure states. Record requested/effective model/flags, context windows, quota windows and bounded conversation/job/Attention activity per exact profile/target with source, coverage and freshness; partial/error data is never zero and never crosses profiles. |
+| Web and Browser | Select an inert Web Resource and prove zero script/network/navigation. In a separately created isolated Browser, exercise typed address/history and reviewed local HTML/localhost, reject origin rebinding, popup/download escalation and page/script control messages, then restore metadata with zero automatic reload. |
+| Remote permission | From the foreground desktop issue one narrow expiring encrypted grant for one known typed provider option. A full remote GUI or companion sends one allow/deny and waits for provider evidence. Replay, widening, stale/offline/cross-profile use and raw remote PTY bytes at that sensitive interaction fail server-side. Credentials, grant changes, administration and host trust stay local; generic unclassifiable TUIs receive no fabricated guarantee. |
+| Client-class separation | Replace/reconnect a full remote GUI using its revisioned WorkSurface and input lease, then independently reconnect a headless status client and companion. Captures prove the latter two expose only their closed projections/allowlists and cannot inherit full GUI or arbitrary terminal authority. |
+
+The canonical left tree, one selected WorkSurface and one logical Attention Queue must remain visible
+throughout. The run records effective capabilities and unavailable/degraded states, not provider marketing
+names. A screenshot or a provider title without protocol receipts and negative side-effect checks is not
+passing evidence.
 
 ## Passing run record — 2026-08-10
 

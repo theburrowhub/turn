@@ -146,6 +146,46 @@ the package/data dir, protocol capture, logs, journal, diagnostics and crash art
 markers. Production release cannot advertise dictation until this packaged pass, VoiceOver/Orca checks and
 model download/delete/privacy inventory all pass for that architecture.
 
+## Accepted control-plane release matrix
+
+ADR-064 is a post-v0.1 target and does not change the three-binary acceptance record below. A release that
+advertises the successor control plane must extend package/preflight/live evidence as follows:
+
+- a fresh packaged foreground Session is selected once under a current safe activation plan and restores/
+  attaches or starts exactly one configured default Shell without a second action. A second fixture changes
+  target/account/command/authority generation before selection and proves the package starts nothing and
+  presents one exact recovery action;
+- every shipped external WorkItemSource and agent adapter records implementation/version/capabilities in
+  build diagnostics without embedding credentials. Package smokes cover bounded page/cursor gaps, source
+  revision conflict and timeout reconciliation, and prove local projection deletion cannot close an external
+  item;
+- each advertised provider-native Job capability has a deterministic contract test plus a current
+  authenticated smoke for provider-dependent survival and mutation receipts. Flow recurrence is reported
+  separately. A package must not advertise `native_jobs` from terminal heuristics;
+- advertised ConversationInventory, title read and rename paths record the exact adapter/provider/profile/
+  target versions used. Live smoke proves bounded history/search and stopped adoption separately from resume,
+  and proves `title_read` and `conversation_rename` degrade independently;
+- Web preview and Browser use different packaged capability paths. The inert renderer's no-script/no-network/
+  no-file/control boundary and the Browser's isolated partition, reviewed local/loopback origin and
+  no-automatic-restore-load behaviour are tested in the sealed package. Any required rendering helper/engine
+  identity and hash joins release metadata and signature verification rather than being downloaded silently;
+- account context, quota and bounded activity-inbox projections are tested with two profiles plus missing,
+  partial, stale, rate-limited and failed sources. Release UI must show those states and never false zero or
+  cross-profile data;
+- a full remote GUI, a headless status client and a companion are version-negotiated as distinct client
+  classes. Release evidence proves the full GUI's scoped revision/input lease, the two bounded clients'
+  smaller allowlists and fail-closed version skew independently. No package may describe a headless snapshot
+  or companion as full remote control;
+- remote permission allow/deny is advertised only after an end-to-end test issues one narrow expiring grant
+  on the foreground desktop, transports one exact encrypted typed response, waits for provider evidence and
+  refuses replay, widening, stale/offline/cross-profile use and raw remote PTY input during that known
+  sensitive interaction. Credentials, grant changes, administration, host trust and destructive authority
+  remain local; no stronger guarantee is claimed for an unclassifiable generic TUI.
+
+The release manifest records which of these capabilities passed for each architecture, adapter, provider and
+client class. `unsupported`, `unknown`, stale live-smoke evidence or a missing helper remains visible and
+cannot be converted into a product-wide supported badge by another provider's pass.
+
 ## Packaged Claude vertical
 
 The final notarized archive uses the same bundle topology as the authenticated harness.

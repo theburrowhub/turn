@@ -3,7 +3,7 @@
 **Status:** normative, accepted, implemented and audited for the first vertical.
 **Precedence:** this document supersedes earlier navigation, simultaneous-session and automatic-subagent-pane decisions wherever they conflict. See ADR-040.
 
-**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059 and
+**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059, ADR-064 and
 `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` supersede its click/selection presentation for the accepted next
 architecture: the whole area to the right of the tree becomes one `WorkSurface`, and selecting a node
 chooses its unique view without mutating the saved Layout, process state, terminal focus or Attention.
@@ -15,12 +15,15 @@ Turn has one persistent navigation surface and one hierarchy projection:
 ```text
 Workspace
 └── Session
+    ├── Flow / Team / Group
     ├── Agent
     │   ├── Subagent
-    │   └── Process
-    ├── Shell
-    ├── TUI
-    └── Background Process
+    │   └── Process / Log
+    ├── Shell / Command / TUI / Service
+    ├── Job
+    │   └── Native Job Iteration references
+    ├── WorkItem
+    └── Resource: Note / File / Diff / Web / Browser / Media
 ```
 
 The left tree is the source of truth for navigation, state and supervision. Workspace, Session, Agent and Process are not duplicated as persistent tabs, thumbnail strips or a second tree. In the implemented v0.1
@@ -31,7 +34,10 @@ those regions as one WorkSurface with mutually exclusive Session and Node views;
 Normalised ownership remains in the existing Workspace/Session/process records; the tree does not replace
 those foreign keys. The UI keeps three independent values: `selected_tree_node`, `focused_pane` and pending
 `AttentionEntry` values. Selecting an item does not focus a pane or resolve attention. Opening or closing a
-pane does not start or stop its AgentNode.
+pane does not start or stop its AgentNode. Selecting a child, resource, WorkItem, Job iteration or historical
+conversation never starts work. ADR-064 has one narrow exception for the Session row itself: a foreground
+selection may issue one typed idempotent Session activation when a current daemon-owned plan has already
+proved every consequence safe; otherwise it starts nothing and shows one exact recovery action.
 
 ## Domain model
 
@@ -51,6 +57,49 @@ Workspace 1 ── * Checkout
 ```
 
 Normalised ownership stays explicit: `Session.workspace_id`, `ProcessNode.session_id`, and `ProcessNode.parent` remain foreign keys/pointers. The unified tree is a projection of these records, not a polymorphic table that hides ownership.
+
+### Accepted ADR-064 hierarchy extensions
+
+The additional rows in the product-invariant tree are post-v0.1 targets, not claims about the implemented
+first vertical. They extend the same canonical projection and single WorkSurface under these rules:
+
+- an externally bound WorkItem remains one canonical Node keyed by source profile/project/external id. Its
+  `WorkItemSource` adapter owns source identity, field/state and assignee mapping, per-field authority,
+  pagination/cache coverage, rate budget, revision/ETag and receipts. A partial page or cache miss cannot
+  delete a row; conflicts remain visible on that Node until revision-fenced reconciliation. Close/reopen and
+  provider deletion are source operations, never consequences of hiding, dismissing or deleting the Turn
+  projection;
+- a provider-native Job is one stable Job Node with ordered stable iteration records and references to any
+  Agent/RuntimeAttempt each iteration launched. It is distinct from a Flow and its recurrence policy.
+  Provider list/create/update/pause/resume/run-now/cancel/delete capabilities and receipts determine job
+  lifecycle; daemon restart, Session end and local hide/delete do not invent provider cancellation;
+- `ConversationInventory` is a bounded, private provider/AccountProfile/ExecutionTarget/namespace query,
+  not another tree or a collection of live Nodes. Search/match results report coverage and freshness and
+  launch nothing. Foreground adoption creates one stopped canonical Agent Node after installation-wide exact
+  ConversationKey ownership checks. Resume is a separate preflight and new RuntimeAttempt; similarity never
+  owns or binds a conversation;
+- an inert Web Resource and an interactive Browser are different Node kinds. Web preview executes no script,
+  form, navigation, popup or download and has no ambient credentials, daemon/file access or control channel.
+  Browser owns an isolated storage partition and typed navigation/history/popup/download operations; local
+  HTML and localhost require a reviewed confined-origin binding, and restore never reloads automatically;
+- provider title read and conversation rename are independent capabilities. The display model keeps
+  requested, provider-observed and effective titles separate; rename requires the exact provider revision,
+  idempotent operation id and correlated receipt, while read-only support exposes no write control;
+- profile telemetry is an `AccountActivityProjection` keyed by exact provider, AccountProfile and execution
+  target. Context windows, quota windows and bounded conversation/job/Attention inbox entries preserve their
+  own source, coverage and freshness. Unknown, unsupported, stale, partial, rate-limited and failed reads are
+  never rendered as zero or an authoritative empty inbox;
+- a full remote GUI is another authenticated revisioned Surface over this tree and WorkSurface, with explicit
+  invitation, scope and input leases. A headless status client and a companion are bounded projections with
+  separate closed allowlists; they are not hidden full GUIs. A remote typed allow/deny requires one exact
+  single-use foreground-desktop-issued encrypted permission grant and provider evidence. While that known
+  sensitive interaction is pending, raw remote PTY input is blocked; credentials, grant changes,
+  administration and host trust stay local. Generic unclassifiable TUI input is never promoted to a typed
+  permission claim.
+
+These additions preserve the cardinal rule: an operational object has one primary tree row and one selected
+view. Job iterations, Flow/Team membership and activity-inbox items may link to that row but never duplicate
+it as a second authoritative navigation object.
 
 ### Session modes and checkout safety
 
@@ -454,3 +503,44 @@ the supported explicit `agent_name: Reviewer` and task fields. Claude Code 2.1.2
 this repository supplied an external worker id and role (`Explore`) but not that parent-declared display
 name. Until a live installed version emits an explicit name, Turn must display the role/fallback honestly
 and enrich the same node later if a declaration arrives; it must never invent `Reviewer` from `Explore`.
+
+## Reproducible ADR-064 successor acceptance
+
+The product-spec completion gate must add a deterministic multi-adapter vertical plus authenticated live
+smokes where a capability depends on an external provider. The deterministic vertical executes this
+sequence against the real daemon/protocol/store and native WorkSurface:
+
+```text
+create Workspace and an inactive Session with a current safe activation plan
+→ select the Session once
+→ assert one idempotent activation, restored Layout and one configured default Shell, with no second action
+→ mutate target/account/authority generation and assert the same selection launches nothing with one recovery
+→ connect a paged external WorkItemSource and project one canonical card
+→ inject a partial page, an ETag conflict and a timeout-after-possible-close
+→ assert no disappearance/false close, visible field conflict and reconcile_required before any retry
+→ enumerate one provider-native Job with two stable iterations and a linked Agent result
+→ restart daemon and assert provider evidence, not app lifetime, determines survival
+→ hide/dismiss/delete the local projection and assert zero provider pause/cancel/delete operations
+→ query two profiles' bounded ConversationInventory pages with overlap, truncation and similar titles
+→ assert exact-key deduplication, private profile/target caches and no Node/runtime from search
+→ adopt one result and assert one stopped Node and zero launch/input
+→ resume it after full preflight and assert one new attempt plus installation-wide current ownership
+→ expose title_read without rename, then rename without fresh read, and assert independent degradation
+→ render profile context/quota/activity projections with stale, partial, rate-limited and failed sources
+→ assert no false zero, no cross-profile entries and no queue reordering from informational telemetry
+→ select an inert Web Resource and assert zero network/script/navigation
+→ create a Browser with isolated storage; exercise reviewed localhost/local-HTML and reject origin rebinding
+→ restore Browser metadata and assert zero reload; reject page/script content as control or Attention evidence
+→ issue one exact remote permission-response grant from the foreground desktop
+→ accept one typed allow/deny from a full remote GUI or companion and wait for provider evidence
+→ replay/cross-profile/widen/stale/offline attempts and raw remote PTY writes all fail server-side
+→ assert credential, grant, administration, host-trust and destructive actions remain local-only
+→ replace the local/full GUI and independently reconnect headless status and companion clients
+→ assert one canonical tree/WorkSurface revision while each client retains only its declared allowlist
+```
+
+The fixtures include delayed/out-of-order pushes, operation retries and Surface/connection/attempt generation
+changes. Native snapshots cover ordinary and dense trees with WorkItem, Job/iteration, adopted conversation,
+Web and Browser rows. They are evidence only when the corresponding semantic assertions and protocol
+captures pass; a screenshot, provider label or headless render by itself cannot prove lifecycle, external
+authority, remote input or absence-of-side-effect claims.

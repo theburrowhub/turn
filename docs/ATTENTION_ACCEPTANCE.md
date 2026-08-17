@@ -64,16 +64,58 @@ automated daemon/GUI tests and native snapshots that prove:
    runtime attempt and prompt id resolves it; unavailable evidence remains `submitted_unconfirmed`.
 6. Several simultaneous children preserve independent queue entries, unread state and prompt identity across
    relaunch. Attempt-scoped stale demands disappear without erasing valid instance-scoped review work.
-7. Context-window warnings and account quota percentages cannot focus, resolve or reorder the queue. Only a
-   typed `ContextBlocked` or `QuotaExhausted` event enters normal policy/confidence resolution.
-8. Selecting an Agent or child never starts/resumes it and never shows a generic “Start pane” gate. Warm
-   attach to an already live runtime is automatic; cold resume/restart requires its semantic lifecycle action
-   or ADR-049's separate explicit Session activation contract.
+7. Context-window warnings, account quota percentages and profile activity summaries cannot focus, resolve
+   or reorder the queue. Only a typed `ContextBlocked` or `QuotaExhausted` event enters normal
+   policy/confidence resolution. Missing, partial, stale or failed observations remain explicitly unknown;
+   they never render as zero usage, zero remaining quota or an authoritative empty inbox.
+8. Selecting an Agent, child, resource, historical conversation or job result never starts/resumes it and
+   never shows a generic “Start pane” gate. Warm attach to an already live runtime is automatic; cold
+   resume/restart requires its semantic lifecycle action. The only selection-triggered start exception is
+   ADR-064's foreground Session activation contract below, which is typed, preflighted and fail-closed.
 9. An authenticated parent/external-worker or unassigned node-less demand opens its exact
    `ProvisionalAttentionView` in the owning Session. It never invents a Node/AgentInstance, borrows an input
    owner or invokes Session activation; later exact binding produces a new route revision.
 
 The cross-layer data and failure contract is `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` §5 and §11.
+
+## Accepted ADR-064 attention and activation extensions
+
+This is a post-v0.1 target, not evidence about the current build. Its automated fixtures, protocol captures
+and native snapshots must prove all of the following without adding a second navigator or replacing the
+single WorkSurface:
+
+1. Selecting a foreground Session with a current, proved-safe activation plan sends exactly one idempotent
+   `activate_session` operation. In the same interaction Turn restores its Layout, attaches proved-live
+   attempts and, only for an empty Session, may start exactly its configured default Shell. Repeated delivery
+   cannot double-start it and no “Start pane” or second confirmation is shown. A stale Session revision,
+   changed target/account/cwd/command/authority, ambiguous survivor, missing containment, permission need or
+   unsafe input owner starts zero processes and exposes one precise recovery action in that Session View.
+   Background restore, child/resource/history selection and merely viewing an ended Session still launch
+   nothing.
+2. An externally sourced WorkItem and a provider-native Job/iteration have exact Attention subjects and
+   routes in the same tree. Dismiss, snooze, mark-read and Session deletion mutate neither the external item
+   nor the provider job. A close/reopen, job pause/resume/cancel or permission/result response advances the
+   projection only after a revision-fenced source/provider receipt; timeout-after-possible-write becomes
+   `reconcile_required`, never an automatic replay.
+3. Conversation inventory search and similarity matches create no Attention, ownership or runtime. Adoption
+   creates one stopped canonical Node and sends no provider input; resume is a separate foreground preflight
+   and creates at most one new attempt. Current ownership is checked installation-wide across exact provider,
+   profile, execution target, namespace and conversation id before any input or context authority exists.
+4. Inert Web preview and interactive Browser Nodes are distinct routes. Preview, page content, navigation,
+   popup, download and script messages cannot fabricate a typed demand, resolve Attention or become a control
+   operation. A Browser action requiring operator review routes to the exact Browser Node; restoring history
+   never reloads a page automatically.
+5. Provider title read and conversation rename are independently advertised. A read never exposes a rename
+   action without its own capability; a revision-fenced rename remains pending/reconciling until a correlated
+   provider receipt establishes the effective title. Usage, context and the bounded activity inbox remain
+   scoped to one AccountProfile and execution target with independent source, coverage and freshness.
+6. A full remote GUI or companion may answer a known typed permission only with a single-use, expiring,
+   foreground-desktop-issued, end-to-end-encrypted grant bound to the exact provider option, profile,
+   Session/Node/instance/attempt/generation and interaction/authority revisions. Allow and deny both wait for
+   provider evidence. Replay, widening, stale/offline use, cross-profile use and raw PTY input at that known
+   sensitive interaction are refused server-side. Credential entry, grant issuance/expansion, administration,
+   host trust and destructive authority stay local. For an unclassifiable generic TUI Turn makes no claim that
+   arbitrary input is a permission response and therefore never upgrades heuristics into this remote path.
 
 ## Accepted M15 local dictation boundary
 

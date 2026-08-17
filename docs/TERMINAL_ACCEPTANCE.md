@@ -2,7 +2,7 @@
 
 This is the reproducible acceptance artifact for search and scrollback, links, path drops,
 appearance preferences, text input and full-screen terminal modes. It deliberately does not
-open Turn or a browser.
+open the Turn desktop application or an interactive Browser Node.
 
 Run from the repository root:
 
@@ -41,6 +41,41 @@ whatever current vendor binaries and shells are installed on both supported desk
 manual smoke is evidence about packaging and upstream releases, not a second implementation of the
 terminal contract. Screen-reader, contrast, motion and zoom evidence is recorded separately in
 [`ACCESSIBILITY_ACCEPTANCE.md`](ACCESSIBILITY_ACCEPTANCE.md).
+
+## Accepted successor terminal and remote-input boundary
+
+ADR-064 does not add provider-specific rendering paths. It adds authority tests around the same PTY:
+
+1. A foreground Session with a current proved-safe activation plan can restore/attach and, when empty, start
+   its configured default Shell as part of selecting that Session. This is one typed idempotent Session
+   activation, not terminal output inference. Selecting a terminal child, historical conversation, Web
+   Resource, Browser, WorkItem or Job iteration starts and submits zero bytes.
+2. An inert `WebPreview` is not a terminal or a browser: its renderer has no script, forms, navigation,
+   download, ambient credentials, daemon socket or file access. An interactive Browser is a separate Node
+   with an isolated storage partition and typed navigation/history/popup/download operations. Browser page
+   content and script messages never become PTY bytes, Turn control operations or Attention evidence.
+3. Provider-native jobs and ConversationInventory come only from typed adapter capabilities. Terminal text,
+   process titles and shell history cannot fabricate a job, conversation ownership, resumability, title-read
+   capability or rename receipt. A generic terminal remains fully functional while those states are
+   explicitly unsupported or unknown.
+4. A full remote GUI may acquire a revision-fenced input/resize lease and use ordinary PTY input subject to
+   the same owner/attempt/surface/connection generations as the local WorkSurface. A headless status client
+   and a companion are not terminal clients and receive no arbitrary PTY input operation.
+5. When adapter evidence identifies an exact typed sensitive permission interaction, all raw remote PTY
+   writes for its input owner are refused while it is pending. A remote allow/deny is accepted only through
+   the closed typed operation and a single-use expiring foreground-desktop-issued encrypted grant bound to
+   the exact provider option, AccountProfile, Session/Node/instance/attempt/generation and interaction/
+   authority revisions; provider evidence, not the write receipt alone, closes it. Credentials, grant
+   issuance/expansion, administration and host trust remain local. For an unclassifiable generic TUI Turn
+   makes no guarantee that arbitrary bytes are a permission response and never fabricates a sensitive-state
+   block from heuristics.
+6. Provider/account context usage, quota and activity data never enter terminal title, scrollback or prompt
+   parsing as authoritative facts. Their profile/target scope, coverage and freshness remain visible in the
+   selected view, and missing/partial/error states never render as zero.
+
+Successor terminal acceptance therefore combines the existing byte/geometry suite with protocol tests for
+input-lease fencing and remote-operation allowlists; a headless render test alone cannot prove remote GUI
+control.
 
 ## Manual release smoke
 

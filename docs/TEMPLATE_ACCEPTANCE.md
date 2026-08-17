@@ -27,3 +27,37 @@ drafts, typed protocol requests, daemon handlers and SQLite repositories used by
 
 Templates deliberately cannot approve permissions. Agent permission requests remain explicit runtime
 decisions regardless of the Template that created the Pane.
+
+## Accepted successor boundary
+
+Templates may contribute defaults to the unified CreationCatalog and a foreground Session activation plan,
+but they remain inert configuration rather than external or provider authority. ADR-064 acceptance must
+prove:
+
+- applying or selecting a Session created from a Template needs no separate start interaction only when the
+  daemon has frozen and preflighted the exact target, AccountProfile, cwd, isolated checkout, command,
+  effective model/flags and authority generation. Exactly one idempotent activation may restore/attach and,
+  for an empty Session, start its one configured default Shell. Any drift or unresolved consequence starts
+  nothing and produces one consolidated recovery action;
+- a Template can name a WorkItemSource definition only by a non-secret profile reference. It cannot contain
+  source credentials, item revisions, assignee authority or an instruction that closes/reopens an external
+  item. Source writes still require current capabilities, compare-and-swap and external receipts;
+- a provider-native Job definition imported or captured by a Template remains inert. Native job ids,
+  schedules already active at the provider, iteration ids and provider delete/cancel authority are never
+  copied. Activating a schedule is a separate consequence-labelled foreground operation, distinct from a
+  Turn Flow's bounded recurrence;
+- ConversationInventory results, provider conversation ids, current ownership and resume authority are not
+  captured as launchable Template state. A Template may hold a non-authoritative search/default descriptor;
+  adoption and resume remain separate revision-fenced foreground operations;
+- a Web Resource Template stores only an inert bounded reference/snapshot. A Browser Template creates a new
+  empty isolated partition and cannot copy cookies, history, reviewed localhost/local-HTML bindings,
+  downloads, ambient credentials or automatic navigation;
+- provider title-read and conversation-rename capabilities are not inferred from a saved display label, and
+  AccountProfile usage/context/activity values are observations, never Template values or zero defaults;
+- neither a Template nor a Flow step may store, mint or widen a remote permission-response grant. An exact
+  single-use grant is issued separately on the foreground desktop for one live typed interaction; raw remote
+  PTY input remains blocked while that known sensitive interaction is pending.
+
+Full remote GUI clients may apply the same revision-fenced Template operation as the local WorkSurface only
+within an explicit invitation and lifecycle grant. Headless status clients and companions may inspect a
+bounded projection but cannot apply Templates or inherit activation authority.
