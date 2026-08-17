@@ -106,6 +106,70 @@ seed_case "$baseline"
 base_pin=$(tr -d '[:space:]' <"$baseline/docs/PRODUCT_SPEC_V1.sha256")
 run_spec "$baseline" >/dev/null
 
+coverage_deleted="$scratch/coverage-deleted"
+clone_case "$baseline" "$coverage_deleted"
+awk -F '\t' '$1!="CAP-001"' "$coverage_deleted/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" \
+  >"$coverage_deleted/docs/coverage.new"
+replace_file "$coverage_deleted/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_deleted/docs/coverage.new"
+commit_case "$coverage_deleted" 'delete one capability coverage row'
+expect_rejected 'deleted capability coverage row' E_COVERAGE_COUNT run_spec "$coverage_deleted"
+
+coverage_unknown="$scratch/coverage-unknown"
+clone_case "$baseline" "$coverage_unknown"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-001" { $1="CAP-999" } { print }' \
+  "$coverage_unknown/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_unknown/docs/coverage.new"
+replace_file "$coverage_unknown/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_unknown/docs/coverage.new"
+commit_case "$coverage_unknown" 'replace one known capability identity'
+expect_rejected 'unknown capability coverage identity' E_COVERAGE_SEQUENCE run_spec "$coverage_unknown"
+
+coverage_weakened="$scratch/coverage-weakened"
+clone_case "$baseline" "$coverage_weakened"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-003" { $4="irrelevant" } { print }' \
+  "$coverage_weakened/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_weakened/docs/coverage.new"
+replace_file "$coverage_weakened/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_weakened/docs/coverage.new"
+commit_case "$coverage_weakened" 'weaken one adopted capability disposition'
+expect_rejected 'weakened capability disposition' E_AUTHORITY_CONTENT run_spec "$coverage_weakened"
+
+coverage_broken_link="$scratch/coverage-broken-link"
+clone_case "$baseline" "$coverage_broken_link"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-001" { $5="PRD-HIE-999"; $6="ACP-HIE-999" } { print }' \
+  "$coverage_broken_link/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_broken_link/docs/coverage.new"
+replace_file "$coverage_broken_link/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_broken_link/docs/coverage.new"
+commit_case "$coverage_broken_link" 'break one capability requirement link'
+expect_rejected 'broken capability requirement link' E_COVERAGE_REQUIREMENT run_spec "$coverage_broken_link"
+
+coverage_bad_digest="$scratch/coverage-bad-digest"
+clone_case "$baseline" "$coverage_bad_digest"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-001" { $9="deadbeef" } { print }' \
+  "$coverage_bad_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_bad_digest/docs/coverage.new"
+replace_file "$coverage_bad_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_bad_digest/docs/coverage.new"
+commit_case "$coverage_bad_digest" 'corrupt one capability evidence digest'
+expect_rejected 'corrupt capability evidence digest' E_COVERAGE_DIGEST run_spec "$coverage_bad_digest"
+
+coverage_changed_digest="$scratch/coverage-changed-digest"
+clone_case "$baseline" "$coverage_changed_digest"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-001" { $9="0000000000000000000000000000000000000000000000000000000000000000" } { print }' \
+  "$coverage_changed_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_changed_digest/docs/coverage.new"
+replace_file "$coverage_changed_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_changed_digest/docs/coverage.new"
+commit_case "$coverage_changed_digest" 'replace one capability evidence digest'
+expect_rejected 'changed capability evidence digest' E_AUTHORITY_CONTENT run_spec "$coverage_changed_digest"
+
+coverage_bad_snapshot="$scratch/coverage-bad-snapshot"
+clone_case "$baseline" "$coverage_bad_snapshot"
+awk 'NR==2 { print "# source-snapshot: 0000000000000000000000000000000000000000"; next } { print }' \
+  "$coverage_bad_snapshot/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_bad_snapshot/docs/coverage.new"
+replace_file "$coverage_bad_snapshot/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_bad_snapshot/docs/coverage.new"
+commit_case "$coverage_bad_snapshot" 'replace the frozen capability source snapshot'
+expect_rejected 'changed capability source snapshot' E_COVERAGE_SNAPSHOT run_spec "$coverage_bad_snapshot"
+
+coverage_bad_tree="$scratch/coverage-bad-tree"
+clone_case "$baseline" "$coverage_bad_tree"
+awk 'NR==3 { print "# source-tree-sha256: 0000000000000000000000000000000000000000000000000000000000000000"; next } { print }' \
+  "$coverage_bad_tree/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$coverage_bad_tree/docs/coverage.new"
+replace_file "$coverage_bad_tree/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$coverage_bad_tree/docs/coverage.new"
+commit_case "$coverage_bad_tree" 'replace the frozen capability source tree digest'
+expect_rejected 'changed capability source tree digest' E_COVERAGE_TREE run_spec "$coverage_bad_tree"
+
 paired_delete="$scratch/paired-delete"
 clone_case "$baseline" "$paired_delete"
 awk '!/`PRD-OUT-001`/' "$paired_delete/docs/PRODUCT_REQUIREMENTS.md" >"$paired_delete/docs/requirements.new"
