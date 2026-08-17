@@ -1,4 +1,4 @@
-# Gemini CLI, OpenCode, and external-app acceptance
+# Agent adapter, quota connector and external-app acceptance
 
 Run the complete reproducible check without opening Turn:
 
@@ -51,10 +51,12 @@ tool version, and rerun `make adapter-acceptance`.
 
 ## Accepted provider-parity target
 
-The checks above prove the current Gemini/OpenCode adapter surface; they do not prove ADR-062's complete
-provider-neutral topology. Before Turn advertises that target, Claude Code, Codex, Gemini and OpenCode run
-the same capability-driven fixture/degradation suite, the generic fallback and user-declared custom adapter
-run the honesty suite, and every advertised live-dependent cell carries a dated authenticated record.
+The checks above prove the current Gemini/OpenCode adapter surface; they do not prove ADR-062/065's complete
+provider-neutral topology. Before Turn advertises that target, Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok run the same capability-driven fixture/degradation suite, the generic fallback and
+user-declared custom adapter run the honesty suite, and every advertised live-dependent cell carries a dated
+authenticated record. Kimi and MiniMax run the AccountProfile-scoped quota/activity connector suite without
+being mislabelled as launch adapters.
 
 ### One complete capability vocabulary
 
@@ -84,6 +86,7 @@ The shared manifest has exactly one row for each canonical capability below. A p
 | `conversation_inventory` | Profile/target-scoped history enumeration, bounded pagination/search, freshness, exact identity matching and adopt/resume eligibility. |
 | `title_read` | Bounded provider-title observation with source revision/freshness and an explicit unavailable state, independent of rename support. |
 | `conversation_rename` | Revision-fenced provider rename with requested/effective receipt and zero-effect refusal, independent of title-read support or Turn's local display alias. |
+| `model_gateway` | Target-bound endpoint/route/model mapping and secret-reference preflight with effective receipt, bounded discovery and zero silent fallback. |
 
 The fixture manifest is bijective with these rows and the production capability manifest. Shared fixtures,
 provider fixtures, degraded/unsupported/unknown fixtures and live evidence all use the same identifiers.
@@ -100,12 +103,12 @@ cells as unknown until current evidence arrives, while independently proved capa
 ### Generic and custom honesty suite
 
 An unrecognised command always selects the generic terminal adapter. A user-declared custom adapter always
-selects deterministically from its declaration. Each is run through all 21 vocabulary rows and must:
+selects deterministically from its declaration. Each is run through all 22 vocabulary rows and must:
 
 1. advertise only evidence it can prove, with an explicit state, mechanism, limits, reason and remediation;
 2. leave Lifecycle and raw terminal/process observation available without fabricating TurnState, questions,
    permissions, subagents, quota, transcript, resume, native jobs, conversation inventory, provider titles,
-   provider rename or structured identity;
+   provider rename, model-gateway routing or structured identity;
 3. reject an undeclared operation before launch/input/network/file effects and without falling through to a
    dedicated provider implementation; and
 4. degrade one capability independently, preserving terminal input, selection and all unrelated capabilities.
@@ -117,9 +120,9 @@ at runtime. UI and protocol snapshots distinguish unsupported, degraded, unknown
 ### Topology and count matrix
 
 The child-topology smoke asks Claude Code for exactly three children and Codex for exactly five, then repeats
-for Gemini and OpenCode whenever they advertise `subagents`. It verifies parent/child ids, UI reconnect,
-daemon recovery, duplicate/out-of-order/stop-without-start evidence and degraded mechanisms. Count assertions
-cover the full Cartesian product below at one graph revision:
+for Gemini, OpenCode, GitHub Copilot and Grok whenever they advertise `subagents`. It verifies parent/child
+ids, UI reconnect, daemon recovery, duplicate/out-of-order/stop-without-start evidence and degraded mechanisms.
+Count assertions cover the full Cartesian product below at one graph revision:
 
 - metric: `semantic_children`, `live_children`, `completed_children`;
 - scope: `direct`, `descendants`; and
@@ -145,6 +148,48 @@ resume and rename likewise select their typed method from the current capability
 no operation silently falls back to PTY text. `title_read` and `conversation_rename` are dispatched and degraded
 independently: a locally edited display alias never counts as a provider rename, and a provider rename receipt
 never fabricates the ability to read the effective provider title.
+
+### Six-adapter roster and quota-only connectors
+
+The dedicated-roster manifest contains exactly six entries: Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok. Each entry fixes adapter id, supported CLI/service version range, detection evidence and all
+22 capability cells. A versioned fixture exercises every cell in `supported|unsupported|degraded|unknown`
+states, and each supported live-dependent cell has the authenticated evidence below. Registry selection by
+renamed executable, wrapper text or process title is insufficient; an unavailable dedicated adapter may fall
+back only to an honestly labelled generic terminal after showing the lost capabilities. Core, protocol and UI
+contain no roster-specific behavior branch after registry selection.
+
+Kimi and MiniMax use a separate `QuotaConnector` manifest. Each reads only the exact provider,
+AccountProfile, ExecutionTarget and credential-reference scope and returns bounded context/quota windows plus
+activity with source, coverage, freshness, rate-limit/error and reset semantics. Shared subscription limits
+stay account facts and never become per-Agent usage. The connector advertises no `launch`, `resume`,
+`transcript`, `questions`, `permissions`, `subagents`, `messaging` or control method; calls to those paths are
+structurally absent or refused before any effect. Cross-profile cache/cursor, missing-page, zero-versus-error,
+expired auth and one-provider timeout fixtures prove isolation and failure independence.
+
+### ModelEndpointProfile and gateway matrix
+
+`ACP-ADP-013` creates two endpoint profiles under the same AccountProfile and target, then exercises create,
+validate, bounded model discovery, set-default, launch, model switch, retire and delete. The route key includes
+profile id/revision, canonical origin, wire dialect and model namespace; discovery results from an older
+revision or target generation are discarded. Responses with more than the declared model/byte/time bound are
+truncated/degraded without claiming completeness. A selected model is never inserted into flags, argv or
+environment without adapter-owned typed mapping.
+
+Credential variants are `environment variable name`, OS keystore, target host-agent or external broker
+references. The suite places unique canaries in every raw secret and proves they are absent from protocol,
+store, argv/process listing, PTY, diagnostics, logs and export. Missing, locked, expired, revoked or wrong-target
+references produce zero provider request and zero launch; a remote attempt resolves only its remote reference
+and cannot receive a locally resolved secret. Migration first commits the secret to the broker, then swaps the
+durable reference and scrubs the old literal; failure preserves the only recoverable copy and blocks use.
+
+Network fixtures reject non-HTTPS origins except an explicitly reviewed exact loopback policy, URL userinfo,
+query/fragment ambiguity, redirect outside the adopted origin, private/metadata targets, DNS rebinding, TLS/pin
+change and oversized/malformed discovery. A valid launch receipt freezes requested/effective endpoint revision,
+wire route/model, AccountProfile and credential generation. A failed switch makes no new attempt and leaves the
+old one usable; a successful capability-declared switch records exact continuity or a new RuntimeAttempt.
+Editing a default affects only future preflights, and no error silently chooses native provider, another route,
+model, profile, target or generic PTY.
 
 ### Foreground Session activation
 
@@ -290,7 +335,9 @@ Every run also captures the integration diagnostic: detected CLI version, config
 last successful invocation, last valid/rejected event, achieved level, freshness, downgrade reason/remediation
 and redacted export. The frozen obligations are `ACP-TOP-001` through `ACP-TOP-009` and `ACP-ADP-001`
 through `ACP-ADP-011`, plus `ACP-LIF-009`, `ACP-VIE-012`, `ACP-ATT-011`, `ACP-CTX-013`,
-`ACP-RUN-011`, `ACP-OBS-009` and `ACP-SCL-010` in `docs/CONTROL_PLANE_ACCEPTANCE.md`.
+through `ACP-ADP-013`, plus `ACP-LIF-009`, `ACP-VIE-012`, `ACP-ATT-011`, `ACP-ATT-012`,
+`ACP-CTX-013`, `ACP-RUN-011`, `ACP-OBS-009` through `ACP-OBS-011` and `ACP-SCL-010` in
+`docs/CONTROL_PLANE_ACCEPTANCE.md`.
 
 Primary contract references:
 

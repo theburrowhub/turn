@@ -6,7 +6,7 @@ and recorded-payload tests remain the deterministic CI floor; they are not subst
 for this run.
 
 This document proves one historical provider vertical only. It is not evidence of cross-provider parity,
-the ADR-064 capability set or completion of the operator control plane. Provider-specific observations below
+the ADR-064/065 capability set or completion of the operator control plane. Provider-specific observations below
 must remain scoped to the recorded adapter/version/account rather than becoming product-wide claims.
 
 ## Local macOS bundle
@@ -108,8 +108,9 @@ Automation does not replace the visible interaction check. During the same run:
 
 ## Accepted successor live-capability matrix
 
-ADR-064 adds a provider-neutral acceptance layer above this historical vertical. Every adapter for Claude
-Code, Codex, Gemini, OpenCode, future/custom agents and the generic terminal fallback runs the same
+ADR-064/065 add a provider-neutral acceptance layer above this historical vertical. Every dedicated adapter
+for Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok, plus future/custom agents and the generic
+terminal fallback, runs the same
 deterministic capability contract. Each capability that depends on a live provider additionally needs one
 current authenticated packaged smoke for that exact adapter/CLI/provider/AccountProfile/ExecutionTarget;
 one provider's pass cannot bless another provider or an unknown version.
@@ -126,11 +127,18 @@ The successor record must include:
 | Web and Browser | Select an inert Web Resource and prove zero script/network/navigation. In a separately created isolated Browser, exercise typed address/history and reviewed local HTML/localhost, reject origin rebinding, popup/download escalation and page/script control messages, then restore metadata with zero automatic reload. |
 | Remote permission | From the foreground desktop issue one narrow expiring encrypted grant for one known typed provider option. A full remote GUI or companion sends one allow/deny and waits for provider evidence. Replay, widening, stale/offline/cross-profile use and raw remote PTY bytes at that sensitive interaction fail server-side. Credentials, grant changes, administration and host trust stay local; generic unclassifiable TUIs receive no fabricated guarantee. |
 | Client-class separation | Replace/reconnect a full remote GUI using its revisioned WorkSurface and input lease, then independently reconnect a headless status client and companion. Captures prove the latter two expose only their closed projections/allowlists and cannot inherit full GUI or arbitrary terminal authority. |
+| Recursive Groups and CheckoutScope | Build a depth-128 same-Session tree, move/promote/reorder subtrees and race a cycle; the tree remains one canonical parent-first projection and no runtime/Attention changes. Create and adopt agent-per-branch CheckoutScopes, then exercise missing/reconcile/unbind/remove with dirty/unpublished/adopted/remote cases while primary `main` stays switchable. |
+| Adapter roster, quota connectors and model route | Run all 22 cells for each of the six exact versioned adapters. Read Kimi/MiniMax quota/activity under two profiles while launch/control is absent. Validate two ModelEndpointProfiles, bounded discovery and one launch/switch receipt; missing secret, stale endpoint and failed switch make zero fallback and every secret canary stays outside argv/PTY/store/log/export. |
+| Resource and local naming truth | Measure local and remote host memory/swap/pressure plus process RSS attribution to current, closed and unmatched owners; failed/partial collection is not zero and exact terminate touches no sibling. Generate/apply one bounded name proposal, then prove manual pinning survives reconnect/provider title changes and sends no rename/input. |
+| Workspace onboarding | Complete New/Open/Clone/SSH adoption and interrupt every phase once. Each exact onboarding id reconciles without duplicate clone, local fallback, hidden residue or primary-main occupation. Successful onboarding performs zero repository publish; the separate reviewed publish receipt names destination/visibility/branch. |
+| Background Attention delivery | Pair two endpoints, deliver two same-titled child demands, replay one, hold/release presence, revoke during batch and end one live status while a late tick arrives. Encryption/collapse/retry/end remain exact; accepted/failed delivery resolves nothing, deep link resyncs the canonical route and NotificationHostMode exposes zero public listener. |
 
 The canonical left tree, one selected WorkSurface and one logical Attention Queue must remain visible
 throughout. The run records effective capabilities and unavailable/degraded states, not provider marketing
 names. A screenshot or a provider title without protocol receipts and negative side-effect checks is not
 passing evidence.
+The separate specification run must also pass the frozen 84-capability/152-requirement ledger and its
+deletion/unknown/weakening/link/digest mutations; a live smoke cannot compensate for a missing disposition.
 
 ## Passing run record — 2026-08-10
 

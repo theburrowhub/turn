@@ -47,9 +47,9 @@ ordinary workspace suite does not fully reproduce.
 
 ## Successor product-spec gate is separate
 
-Passing this historical v0.1.0 gate is not completion evidence for ADR-059–ADR-064 or the operator
+Passing this historical v0.1.0 gate is not completion evidence for ADR-059–ADR-065 or the operator
 control-plane goal. The successor completion gate must additionally dispatch independent production-path
-oracles for all of these ADR-064 obligations:
+oracles for all of these later obligations:
 
 - one safe foreground Session selection performs at most one idempotent preflighted activation without a
   second start action, while every stale/unsafe case and every child/resource/history selection launches
@@ -69,6 +69,22 @@ oracles for all of these ADR-064 obligations:
   extending the claim to an unclassifiable generic TUI; and
 - per-provider/AccountProfile/ExecutionTarget context, quota and bounded activity inbox projections whose
   independent source, coverage and freshness prevent false zero or cross-profile leakage.
+- recursive same-Session Groups and separately owned CheckoutScopes, including cycle-safe atomic subtree
+  mutation, complete worktree lifecycle and a primary `main` checkout that remains free;
+- resumable new/open/clone/SSH Workspace onboarding with exact partial-effect reconciliation and publication
+  kept as a separate reviewed foreground operation;
+- all six dedicated adapters under one complete capability/evidence matrix, with Kimi/MiniMax confined to
+  quota/activity connectors and no inherited launch or control authority;
+- target-bound ModelEndpointProfiles with bounded untrusted discovery, secret references, network trust,
+  launch/switch receipts and no silent endpoint/model/account/target fallback;
+- host memory/swap/pressure and reuse-safe process-tree attribution over the existing RuntimeInventory,
+  preserving complete-empty, partial, failed, stale and measured-zero distinctions;
+- revisioned generated local display names whose manual pinning and redaction rules cannot rename a provider,
+  change identity or send terminal input;
+- background/headless Attention delivery through revocable grants, a minimal encrypted outbox, exact
+  collapse/retry/live-status semantics and a notification-only host with zero public listener; and
+- the frozen 84-capability disposition/evidence ledger and its one-to-one trace to the complete PRD/ACP/ADR
+  inventory, including adversarial deletion, weakening and coordinated-rewrite rejection.
 
 Those proofs must use the same canonical tree, one selected WorkSurface and one logical Attention Queue.
 Full remote GUI, headless status and companion clients have distinct authenticated sync/input/action

@@ -31,7 +31,7 @@ decisions regardless of the Template that created the Pane.
 ## Accepted successor boundary
 
 Templates may contribute defaults to the unified CreationCatalog and a foreground Session activation plan,
-but they remain inert configuration rather than external or provider authority. ADR-064 acceptance must
+but they remain inert configuration rather than external or provider authority. ADR-064/065 acceptance must
 prove:
 
 - applying or selecting a Session created from a Template needs no separate start interaction only when the
@@ -58,6 +58,23 @@ prove:
 - neither a Template nor a Flow step may store, mint or widen a remote permission-response grant. An exact
   single-use grant is issued separately on the foreground desktop for one live typed interaction; raw remote
   PTY input remains blocked while that known sensitive interaction is pending.
+- a Template may preserve a recursive Group shape and an inert CheckoutScope request/default, but never a
+  live Group binding, repository/worktree identity, creator provenance, dirty-state claim or remove/merge/
+  publish authority. Application validates the whole acyclic tree and provisions a fresh target-bound scope;
+  partial failure has receipts and cannot occupy primary `main`;
+- WorkspaceOnboarding inputs stored in a Template are non-secret suggestions only. Applying a Template cannot
+  open/clone/adopt SSH or publish a repository implicitly; each uses its own preassigned foreground operation,
+  current target/path/repository/auth reference and consequence review;
+- a Template may name `ModelEndpointProfileId` and model request but cannot copy an endpoint credential,
+  discovered catalogue, health claim or effective receipt. Launch preflight revalidates the current route,
+  target/profile/credential generation and fails without fallback. Quota samples from Kimi/MiniMax or any
+  provider are observations and cannot become Template defaults;
+- generated DisplayName proposals, captured source bytes/confidence and a manual pinned alias are not copied as
+  generation authority. A Template may contain an explicit declared static label or an inert name-policy id;
+  stale output cannot rename the new Node/Group or invoke provider rename; and
+- NotificationEndpoint, DeliveryGrant, outbox/live state and device secret references are never Template or
+  FlowDefinition content. A run may declare which canonical Attention events are eligible under an already
+  active separately issued endpoint grant, but cannot pair, widen, persist or resolve through it.
 
 Full remote GUI clients may apply the same revision-fenced Template operation as the local WorkSurface only
 within an explicit invitation and lifecycle grant. Headless status clients and companions may inspect a

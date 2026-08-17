@@ -37,6 +37,7 @@ never sufficient by itself.
 | `ACP-HIE-006` | `PRD-HIE-006` | A | Conflicting explicit/inferred/out-of-order edges keep the strongest evidence; unresolved children render unassigned with provenance. |
 | `ACP-HIE-007` | `PRD-HIE-007` | A | A generated schema inventory matches domain/store/protocol/view/detailed-contract kind and relationship sets byte-for-byte; every kind round-trips and no vNext id aliases another type. |
 | `ACP-HIE-008` | `PRD-HIE-008` | A, P | A node with spawn/process ancestry, one Group, multiple Teams and Flow membership renders once under fixed precedence; equal strongest evidence for two different parents remains ambiguous/unassigned, stable edge id orders only references, and Group moves leave semantic counts/Attention unchanged. |
+| `ACP-HIE-009` | `PRD-HIE-009` | A, D, P | A 128-level persisted Group tree hydrates parent-first and round-trips exact order; self/indirect/concurrent cycles, cross-Session/non-Group parents and depth 129 fail atomically, subtree reparent/ungroup/promote/delete preserve descendants, runtimes and Attention, and fuzzed corrupt input terminates bounded with an isolated diagnostic. One-step create/adopt plus bind/unbind/missing/reconcile/remove covers complete-versus-failed repository inventory, adopted/dirty/unpublished/path-danger/remote generation cases, never changes cwd on presentation move, never deletes by default and leaves primary `main` switchable. |
 | `ACP-VIE-001` | `PRD-VIE-001` | A, P | Selecting every hierarchy kind produces exactly one revisioned ViewTarget and one WorkSurface destination. |
 | `ACP-VIE-002` | `PRD-VIE-002` | A | Selecting every child/resource changes no persisted Layout, process count, PTY input, Flow operation, unread flag or Attention state; Session activation is exercised only by ACP-LIF-009. |
 | `ACP-VIE-003` | `PRD-VIE-003` | A, P | Snapshot/state-table tests cover content plus loading/empty/unsupported/disconnected/stopped/lost/stale for every NodeKind without generic fallback lies. |
@@ -61,6 +62,7 @@ never sufficient by itself.
 | `ACP-CRE-005` | `PRD-CRE-005` | A | Template duplication contains no live/runtime/provider ids; Flow launch pins one immutable revision and later edits affect only later runs. |
 | `ACP-CRE-006` | `PRD-CRE-006` | A, P | Single, multi, cancelled and cross-Workspace creates produce the specified selection/focus outcome; no child steals focus and no unsafe/missing owner receives input. |
 | `ACP-CRE-007` | `PRD-CRE-007` | A, D, P | Clean/degraded/skipped setup discovers exact versions, guides auth/consent/trust at point of use, stores no credential canary and leaves generic terminal usable after every cancellation/failure. |
+| `ACP-CRE-008` | `PRD-CRE-008` | A, D, L, P | New/open/clone/SSH-adopt each complete in one resumable catalogue path with exact target/path/repository identity; cancellation/crash at every clone phase reconciles once without duplicate repository or hidden residue, hostile saved config remains inert pending local consent, remote failure never opens a local namesake, and zero network publication occurs until a separate destination/visibility/branch/credential-reviewed operation. |
 | `ACP-FLW-001` | `PRD-FLW-001` | A | Schema round-trip and invalid-case tests cover every declared node, role, command/prompt, dependency, context, execution, isolation, Attention and resource field. |
 | `ACP-FLW-002` | `PRD-FLW-002` | A, D | A FlowRun survives reconnect/restart with immutable inputs, grants, operations, attempts, receipts/results and terminal state; definition edits do not alter it. |
 | `ACP-FLW-003` | `PRD-FLW-003` | A, D | Each non-recurring closed start policy advances once on current typed evidence; unknown/idle/stale evidence and later definition edits do not. |
@@ -88,7 +90,7 @@ never sufficient by itself.
 | `ACP-TOP-008` | `PRD-TOP-008` | A, D, L | Complete empty snapshots alone produce exact zero; best-effort starts unknown, 1,025-event overflow/drop/disconnect/sequence gap immediately degrades exact to lower-bound/unknown, and a later matching asynchronous snapshot restores exactness without blocking input. |
 | `ACP-TOP-009` | `PRD-TOP-009` | A, D, L | A total table-driven reducer maps every declared provider-native state, rejects unknown native values and illegal Lifecycle/Turn transitions, tests source-local ordering and comparable conflicts, correlates TurnId/revision/pending-result evidence and keeps turn completion, process exit and live children independent. |
 | `ACP-ADP-001` | `PRD-ADP-001` | A | A repository guard rejects provider-name branching outside adapter packages/fixtures/docs allowlist; all behavior dispatches through the registry contract. |
-| `ACP-ADP-002` | `PRD-ADP-002` | A, L | Claude Code, Codex, Gemini and OpenCode pass the same state/topology/capability suite; differences appear only as capability/evidence values. |
+| `ACP-ADP-002` | `PRD-ADP-002` | A, L | Every dedicated adapter passes the same complete state/topology/capability suite; differences appear only as supported/unsupported/degraded/unknown evidence values and no cell is omitted. |
 | `ACP-ADP-003` | `PRD-ADP-003` | A | Unknown/custom/shell fixtures always select an adapter and expose only declared semantics with explicit unsupported/degraded reasons. |
 | `ACP-ADP-004` | `PRD-ADP-004` | A, L | The capability manifest and test manifest are bijective; every live-dependent advertised cell links a passing dated versioned evidence record. |
 | `ACP-ADP-005` | `PRD-ADP-005` | A, D | Hung/erroring usage, transcript and hook sources for one adapter leave other adapters, selection and terminal input within latency budgets. |
@@ -98,6 +100,8 @@ never sufficient by itself.
 | `ACP-ADP-009` | `PRD-ADP-009` | A, D, L, P | Self-test preview/cancel/timeout/crash/live cases use disposable identity, enforce resource/quota disclosure, restore hooks, remove temporary resources and leave the inspected Session byte-for-byte unchanged with redacted receipts. |
 | `ACP-ADP-010` | `PRD-ADP-010` | A, D, L, P | Exactly five independent instances/conversations in two AccountProfiles share one live endpoint while input/transcript/context/Attention remain isolated; duplicate conversation ownership, sibling operations, account/generation mismatch, endpoint crash/restart/backpressure and explicit per-instance fallback converge without merge, cross-talk or duplicate launch. |
 | `ACP-ADP-011` | `PRD-ADP-011` | A, D, L, P | Shared fixtures plus one claiming live adapter create/list/update/pause/resume/run-now/cancel/delete a native job, preserve stable job and iteration ids/schedule/revisions across app/provider disconnect, route an iteration prompt/result through canonical Attention, refuse ambiguous duplicate mutation, and prove Flow recurrence plus dismiss/hide/delete-projection cause zero provider-job control. |
+| `ACP-ADP-012` | `PRD-ADP-012` | A, D, L, P | Versioned live and degradation fixtures run every common capability row for all six dedicated adapters and reject executable-name/generic fallback masquerading as dedicated support; two quota-only provider connectors report independent AccountProfile/target windows and activity states while every launch, transcript and control call remains absent/refused. |
+| `ACP-ADP-013` | `PRD-ADP-013` | A, D, L, P | Two routes under one account remain isolated; late discovery after endpoint revision, 10k-model response, redirect/rebind/private-metadata/TLS change, missing/locked/revoked secret and wrong remote generation produce zero unintended request/launch/fallback. Secret canaries remain absent from argv/PTY/protocol/store/log/export; a valid launch receipt freezes route/model/mapping/credential generation, and a failed model switch leaves the prior attempt intact. |
 
 ## Lifecycle, runtime and resources
 
@@ -150,6 +154,8 @@ never sufficient by itself.
 | `ACP-OBS-007` | `PRD-OBS-007` | A, D | Canary secrets in argv/env/output/provider errors are absent from protocol, UI snapshots, store, logs, diagnostics and exported telemetry. |
 | `ACP-OBS-008` | `PRD-OBS-008` | A, D, L, P | Two providers, hosts and accounts exercise create/adopt/external-auth/validate/default/retire/delete plus concurrent launches; precedence and LaunchReceipt freeze are exact, defaults affect only future work, active references block delete, sibling reads of auth/config roots are denied by the declared sandbox/broker, unsupported isolation refuses cross-profile concurrency, and credential/config/transcript/conversation/quota/fallback never crosses profiles. |
 | `ACP-OBS-009` | `PRD-OBS-009` | A, D, L, P | Capability cross-products independently enable/disable title read and rename; read never writes, rename uses exact ConversationKey/provider revision and one idempotent receipt, and stale/timeout/ambiguous/rate-limited/unsupported cases never change the displayed effective title without correlated provider evidence. |
+| `ACP-OBS-010` | `PRD-OBS-010` | A, D, L, M, P | Local/remote complete-empty, nonempty, partial, gap, collector error and stale target fixtures render distinct coverage and never substitute local/other-host or false zero. Independent process-tree accounting covers PID reuse, cycles, overlapping/shared trees, current and closed Session owners plus unmatched survivors without double count; exact fresh termination touches only its target+generation+handle+start identity and argv/env canaries never escape. |
+| `ACP-OBS-011` | `PRD-OBS-011` | A, D, P | Declared/provider/generated/manual/fallback name facts follow precedence and revision; a pinned alias survives reconnect and provider changes, same-cwd siblings never cross-name, stale/oversized/secret/control/bidi/multiline proposals fail, Group proposals use bounded summaries, and local apply emits no provider rename, command or terminal byte. |
 
 ## Attention and voice
 
@@ -166,6 +172,7 @@ never sufficient by itself.
 | `ACP-ATT-009` | `PRD-ATT-009` | A, D | Dedup, ageing/no-starvation, snooze/new-revision wake, dismiss-without-resolve, mute-with-badge, cooldown/manual-route and every policy inheritance field match `ATTENTION_ACCEPTANCE.md`. |
 | `ACP-ATT-010` | `PRD-ATT-010` | A, D, P | Node-less/owner-less evidence opens the exact ProvisionalAttentionView; no Node/input owner is created or borrowed, and later binding/stale revisions cannot redirect or submit the original route. |
 | `ACP-ATT-011` | `PRD-ATT-011` | A, D, L, P | A foreground desktop issues one narrow expiring response grant; remote/companion E2EE allow/deny succeeds only for its exact provider option and interaction/attempt/authority revisions and closes only on provider evidence. Replay, widening, stale/offline use, cross-profile use, raw PTY bypass and every secret/admin/trust/grant path fail server-side; a generic unclassifiable TUI makes no stronger claim. |
+| `ACP-ATT-012` | `PRD-ATT-012` | A, D, L, M, P | Background/killed-client, duplicate replay, presence leave, offline, expiry, 401/403 and revocation-during-batch fixtures enforce endpoint/grant generations, minimal E2EE payload, exact subject/revision collapse and bounded retry; two same-titled subagents yield two demands, accepted/failed delivery never resolves either, deep links resync, resolve/read/delete emits a terminal live event and late ticks cannot resurrect it. NotificationHostMode packet/listener proof finds zero public listener or inbound port. |
 | `ACP-VOI-001` | `PRD-VOI-001` | A, D, P | Network denial, remote Session and worker crash/hang/OOM prove PCM/inference stay local and Sessions/Attention/runtimes continue unaffected; the packaged worker has no outbound socket route. |
 | `ACP-VOI-002` | `PRD-VOI-002` | A, D, P | Selection/attempt/prompt/window changes never retarget a capture; zero target bytes precede explicit reviewed Insert/Send and uncertain delivery never replays. |
 | `ACP-VOI-003` | `PRD-VOI-003` | A, D, P | Bad signature/digest/size/redirect/symlink/race fail before parsing; verified model works offline and inventory/export/delete accounts for all artifacts. |
@@ -189,6 +196,7 @@ never sufficient by itself.
 | `ACP-SAF-011` | `PRD-SAF-011` | A, D | Imports with colliding/hostile ids remint every semantic object through one package map, omit all forbidden runtime/authority ids, preserve inert origin hash and cannot mutate or resurrect pre-existing state. |
 | `ACP-SAF-012` | `PRD-SAF-012` | A, D, P | Every CompanionAction passes allowlist/scope/revision/expiry/receipt and offline-stale cases; free text works only for verified non-sensitive questions/decisions, only ACP-ATT-011's exact typed permission response is admitted, every secret/authority/admin/destructive/trust/integration action is absent/refused remotely, and writer handoff is visible before bytes are accepted. |
 | `ACP-SAF-013` | `PRD-SAF-013` | A, D, P | Boundary clocks/counts enforce each §14 retention value, referenced Flow revisions survive, compacted journals retain deletion fences, ephemeral presence/drafts are absent and export/delete accounts for every retained record. |
+| `ACP-SAF-014` | `PRD-SAF-014` | A, D | The verifier accepts exactly the frozen ledger schema/snapshot/count and one unique row per stable feature id with allowed disposition, nonempty rationale, 64-hex evidence and existing PRD/ACP/ADR links; fixtures for an unknown disposition, deleted/duplicated/weakened row, broken link, altered snapshot/digest and coordinated local authority rewrite all fail before specification completion. |
 | `ACP-SCL-001` | `PRD-SCL-001` | A, M, P | The fixed minimum profile runs 50 Sessions, 100 live runtimes and 1,000 nodes with concurrent Attention for the declared duration while all correctness and latency budgets pass. |
 | `ACP-SCL-002` | `PRD-SCL-002` | A, D, M | Viewport materialisation and large-payload subscriptions remain bounded; queue saturation recovers by revision and terminal input is never blocked. |
 | `ACP-SCL-003` | `PRD-SCL-003` | A, D, M | Every §13 pressure source degrades/refuses and recovers as declared, preserves every runtime absent an external OS kill and records that Turn issued no undeclared signal; proposed intervention appears as exact Attention. |
@@ -207,8 +215,8 @@ while still failing the product.
 
 ### E2E-01 — mixed-provider delegated team
 
-From a clean Workspace, one Flow action creates a conductor plus Claude Code, Codex, Gemini, OpenCode and a
-shell/log worker in separate writable worktrees. Children appear under the correct semantic parents even
+From a clean Workspace, one Flow action creates a conductor plus Claude Code, Codex, Gemini, OpenCode,
+GitHub Copilot, Grok and a shell/log worker in separate writable worktrees. Children appear under the correct semantic parents even
 when some have no PTY. Model/mode/account/context/quota fields show effective or honest unavailable values.
 Independent results arm one synthesiser. Questions and the final review reach the exact views through
 Attention. The primary `main` checkout remains available throughout.
@@ -216,7 +224,7 @@ Attention. The primary `main` checkout remains available throughout.
 ### E2E-02 — nested children and truthful counts
 
 Authenticated versioned runs ask Claude Code to create exactly three children and Codex to create exactly
-five; equivalent runs cover Gemini and OpenCode whenever they advertise the capability. One child creates a
+five; equivalent runs cover Gemini, OpenCode, GitHub Copilot and Grok whenever they advertise the capability. One child creates a
 grandchild, one is discovered through process evidence before structured evidence, one finishes while its
 parent remains busy and one outlives the parent. Direct/live/total counts and tree placement stay correct
 across UI reconnect and daemon restart. A claiming adapter that fails to emit its observation degrades with
@@ -314,11 +322,35 @@ show two profiles' title/read-versus-rename capabilities, context usage, quota w
 Provider timeout and a partial cursor mark only the affected facts stale/unknown and never show false zero,
 cross-profile data or an independent Attention queue.
 
+### E2E-14 — recursive agent-per-branch tree and Workspace onboarding
+
+Starting from no Workspace, one resumable operation clones a repository into an exact target, creates a
+Session-owned CheckoutScope and projects it through nested Groups; a second path adopts an SSH repository.
+The operator creates, reorders and promotes a depth-128 subtree while a concurrent cycle attempt fails
+atomically. New descendants inherit the scope default, but moving an existing live child changes no cwd.
+After external worktree deletion, failed inventory remains unknown and a complete inventory yields `missing`;
+reconcile/unbind retains the adopted worktree and every runtime, while an explicitly reviewed remove refuses
+dirty/unpublished/dangerous paths. Crash/cancel at each onboarding phase repeats no clone and performs no
+publish. The primary `main` checkout stays available and a corrupt persisted cycle cannot hang restoration.
+
+### E2E-15 — background Attention, resource pressure and routed model truth
+
+All six dedicated adapters start through two independently scoped ModelEndpointProfiles while Kimi/MiniMax
+quota-only connectors update two profiles. One missing secret and one late discovery fail without fallback;
+the valid LaunchReceipts retain exact effective route/model/credential generation. Local and remote resource
+snapshots then attribute current, closed-Session and unmatched processes, preserve partial/error versus zero
+and permit only one exact re-probed termination. Two same-titled children raise demands while the GUI is
+backgrounded: revocable endpoint grants produce two minimal encrypted notifications, duplicate replay
+collapses only its exact revision, delivery failure resolves nothing, and live end fences a late tick. A deep
+link resynchronises into the one WorkSurface. A generated Group/Node name is applied only at its current
+revision; a pinned operator alias survives provider rename/reconnect and no terminal bytes are sent.
+
 ## Completion report
 
 The final implementation report must list, for the exact merged commit:
 
-1. the frozen requirement count and zero unmatched requirement/acceptance ids;
+1. the frozen 84-capability ledger snapshot/tree digest and disposition totals, the 152-requirement count and
+   zero unmatched requirement/acceptance ids;
 2. status and evidence artifact for every `PRD-*` row;
 3. provider capability matrix with fixture and live-evidence links;
 4. results for every named end-to-end journey and the recovery/security/accessibility matrices;

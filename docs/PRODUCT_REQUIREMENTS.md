@@ -58,6 +58,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-HIE-006` | Uncertain parentage stays unassigned/provisional; stronger evidence is never overwritten by weaker evidence. | §2.2; `UNIFIED_HIERARCHY_UPGRADE.md` §2 | baseline | `ACP-HIE-006` |
 | `PRD-HIE-007` | One closed NodeKind and relationship ontology is identical across domain, store, protocol, views and detailed contracts; migrations never expose aliased identities. | §2; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §3 | conflict | `ACP-HIE-007` |
 | `PRD-HIE-008` | Every operational Node has exactly one deterministic primary tree row; Group override, spawn, process and Session fallback precedence is fixed while Team/Flow/non-winning relations are references. | §2.2 | target | `ACP-HIE-008` |
+| `PRD-HIE-009` | Groups form a same-Session bounded acyclic forest with atomic subtree operations; an optional Group projection of a separately owned CheckoutScope delivers agent-per-branch defaults and complete worktree lifecycle without changing runtime ancestry or granting Group authority. | §2.1–2.2, §7 | target | `ACP-HIE-009` |
 
 ## Navigation, views and window behavior
 
@@ -87,6 +88,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-CRE-005` | Templates copy reusable layout/configuration; Flows create versioned execution runs; neither claims to copy live provider identity. | §4, §5.1 | partial | `ACP-CRE-005` |
 | `PRD-CRE-006` | Successful single creation selects its canonical Node and safe input, multi-create selects its summary, cancellation restores prior selection and contextual surfaces may group but not redefine catalogue actions. | §3.3–4 | target | `ACP-CRE-006` |
 | `PRD-CRE-007` | Resumable first-run/setup discovers versions and capabilities, explains degraded integration and guides provider authentication, notification/microphone consent and remote trust without collecting credentials or blocking generic terminal use. | §4, §6.1 | target | `ACP-CRE-007` |
+| `PRD-CRE-008` | One resumable WorkspaceOnboarding path creates/opens local directories, safely clones repositories and adopts SSH targets with exact partial-effect recovery; repository publication remains a separate reviewed foreground operation and primary `main` remains free. | §4, §7 | target | `ACP-CRE-008` |
 
 ### Reusable flows and delegation
 
@@ -124,7 +126,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | Requirement | Normative outcome | Contract | Current | Acceptance |
 | --- | --- | --- | --- | --- |
 | `PRD-ADP-001` | The adapter registry is the sole provider-specific seam; core, store, protocol projections and UI contain no provider-name behavior branches. | §1.1, §6.1 | conflict | `ACP-ADP-001` |
-| `PRD-ADP-002` | Claude Code, Codex, Gemini and OpenCode implement the same capability vocabulary and common state/topology semantics. | §6.1 | partial | `ACP-ADP-002` |
+| `PRD-ADP-002` | Every dedicated agent adapter implements the same capability vocabulary and common state/topology semantics; differences are evidence values, never missing contract cells. | §6.1 | partial | `ACP-ADP-002` |
 | `PRD-ADP-003` | The generic fallback and user-declared custom adapters advertise honest supported/unsupported/unknown/degraded capabilities and never fabricate agent semantics. | §6.1, §11 | partial | `ACP-ADP-003` |
 | `PRD-ADP-004` | Every advertised capability has shared fixtures, provider fixtures, degradation cases and live evidence when credentials/service behavior affect the claim. | §6.1 | partial | `ACP-ADP-004` |
 | `PRD-ADP-005` | One provider's slow/failing usage, hook, transcript or control endpoint does not block another provider or the selected view. | §6.1, §9 | target | `ACP-ADP-005` |
@@ -134,6 +136,8 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-ADP-009` | Integration self-tests are explicit, consequence-previewed, disposable, bounded and redacted, clean up fully and cannot mutate the inspected Session, hooks or quota except as disclosed. | §4, §6.1 | target | `ACP-ADP-009` |
 | `PRD-ADP-010` | A shared provider RuntimeEndpoint can multiplex independently bound instances/conversations with unique ownership, isolated input/context/transcript/Attention and per-binding recovery/fallback. | §6.2; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §7.4 | target | `ACP-ADP-010` |
 | `PRD-ADP-011` | Provider-native scheduled, recurring and background jobs have stable job/iteration identity, schedule and lifecycle evidence, survive according to provider truth, route Attention normally and expose independent capability-gated controls; Flow recurrence and dismiss/delete remain distinct. | §2.1, §3.1, §6.3 | target | `ACP-ADP-011` |
+| `PRD-ADP-012` | Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok are six dedicated adapters under one complete capability/evidence matrix; Kimi and MiniMax are equally scoped quota/activity connectors and never inherit launch/control authority. | §6.1, §9 | target | `ACP-ADP-012` |
+| `PRD-ADP-013` | ModelEndpointProfiles provide target-bound BYO endpoint/model routing with secret references, bounded discovery, network trust, launch/switch freeze and no silent provider, model, account or local/remote fallback. | §6.4; `SECURITY.md` | target | `ACP-ADP-013` |
 
 ## Runtime lifecycle and execution targets
 
@@ -196,6 +200,8 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-OBS-007` | Telemetry may show safe names/typed modes but never credential values, raw environment content or secrets parsed from commands/output. | §9, §14 | partial | `ACP-OBS-007` |
 | `PRD-OBS-008` | Account profiles have isolated external auth/config roots and foreground create/adopt/auth/validate/default/retire/delete lifecycle; launch freezes the resolved account and default changes never migrate or cross-contaminate active instances. | §9; `PROTOCOL.md` | target | `ACP-OBS-008` |
 | `PRD-OBS-009` | Provider conversation title read and rename are separate capability facts and operations; rename is revision-fenced and receipt-backed, and either function degrades independently without invented success. | §6.1–6.2, §9 | target | `ACP-OBS-009` |
+| `PRD-OBS-010` | Target-wide RuntimeInventory includes host memory/swap/pressure and reuse-safe process-tree resource attribution to current/closed owners and unmatched survivors, with coverage that distinguishes measured empty, partial/error and zero plus exact safe intervention. | §7, §9 | target | `ACP-OBS-010` |
+| `PRD-OBS-011` | Local display-name facts and bounded generated proposals follow explicit precedence, revision, redaction and pinning; manual aliases survive provider/reconnect changes and never imply provider rename, terminal input or identity. | §9 | target | `ACP-OBS-011` |
 
 ## Attention and operator input
 
@@ -212,6 +218,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-ATT-009` | Attention admits actionable evidence only and specifies deduplication, safety-class ageing/no-starvation, snooze, dismiss, mute, cooldown and field-level Global→Workspace→Template→Session policy. | §10; `ATTENTION_ACCEPTANCE.md` | partial | `ACP-ATT-009` |
 | `PRD-ATT-010` | Node-less or owner-less evidence routes to an exact revisioned ProvisionalAttentionView without inventing a Node, borrowing input ownership or allowing stale submission. | §10; `ATTENTION_ACCEPTANCE.md` | partial | `ACP-ATT-010` |
 | `PRD-ATT-011` | A remote/full/companion surface may answer only an exact typed permission through a single-use foreground-issued E2EE revision-fenced grant; secrets, administration, trust and authority remain local, and raw remote input cannot bypass a known sensitive interaction. | §10, §14; `SECURITY.md` | target | `ACP-ATT-011` |
+| `PRD-ATT-012` | Background/headless delivery projects canonical Attention through revocable device grants, encrypted minimal collapse-aware outbox and monotonic live status; push failure never resolves work and notification-only mode opens no public listener. | §10; `ATTENTION_ACCEPTANCE.md`, `SECURITY.md` | target | `ACP-ATT-012` |
 
 ## Local voice
 
@@ -240,6 +247,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-SAF-011` | Portable imports use package-local ids, remint every local semantic id, omit runtime/authority/machine ids and cannot collide with, update or resurrect existing objects. | §14 | target | `ACP-SAF-011` |
 | `PRD-SAF-012` | Companion actions are a closed revision-fenced set with expiry/receipts/offline refusal; only an exact separately granted typed permission response may be remote, while secrets, authority, administration, destructive lifecycle, host trust and repository integration stay desktop-foreground-only. | §10, §14; `PROTOCOL.md` | target | `ACP-SAF-012` |
 | `PRD-SAF-013` | Retention is numerically bounded for Flow revisions, sync journals, status/diagnostics, input leases and share metadata; compaction preserves stale-client resurrection fences and deletion/export proof. | §14; `PRIVACY.md` | target | `ACP-SAF-013` |
+| `PRD-SAF-014` | A frozen neutral source-capability ledger gives every audited feature a stable disposition, rationale, evidence digest and PRD/ACP/ADR trace; unknown, deletion, broken trace or weakening blocks specification completion. | §16.1; `PRODUCT_CAPABILITY_COVERAGE_V1.tsv` | target | `ACP-SAF-014` |
 
 ### Scale and quality
 

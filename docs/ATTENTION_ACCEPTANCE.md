@@ -118,6 +118,39 @@ single WorkSurface:
    host trust and destructive authority stay local. For an unclassifiable generic TUI Turn makes no claim that
    arbitrary input is a permission response and therefore never upgrades heuristics into this remote path.
 
+## Accepted ADR-065 background delivery and live-status projection
+
+This post-v0.1 target proves `ACP-ATT-012`. It projects the canonical queue; it does not add another queue,
+resolution state or authority:
+
+1. Pairing creates one `NotificationEndpointId` and foreground-issued `DeliveryGrant` with endpoint public
+   key/token reference, exact Workspace/ExecutionTarget/event-class/privacy scopes, generation, batch/rate
+   bounds and expiry. Proposed, active, expired, invalid and revoked states follow the closed machine. Secret
+   canaries are absent from protocol reads, UI/store/export/logs; 401/403 invalidates only the exact generation.
+2. Outbox insert and flush independently revalidate grant, queue/subject revision, resolution and presence.
+   `CollapseKey` includes endpoint, full tagged subject identity/revision and demand kind: replay of one demand
+   emits at most one eligible alert, while two same-titled subagents or two demand kinds remain two. Batching,
+   jitter and retry remain within declared endpoint and global bounds.
+3. Payloads are end-to-end encrypted and contain only the minimum route/display class authorised by the
+   privacy scope—never transcript, prompt/answer body, command, path, account, secret or raw provider payload.
+   Gateway `accepted` is not `delivered`, `read`, `acknowledged` or `resolved`; retryable/terminal failure and
+   offline expiry mutate none of those canonical states.
+4. Presence may hold the alert portion only. When presence leaves, the host releases only a still-current
+   demand after a fresh revision check; a resolved, superseded, deleted or expired item is discarded. A
+   notification deep link resynchronises snapshot/events and routes only after exact subject revalidation, so
+   an offline stale action cannot submit.
+5. Live status uses one key per endpoint+subject+attempt generation and monotonic revisions. Start/update/end
+   converge under duplicate/out-of-order delivery. Resolve, result-read where applicable, deletion and attempt
+   end emit a terminal update/tombstone; a delayed tick cannot resurrect it.
+6. `NotificationHostMode` accepts only authenticated owner-local/loopback observations and performs outbound
+   HTTPS delivery. A packet/listener oracle enumerates every interface/port and proves that it never constructs
+   or binds public HTTP, WebSocket or renderer services, even when public bind settings exist. Ordinary remote
+   GUI mode is tested separately and cannot be enabled implicitly.
+7. Packaged tests cover desktop background, client killed, headless service restart, network outage, replay,
+   revocation during a queued batch, expiry, dead token, two concurrent children, presence races, resolved
+   deep links and late live ticks. No path changes queue order, marks read, acknowledges, responds to or
+   resolves the underlying Attention demand.
+
 ## Accepted M15 local dictation boundary
 
 This is an ADR-060 target, not evidence about v0.1. `make dictation-acceptance` and native snapshots must

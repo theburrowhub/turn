@@ -46,14 +46,14 @@ restart instead of being attributed or resolved session-wide.
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Done for v0.1.0**; tree management, terminal UX and accessibility contract landed |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Done**; packaged Claude Code 2.1.226 run and UI reconnect passed |
 | M9 — Hardening | Measurement, restore semantics, packaging and release gates | **Functional baseline done**; public distribution and broad platform sign-off continue post-MVP |
-| M10 — Agent Node WorkSurface | Unique node views, safe one-action Session activation, canonical board/external work-item projections and exact Attention routing | **Accepted, not started**; ADR-059/063/064 |
-| M11 — Durable instances and provider topology | Stable instance/attempt identity, normalized children/native jobs, private conversation inventory, shared-runtime isolation and receipted title capabilities | **Accepted, not started**; ADR-059/062/063/064 |
-| M12 — Context and observability | Context links/packets and Note briefs, lineage, account-profile lifecycle, model/runtime/context/quota truth and per-profile companion projections | **Accepted, not started**; ADR-059/063/064 |
-| M13 — Flows and delegated control | CreationCatalog, FlowRuns, bounded conductor grants, messages, dependencies, Teams, Resource/progress publishing and worktree-safe fan-out | **Accepted, sequenced after M11–M12; not started**; ADR-061/063 |
-| M14 — Resource nodes | Session-owned Group, Note, File, Diff, inert WebPreview, isolated Browser and Media views | **Accepted, sequenced after M10–M12; not started**; ADR-059/064 |
+| M10 — Agent Node WorkSurface | Unique node views, safe one-action Session activation, canonical board/external work-item projections and exact Attention routing | **Accepted, not started**; ADR-059/063/064/065 |
+| M11 — Durable instances and provider topology | Stable instance/attempt identity, normalized children/native jobs, six-adapter parity, quota-only connectors, model endpoint routing, private conversation inventory, shared-runtime isolation and receipted title capabilities | **Accepted, not started**; ADR-059/062/063/064/065 |
+| M12 — Context and observability | Context links/packets and Note briefs, lineage, account-profile lifecycle, model/runtime/context/quota/resource/name truth and per-profile companion projections | **Accepted, not started**; ADR-059/063/064/065 |
+| M13 — Flows and delegated control | CreationCatalog plus Workspace onboarding, FlowRuns, bounded conductor grants, messages, dependencies, Teams, Resource/progress publishing and worktree-safe fan-out | **Accepted, sequenced after M11–M12; not started**; ADR-061/063/065 |
+| M14 — Resource nodes | Recursive Session-owned Group projections, separate CheckoutScopes, Note, File, Diff, inert WebPreview, isolated Browser and Media views | **Accepted, sequenced after M10–M12; not started**; ADR-059/064/065 |
 | M15 — Local dictation | On-device speech worker, reviewed exact-target input and trusted model lifecycle | **Accepted, sequenced after M10–M11; not started**; ADR-060 |
-| M16 — Durable and remote runtime | RuntimeBackend, target-wide recovery inventory, revisioned file editing, remote targets, full remote/headless surfaces, scoped remote permission response and companion projections | **Accepted, not started**; ADR-061/062/063/064 |
-| M17 — Control-plane closeout | Full-scale, live-provider, recovery, security, accessibility and packaged proof for the frozen inventory | **Accepted, not started**; ADR-061/062/063/064 |
+| M16 — Durable and remote runtime | RuntimeBackend, target-wide recovery/resource inventory, revisioned file editing, remote targets, full remote/headless surfaces, background notification delivery, scoped remote permission response and companion projections | **Accepted, not started**; ADR-061/062/063/064/065 |
+| M17 — Control-plane closeout | Full-scale, live-provider, recovery, security, accessibility and packaged proof for the frozen requirement and source-capability ledgers | **Accepted, not started**; ADR-061/062/063/064/065 |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -513,17 +513,26 @@ receipts. Dismissing an Attention/unread item never cancels or deletes the under
 read and provider conversation rename are likewise separate capabilities: rename needs a current-revision
 acknowledgement receipt, and degradation creates only a labelled local alias.
 
+The dedicated roster is exactly Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok; all six run
+the same 22-cell capability/evidence matrix. Kimi and MiniMax use quota/activity connectors scoped by exact
+AccountProfile/target and expose no launch or control methods. `ModelEndpointProfile` is separate from account
+and RuntimeEndpoint identity: it validates a target-bound HTTPS route, resolves only a secret reference,
+bounds model discovery and freezes effective route/model/credential generations into launch/switch receipts
+without fallback.
+
 **Exit proof.** Append-only migrations, protocol catalogue tests and restart/restore adversarial tests prove
 stable identity, one-current-attempt fencing, attempt-scoped capability cleanup, exact Attention retention,
 no silent downgrade, no resurrection after an authoritative delete and multi-surface attachment. UI close/
 reopen, daemon restart and machine restart cover live attach, honest loss and explicit auto-start/resume;
 recovered scrollback never claims liveness and a failed resume never becomes a fresh conversation. A shared
 provider runtime with isolated per-node conversations and a dedicated-process adapter both pass the same
-instance contract. Shared fixtures plus authenticated versioned Claude Code, Codex, Gemini and OpenCode
+instance contract. Shared fixtures plus authenticated versioned Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok
 evidence cover every advertised topology/lifecycle capability, including exact child counts and degradation.
 Inventory fixtures prove paging/cache bounds, stale and ambiguous match refusal and exact adopt/resume;
 native-job fixtures prove restart survival, iteration identity and dismiss-not-delete; title fixtures prove
-independent read/rename capability negotiation, receipts and local-alias fallback.
+independent read/rename capability negotiation, receipts and local-alias fallback. Quota-only and model-route
+fixtures prove cross-profile/target isolation, secret absence, bounded discovery and failed-switch continuity.
 
 ## M12 — Context and observability · **Accepted, not started**
 
@@ -552,6 +561,12 @@ keeps source, scope, coverage and freshness, and unknown/partial/stale/unavailab
 zero. The inbox is a view of the canonical Attention Queue and unread revisions, not a second activity or
 resolution authority.
 
+The same target RuntimeInventory supplies host RAM/swap/pressure plus reuse-safe process trees and attributes
+own/descendant RSS to current or closed Session owners and unmatched survivors with explicit coverage.
+Measured empty, unmeasured, partial/gapped, unavailable, stale and true numeric zero remain distinct. Local
+DisplayNameFacts and bounded generated proposals preserve source/confidence/revision and operator pinning;
+they never alter identity, invoke provider rename or type into a terminal.
+
 **Exit proof.** Foreground-operator supported-flow authority plus the explicit unsandboxed same-uid
 impersonation limit, destination/attempt binding, capability rotation, revocation/delete/archive races,
 lost-response idempotency and active-link bounds, cross-Workspace refusal, local/remote path jail, offline
@@ -568,6 +583,9 @@ cover every new table and filesystem category.
 ## M13 — Flows and delegated control · **Accepted, sequenced after M11–M12; not started**
 
 **Delivers.** One declarative CreationCatalog drives Workspace `+`, toolbar, palette and context actions.
+Its resumable WorkspaceOnboarding operation provides new/open/clone/SSH adoption with preassigned identity,
+closed phases, cancellation and exact reconciliation; repository publication remains a separate reviewed
+foreground operation and no path occupies primary `main`.
 Versioned `FlowDefinition`s create immutable `FlowRun`s containing mixed Agent/Tool nodes, roles,
 prompts/commands, typed dependencies/start policies, context, execution/worktree strategy, Attention and
 resource bounds. `manual`, `with_run`, result-gated and bounded-recurring policies advance only from current
@@ -603,7 +621,11 @@ AttentionManager/governor can move focus.
 
 **Delivers.** Session-owned Group, Note, File, Diff, WebPreview, Browser and Media nodes use the same
 hierarchy and one WorkSurface.
-A Group is presentation only. A Note stores private Turn-owned text. File and Diff store canonical,
+A Group is presentation only but may recursively contain Groups/nodes inside one bounded acyclic forest.
+Atomic subtree operations and non-cascading removal preserve runtimes/Attention. An optional Group row may
+project a separately identified Session-owned CheckoutScope with complete create/adopt/missing/reconcile/
+unbind/remove lifecycle; presentation move alone changes no cwd and adopted worktrees are never deleted by
+default. A Note stores private Turn-owned text. File and Diff store canonical,
 checkout-confined references rather than owning user data. WebPreview is inert: no scripts, cookies, ambient
 credentials, interactive navigation or restore/background load. Browser is a separately created,
 process-isolated Node with an isolated storage partition, bounded per-node history and revision-fenced
@@ -613,7 +635,8 @@ subresources or navigation. Removing a resource forgets Turn's record and never 
 site it references.
 
 **Exit proof.** The incompatible vNext `HierarchyKey.node` migration covers every resource kind. Creation,
-restore, selection, one-level Group membership/safe child reparent, reorder, archive/delete, late-response
+restore, selection, 128-level Group membership/safe subtree reparent, concurrent-cycle refusal, promote/
+reorder/archive/delete, CheckoutScope inventory/lifecycle, late-response
 and subscription tests preserve runtime parentage, Session ownership and Layout. Descriptor-root/TOCTOU/
 symlink/hardlink/mount checks, inert File/Diff/Note/WebPreview rendering, query/userinfo/fragment refusal,
 all-answer DNS validation and approved-IP pinning per HTTPS connection/redirect, Browser process/storage
@@ -656,7 +679,9 @@ capabilities are pinned and remote outage never falls back to a local process or
 
 Each backend also exposes bounded complete/partial/gapped target-wide inventory. Known attempts reconcile;
 unmatched live handles stay in a Recovery View without invented Nodes and adopt/ignore/terminate revalidates
-one exact target+handle+generation before any effect.
+one exact target+handle+generation before any effect. ResourceInventory extends that same snapshot with host
+capacity/pressure and deduplicated reuse-safe process attribution; failed/partial remote collection never
+becomes local data or zero, and exact termination re-probes the handle/process-start identity.
 
 Separate `FileBackend` and `RepositoryBackend` contracts cover confined exploration and full status/diff/
 stage/unstage/commit/history/fetch/pull/push/branch/conflict/worktree operations. Remote channels provide
@@ -684,6 +709,12 @@ integration remain local and fail at the daemon. Companion usage, context and ac
 bounded per profile, carry source/coverage/freshness and preserve unknown/partial/stale/unavailable rather
 than displaying false zero; the inbox remains a projection of canonical Attention/unread state.
 
+Revocable NotificationEndpoints and DeliveryGrants project canonical Attention while GUI/companion is
+backgrounded or absent. The encrypted minimal outbox uses subject/revision collapse, bounded retry and
+monotonic live end fences; gateway acceptance/failure never reads, acknowledges or resolves work. Deep links
+resnapshot before routing. NotificationHostMode receives authenticated owner-local/loopback observations,
+makes outbound HTTPS requests only and binds no public listener.
+
 **Exit proof.** Local and remote runtime/file/repository backends pass their separate contracts. UI/daemon/
 shell restart, host reboot, reconnect, two writers, stale/compacted clients, delete resurrection, uncertain
 external effects, MITM/replay/key rotation and wrong-host/root/repository cases pass adversarially. Packaged
@@ -695,7 +726,7 @@ freshness expiry, partial coverage and absence of false zero or a second Attenti
 ## M17 — Control-plane closeout · **Accepted, not started**
 
 **Delivers.** The complete accepted target is evaluated as one product rather than a collection of merged
-milestones. The frozen inventory and proof matrix cover mixed providers/tools, safe one-action activation,
+milestones. The frozen source-capability ledger, requirement inventory and proof matrix cover mixed providers/tools, safe one-action activation,
 external work items, native jobs and conversations, title capabilities, all Node Views including isolated
 Browser, exact Attention, Flows, lifecycle, context, telemetry, resources, voice, granted remote permission
 response, per-profile companion projections, privacy, security, accessibility and recovery.
@@ -703,7 +734,9 @@ response, per-profile companion projections, privacy, security, accessibility an
 **Exit proof.** Every row in `docs/PRODUCT_REQUIREMENTS.md` has evidence from its matching
 `docs/CONTROL_PLANE_ACCEPTANCE.md` oracle on the same commit. All named end-to-end journeys pass, including
 the 50-Session/100-live-runtime/1,000-node fixed-profile sustained envelope with p50/p95/p99 measurements.
-At least two non-authors perform adversarial cross-document and implementation audits with zero unresolved
+Every one of the 84 frozen capability rows retains a valid disposition/evidence/PRD/ACP/ADR trace and every
+deletion, unknown, weakening or broken link mutation fails. At least two non-authors perform adversarial
+cross-document and implementation audits with zero unresolved
 P0/P1/P2. CI is green on the exact
 commit merged to `main`. A documentation contract alone cannot close M17.
 
@@ -718,19 +751,22 @@ and what must not be foreclosed.
    zero-extra-click Session activation, external work-item projections and one interaction from every demand
    to its safe action.
 2. **M11 durable instances and provider topology.** Stable identities, truthful nested children/counts,
-   native-job and private-conversation discovery, runtime receipts, separate title capabilities and common
-   Claude Code/Codex/Gemini/OpenCode capability evidence.
+   native-job and private-conversation discovery, runtime receipts, six dedicated adapters, quota-only
+   connectors, model endpoint routing and separate title capabilities under common evidence.
 3. **M12 context and observability.** Pull links, budgeted ContextPacket/lineage, launch truth, integration
-   diagnostics, separate context/provider-quota telemetry and fresh per-profile companion projections.
-4. **M13 Flows and delegated control.** One creation catalog, FlowRuns, conductor grants, messages,
+   diagnostics, host/process resource accounting, safe local names, separate context/provider-quota telemetry
+   and fresh per-profile companion projections.
+4. **M13 Flows and delegated control.** One creation/onboarding catalog, FlowRuns, conductor grants, messages,
    dependency advancement, Teams/review synthesis and primary-`main`-safe worktrees.
-5. **M14 resource nodes.** Group, Note, File, Diff, inert WebPreview, isolated Browser and Media views plus
+5. **M14 resource nodes.** Recursive Groups with separately owned CheckoutScopes, Note, File, Diff, inert
+   WebPreview, isolated Browser and Media views plus
    target-bound explorer/source control with explicit privacy and content-security boundaries.
 6. **M15 local dictation.** Reviewed on-device speech input bound to one exact Agent/runtime input without
    weakening or becoming another source of Attention.
 7. **M16 durable and remote runtime.** Warm runtime survival, SSH/remote targets, multi-client revisions,
-   input leases, scoped encrypted companion/operator sharing and explicitly granted permission response.
-8. **M17 control-plane closeout.** Full frozen-inventory evidence at scale across live providers, recovery,
+   input leases, resource inventory, outbound-only background Attention delivery, scoped encrypted companion/
+   operator sharing and explicitly granted permission response.
+8. **M17 control-plane closeout.** Full frozen capability/inventory evidence at scale across live providers, recovery,
    security, privacy, accessibility and packaged platforms.
 9. **Richer provider side channels** such as Codex `app-server`, integrated only through ADR-062 capability
    adapters and never as a core/UI special case.

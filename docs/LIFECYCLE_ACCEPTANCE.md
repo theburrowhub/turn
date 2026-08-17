@@ -35,7 +35,7 @@ the status bar says exactly what selection or state is required.
 
 ## Accepted successor lifecycle matrix
 
-ADR-064 extends the post-v0.1 lifecycle target. These rows are acceptance obligations, not claims that
+ADR-064/065 extend the post-v0.1 lifecycle target. These rows are acceptance obligations, not claims that
 `make lifecycle-acceptance` proves them today:
 
 | Requirement | Required successor evidence |
@@ -48,6 +48,12 @@ ADR-064 extends the post-v0.1 lifecycle target. These rows are acceptance obliga
 | Title read and rename do not share authority | Provider title read is a read-only capability. Rename is a separately advertised, expected-revision/idempotent operation whose requested title becomes effective only after correlated provider evidence; ambiguous or rate-limited outcomes reconcile rather than invent success. |
 | Remote permission response is narrow, not terminal input | A full remote GUI or companion may send allow/deny only for a known typed interaction under an exact single-use foreground-issued grant. While that interaction is sensitive, raw remote PTY input is rejected. Credential/admin/trust/grant/destructive operations stay desktop-foreground-only; an unclassifiable generic TUI receives no fabricated typed-permission guarantee. |
 | Account activity is profile-scoped and tri-state | Context windows, quota windows and the bounded activity inbox keep exact provider/AccountProfile/target identity plus independent source, coverage and freshness. Missing, partial, stale, rate-limited and failed reads never become zero usage, zero remaining or authoritative empty history. |
+| Recursive Groups and CheckoutScope have separate lifecycle | A depth-128 same-Session Group forest survives reverse-order restore and atomic subtree operations; self/indirect/concurrent cycles and corrupt/depth overflow refuse without a partial tree. Group promote/delete never stops work. CheckoutScope create/adopt/missing/conflicted/reconcile/remove state remains separate from optional Group binding proposed/current/stale/unbound; unbind changes no scope/worktree, adopted defaults to keep, and presentation move never rewrites cwd. |
+| WorkspaceOnboarding is a resumable saga | One preassigned onboarding id passes the closed draft/preflight/provision/commit/cancel/reconcile/terminal machine and records every closed phase receipt. Crash/cancel at each create/clone/checkout/persist/SSH phase reconciles only the exact path/repository/remote identity, repeats no ambiguous effect and never publishes implicitly. |
+| Model endpoint route state is independent | Draft/validate/active/degraded/invalid/retired/deleted transitions use exact target/profile/credential generation. Late discovery cannot reactivate or overwrite a changed route; missing/revoked secrets or trust change launch nothing. A failed switch leaves the prior attempt current, while a proved switch records continuity or a new attempt exactly as the adapter capability declares. |
+| Resource observation never implies lifecycle control | Complete/partial/gapped/unavailable/stale and measured-empty/unmeasured ResourceInventory updates alter only telemetry. Current, closed-owner and unmatched live rows remain visible. Terminate requires a fresh separate foreground receipt over exact target+handle+process-start+observation revision; error/PID reuse/late remote response changes no runtime. |
+| Notification delivery has its own retry state | Eligible/held/queued/submitted/accepted/retryable/terminal/superseded/expired follows the closed machine under one DeliveryId and bounded attempt count. Retry, expiry, revocation, endpoint failure, gateway acceptance and live-status end never acknowledge/read/respond/resolve Attention; an end/tombstone prevents late resurrection. |
+| Local display naming is not provider/runtime lifecycle | Follow-source facts and generated proposals can change only an unpinned local label at the current Node/Group revision. Manual pin survives reconnect, attempt replacement and provider title change; apply/unpin/provider rename are separate operations and emit no launch, input or lifecycle transition. |
 
 A full remote GUI is a revisioned WorkSurface client subject to the same typed lifecycle operations and input
 leases as a local GUI. A headless status client and a companion are bounded projections with closed action

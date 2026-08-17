@@ -818,8 +818,61 @@ the same-uid limitation in §2:
    borrow sibling profile values. The inbox grants no conversation body, credential, runtime input or control;
    actions use only the same default-deny typed allowlist as the rest of Companion.
 
-**M14 resources are hostile content, not trusted UI.** Group is same-Session presentation only; deleting a
-non-empty Group explicitly reparents children and never cascades into runtimes or user data. Note content is
+**ADR-065 adds eight final target boundaries.** They are not v0.1 implementation claims:
+
+1. **Recursive Group mutation is bounded and cannot acquire execution authority.** Parent changes are one
+   Session-scoped compare-and-swap over the complete Group tree and recheck unique parent, kind, same-Session,
+   depth and acyclicity after every concurrent race. Traversal is iterative with seen/depth/node bounds;
+   corrupt persisted cycles become isolated diagnostics, never hangs or arbitrary repair. Delete promotes or
+   refuses as explicitly selected and cannot cascade into runtime, context, Attention or repository effects.
+   A Group may only project a separately identified Session-owned CheckoutScope.
+2. **CheckoutScope owns branch/worktree consequences.** Repository and worktree identity, target generation,
+   creator provenance and state remain distinct from GroupId. Failed/partial inventory never means gone;
+   adopted worktrees default to unbind, and dirty/unpublished/live-writer/path-danger cases refuse remove.
+   Presentation moves do not rewrite cwd. Migrate/relaunch, merge, publish and disk/branch removal are separate
+   foreground operations; exact remote targeting and the primary-main invariant remain mandatory.
+3. **Background notification delivery grants no Attention authority.** A device DeliveryGrant fixes endpoint,
+   key/token reference, scope, event classes, privacy, rate and expiry. Insert and flush revalidate the exact
+   generation and canonical demand revision; encrypted payloads omit transcript, prompt/answer, command, path,
+   account and secret bodies. Gateway acceptance cannot mark delivered/read/acknowledged/resolved. Revocation,
+   expiry, dead token or failure mutates no canonical work. NotificationHostMode accepts owner-local/loopback
+   input, makes outbound HTTPS calls only and binds no public listener.
+4. **ResourceInventory measures without granting broad kill.** Host capacity and process rows are scoped to
+   exact ExecutionTarget/trust generation, use reuse-safe process identity and preserve complete/partial/gap/
+   unavailable/stale plus measured-empty versus unmeasured. A failed remote read cannot disclose or substitute
+   local facts. argv, environment and transcript remain excluded. Observation never signals a process; exact
+   terminate re-probes target, handle generation, process start identity and observation revision and cannot
+   fan out by pid/name.
+5. **Dedicated roster and quota-only connectors cannot borrow capability.** Six named adapters each prove all
+   common cells at their exact version/profile/target/mechanism. Detection by executable label alone grants
+   nothing. Kimi/MiniMax connectors expose only bounded AccountProfile-scoped quota/activity; they have no
+   launch, transcript, conversation, input or control method, and cache/cursor data never crosses profiles.
+6. **ModelEndpointProfile is a secret and network boundary.** Raw API keys are write-only at a target-local
+   keystore/agent/broker and never enter protocol reads, argv, PTY, durable environment, shared config, logs,
+   diagnostics or export. URL validation, TLS/pinning, DNS-rebind/redirect/private-metadata policy and bounded
+   discovery precede launch. Preflight freezes route/model/profile/credential generations; missing/stale/locked
+   evidence causes zero provider request or launch and never falls back to another route/provider/model/target.
+   Secret migration commits the broker copy before replacing/scrubbing the only durable literal.
+7. **Workspace onboarding treats imported configuration and partial clone as hostile.** New/open/clone/SSH
+   adoption binds exact target/path/repository/remote and local capability consent. Crash/cancel retains
+   bounded partial-effect receipts and reconciles by operation identity instead of deleting or cloning by
+   guess. Host mismatch and outage never use a local namesake. Publish names destination, visibility, branch
+   and credential reference in a separate foreground review; creation never publishes implicitly.
+8. **Generated display names are untrusted local proposals.** Source bytes are bounded, redacted and target-
+   scoped; control/bidi/invisible/multiline/secret output is refused. Node/Group revision and expiry fence apply;
+   a manual pinned alias wins until explicit unpin. Applying a proposal changes no stable identity, provider
+   title, command, input or Attention. The frozen capability ledger and authority gate ensure none of these
+   boundaries can disappear under an unknown/deleted/weakened disposition.
+
+The remote surface remains a deliberate adaptation: ordinary create, view, edit and terminal input may be
+granted through the closed versioned allowlist and visible lease, but credential entry, grant/authority issue,
+host trust, destructive process/repository lifecycle and publish/integration remain server-refused unless a
+future ADR supplies a stronger authority boundary. A source capability that is intentionally narrower is
+recorded as adapted in the frozen ledger, never silently omitted.
+
+**M14 resources are hostile content, not trusted UI.** Group is same-Session presentation only even when
+recursively nested or projecting a CheckoutScope; deleting a non-empty Group explicitly promotes/refuses
+children and never cascades into runtimes or user data. Note content is
 size-bounded private text stored exactly, while every projection escapes controls/markup and executes
 nothing. File/Diff uses the same descriptor-relative regular-file jail, hardlink/mount policy and byte limits
 as repository context. Markdown, SVG, HTML and similar content render inert with scripts and remote loads

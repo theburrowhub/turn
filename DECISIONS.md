@@ -4213,3 +4213,95 @@ independent notification queue is introduced.
 - **Downside:** adapters now need more granular capabilities, live evidence and conflict fixtures.
 - **Downside:** browser origins, external-source reconciliation and remote response grants substantially
   enlarge security, privacy, performance and packaged accessibility acceptance.
+
+---
+
+<a id="adr-065"></a>
+## ADR-065 — Make source-capability coverage explicit and close the final operational gaps
+
+**Status:** Accepted, not yet implemented. Extends ADR-049/059/061/062/063/064 after a second blind audit
+rejected the prior candidate and corrected both over-broad and missing claims.
+
+**Requirement scope:** `PRD-HIE-009`, `PRD-CRE-008`, `PRD-ADP-012`, `PRD-ADP-013`, `PRD-OBS-010`,
+`PRD-OBS-011`, `PRD-ATT-012`, `PRD-SAF-014`. The machine-checked one-to-one origin map lives in
+`docs/PRODUCT_SPEC_V1.authority`; moving any requirement to another decision changes the frozen authority
+root.
+
+### Context
+
+The first independent audit found capabilities that a requirements-only comparison could miss: recursive
+organisation, branch-isolated group workflows, notification delivery while the UI is absent, target memory
+pressure, two additional dedicated agent adapters, quota-only providers, configurable inference endpoints,
+complete Workspace onboarding and safe generated names. A later audit also corrected an imprecise claim:
+target-wide runtime/survivor inventory already existed, but it lacked host capacity and process-tree resource
+accounting. Corrections must narrow the gap rather than inflate the amount of purported missing work.
+
+The deeper failure was methodological. A selective gap narrative has no frozen denominator, so an omitted
+feature is indistinguishable from a deliberately rejected one. Turn therefore needs an independently auditable
+coverage ledger as well as PRD and ACP rows. The ledger may cite an opaque frozen source snapshot and evidence
+digests, but product/code/docs must remain source-neutral and must not inherit another product's names,
+architecture or canvas authority.
+
+### Alternatives considered
+
+**Declare broad hierarchy, telemetry and adapter rows sufficient.** Rejected. They do not force cycle-safe
+Group mutation, complete-versus-failed memory accounting, a six-adapter live matrix, quota-only isolation or
+BYO model-route secret handling.
+
+**Give Group runtime/repository authority because it presents a branch.** Rejected. Group remains a
+presentation relationship. A Session-owned CheckoutScope owns repository/worktree identity and lifecycle;
+the Group only projects it and supplies reviewed defaults. This preserves one hierarchy without creating a
+second execution owner.
+
+**Treat notification gateway acceptance as delivery or Attention resolution.** Rejected. Push is an encrypted,
+revocable, collapse-aware projection. It can be accepted, fail or expire without saying anything about device
+delivery, reading or the underlying interaction.
+
+**Reuse AccountProfile or RuntimeEndpoint as a model gateway.** Rejected. Account identity, a multiplexed
+provider service and a configurable inference route have different identities, secrets, network trust and
+launch-freeze semantics.
+
+**Copy every remote mutation exposed by the audited source.** Rejected as a deliberate safety adaptation.
+The full remote surface may create ordinary work, type under a visible lease and perform revision-fenced
+non-destructive mutations. Credential entry, grant/authority issue, host trust, destructive process/repository
+lifecycle and publish/integration stay desktop-foreground-only under `PRD-SAF-012` and `PRD-SCL-009`. This is
+recorded as an adapted capability, not an omission.
+
+### Decision
+
+Turn adds eight independently testable obligations:
+
+- same-Session recursive Groups with one parent, atomic CAS subtree operations, cycle/depth/corruption bounds
+  and closed non-cascading removal dispositions;
+- Session-owned CheckoutScope identity/lifecycle, optionally projected by a Group, with one-step agent-per-
+  branch creation/adoption, truthful inventory/reconciliation and no implicit cwd/runtime/worktree deletion;
+- one resumable WorkspaceOnboarding path for new/open/clone/SSH adoption, with crash-safe partial receipts and
+  repository publication as a separate foreground operation;
+- six dedicated agent adapters—Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok—under the same
+  capability/live-evidence matrix, plus isolated Kimi and MiniMax quota/activity connectors;
+- a distinct ModelEndpointProfile for target-bound BYO endpoint/model routing, bounded discovery, secret
+  references, network trust and launch/switch receipts with no silent fallback;
+- ResourceInventory fields over the existing target RuntimeInventory for host RAM/swap/pressure and
+  reuse-safe process-tree accounting across current owners, closed owners and unmatched survivors;
+- local DisplayNameFacts and bounded generated proposals whose manual pinning, redaction and revision rules
+  never imply identity, provider rename or terminal input; and
+- revocable device delivery grants, minimal encrypted outbox, subject/revision collapse, monotonic live status
+  and a notification-only host that opens no public listener.
+
+`docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv` freezes the audited denominator. Every stable feature id has one
+`adopted|adapted|rejected|irrelevant` disposition, evidence digest, rationale and PRD/ACP/ADR trace. Unknown,
+duplicate, missing, malformed, broken-link or weakened entries fail the specification gate and its mutation
+suite. The file is authority-hashed with every other normative source.
+
+### Consequences
+
+- Nested agent-per-branch workflows remain visible in the canonical tree without making presentation equal
+  ownership or blocking the primary `main` checkout.
+- Operator Attention can arrive when the full UI is backgrounded or absent without inventing a second queue
+  or falsely acknowledging work.
+- Capacity, adapter, quota, route and naming claims become scoped evidence rather than labels or guesses.
+- A future audit can prove what was considered and why, instead of trusting a prose assertion of completeness.
+- **Downside:** the protocol/store/security/privacy/performance/accessibility matrices gain new identities,
+  lifecycle machines and destructive-boundary cases.
+- **Downside:** any source-snapshot refresh now requires an explicit ledger review, ADR and external authority
+  pin rotation rather than a quiet documentation edit.

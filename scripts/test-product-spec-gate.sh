@@ -282,7 +282,7 @@ awk '!/`PRD-OUT-001`/' "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" >"$coedit
 replace_file "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" "$coedited_delete/docs/requirements.new"
 awk '!/`ACP-OUT-001`/' "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" >"$coedited_delete/docs/acceptance.new"
 replace_file "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" "$coedited_delete/docs/acceptance.new"
-awk '{ gsub(/expected_requirement_count=144/, "expected_requirement_count=143"); gsub(/expected_acceptance_count=144/, "expected_acceptance_count=143"); print }' \
+awk '{ gsub(/expected_requirement_count=152/, "expected_requirement_count=151"); gsub(/expected_acceptance_count=152/, "expected_acceptance_count=151"); print }' \
   "$coedited_delete/scripts/verify-product-spec.sh" >"$coedited_delete/scripts/verifier.new"
 replace_file "$coedited_delete/scripts/verify-product-spec.sh" "$coedited_delete/scripts/verifier.new"
 refreeze_case "$coedited_delete"

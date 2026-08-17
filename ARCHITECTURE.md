@@ -42,6 +42,12 @@ delegated control, plus one durable provider-neutral topology/capability contrac
 implemented**. `docs/OPERATOR_CONTROL_PLANE.md` is normative; `docs/PRODUCT_REQUIREMENTS.md` records the
 audited current gaps and `docs/CONTROL_PLANE_ACCEPTANCE.md` defines the one-to-one proof obligations.
 
+ADR-063/064/065 close the audited operational surface—recovery/account/file/remote objects, provider-retained
+work and Browser/history, then recursive Groups/CheckoutScopes, background Attention delivery, resource
+capacity, six dedicated adapters plus quota-only connectors, model endpoint routing, Workspace onboarding and
+safe local naming. These are also **not yet implemented**. The neutral frozen capability ledger is
+`docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv`; its disposition/evidence trace is part of the specification gate.
+
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
 `vitest` and no second lockfile.
 
@@ -1536,21 +1542,21 @@ durable category because persistence is forbidden. `docs/LOCAL_VOICE_INPUT.md` i
 
 ### 6.6 Accepted operator-control-plane architecture
 
-**Status: accepted, not yet implemented.** ADR-061/062 join creation, orchestration, provider topology,
+**Status: accepted, not yet implemented.** ADR-061 through ADR-065 join creation, orchestration, provider topology,
 runtime continuity, observability, remote/companion clients and scale around the existing daemon boundary.
 The cross-layer ownership is fixed before implementation:
 
 | Layer | New authority and responsibility |
 | --- | --- |
-| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun/native-job ids; independent relationship graphs; WorkItemState/WorkItemSource, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant state machines; normalized topology, lifecycle, observation and Attention invariants. |
-| `turn-agents` | Open adapter registry, capability vocabulary, provider event normalization, launch/control operations, bounded conversation/job inventory, transcript/context/usage/title sources, separately receipted provider rename and shared RuntimeEndpoint bindings isolated by profile/conversation. Provider dialects end here. |
-| `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles; process evidence is provisional semantic evidence. |
+| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun/native-job/CheckoutScope/notification/model-endpoint ids; independent relationship graphs including bounded acyclic Group forest; WorkItemState/WorkItemSource, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant, delivery and route state machines; normalized topology, lifecycle, resource observation and Attention invariants. |
+| `turn-agents` | Open six-adapter registry plus honest generic/custom adapters, 22-cell capability vocabulary, provider event normalization, launch/control operations, bounded conversation/job/model inventory, transcript/context/usage/title sources, quota-only connectors, ModelEndpoint mapping, separately receipted provider rename and shared RuntimeEndpoint bindings isolated by profile/conversation. Provider dialects end here. |
+| `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles and reuse-safe host/process ResourceInventory; process evidence is provisional semantic evidence. |
 | FileBackend / RepositoryBackend | Separately capability-gated local/remote confined file and SCM effects with host/generation/root/revision-bound receipts; FileBackend open/save is revisioned CAS with conflict and zero overwrite; access is never inferred from RuntimeBackend. |
-| `turn-store` | Append-only identities, graph revisions, immutable Flow runs/receipts, non-secret account profiles, endpoint bindings, Resource revisions/provenance, bounded inventory/work-item caches, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
-| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces, plus an encrypted revision-fenced remote response envelope; no provider-specific UI messages. |
-| `turnd` | Single writer and reconciliation authority; preflight/provision sagas; Flow scheduling; adapter/runtime dispatch; exact Attention routing; independent bounded collectors; authoritative multi-client snapshot/journal. |
-| `turn-gui` | One canonical hierarchy and WorkSurface; catalog-driven creation; Agent/Tool/Flow/resource views; derived board, work-item and runtime Recovery Views; integration/runtime truth; bottom status; no scheduling, provider inference or duplicated business rules. |
-| remote/headless clients | Full capability-negotiated projections over the same snapshot/journal/routes; server policy refuses every desktop-only authority operation. |
+| `turn-store` | Append-only identities, Group/graph revisions, CheckoutScope/onboarding operations, immutable Flow runs/receipts, non-secret account/model/notification profiles, endpoint bindings, Resource/name revisions/provenance, bounded inventory/work-item/delivery caches, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
+| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces, encrypted revision-fenced remote/notification envelopes and bounded Group/Checkout/resource/model/onboarding/name schemas; no provider-specific UI messages. |
+| `turnd` | Single writer and reconciliation authority; preflight/provision/onboarding sagas; Group/Checkout transaction validation; Flow scheduling; adapter/runtime/model dispatch; exact Attention routing and delivery outbox; independent bounded collectors; authoritative multi-client snapshot/journal. |
+| `turn-gui` | One canonical recursive hierarchy and WorkSurface; catalog-driven creation/onboarding; Agent/Tool/Flow/resource/model/notification views; derived board, work-item and runtime/resource Recovery Views; integration/runtime/name truth; bottom status; no scheduling, provider inference or duplicated business rules. |
+| remote/headless clients | Full capability-negotiated projections over the same snapshot/journal/routes; server policy refuses every desktop-only authority operation. NotificationHostMode is outbound-only and constructs no public listener/UI. |
 | companions | Reduced closed-action projections of daemon queue/revisions over authenticated encrypted channels; never another state or Attention authority. |
 
 The core event envelope carries operation, Workspace/Session/FlowRun, Node/instance/attempt/generation,
@@ -1567,6 +1573,26 @@ sibling input, context, transcript cursors and Attention remain isolated. Runtim
 never invents Nodes for unmatched handles and adopts, ignores or terminates only one exact
 target+handle+generation. AccountProfile stores only non-secret identity/external references, isolates auth,
 config, cache and quota roots, and never falls back or migrates active instances after a default change.
+
+Group presentation is a Session-scoped acyclic forest with one parent and one tree revision; atomic subtree
+mutations validate kind/session/cycle/depth after concurrent changes. CheckoutScope is a separate Session-owned
+domain identity and state machine. A Group may project it and supply creation defaults, but cannot own its
+worktree, mutate runtime ancestry or change a live cwd. Repository inventory/reconciliation, create/adopt/
+unbind/remove, migration/relaunch, merge and publish remain distinct target-bound operations. This separation
+delivers nested agent-per-branch navigation without making presentation an authority graph.
+
+`ResourceInventoryObservation` extends the RuntimeInventory snapshot family with target host capacity/pressure
+and reuse-safe process-tree rows. Aggregation preserves current, closed and unmatched owners, shared buckets and
+complete/partial/gapped/unmeasured coverage; a collector failure is never numeric zero. Exact intervention
+revalidates the same target/handle/process-start generation and reuses RuntimeInventory termination rather than
+introducing a pid/name kill path.
+
+ModelEndpointProfile is distinct from AccountProfile and RuntimeEndpoint. It owns target-bound route/model-
+catalogue/network-trust metadata plus a secret reference whose raw value resolves only at the target broker.
+Launch/switch preflight freezes route/profile/credential/model revisions into its receipt. Late discovery,
+missing secrets and endpoint/TLS/DNS changes fail before provider request and cannot fall back. The six named
+dedicated adapters prove one 22-cell matrix; Kimi/MiniMax quota connectors consume AccountProfile-scoped
+collector contracts but expose no agent control method.
 
 An adapter's private `ConversationInventory` is scoped to one provider, AccountProfile and target. It exposes
 only bounded metadata needed for a paged search, with opaque cursors, cache TTL/byte/result limits, provenance
@@ -1623,8 +1649,20 @@ never coerced to zero; cross-profile aggregation is absent unless each component
 activity inbox is a filtered projection of canonical Attention and unread revisions: dismissing or reading
 there cannot resolve an Agent demand, delete a native job or create a second queue.
 
-`docs/OPERATOR_CONTROL_PLANE.md` defines the complete domain and behavior. The frozen requirement inventory
-and exact proof matrix are machine-checked by `make product-spec-acceptance`. That check proves specification
+Background delivery consumes only canonical Attention revisions. The daemon owns revocable DeliveryGrants,
+encrypted minimal outbox records, exact subject/revision collapse keys and monotonic live start/update/end;
+gateway acceptance/failure never mutates queue/read/resolution state. Deep links resnapshot and revalidate.
+NotificationHostMode accepts owner-local/loopback observations and performs outbound HTTPS only; it cannot
+construct the remote GUI/listener path. DisplayNameFact/NameProposal follows a separate local alias/pinning
+reducer, so generated or provider text changes neither identity nor provider conversation title.
+
+WorkspaceOnboarding is a daemon saga over new/open/clone/SSH adoption with operation-id reconciliation and
+partial-effect receipts. It shares CreationCatalog defaults but not publication authority: publish remains a
+separate foreground repository operation. Imported configuration is inert until local capability consent,
+remote mismatch never falls back to a local path and every writer preserves the primary-main invariant.
+
+`docs/OPERATOR_CONTROL_PLANE.md` defines the complete domain and behavior. The frozen capability ledger,
+requirement inventory and exact proof matrix are machine-checked by `make product-spec-acceptance`. That check proves specification
 coverage only; the crate table above remains the implementation truth until the named vertical evidence
 lands.
 

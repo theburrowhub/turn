@@ -102,7 +102,7 @@ The expected production result contains no unbounded channel constructor.
 **Status:** post-v0.1 target; the v0.1 measurements above do not prove it.
 
 M17 expands the production-shaped workload to 50 concurrent Sessions, 100 live runtimes, 1,000 total
-expanded/historical nodes, nested child events across four dedicated adapters, simultaneous Attention,
+expanded/historical nodes, nested child events across six dedicated adapters, simultaneous Attention,
 independent usage collectors and one noisy terminal/log stream. It records p50/p95/p99 rather than a single
 average. ADR-063 adds this exact non-optional sub-fixture:
 
@@ -141,12 +141,30 @@ ADR-064 adds these independent non-optional sub-fixtures to the same run:
 - each Companion profile receives context/quota samples and a 1,000-row bounded activity inbox; ten recognised
   remote permission prompts are answered through the typed encrypted path while raw PTY bytes are refused.
 
+ADR-065 adds these independent non-optional sub-fixtures:
+
+- 1,000 Nodes include a 128-level Group chain plus 250 nested siblings; subtree move/promote/delete, a
+  concurrent cycle race and one corrupt persisted cycle remain bounded, while 50 Session-owned CheckoutScopes
+  run create/adopt/missing/unbind/remove reconciliation without blocking or registering primary `main`;
+- all six dedicated adapters execute their 22-cell capability matrices concurrently; Kimi and MiniMax quota-
+  only connectors add independent profile samples while a slow/failing cell cannot delay another adapter;
+- 32 ModelEndpointProfiles each expose 10,000 bounded mapped model rows, with endpoint revision churn, one
+  oversized discovery, missing-secret refusal and launch/switch receipts under the shaped network;
+- the existing 2,000-handle target inventory includes 10,000 reuse-safe process rows, host RAM/swap/pressure,
+  current/closed/unmatched attribution and one failed remote collector without local fallback or false zero;
+- 64 notification endpoints receive a 10,000-item encrypted collapse-aware burst, presence release, offline
+  retry, revocation during batch and monotonic live start/update/end while NotificationHostMode exposes zero
+  inbound listener; and
+- 1,000 bounded name proposals plus 100 simultaneous new/open/clone/SSH WorkspaceOnboarding operations cover
+  stale proposal, source redaction, cancellation/partial clone reconciliation and separate publish receipts.
+
 The release gate uses a fixed minimum reference profile: base Apple M1 (8-core), 8 GiB RAM, internal SSD,
 supported macOS, 1,920×1,080 display, AC power, no swap at start and an optimised packaged build. The same
 workload is recorded on each claimed Linux platform, but a faster developer or CI host cannot replace the
 minimum-profile artifact. After a five-minute warm-up, the harness runs 30 minutes continuously and injects
 a 10-second topology/Attention/output burst every minute. `Turn-owned` includes daemon, every GUI/client,
-SpeechWorker, isolated Browser renderer, remote transport helper, provider broker/collector and watchdog
+SpeechWorker, isolated Browser renderer, NotificationHost/delivery worker, remote transport helper, provider
+broker/collector and watchdog
 spawned or retained by Turn. Managed user/agent processes, external provider-owned services/caches and
 checkout data are reported separately and excluded from Turn's own RSS/disk budget; no Turn helper may be
 misclassified into those exclusions.
@@ -177,6 +195,13 @@ evidence records provider latency separately and cannot replace the deterministi
 | Flow fan-out | create call returns after durable operation receipts, never after child completion; parent and later operations remain interactive |
 | Shared endpoint | all five binding queues make progress; per-binding input/event p99 below 250 ms and endpoint restart convergence p99 below 5 s with zero cross-profile/conversation bytes |
 | Target inventory | 2,000-handle complete/partial/gapped reconciliation p95 below 100 ms and p99 below 200 ms CPU, below 16 MiB serialized, without blocking input or claiming exactness after a gap |
+| Resource inventory | 10,000 process rows plus host capacity/pressure aggregate p95 below 150 ms and p99 below 300 ms CPU, below the same 16 MiB target snapshot cap; failed/partial collection never renders zero or blocks input |
+| Recursive Groups / CheckoutScope | tree projection and one subtree CAS p95 below 50 ms/p99 below 100 ms at 1,000 nodes; cycle/depth/corruption rejection p99 below 100 ms and checkout reconciliation stays asynchronous |
+| Dedicated roster / quota connectors | every six-adapter capability result and two quota-only samples apply p95 below 50 ms/p99 below 100 ms after receipt; one stalled cell consumes no other provider queue |
+| Model endpoint | cached search/filter over 10,000 mapped models p95 below 75 ms/p99 below 150 ms; bounded remote discovery p95 below 400 ms/p99 below 800 ms; stale/cancelled pages cannot replace current route |
+| Notification delivery | outbox projection/encryption enqueue p95 below 10 ms/p99 below 25 ms; a 10,000-item burst remains within 16 MiB, batches without blocking Attention/input and revocation fences queued dispatch within one scheduler turn |
+| Local name proposal | sanitise/project/apply p95 below 25 ms/p99 below 50 ms after generator receipt; generation never blocks navigation/input and stale results are constant-time refused |
+| Workspace onboarding | each catalogue operation returns a durable start/refusal receipt p95 below 100 ms/p99 below 200 ms; clone transfer is asynchronous and crash/cancel reconciliation cannot stall another creation |
 | Board/Note/Resource | each projection/update p95 below 50 ms and p99 below 100 ms; progress compaction p99 below 200 ms; content bodies never enter the hierarchy snapshot |
 | External WorkItemSource | apply and project one 500-item page p95 below 100 ms/p99 below 200 ms locally and below 300/600 ms over the shaped remote source; filter/cursor/rate-limit/conflict handling never blocks input or turns stale cache into an empty exact result |
 | Native jobs | apply a 200-job/2,000-iteration snapshot or delta burst p95 below 100 ms/p99 below 200 ms; Flow recurrence remains independently responsive and no dismissed history is fetched/rendered eagerly |
@@ -191,27 +216,32 @@ evidence records provider latency separately and cannot replace the deterministi
 | Heavy subscriptions | selected visible subject plus an explicit bounded preview set; reselection cancels old generation |
 | Turn-owned memory | combined RSS of every Turn-owned process above is at most 1.5 GiB; growth from minute 10 to minute 30 is at most 128 MiB; one SpeechWorker is at most 512 MiB, one active Browser renderer 256 MiB and each remote/broker/helper 128 MiB, all still counting toward the aggregate |
 | Turn-owned disk | at most 1 GiB growth during the run, excluding checkouts/provider caches; retention/compaction stabilises growth |
-| Queues | GUI inbound/outbound/awaiting remain 64/256/512; topology is 1,024 per source; message is 256 items and 1 MiB per destination; each remote connection is 256 frames or 8 MiB and each frame is at most 256 KiB; every other boundary is at most 4,096 items or 16 MiB and declares refusal/gap/resync |
+| Queues | GUI inbound/outbound/awaiting remain 64/256/512; topology is 1,024 per source; message is 256 items and 1 MiB per destination; each remote connection is 256 frames or 8 MiB and each frame is at most 256 KiB; notification outbox is 10,000 items or 16 MiB; every other boundary is at most 4,096 items or 16 MiB and declares refusal/gap/resync |
 | Network volume | after warm-up, Turn protocol egress averaged across the 30-minute run is at most 5 Mbit/s and p99 one-second egress at most 15 Mbit/s; payload bodies count, TLS framing does not |
 | Resource pressure | may coalesce, slow preview or park reconstructible views; never terminates/suspends live work |
 | Evidence | workload, hardware, commit, build profile and raw p50/p95/p99/memory/disk/queue results are retained |
 
 The harness injects a slow provider collector, a 1,025-event topology overflow, shared-endpoint binding
 backpressure, an inventory generation gap, Note edit/revoke races, delegated Resource/progress overflow,
-board conflicts, FileBackend external-edit conflict, view failures and GPU/GUI memory, PTY, file-descriptor,
-process-limit, store/disk/journal, shaped-network and collector pressure while the operator switches nodes
+board conflicts, FileBackend external-edit conflict, recursive Group/cycle races, resource-process scan,
+model discovery, notification outbox/revocation, onboarding cancellation, view failures and GPU/GUI memory,
+PTY, file-descriptor, process-limit, store/disk/journal, shaped-network and collector pressure while the operator switches nodes
 and types on all four surfaces. Every latency population has at least 10,000 observations (reconnect has 100),
 uses nearest-rank percentiles and reports misses/timeouts as infinite latency; warm-up samples are excluded.
 It fails on false zero counts, stale-route application, dropped Attention, duplicate effects, cross-binding or
 cross-profile bytes, duplicate auto-starts, background-selection launches, hidden WorkItemSource or
 conversation gaps, Flow/native-job conflation, stale title overwrite, remote permission PTY fallback,
-cross-profile Companion samples, unbounded Browser/history growth, overwritten files or runtime termination
+cross-profile Companion samples, false resource zero/double count, stale model/name result, notification
+resolution/resurrection/public listener, Group cycle/hang, duplicate clone, unbounded Browser/history growth,
+overwritten files or runtime termination
 as well as on latency regression.
 
 Passing performance never substitutes for semantic acceptance. The complete cross-gate obligations are
 `ACP-FLW-008`, `ACP-ADP-005`, `ACP-VIE-011`, `ACP-FLW-012`, `ACP-ADP-010`, `ACP-LIF-008`,
 `ACP-RUN-010`, `ACP-CTX-012`, `ACP-OBS-008`, `ACP-SCL-001` through `ACP-SCL-009`, `ACP-LIF-009`,
-`ACP-VIE-012`, `ACP-ATT-011`, `ACP-ADP-011`, `ACP-CTX-013`, `ACP-RUN-011`, `ACP-OBS-009` and `ACP-SCL-010`;
+`ACP-VIE-012`, `ACP-ATT-011`, `ACP-ATT-012`, `ACP-ADP-011` through `ACP-ADP-013`, `ACP-CTX-013`,
+`ACP-RUN-011`, `ACP-HIE-009`, `ACP-CRE-008`, `ACP-OBS-009` through `ACP-OBS-011`, `ACP-SAF-014` and
+`ACP-SCL-010`;
 each named ACP must pass
 its functional, durability, loss, migration and privacy dimensions independently before these measurements
 can be release evidence.

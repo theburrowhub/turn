@@ -15,8 +15,8 @@ authority_pin="$repo_root/docs/PRODUCT_SPEC_V1.sha256"
 decisions="$repo_root/DECISIONS.md"
 mode=${1:-verify}
 
-expected_requirement_count=144
-expected_acceptance_count=144
+expected_requirement_count=152
+expected_acceptance_count=152
 expected_coverage_count=84
 expected_coverage_snapshot=130cdc24bb493349d9b3f3c531198b7bb5fec3df
 expected_coverage_tree_sha256=721e0b9538fb8225f8c773b904b1e98c388ea3e518ad818e9ce3e5f0d8dde3ce

@@ -3,7 +3,8 @@
 **Status:** normative, accepted, implemented and audited for the first vertical.
 **Precedence:** this document supersedes earlier navigation, simultaneous-session and automatic-subagent-pane decisions wherever they conflict. See ADR-040.
 
-**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059, ADR-064 and
+**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059, ADR-064,
+ADR-065 and
 `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` supersede its click/selection presentation for the accepted next
 architecture: the whole area to the right of the tree becomes one `WorkSurface`, and selecting a node
 chooses its unique view without mutating the saved Layout, process state, terminal focus or Attention.
@@ -16,6 +17,7 @@ Turn has one persistent navigation surface and one hierarchy projection:
 Workspace
 └── Session
     ├── Flow / Team / Group
+    │                 └── nested Group / presented members
     ├── Agent
     │   ├── Subagent
     │   └── Process / Log
@@ -30,6 +32,9 @@ The left tree is the source of truth for navigation, state and supervision. Work
 baseline the optional right inspector shows details for the selected node and the centre contains only panes
 chosen by the user, a template, restoration, or an explicit automation. The accepted successor composes
 those regions as one WorkSurface with mutually exclusive Session and Node views; it does not add navigation.
+ADR-065 lets Groups form a bounded same-Session acyclic presentation forest and optionally project a
+separately owned CheckoutScope. Neither nesting nor the projection changes spawn/process ancestry, runtime or
+repository authority, and moving a row never silently changes a live cwd.
 
 Normalised ownership remains in the existing Workspace/Session/process records; the tree does not replace
 those foreign keys. The UI keeps three independent values: `selected_tree_node`, `focused_pane` and pending
@@ -504,7 +509,7 @@ this repository supplied an external worker id and role (`Explore`) but not that
 name. Until a live installed version emits an explicit name, Turn must display the role/fallback honestly
 and enrich the same node later if a declaration arrives; it must never invent `Reviewer` from `Explore`.
 
-## Reproducible ADR-064 successor acceptance
+## Reproducible ADR-064/065 successor acceptance
 
 The product-spec completion gate must add a deterministic multi-adapter vertical plus authenticated live
 smokes where a capability depends on an external provider. The deterministic vertical executes this
@@ -536,12 +541,22 @@ create Workspace and an inactive Session with a current safe activation plan
 → accept one typed allow/deny from a full remote GUI or companion and wait for provider evidence
 → replay/cross-profile/widen/stale/offline attempts and raw remote PTY writes all fail server-side
 → assert credential, grant, administration, host-trust and destructive actions remain local-only
+→ create a depth-128 same-Session Group branch projected from a separate CheckoutScope
+→ reject a concurrent cycle and cross-Session parent atomically; unbind without changing cwd, runtime or worktree
+→ crash and resume one New/Open/Clone/SSH onboarding operation without duplicate effects or implicit publish
+→ run the 22-cell matrix for all six dedicated adapters and prove quota-only connectors have no launch/control
+→ freeze one target-bound ModelEndpointProfile in a launch receipt and reject late discovery/secret/target drift
+→ reconcile host memory and reuse-safe process trees across current, closed and unmatched runtime owners
+→ apply one current safe generated alias, then prove manual pinning and sibling isolation across reconnect
+→ deliver two same-titled child demands while the GUI is absent through separate exact notification revisions
+→ revoke during retry, resolve one demand, reject the late live tick and find zero inbound listener
 → replace the local/full GUI and independently reconnect headless status and companion clients
 → assert one canonical tree/WorkSurface revision while each client retains only its declared allowlist
 ```
 
 The fixtures include delayed/out-of-order pushes, operation retries and Surface/connection/attempt generation
-changes. Native snapshots cover ordinary and dense trees with WorkItem, Job/iteration, adopted conversation,
-Web and Browser rows. They are evidence only when the corresponding semantic assertions and protocol
+changes. Native snapshots cover ordinary and dense trees with nested Groups, CheckoutScopes, WorkItem,
+Job/iteration, adopted conversation, Web, Browser, resource pressure and delivery rows. They are evidence
+only when the corresponding semantic assertions and protocol
 captures pass; a screenshot, provider label or headless render by itself cannot prove lifecycle, external
 authority, remote input or absence-of-side-effect claims.

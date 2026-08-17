@@ -72,7 +72,7 @@ Workspace
 └── Session
     ├── FlowNode ── FlowRun
     ├── TeamNode                 (members are references, not duplicate rows)
-    ├── GroupNode                (may contain one primary presentation of a member)
+    ├── GroupNode                (may contain Groups and one primary presentation of a member)
     ├── AgentNode ── AgentInstance ── RuntimeAttempt*
     │   ├── SubagentNode ── AgentInstance ── RuntimeAttempt*
     │   └── ProcessNode / LogNode
@@ -84,7 +84,8 @@ Workspace
 A Workspace is a persistent project boundary. A Session is one operator-recognisable unit of work. Running a
 Flow creates or reuses exactly one Session and records a `FlowRun`; it does not introduce a parallel
 navigation root. Every visible child has a stable `NodeId`, one `NodeKind`, one owning Session and at most
-one presentation Group.
+one presentation Group. A Group may itself have at most one parent Group in the same Session; the resulting
+presentation graph is a bounded acyclic forest rather than a one-level list.
 
 `RuntimeAttempt*` means zero or more attempts over the lifetime of an agent/tool; an observed child may
 exist before any launch/runtime evidence arrives.
@@ -111,7 +112,7 @@ The same nodes may participate in several graphs. They must never be collapsed i
 | `OwnershipEdge` | Workspace/Session owns a durable node | supplies the root/fallback | no | no |
 | `SpawnEdge` | one runtime or agent created another | yes when verified | no | no |
 | `ProcessEdge` | observed OS parent/child relationship | only when no stronger display edge exists | no | no |
-| `GroupMembership` | explicit single Group presentation | yes, as an operator override | no | no |
+| `GroupMembership` | explicit single Group presentation, including Group-in-Group | yes, as an operator override | no | no |
 | `TeamMembership` | role membership in zero or more Teams | no; Team View holds references | no | no |
 | `FlowMembership` | node/step belongs to one or more recorded runs | no; Flow View holds references | no | only through run policy |
 | `DependencyEdge` | typed result gates a downstream step | no | no | only through an authorised Flow policy |
@@ -125,13 +126,31 @@ being attached to a plausible agent.
 
 One operational Node has exactly one primary row. Its display parent is chosen deterministically in this
 order: its one explicit Group, its strongest verified semantic SpawnEdge, its strongest verified ProcessEdge,
-then its owning Session. Evidence strength and source priority choose a tier; if two different parents remain
-equal at the strongest tier, placement is ambiguous and stays unassigned rather than using an arbitrary id to
-invent parentage. Stable edge id orders only the displayed competing references. Team and Flow membership, non-winning ancestry and lineage render as
-activatable references to that row, never aliases. Moving a Group changes only the primary display edge;
-semantic child counts traverse SpawnEdges, process counts traverse ProcessEdges and neither changes. A
-fixture combining spawn parent, process parent, Group, multiple Teams and Flow membership is the canonical
-placement oracle.
+then its owning Session. A Group's display parent is its explicit parent Group or its owning Session. Every
+GroupMembership mutation is one compare-and-swap transaction over a Session-scoped `GroupTreeRevision`; it
+revalidates same-Session ownership, a maximum depth of 128, uniqueness and acyclicity after concurrent moves.
+Evidence strength and source priority choose an ancestry tier; if two different parents remain equal at the
+strongest tier, placement is ambiguous and stays unassigned rather than using an arbitrary id to invent
+parentage. Stable edge id orders only the displayed competing references. Team and Flow membership,
+non-winning ancestry and lineage render as activatable references to that row, never aliases. Moving a Group
+changes only the primary display edge; semantic child counts traverse SpawnEdges, process counts traverse
+ProcessEdges and neither changes. Removing a non-empty Group requires one closed disposition:
+`refuse|promote_children|move_children_to_session`; it never cascades into runtime, context, Attention or
+checkout deletion. A fixture combining nested Groups, spawn parent, process parent, multiple Teams and Flow
+membership is the canonical placement oracle, including concurrent reparent, cycle, depth and delete races.
+
+A Group may project an optional Session-owned `CheckoutScopeBinding` to one proved local or remote repository
+worktree. `CheckoutScopeId` and repository/worktree identity remain distinct from GroupId; the binding grants
+no runtime or repository authority and does not make Group an execution owner. It supplies the default
+cwd/isolation input for newly created descendants and for an explicit `move_and_rehome` operation;
+merely moving an existing Node changes presentation only. `move_and_rehome` separately preflights and records
+each stopped descriptor it changes, refuses live writers, and never silently rewrites a running process cwd.
+Create/adopt/bind/unbind/remove/reconcile use stable repository, worktree and target generations. Missing or
+foreign worktrees become `stale|conflicted`, never local-path fallback. Deleting a Group or unbinding keeps the
+worktree; removal of an app-created worktree/branch is a separate foreground destructive operation with dirty,
+unpublished, ownership and survivor proof. Agent-per-branch Flows remain the preferred automation: each
+writable member gets its dedicated worktree and an optional Group projection only makes that separately owned
+isolation visible in the tree.
 
 ### 2.3 Stable identities
 
@@ -161,8 +180,13 @@ The target schema never aliases these ids, including during migration. Cardinali
 | ClientConnection → Surface | one connection generation owns one-or-more Surfaces; each live Surface belongs to exactly one connection generation and is never transferred implicitly |
 | runtime/input owner → InputLease | exactly zero-or-one current input/resize lease holder; viewers without it are read-only |
 | Session → FlowRun | zero-to-many immutable runs; a Flow Node projects exactly one run and a work Node records each producing step/run reference |
+| Session → Group forest | zero-to-many Groups; every Group and presented non-Group Node has zero-or-one current GroupMembership, all inside the same Session; depth is at most 128 and one GroupTreeRevision fences the forest |
+| Session → CheckoutScope → Group projection | a Session owns zero-to-many scopes; one scope has zero-or-one current CheckoutScopeBinding to one Group, while the Group never becomes scope/repository identity or authority |
 | WorkItemKey → WorkItem Node | one `(source_id, source_profile_id, project_namespace, external_item_id)` maps to at most one canonical Node; a Node has zero-or-one current external binding plus retained rebinding lineage |
 | Job Node ↔ NativeJob | exactly one-to-one; one job has ordered stable iteration ids, and any runtime/agent spawned by an iteration remains a separate referenced Node |
+| ExecutionTarget → ModelEndpointProfile | zero-to-many non-secret route profiles; one launch/switch receipt freezes exactly one profile revision/model/credential generation or explicitly none, never an implicit fallback |
+| WorkspaceOnboardingId → Workspace | one operation preassigns zero-or-one intended Workspace identity and yields at most one completed Workspace; retries reuse the operation and never create a second target/repository clone |
+| NotificationEndpoint → DeliveryGrant → Delivery | one endpoint has zero-or-many grant generations with at most one active equivalent scope; one DeliveryId carries one exact Attention revision and retry history, while a collapse family may supersede older revisions only |
 
 Legacy rows that reused a `NodeId` as an instance id are migrated atomically to freshly minted ids with an
 alias tombstone used only to resolve old references; new protocol responses never expose the alias as the
@@ -200,7 +224,7 @@ use stable keys and revisions, not widget history.
 | Process | technical identity, ancestry evidence, resource state, output/log handles and owner references |
 | Log | bounded streaming output, source, filter/search and retention state |
 | Flow/Team | members, roles, dependencies, grants, progress, messages, results and blocked steps |
-| Group | member overview and aggregated Attention only; it owns no runtime or checkout |
+| Group | nested member overview, optional checkout-scope binding and aggregated Attention; it owns no runtime, repository or checkout authority |
 | WorkItem | canonical local fields or source-of-truth fields/local overlay, sync revision/staleness/conflict, comments/assignees and linked work without runtime authority |
 | Note/File/Diff | inert bounded content, canonical source and privacy/checkout facts |
 | Web/Media | explicitly loaded inert isolated preview with origin/source and no ambient credentials |
@@ -335,6 +359,29 @@ credentials, request notification/microphone permissions only when the related f
 explain degraded integration plus remediation. Setup can be skipped without disabling generic terminal use.
 Every probe is bounded, read-only unless a consequence is explicitly shown, cancellable and recorded as a
 redacted diagnostic receipt; remote trust and host identity require a separate explicit adoption.
+
+`WorkspaceOnboarding` is the single resumable catalogue path for `create_directory`, `open_directory`,
+`clone_repository` and `adopt_ssh_target`. It freezes an operation id, intended Workspace identity,
+ExecutionTarget, canonical path, repository/remote identity, authentication reference and current target
+generation before any effect. `WorkspaceOnboardingId` is allocated before work and every command carries it,
+the idempotency operation id and expected onboarding/target revision. `OnboardingState` is closed:
+`draft → preflighting|cancelled`, `preflighting → provisioning|failed|cancelled`, `provisioning → committing|
+cancel_requested|reconcile_required`, `committing → completed|reconcile_required`, `cancel_requested →
+cancelled|reconcile_required`; `completed|failed|cancelled` are terminal, while `reconcile_required` retains
+the last proved phase plus optional desired `cancelled|failed` and may advance only from fresh effect evidence.
+`OnboardingPhase` is the closed current step `resolve_target|validate_path|review_import|create_directory|
+fetch_repository|checkout_repository|persist_workspace|connect_ssh|verify_result`; every phase appends a
+bounded started/definite/uncertain/no-effect receipt. `cancel_workspace_onboarding` prevents new phases and
+cancels only the currently declared cancellable effect; `reconcile_workspace_onboarding` probes the exact
+preassigned directory/repository/remote identity and never repeats an ambiguous effect. Open/adopt is inert
+until local capability consent has been decided; clone is
+cancel-safe and reports each created directory, fetched object, checkout and uncertain cleanup state rather
+than hiding a partial repository. A retry reconciles by operation id and remote/repository identity instead of
+cloning twice. SSH host identity and path are pinned and a failed remote operation never falls back to a
+same-named local path. `publish_repository` is a distinct foreground operation with destination, visibility,
+branch/upstream, credential-reference and consequence review; onboarding and successful local creation never
+publish automatically. Every writer uses an isolated checkout and no onboarding path occupies the operator's
+primary `main` checkout.
 
 Templates remain reusable Layout/configuration. Flows are reusable execution graphs. Duplicating a Session
 copies its shape and selected Flow inputs but never claims to copy a live provider conversation.
@@ -671,12 +718,13 @@ tombstones/history require a separate explicit history query.
 
 ### 6.1 Adapter capability contract
 
-Claude Code, Codex, Gemini, OpenCode and future/custom agents implement the same capability vocabulary:
+Claude Code, Codex, Gemini, OpenCode, GitHub Copilot, Grok and future/custom agents implement the same
+capability vocabulary:
 
 `launch`, `resume`, `branch`, `stop`, `structured_status`, `questions`, `permissions`, `subagents`,
 `transcript`, `context_usage`, `provider_quota`, `model_switch`, `messaging`, `context_transfer`,
 `shared_identity`, `durable_attach`, `delegated_control`, `native_jobs`, `conversation_inventory`,
-`title_read` and `conversation_rename`.
+`title_read`, `conversation_rename` and `model_gateway`.
 
 Capabilities are evidence, not marketing labels or one global provider bit. Each fact is keyed by adapter
 and CLI version, provider, account, ExecutionTarget/host, endpoint, AgentInstance/attempt/generation and
@@ -691,6 +739,11 @@ advertises only what it can prove.
 Every advertised capability has shared contract fixtures, provider-specific fixtures and degradation tests.
 Capabilities dependent on credentials or a live service additionally require a recorded live smoke test
 before the product labels them available. One provider's timeout or usage error does not block another.
+The six named dedicated adapters run the same complete capability matrix against supported, unsupported,
+degraded, stale and version-bound fixtures; none may be replaced by executable-name inference or the generic
+terminal adapter while the product claims dedicated support. Kimi and MiniMax are first-class quota/activity
+connectors under the same AccountProfile scoping contract even when Turn does not advertise a launch adapter
+for them. A quota connector grants no launch, transcript, conversation or control capability.
 
 Each Agent View exposes an integration diagnostic: detected provider/CLI version, requested and achieved
 integration level, installed event mechanisms, last valid/rejected observation, last successful invocation,
@@ -767,6 +820,33 @@ Questions, permissions, failures and unread results from an iteration enter the 
 that exact Job/iteration/attempt route. A job is imported/exported only as inert configuration text and must
 be locally adopted; provider job ids, authority and schedule activation never cross the package boundary.
 
+### 6.4 Model endpoint routing
+
+`ModelEndpointProfile` is a non-secret, revisioned routing object for a provider-compatible gateway or direct
+endpoint. Its stable id is scoped to one ExecutionTarget and records display label, canonical HTTPS origin,
+TLS/pin policy, supported wire protocols, bounded discovered model catalogue, provider/account eligibility,
+health/freshness and only an OS-keystore/agent/environment credential reference. Raw API keys are write-only
+at the secret broker boundary and never enter protocol reads, argv, durable environment values, logs,
+diagnostics, exports or shared configuration. An environment reference exposes its variable name and
+availability, never its value.
+
+`ModelEndpointProfileState` is closed: `draft → validating|retired|deleted`, `validating → active|invalid|
+retired`, `active → validating|degraded|retired`, `degraded → validating|active|retired`, `invalid →
+validating|retired|deleted`, `retired → validating|deleted`; `deleted` is terminal with an id tombstone.
+Create/update/validate/set-default/retire/delete are separate operation-idempotent, revision-fenced foreground
+operations. Validation bounds redirects, response size/time/model count and rejects non-HTTPS endpoints,
+userinfo, DNS rebinding, loopback/private/metadata destinations unless a target policy explicitly adopted the
+exact origin. TLS or endpoint identity changes fail closed; health failure never silently routes to another
+endpoint or native provider.
+
+Launch preflight intersects adapter `model_gateway`, endpoint protocol, selected AccountProfile, target,
+requested model and current credential reference. `LaunchSpec` freezes the requested endpoint/model while
+`LaunchReceipt` records effective endpoint revision, wire route/model and redacted credential-reference kind.
+Changing a profile/default affects only future attempts. Custom adapters inherit gateway mapping only through
+declared base-adapter capability data, never a provider-name UI branch. Model discovery is untrusted data:
+ids/labels are bounded and sanitised, cannot inject flags or environment, and an unavailable/partial catalogue
+never proves that a model is absent.
+
 ## 7. Runtime lifecycle and continuity
 
 Turn supports local and remote `ExecutionTarget`s through a `RuntimeBackend`. The first durable backend may
@@ -791,6 +871,26 @@ delete requires no active runtime, profile, job, Workspace default or audit refe
 reads. Every mutator carries operation id, expected target/trust revision and returns a receipt; reconnect or
 same-named host discovery never changes identity or trust implicitly.
 
+`CheckoutScope` owns worktree lifecycle independently of its optional Group projection. It is keyed by stable
+`CheckoutScopeId`, Session, ExecutionTarget/trust generation, canonical repository identity, worktree identity,
+branch/ref and creator provenance `turn_created|adopted`; state is closed: `provisioning → active|
+reconcile_required`, `active → missing|conflicted|removing`, `missing|conflicted → active|removing|
+reconcile_required`, `removing → removed|reconcile_required`, and `reconcile_required` may advance only to a
+state proved by fresh exact inventory or return to its retained last-proved state. `removed` is terminal for
+the scope id. A separate `CheckoutScopeBindingId` relates at most one Group projection to a scope; its closed
+state is `proposed → current|refused`, `current → stale|unbound`, `stale → current|unbound`, with
+`refused|unbound` terminal. Unbinding only removes that presentation/default relationship and never changes the
+CheckoutScope state or worktree. One catalogue action may create/adopt the worktree, create its Session and
+optional Group projection, then select it; a partial effect persists exact reconciliation receipts.
+
+Repository inventory distinguishes a complete empty/list result from read failure, partial/gapped data and a
+stale target generation. Only complete current evidence may declare a binding missing or an unregistered
+worktree orphan. Adopted scopes default to unbind, never disk/branch deletion. Remove requires fresh dirty,
+unpublished, path-owner, repository and live-writer proof and rejects repository/home/filesystem-root or ancestor
+targets. Merge and publish are separate foreground operations. Unbind releases dead cwd defaults but does not
+stop or relabel a live runtime; moving a runtime to another CheckoutScope is an explicit migrate/relaunch. Every
+local/remote action stays target-bound and main remains checked out and switchable in the operator checkout.
+
 Each RuntimeBackend also exposes bounded, capability-declared inventory snapshots for its entire authenticated
 ExecutionTarget, not only handles already linked to the current Workspace. `RuntimeInventoryObservation`
 names target/fingerprint/generation, adapter/backend, snapshot epoch/sequence/watermark, stable handle,
@@ -805,6 +905,28 @@ revision for a bounded time, or terminate that exact handle after a consequence 
 the proper Node/owner/RuntimeAttempt with a receipt; termination revalidates target, generation and handle
 and never broad-kills a host or same-named runtime. Runtimes surviving end/delete, daemon loss or a failed
 attach remain visible here until reconciled.
+
+The same target snapshot family supplies a `ResourceInventoryObservation`; it is an extension of
+RuntimeInventory, not a second owner graph. `ResourceScopeKey = (ExecutionTargetId, target_generation)` and
+each `RuntimeResourceRowKey = (ExecutionTargetId, target_generation, backend_handle, handle_generation)`.
+The host observation carries physical memory total/available/used, swap total/free, measured pressure signals,
+accounting method, observed time and `complete|partial|gapped|unavailable|unsupported|stale` coverage. Optional
+facts stay absent when unmeasured; absence, collector error and a failed remote read never become zero. A
+result distinguishes `measured_nonempty|measured_empty|unmeasured` explicitly.
+
+Each process row uses a reuse-safe root identity `(target boot id, pid, process start time)`, bounded parent
+edges, own RSS and deduplicated descendant RSS. It attributes to an exact RuntimeAttempt, Node and Session when
+proved; ownership is `owned_current|owned_closed_session|unmatched_survivor|ambiguous`. A live process retained
+by an ended/archived Session remains attributed to that closed owner instead of becoming a fabricated orphan.
+Cycles, inaccessible processes, shared RuntimeEndpoints and overlapping trees are surfaced as partial/shared
+buckets; they are never double-counted or split by guess. Session/Node/target aggregates name numerator,
+denominator, coverage and revision, and remain locally/remote target-bound.
+
+Observation never terminates work. `terminate_resource_owner` is a foreground consequence-labelled operation
+that re-probes and revalidates target/trust generation, exact backend handle generation, process start identity
+and expected resource observation before delegating to the existing exact RuntimeInventory termination path.
+PID/name-only kills, broad host kills and remote-to-local fallback are forbidden. A late remote response is
+discarded after target-generation change, and failure affects no sibling runtime.
 
 File editing is an explicit FileBackend operation, not terminal keystroke synthesis. Open returns canonical
 root-relative path, host/generation, file identity, byte/encoding bounds, content hash and revision. Save is
@@ -969,6 +1091,20 @@ Usage collection is independent per provider/account/remote host, bounded and ca
 providers do not delay the selected Node View or hide fresh values from others. Expensive network/subprocess
 collection occurs on demand and at a bounded cadence while relevant views or policies subscribe.
 
+Display naming is local metadata, never identity or provider authority. `DisplayNameFact` records Node/Group
+and source revision, source `declared|structured_task|provider_observed|generated|operator_alias|fallback`,
+confidence, observed time and a bounded sanitised label. `NameMode` is `follow_source|pinned`; an operator edit
+or explicit `apply_name_proposal` pins the local alias until the operator unpins it, so reconnect, provider
+title change and later generated output cannot overwrite it. Provider `conversation_rename` remains a separate
+operation and local rename sends no provider command or terminal bytes.
+
+`NameProposalId` binds the captured bounded source bytes/hash, target scope, Node/Group revision, generator
+identity/model, redaction policy and expiry. Proposals are on-demand unless a reviewed local policy enables
+bounded generation, use target-aware source acquisition, never send raw remote output to an undeclared local
+or network generator, and cannot carry controls, bidi/invisible injection, paths, secrets or multiline text.
+Applying a stale proposal fails without changing the current label. Group proposals use bounded member
+summaries rather than concatenated transcripts; same-cwd or same-title nodes remain independently keyed.
+
 An `AccountProfile` is a non-secret identity scoped to provider plus ExecutionTarget and backed by an
 isolated provider config/auth home or OS-keystore/agent reference. Foreground operations create, adopt,
 launch the provider's external authentication flow, validate, rename, retire and delete a profile; Turn
@@ -1065,6 +1201,37 @@ Compact system status, an optional HUD and authenticated remote/mobile companion
 queue and revisions, never independent queues. A companion may submit only closed-schema actions its current
 capability grants allow. Sensitive permissions, credentials and authority changes always require the
 foreground desktop surface.
+
+Background delivery is a projection of that queue through `NotificationEndpointId`, never another Attention
+authority. A foreground-paired `DeliveryGrant` binds one endpoint public key/token reference, device/profile,
+allowed Workspaces/ExecutionTargets, event classes, privacy detail, rate/batch bounds, generation and expiry.
+Its state is `proposed → active|invalid|revoked`, `active → expired|invalid|revoked`; terminal states cannot be
+reactivated. Tokens and private keys remain in the keystore/agent and are absent from UI reads, store exports,
+logs and diagnostic payloads. Revocation or 401/403 invalidates only the exact grant generation.
+
+`NotificationDeliveryState` is closed for one stable `DeliveryId`: `eligible → held_present|queued|superseded|
+expired`, `held_present → queued|superseded|expired`, `queued → submitted|superseded|expired`, `submitted →
+accepted|failed_retryable|failed_terminal|superseded|expired`, and `failed_retryable → queued|failed_terminal|
+superseded|expired`. Retry retains DeliveryId, increments a bounded attempt counter and fixes next-eligible
+time; exhaustion becomes failed_terminal. Gateway acceptance never means device delivery, reading or demand
+resolution. `CollapseFamilyKey` includes endpoint, stable tagged Attention subject identity and demand kind;
+`CollapseKey` adds the exact subject/evidence revision. A newer current revision supersedes older family
+members, while different children or kinds never collapse by title. Outbox insertion and flush both revalidate
+grant, current queue revision, resolution and presence. Batching, bounded retry/jitter, per-endpoint rate limit
+and encrypted minimal payloads prevent transcript/path/command/secret disclosure. Delivery failure changes no Attention,
+unread or runtime state. A deep link always resynchronises the authoritative queue and revalidates the exact
+route before showing or acting; an offline/stale notification cannot submit.
+
+An optional live status stream uses `LiveStreamKey = (endpoint, AttentionSubject identity, attempt generation)`
+and monotonic event revision. Start/update/end are collapse-aware, and an end or tombstone fences every late
+tick so a resolved/deleted/ended subject cannot resurrect. Presence may hold an alert but never pauses the
+authoritative stream; leaving presence releases only still-current queued demands.
+
+`NotificationHostMode` accepts authenticated local owner-only or loopback observation input and makes outbound
+HTTPS delivery only. It creates no public HTTP/WebSocket/UI listener, ignores configured public bind host/port
+and exposes zero inbound network ports. The ordinary remote GUI remains a separate deployment. Packet/listener
+tests, endpoint revocation during a batch, background/killed clients, duplicate replay, two same-titled
+subagents, offline acceptance and late live ticks are normative failure oracles.
 
 `CompanionAction` is closed to `route_attention`, `mark_result_read`, `acknowledge`, `snooze`, `dismiss`,
 `submit_free_text_response`, `submit_permission_response`, `interrupt` and `request_writer_lease`.
@@ -1279,14 +1446,15 @@ Failures preserve what is known and expose recovery:
 
 This contract is delivered as coherent verticals, not isolated widgets:
 
-1. provider-neutral identities, topology observations and capability contract;
-2. one WorkSurface plus exact Attention routes over those identities;
-3. truthful launch receipts, lifecycle attempts and durable/local/remote runtime seam;
-4. one CreationCatalog, FlowRun and worktree-safe typed control;
+1. provider-neutral identities, six-adapter topology/capability evidence, quota-only connectors and model-route
+   profiles;
+2. one recursive canonical hierarchy, separate CheckoutScopes and one WorkSurface plus exact Attention routes;
+3. truthful launch receipts, lifecycle attempts and durable/local/remote runtime plus ResourceInventory seam;
+4. one CreationCatalog/WorkspaceOnboarding path, FlowRun and worktree-safe typed control;
 5. context transfer, messages, Teams, dependency execution and verification flows;
-6. quota/context/resource telemetry and companion projections;
-7. resource Node Views and local voice input;
-8. scale, live-provider, remote, packaged accessibility and failure-recovery proof.
+6. quota/context/resource/name telemetry and companion projections;
+7. resource Node Views, background Attention delivery and local voice input;
+8. frozen capability-ledger, scale, live-provider, remote, packaged accessibility and failure-recovery proof.
 
 A vertical may ship incrementally behind capability/status labels. It may not claim provider parity,
 restoration, zero subagents, delivery, continuity or completion without the corresponding evidence.
@@ -1299,13 +1467,16 @@ The product-specification goal is complete only when, on the same commit:
 
 1. the versioned manifest fixes every requirement id, acceptance id and hashes of its normative outcome and
    oracle; removal or semantic change names an accepted ADR in the manifest revision;
-2. every inventory row maps one-to-one to a non-empty proof obligation and the mutation tests prove that
+2. the neutral capability-coverage ledger fixes the audited source snapshot and gives every discovered
+   feature a stable id, evidence digest, `adopted|adapted|rejected|irrelevant` disposition, rationale and linked
+   requirement/acceptance/ADR; unknown disposition, silent deletion, link drift or semantic weakening fails;
+3. every inventory row maps one-to-one to a non-empty proof obligation and the mutation tests prove that
    paired deletion, requirement weakening and trivial-oracle substitution fail the gate;
-3. the contract, Product, Architecture, Protocol, Roadmap, decisions and detailed specifications use one
+4. the contract, Product, Architecture, Protocol, Roadmap, decisions and detailed specifications use one
    ontology and contain no unresolved contradiction or relevant capability gap;
-4. at least two non-author adversarial audits of the final frozen diff return no P0/P1 finding; every P2 is
+5. at least two non-author adversarial audits of the final frozen diff return no P0/P1 finding; every P2 is
    either closed or named with a justified product boundary;
-5. `make verify` and the specification gate are green and the exact commit is merged to `main`.
+6. `make verify` and the specification gate are green and the exact commit is merged to `main`.
 
 This gate may pass while implementation statuses remain `baseline`, `partial`, `target` or `conflict`. It is
 a claim that the accepted destination and its tests are complete, not that the destination exists yet.

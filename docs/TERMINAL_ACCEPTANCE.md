@@ -44,7 +44,7 @@ terminal contract. Screen-reader, contrast, motion and zoom evidence is recorded
 
 ## Accepted successor terminal and remote-input boundary
 
-ADR-064 does not add provider-specific rendering paths. It adds authority tests around the same PTY:
+ADR-064/065 do not add provider-specific rendering paths. They add authority tests around the same PTY:
 
 1. A foreground Session with a current proved-safe activation plan can restore/attach and start its exact
    bounded eligible saved-runtime descriptor set—or, when empty, its configured default Shell—as part of
@@ -73,6 +73,22 @@ ADR-064 does not add provider-specific rendering paths. It adds authority tests 
 6. Provider/account context usage, quota and activity data never enter terminal title, scrollback or prompt
    parsing as authoritative facts. Their profile/target scope, coverage and freshness remain visible in the
    selected view, and missing/partial/error states never render as zero.
+7. Recursive Group move/reorder/ungroup changes only presentation. It never types `cd`, relaunches a process or
+   claims its cwd changed. A separately explicit CheckoutScope `move_and_rehome` refuses live writers and
+   rewrites only stopped descriptors after current target/repository/worktree proof; missing inventory never
+   falls back to the terminal or primary checkout.
+8. ModelEndpointProfile discovery, selection and credential resolution are typed adapter/broker operations.
+   Terminal output cannot advertise a route/model/capability or request a secret. Raw endpoint secrets are
+   absent from argv, PTY, title, scrollback and durable environment; a missing/stale route writes zero terminal
+   bytes and never launches a generic/native fallback.
+9. Automatic name input is one bounded captured output/task summary under explicit NameProposal identity. An
+   arbitrary OSC title, prompt line or provider `/rename` text cannot pin a local alias, rename a Group or send
+   a provider command. Control/bidi/multiline/secret output is rejected, and applying a current proposal writes
+   no PTY bytes.
+10. Notification delivery, live status, host resource metrics, quota-only connectors and WorkspaceOnboarding
+    phases come only from typed state/receipts. Terminal text cannot fabricate endpoint pairing, delivery
+    acceptance, memory zero/pressure, clone completion, publish success or adapter support; displaying their
+    status never injects input. NotificationHostMode opens no terminal/public listener implicitly.
 
 Successor terminal acceptance therefore combines the existing byte/geometry suite with protocol tests for
 input-lease fencing and remote-operation allowlists; a headless render test alone cannot prove remote GUI

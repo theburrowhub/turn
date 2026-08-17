@@ -50,7 +50,7 @@ boundary. Unknown or secret Settings values are replaced by `<redacted>`.
 
 ### Accepted control-plane data extension (not yet implemented)
 
-ADR-059/061/062/063/064 and M11–M17 add categories only after they enter the same closed catalogue:
+ADR-059/061/062/063/064/065 and M11–M17 add categories only after they enter the same closed catalogue:
 
 - semantic/resource nodes and private Note records;
 - `AgentInstance`, `RuntimeAttempt`, safe `LaunchSpec`/`LaunchReceipt`/`RuntimeConfigurationReceipt` and
@@ -76,7 +76,7 @@ ADR-063 adds eight explicitly classified families. None may hide inside a generi
 | WorkItem/board | Node id/revision, closed state, priority, due date, bounded tags/assignees/comments and conflict/audit metadata | runtime state, dependency state and Attention authority; a board remains a projection |
 | Delegated Resource/Progress | typed Resource body, author/schema/revision, bounded progress samples, grant/operation ids and receipts | referenced file/site payload, terminal bytes and any control instruction inferred from content |
 | Shared RuntimeEndpoint | endpoint/binding ids, safe continuity fingerprint, instance/conversation/account/profile references, generation and recovery state | provider credentials, raw auth/config roots, transcript/input/context bodies and provider-native payloads |
-| RuntimeInventory | target/host/generation, observation coverage, safe handle fingerprint, reconciliation decision and proof | raw process environment, command-line secrets, memory, open-file contents and unmatched runtime transcript |
+| RuntimeInventory/ResourceInventory | target/host/generation, observation coverage, safe handle/process-start fingerprint, bounded host memory/swap/pressure and process RSS/attribution, reconciliation decision and proof | raw process environment, argv/command-line secrets, open-file contents and unmatched runtime transcript |
 | FileBackend edit | canonical target/root/revision/encoding/size metadata, conflict/save receipt and redacted audit | file body, edit buffer, merge buffer, diff body and adopted external repository data |
 | Note-backed live brief | private Note body and immutable body revisions required by an active/pinned disclosure, link revision policy and read audit | any additional provider-side copy produced after delivery |
 | AccountProfile | safe provider/profile id, ownership kind, redacted root fingerprints, validation/default/retirement state and active-reference count | credentials, tokens, cookies, raw auth/config files, transcripts and provider conversation bodies |
@@ -95,6 +95,20 @@ because their UI appears in the same tree or WorkSurface:
 | Web preview / Browser | private reviewed origin or canonical local-file identity, content hash/revision where local, isolation policy generation, bounded navigation receipt and blocked-popup/redirect reason | rendered/page body, DOM, script/storage/cookie state, form/input values, downloads, ambient browser history and unreviewed sibling local files |
 | Provider title read/rename | bounded untrusted provider title, source revision/freshness and requested/effective rename receipt, separately from the local display alias | conversation/transcript body and provider response payload beyond the bounded title |
 | Companion profile inbox | AccountProfile/metric scope, bounded context/quota samples, units/windows/reset/freshness, safe activity identity/summary/read state and sync cursor | provider credentials, transcript/prompt bodies, raw provider event payloads and any sibling profile's data |
+
+ADR-065 adds eight final classified families. A Group projection never changes ownership of CheckoutScope,
+and a pushed notification never becomes a second copy of the underlying private body:
+
+| Family | Durable Turn-owned data | Content deliberately not copied into the catalogue |
+| --- | --- | --- |
+| Recursive Group / CheckoutScope | Group parent/order/tree revision, separate scope/repository/worktree/target identity, creator provenance, lifecycle and bounded operation receipts | repository files/diffs, branch contents, credentials, runtime output and worktree payload |
+| WorkspaceOnboarding | operation/Workspace/target/path/repository identity, phase, local consent and bounded partial/reconcile/publish receipt metadata | repository objects/files, SSH credential/passphrase, raw clone output and external hosting response body |
+| Dedicated adapter / quota connector | roster/capability/version evidence ids, AccountProfile/target-scoped bounded samples, coverage/freshness/error and redacted live-evidence receipts | credentials, raw billing/provider responses, transcript/activity bodies and sibling-profile data |
+| ModelEndpointProfile | safe route/origin/protocol/model metadata, target/profile/credential-reference kind+generation, health/freshness and redacted validation/launch receipts | API key/token/secret values, raw discovery response, request/response body and target environment value |
+| ResourceInventory | latest bounded host capacity/pressure and process identity/RSS/owner/coverage snapshots plus exact intervention receipt | argv, environment, open files, transcript, command/output bodies and unrelated host process detail |
+| DisplayNameFact / proposal | bounded sanitised label, source kind/confidence/revision, pin mode and proposal generator/hash/expiry metadata | raw terminal/transcript/task capture, secret/control-stripped source and provider response body |
+| Notification delivery | endpoint/grant/delivery/live ids, scope/privacy/rate/expiry/generation, minimal encrypted-payload hash, state and redacted failure/revocation receipt | device bearer/private key, plaintext prompt/transcript/command/path/account body, provider payload and downstream device cache |
+| Specification capability ledger | opaque source-snapshot/evidence digests, stable feature/disposition/rationale and PRD/ACP/ADR trace | source repository content, credentials, user records and runtime/provider payloads |
 
 A WorkItemSource remains an external data owner. Import copies only mapped fields selected by the configured
 filter into the explicitly private WorkItem category; paging and reconciliation do not grant Turn a right to
@@ -163,6 +177,22 @@ bytes durable downstream in a provider transcript, terminal screen/scrollback or
 output must not claim those recipient copies are revocable.
 Because packet/message bytes are not durable, daemon loss before proven submission records the applicable
 lost/review-required state; Turn never reconstructs or re-sends content from its retained hash/manifest.
+
+A ModelEndpointProfile's origin, route/model catalogue and credential-reference metadata are sensitive. Raw
+discovery pages are memory-only and bounded; only validated mapped model ids/labels and coverage/freshness may
+be cached. A secret value is written directly to the target's keystore/agent/broker and has no readable Turn
+field. Environment references retain only variable name, target and availability. Report/export redact private
+origins and show credential-reference kind/generation, never value. Deleting a route removes Turn metadata and
+Turn-created secret material after reference checks; it does not delete an externally owned environment,
+broker account or provider model.
+
+Notification pairing records a public endpoint identity and secret reference, not the device token/private
+key. Plaintext payload exists only in bounded memory before endpoint encryption and contains no transcript,
+prompt/answer body, command, path, account or raw provider payload. Outbox persistence, when required for
+offline retry, retains only encrypted bytes plus minimal route hash/state and expires at the delivery boundary.
+Revocation deletes queued encrypted bytes for that endpoint generation and retains a bounded non-secret audit
+receipt. Device OS/cloud notification history is downstream external retention disclosed at pairing and cannot
+be erased by Turn; Turn never claims that gateway acceptance proves device deletion or reading.
 
 Private Note bodies, WorkItem comments and delegated Resource bodies are exceptions to the metadata-only
 default because they are explicit Turn-owned content. Reports show only their item/byte counts and content
@@ -392,6 +422,7 @@ are not current v0.1 settings:
 | `records.runtime_inventory_handles_per_target` | 10,000 | Global; known plus unmatched handles in one target generation; overflow marks the snapshot gapped |
 | `records.runtime_inventory_snapshot_mib` | 16 MiB | Global; maximum redacted snapshot per target; overflow is a gap, never silent truncation/exactness |
 | `records.runtime_inventory_observation_days` | 7 days | Global; only the latest complete/partial/gapped snapshot per live generation is owner-lifetime |
+| `records.resource_inventory_processes_per_target` | 10,000 | Global; reuse-safe process rows in the same target snapshot; overflow marks coverage gapped and never drops into exact accounting |
 | `records.runtime_reconciliation_receipts` | 10,000 | Global; newest safe adopt/ignore/terminate proofs installation-wide |
 | `records.runtime_reconciliation_receipt_days` | 180 days | Global; a receipt is removed when older even if fewer than 10,000 remain |
 | `records.native_jobs_per_profile` | 10,000 | Global; current provider-job projections; overflow marks inventory gapped rather than dropping a job silently |
@@ -400,6 +431,14 @@ are not current v0.1 settings:
 | `records.conversation_inventory_entries_per_profile` | 10,000 | Global; metadata-only bounded cache; overflow marks coverage gapped and refuses authoritative search/zero |
 | `records.conversation_inventory_cache_minutes` | 15 minutes | Global; expiry changes the cache to stale and never deletes provider data or fabricates an empty result |
 | `records.provider_title_observations_per_conversation` | 10 | Global; bounded untrusted requested/effective title observations and rename receipts |
+| `records.name_facts_per_node` | 10 | Global; newest bounded sanitised source facts/proposal metadata; manual pinned alias remains owner-lifetime |
+| `records.name_proposal_days` | 7 days | Global; unapplied proposal metadata expires; raw captured source is never durable |
+| `records.model_endpoint_profiles_per_target` | 32 | Global; safe route metadata only; creation is refused at the bound |
+| `records.model_discovery_entries_per_profile` | 10,000 | Global; mapped metadata cache; overflow marks discovery partial, raw page remains memory-only |
+| `records.model_discovery_cache_minutes` | 15 minutes | Global; expiry becomes stale and never proves absence or changes a running attempt |
+| `records.model_endpoint_receipts_per_profile` | 100 | Global; newest redacted validation/launch/switch receipts; active/uncertain evidence is retained |
+| `records.workspace_onboarding_receipts` | 10,000 | Global; newest phase/partial/reconcile/publish metadata, never repository/SSH/clone output bodies |
+| `records.workspace_onboarding_receipt_days` | 180 days | Global; terminal unreferenced receipts compact at the boundary while uncertain recovery evidence remains |
 | `records.web_browser_navigation_receipts_per_node` | 100 | Global; safe origin/file identity, policy generation and outcome only; DOM/history/form/cookie bodies remain memory-only |
 | `records.web_browser_navigation_receipt_days` | 30 days | Global; unreferenced terminal receipts older than the boundary compact even below count |
 | `records.open_file_snapshots_per_client` | 16 | Global; memory-only open/edit/merge buffers; the seventeenth open is refused |
@@ -416,6 +455,10 @@ are not current v0.1 settings:
 | `records.remote_replay_nonces` | 10,000 | Global; hashed nonce/id metadata only, expires after 10 minutes; overflow refuses a new remote mutation |
 | `records.remote_permission_receipts` | 10,000 | Global; newest redacted typed-option receipts, never prompt/frame/credential bodies |
 | `records.remote_permission_receipt_days` | 180 days | Global; resolved receipts compact at the boundary while active/uncertain reconciliation evidence remains |
+| `records.notification_endpoints` | 64 | Global; active/retired safe endpoint and grant metadata; new pairing refuses at the bound |
+| `records.notification_encrypted_outbox_mib` | 16 MiB | Global; encrypted minimal payloads only; overflow expires lowest-priority eligible delivery without changing Attention and records a gap |
+| `records.notification_delivery_hours` | 24 hours | Global; pending encrypted delivery expires; accepted/failed/revoked metadata compacts after seven days |
+| `records.notification_delivery_audit_days` | 7 days | Global; non-secret state/endpoint-generation/hash metadata only |
 | `records.companion_activity_items_per_profile` | 1,000 | Global; newest bounded safe activity metadata per AccountProfile; overflow requires a gap/resync marker |
 | `records.companion_activity_days` | 30 days | Global; handled/unhandled provider activity metadata older than the boundary compacts without changing Attention |
 | `records.sync_journal_days` | 30 days | Global; earlier cursors must resnapshot and cannot replay mutations |
@@ -489,6 +532,15 @@ proves mapped source fields, safe job/conversation/title metadata, numeric usage
 typed permission receipts appear only in their exact source/profile/node/client scope; unavailable usage is
 never serialised as zero. Source/profile/node privacy deletion leaves external items, jobs, conversations,
 titles, local HTML and sites unchanged.
+The ADR-065 fixture adds independent canaries for worktree/repository content, clone/SSH output, each of six
+adapter transcripts and two quota-provider raw pages, model-gateway secret/discovery body, process argv/env,
+automatic-name raw capture and notification token/plaintext. It proves only bounded sanitised roster,
+CheckoutScope, onboarding, quota, route/model, resource-aggregate, name-fact and encrypted-delivery metadata
+appear in their exact target/profile/node/endpoint scope. No canary appears in report/export, SQLite/WAL,
+sync/status/Attention logs, diagnostics, process argv, PTY, crash artifacts or another profile/target/endpoint.
+Boundary tests distinguish unmeasured resource data from measured zero, remove a notification generation's
+queued ciphertext on revoke, preserve externally owned credentials/repositories/worktrees/device history, and
+delete/compact every new Turn-owned category under the numerical controls above.
 When M15 ships, it must additionally seed recognisable PCM/transcript markers and prove they are absent from
 protocol captures, SQLite/WAL, filesystem, logs, events, Attention, journals, diagnostics, exports and crash
 artifacts before explicit delivery. It covers model/receipt/partial inventory, metadata-only export, signed-

@@ -148,7 +148,7 @@ model download/delete/privacy inventory all pass for that architecture.
 
 ## Accepted control-plane release matrix
 
-ADR-064 is a post-v0.1 target and does not change the three-binary acceptance record below. A release that
+ADR-064/065 are post-v0.1 targets and do not change the three-binary acceptance record below. A release that
 advertises the successor control plane must extend package/preflight/live evidence as follows:
 
 - a fresh packaged foreground Session is selected once under a current safe activation plan and restores/
@@ -182,6 +182,27 @@ advertises the successor control plane must extend package/preflight/live eviden
   refuses replay, widening, stale/offline/cross-profile use and raw remote PTY input during that known
   sensitive interaction. Credentials, grant changes, administration, host trust and destructive authority
   remain local; no stronger guarantee is claimed for an unclassifiable generic TUI.
+- a packaged 128-level recursive Group fixture plus Session-owned CheckoutScope create/adopt/missing/
+  reconcile/unbind/remove proves cycle/depth/corruption bounds, non-cascading tree changes, retained adopted
+  worktrees and a continuously switchable primary `main`. No package may label Group itself a repository or
+  runtime owner;
+- the release adapter roster is exactly the six dedicated adapters, each with all 22 capability cells and
+  current versioned/live evidence where claimed. Kimi/MiniMax remain quota-only connector entries. Every
+  shipped ModelEndpointProfile path proves target-local secret resolution, bounded discovery, route/model
+  receipt, failed-switch continuity and absence of secret canaries from package/config/argv/PTY/log/export;
+- local and remote ResourceInventory smokes include host RAM/swap/pressure, reuse-safe current/closed/unmatched
+  process attribution and complete-empty versus failed collection. Any packaged helper identity/hash is
+  sealed, and an exact terminate test proves no sibling/PID-reuse or local-fallback effect;
+- background notification support is advertised only after paired/revoked/offline/batched/dead-token and
+  live-end/replay tests prove encrypted minimal payloads, no Attention resolution and no late resurrection.
+  The notification-only service package/socket manifest is scanned at runtime and must expose zero public
+  listener or inbound port; remote GUI helpers cannot be smuggled into that mode;
+- New/Open/Clone/SSH onboarding in the package is cancelled/crashed at every phase and reconciles one exact
+  preassigned operation without duplicate clone or implicit publish. Local/generated Node and Group naming
+  proves revision/redaction/manual pinning and sends no provider/terminal rename; and
+- the release commit passes the exact 84-row neutral capability ledger plus 152 PRD/ACP trace and adversarial
+  mutation suite. The recorded authority root and protected repository pin must match the merged commit;
+  deleting, weakening or marking a row unknown cannot be compensated by a product badge or manual smoke.
 
 The release manifest records which of these capabilities passed for each architecture, adapter, provider and
 client class. `unsupported`, `unknown`, stale live-smoke evidence or a missing helper remains visible and

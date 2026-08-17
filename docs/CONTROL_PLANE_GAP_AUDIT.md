@@ -2,14 +2,15 @@
 
 **Audited commit:** `e386f835a3eeced8a46aa60511a58ec8ddfa29b6`  
 **Method:** independent read-only reviews of current domain, daemon, adapters, protocol, store, GUI and
-product documents, followed by cross-checking against the frozen product inventory  
+product documents; two blind source-capability audits; then cross-checking against the frozen 84-row neutral
+capability ledger and product inventory
 **Conclusion:** the v0.1 foundation is real; the complete operator-control-plane product is not implemented
 
 This report exists to prevent specification work from being mistaken for product completion. At the audited
-commit the inventory classifies 4 requirements as baseline, 43 partial, 80 accepted target and 17 in direct
+commit the integrated target inventory classifies 4 requirements as baseline, 43 partial, 88 accepted target and 17 in direct
 conflict with current behavior. `make product-spec-acceptance` reproduces the current count, verifies the
 versioned semantic-hash manifest and proves every row has one proof obligation; it does not turn the latter
-140 rows into implemented features.
+148 rows into implemented features.
 
 ## Critical observed gaps
 
@@ -34,6 +35,12 @@ versioned semantic-hash manifest and proves every row has one proof obligation; 
 | Web content has no interactive isolated counterpart | Resource Web semantics are inert and there is no Browser object with origin, storage, popup/download or reviewed local/loopback policy. | Separate inert WebPreview and isolated Browser Node whose untrusted content has no control authority. |
 | Remote permission handling is all-or-nothing | Companion/full remote cannot answer typed permissions safely; raw PTY input could bypass a superficial deny list. | One exact foreground-issued E2EE response grant, revision fencing and raw-input block at known sensitive interactions; secrets/admin/trust remain local. |
 | Conversation titles and profile activity are underspecified | Read/rename are not distinct capabilities and companion usage/history can lack profile/coverage/freshness truth. | Separate read/rename receipts and per-profile context/quota/activity projections that never invent zero. |
+| Group presentation is one-level and has no complete branch-isolation lifecycle | Existing Group contracts prohibit nesting, while worktree-safe fan-out lacks recursive tree operations, creator provenance, missing-versus-failed inventory and explicit unbind/remove behavior. | Same-Session bounded acyclic Group forest plus separately owned CheckoutScope state projected into the tree; atomic subtree and exact target-bound worktree lifecycle while primary `main` stays free. |
+| Attention has no durable background delivery contract | OS/companion projection language does not define endpoint/grant/outbox/retry/collapse/live-end state or a notification-only host with zero public listener. | Revocable scoped device grants, minimal encrypted subject/revision delivery, monotonic live fences and outbound-only headless mode; delivery never resolves Attention. |
+| RuntimeInventory lacks capacity/accounting truth | Target-wide handles/survivors exist in the accepted target, but host used/total/swap/pressure, reuse-safe process trees, closed-owner attribution and measured-empty versus failure are absent. | ResourceInventory fields on the same target snapshot, explicit coverage/result state, deduplicated current/closed/unmatched attribution and exact re-probed intervention. |
+| Dedicated/provider support denominator is incomplete | The previous target named four adapters plus generic/custom and did not distinguish quota-only providers or configurable model routes from AccountProfile/RuntimeEndpoint. | Six dedicated adapters under all 22 common cells, Kimi/MiniMax quota-only connectors and separate target-bound ModelEndpointProfiles with secret refs, discovery and no fallback. |
+| Workspace onboarding and safe names are implicit ergonomics | Setup mentions integration diagnostics but not closed new/open/clone/SSH partial-effect recovery; local generated terminal/Group names lack source/revision/redaction/pinning. | One resumable WorkspaceOnboarding state machine with publish separated, plus bounded DisplayNameFact/NameProposal that cannot alter identity/provider title/input. |
+| Selective gap prose has no frozen denominator | A capability omitted from both requirement and oracle was previously indistinguishable from a deliberate product boundary. | An 84-row neutral snapshot/evidence ledger with adopted/adapted/rejected/irrelevant disposition and PRD/ACP/ADR trace; deletion, unknown, weakening or broken evidence fails the gate. |
 
 ## What the integrated specification now closes
 
@@ -53,6 +60,12 @@ versioned semantic-hash manifest and proves every row has one proof obligation; 
 - ADR-064 adds separately falsifiable foreground Session activation, external WorkItemSource, provider-native
   jobs, ConversationInventory, WebPreview/Browser, title read/rename, delegated typed remote permission and
   profile-scoped companion activity contracts rather than hiding them inside broad feature rows.
+- ADR-065 adds recursive Groups/CheckoutScopes, closed Workspace onboarding, six-adapter and quota-connector
+  parity, ModelEndpointProfile, ResourceInventory capacity/accounting, safe name proposals and background
+  Attention delivery; each has an independent requirement and oracle.
+- `PRODUCT_CAPABILITY_COVERAGE_V1.tsv` freezes 84 source-capability dispositions with per-locator evidence
+  digests and an opaque source/tree digest. Its schema/count/sequence/links/evidence are machine-checked, so a
+  future audit has a visible denominator rather than a selective narrative.
 - Every frozen requirement maps one-to-one to an acceptance oracle, including every named cross-feature journey.
 - CI requires an out-of-band authority pin and runs traceability plus adversarial mutations. Paired deletion,
   fully co-edited deletion/weakening, origin swaps, requirement/oracle weakening, malformed cells and dirty,
@@ -85,6 +98,6 @@ git grep -nE 'ACP-[A-Z]+-[0-9]{3}' -- docs/CONTROL_PLANE_ACCEPTANCE.md
 git status --short
 ```
 
-The first command must report 144 requirements, 144 proof obligations, the exact manifest revision and the
+The first command must report 152 requirements, 152 proof obligations, the exact manifest revision and the
 honest current-state distribution above. The last command is included so an audit records the exact tree
 whose claims it evaluated.

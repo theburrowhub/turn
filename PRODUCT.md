@@ -42,7 +42,7 @@ an approval bot: Attention remains the single interruption authority and grants 
 revocable. The complete target is `docs/OPERATOR_CONTROL_PLANE.md`.
 
 Turn is not an agent, not a model client, and not a chat interface. It supervises the agent CLIs the
-user already installs and pays for — Claude Code, Codex CLI, Gemini CLI, OpenCode, and any other interactive
+user already installs and pays for — Claude Code, Codex CLI, Gemini CLI, OpenCode, GitHub Copilot, Grok and any other interactive
 terminal program — as they exist today, without asking their vendors for anything.
 
 ---
@@ -851,7 +851,9 @@ These are accepted requirements, not claims about the current build. The authori
 `docs/OPERATOR_CONTROL_PLANE.md`; the frozen ledger in `docs/PRODUCT_REQUIREMENTS.md` distinguishes the
 implemented baseline, partial behavior, accepted target and current contradictions. Its one-to-one proof
 matrix is `docs/CONTROL_PLANE_ACCEPTANCE.md`, and a versioned semantic-hash manifest prevents paired rows
-from disappearing silently. The detailed Agent/context and voice contracts remain normative.
+from disappearing silently. `docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv` fixes the audited capability denominator
+and disposition so an omitted source feature cannot disappear behind that matrix. The detailed Agent/context
+and voice contracts remain normative.
 
 - [ ] **One canonical tree and one unique WorkSurface view per node.** Agents, nested subagents, processes,
   tools, Teams, Flows and resources keep distinct stable identities; derived search/board views never create
@@ -859,16 +861,22 @@ from disappearing silently. The detailed Agent/context and voice contracts remai
   revisioned Node metadata and cannot drive runtime, dependency or Attention state implicitly. External
   WorkItemSources retain stable source/item identity, bounded paged sync/cache, field mappings, trust and
   freshness; their writes use compare-and-swap and preserve conflicts under source rate limits.
+  Groups may nest to the bounded protocol depth with atomic cycle-safe subtree operations. They may project a
+  separately owned CheckoutScope for agent-per-branch work without becoming runtime/repository authority or
+  changing an existing process cwd merely because its row moved.
 - [ ] **Fast creation and reusable execution Flows.** One catalog drives Workspace `+`, toolbar, palette and
   context actions; resumable setup discovers integrations; one operation can preflight and create a typed
   multi-agent/tool run with safe defaults and the fixed common-path interaction budgets. One foreground
   Session activation safely materialises eligible saved runtimes or a default Shell with no extra start
-  interaction; every unresolved, unsafe, remote/offline or ambiguous case fails closed before spawn.
+  interaction; every unresolved, unsafe, remote/offline or ambiguous case fails closed before spawn. The same
+  catalog provides resumable New/Open/Clone/SSH Workspace onboarding, while publish is always a separate exact
+  foreground operation with partial-effect recovery.
 - [ ] **Bounded delegated control.** An operator-reviewed grant lets conductors fan out agents, worktrees,
   context, messages, dependencies, typed Resource revisions and ProgressUpdates asynchronously without
   repeated prompts, but never self-expand, delete/reparent, mutate a referenced file,
   approve permissions, occupy the primary `main` checkout or treat output as a command.
-- [ ] **Provider-neutral durable topology.** Claude Code, Codex, Gemini, OpenCode and future/custom adapters
+- [ ] **Provider-neutral durable topology.** Claude Code, Codex, Gemini, OpenCode, GitHub Copilot, Grok and
+  future/custom adapters
   translate into one child/lifecycle/capability contract with source epochs, snapshots/deltas, gap/resync and
   the canonical two-dimensional state reducer. Confirmed zero requires closed coverage; partial observation,
   unavailable, unsupported and stale remain visibly different and backed by independent fixture plus live evidence.
@@ -878,14 +886,21 @@ from disappearing silently. The detailed Agent/context and voice contracts remai
   advertised discovery/control capabilities; dismissal of their activity never deletes or cancels them.
   Reading a provider title and renaming a provider conversation are separate capabilities: rename is
   revision-fenced and receipt-backed, while unsupported rename degrades only to an explicit local alias.
+  Kimi and MiniMax are quota/activity connectors with the same AccountProfile scope but no inherited launch,
+  transcript or control authority. ModelEndpointProfiles separately provide target-bound BYO endpoint/model
+  routing, bounded discovery and secret references whose exact revision is frozen into each launch/switch.
 - [ ] **Exact Attention is still the product's centre.** Every permission, question, failure and unread result
   routes in one interaction to its semantic subject and verified action owner; navigation, read,
-  acknowledgement, submission and resolution remain independent.
+  acknowledgement, submission and resolution remain independent. Revocable encrypted background delivery and
+  monotonic live status project that same demand while the UI is absent; gateway acceptance/failure never
+  resolves work, and notification-only hosts expose no public listener.
 - [ ] **Durable lifecycle and execution targets.** AgentInstance, RuntimeAttempt, provider conversation,
   process, PTY and views remain separate; warm reattach, cold reconstruction, resume, restart, switch, branch,
   local/remote execution and uncertain effects state their exact guarantees without fallback. Target-wide
   inventory exposes unmatched/orphaned handles without inventing Nodes and scopes adopt/ignore/terminate to
-  one exact target+handle+generation.
+  one exact target+handle+generation. Its ResourceInventory extension reports host memory/swap/pressure and
+  reuse-safe process-tree attribution to current/closed owners and unmatched survivors, distinguishing error,
+  partial, measured empty and true zero.
 - [ ] **The primary `main` checkout is always operator-only.** Every direct, Template, Flow, foreground,
   background and lifecycle writer uses a dedicated worktree; legacy MainCheckout is migration-only and
   release proof requires zero Turn-owned primary leases, processes or secondary branch locks.
@@ -899,7 +914,9 @@ from disappearing silently. The detailed Agent/context and voice contracts remai
   worktree, context, provider quota, resources, status age and integration diagnostics distinguish unknown,
   unsupported, stale and failed without exposing secrets. AccountProfile create/adopt/external-auth/validate/
   default/retire/delete keeps isolated roots, and each LaunchReceipt freezes the effective profile so a
-  default change never migrates active work.
+  default change never migrates active work. Local display-name facts and bounded generated proposals retain
+  source/confidence/revision; a manual pin survives reconnect/provider changes and never invokes provider
+  rename or terminal input.
 - [ ] **Terminal tools, resources and remote/companion surfaces remain first-class.** Shells, TUIs, services,
   logs, explorer/source control, files, diffs, web/media and authenticated remote/companion projections share the
   hierarchy and exact target/checkout boundaries without being disguised as agents. Runtime, file and

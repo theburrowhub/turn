@@ -88,8 +88,17 @@ Implemented today:
 
 The frozen operator-control-plane specification additionally requires:
 
+- recursive, cycle-safe Groups whose rows may project a separately owned CheckoutScope for agent-per-branch
+  work without making presentation a runtime/repository authority;
+- one resumable New/Open/Clone/SSH Workspace onboarding path with exact partial-effect recovery and publish
+  kept as a distinct foreground operation;
+- six dedicated adapters—Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok—under the same
+  capability/evidence matrix, plus quota-only Kimi and MiniMax connectors;
+- target-bound ModelEndpointProfiles for BYO endpoint/model routing, bounded discovery and secret references
+  with no silent provider/model/account/local fallback;
 - shared provider RuntimeEndpoints with independently owned, isolated instance/conversation bindings;
-- target-wide recovery inventory for known, unmatched and surviving runtimes with exact reconciliation;
+- target-wide recovery inventory for known, unmatched and surviving runtimes with exact reconciliation, host
+  RAM/swap/pressure and reuse-safe process-tree attribution that never turns collection failure into zero;
 - revisioned board/work-item metadata projected from canonical Node ids;
 - bounded delegated Resource Node revisions and typed ProgressUpdates with receipts;
 - pinned or explicitly reviewed live Note briefs as ContextLink sources;
@@ -104,11 +113,17 @@ The frozen operator-control-plane specification additionally requires:
 - distinct inert WebPreview and isolated interactive Browser Nodes, including reviewed local-content access;
 - revision-fenced encrypted permission responses from an explicitly granted remote/companion client, while
   credentials and administration remain local; and
+- revocable encrypted background Attention delivery plus monotonic live status, with failure never resolving
+  work and notification-only hosts opening no public listener;
+- bounded local display-name proposals with source/revision/redaction and manual pinning, never provider rename
+  or terminal input; and
 - bounded per-profile companion projections for usage, context and the canonical activity inbox, with
   source, coverage and freshness that never render unknown as zero.
 
 These are accepted requirements and proof obligations, not claims about the current executable. See
-[docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
+[docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md). The audited denominator is frozen separately in
+[docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv](docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv), so an omitted capability
+cannot be hidden by deleting both a requirement and its test.
 
 The functional v0.1.0 baseline is complete and reproducible with `make mvp-acceptance`;
 see [docs/MVP_ACCEPTANCE.md](docs/MVP_ACCEPTANCE.md) for the evidence map and explicit scope.
