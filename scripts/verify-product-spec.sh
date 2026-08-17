@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+requirements="$repo_root/docs/PRODUCT_REQUIREMENTS.md"
+acceptance="$repo_root/docs/CONTROL_PLANE_ACCEPTANCE.md"
+contract="$repo_root/docs/OPERATOR_CONTROL_PLANE.md"
+gap_audit="$repo_root/docs/CONTROL_PLANE_GAP_AUDIT.md"
+manifest="$repo_root/docs/PRODUCT_REQUIREMENTS_V1.manifest"
+authority="$repo_root/docs/PRODUCT_SPEC_V1.authority"
+authority_pin="$repo_root/docs/PRODUCT_SPEC_V1.sha256"
+decisions="$repo_root/DECISIONS.md"
+mode=${1:-verify}
+
+expected_requirement_count=136
+expected_acceptance_count=136
+
+die() {
+  code=$1
+  shift
+  echo "product-spec-acceptance: $code: $*" >&2
+  exit 1
+}
+
+hash_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    die E_HASH_TOOL "sha256sum or shasum is required"
+  fi
+}
+
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die E_HASH_TOOL "sha256sum or shasum is required"
+  fi
+}
+
+normative_paths() {
+  printf '%s\n' \
+    README.md \
+    PRODUCT.md \
+    ARCHITECTURE.md \
+    Makefile \
+    ROADMAP.md \
+    .github/workflows/ci.yml \
+    docs/ACCESSIBILITY_ACCEPTANCE.md \
+    docs/ADAPTER_ACCEPTANCE.md \
+    docs/AGENT_NODE_VIEWS_AND_CONTEXT.md \
+    docs/ATTENTION_ACCEPTANCE.md \
+    docs/CONTROL_PLANE_ACCEPTANCE.md \
+    docs/CONTROL_PLANE_GAP_AUDIT.md \
+    docs/INSPECTOR_ACCEPTANCE.md \
+    docs/LIFECYCLE_ACCEPTANCE.md \
+    docs/LOCAL_VOICE_INPUT.md \
+    docs/MVP_ACCEPTANCE.md \
+    docs/OPERATOR_CONTROL_PLANE.md \
+    docs/PERFORMANCE.md \
+    docs/PRIVACY.md \
+    docs/PRODUCT_IMPLEMENTATION_EVIDENCE.md \
+    docs/PRODUCT_REQUIREMENTS.md \
+    docs/PROTOCOL.md \
+    docs/RELEASE.md \
+    docs/REVIEWER_ACCEPTANCE.md \
+    docs/SECURITY.md \
+    docs/TEMPLATE_ACCEPTANCE.md \
+    docs/TERMINAL_ACCEPTANCE.md \
+    docs/UNIFIED_HIERARCHY_UPGRADE.md \
+    scripts/test-product-spec-gate.sh \
+    scripts/verify-product-completion.sh \
+    scripts/verify-product-spec.sh
+}
+
+origin_for_id() {
+  case "$1" in
+    PRD-VIE-011|PRD-FLW-012|PRD-ADP-010|PRD-LIF-008|PRD-RUN-010|PRD-CTX-012|PRD-OBS-008|PRD-SCL-009)
+      printf '%s\n' ADR-063
+      ;;
+    PRD-VOI-*) printf '%s\n' ADR-060 ;;
+    PRD-OUT-*|PRD-CRE-*|PRD-FLW-*|PRD-SCL-*) printf '%s\n' ADR-061 ;;
+    PRD-TOP-*|PRD-ADP-*) printf '%s\n' ADR-062 ;;
+    PRD-HIE-*|PRD-VIE-*|PRD-LIF-*|PRD-RUN-*|PRD-CTX-*|PRD-OBS-*|PRD-ATT-*|PRD-SAF-*)
+      printf '%s\n' ADR-059
+      ;;
+    *) die E_ORIGIN "no originating decision rule for $1" ;;
+  esac
+}
+
+redacted_requirement_hash() {
+  awk -F '|' 'BEGIN { OFS="|" }
+    /^\| `PRD-[A-Z]+-[0-9][0-9][0-9]` / {
+      if (NF != 7) exit 91
+      $5=" <STATUS> "
+    }
+    { print }
+  ' "$1" | hash_stream
+}
+
+decision_section_hash() {
+  decision=$1
+  awk -v heading="## $decision " '
+    index($0, heading) == 1 { active=1 }
+    active && seen && /^## ADR-[0-9][0-9][0-9] / { exit }
+    active { print; seen=1 }
+  ' "$decisions" | hash_stream
+}
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/turn-product-spec.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+
+if [[ "$mode" == verify || "$mode" == --verify-local ]]; then
+  [[ -f "$authority" && ! -L "$authority" ]] || die E_AUTHORITY_MISSING "authority root is missing or not a regular file"
+  [[ -f "$authority_pin" && ! -L "$authority_pin" ]] || die E_AUTHORITY_PIN "authority pin is missing or not a regular file"
+  expected_authority_sha256=$(tr -d '[:space:]' <"$authority_pin")
+  actual_authority_sha256=$(hash_file "$authority")
+  [[ "$expected_authority_sha256" =~ ^[0-9a-f]{64}$ ]] || die E_AUTHORITY_PIN "verifier has no valid frozen authority hash"
+  [[ "$actual_authority_sha256" == "$expected_authority_sha256" ]] || die E_AUTHORITY_HASH "authority root hash differs from the frozen verifier pin"
+  if [[ "$mode" == verify ]]; then
+    [[ "${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+      die E_AUTHORITY_CI_PIN "a protected external authority pin is required"
+    [[ "$TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256" == "$expected_authority_sha256" ]] ||
+      die E_AUTHORITY_CI_PIN "external authority pin differs from repository pin"
+  elif [[ -n "${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" &&
+          "$TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256" != "$expected_authority_sha256" ]]; then
+    die E_AUTHORITY_CI_PIN "supplied external authority pin differs from repository pin"
+  fi
+fi
+
+for required_file in "$requirements" "$acceptance" "$contract" "$gap_audit" "$manifest" "$decisions"; do
+  [[ -s "$required_file" && ! -L "$required_file" ]] || die E_REQUIRED_FILE "missing, empty or symlinked ${required_file#$repo_root/}"
+done
+
+if ! awk -F '|' -v pairs="$scratch/requirement-pairs" -v statuses="$scratch/statuses" \
+  -v canonical="$scratch/requirement-canonical" -v ids="$scratch/requirements" '
+  /^\| Requirement \| Normative outcome \| Contract \| Current \| Acceptance \|[[:space:]]*$/ {
+    in_table=1; tables++; next
+  }
+  in_table && /^\| --- \| --- \| --- \| --- \| --- \|[[:space:]]*$/ { next }
+  in_table && /^\|/ {
+    if ($0 ~ /\\\|/) {
+      print "product-spec-acceptance: E_TABLE_ESCAPE: escaped pipe in requirement row at line " FNR > "/dev/stderr"
+      bad=1; next
+    }
+    if (NF != 7 || $2 !~ /^ `PRD-[A-Z]+-[0-9][0-9][0-9]` $/) {
+      print "product-spec-acceptance: E_TABLE_PARSE: malformed or unrecognised requirement row at line " FNR > "/dev/stderr"
+      bad=1; next
+    }
+    id=$2; outcome=$3; contract=$4; status=$5; acceptance=$6
+    gsub(/[ `]/, "", id); gsub(/[ `]/, "", acceptance)
+    gsub(/^ +| +$/, "", outcome); gsub(/^ +| +$/, "", contract); gsub(/^ +| +$/, "", status)
+    if (outcome == "" || contract == "" || acceptance == "") {
+      print "product-spec-acceptance: E_TABLE_PARSE: incomplete requirement " id > "/dev/stderr"; bad=1
+    }
+    if (status != "baseline" && status != "partial" && status != "target" && status != "conflict" && status != "implemented") {
+      print "product-spec-acceptance: E_STATUS: invalid current status for " id > "/dev/stderr"; bad=1
+    }
+    print id > ids
+    print id " " acceptance > pairs
+    print status > statuses
+    print id "\t" acceptance "\t" outcome "\t" contract > canonical
+    next
+  }
+  in_table { in_table=0 }
+  END {
+    if (tables == 0) {
+      print "product-spec-acceptance: E_TABLE_PARSE: no requirement tables found" > "/dev/stderr"; bad=1
+    }
+    exit bad
+  }
+' "$requirements"; then
+  exit 1
+fi
+
+if ! awk -F '|' -v canonical="$scratch/acceptance-canonical" -v pairs="$scratch/acceptance-pairs" '
+  /^\| Acceptance \| Requirement \| Evidence \| Passing oracle \|[[:space:]]*$/ {
+    in_table=1; tables++; next
+  }
+  in_table && /^\| --- \| --- \| --- \| --- \|[[:space:]]*$/ { next }
+  in_table && /^\|/ {
+    if ($0 ~ /\\\|/) {
+      print "product-spec-acceptance: E_TABLE_ESCAPE: escaped pipe in acceptance row at line " FNR > "/dev/stderr"
+      bad=1; next
+    }
+    if (NF != 6 || $2 !~ /^ `ACP-[A-Z]+-[0-9][0-9][0-9]` $/ ||
+        $3 !~ /^ `PRD-[A-Z]+-[0-9][0-9][0-9]` $/) {
+      print "product-spec-acceptance: E_TABLE_PARSE: malformed or unrecognised acceptance row at line " FNR > "/dev/stderr"
+      bad=1; next
+    }
+    acceptance=$2; requirement=$3; evidence=$4; oracle=$5
+    gsub(/[ `]/, "", acceptance); gsub(/[ `]/, "", requirement)
+    gsub(/^ +| +$/, "", evidence); gsub(/^ +| +$/, "", oracle)
+    if (evidence == "" || oracle == "") {
+      print "product-spec-acceptance: E_TABLE_PARSE: incomplete acceptance " acceptance > "/dev/stderr"; bad=1
+    }
+    print acceptance " " requirement > pairs
+    print acceptance "\t" requirement "\t" evidence "\t" oracle > canonical
+    next
+  }
+  in_table { in_table=0 }
+  END {
+    if (tables == 0) {
+      print "product-spec-acceptance: E_TABLE_PARSE: no acceptance tables found" > "/dev/stderr"; bad=1
+    }
+    exit bad
+  }
+' "$acceptance"; then
+  exit 1
+fi
+
+[[ -s "$scratch/requirements" && -s "$scratch/acceptance-pairs" ]] || die E_EMPTY_INVENTORY "requirement or acceptance inventory is empty"
+
+sort "$scratch/requirements" | uniq -d >"$scratch/duplicate-requirements"
+cut -d ' ' -f1 "$scratch/acceptance-pairs" | sort | uniq -d >"$scratch/duplicate-acceptance"
+cut -d ' ' -f2 "$scratch/acceptance-pairs" | sort | uniq -d >"$scratch/duplicate-mappings"
+for duplicate_file in duplicate-requirements duplicate-acceptance duplicate-mappings; do
+  [[ ! -s "$scratch/$duplicate_file" ]] || die E_DUPLICATE "duplicate ids in $duplicate_file"
+done
+
+sort -u "$scratch/requirements" >"$scratch/requirements-sorted"
+cut -d ' ' -f2 "$scratch/acceptance-pairs" | sort -u >"$scratch/mapped-sorted"
+diff -u "$scratch/requirements-sorted" "$scratch/mapped-sorted" >"$scratch/unmatched" ||
+  die E_PAIR_SET "requirement and acceptance sets differ"
+
+awk '
+  {
+    acceptance=$1; requirement=$2
+    sub(/^ACP-/, "", acceptance); sub(/^PRD-/, "", requirement)
+    if (acceptance != requirement) {
+      print "product-spec-acceptance: E_PAIR_ID: mismatched pair " $1 " -> " $2 > "/dev/stderr"; bad=1
+    }
+  }
+  END { exit bad }
+' "$scratch/acceptance-pairs"
+
+awk '
+  {
+    requirement=$1; acceptance=$2
+    sub(/^PRD-/, "", requirement); sub(/^ACP-/, "", acceptance)
+    if (requirement != acceptance) {
+      print "product-spec-acceptance: E_PAIR_ID: inventory points to mismatched proof " $1 " -> " $2 > "/dev/stderr"; bad=1
+    }
+  }
+  END { exit bad }
+' "$scratch/requirement-pairs"
+
+cut -d ' ' -f2 "$scratch/requirement-pairs" | sort -u >"$scratch/inventory-acceptance"
+cut -d ' ' -f1 "$scratch/acceptance-pairs" | sort -u >"$scratch/acceptance-ids"
+diff -u "$scratch/inventory-acceptance" "$scratch/acceptance-ids" >/dev/null ||
+  die E_PAIR_SET "inventory acceptance links and proof ids differ"
+
+requirement_count=$(wc -l <"$scratch/requirements" | tr -d ' ')
+acceptance_count=$(wc -l <"$scratch/acceptance-pairs" | tr -d ' ')
+[[ "$requirement_count" == "$expected_requirement_count" ]] || die E_REQUIREMENT_COUNT "expected $expected_requirement_count requirements, found $requirement_count"
+[[ "$acceptance_count" == "$expected_acceptance_count" ]] || die E_ACCEPTANCE_COUNT "expected $expected_acceptance_count acceptances, found $acceptance_count"
+
+cut -d '-' -f2 "$scratch/requirements" | sort -u >"$scratch/categories"
+cat >"$scratch/expected-categories" <<'EOF'
+ADP
+ATT
+CRE
+CTX
+FLW
+HIE
+LIF
+OBS
+OUT
+RUN
+SAF
+SCL
+TOP
+VIE
+VOI
+EOF
+diff -u "$scratch/expected-categories" "$scratch/categories" >/dev/null ||
+  die E_CATEGORY_SET "capability category set changed"
+
+while IFS=$'\t' read -r id acceptance_id outcome contract_ref; do
+  digest=$(printf '%s' "$id|$outcome|$contract_ref|$acceptance_id" | hash_stream)
+  printf '%s\t%s\t%s\n' "$id" "$acceptance_id" "$digest"
+done <"$scratch/requirement-canonical" >"$scratch/requirement-hashes"
+
+while IFS=$'\t' read -r acceptance_id requirement_id evidence oracle; do
+  digest=$(printf '%s' "$acceptance_id|$requirement_id|$evidence|$oracle" | hash_stream)
+  printf '%s\t%s\t%s\n' "$acceptance_id" "$requirement_id" "$digest"
+done <"$scratch/acceptance-canonical" >"$scratch/acceptance-hashes"
+
+awk -F '\t' '
+  NR == FNR { oracle_hash[$1]=$3; next }
+  {
+    if (!($2 in oracle_hash)) {
+      print "product-spec-acceptance: E_MANIFEST_CONTENT: no oracle hash for " $2 > "/dev/stderr"; bad=1
+    }
+    print "v1|" $1 "|" $2 "|" $3 "|" oracle_hash[$2]
+  }
+  END { exit bad }
+' "$scratch/acceptance-hashes" "$scratch/requirement-hashes" | sort >"$scratch/generated-manifest"
+
+emit_manifest() {
+  printf '%s\n' '# manifest-version: 1'
+  printf '%s\n' '# Format: version|requirement|acceptance|requirement-sha256|oracle-sha256|originating-decision'
+  printf '%s\n' '# Hash inputs exclude mutable implementation status but include ids, normative outcome/contract and evidence/oracle.'
+  while IFS='|' read -r version id acceptance_id requirement_hash oracle_hash; do
+    origin=$(origin_for_id "$id")
+    printf '%s|%s|%s|%s|%s|%s\n' "$version" "$id" "$acceptance_id" "$requirement_hash" "$oracle_hash" "$origin"
+  done <"$scratch/generated-manifest"
+}
+
+if [[ "$mode" == --emit-manifest ]]; then
+  emit_manifest
+  exit 0
+fi
+
+grep -Fxq '# manifest-version: 1' "$manifest" || die E_MANIFEST_VERSION "unsupported or missing manifest version"
+if ! awk -F '|' -v projected="$scratch/manifest-projected" -v origins="$scratch/manifest-origins" '
+  /^#/ || /^$/ { next }
+  {
+    if (NF != 6 || $1 != "v1" || $2 !~ /^PRD-[A-Z]+-[0-9][0-9][0-9]$/ ||
+        $3 !~ /^ACP-[A-Z]+-[0-9][0-9][0-9]$/ || length($4) != 64 || $4 !~ /^[0-9a-f]+$/ ||
+        length($5) != 64 || $5 !~ /^[0-9a-f]+$/ || $6 !~ /^ADR-[0-9][0-9][0-9]$/) {
+      print "product-spec-acceptance: E_MANIFEST_PARSE: malformed manifest row: " $0 > "/dev/stderr"; bad=1
+    }
+    print $1 "|" $2 "|" $3 "|" $4 "|" $5 > projected
+    print $2 "\t" $6 > origins
+  }
+  END { exit bad }
+' "$manifest"; then
+  exit 1
+fi
+
+cut -f1 "$scratch/manifest-origins" | sort | uniq -d >"$scratch/manifest-duplicate-requirements"
+[[ ! -s "$scratch/manifest-duplicate-requirements" ]] || die E_MANIFEST_DUPLICATE "duplicate manifest requirement identity"
+sort -u "$scratch/manifest-projected" -o "$scratch/manifest-projected"
+diff -u "$scratch/manifest-projected" "$scratch/generated-manifest" >/dev/null ||
+  die E_MANIFEST_CONTENT "frozen requirement/oracle manifest differs"
+
+while IFS=$'\t' read -r id decision; do
+  expected_decision=$(origin_for_id "$id")
+  [[ "$decision" == "$expected_decision" ]] ||
+    die E_ORIGIN "$id declares $decision but the frozen origin rule requires $expected_decision"
+done <"$scratch/manifest-origins"
+
+emit_authority() {
+  printf 'schema\t1\n'
+  printf 'count\trequirements\t%s\n' "$expected_requirement_count"
+  printf 'count\tacceptance\t%s\n' "$expected_acceptance_count"
+  printf 'file\traw\tdocs/PRODUCT_REQUIREMENTS_V1.manifest\t%s\n' "$(hash_file "$manifest")"
+  while IFS= read -r path; do
+    if [[ "$path" == docs/PRODUCT_REQUIREMENTS.md ]]; then
+      digest=$(redacted_requirement_hash "$repo_root/$path")
+      format=status-redacted-v1
+    else
+      digest=$(hash_file "$repo_root/$path")
+      format=raw
+    fi
+    printf 'file\t%s\t%s\t%s\n' "$format" "$path" "$digest"
+  done < <(normative_paths)
+  for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063; do
+    printf 'section\t%s\tDECISIONS.md\t%s\n' "$decision" "$(decision_section_hash "$decision")"
+  done
+  sort "$scratch/manifest-origins" | while IFS=$'\t' read -r id decision; do
+    printf 'origin\t%s\t%s\n' "$id" "$decision"
+  done
+}
+
+if [[ "$mode" == --emit-authority ]]; then
+  emit_authority
+  exit 0
+fi
+
+[[ "$mode" == verify || "$mode" == --verify-local ]] ||
+  die E_USAGE "usage: verify-product-spec.sh [verify|--verify-local|--emit-manifest|--emit-authority]"
+
+if ! git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die E_GIT "repository identity is unavailable"
+fi
+
+{
+  normative_paths
+  printf '%s\n' \
+    DECISIONS.md \
+    docs/PRODUCT_REQUIREMENTS_V1.manifest \
+    docs/PRODUCT_SPEC_V1.authority \
+    docs/PRODUCT_SPEC_V1.sha256
+} | sort -u >"$scratch/tracked-authority-paths"
+
+while IFS= read -r path; do
+  [[ -f "$repo_root/$path" && ! -L "$repo_root/$path" ]] || die E_AUTHORITY_FILE "authority path is missing, non-regular or symlinked: $path"
+  git -C "$repo_root" ls-files --error-unmatch -- "$path" >/dev/null 2>&1 || die E_UNTRACKED_AUTHORITY "authority path is not tracked: $path"
+  git -C "$repo_root" diff --quiet HEAD -- "$path" || die E_DIRTY_AUTHORITY "authority path differs from HEAD: $path"
+done <"$scratch/tracked-authority-paths"
+
+emit_authority >"$scratch/generated-authority"
+diff -u "$authority" "$scratch/generated-authority" >/dev/null ||
+  die E_AUTHORITY_CONTENT "authority root does not match current normative files"
+
+awk -F '\t' '$1 == "origin" { print $2 "\t" $3 }' "$authority" | sort >"$scratch/authority-origins"
+sort "$scratch/manifest-origins" >"$scratch/sorted-manifest-origins"
+diff -u "$scratch/authority-origins" "$scratch/sorted-manifest-origins" >/dev/null ||
+  die E_ORIGIN "manifest decisions differ from frozen requirement origins"
+
+for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063; do
+  section="$scratch/$decision.section"
+  awk -v heading="## $decision " '
+    index($0, heading) == 1 { active=1 }
+    active && seen && /^## ADR-[0-9][0-9][0-9] / { exit }
+    active { print; seen=1 }
+  ' "$decisions" >"$section"
+  [[ -s "$section" ]] || die E_DECISION "missing $decision"
+  grep -Fq '**Status:** Accepted' "$section" || die E_DECISION "decision is not accepted: $decision"
+done
+
+awk -F '\t' '$1 == "file" { print $3 }' "$authority" | sort -u >"$scratch/authority-file-paths"
+grep -o '`[^`]*\.md`' "$scratch/requirement-canonical" | tr -d '`' | sort -u >"$scratch/contract-doc-refs" || true
+while IFS= read -r ref; do
+  [[ -n "$ref" ]] || continue
+  if [[ -f "$repo_root/$ref" ]]; then
+    resolved=$ref
+  elif [[ -f "$repo_root/docs/$ref" ]]; then
+    resolved="docs/$ref"
+  else
+    die E_CONTRACT_REFERENCE "missing referenced contract $ref"
+  fi
+  grep -Fxq "$resolved" "$scratch/authority-file-paths" || die E_AUTHORITY_CLOSURE "referenced contract is outside authority root: $resolved"
+done <"$scratch/contract-doc-refs"
+
+grep -Fq '**Status:** accepted post-v0.1 product contract' "$contract" ||
+  die E_CONTRACT_STATUS "master contract must state accepted target status"
+grep -Fq '**Implementation status:** mixed; this file is not a claim that the target is built' "$requirements" ||
+  die E_INVENTORY_STATUS "inventory must distinguish specification from implementation"
+if grep -En '(^|[^[:alnum:]_])(TODO|TBD|FIXME)([^[:alnum:]_]|$)' "$contract" "$requirements" "$acceptance" "$gap_audit"; then
+  die E_PLACEHOLDER "unresolved placeholder in normative product specification"
+fi
+
+category_count=$(wc -l <"$scratch/categories" | tr -d ' ')
+status_summary=$(sort "$scratch/statuses" | uniq -c | awk '{printf "%s%s=%s", separator, $2, $1; separator=", "}')
+echo "product-spec-acceptance: authority $expected_authority_sha256, manifest v1, ${requirement_count} requirements, ${acceptance_count} proof obligations, ${category_count} categories (${status_summary})"

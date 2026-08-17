@@ -47,6 +47,8 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 
 - **Claude Code** — structured hooks plus terminal/process observation.
 - **OpenAI Codex CLI** — structured hooks and notifications, with graceful fallback.
+- **Gemini CLI** — dedicated hook adapter with explicit capability/degradation reporting.
+- **OpenCode** — dedicated plugin/session adapter with explicit capability/degradation reporting.
 - **Other agent CLIs** — run through the generic terminal adapter even without a dedicated integration.
 - **Shells and TUIs** — ordinary interactive processes remain first-class: shells, test runners, servers,
   logs, file explorers, `lazygit`, `btop`, and similar tools.
@@ -69,7 +71,7 @@ Implemented today:
 - Optional contextual inspectors for Workspace, Session, Agent, and Process rows, with safe bounded
   history, readable parent links, confidence labels, runtime facts, and contextual actions.
 - Review-before-send context handoffs between controllable Agents in one Session.
-- Claude Code and Codex adapter infrastructure.
+- Claude Code, Codex, Gemini and OpenCode adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
 - Live font/zoom controls, a measured high-contrast palette, reduced-motion support,
   modal AccessKit semantics, separate state/selection/focus/attention announcements, and
@@ -81,6 +83,22 @@ Implemented today:
 - Automated macOS and Linux builds plus native UI snapshot coverage.
 - A version-checked macOS app bundle, hardened-runtime signing/notarization workflow,
   arm64 and Intel release channels, and an updater that leaves compatible live daemons and PTYs alone.
+
+## Accepted post-v0.1 target — not implemented yet
+
+The frozen operator-control-plane specification additionally requires:
+
+- shared provider RuntimeEndpoints with independently owned, isolated instance/conversation bindings;
+- target-wide recovery inventory for known, unmatched and surviving runtimes with exact reconciliation;
+- revisioned board/work-item metadata projected from canonical Node ids;
+- bounded delegated Resource Node revisions and typed ProgressUpdates with receipts;
+- pinned or explicitly reviewed live Note briefs as ContextLink sources;
+- isolated AccountProfile creation, external authentication, defaults, retirement and deletion;
+- revision-fenced atomic FileBackend editing with truthful conflict recovery; and
+- a full authenticated remote/headless operator surface, distinct from the reduced companion API.
+
+These are accepted requirements and proof obligations, not claims about the current executable. See
+[docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
 
 The functional v0.1.0 baseline is complete and reproducible with `make mvp-acceptance`;
 see [docs/MVP_ACCEPTANCE.md](docs/MVP_ACCEPTANCE.md) for the evidence map and explicit scope.
@@ -165,7 +183,7 @@ Turn is one Rust workspace with a daemon-owned runtime and a thin native client.
 | `turn-gui` | Native `eframe`/`egui` desktop interface rendered through `wgpu` |
 | `turnd` | Authoritative owner of PTYs, Sessions, hierarchy, write leases, and Attention |
 | `turn-pty` | PTY processes, private bounded journals/checkpoints, replay, resize, signals, and supervision |
-| `turn-agents` | Claude Code, Codex, heuristic, and generic terminal adapters |
+| `turn-agents` | Claude Code, Codex, Gemini, OpenCode, heuristic, and generic terminal adapters |
 | `turn-store` | SQLite persistence, migrations, hierarchy records, and secret redaction |
 | `turn-proto` | Versioned daemon/client protocol, requests, events, terminal cells, and view models |
 | `turn-core` | Domain model, process/turn state machines, layouts, events, and Attention policy |
@@ -181,7 +199,8 @@ relationships, permissions, or write authority.
 - Closing a pane never terminates the process behind it.
 - A checkout has at most one active writing Session across every cooperating Turn daemon for the same host user, even when daemons use different data directories or path aliases.
 - Permission prompts show the exact Session, process, command, and working directory available to Turn.
-- Restore never relaunches a process until the user explicitly asks.
+- Restore never launches from metadata or selection; only an explicit operator action or a still-valid,
+  operator-reviewed persisted Flow policy may advance declared work.
 
 See [SECURITY.md](docs/SECURITY.md) for the complete threat model.
 
@@ -207,6 +226,17 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module boundaries, integration levels, security, and performance.
 - [DECISIONS.md](DECISIONS.md) — architectural decision records and their trade-offs.
 - [ROADMAP.md](ROADMAP.md) — milestones, open risks, technical debt, and release work.
+- [Operator control plane](docs/OPERATOR_CONTROL_PLANE.md) — the complete accepted post-v0.1 contract for
+  Flows, provider-neutral topology, views, lifecycle, context, telemetry, Attention, remote runtime and voice.
+- [Product requirement inventory](docs/PRODUCT_REQUIREMENTS.md) — frozen requirements with an honest audited
+  baseline/partial/target/conflict/implemented status for each capability; its versioned semantic-hash
+  manifest makes paired deletion or weakening fail CI.
+- [Control-plane acceptance](docs/CONTROL_PLANE_ACCEPTANCE.md) — one proof obligation per requirement plus
+  cross-feature end-to-end journeys and the completion report contract.
+- [Product implementation evidence](docs/PRODUCT_IMPLEMENTATION_EVIDENCE.md) — deliberately empty until
+  implementation commits supply one reproducible ACP command and immutable artifact record per requirement.
+- [Current control-plane gap audit](docs/CONTROL_PLANE_GAP_AUDIT.md) — evidence-backed baseline/partial/
+  target/conflict findings that keep specification completion separate from product implementation.
 - [Unified hierarchy upgrade](docs/UNIFIED_HIERARCHY_UPGRADE.md) — tree, Agent/Pane separation,
   write leases, previews, and persistence contracts.
 - [Agent node views and context routing](docs/AGENT_NODE_VIEWS_AND_CONTEXT.md) — the accepted post-v0.1

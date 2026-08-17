@@ -10,7 +10,8 @@
 #   * `--all-targets` on lint. Without it, clippy never looks at test code, and
 #     the snapshot tests stop compiling without anyone noticing.
 #
-# `make verify` is what CI runs. If it passes here it passes there.
+# `make verify` is the local umbrella. CI runs the same gates with platform-specific
+# test selection for macOS GPU snapshots and Linux headless coverage.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -41,8 +42,29 @@ help: ## Show this help
 # --- the loop you actually run -----------------------------------------------
 
 .PHONY: verify
-verify: fmt-check lint test ## Everything CI checks, in CI's order
+verify: product-spec-acceptance fmt-check lint test ## Everything CI checks, in CI's order
 	@echo "verify: ok"
+
+.PHONY: product-spec-acceptance
+product-spec-acceptance: ## Verify the frozen semantic inventory, proof mapping and mutation resistance
+	@if [ -n "$${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" ] || [ "$${CI:-}" = true ]; then \
+	  ./scripts/verify-product-spec.sh verify; \
+	else \
+	  ./scripts/verify-product-spec.sh --verify-local; \
+	fi
+	./scripts/test-product-spec-gate.sh
+
+.PHONY: product-completion-acceptance
+product-completion-acceptance: verify ## Require every product requirement to be implemented with evidence
+	./scripts/verify-product-completion.sh
+
+# Every completion proof has one requirement-derived target and one tracked entrypoint.
+# A missing entrypoint is a hard failure; this pattern does not make an unimplemented
+# requirement pass and explicit targets may override it when a proof needs orchestration.
+acp-%:
+	@entrypoint="./scripts/product-acceptance/acp-$*.sh"; \
+	  test -f "$$entrypoint" && test -x "$$entrypoint" || { echo "missing executable $$entrypoint" >&2; exit 1; }; \
+	  "$$entrypoint"
 
 .PHONY: test
 test: ## Run the whole test suite

@@ -23,7 +23,7 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | `turn-store` | Built | reproduce | Append-only migrations, store-wide fences, hierarchy and secure hook cleanup. |
 | `turn-pty` | Built | reproduce | Ptys, buffers, supervision. |
 | `turn-hook` | Built | reproduce | The `turn-hook` helper binary and its library. |
-| `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, heuristics, registry, hook server, risk. |
+| `turn-agents` | Built | reproduce | Adapter trait, Claude Code, Codex, Gemini, OpenCode, heuristics, registry, hook server, risk. |
 | `turnd` | Built | reproduce | Atomic Session/lease lifecycle, PTYs, hierarchy projection and restore vertical. |
 | `turn-gui` | Built for v0.1.0 MVP | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
 
@@ -36,6 +36,11 @@ ADR-060/M15 is likewise an accepted, **not-yet-implemented** local-dictation tar
 sandboxed speech worker, daemon-owned verified model store and memory-only client draft after ADR-059's
 exact input identity exists. Its normative contract is `docs/LOCAL_VOICE_INPUT.md`; no current binary or
 status row claims microphone or speech-model support.
+
+ADR-061/062 extend the accepted target into a complete operator control plane: reusable FlowRuns and bounded
+delegated control, plus one durable provider-neutral topology/capability contract. They are **not yet
+implemented**. `docs/OPERATOR_CONTROL_PLANE.md` is normative; `docs/PRODUCT_REQUIREMENTS.md` records the
+audited current gaps and `docs/CONTROL_PLANE_ACCEPTANCE.md` defines the one-to-one proof obligations.
 
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
 `vitest` and no second lockfile.
@@ -546,7 +551,7 @@ load-bearing (`ROADMAP.md` §Risks 4); it is no longer unverified code.
 
 **Status: built and green in the serial workspace audit; reproduce with `cargo test -p turn-agents`.**
 Modules: `adapter`,
-`claude`, `codex`, `heuristic`, `registry`, `risk`, `server`.
+`claude`, `codex`, `gemini`, `opencode`, `heuristic`, `registry`, `risk`, `server`.
 
 ### 4.1 The adapter contract
 
@@ -583,7 +588,7 @@ rather than pulling in a crate, and it rejects a directory that shares a binary'
 | `GenericTerminal` | Not at all. Turn shows a terminal and knows only what the OS says about the process. | `Supervisor` | `Explicit` about the *process*, never about a turn | Yes, for process facts | `registry::GenericTerminalAdapter` |
 | `Heuristic` | Inferred from terminal output. | `PtyHeuristic` | `InferredHigh` | **No** | `heuristic::HeuristicAdapter` |
 | `Wrapper` | Launched through something Turn controls, which reports lifecycle. | `SideChannel` | `Explicit` | Yes | `codex` degraded to `notify` only |
-| `Structured` | The tool reports events itself over a contract it owns. | `Hook` | `Explicit` | Yes | `claude`, `codex` with hooks |
+| `Structured` | The tool reports events itself over a contract it owns. | `Hook` | `Explicit` | Yes | `claude`, `codex` with hooks, authenticated `gemini`/`opencode` callbacks |
 
 ### 4.3 The Confidence ladder, and why a heuristic can never move focus
 
@@ -688,7 +693,7 @@ exists. **The adapter reports the level it achieved rather than pretending to on
 (`codex::tests::without_hooks_the_launch_degrades_to_notify_and_says_so`, and at contract level
 `tests/contract_codex.rs::without_hook_trust_the_adapter_reports_wrapper_and_says_what_is_missing`).
 
-Both mechanisms are command-based, so Codex reaches Turn only through the `turn-hook` helper (§4.8).
+Both mechanisms are command-based, so Codex reaches Turn only through the `turn-hook` helper (§4.9).
 One detail is a deliberate hedge against an unverified assumption: whether a hook *handler* entry
 accepts an `args` array was read out of the binary's strings but not exercised live, so the callback URL
 travels to the helper in the **`TURN_HOOK_URL` environment variable** — a surface Codex cannot mis-parse.
@@ -703,7 +708,23 @@ alone, with the helper reading `TURN_HOOK_URL` from the environment it inherits,
 Treat "the URL reaches the helper through the environment on both paths" as the intended shape and check
 `crates/turn-agents/src/codex.rs` for where it actually landed.
 
-### 4.6 Heuristic adapter — `Heuristic`
+### 4.6 Gemini CLI and OpenCode adapters — callback-proven `Structured`
+
+Gemini CLI uses its documented command-hook contract from a Turn-owned lowest-precedence settings layer;
+OpenCode uses a fire-and-forget observer in a Turn-owned merged plugin directory. Both leave user/project
+configuration intact and launch with heuristic status until the first authenticated callback proves the
+injected mechanism is actually live. Configuration success alone is not evidence of achieved integration.
+
+Gemini's current adapter reports turn, question/permission, model and external-session evidence but declares
+`subagent_events=false` and `usage_events=false`. OpenCode maps child sessions, turn status, questions,
+permissions, errors and session deletion, but likewise declares no usage events. These are explicit current
+capability gaps, not parity claims. Both expose validated resume arguments, although the v0.1 daemon still
+contains a Claude-only resume guard; ADR-062 requires capability dispatch to remove that contradiction.
+
+Captured contract fixtures and degradation cases live in `docs/ADAPTER_ACCEPTANCE.md`. The accepted target
+adds shared topology/capability fixtures and authenticated live evidence before any richer cell is advertised.
+
+### 4.7 Heuristic adapter — `Heuristic`
 
 Inference from terminal output, for tools with no contract to honour. It is written to know it is the
 weakest tier, and three rules constrain it because the failure each prevents is worse than the
@@ -737,7 +758,10 @@ briefly clears between frames does not produce a stream of started/waiting/start
 detection uses `bytes_seen` rather than diffing screen text. Only the last 12 lines are matched, so a
 resolved permission box does not stay "alive" forever in the scrollback.
 
-### 4.7 Registry — selection that always answers
+Dedicated adapters are ordered before this closed list, so names such as `gemini` and `opencode` reach
+heuristics only when their dedicated integration has degraded or been disabled.
+
+### 4.8 Registry — selection that always answers
 
 One question: given a command line the user typed, which adapter runs it? `AdapterRegistry::select`
 walks the registered adapters strongest-first and falls back to `GenericTerminalAdapter`, because
@@ -758,7 +782,7 @@ than as "unrecognised".
 `GenericTerminalAdapter::handles` returns `false` for everything. Claiming everything would shadow the
 real adapters depending on iteration order; selection reaches the fallback explicitly instead.
 
-### 4.8 Hook server — `server::HookServer`
+### 4.9 Hook server — `server::HookServer`
 
 The loopback endpoint structured adapters point their tools at. Four constraints, all about not being
 in the way of the user's Agent:
@@ -791,7 +815,15 @@ went away.
 `HookStats { accepted, refused, unparsable, dropped, emitted }` is surfaced to the UI. `refused` is the
 interesting one: a non-zero value means something on this machine posted to Turn without a valid token.
 
-### 4.9 Risk assessment
+**Post-v0.1 topology correction.** The bounded/non-blocking rule remains, but an aggregate drop counter is
+not enough to preserve truthful child counts. Every registration owns a source id and observation epoch.
+Dropping a topology-bearing event, losing the receiver, finding a sequence gap or restarting registration
+emits/persists a scoped `gap` before any later exact projection, invalidates that source's complete coverage
+and schedules an asynchronous adapter snapshot/resync. A closed matching snapshot watermark is the only way
+back to exact coverage. Best-effort adapters can add observed children but cannot produce exact zero. The
+hook still answers immediately; it never blocks provider work to protect Turn's telemetry.
+
+### 4.10 Risk assessment
 
 `risk::assess(tool_name, command) -> Risk` rates a pending permission for **display and queue ordering
 only**. It authorises nothing (ADR-024). It errs upward — an unrecognised tool is `Medium`, not `Low` —
@@ -1149,6 +1181,12 @@ selection. Implemented node actions include `GetPreviewHistory`, `SetPreviewVisi
 Lease release carries expected fencing generation; `CreateSession` implicitly requests the main checkout,
 while dedicated read-only/worktree operations express the safe alternatives. No creation path returns a
 partial Session on conflict.
+
+That sentence describes protocol v4 and is an explicit post-v0.1 conflict, not the target default. The
+operator-control-plane architecture removes all new `MainCheckout` worker acquisition: direct, Template,
+Flow, add-node/pane, activation, restore and every lifecycle relaunch must resolve enforced read-only or a
+dedicated worktree before spawning. The legacy lease/table remains decode/reconciliation input only until
+the migration in `docs/OPERATOR_CONTROL_PLANE.md` §7 proves zero Turn-owned primary-path workers/locks.
 `CreateReadOnlySessionFromTemplate` and `CreateWorktreeSessionFromTemplate` keep a failed Template request
 authoritative instead of asking the GUI to reconstruct panes from `TemplateSummary`; absolute primary cwd
 values are mapped repository-relatively for the isolated checkout.
@@ -1412,12 +1450,15 @@ may mark it read. A submitted answer stays pending until adapter evidence confir
 permission, unread-result and runtime lifecycle remain separate; context or quota telemetry cannot move
 focus merely because a percentage crossed a threshold.
 
-Context is another authority graph, not tree ownership. `ContextLink` grants bounded pull access from one
-AgentInstance to another through a separate short-lived, destination/current-attempt-bound broker
-capability—not the administrative socket. `ContextPacket` is a reviewed, redacted one-shot handoff with
-lineage and an evidence-backed delivery state. Branches, short messages, observational dependencies and
-Teams use their own typed edges and cannot grant context, checkout writes, approvals or focus; a dependency
-never starts, advances or retries work. Large node content uses a surface-scoped, revisioned, bounded
+Context is another authority graph, not tree ownership. `ContextLink` grants bounded pull access from a
+tagged source—an AgentInstance or an exact Note Resource revision/policy—to one destination AgentInstance
+through a separate short-lived, destination/current-attempt-bound broker capability—not the administrative
+socket. A live-Note policy fixes reviewed authors, schema, revisions, cumulative budgets and expiry, and every
+read audits the disclosed revision. `ContextPacket` is a reviewed, redacted one-shot handoff with
+lineage and an evidence-backed delivery state. Branches, short messages, dependencies and Teams use their
+own typed edges and cannot grant context, checkout writes, approvals or focus. Outside a FlowRun a dependency
+is observational; ADR-061 permits only an immutable operator-reviewed Flow policy to consume its typed
+result automatically within exact bounds. Large node content uses a surface-scoped, revisioned, bounded
 subscription only for the visible subject so hierarchy snapshots keep their current bounded role.
 
 Foreground-operator authority is enforced by the supported authenticated flow, not by same-uid process
@@ -1475,6 +1516,65 @@ atomic adoption. ADR-057 inventories model files/receipts/partials/settings, whi
 durable category because persistence is forbidden. `docs/LOCAL_VOICE_INPUT.md` is the complete contract.
 
 ---
+
+### 6.6 Accepted operator-control-plane architecture
+
+**Status: accepted, not yet implemented.** ADR-061/062 join creation, orchestration, provider topology,
+runtime continuity, observability, remote/companion clients and scale around the existing daemon boundary.
+The cross-layer ownership is fixed before implementation:
+
+| Layer | New authority and responsibility |
+| --- | --- |
+| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun ids; independent relationship graphs; WorkItemState, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant state machines; normalized topology, lifecycle, observation and Attention invariants. |
+| `turn-agents` | Open adapter registry, capability vocabulary, provider event normalization, launch/control operations, transcript/context/usage sources, shared RuntimeEndpoint bindings isolated by profile/conversation and integration diagnostics. Provider dialects end here. |
+| `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles; process evidence is provisional semantic evidence. |
+| FileBackend / RepositoryBackend | Separately capability-gated local/remote confined file and SCM effects with host/generation/root/revision-bound receipts; FileBackend open/save is revisioned CAS with conflict and zero overwrite; access is never inferred from RuntimeBackend. |
+| `turn-store` | Append-only identities, graph revisions, immutable Flow runs/receipts, non-secret account profiles, endpoint bindings, Resource revisions/provenance, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
+| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces; no provider-specific UI messages. |
+| `turnd` | Single writer and reconciliation authority; preflight/provision sagas; Flow scheduling; adapter/runtime dispatch; exact Attention routing; independent bounded collectors; authoritative multi-client snapshot/journal. |
+| `turn-gui` | One canonical hierarchy and WorkSurface; catalog-driven creation; Agent/Tool/Flow/resource views; derived board and runtime Recovery View; integration/runtime truth; bottom status; no scheduling, provider inference or duplicated business rules. |
+| remote/headless clients | Full capability-negotiated projections over the same snapshot/journal/routes; server policy refuses every desktop-only authority operation. |
+| companions | Reduced closed-action projections of daemon queue/revisions over authenticated encrypted channels; never another state or Attention authority. |
+
+The core event envelope carries operation, Workspace/Session/FlowRun, Node/instance/attempt/generation,
+causal parent/invocation, source/observation epoch, sequence or snapshot watermark, confidence, native and
+daemon revisions, observation time, coverage and typed payload. Adapters may omit unsupported payload fields
+but not identity/trust semantics. Duplicate and reordered events must converge before any projection. A
+complete matching snapshot or gap-free authoritative stream is required for an exact child count; hook drop,
+sequence gap, disconnect/restart or stale heartbeat invalidates it until asynchronous resync. Partial
+coverage is a lower bound and absent coverage is unknown/unsupported rather than zero.
+
+A shared RuntimeEndpoint never becomes semantic identity. Every current binding fixes endpoint generation,
+AccountProfile, host, AgentInstance, RuntimeAttempt and conversation; conversation ownership is unique and
+sibling input, context, transcript cursors and Attention remain isolated. Runtime inventory is target-wide,
+never invents Nodes for unmatched handles and adopts, ignores or terminates only one exact
+target+handle+generation. AccountProfile stores only non-secret identity/external references, isolates auth,
+config, cache and quota roots, and never falls back or migrates active instances after a default change.
+
+Flow provisioning is an idempotent daemon saga. It reserves semantic identity and operation ids before
+external effects, writes each effect receipt, adopts only the preassigned runtime on uncertain response and
+never replays an ambiguous write. Dependencies are evaluated asynchronously from durable result revisions.
+A DelegationGrant is a short-lived scoped capability, not a role label; changing attempt/generation or
+exhausting any budget revokes it. Its closed Resource/Progress variants fix kind, owner, schema, authors,
+revision/byte/rate limits and provenance; they cannot delete/reparent, mutate an underlying file or turn
+content into control. The primary checkout is never a worker target.
+
+Heavy terminal/transcript/log/media data uses revisioned subject subscriptions rather than hierarchy
+snapshots. Collectors are independent per provider/account/host and cannot block selection or input. The
+daemon may coalesce background status; GUI pressure may park renderers but never terminate runtimes. Multiple
+clients receive a generation-keyed snapshot watermark plus strictly sequenced journal, acknowledge applied
+revisions and resnapshot on gap/compaction. Object-specific conflicts and deletion fences are daemon-owned.
+One runtime input/resize lease has a 15-second TTL/5-second renewal and explicit atomic visible handoff;
+draft bytes never transfer between clients.
+
+Full remote/headless clients reuse those exact snapshots, journals, Node subscriptions and Attention routes.
+They do not share the companion's reduced API, but permission/credential/grant/host-trust/destructive/
+repository-integration operations remain desktop-only and are rejected by the daemon, not merely hidden.
+
+`docs/OPERATOR_CONTROL_PLANE.md` defines the complete domain and behavior. The frozen requirement inventory
+and exact proof matrix are machine-checked by `make product-spec-acceptance`. That check proves specification
+coverage only; the crate table above remains the implementation truth until the named vertical evidence
+lands.
 
 ## 7. Security model
 

@@ -75,6 +75,52 @@ Linux has no single desktop API equivalent to the two AppKit preference properti
 Therefore High contrast and Reduce motion must always be testable through Turn's explicit
 Global controls even when the desktop cannot be inherited.
 
+## Accepted operator-control-plane surface matrix
+
+These post-v0.1 rows become required as their verticals ship. Automated accessibility-tree snapshots prove
+roles/names/state/order; packaged VoiceOver and Orca runs prove the platform bridge. Every pointer drag has a
+keyboard move/action-menu equivalent, and closing a view/dialog restores the exact invoking element.
+
+| Surface | Required semantic/focus oracle |
+| --- | --- |
+| Canonical tree | Workspace, Session and every `Agent`, `Subagent`, `Shell`, `Command`, `Tui`, `Service`, `Process`, `Log`, `Group`, `Team`, `Flow`, `Note`, `File`, `Diff`, `Web`, `Media` row is one named tree item with level, expanded/selected, lifecycle/turn and badge described independently; references activate the one row rather than duplicate it. |
+| Agent/Subagent WorkSurface | Heading names role/task/provider; attempt, turn, children, context/quota and unavailable/stale state use labelled regions; transcript/activity order is stable; action focus never jumps when observations update. |
+| Terminal/runtime WorkSurface | Terminal keeps application/document semantics as appropriate; Service health, Process ancestry and Log filters are named; alternate-screen/IME remains primary input and status updates do not steal focus. |
+| Flow/Team/Group | Definition/run state, step/member/reference lists, dependency result and grant limits are named; pause/cancel/abort/retry consequences are descriptions; add/remove/reorder/member-role editing works without drag. |
+| Resource WorkSurface | Note editor, inert File/Diff, isolated Web/Media and loading/blocked origin state are distinct; source and external-navigation actions are named and content cannot create invisible focus targets. |
+| CreationCatalog/setup | Search, grouped entries, capability/disabled reason, effective defaults and target Workspace are announced; keyboard order follows visible grouping; progress/cancel returns to the invoking tree item or specified new target. |
+| Integration diagnostic | Provider/version/mechanism/freshness/downgrade and self-test consequences are labelled; starting a self-test is explicit, progress is one live region and cleanup receipt returns focus. |
+| Bottom status and HUD | Highest event plus overflow count has `status`; history has deterministic severity/time order; progress announces start/terminal only; ordinary working rows never appear as actionable Attention. |
+| Attention/provisional view | Next routes in one command; permission/question/result controls expose the exact subject/owner; node-less evidence opens a named provisional document with no enabled input; mark-read/ack/resolve remain separate. |
+| File explorer/SCM/conflict | Tree/table rows expose host/repository/path and selected/staged/conflict state; stage/unstage/commit/history/conflict resolution all work by keyboard; discard/history rewrite identify destructive scope. |
+| Remote writer handoff | Current viewer/writer, lease expiry and requested recipient are announced on both clients; accept/refuse is modal and focus returns to the runtime input only after the new generation is active. |
+| Companion | Observe/respond/control scope and offline/stale state are named; every allowed action has a native accessibility role; desktop-only actions are absent or expose a disabled reason, never an inert icon. |
+
+For each row, the packaged record names OS/session, VoiceOver or Orca version, zoom, contrast, reduced-motion
+and IME state. The minimum/maximum window sizes are tested at 50%, 100%, 200% and 300% zoom. Focus-order
+snapshots and screen-reader speech logs are retained as artifacts rather than replaced by visual screenshots.
+
+### ADR-063 independent capability rows
+
+The following are eight independent acceptance rows. Passing another row, or the broader surface row above,
+cannot stand in for one of them. Each row needs an automated accessibility-tree/focus-order snapshot and a
+packaged VoiceOver and Orca run on every surface on which that capability is advertised.
+
+| Capability | Required semantic, keyboard and focus oracle |
+| --- | --- |
+| Board and `WorkItem` projection | The board is one named region whose columns/groups and revision are exposed; every item announces title, closed state, assignee, labels, dependencies and stale/conflict state independently. Keyboard commands cover create, edit, move, close, filter and opening the canonical Node. Reordering never requires drag, selection remains stable after a revision, and board metadata is never announced as Lifecycle, dependency-result or Attention authority. |
+| Delegated `Resource` and `ProgressUpdate` | A delegated resource is a normal named tree item with creator, owning attempt, bounded kind/size and accepted/refused receipt. Progress is attached to the exact Flow/step/attempt and announces start, meaningful state changes and terminal state once, not every sample. Limit refusal and partial acceptance are labelled, do not steal focus, and expose no enabled edit/control action outside the grant. |
+| Shared `RuntimeEndpoint` multiplexing | Endpoint health is a labelled group separate from each bound AgentInstance. Every binding announces its unique conversation owner, profile/target scope, connection generation and current/stale/recovery state; moving among siblings never changes another sibling's input focus or transcript position. A binding failure updates only that binding plus endpoint summary, and reconnect/fallback actions return focus to the same instance. |
+| Target-wide runtime inventory and reconciliation | The recovery view is a named table/tree with provider, target/host, account profile, endpoint generation, runtime identity and bound/unbound/ignored state per row. Adopt, Ignore and Terminate are distinct keyboard actions with exact-scope confirmation, disabled reasons and uncertain-effect status; refresh preserves selection by runtime identity and never silently activates the first discovered runtime. |
+| `FileBackend` editing | The editor announces backend, target/host, jailed root, path, encoding, dirty state and exact base revision. Save is a named keyboard action; revision mismatch opens a labelled conflict with Reload, Compare and Cancel, preserves the draft and returns focus to the conflicted editor. Read-only, disconnected and unsupported states remove or disable mutation with a stated reason and never substitute a same-named local file. |
+| Note-backed live brief `ContextLink` | A Note announces author, current reviewed revision, consumers and whether each link is pinned or follows reviewed revisions. Editing, reviewing, pinning, advancing, expanding, renewing and revoking have separate named actions and keyboard paths. A newer unreviewed revision produces one non-disruptive stale/update status; it never changes a consumer's effective context or steals editor/terminal focus. |
+| `AccountProfile` lifecycle and isolation | Profile creation/edit/archive/default controls identify provider plus ExecutionTarget and explicitly state that the record is non-secret. Launch/setup announces requested, resolved and effective profile; an active attempt keeps its frozen profile when defaults change. Missing authentication, archived profile and unavailable isolation each expose a distinct disabled reason, and no credential value appears in accessible names, descriptions or speech logs. |
+| Full remote/headless operator surface | This is a complete browser/client rendering of the canonical tree, one selected WorkSurface, status history, Attention queue and capability-gated controls; it is tested independently from the reduced Companion. Browser landmarks, page/view titles, reconnect/stale state, writer lease and network-lag status are named; keyboard routing survives reconnect without duplicate activation or focus loss. Desktop-only sensitive actions are absent or explicitly disabled server-side, while every advertised remote action remains operable with a screen reader at all zoom levels. |
+
+The full remote/headless row and the Companion row are different products and therefore require different
+records. A Companion pass cannot approve the full remote surface, and a full remote pass cannot approve the
+Companion's deliberately reduced action set.
+
 ## Accepted M15 local dictation checks
 
 These checks apply when ADR-060 ships and do not claim current support:
@@ -103,10 +149,13 @@ The full acceptance matrix is `docs/LOCAL_VOICE_INPUT.md`.
 
 Do not mark the manual pass complete without a row that another person can reproduce:
 
-| Date | Commit/build | OS and session | Assistive technology/version | Input method | Result | Follow-up issue |
-| --- | --- | --- | --- | --- | --- | --- |
-| _pending_ | | | | | | |
+| Date | Commit/build | OS and session | Surface and browser/client version | Network profile | Assistive technology/version | Input method | Result | Follow-up issue |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| _pending_ | | | | | | | | |
 
 An automated green run proves the application-owned contract. The manual rows prove that
 the packaged platform bridge and current assistive-technology release expose that contract
-as intended; neither is a substitute for the other.
+as intended; neither is a substitute for the other. `Surface` is one of desktop, full remote/headless or
+Companion and names its app/browser build. `Network profile` records local/LAN/WAN plus injected latency,
+loss, offline/reconnect and endpoint location, so a local desktop record cannot silently approve a remote
+focus/reconnect path.

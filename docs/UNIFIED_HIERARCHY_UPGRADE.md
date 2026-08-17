@@ -58,6 +58,13 @@ Normalised ownership stays explicit: `Session.workspace_id`, `ProcessNode.sessio
 - `read_only`: review/research against the primary checkout. Turn must use a technical guard when viable and must require explicit escalation before a write-capable relaunch.
 - `isolated_worktree`: independent path and branch. It may write concurrently, but Turn warns about declared shared ports, containers, databases, caches, credentials and services.
 
+These are the implemented v4 modes. The accepted operator-control-plane target retires new
+`main_checkout` creation entirely: the enum becomes migration-only, every write-capable path provisions a
+dedicated worktree and enforced read-only is the only primary-checkout runtime mode. Live legacy main workers
+are quarantined and block target release compliance until stopped or explicitly recreated in isolation; see
+`docs/OPERATOR_CONTROL_PLANE.md` §7. This target supersedes any v4 text below that treats the primary write
+lease as an allowed steady state.
+
 An active second main-checkout session is a conflict, never a silent success. Creation must return the
 current owner and the alternatives: focus it, create read-only, create an isolated worktree, or cancel. If
 the failed creation came from a Template, the safe retry retains only its Template id and interpolation
@@ -191,7 +198,8 @@ Agent runtime state remains the existing two-dimensional model:
 
 ```text
 Lifecycle: Spawning → Alive
-                 ├──────→ Orphaned → Lost
+                 ├──────→ Reconnected → Alive
+                 ├──────→ Orphaned → Reconnected | Lost
                  └──────→ Exited(code) | Signaled(signal) | Stopped(signal)
 Turn:      Idle → Active ↔ AwaitingUser(reason)
                   ├────→ Done → Active
@@ -200,9 +208,11 @@ Turn:      Idle → Active ↔ AwaitingUser(reason)
             any state may degrade to Unknown when no adapter can vouch for it
 ```
 
-`Reconnected` remains a reserved lifecycle value for a backend that can prove PTY reattachment; the current
-daemon-restart path deliberately emits only `Orphaned` or `Lost`. Reconnecting a UI to the same live daemon
-reattaches a view and does not change the runtime lifecycle.
+`Reconnected` is emitted only when a backend proves exact durable PTY/runtime reattachment; the current v4
+daemon-restart path may still emit only `Orphaned` or `Lost` until that proof ships. The canonical closed
+transition/evidence/tie-break table and TurnId rules are `OPERATOR_CONTROL_PLANE.md` §6 and supersede any
+shorthand in this diagram. Reconnecting a UI to the same live daemon reattaches a view and does not change
+the runtime lifecycle.
 
 Node state is a daemon-derived projection whose actual labels include `starting`, `RUNNING`, `WAITING`,
 `PERMISSION`, `QUESTION`, `turn done`, `DONE`, `FAILED`, `STOPPED`, `IDLE` and `UNKNOWN`. `YOUR TURN` is the
@@ -371,8 +381,10 @@ the list remains so a future refactor does not reintroduce them:
 
 ## Implementation and migration sequence
 
-Steps 1–8 and the deterministic half of step 9 are implemented. The authenticated live Claude Code smoke
-test in step 9 remains pending.
+Steps 1–9 are implemented for the v0.1 vertical. The authenticated packaged Claude Code 2.1.226 run passed
+on 2026-08-10; its environment, observations and reproducible harness are recorded in
+`docs/REVIEWER_ACCEPTANCE.md`. This proof does not imply ADR-062 provider-parity or durable nested-topology
+acceptance, which remain post-v0.1 targets.
 
 1. Land this normative document and ADR-040; update product/architecture/protocol claims.
 2. Add domain types, event variants and deterministic migration 003 with upgrade tests.

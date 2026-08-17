@@ -26,14 +26,14 @@ The target hierarchy is:
 ```text
 Workspace
 └── Session (owns checkout/worktree, Layout and Attention policy)
-    ├── optional explicit Group
-    │   └── Shell, standalone Agent or resource
-    ├── Shell (owns a local PTY and its Pane bindings)
-    │   └── Agent
-    │       ├── semantic subagent
-    │       └── managed process or tool
-    ├── standalone Agent (only when its adapter proves a non-shell runtime)
-    └── shell or process without agent identity
+    ├── Flow                         (projects one immutable FlowRun)
+    ├── Team                         (member references; never duplicate rows)
+    ├── optional explicit Group      (one primary presentation override)
+    ├── Agent ── AgentInstance ── RuntimeAttempt*
+    │   ├── Subagent ── AgentInstance ── RuntimeAttempt*
+    │   └── Process / Log
+    ├── Shell / Command / Tui / Service / Process / Log
+    └── Note / File / Diff / Web / Media
 ```
 
 Canvas coordinates, overlapping cards and graph edges are not part of Turn. Ownership stays legible as a
@@ -73,12 +73,12 @@ tree; context access and conversation lineage are separate typed relationships.
 
 - `Agent` — an operator-visible agent identity;
 - `Subagent` — an agent reported by another agent, possibly without its own PTY;
-- `Shell` or `Process` — a runtime/tool without an independent agent identity;
-- `Note`, `File`, `Diff` or `Web` — user-created resources when their capability ships;
-- `Group` — an explicit organisational boundary inside one Session, never an inferred process relationship.
+- `Shell`, `Command`, `Tui`, `Service`, `Process` or `Log` — runtime/tool work without an independent agent identity;
+- `Note`, `File`, `Diff`, `Web` or `Media` — typed resources when their capability ships;
+- `Group`, `Team` or `Flow` — explicit organisation/run projections, never inferred process relationships.
 
-Each kind declares a truthful `ContentCapability`: live terminal, structured activity/transcript, file,
-diff, web, note, group overview or technical process detail. A client must not render a semantic subagent
+Each kind declares a truthful `ContentCapability`: live terminal, structured activity/transcript, service,
+log, file, diff, web/media, note, group/team/Flow overview or technical process detail. A client must not render a semantic subagent
 as an empty terminal merely because an ancestor owns one.
 
 ADR-044's local ownership remains: a Shell node owns the PTY and Pane bindings, while the Agent launched
@@ -87,14 +87,18 @@ that Shell/runtime owner. Its AgentNodeView may project the bound live terminal 
 the visible semantic subject; it never claims that the Agent owns the PTY. A provider-side thread with no
 local shell uses a different adapter capability and does not fabricate one.
 
-`Group`, `Note`, `File`, `Diff` and `Web` are accepted resource-node kinds but are sequenced after the first
+`Group`, `Note`, `File`, `Diff`, `Web` and `Media` are accepted resource-node kinds but are sequenced after the first
 Agent Node milestone. A Group is explicit presentation inside one Session and owns no checkout, lease,
 Attention policy or runtime. Notes are Turn-owned private content; File and Diff nodes refer to canonical,
 checkout-confined sources and never own user files; Web nodes hold a validated URL and perform no network
 load merely because the tree restored. Removing any resource node forgets Turn's record, not the referenced
 file, branch or site. Their creation, persistence, privacy and content-security acceptance is M14 scope.
+Media stores a canonical bounded local/remote source reference and declared MIME evidence, never copied
+payload by default; restore does not fetch, decode, autoplay, capture or emit network traffic. Explicit view
+uses a crash-isolated decoder with the same root/host confinement and treats metadata as untrusted.
 
-The supported flow accepts resource creation/edit only from a foreground operator operation. A Group is a direct child of its
+The supported flow accepts resource creation/edit only from a foreground operator operation or an exact
+resource specification in a reviewed Flow policy; an agent event or payload can only propose it. A Group is a direct child of its
 owning Session and Groups never nest. Any Agent, Shell/Process or resource in that Session may have at most
 one explicit presentation membership in a Group; changing it does not rewrite the runtime/process parent,
 which remains visible as a reference in the Node View. Resource payloads cannot reparent themselves. Deleting
@@ -116,34 +120,46 @@ credentials, filesystem/IPC access, downloads, popups or automatic external navi
 after explicit foreground navigation. Restore reconstructs private content and an unloaded view only; URL
 changes and navigation never happen from page script without a new typed foreground operation.
 
-Three edge families remain independent:
+Relationship axes remain independent:
 
 | Edge | Meaning | May affect tree placement | Grants context read | Transfers work/control |
 | --- | --- | --- | --- | --- |
-| `HierarchyEdge` | owns, spawned, contains or explicitly grouped | yes | no | no |
-| `ContextLink` | one AgentInstance may pull bounded context from another | no | yes, within scope | no |
+| `OwnershipEdge` | Workspace/Session owns a Node | root/fallback | no | no |
+| `SpawnEdge` | one semantic runtime caused another | primary when verified below Group override | no | no |
+| `ProcessEdge` | observed OS ancestry | primary only without Group/Spawn | no | no |
+| `GroupMembership` | one explicit presentation Group | primary operator override | no | no |
+| `TeamMembership` / `FlowMembership` | role/run references | no; activatable reference only | no | only through Flow policy |
+| `ContextLink` | one AgentInstance may pull bounded context from an AgentInstance or exact Note revision/policy | no | yes, within scope | no |
 | `LineageEdge` | an instance continued, handed off or branched from another | no; shown as reference | no by itself | records an explicit operation |
+| `DependencyEdge` / `MessageEdge` | typed result gate / delivery evidence | no | no implicit access | only a reviewed Flow policy may start work |
 
-Process-derived hierarchy edges retain their confidence. Context and lineage must never be inferred from
-process ancestry, matching directories, shared accounts or similar titles.
+Every operational Node has one primary row using Group → strongest verified Spawn → strongest verified
+Process → Session fallback. Team/Flow and non-winning relationships are references, not aliases; semantic
+counts use SpawnEdges rather than display placement. Process-derived edges retain confidence. Context and
+lineage must never be inferred from process ancestry, matching directories, shared accounts or similar titles.
 
 ### 3.2 Stable agent identity and runtime attempts
 
 An `AgentInstance` is Turn's stable identity for one operator-recognisable agent. Its `AgentInstanceId`
 survives warm view attachment and survives cold resume, model switch or runtime restart only when the
-adapter verifies continuity of the same provider conversation. For the first migration a current agent
-`NodeId` may also be its instance id, but the concepts remain distinct in APIs and storage.
+adapter verifies continuity of the same provider conversation. Migration always mints a distinct
+`AgentInstanceId`; an old Node-shaped identifier survives only as a resolution tombstone and is never emitted
+as the new instance id.
 
 Every agentic Node owns exactly one AgentInstance; non-agent nodes own none. An AgentInstance belongs to one
-Node for its lifetime and owns zero or more RuntimeAttempts, with at most one `current_attempt_id`. Attention
+Node for its lifetime. `AttemptOwner` is a tagged union: an AgentInstance owns agent/subagent attempts, while
+a runtime-capable non-agent Node (`Shell|Command|Tui|Service|Process|Log`) owns its own attempts directly;
+exactly one variant is present. Every owner has ordered zero-or-more attempts, an optional
+`active_attempt_id` naming at most one non-terminal attempt and an optional `latest_attempt_id` that may be
+terminal. Attention
 and visible selection carry `node_id + agent_instance_id` when agentic and the daemon rejects a mismatched
 pair; attempt-scoped interactions additionally carry the current `runtime_attempt_id` and generation.
-ContextLinks and handoff destinations name AgentInstances and revalidate the same join. This one-to-one join
+ContextLink destinations and handoff destinations name AgentInstances and revalidate the same join. This one-to-one join
 is daemon-derived and never reconstructed from provider ids, cwd or titles. A create, branch or new-target
 handoff commits its Node + AgentInstance pair together in one store transaction; neither half can exist
 alone. External launch remains the separate visible saga described below.
 
-A `RuntimeAttempt` is one concrete runtime-configuration epoch. It starts with a launch/resume or with a
+A `RuntimeAttempt` is one concrete runtime-configuration epoch. For agent owners it starts with a launch/resume or with a
 verified in-place model switch that changes the effective execution contract while preserving the same
 provider conversation and process binding:
 
@@ -156,6 +172,13 @@ AgentInstance
     ├── PTY/runtime binding
     └── descendant processes
 ```
+
+For a runtime-capable non-agent Node it starts with create/adopt/restart/recycle and never fabricates an
+AgentInstance or provider conversation. One `(ExecutionTarget, backend, handle, generation)`, PTY generation
+or surfaced OS process identity belongs to at most one current AttemptOwner; conflicts remain unresolved
+rather than being attached twice. A durable Pane belongs to one Session Layout and binds at most one runtime
+owner; a temporary Pane belongs to one Surface. One client connection generation owns each live Surface,
+and neither a Surface nor an input lease transfers implicitly.
 
 The identifiers must not be substituted for one another:
 
@@ -207,11 +230,14 @@ show all three without rewriting history.
 ### 3.4 Lifecycle operations
 
 - **Warm attach:** connect a view to the still-live attempt. It never launches a command.
+- **Adopt runtime:** bind a proved already-running external runtime as one new attempt; later view attachments
+  reuse it and never create another attempt.
 - **Cold resume:** create a new attempt that resumes a verified provider conversation.
 - **Fresh start:** create a new Node + AgentInstance and provider conversation. “Replace” may archive the
   old node and select the new one in the same presentation position, but never reuses its ids.
-- **Restart runtime:** create a new attempt under the same AgentInstance only with verified conversation
-  continuity. Previous attempts remain history; otherwise the operation refuses and offers Fresh start.
+- **Restart runtime:** a generic Tool/Process creates a fresh attempt under its existing Node; an Agent keeps
+  its instance only with verified conversation continuity and otherwise creates a fresh Node/instance with
+  lineage. Previous attempts remain history.
 - **Switch model in place:** when the adapter proves the same conversation/process and effective new model,
   atomically end the old epoch, create a configuration-receipt attempt and rotate attempt capabilities. It
   neither launches nor resumes anything; insufficient proof leaves the observed model uncertain.
@@ -219,6 +245,12 @@ show all three without rewriting history.
   conversation when the provider supports it.
 - **Handoff/continue with:** target an existing instance or provision a new one through an idempotent,
   fenced saga, attach one bounded context packet and record lineage. It does not create a Pane.
+- **Interrupt/terminate/kill:** respectively send a non-terminal interrupt, request graceful exit and apply
+  the declared forceful backend action; receipts preserve the distinct outcome.
+- **Recycle:** replace runtime infrastructure while preserving Node/instance/conversation only when durable
+  attach/resume proves continuity; otherwise refuse and offer Fresh start.
+- **Destroy:** fence/remove the semantic Node and revoke its capabilities with a durable tombstone; cleanup
+  of surviving processes, worktrees, branches or artifacts is a separate disposition.
 
 The unattended daemon never launches work merely because it restored metadata. A connected client may
 start only a runtime whose persisted auto-start contract is explicit and whose checkout, account, host,
@@ -435,23 +467,33 @@ Turn supports two complementary channels. Neither is implied by the tree.
 
 ### 7.1 Live ContextLink: scoped pull
 
-A `ContextLink` is a durable, revocable grant from source AgentInstance to destination AgentInstance. Only
-an explicit foreground operator action on the authenticated control channel can create, expand or renew it;
-an agent, hook payload, transcript or repository file may propose but never authorise one. The default grant
+A `ContextLink` is a durable, revocable grant from a tagged source—an AgentInstance or an exact Note Resource
+Node—to a destination AgentInstance. A Note source defaults to a pinned content revision; an explicit
+`follow_reviewed_revisions` mode fixes the permitted author/grant set, schema and cumulative revision/byte/
+token budget, and audits the exact revision returned on every pull. It cannot follow another resource id,
+reset budget on edit or expose File/Diff/Web/Media content implicitly. Only
+an explicit foreground operator action on the authenticated control channel can issue, expand or renew root
+context authority. That action may itself create the link or issue an ADR-061 `DelegationGrant` whose
+immutable Flow revision authorises an exact current agent attempt to exercise bounded link/packet operations.
+The agent never authorises or widens the scope; a hook payload, transcript or repository file may only
+propose. The default grant
 is directional; a bidirectional relationship is two grants. Initial scope is one Workspace, including
 separate Sessions/worktrees; cross-Workspace links are refused because they cross an operator's project
 boundary. Every grant has a purpose, closed scopes, cumulative request/byte/token limits and a required
 expiry; “until either Session ends” is the longest default, not an unbounded capability.
-Foreground create/update/revoke carry an operation id and are idempotent across a lost response; lifecycle,
-expiry and endpoint-delete revocations are internal. Each source and destination counts the live link against
+Foreground issue/update/revoke and delegated exercise carry an operation id, issuer/grant provenance and are
+idempotent across a lost response; lifecycle, expiry and endpoint-delete revocations are internal. Each
+source and destination counts the live link against
 `records.active_context_links_per_agent`; reaching the bound refuses creation rather than merging grants or
 silently revoking an existing one.
 
-“Only the foreground operator” is an invariant of Turn's authenticated, supported control flow, not a claim
+“Only the foreground operator issues root authority” is an invariant of Turn's authenticated, supported
+control flow; exercising its exact delegated capability is not new authorisation. This is not a claim
 of hostile same-uid process isolation. A compromised local agent running as the operator could steal the
 daemon's administrative capability or impersonate a UI unless a per-agent OS sandbox or a UI-owned authority
 that the agent cannot access is active. The UI, threat model and acceptance tests state that limitation; the
-daemon still rejects agent-event, hook, transcript and repository-file attempts to exercise these operations.
+daemon still rejects agent-event, hook, transcript and repository-file attempts without the separate exact
+delegated-control capability.
 
 Durable means the grant survives a UI or daemon restart, not that it outlives its authority. Each link has a
 fenced generation and records the source/destination Workspace, Session, provider, safe account scope and
@@ -525,10 +567,12 @@ consumed or retained; the UI states both limits before grant creation.
 ### 7.2 ContextPacket: one-shot handoff
 
 A handoff is a versioned, bounded `ContextPacket` plus a `LineageEdge`. It supports continue-with, review,
-second-opinion, delegation and branch intents. The first implementation is same-Workspace, including
-different Sessions/worktrees; cross-Workspace transfer requires a future explicit export/import boundary.
-The source may target an existing compatible instance or describe a new AgentInstance without changing
-Layout.
+second-opinion, delegation and branch intents. Live ContextLinks are same-Workspace. A packet may target a
+different Session/worktree directly; crossing a Workspace uses the explicit portable export/import boundary
+in the master contract: package-local identities are reminted, runtime/authority ids are stripped, imported
+content stays inert, and a fresh destination review/adoption is required before delivery. No link or grant
+crosses with it. The source may target an existing compatible instance or describe a new AgentInstance
+without changing Layout.
 
 The canonical packet is assembled from typed sources:
 
@@ -553,7 +597,9 @@ manifest; delivery never creates implicit context authority.
 
 The vNext `prepare_context_packet` operation replaces—rather than aliases—the implemented v4
 `prepare_context_handoff`; their schemas and guarantees differ. It remains review-before-send because this
-is a cross-agent disclosure boundary. Preparation creates only an expiring draft and optional target launch
+is a cross-agent disclosure boundary, unless the immutable FlowRun already contains an operator-reviewed
+source/destination/transform/redaction/budget policy and a current DelegationGrant exercise stays exactly
+inside it. Preparation creates only an expiring draft and optional target launch
 spec: no node, process or grant exists yet. The review is rendered directly in the Node View rather than a
 modal maze and shows the exact canonical sanitised body, known-secret redaction result, trusted transport
 template/version, grant manifest and retention warning. `deliver_context_packet` carries only an operation
@@ -562,14 +608,16 @@ body hash is passed unchanged into the reviewed transport encoder. A native adap
 can prove the decoded body matches; PTY fallback proves only the deterministic submitted envelope/bytes, not
 what the downstream program decoded.
 
-The draft/capability is memory-only and bound to its preparing surface connection and daemon generation.
+An ad-hoc draft/capability is memory-only and bound to its preparing surface connection and daemon generation.
 Disconnect before `deliver_context_packet` is accepted discards it. Once accepted, the current daemon may
 retain the body only in the in-flight saga's bounded memory; durable state stores its hash/manifest/phases,
 never reconstructible bytes. A daemon-generation change therefore cannot resume delivery from a hash. It
 reconciles already attempted external effects, then: preserved submission evidence stays submitted; an
 in-progress/ambiguous write becomes `submitted_unconfirmed`; otherwise any prepared/installed grant is
 revoked and the delivery becomes `draft_lost`/`review_required`. The operator must prepare and review a new
-packet, with a new operation id, before the already provisioned compatible target can receive anything.
+ad-hoc packet, with a new operation id, before the already provisioned compatible target can receive
+anything. A definitely-not-started Flow packet may instead be reassembled from its immutable still-current
+policy and exercised under a new operation id; possible submission always remains fenced and cannot replay.
 
 Delivery revalidates that the target has no pending question, permission or other interaction. Adapter-
 native delivery is preferred; a terminal fallback is one bracketed paste into the verified idle PTY owned by
@@ -633,29 +681,33 @@ moving either node in the ownership tree.
 
 ### 7.4 Messages, dependencies and teams
 
-Context access, handoff and direct coordination are not synonyms. A future `AgentMessage` is a short,
+Context access, handoff and direct coordination are not synonyms. The accepted `AgentMessage` is a short,
 typed, destination-addressed instruction or status—not a hidden transcript transfer. It has a bounded body,
-sender/destination instance, purpose, creation/expiry time, idempotency key and evidence-backed
-state split across three independent axes:
+sender/destination instance, purpose, creation/expiry time, idempotency key and evidence-backed state. The
+closed `BodyAuthority × Transport × Evidence` variants and legal combinations are exactly those in the
+master contract §5.3: receipt/read/action are independent optional evidence facts, never transport states;
+evidence is permitted only after `submitted|submitted_unconfirmed`; and a pre-write body loss terminates the
+old operation as `failed(body_lost|policy_invalid)`, never as a queued or prepared zombie.
 
-```text
-draft_state    = live | consumed | lost
-review_state   = pending | reviewed | review_required
-delivery_state = not_started | queued | submitted | received | submitted_unconfirmed | failed
-```
-
-Preparation starts at `live/pending/not_started`. The explicit deliver action records `reviewed`, consumes
-the reviewed draft and enters `queued`; submission advances only that delivery axis. Per-destination
-ordering is FIFO. Messages are
-delivered only to a verified idle adapter endpoint and never into a pending permission or question. No
-message body is treated as trusted executable control. The supported flow accepts prepare/review/deliver
-only from a foreground operator; an agent or conductor can propose a message only as an Attention item. The draft is client-bound and
-memory-only, durable state stores hash/metadata/evidence, uncertain delivery is never retried, and provider/
-terminal downstream retention is disclosed exactly as for a ContextPacket.
+Ad-hoc preparation starts `live/pending/prepared`; reviewed Flow content starts
+`reassemblable/preauthorised/prepared`. Queue acceptance consumes the body. Per-destination ordering is FIFO
+with explicit count/byte capacity and TTL; overflow refuses visibly. Messages are delivered only to a
+verified idle structured adapter endpoint and never into a pending permission, question or human draft.
+Generic PTY injection is not an AgentMessage transport. No
+message body is treated as trusted executable control. A foreground operator may prepare/review/deliver
+directly. A conductor may do so without another prompt only through the exact destination, body/purpose
+bounds and expiry of a current `DelegationGrant` in an immutable `FlowRun`; otherwise it can only propose a
+message as an Attention item. The draft is client-bound and memory-only outside an already reviewed Flow;
+durable state stores hash/metadata/evidence, uncertain delivery is never retried, and provider/
+downstream retention is disclosed exactly as for a ContextPacket.
 Its delivery capability is bound to the current daemon generation. After daemon loss, proven submission
-remains evidence, an in-progress write becomes `submitted_unconfirmed`, and a pre-write message becomes
-`lost/review_required/not_started`; the old operation is terminal and its hash can never reconstruct or
-replay the body. Retrying requires a newly prepared body, another visible review and a new operation id.
+remains evidence, an in-progress write becomes `submitted_unconfirmed`, and a pre-write ad-hoc message
+becomes `lost/review_required/failed(body_lost)`; an invalidated Flow recipe becomes
+`lost/review_required/failed(policy_invalid)`. The old operation is terminal and its hash can never
+reconstruct or replay the body. Independently correlated late evidence may refine
+`submitted_unconfirmed → submitted` without another write. Retrying requires a newly prepared body, another
+visible review (or a deterministic still-valid Flow reassembly owned by the Flow, not the consumed message)
+and a new operation id.
 
 `DependencyEdge` is a fourth non-tree relationship: one node declares that another node's typed result is a
 prerequisite. A dependency is satisfied by a durable closed-schema `DependencyResult`, not by observing that
@@ -664,28 +716,37 @@ bounded operation/artifact ids or content hashes, verified canonical references,
 confidence. An optional human summary uses the declared durable-text byte limit plus control stripping and
 best-effort known-secret redaction. Raw PTY/output, transcript turns, file/diff bodies, environment values and
 arbitrary provider payloads are forbidden. The graph rejects cycles and projects `blocked`, `ready`, `failed`
-or `cancelled` evidence into each Node View and the Attention policy. It never starts, advances, interrupts
-or retries a dependent Agent. A user or agent may propose the next operation, but only a foreground operator
-action may execute it. ADR-049 Session activation may still start its independently persisted safe runtime
-contract; becoming dependency-ready is never an activation signal. Dependencies render as references and
-badges; they do not reparent nodes, form a second canvas or turn Turn into a workflow scheduler.
+or `cancelled` evidence into each Node View and the Attention policy. Outside a `FlowRun`, it never starts,
+advances, interrupts or retries a dependent Agent. Inside a FlowRun, only the immutable start policy and
+resource/authority bounds reviewed before launch may consume a matching current result automatically; an
+idle process, guessed completion or later agent proposal never does. ADR-049 Session activation may still
+start its independently persisted safe runtime contract. Dependencies render as references and badges; they
+do not reparent nodes or form a second canvas.
 
 A Team is an explicit Session-scoped coordination object with member AgentInstances, roles and an optional
-conductor/synthesiser. Its members keep normal tree positions and independent Attention subjects. A
-conductor may propose delegation, messages and dependency changes only within a user-authorised policy;
-it cannot grant context access, approve permissions, take checkout write authority or invoke focus. It emits
-typed evidence/proposals; only the AttentionManager and governor may emit Focus under operator policy. Final
-reconciliation is a visible result/Attention item with repository evidence before integration.
+conductor/synthesiser. An instance may belong to multiple Teams. Members keep their one primary tree row and
+independent Attention subjects; the Team View contains activatable references and never duplicate rows. A
+conductor may execute delegation, messages and dependency changes only within a current typed
+`DelegationGrant`; outside it those are proposals. It cannot expand the grant, approve permissions, occupy
+the primary checkout, take undeclared context/write authority or invoke focus. It emits typed operations and
+evidence; only the AttentionManager and governor may emit Focus under operator policy. Final reconciliation
+is a visible result/Attention item with repository evidence before integration.
 
-M13 runtime continuity introduces a `RuntimeEndpoint` record for a configured provider-runtime service or
-external multiplexer. It stores a non-secret endpoint/host fingerprint, conversation binding, capabilities
-and observations—never a bearer, descriptor or raw transcript. Warm attach to a verified live endpoint
-launches nothing; cold resume still creates a generation-fenced attempt and requires verified conversation
-continuity. Daemon recovery cannot duplicate an attempt, and a missing/mismatched endpoint becomes lost.
-This contract tests reconnect to an already configured adapter endpoint; it does not implement general
-Remote/SSH Session creation, which remains later scope.
+M16 runtime continuity introduces a `RuntimeEndpoint` record for a configured provider-runtime service or
+external multiplexer. It stores a non-secret endpoint/host fingerprint, capabilities and observations—never
+a bearer, descriptor or raw transcript. A separate `RuntimeEndpointBinding` joins one endpoint generation,
+provider/account/host scope, AgentInstance/RuntimeAttempt and verified conversation. One endpoint may serve
+many bindings, but within its generation a conversation has at most one current instance owner and each
+instance has at most one current binding. Transcript cursors, input, context grants, Attention and identity
+stay isolated per binding. Warm attach enumerates and verifies the exact binding and launches nothing; cold
+resume still creates a generation-fenced attempt and requires verified conversation continuity. Daemon or
+endpoint recovery cannot duplicate/merge attempts, and missing, cross-account, duplicate-claimed or
+mismatched bindings become independently stale/lost. A service failure cannot block unrelated instances;
+fallback is an explicit per-instance new attempt rather than an automatic shared restart.
+This contract tests reconnect to an already configured adapter endpoint; general Remote/SSH Session creation
+and its Runtime/File/Repository backend security are the wider M16 scope.
 
-Direct messaging, observational dependencies and Teams are sequenced after live context links. Their data
+Direct messaging, Flow-aware dependencies and Teams are sequenced after live context links. Their data
 types are reserved now so instance and lineage schemas do not need another identity migration later.
 
 ## 8. Protocol and persistence target
@@ -694,7 +755,8 @@ The protocol additions are version-gated and derive views from daemon-owned stat
 
 - ids: `agent_instance_id`, `runtime_attempt_id`, `context_link_id`, `context_packet_id`,
   `context_scope_id`, `quota_scope_id`, `node_view_subscription_id`,
-  `agent_message_id`, `dependency_edge_id`, `team_id` and `runtime_endpoint_id`;
+  `agent_message_id`, `dependency_edge_id`, `team_id`, `flow_definition_id`, `flow_run_id`,
+  `delegation_grant_id` and `runtime_endpoint_id`;
 - navigation requests: `get_node_view`, `subscribe_node_view`, `unsubscribe_node_view` and
   `route_attention`, plus `update_surface_activity` and separate `activate_session`;
 - lifecycle requests: `create_agent_instance`, `restart_agent_instance`, `branch_agent_instance`,
@@ -719,7 +781,8 @@ The protocol additions are version-gated and derive views from daemon-owned stat
 
 The current v4 `HierarchyKey` has `workspace`, `session` and `process` tags. The incompatible vNext protocol
 replaces the last tag with a general `node` tag whose payload includes the closed Node kind, covering Agent,
-Subagent, Shell/Process, Group, Note, File, Diff and Web without forging process identity. Migration converts
+Subagent, Shell, Command, Tui, Service, Process, Log, Group, Team, Flow, Note, File, Diff, Web and Media
+without forging process identity. Migration converts
 every old process key losslessly; a mixed-version peer is rejected at handshake rather than guessing.
 
 `get_node_view` is keyed by both `surface_id` and `HierarchyKey`. Its response repeats the key and a
@@ -782,11 +845,11 @@ semantics or cleanup proof.
    transcript input, budget manifests, delivery receipts and idempotent target provisioning.
 6. **Live context links and branching.** Add scoped pull, revocation, provider adapters, remote jail and
    verified native branch support.
-7. **Coordination.** Add typed messages, observational dependency results and user-authorised Teams without
-   a scheduler, canvas, hidden context rights or a second Attention authority.
+7. **Flows and coordination.** Add typed messages, dependency results, Teams and ADR-061 FlowRuns/
+   DelegationGrants without a canvas, hidden context rights or a second Attention authority.
 8. **Durable runtime continuity.** Add external multiplexing or provider-runtime services only after warm
    attach, cold resume, remote failure and updater behavior have adversarial acceptance coverage.
-9. **Resource nodes.** Add Group, Note, File, Diff and Web creation/persistence only after their canonical
+9. **Resource nodes.** Add Group, Note, File, Diff, Web and Media creation/persistence only after their canonical
    ownership, private-data, content-security and no-load-on-restore contract passes M14 acceptance.
 
 Each slice must ship end to end—domain, store migration, protocol, daemon, native UI and acceptance—rather
@@ -828,9 +891,12 @@ contract and reproducible, versioned credentialed acceptance records prove the l
 - Telemetry thresholds alone cannot focus, reorder or resolve Attention.
 - A live ContextLink binds the logical destination/attempt and ignores caller-supplied destination ids;
   tests also state that this is not same-uid process isolation without an OS sandbox.
-- The supported control flow accepts create/renew/expand only from a foreground operator surface and rejects
-  agent-event attempts; tests and UI also expose that an unsandboxed malicious same-uid process may steal the
-  administrative capability and impersonate that surface. Every broker read is destination/attempt-bound,
+- Root create/update/renew/expand/revoke is accepted only from a foreground operator surface. An exact
+  current Agent attempt may exercise one immutable pre-authorised operation only through
+  `submit_delegated_operation`; source, destination, transformation, limits and generation are derived from
+  the unexpired ADR-061 grant, and every direct administrative endpoint call by an agent is refused. All
+  other agent-event attempts become proposals. Tests and UI also expose that an unsandboxed malicious same-uid process may steal the
+  administrative capability and impersonate a surface. Every broker read is destination/attempt-bound,
   descriptor-jailed, atomically budgeted and audited. Revoke/read races are linearised before body commit,
   and ending/archive or deletion revokes authority permanently.
 - A handoff packet is bounded and reviewed; its canonical bytes/hash enter the reviewed encoder unchanged.
@@ -847,13 +913,15 @@ contract and reproducible, versioned credentialed acceptance records prove the l
 - Creating a branch/handoff target does not create a Pane or mutate the source Layout.
 - Message delivery is ordered, bounded and retry-fenced; it cannot answer an existing prompt or imply
   receipt without evidence.
-- Agent/conductor-authored message, dependency or Team changes remain proposals/Attention; only a foreground
-  operator operation commits them, and no durable message body or bearer enters protocol/storage.
+- Agent/conductor-authored message, dependency or Team changes execute only within an exact current
+  DelegationGrant; otherwise they remain proposals/Attention. No durable message body or bearer enters
+  protocol/storage.
 - Dependency cycles are rejected, idle is not mistaken for a completed result, and the bounded closed result
-  schema rejects raw output/transcript/diff/file/environment/provider payloads. No dependency automatically
-  starts/advances/retries work, and a Team keeps exact per-agent Attention subjects.
+  schema rejects raw output/transcript/diff/file/environment/provider payloads. Outside a FlowRun no
+  dependency starts work; inside it only an immutable reviewed start policy advances once from the exact
+  current result. A Team keeps exact per-agent Attention subjects.
 - RuntimeEndpoint reconnect proves mutual endpoint/conversation/instance/generation identity, launches
-  nothing on warm attach and fails closed on mismatch; it does not claim general Remote/SSH Session support.
+  nothing on warm attach and fails closed on mismatch; general Remote/SSH Session support is M16.
 - Offline hosts, missing worktrees and unsupported provider features remain visible and never fall back to a
   different host, checkout, model, account or fresh conversation.
 - Group/Note/File/Diff/Web creation, restore and deletion preserve Session ownership, never load Web on
@@ -869,8 +937,10 @@ contract and reproducible, versioned credentialed acceptance records prove the l
 
 ## 12. Product boundaries
 
-Turn remains a supervisor, not an autonomous workflow scheduler. User-directed create, delegate, branch,
-resume and context operations are in scope; the supported authenticated flow never accepts agent events as
-hidden context authority, permission approval or a way to move focus outside the Attention policy. This is
-not same-uid hostile-process isolation: without an active OS sandbox or UI-owned authority inaccessible to
-the agent, a compromised local process may steal the administrative capability and impersonate the operator.
+Turn is an operator control plane, not an unbounded autonomous scheduler. Operator-authored Flows, bounded
+recurrence and typed delegated creation/dependency advancement are in scope under ADR-061 and
+`docs/OPERATOR_CONTROL_PLANE.md`. The supported authenticated flow never accepts agent events as hidden
+context authority, permission approval, grant expansion or a way to move focus outside Attention policy.
+This is not same-uid hostile-process isolation: without an active OS sandbox or UI-owned authority
+inaccessible to the agent, a compromised local process may steal the administrative capability and
+impersonate the operator.
