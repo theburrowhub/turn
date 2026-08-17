@@ -196,8 +196,8 @@ Two rules, because either alone leaks:
 The durable metadata/diagnostic boundary applies these rules to every free-text projection, not only events:
 Workspace and Session metadata, Layout/Pane definitions, Templates, process/Agent metadata, settings,
 Attention, Activity Preview and event provenance. Explicit bounded private-content stores are different:
-Note bodies, WorkItem comments and terminal archives may intentionally retain the operator/author's exact
-bytes under owner-only storage and declared retention, are never labelled secret-free and are excluded from
+Note bodies, WorkItem comments, delegated typed Resource bodies and terminal archives may intentionally
+retain the operator/author's exact bytes under owner-only storage and declared retention, are never labelled secret-free and are excluded from
 export by default. Only their redacted metadata/projections may enter logs, diagnostics, notifications or
 unprivileged summaries; canary tests prove the body is not copied there. Repository writers create a redacted
 copy before constructing any metadata row; ids and foreign keys remain byte-for-byte stable. A structural filesystem identity (`root`, checkout
@@ -478,11 +478,12 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 The daemon never relaunches unattended during restore: `SessionRepo::load_for_restore` downgrades every
 stored `Alive` to `Orphaned` and only reports recovery state. Reconnect, tree expansion, preview and Attention
 routing likewise launch nothing. Exactly one foreground selection of a canonical Session may issue one
-node-addressed activation for an existing eligible child, a pane explicitly marked `Relaunch`, or a
-commandless default terminal whose resolved launch is only the user's interactive shell. Before effect, the
-daemon revalidates Session/Node revision, selected WorkSurface, current authority/capability generation,
-ExecutionTarget, cwd/worktree containment, write lease and AccountProfile where applicable. The reserved
-attempt plus operation id makes selection idempotent; ambiguous launch is reconciled, never automatically
+Session-addressed activation plan for its bounded eligible saved descriptors—including panes explicitly
+marked `Relaunch`—or a commandless default terminal whose resolved launch is only the user's interactive
+shell when none exists. Before effect, the daemon revalidates Session and descriptor revisions, selected
+WorkSurface, current authority/capability generations, every ExecutionTarget, cwd/worktree containment,
+write lease and AccountProfile where applicable. The reserved attempts plus operation id make selection
+idempotent; ambiguous launch is reconciled, never automatically
 repeated. Consequential `ReattachOnly`, permission, credential, host-trust or destructive commands never cross
 that automatic boundary. Refusal leaves zero process effect and reports exact recovery in the selected view
 and bottom status rather than exposing a generic secondary start action.
@@ -760,13 +761,15 @@ the same-uid limitation in §2:
 1. **Foreground activation is narrow, current intent.** Only the canonical Session selection gesture described
    above can mint the one-shot activation operation; a forged tree label, reference, page load, restore,
    reconnect, remote projection or Attention event cannot. Preflight freezes every authority-bearing input
-   before effect, rejects stale generations and reserves one attempt id. It can start only the already declared
-   safe child/default Shell. No stored provider output can supply argv, environment, cwd, profile, grant or
+   before effect, rejects stale generations and reserves every attempt id. It can start only the exact bounded
+   already-declared safe descriptor set or the empty-Session default Shell. No stored provider output can
+   supply argv, environment, cwd, profile, grant or
    elevated mode, and a failed or uncertain attempt never falls back or repeats by display name.
 2. **WorkItemSource is untrusted synchronisation, not control.** Credentials remain in the exact profile-
    scoped broker and the adapter authenticates/encrypts to the pinned source origin. Native items, pagination
    cursors and webhooks are bounded, schema-validated and mapped through one versioned exhaustive table.
-   Identity is `(source_id, external_item_id)`, never title/URL/order. Complete, partial, gapped, expired and
+   Identity is `(source_id, source_profile_id, project_namespace, external_item_id)`, never title/URL/order.
+   Complete, partial, gapped, expired and
    rate-limited coverage remain distinct; cache cannot turn a failed poll into authoritative empty state.
    Outbound create/edit/close/reopen uses the exact remote revision/ETag and operation id; conflict keeps both
    values and never retries last-writer-wins. Assignee and item text remain inert metadata and cannot create,
@@ -805,7 +808,7 @@ the same-uid limitation in §2:
    unreviewed sibling resources.
 7. **Title observation and provider rename are independent.** Provider titles are bounded, sanitised,
    revisioned untrusted text; they cannot change stable id, parentage, action owner, Attention subject or local
-   alias. `title_read` never grants `rename`. Provider rename requires its own current capability, exact
+   alias. `title_read` never grants `conversation_rename`. Provider rename requires its own current capability, exact
    conversation/profile/target, expected revision and requested/effective receipt; uncertain effect is
    reconciled, not repeated. A local alias edit never claims or triggers a provider rename.
 8. **Companion account data cannot cross profiles or mint urgency.** Usage, context and activity queries bind

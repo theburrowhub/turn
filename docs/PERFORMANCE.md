@@ -145,8 +145,11 @@ The release gate uses a fixed minimum reference profile: base Apple M1 (8-core),
 supported macOS, 1,920×1,080 display, AC power, no swap at start and an optimised packaged build. The same
 workload is recorded on each claimed Linux platform, but a faster developer or CI host cannot replace the
 minimum-profile artifact. After a five-minute warm-up, the harness runs 30 minutes continuously and injects
-a 10-second topology/Attention/output burst every minute. Managed child-process memory, provider caches and
-checkout data are reported separately and excluded from Turn's own RSS/disk budget.
+a 10-second topology/Attention/output burst every minute. `Turn-owned` includes daemon, every GUI/client,
+SpeechWorker, isolated Browser renderer, remote transport helper, provider broker/collector and watchdog
+spawned or retained by Turn. Managed user/agent processes, external provider-owned services/caches and
+checkout data are reported separately and excluded from Turn's own RSS/disk budget; no Turn helper may be
+misclassified into those exclusions.
 
 Remote measurements pass through a deterministic shaping proxy between client and daemon: 40 ms round-trip
 latency, a repeating 0/5/10/5 ms packet-delay pattern (10 ms maximum jitter), every 100th packet dropped,
@@ -186,7 +189,7 @@ evidence records provider latency separately and cannot replace the deterministi
 | Hierarchy projection | below 8 MiB serialized at 1,000 nodes; no terminal/transcript/log/media body in the snapshot |
 | Lazy tree | only viewport + fixed overscan + explicit reveal target materialise text/paint/accessibility rows |
 | Heavy subscriptions | selected visible subject plus an explicit bounded preview set; reselection cancels old generation |
-| Turn-owned memory | combined daemon+GUI RSS at most 1.5 GiB; growth from minute 10 to minute 30 at most 128 MiB |
+| Turn-owned memory | combined RSS of every Turn-owned process above is at most 1.5 GiB; growth from minute 10 to minute 30 is at most 128 MiB; one SpeechWorker is at most 512 MiB, one active Browser renderer 256 MiB and each remote/broker/helper 128 MiB, all still counting toward the aggregate |
 | Turn-owned disk | at most 1 GiB growth during the run, excluding checkouts/provider caches; retention/compaction stabilises growth |
 | Queues | GUI inbound/outbound/awaiting remain 64/256/512; topology is 1,024 per source; message is 256 items and 1 MiB per destination; each remote connection is 256 frames or 8 MiB and each frame is at most 256 KiB; every other boundary is at most 4,096 items or 16 MiB and declares refusal/gap/resync |
 | Network volume | after warm-up, Turn protocol egress averaged across the 30-minute run is at most 5 Mbit/s and p99 one-second egress at most 15 Mbit/s; payload bodies count, TLS framing does not |

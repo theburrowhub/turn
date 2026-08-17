@@ -11,11 +11,17 @@ inventory, its normative contract and its acceptance row in the same commit. Qui
 row to make a milestone look complete is forbidden and is covered by mutation tests.
 
 `PRODUCT_SPEC_V1.authority` also hashes every normative document and the three gate scripts. Its repository
-digest file permits convenient local verification; CI additionally requires the protected repository
-variable `PRODUCT_SPEC_V1_AUTHORITY_SHA256`. Because a pull request cannot update that variable, co-editing
-requirements, manifest, authority, local pin and verifier still fails with `E_AUTHORITY_CI_PIN`. Changing the
-frozen product version therefore requires an explicit out-of-band pin rotation whose audit trail is separate
-from the proposing commit.
+digest file permits convenient local verification; the checked-in CI job additionally requires the protected
+repository variable `PRODUCT_SPEC_V1_AUTHORITY_SHA256`. While that unchanged job runs, co-editing requirements,
+manifest, authority, local pin and verifier still fails with `E_AUTHORITY_CI_PIN`. Changing the frozen product
+version therefore requires an explicit out-of-band pin rotation whose audit trail is separate from the
+proposing commit.
+
+This is not a claim that same-repository CI can authenticate its own workflow against a malicious committer:
+a PR that is allowed to delete or replace the required job can bypass any check stored in that PR. Repository
+policy must require a workflow/ruleset whose identity the change cannot redefine, or a trusted operator must
+compare the workflow and authority root before merge. The machine gate prevents accidental or concealed
+semantic drift within the executed workflow; the external merge-policy boundary prevents removal of the gate.
 
 Status vocabulary:
 
@@ -58,7 +64,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | Requirement | Normative outcome | Contract | Current | Acceptance |
 | --- | --- | --- | --- | --- |
 | `PRD-VIE-001` | One hierarchy selection resolves one Workspace, Session or Node `ViewTarget` in one right-hand `WorkSurface`. | §3; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §4 | target | `ACP-VIE-001` |
-| `PRD-VIE-002` | Selecting a node changes only the view; it never changes Layout, launches work, sends input or acknowledges Attention. | §3 | partial | `ACP-VIE-002` |
+| `PRD-VIE-002` | Selecting a child/resource changes only the view; it never changes Layout, launches work, sends input or acknowledges Attention, while foreground Session activation is governed only by `PRD-LIF-009`. | §3–3.3 | partial | `ACP-VIE-002` |
 | `PRD-VIE-003` | Every NodeKind has a truthful unique content view with explicit loading, empty, unsupported, disconnected, stopped, lost and stale states. | §3.1 | target | `ACP-VIE-003` |
 | `PRD-VIE-004` | Agent/subagent views expose semantic identity, task, parent, attempt, turn/lifecycle, transcript/activity, result, children, context, runtime truth and safe actions. | §3.1, §6, §9 | target | `ACP-VIE-004` |
 | `PRD-VIE-005` | A live binding attaches automatically; stopped/lost work offers a precise lifecycle action and never a generic `Start pane` gate. | §1.1, §3.1 | conflict | `ACP-VIE-005` |
@@ -68,6 +74,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-VIE-009` | Search, status groupings and optional board/card views are projections of canonical Node ids/routes, never duplicate runtimes or navigation; one failed Node View is crash-isolated. | §3.1 | target | `ACP-VIE-009` |
 | `PRD-VIE-010` | Concurrent operational messages use a bounded, prioritised bottom StatusEvent history with expiry/recovery and non-spamming accessible announcements; status becomes Attention only through a separate demand. | §3.2 | target | `ACP-VIE-010` |
 | `PRD-VIE-011` | Board/work-item views have closed state, priority, due, tag, comment and assignee semantics over canonical Node revisions; they never become a second runtime, topology or Attention authority. | §3.1 | target | `ACP-VIE-011` |
+| `PRD-VIE-012` | External WorkItemSource adapters preserve source identity/authority, mapping, pagination/cache/coverage, CAS writes, conflict/reconcile, close/reopen, assignees, rate limits and credential isolation in canonical cards. | §3.1; `PROTOCOL.md` | target | `ACP-VIE-012` |
 
 ## Creation and reusable flows
 
@@ -126,6 +133,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-ADP-008` | Capability facts are independently scoped by mechanism, adapter/version, provider/account, target/host, endpoint and attempt/epoch; operations require their current intersection plus authority. | §6.1 | target | `ACP-ADP-008` |
 | `PRD-ADP-009` | Integration self-tests are explicit, consequence-previewed, disposable, bounded and redacted, clean up fully and cannot mutate the inspected Session, hooks or quota except as disclosed. | §4, §6.1 | target | `ACP-ADP-009` |
 | `PRD-ADP-010` | A shared provider RuntimeEndpoint can multiplex independently bound instances/conversations with unique ownership, isolated input/context/transcript/Attention and per-binding recovery/fallback. | §6.2; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §7.4 | target | `ACP-ADP-010` |
+| `PRD-ADP-011` | Provider-native scheduled, recurring and background jobs have stable job/iteration identity, schedule and lifecycle evidence, survive according to provider truth, route Attention normally and expose independent capability-gated controls; Flow recurrence and dismiss/delete remain distinct. | §2.1, §3.1, §6.3 | target | `ACP-ADP-011` |
 
 ## Runtime lifecycle and execution targets
 
@@ -135,10 +143,11 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-LIF-002` | Resume, restart, model/mode switch, branch, interrupt, terminate, kill, recycle and destroy have distinct, idempotent identity/continuity semantics. | §7; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §3.4 | conflict | `ACP-LIF-002` |
 | `PRD-LIF-003` | Create/attach/resume has a durable idempotency key and receipt reporting `created`, `attached`, `recovered`, `refused` or uncertain outcome. | §2.3, §7 | target | `ACP-LIF-003` |
 | `PRD-LIF-004` | Recovery separately specifies UI reload, daemon restart, shell restart, host reboot, disconnect, remote outage and observation-source loss. | §7, §14 | partial | `ACP-LIF-004` |
-| `PRD-LIF-005` | Restore reattaches proved handles but launches nothing from metadata/selection; only a persisted authorised Flow policy may advance work. | §7 | partial | `ACP-LIF-005` |
+| `PRD-LIF-005` | Background restore reattaches proved handles but launches nothing from metadata, child selection or history; only a persisted authorised Flow policy or the separately preflighted foreground Session activation may advance work. | §3.3, §7 | partial | `ACP-LIF-005` |
 | `PRD-LIF-006` | End/delete is operator-authoritative, immediately updates navigation, fences resurrection and reports rather than hides unreachable survivors. | §3.2, §7, §14 | partial | `ACP-LIF-006` |
 | `PRD-LIF-007` | A normative survivor matrix declares Node/instance/attempt/conversation/runtime/PTY/receipt/Attention/grant/message/input-lease outcomes for UI/daemon/shell restart, reboot, disconnect and observation loss. | §7 | target | `ACP-LIF-007` |
 | `PRD-LIF-008` | Target-wide runtime inventory reconciles known attempts and exposes unmatched/orphaned live handles without invented Nodes, with exact adopt/ignore/terminate actions scoped to target+handle+generation. | §7; `PROTOCOL.md` | target | `ACP-LIF-008` |
+| `PRD-LIF-009` | Foreground Session selection restores/attaches and, only under a current fully preflighted activation plan, materialises its bounded eligible saved runtimes or one safe default Shell in the same interaction; every unresolved or changed consequence fails closed with one precise recovery action. | §3.3, §7 | target | `ACP-LIF-009` |
 
 ### Execution targets and resources
 
@@ -154,6 +163,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-RUN-008` | Remote runtime/file/repository transport has pinned or mutual authentication, confidentiality, integrity, replay protection, explicit key rotation/revocation and secret-safe credential storage/diagnostics. | §7, §14; `SECURITY.md` | target | `ACP-RUN-008` |
 | `PRD-RUN-009` | RuntimeBackend, FileBackend and RepositoryBackend are distinct capability seams; every remote file/SCM request binds host/generation/root/revision and outage causes zero same-name local effects. | §7, §11 | target | `ACP-RUN-009` |
 | `PRD-RUN-010` | File editing opens a bounded revisioned snapshot and saves atomically through FileBackend with conflict recovery, root/descriptor confinement, remote identity and no implicit terminal/resource mutation. | §7; `PROTOCOL.md` | target | `ACP-RUN-010` |
+| `PRD-RUN-011` | Inert WebPreview and isolated interactive Browser are distinct capabilities; Browser navigation/history, reviewed popup/download, partitioned storage and reviewed localhost/local-HTML paths cannot acquire ambient credentials, file access or control authority. | §3.1, §11; `SECURITY.md` | target | `ACP-RUN-011` |
 
 ## Context, communication and runtime truth
 
@@ -171,6 +181,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-CTX-010` | Local/remote context acquisition and delivery enforce descriptor/root jails, TOCTOU/symlink/hardlink/mount defenses, authenticated encrypted anti-replay transport, non-executable framing and canary-proved redaction. | §8; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §7 | target | `ACP-CTX-010` |
 | `PRD-CTX-011` | AgentMessage has one closed transport state machine, structured endpoint only, exact queue/byte/TTL/input gates and no retry after ambiguous submission; read and acted remain separate. | §5.3 | target | `ACP-CTX-011` |
 | `PRD-CTX-012` | ContextLink may use an exact Note Resource as a pinned or explicitly reviewed live brief with author/schema/revision/budget bounds; edits never widen/reset authority and every disclosed revision is audited. | §8; `AGENT_NODE_VIEWS_AND_CONTEXT.md` §7.1 | target | `ACP-CTX-012` |
+| `PRD-CTX-013` | A private bounded ConversationInventory searches and pages exact provider/profile/target history, reports coverage/freshness, enforces installation-wide current ownership and keeps adopt, resume and similarity matching distinct without launching implicitly. | §6.2, §7; `PROTOCOL.md` | target | `ACP-CTX-013` |
 
 ### Runtime truth and telemetry
 
@@ -184,6 +195,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-OBS-006` | Collection is independent, bounded, cache-aware and demand-driven so unavailable telemetry cannot stall input or node selection. | §9 | target | `ACP-OBS-006` |
 | `PRD-OBS-007` | Telemetry may show safe names/typed modes but never credential values, raw environment content or secrets parsed from commands/output. | §9, §14 | partial | `ACP-OBS-007` |
 | `PRD-OBS-008` | Account profiles have isolated external auth/config roots and foreground create/adopt/auth/validate/default/retire/delete lifecycle; launch freezes the resolved account and default changes never migrate or cross-contaminate active instances. | §9; `PROTOCOL.md` | target | `ACP-OBS-008` |
+| `PRD-OBS-009` | Provider conversation title read and rename are separate capability facts and operations; rename is revision-fenced and receipt-backed, and either function degrades independently without invented success. | §6.1–6.2, §9 | target | `ACP-OBS-009` |
 
 ## Attention and operator input
 
@@ -199,6 +211,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-ATT-008` | Desktop, compact HUD and authenticated remote/mobile companions project the same queue/revisions and have explicit action-capability limits. | §10 | target | `ACP-ATT-008` |
 | `PRD-ATT-009` | Attention admits actionable evidence only and specifies deduplication, safety-class ageing/no-starvation, snooze, dismiss, mute, cooldown and field-level Global→Workspace→Template→Session policy. | §10; `ATTENTION_ACCEPTANCE.md` | partial | `ACP-ATT-009` |
 | `PRD-ATT-010` | Node-less or owner-less evidence routes to an exact revisioned ProvisionalAttentionView without inventing a Node, borrowing input ownership or allowing stale submission. | §10; `ATTENTION_ACCEPTANCE.md` | partial | `ACP-ATT-010` |
+| `PRD-ATT-011` | A remote/full/companion surface may answer only an exact typed permission through a single-use foreground-issued E2EE revision-fenced grant; secrets, administration, trust and authority remain local, and raw remote input cannot bypass a known sensitive interaction. | §10, §14; `SECURITY.md` | target | `ACP-ATT-011` |
 
 ## Local voice
 
@@ -225,7 +238,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-SAF-009` | Optional operator sharing is separately granted, end-to-end encrypted and scope-bound; ephemeral presence never grants input, control, credentials or checkout authority. | §14 | target | `ACP-SAF-009` |
 | `PRD-SAF-010` | Multi-client sync fixes generation/revision/watermark/ack/gap/compaction semantics, per-object conflict rules and permanent deletion fences; offline drafts never replay as mutations without revalidation. | §14; `PROTOCOL.md` | target | `ACP-SAF-010` |
 | `PRD-SAF-011` | Portable imports use package-local ids, remint every local semantic id, omit runtime/authority/machine ids and cannot collide with, update or resurrect existing objects. | §14 | target | `ACP-SAF-011` |
-| `PRD-SAF-012` | Companion actions are a closed revision-fenced set with expiry/receipts/offline refusal; permissions, secrets, authority, destructive lifecycle, host trust and repository integration stay desktop-foreground-only. | §10, §14; `PROTOCOL.md` | target | `ACP-SAF-012` |
+| `PRD-SAF-012` | Companion actions are a closed revision-fenced set with expiry/receipts/offline refusal; only an exact separately granted typed permission response may be remote, while secrets, authority, administration, destructive lifecycle, host trust and repository integration stay desktop-foreground-only. | §10, §14; `PROTOCOL.md` | target | `ACP-SAF-012` |
 | `PRD-SAF-013` | Retention is numerically bounded for Flow revisions, sync journals, status/diagnostics, input leases and share metadata; compaction preserves stale-client resurrection fences and deletion/export proof. | §14; `PRIVACY.md` | target | `ACP-SAF-013` |
 
 ### Scale and quality
@@ -241,6 +254,7 @@ to become `implemented`; the specification gate deliberately permits honest gaps
 | `PRD-SCL-007` | Scale evidence uses a fixed minimum host/build profile, 30-minute sustained plus burst workload and numeric memory/disk/queue limits; pressure covers GPU, memory, PTY, descriptors, processes, disk/journal, hooks, remote and collectors. | §13; `PERFORMANCE.md` | target | `ACP-SCL-007` |
 | `PRD-SCL-008` | Detailed accessibility acceptance covers every NodeKind WorkSurface, catalog, Flow/Team controls, diagnostics, status/HUD, file/SCM/conflict views, remote writer handoff and companions with keyboard/screen-reader/focus oracles. | §13; `ACCESSIBILITY_ACCEPTANCE.md` | target | `ACP-SCL-008` |
 | `PRD-SCL-009` | A full authenticated remote/headless operator surface can use the canonical hierarchy, views, flows, terminal streams and Attention protocol with identical revision/recovery semantics while server-side desktop-only authority remains unavailable. | §14; `PROTOCOL.md` | target | `ACP-SCL-009` |
+| `PRD-SCL-010` | Desktop and companion project usage, context and bounded activity inbox per exact AccountProfile/target with independent freshness/coverage and never turn absence, partial pages or errors into false zero. | §9–10; `PERFORMANCE.md`, `PRIVACY.md` | target | `ACP-SCL-010` |
 
 ## Completeness rule
 

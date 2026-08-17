@@ -46,8 +46,9 @@ terminal contract. Screen-reader, contrast, motion and zoom evidence is recorded
 
 ADR-064 does not add provider-specific rendering paths. It adds authority tests around the same PTY:
 
-1. A foreground Session with a current proved-safe activation plan can restore/attach and, when empty, start
-   its configured default Shell as part of selecting that Session. This is one typed idempotent Session
+1. A foreground Session with a current proved-safe activation plan can restore/attach and start its exact
+   bounded eligible saved-runtime descriptor set—or, when empty, its configured default Shell—as part of
+   selecting that Session. This is one typed idempotent Session
    activation, not terminal output inference. Selecting a terminal child, historical conversation, Web
    Resource, Browser, WorkItem or Job iteration starts and submits zero bytes.
 2. An inert `WebPreview` is not a terminal or a browser: its renderer has no script, forms, navigation,

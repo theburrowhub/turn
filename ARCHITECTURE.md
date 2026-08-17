@@ -1415,6 +1415,14 @@ an Agent view never claims ownership of the Shell's PTY or Pane. Returning to th
 unchanged Layout. The existing inspector becomes an internal details region instead of a second right-hand
 destination.
 
+The primary foreground Session gesture is a revision-fenced `activate_session`, not a view-side spawn. In
+one operation the daemon opens the saved Layout and materialises every complete safe runtime descriptor, or
+one policy-resolved default Shell when no runtime exists. No follow-up “Start pane” action is part of the
+normal path. Restore, hover, background clients, derived projections and child selection cannot activate.
+Preflight proves foreground surface generation, checkout/worktree identity and lease, local target/profile,
+command completeness and policy safety before the first external effect; missing, remote/offline, changed,
+unsafe or recovery-ambiguous inputs return a typed blocked reason and create no process or partial Layout.
+
 Runtime identity splits into `AgentInstance` (stable semantic history), `RuntimeAttempt` (one launch/resume or
 verified in-place configuration epoch), provider conversation/thread, PTY/runtime binding and Pane binding. Every agentic Node
 owns exactly one instance, with at most one current attempt; Node/instance pairs and attempt generations are
@@ -1423,7 +1431,7 @@ semantic node only with verified provider-conversation continuity; a fresh or un
 creates a new Node/instance with lineage. Immutable launch
 specification and receipt values keep requested, effective and current model/account/permission/sandbox/
 flags/host/worktree facts distinct, with source, confidence, observation time and unknown/stale state.
-Selection launches nothing; warm attachment only connects a view to an already live attempt. Launch/resume
+Node selection launches nothing; warm attachment only connects a view to an already live attempt. Launch/resume
 epochs carry immutable launch specs/receipts; an in-process model switch instead carries a verified
 configuration-transition receipt and transfers the same process/conversation binding under a new fence.
 
@@ -1474,9 +1482,18 @@ dedicated semantic handoff-body record. Delivered bytes may still persist downst
 and ADR-052 terminal history, which review discloses. Remote context reads execute through a source-host jail
 and never fall back to a same-named local path. The complete data shapes, lifecycle and adversarial
 acceptance are in `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`. Offline remote files remain reported
-`pending_purge` behind bounded tombstones until authenticated host/generation cleanup proof. Initial Web
+`pending_purge` behind bounded tombstones until authenticated host/generation cleanup proof. Initial WebPreview
 resources keep their full URL as private content and pin every request/redirect to an address from a wholly
 public validated DNS answer set.
+
+`WebPreview` and `Browser` are distinct resource kinds. WebPreview is inert, has no scripts, cookies,
+storage, ambient credentials, navigation or popup capability and cannot be promoted merely by selecting it.
+Browser is an explicitly created, process-isolated Node with an isolated cookie/storage partition, bounded
+per-node history and revision-fenced navigation receipts. Popups are blocked unless the operator reviews and
+creates a separate Browser child; opener authority is not inherited. Network access to loopback/private
+origins and loading local HTML are denied by default and require a narrowly reviewed exact-origin or
+descriptor-fenced file capability; redirects, subresources and later navigation are revalidated without
+grant widening.
 
 ### 6.5 Accepted local voice-input architecture
 
@@ -1525,14 +1542,14 @@ The cross-layer ownership is fixed before implementation:
 
 | Layer | New authority and responsibility |
 | --- | --- |
-| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun ids; independent relationship graphs; WorkItemState, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant state machines; normalized topology, lifecycle, observation and Attention invariants. |
-| `turn-agents` | Open adapter registry, capability vocabulary, provider event normalization, launch/control operations, transcript/context/usage sources, shared RuntimeEndpoint bindings isolated by profile/conversation and integration diagnostics. Provider dialects end here. |
+| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun/native-job ids; independent relationship graphs; WorkItemState/WorkItemSource, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant state machines; normalized topology, lifecycle, observation and Attention invariants. |
+| `turn-agents` | Open adapter registry, capability vocabulary, provider event normalization, launch/control operations, bounded conversation/job inventory, transcript/context/usage/title sources, separately receipted provider rename and shared RuntimeEndpoint bindings isolated by profile/conversation. Provider dialects end here. |
 | `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles; process evidence is provisional semantic evidence. |
 | FileBackend / RepositoryBackend | Separately capability-gated local/remote confined file and SCM effects with host/generation/root/revision-bound receipts; FileBackend open/save is revisioned CAS with conflict and zero overwrite; access is never inferred from RuntimeBackend. |
-| `turn-store` | Append-only identities, graph revisions, immutable Flow runs/receipts, non-secret account profiles, endpoint bindings, Resource revisions/provenance, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
-| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces; no provider-specific UI messages. |
+| `turn-store` | Append-only identities, graph revisions, immutable Flow runs/receipts, non-secret account profiles, endpoint bindings, Resource revisions/provenance, bounded inventory/work-item caches, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
+| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces, plus an encrypted revision-fenced remote response envelope; no provider-specific UI messages. |
 | `turnd` | Single writer and reconciliation authority; preflight/provision sagas; Flow scheduling; adapter/runtime dispatch; exact Attention routing; independent bounded collectors; authoritative multi-client snapshot/journal. |
-| `turn-gui` | One canonical hierarchy and WorkSurface; catalog-driven creation; Agent/Tool/Flow/resource views; derived board and runtime Recovery View; integration/runtime truth; bottom status; no scheduling, provider inference or duplicated business rules. |
+| `turn-gui` | One canonical hierarchy and WorkSurface; catalog-driven creation; Agent/Tool/Flow/resource views; derived board, work-item and runtime Recovery Views; integration/runtime truth; bottom status; no scheduling, provider inference or duplicated business rules. |
 | remote/headless clients | Full capability-negotiated projections over the same snapshot/journal/routes; server policy refuses every desktop-only authority operation. |
 | companions | Reduced closed-action projections of daemon queue/revisions over authenticated encrypted channels; never another state or Attention authority. |
 
@@ -1551,6 +1568,30 @@ never invents Nodes for unmatched handles and adopts, ignores or terminates only
 target+handle+generation. AccountProfile stores only non-secret identity/external references, isolates auth,
 config, cache and quota roots, and never falls back or migrates active instances after a default change.
 
+An adapter's private `ConversationInventory` is scoped to one provider, AccountProfile and target. It exposes
+only bounded metadata needed for a paged search, with opaque cursors, cache TTL/byte/result limits, provenance
+and match confidence. Adopt/resume requires a foreground review and a second exact-identity probe; a stale or
+ambiguous match cannot launch, bind or cross a profile. Raw transcript bodies are neither indexed nor stored
+by this inventory.
+
+Provider-native scheduled, recurring and background work is observation, not a synthetic Flow. Its stable
+native job identity owns ordered iteration identities plus schedule, next-run, lifecycle and survival evidence
+across UI/daemon absence. Discovery and `pause`, `resume`, `run_now`, `cancel_iteration` and `delete_job` are
+separate adapter capabilities with revision-fenced receipts and explicit unsupported/unknown degradation.
+Dismissing its Attention/unread activity changes only that projection and never cancels or deletes the job.
+
+Provider title observation and provider conversation rename are also distinct capabilities. Observed titles
+retain source/freshness and cannot override a user alias. Rename binds profile, conversation, attempt and
+expected provider revision and becomes effective only with an acknowledgement receipt; unsupported or
+uncertain rename leaves the provider untouched and may create only a labelled local alias.
+
+`WorkItemSource` adapters map stable source/profile/item identity to canonical Node ids through declarative
+field mappings. Snapshot and delta sync are cursor-based, bounded and rate-limited; every cached field keeps
+source revision, trust and freshness. Mutations use compare-and-swap against the observed source revision.
+Rate limiting pauses sync without erasing state, and remote divergence stores both versions as a conflict for
+operator resolution rather than choosing a winner. Imported content is inert and cannot emit lifecycle,
+dependency, runtime or Attention transitions.
+
 Flow provisioning is an idempotent daemon saga. It reserves semantic identity and operation ids before
 external effects, writes each effect receipt, adopts only the preassigned runtime on uncertain response and
 never replays an ambiguous write. Dependencies are evaluated asynchronously from durable result revisions.
@@ -1568,8 +1609,19 @@ One runtime input/resize lease has a 15-second TTL/5-second renewal and explicit
 draft bytes never transfer between clients.
 
 Full remote/headless clients reuse those exact snapshots, journals, Node subscriptions and Attention routes.
-They do not share the companion's reduced API, but permission/credential/grant/host-trust/destructive/
-repository-integration operations remain desktop-only and are rejected by the daemon, not merely hidden.
+The companion keeps a reduced closed API. Either may answer a permission only when a foreground local
+operator has issued one short-lived grant bound to client/surface generation, Workspace/Session, request
+class and expiry. The authenticated end-to-end encrypted response envelope binds grant, pending request id
+and revision, exact typed answer, nonce and operation id; daemon compare-and-swap rejects expiry, replay,
+stale requests and grant widening and journals one terminal receipt. Credential entry, AccountProfile/auth
+mutation, grant administration, host trust, destructive control and repository integration remain local and
+are rejected by the daemon, not merely hidden.
+
+Companion usage, context and activity-inbox payloads are bounded per AccountProfile and carry observation
+source, scope, coverage and freshness. Unknown, partial, stale, unavailable and unsupported are wire states,
+never coerced to zero; cross-profile aggregation is absent unless each component remains visible. The
+activity inbox is a filtered projection of canonical Attention and unread revisions: dismissing or reading
+there cannot resolve an Agent demand, delete a native job or create a second queue.
 
 `docs/OPERATOR_CONTROL_PLANE.md` defines the complete domain and behavior. The frozen requirement inventory
 and exact proof matrix are machine-checked by `make product-spec-acceptance`. That check proves specification

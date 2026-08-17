@@ -139,11 +139,19 @@ expect_rejected 'normative prose mutation' E_AUTHORITY_CONTENT run_spec "$normat
 
 decision_mutation="$scratch/decision-mutation"
 clone_case "$baseline" "$decision_mutation"
-awk '/## ADR-063 / { print; print "\nUnfrozen weakening."; next } { print }' \
+awk '/## ADR-064 / { print; print "\nUnfrozen weakening."; next } { print }' \
   "$decision_mutation/DECISIONS.md" >"$decision_mutation/DECISIONS.new"
 replace_file "$decision_mutation/DECISIONS.md" "$decision_mutation/DECISIONS.new"
 commit_case "$decision_mutation" 'mutate an originating decision'
 expect_rejected 'originating decision mutation' E_AUTHORITY_CONTENT run_spec "$decision_mutation"
+
+transitive_decision_mutation="$scratch/transitive-decision-mutation"
+clone_case "$baseline" "$transitive_decision_mutation"
+awk '/## ADR-040 / { print; print "\nUnfrozen transitive weakening."; next } { print }' \
+  "$transitive_decision_mutation/DECISIONS.md" >"$transitive_decision_mutation/DECISIONS.new"
+replace_file "$transitive_decision_mutation/DECISIONS.md" "$transitive_decision_mutation/DECISIONS.new"
+commit_case "$transitive_decision_mutation" 'mutate an earlier transitive decision'
+expect_rejected 'transitive decision mutation' E_AUTHORITY_CONTENT run_spec "$transitive_decision_mutation"
 
 origin_swap="$scratch/origin-swap"
 clone_case "$baseline" "$origin_swap"
@@ -210,7 +218,7 @@ awk '!/`PRD-OUT-001`/' "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" >"$coedit
 replace_file "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" "$coedited_delete/docs/requirements.new"
 awk '!/`ACP-OUT-001`/' "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" >"$coedited_delete/docs/acceptance.new"
 replace_file "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" "$coedited_delete/docs/acceptance.new"
-awk '{ gsub(/expected_requirement_count=136/, "expected_requirement_count=135"); gsub(/expected_acceptance_count=136/, "expected_acceptance_count=135"); print }' \
+awk '{ gsub(/expected_requirement_count=144/, "expected_requirement_count=143"); gsub(/expected_acceptance_count=144/, "expected_acceptance_count=143"); print }' \
   "$coedited_delete/scripts/verify-product-spec.sh" >"$coedited_delete/scripts/verifier.new"
 replace_file "$coedited_delete/scripts/verify-product-spec.sh" "$coedited_delete/scripts/verifier.new"
 refreeze_case "$coedited_delete"
@@ -257,6 +265,7 @@ build_completion_fixture() {
 : "${TURN_PRODUCT_ACCEPTANCE_TOKEN:?}"
 : "${TURN_PRODUCT_ACCEPTANCE_TARGET:?}"
 [[ "$TURN_PRODUCT_ACCEPTANCE_TARGET" == "$expected_target" ]]
+[[ -f crates/product-fixture/src/lib.rs ]]
 mkdir -p "$TURN_PRODUCT_ACCEPTANCE_ROOT/.oracle-invocations" \
   "$TURN_PRODUCT_ACCEPTANCE_ROOT/$TURN_PRODUCT_ACCEPTANCE_TARGET"
 printf '%s' "$TURN_PRODUCT_ACCEPTANCE_TOKEN" \
@@ -440,6 +449,13 @@ rebind_first_requirement "$completion_ignored_input"
 printf '%s\n' 'influence.flag' >>"$completion_ignored_input/.git/info/exclude"
 printf '%s\n' 'caller-only ignored input' >"$completion_ignored_input/influence.flag"
 expect_rejected 'caller ignored input isolation' E_ORACLE_NOT_INVOKED run_completion "$completion_ignored_input"
+
+completion_revision_switch="$scratch/completion-revision-switch"
+clone_case "$completion_good" "$completion_revision_switch"
+printf '%s\n' 'git checkout --quiet --detach "$(git rev-list --max-parents=0 HEAD)"' \
+  >>"$completion_revision_switch/scripts/product-acceptance/acp-adp-001.sh"
+rebind_first_requirement "$completion_revision_switch"
+expect_rejected 'oracle checkout revision switch' E_ORACLE_REVISION run_completion "$completion_revision_switch"
 
 completion_dirty="$scratch/completion-dirty"
 clone_case "$completion_good" "$completion_dirty"

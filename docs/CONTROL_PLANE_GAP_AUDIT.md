@@ -6,10 +6,10 @@ product documents, followed by cross-checking against the frozen product invento
 **Conclusion:** the v0.1 foundation is real; the complete operator-control-plane product is not implemented
 
 This report exists to prevent specification work from being mistaken for product completion. At the audited
-commit the inventory classifies 4 requirements as baseline, 43 partial, 72 accepted target and 17 in direct
+commit the inventory classifies 4 requirements as baseline, 43 partial, 80 accepted target and 17 in direct
 conflict with current behavior. `make product-spec-acceptance` reproduces the current count, verifies the
 versioned semantic-hash manifest and proves every row has one proof obligation; it does not turn the latter
-132 rows into implemented features.
+140 rows into implemented features.
 
 ## Critical observed gaps
 
@@ -28,6 +28,12 @@ versioned semantic-hash manifest and proves every row has one proof obligation; 
 | Local voice is specification only | `docs/LOCAL_VOICE_INPUT.md` explicitly states not implemented; no SpeechWorker/DictationTarget/model operations exist. | Packaged on-device worker, verified optional models, exact memory-only review target and zero Attention/control authority. |
 | Multi-client/remote collaboration is not authoritative | The v0.1 socket supports clients but has no full snapshot+journal conflict model, durable tombstones, runtime input lease or scoped encrypted operator sharing. | Revisioned reconnect and conflict rules, one visible writer, capability-separated companions/sharing. |
 | Primary `main` is an allowed v4 worker target | `CreateSession` defaults to `main_checkout`, current protocol exposes acquisition and legacy sessions may retain the write lease. | Every creation/lifecycle writer path resolves a dedicated worktree; legacy mode is migration-only and release proof finds zero primary-path workers/locks. |
+| Foreground activation still needs a second action | Restored/stopped content can surface a start affordance and selection is not backed by a safe revisioned activation plan. | One Session selection restores/attaches and may start its exact bounded eligible saved descriptors or one preflighted safe default Shell; every changed consequence fails closed. |
+| External issue/work sources are not modeled | Board metadata is local; no source identity, paging, cache coverage, revisioned writes or conflict/reconciliation adapter exists. | Canonical WorkItems with source/field authority, bounded sync, CAS writes, close/reopen and credential-safe conflict handling. |
+| Provider-retained conversations and jobs are invisible | Runtime discovery covers live handles only and Turn has no provider-native job or historical conversation identity. | Private bounded ConversationInventory plus stable provider Job/Iteration objects, independent adopt/resume/control and honest survival/coverage. |
+| Web content has no interactive isolated counterpart | Resource Web semantics are inert and there is no Browser object with origin, storage, popup/download or reviewed local/loopback policy. | Separate inert WebPreview and isolated Browser Node whose untrusted content has no control authority. |
+| Remote permission handling is all-or-nothing | Companion/full remote cannot answer typed permissions safely; raw PTY input could bypass a superficial deny list. | One exact foreground-issued E2EE response grant, revision fencing and raw-input block at known sensitive interactions; secrets/admin/trust remain local. |
+| Conversation titles and profile activity are underspecified | Read/rename are not distinct capabilities and companion usage/history can lack profile/coverage/freshness truth. | Separate read/rename receipts and per-profile context/quota/activity projections that never invent zero. |
 
 ## What the integrated specification now closes
 
@@ -44,13 +50,19 @@ versioned semantic-hash manifest and proves every row has one proof obligation; 
 - Flow lifecycle/recurrence/wire operations, deterministic tree placement, context authority, message state,
   remote security/backends, Attention policy, companion actions, sync/conflict/import, setup, status,
   accessibility, retention and fixed-profile scale all have explicit falsifiable contracts.
+- ADR-064 adds separately falsifiable foreground Session activation, external WorkItemSource, provider-native
+  jobs, ConversationInventory, WebPreview/Browser, title read/rename, delegated typed remote permission and
+  profile-scoped companion activity contracts rather than hiding them inside broad feature rows.
 - Every frozen requirement maps one-to-one to an acceptance oracle, including every named cross-feature journey.
-- CI supplies a protected authority pin and runs traceability plus adversarial mutations. Paired deletion,
+- CI requires an out-of-band authority pin and runs traceability plus adversarial mutations. Paired deletion,
   fully co-edited deletion/weakening, origin swaps, requirement/oracle weakening, malformed cells and dirty,
   untracked or symlinked authority all fail for their exact expected reason. Separate SHA-1/SHA-256
   transition fixtures require all-`implemented` inventory, commit-bound production/oracle sources and fresh
   exact artifacts from an isolated checkout; no-op, stale, path-traversal, wrong-hash, extra-file/FIFO and
   caller-input attacks are rejected.
+- The protected pin cannot authenticate a workflow that a malicious PR is itself permitted to replace. The
+  merge policy must require an externally identified workflow/ruleset or a trusted workflow/authority diff;
+  the checked-in gate is deliberately not described as a self-protecting trust anchor.
 
 ## What remains unproved
 
@@ -73,6 +85,6 @@ git grep -nE 'ACP-[A-Z]+-[0-9]{3}' -- docs/CONTROL_PLANE_ACCEPTANCE.md
 git status --short
 ```
 
-The first command must report 136 requirements, 136 proof obligations, the exact manifest revision and the
+The first command must report 144 requirements, 144 proof obligations, the exact manifest revision and the
 honest current-state distribution above. The last command is included so an audit records the exact tree
 whose claims it evaluated.

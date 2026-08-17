@@ -14,8 +14,8 @@ authority_pin="$repo_root/docs/PRODUCT_SPEC_V1.sha256"
 decisions="$repo_root/DECISIONS.md"
 mode=${1:-verify}
 
-expected_requirement_count=136
-expected_acceptance_count=136
+expected_requirement_count=144
+expected_acceptance_count=144
 
 die() {
   code=$1
@@ -49,6 +49,7 @@ normative_paths() {
     README.md \
     PRODUCT.md \
     ARCHITECTURE.md \
+    DECISIONS.md \
     Makefile \
     ROADMAP.md \
     .github/workflows/ci.yml \
@@ -81,6 +82,9 @@ normative_paths() {
 
 origin_for_id() {
   case "$1" in
+    PRD-VIE-012|PRD-ADP-011|PRD-LIF-009|PRD-RUN-011|PRD-CTX-013|PRD-OBS-009|PRD-ATT-011|PRD-SCL-010)
+      printf '%s\n' ADR-064
+      ;;
     PRD-VIE-011|PRD-FLW-012|PRD-ADP-010|PRD-LIF-008|PRD-RUN-010|PRD-CTX-012|PRD-OBS-008|PRD-SCL-009)
       printf '%s\n' ADR-063
       ;;
@@ -362,7 +366,7 @@ emit_authority() {
     fi
     printf 'file\t%s\t%s\t%s\n' "$format" "$path" "$digest"
   done < <(normative_paths)
-  for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063; do
+  for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064; do
     printf 'section\t%s\tDECISIONS.md\t%s\n' "$decision" "$(decision_section_hash "$decision")"
   done
   sort "$scratch/manifest-origins" | while IFS=$'\t' read -r id decision; do
@@ -406,7 +410,7 @@ sort "$scratch/manifest-origins" >"$scratch/sorted-manifest-origins"
 diff -u "$scratch/authority-origins" "$scratch/sorted-manifest-origins" >/dev/null ||
   die E_ORIGIN "manifest decisions differ from frozen requirement origins"
 
-for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063; do
+for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064; do
   section="$scratch/$decision.section"
   awk -v heading="## $decision " '
     index($0, heading) == 1 { active=1 }

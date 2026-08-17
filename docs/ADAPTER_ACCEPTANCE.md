@@ -83,7 +83,7 @@ The shared manifest has exactly one row for each canonical capability below. A p
 | `native_jobs` | Provider-owned scheduled, recurring or background job plus iteration identities, lifecycle, schedule and exact control receipts; never inferred from a Turn Flow. |
 | `conversation_inventory` | Profile/target-scoped history enumeration, bounded pagination/search, freshness, exact identity matching and adopt/resume eligibility. |
 | `title_read` | Bounded provider-title observation with source revision/freshness and an explicit unavailable state, independent of rename support. |
-| `rename` | Revision-fenced provider rename with requested/effective receipt and zero-effect refusal, independent of title-read support or Turn's local display alias. |
+| `conversation_rename` | Revision-fenced provider rename with requested/effective receipt and zero-effect refusal, independent of title-read support or Turn's local display alias. |
 
 The fixture manifest is bijective with these rows and the production capability manifest. Shared fixtures,
 provider fixtures, degraded/unsupported/unknown fixtures and live evidence all use the same identifiers.
@@ -142,29 +142,31 @@ operation id. Unsupported or mismatched calls fail before side effects. The daem
 Attention reducers contain no provider-name re-check after registry selection. Question/permission answers,
 messaging, context transfer, durable attach, delegated control, native-job control, conversation adoption/
 resume and rename likewise select their typed method from the current capability intersection plus authority;
-no operation silently falls back to PTY text. `title_read` and `rename` are dispatched and degraded
+no operation silently falls back to PTY text. `title_read` and `conversation_rename` are dispatched and degraded
 independently: a locally edited display alias never counts as a provider rename, and a provider rename receipt
 never fabricates the ability to read the effective provider title.
 
 ### Foreground Session activation
 
 `ACP-LIF-009` removes the generic secondary “start pane” interaction without making selection a broad launch
-capability. Exactly one foreground selection of a canonical Session row resolves its current eligible
-foreground child, or a declared default Shell when the Session has none, and automatically performs the one
-safe attach/start operation. Tree expansion, hover/preview, search results, references, restore, reconnect,
+capability. Exactly one foreground selection of a canonical Session row resolves its bounded eligible saved-
+runtime descriptor set, or a declared default Shell when the Session has none, and automatically performs
+the preflighted attach/start plan. Tree expansion, hover/preview, search results, references, restore, reconnect,
 Attention routing and background sync are not foreground selections and perform zero launch/attach effects.
 
-Before any process effect, one revision-fenced preflight resolves and freezes the Session, selected/default
-Node, WorkSurface, ExecutionTarget, cwd/worktree containment, write lease, AccountProfile where applicable,
+Before any process effect, one revision-fenced preflight resolves and freezes the Session, bounded
+descriptor/default set, WorkSurface, every ExecutionTarget, cwd/worktree containment, write lease and
+AccountProfile where applicable,
 adapter/version/capability generation, effective argv/environment policy and current operator authority. A
 missing or stale fact refuses before spawn and leaves selection usable; the exact reason and recovery appear
 in the WorkSurface and bottom status history, not behind a generic start button. The preflight operation id
-and reserved attempt identity make rapid reselection/reconnect idempotent. An ambiguous spawn is reconciled
-against that identity and is never repeated automatically. Existing pending permission, credential,
+and reserved attempt identities make rapid reselection/reconnect idempotent. An ambiguous spawn is reconciled
+against its identity and is never repeated automatically. Existing pending permission, credential,
 destructive or host-trust work is surfaced through Attention and cannot be bypassed by autoactivation.
 
-The acceptance fixture selects each of an already-running child, a stopped restorable child, an empty Session,
-a missing executable, a stale profile/capability, a checkout conflict and an uncertain launch. Every eligible
+The acceptance fixture selects Sessions containing an already-running child, several eligible saved/stopped
+descriptors, an empty default-Shell plan, a missing executable, a stale profile/capability, a checkout
+conflict and an uncertain launch. Every eligible
 case needs one selection and zero follow-up actions; every refusal creates zero process effects, never changes
 the requested target, and never offers a provider-generic PTY fallback.
 
@@ -173,8 +175,9 @@ the requested target, and never offers a provider-generic PTY fallback.
 `ACP-VIE-012` is a separate integration-adapter contract; it does not extend an agent's authority. A
 `WorkItemSource` manifest declares source/version, credential-reference kind, supported filters, cursor and
 page limits, rate-limit semantics, writable fields and an exhaustive native-to-`WorkItemState` mapping.
-Each imported item is keyed by `(source_id, external_item_id)`, never title, URL or ordinal. Per-field
-authority is explicit (`source`, `turn` or reviewed `merge`), and unknown native state, assignee or field is
+Each imported item is keyed by `(source_id, source_profile_id, project_namespace, external_item_id)`, never
+title, URL or ordinal. Per-field
+authority is explicit (`source|turn|reviewed_merge`), and unknown native state, assignee or field is
 preserved as unmapped/degraded rather than coerced into a known value.
 
 The source suite exercises initial and incremental sync, saved filter changes, every page boundary, duplicate
@@ -219,7 +222,7 @@ search results never carry body content unless the independent bounded `transcri
 ### Remote permission and Companion observation
 
 `ACP-ATT-011` permits a remote or Companion client to resolve a provider permission only when its negotiated,
-versioned default-deny operation allowlist contains `resolve_permission` and an explicit response grant binds
+versioned default-deny operation allowlist contains `submit_permission_response` and an explicit response grant binds
 client, Workspace/Session, AgentInstance, RuntimeAttempt, interaction id, allowed options and expiry. Only an
 authenticated local foreground operator may issue, expand or revoke that grant. The
 encrypted authenticated request contains the exact typed option, operation id, expected interaction revision,

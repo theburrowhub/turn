@@ -513,7 +513,8 @@ sequence against the real daemon/protocol/store and native WorkSurface:
 ```text
 create Workspace and an inactive Session with a current safe activation plan
 → select the Session once
-→ assert one idempotent activation, restored Layout and one configured default Shell, with no second action
+→ assert one idempotent activation, restored Layout and its exact bounded eligible saved descriptor set (or
+  one configured default Shell when empty), with no second action
 → mutate target/account/authority generation and assert the same selection launches nothing with one recovery
 → connect a paged external WorkItemSource and project one canonical card
 → inject a partial page, an ETag conflict and a timeout-after-possible-close

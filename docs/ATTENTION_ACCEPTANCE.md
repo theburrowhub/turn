@@ -86,8 +86,9 @@ single WorkSurface:
 
 1. Selecting a foreground Session with a current, proved-safe activation plan sends exactly one idempotent
    `activate_session` operation. In the same interaction Turn restores its Layout, attaches proved-live
-   attempts and, only for an empty Session, may start exactly its configured default Shell. Repeated delivery
-   cannot double-start it and no “Start pane” or second confirmation is shown. A stale Session revision,
+   attempts and starts the exact bounded eligible saved-runtime descriptor set—or, only when empty, exactly
+   its configured default Shell. Repeated delivery cannot double-start any attempt and no “Start pane” or
+   second confirmation is shown. A stale Session revision,
    changed target/account/cwd/command/authority, ambiguous survivor, missing containment, permission need or
    unsafe input owner starts zero processes and exposes one precise recovery action in that Session View.
    Background restore, child/resource/history selection and merely viewing an ended Session still launch

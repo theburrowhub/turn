@@ -3270,7 +3270,8 @@ menu, because that is a decision about the pane.
 ## ADR-049 — Coming back to a Session starts it; the daemon still starts nothing on its own
 
 **Status:** Accepted, implemented; its blanket “daemon never sends itself a start request” clause is
-superseded only by ADR-061 for a persisted, still-valid reviewed Flow policy. Overturns the restore half of
+superseded by ADR-061 for a persisted, still-valid reviewed Flow policy, and its v0.1 client fan-out is
+refined by ADR-064 into one foreground, revision-fenced Session activation operation. Overturns the restore half of
 "Turn never relaunches", which was a product rule of this project from its brief onwards.
 
 ### Context
@@ -3316,6 +3317,13 @@ when an immutable restored FlowRun policy, current result, budgets, authority ge
 all prove it was authorised up front. It does not generalise Session activation or metadata restore, and an
 ambiguous effect is never replayed.
 
+ADR-064 preserves the human-foreground boundary and the per-pane `Relaunch` decision while replacing the
+window's v0.1 loop of `RelaunchNode` requests. One explicit Session selection submits one idempotent activation
+plan for the exact current bounded eligible descriptor set—or one commandless default Shell when empty.
+The daemon preflights every descriptor and authority fence before the first effect; a stale, unsafe or
+ambiguous member launches nothing and produces one exact recovery action. Background restore, child selection
+and reconnect still submit no activation.
+
 The **window** acts on it, when it receives the restore report — which is the moment a person has
 opened Turn and asked for that Session. It starts every `auto_start` pane, once, without asking,
 and holds back exactly two cases: a pane that would use the checkout while a write confirmation is
@@ -3338,9 +3346,9 @@ row's contextual `Start again` action without turning every recovered layout int
 - **Downside:** a command-bearing pane left on the default `ReattachOnly` does not start
   automatically, so a hand-built job behaves differently from a template's. The default is the
   cautious one; commandless terminal panes are exempt because their fallback is only a shell.
-- **Downside:** two windows attached to the same Session both act on the report. The second
-  request arrives after the first has started the node and is refused, so the outcome is right and
-  the log carries a refusal nobody asked about.
+- **Historical v0.1 downside, superseded by ADR-064:** two windows attached to the same Session could both act
+  on the report; the second request was refused and produced noise. The vNext operation id plus Session/
+  surface revision makes duplicate activation return the same receipt.
 - **Downside:** this is a product rule reversed under pressure from its owner, on the third
   report. The rule was defensible and the way it was applied was not, and the record should say
   that the owner was right and I was slow.
@@ -4027,6 +4035,10 @@ transfer, shared identity, durable attach and delegated control. The registry is
 seam. Core, store, protocol projections, Attention and UI may not branch on provider names. Generic/custom
 adapters always answer but advertise only proved behavior.
 
+ADR-064 extends that same vocabulary, rather than adding provider branches, with `native_jobs`,
+`conversation_inventory`, `title_read` and `conversation_rename`; the complete closed versioned list is in
+`docs/ADAPTER_ACCEPTANCE.md`.
+
 Subagents are durable semantic nodes with their own identity, lifecycle and result, not renderer-local cards.
 Aggregates declare direct versus descendant scope, graph revision and observation coverage. Exact `0` needs
 a matching complete authoritative snapshot or gap-free sequenced coverage for the exact scope/attempt/
@@ -4093,8 +4105,8 @@ input ownership and recovery truth. A remote surface must consume the same proto
 
 Turn adds the following provider-neutral control-plane objects and operations:
 
-- one-to-many `RuntimeEndpointBinding`s with unique per-generation conversation ownership and isolated
-  input/transcript/context/Attention;
+- one-to-many `RuntimeEndpointBinding`s with installation-wide current ConversationKey ownership while
+  endpoint generations fence transport, plus isolated input/transcript/context/Attention;
 - authenticated target-wide `RuntimeInventoryObservation`s plus exact adopt/ignore/terminate reconciliation;
 - Note-backed ContextLinks with pinned or explicitly reviewed live-revision policies;
 - isolated non-secret `AccountProfile`s with external authentication, launch/default precedence and a
@@ -4103,7 +4115,7 @@ Turn adds the following provider-neutral control-plane objects and operations:
 - canonical work-item metadata projected as board/list/search without another topology or Attention queue;
 - revisioned atomic FileBackend editing with conflict and confinement semantics; and
 - a capability-negotiated remote/headless operator surface over the same hierarchy, WorkSurface, streams,
-  Attention routes and mutation journal, while sensitive desktop-only authority remains server-enforced.
+  Attention routes and mutation journal, while the server enforces its closed remote allowlist.
 
 All of these preserve the same invariant: an observation or piece of content is not authority. Every
 external effect names an exact target, identity, generation, revision and operation id, and every unavailable
@@ -4118,3 +4130,86 @@ capability is shown honestly rather than silently approximated.
 - Account, file, work-item and remote workflows become testable domain behavior instead of renderer state.
 - **Downside:** host inventory, remote clients and account isolation enlarge the security/acceptance matrix.
 - **Downside:** live-note and delegated-resource policies need strict cumulative bounds and revision audits.
+
+---
+
+<a id="adr-064"></a>
+## ADR-064 — Close the remaining operator-loop capabilities as typed first-class contracts
+
+**Status:** Accepted, not yet implemented. Extends ADR-059/061/062/063 after an independent final-reference
+coverage audit rejected the previous specification candidate.
+
+**Requirement scope:** `PRD-VIE-012`, `PRD-ADP-011`, `PRD-LIF-009`, `PRD-RUN-011`, `PRD-CTX-013`,
+`PRD-OBS-009`, `PRD-ATT-011`, `PRD-SCL-010`. The machine-checked one-to-one origin map lives in
+`docs/PRODUCT_SPEC_V1.authority`; moving any requirement to another decision changes the frozen authority
+root.
+
+### Context
+
+The earlier candidate covered the hierarchy, WorkSurface, Attention, Flows, topology, context handoff and
+telemetry, but it still forced avoidable operator actions and left real work outside the model. In
+particular it did not fully specify external work-item sources, provider conversation history, provider-native
+jobs, an interactive Browser, independent title operations, profile-scoped companion activity or a narrowly
+delegated remote permission response. It also said both that selection never starts work and that returning
+to a Session should be immediately useful.
+
+Those are not optional visual extras. An operator supervising many processes needs the default foreground
+Session to become usable in one action, must see provider work that exists outside current runtime handles,
+and must distinguish a local projection from an externally authoritative object. Remote assistance is
+incomplete if every routine typed permission requires returning to the desktop, but unsafe if raw terminal
+input or a broad invitation can answer it.
+
+### Alternatives considered
+
+**Leave these as implementation details beneath existing broad rows.** Rejected. A broad row could pass
+without testing pagination, ambiguous source writes, global conversation ownership, job survival, browser
+origin isolation or permission-grant fencing; the missing behavior would remain invisible to the gate.
+
+**Treat provider-native jobs as recurring Flows and history as RuntimeInventory.** Rejected. Provider jobs
+have provider-owned schedules and iterations that may survive Turn, while historical conversations need no
+live runtime. Combining them would invent identity, lifecycle and cancellation authority.
+
+**Use one generic Web view and raw remote PTY input.** Rejected. Inert reference content and interactive
+browsing have different network/storage/origin consequences, and raw input can bypass a typed sensitive
+interaction contract.
+
+**Keep every permission desktop-only.** Rejected. It creates unnecessary operator polling and movement even
+when the desktop can pre-authorise one exact closed response. Credentials, host trust, administration and
+authority changes still cannot be delegated this way.
+
+### Decision
+
+Turn adds eight separately testable capabilities:
+
+- a WorkItemSource adapter with stable external identity, per-field authority, bounded sync/cache coverage,
+  revision-fenced writes and explicit conflict/reconciliation;
+- provider-native Job/Iteration identity and controls, explicitly distinct from Flow recurrence and from
+  dismissing Turn projections;
+- foreground Session activation that restores/attaches and may materialise only its bounded fully preflighted
+  eligible saved descriptors—or one safe default Shell when empty—in the same selection, otherwise failing
+  closed with one precise recovery action;
+- separate inert WebPreview and isolated interactive Browser semantics, including reviewed local HTML and
+  loopback origins, navigation/history, popup/download and storage policy;
+- a private bounded ConversationInventory with search/pagination, global ConversationKey ownership and
+  separate adopt/resume operations;
+- independent `title_read` and `conversation_rename` capabilities with revisioned receipts and degradation;
+- a single-use, foreground-issued, end-to-end encrypted typed remote permission response grant, with raw
+  remote input blocked at a known sensitive interaction and all secret/admin/trust/grant authority retained
+  locally; and
+- AccountProfile-scoped context, quota and activity projections shared by desktop/companion, preserving
+  freshness/coverage and never converting missing or partial evidence into zero.
+
+Every object remains in the canonical tree or a projection of it, every selection routes to the one
+WorkSurface, and every actionable event enters the same Attention Queue. No new canvas, runtime identity or
+independent notification queue is introduced.
+
+### Consequences
+
+- External and provider-retained work can be discovered and controlled without identity or authority lies.
+- Common safe foreground activation and narrowly delegated permissions reduce operator interactions while
+  preserving explicit failure and review boundaries.
+- Web/browser, Flow/job, runtime/history and read/rename pairs can degrade independently and be tested
+  independently.
+- **Downside:** adapters now need more granular capabilities, live evidence and conflict fixtures.
+- **Downside:** browser origins, external-source reconciliation and remote response grants substantially
+  enlarge security, privacy, performance and packaged accessibility acceptance.

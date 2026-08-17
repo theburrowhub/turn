@@ -152,7 +152,8 @@ ADR-064 is a post-v0.1 target and does not change the three-binary acceptance re
 advertises the successor control plane must extend package/preflight/live evidence as follows:
 
 - a fresh packaged foreground Session is selected once under a current safe activation plan and restores/
-  attaches or starts exactly one configured default Shell without a second action. A second fixture changes
+  attaches or starts its exact bounded eligible saved-runtime set—or exactly one configured default Shell
+  when empty—without a second action. A second fixture changes
   target/account/command/authority generation before selection and proves the package starts nothing and
   presents one exact recovery action;
 - every shipped external WorkItemSource and agent adapter records implementation/version/capabilities in

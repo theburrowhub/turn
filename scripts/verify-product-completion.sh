@@ -212,13 +212,17 @@ while IFS=$'\t' read -r id commit target descriptor_path descriptor_hash; do
 
   run_root="$scratch/run-$target"
   mkdir -m 700 "$run_root"
-  token="$head_commit:$target:$$"
+  token=$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || die E_TOKEN "cannot create a random 256-bit oracle token"
   oracle_entrypoint="$oracle_repo/$entrypoint"
-  TURN_PRODUCT_ACCEPTANCE_ROOT="$run_root" \
-  TURN_PRODUCT_ACCEPTANCE_TOKEN="$token" \
-  TURN_PRODUCT_ACCEPTANCE_TARGET="$target" \
-  CARGO_TARGET_DIR="$scratch/cargo-target" \
-    "$oracle_entrypoint" || die E_ORACLE_FAILED "$target failed for $id"
+  (
+    cd "$oracle_repo"
+    TURN_PRODUCT_ACCEPTANCE_ROOT="$run_root" \
+    TURN_PRODUCT_ACCEPTANCE_TOKEN="$token" \
+    TURN_PRODUCT_ACCEPTANCE_TARGET="$target" \
+    CARGO_TARGET_DIR="$scratch/cargo-target" \
+      "$oracle_entrypoint"
+  ) || die E_ORACLE_FAILED "$target failed for $id"
 
   marker="$run_root/.oracle-invocations/$target"
   [[ -f "$marker" && ! -L "$marker" && "$(cat "$marker")" == "$token" ]] ||
@@ -243,6 +247,9 @@ while IFS=$'\t' read -r id commit target descriptor_path descriptor_hash; do
   find "$run_root" -type f ! -path "$run_root/.oracle-invocations/$target" -print | sed "s#^$run_root/##" | sort >"$scratch/$target.actual-artifacts"
   diff -u "$scratch/$target.expected-artifacts" "$scratch/$target.actual-artifacts" >/dev/null ||
     die E_ARTIFACT_SET "$target generated an undeclared or omitted artifact"
+
+  [[ "$(git -C "$oracle_repo" rev-parse HEAD 2>/dev/null || true)" == "$head_commit" ]] ||
+    die E_ORACLE_REVISION "$target changed the isolated checkout away from the completion commit"
 
   [[ -z "$(git -C "$oracle_repo" status --porcelain --ignored --untracked-files=all)" ]] ||
     die E_ORACLE_DIRTY "$target modified its isolated checkout"

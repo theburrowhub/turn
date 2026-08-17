@@ -58,14 +58,6 @@ product-spec-acceptance: ## Verify the frozen semantic inventory, proof mapping 
 product-completion-acceptance: verify ## Require every product requirement to be implemented with evidence
 	./scripts/verify-product-completion.sh
 
-# Every completion proof has one requirement-derived target and one tracked entrypoint.
-# A missing entrypoint is a hard failure; this pattern does not make an unimplemented
-# requirement pass and explicit targets may override it when a proof needs orchestration.
-acp-%:
-	@entrypoint="./scripts/product-acceptance/acp-$*.sh"; \
-	  test -f "$$entrypoint" && test -x "$$entrypoint" || { echo "missing executable $$entrypoint" >&2; exit 1; }; \
-	  "$$entrypoint"
-
 .PHONY: test
 test: ## Run the whole test suite
 	$(CARGO) test --workspace -- --test-threads=$(TEST_THREADS)

@@ -36,8 +36,9 @@ prove:
 
 - applying or selecting a Session created from a Template needs no separate start interaction only when the
   daemon has frozen and preflighted the exact target, AccountProfile, cwd, isolated checkout, command,
-  effective model/flags and authority generation. Exactly one idempotent activation may restore/attach and,
-  for an empty Session, start its one configured default Shell. Any drift or unresolved consequence starts
+  effective model/flags and authority generation. Exactly one idempotent activation may restore/attach and
+  start the exact bounded eligible saved descriptor set—or, for an empty Session, its one configured default
+  Shell. Any drift or unresolved consequence starts
   nothing and produces one consolidated recovery action;
 - a Template can name a WorkItemSource definition only by a non-secret profile reference. It cannot contain
   source credentials, item revisions, assignee authority or an instruction that closes/reopens an external

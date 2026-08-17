@@ -94,8 +94,18 @@ The frozen operator-control-plane specification additionally requires:
 - bounded delegated Resource Node revisions and typed ProgressUpdates with receipts;
 - pinned or explicitly reviewed live Note briefs as ContextLink sources;
 - isolated AccountProfile creation, external authentication, defaults, retirement and deletion;
-- revision-fenced atomic FileBackend editing with truthful conflict recovery; and
-- a full authenticated remote/headless operator surface, distinct from the reduced companion API.
+- revision-fenced atomic FileBackend editing with truthful conflict recovery;
+- a full authenticated remote/headless operator surface, distinct from the reduced companion API;
+- one-action foreground Session activation that safely materialises its saved runtimes or default Shell,
+  while every ambiguous or unsafe case fails closed without a generic start gate;
+- external work-item projections with stable source identity, bounded synchronisation and explicit conflict;
+- separately capable provider-native background jobs, private conversation inventory, title reading and
+  provider rename, each with truthful receipts and degradation;
+- distinct inert WebPreview and isolated interactive Browser Nodes, including reviewed local-content access;
+- revision-fenced encrypted permission responses from an explicitly granted remote/companion client, while
+  credentials and administration remain local; and
+- bounded per-profile companion projections for usage, context and the canonical activity inbox, with
+  source, coverage and freshness that never render unknown as zero.
 
 These are accepted requirements and proof obligations, not claims about the current executable. See
 [docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md).
