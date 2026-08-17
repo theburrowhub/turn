@@ -8,7 +8,8 @@ inspectable result rather than an assumption based on a missing settings screen.
 That is not a claim that an agent supervisor is offline. User-launched provider CLIs can contact their
 configured providers outside Turn. The implemented handoff explicitly submits reviewed content to another
 local Agent. Accepted later features add operator-authorised ContextPacket/ContextLink delivery to a named
-destination instance/provider/host and explicit foreground Web navigation to a validated origin. A custom
+destination instance/provider/host, inert Web preview retrieval and explicit foreground Browser navigation
+to a reviewed origin or local HTML file. A custom
 action can also perform whatever transfer its user-authored command performs. These are functional,
 purpose-bound transfers, not telemetry: before authorisation the UI names destination, data categories,
 scope/budget and known downstream retention, and Turn records bounded metadata/audit where specified. It
@@ -49,7 +50,7 @@ boundary. Unknown or secret Settings values are replaced by `<redacted>`.
 
 ### Accepted control-plane data extension (not yet implemented)
 
-ADR-059/061/062/063 and M11–M17 add categories only after they enter the same closed catalogue:
+ADR-059/061/062/063/064 and M11–M17 add categories only after they enter the same closed catalogue:
 
 - semantic/resource nodes and private Note records;
 - `AgentInstance`, `RuntimeAttempt`, safe `LaunchSpec`/`LaunchReceipt`/`RuntimeConfigurationReceipt` and
@@ -65,8 +66,8 @@ ADR-059/061/062/063 and M11–M17 add categories only after they enter the same 
 - multi-client revision/journal/tombstone records, input-lease history and scoped share invitation/session
   metadata—never invitation secrets, encrypted content keys or presence/typing history;
 - remote-cleanup tombstones and authenticated purge evidence, never bearer/key bytes;
-- File/Diff canonical references and private validated Web URL content, never the referenced file, branch or
-  site payload.
+- File/Diff canonical references and private validated Web/Browser navigation identity, never the referenced
+  file, branch, rendered document or site payload.
 
 ADR-063 adds eight explicitly classified families. None may hide inside a generic JSON/blob column:
 
@@ -80,6 +81,57 @@ ADR-063 adds eight explicitly classified families. None may hide inside a generi
 | Note-backed live brief | private Note body and immutable body revisions required by an active/pinned disclosure, link revision policy and read audit | any additional provider-side copy produced after delivery |
 | AccountProfile | safe provider/profile id, ownership kind, redacted root fingerprints, validation/default/retirement state and active-reference count | credentials, tokens, cookies, raw auth/config files, transcripts and provider conversation bodies |
 | Remote/headless operator | client/session/scope/revision, authentication-method class, lease/route/audit metadata and revocation proof | bearer/session/key bytes, terminal/input/context bodies duplicated for audit, presence and typing history |
+
+ADR-064 adds eight more independently classified families. They do not inherit a broader category merely
+because their UI appears in the same tree or WorkSurface:
+
+| Family | Durable Turn-owned data | Content deliberately not copied into the catalogue |
+| --- | --- | --- |
+| Foreground Session activation | selected Session/Node ids, preflight generation, reserved attempt, safe effective launch receipt and accepted/refused/uncertain outcome | terminal input/output, secret environment expansion, credentials and any second copy of provider configuration |
+| External WorkItemSource | source id/version, credential-reference id, external item identity, field-authority map, filter hash, cursor/watermark, coverage/freshness, mapping version and bounded sync/conflict/write receipts | credential bytes, unselected remote fields, remote attachments, provider response bodies and source-wide issue history |
+| Remote typed permission response | client/grant/interaction/attempt/revision ids, selected closed option, accepted/refused/uncertain receipt, anti-replay/audit metadata and redacted permission kind/risk | bearer/session/key bytes, credential/password answers, raw PTY bytes, unbounded prompt/tool payload and encrypted frame plaintext duplicated for audit |
+| Provider-native job | profile/target/job identity, bounded schedule/time-zone/enabled state, safe iteration identity/state/timestamps, freshness and exact control receipts | job prompt/output/transcript, provider credentials and unrelated provider scheduler data |
+| ConversationInventory | provider/profile/target namespace, stable conversation identity, bounded safe title observation, state/timestamps, page/coverage/freshness and match/adopt/resume receipts | message/transcript bodies, provider search response bodies, credentials and conversations outside the requested profile/target scope |
+| Web preview / Browser | private reviewed origin or canonical local-file identity, content hash/revision where local, isolation policy generation, bounded navigation receipt and blocked-popup/redirect reason | rendered/page body, DOM, script/storage/cookie state, form/input values, downloads, ambient browser history and unreviewed sibling local files |
+| Provider title read/rename | bounded untrusted provider title, source revision/freshness and requested/effective rename receipt, separately from the local display alias | conversation/transcript body and provider response payload beyond the bounded title |
+| Companion profile inbox | AccountProfile/metric scope, bounded context/quota samples, units/windows/reset/freshness, safe activity identity/summary/read state and sync cursor | provider credentials, transcript/prompt bodies, raw provider event payloads and any sibling profile's data |
+
+A WorkItemSource remains an external data owner. Import copies only mapped fields selected by the configured
+filter into the explicitly private WorkItem category; paging and reconciliation do not grant Turn a right to
+export unrelated source fields. The cache stores bounded mapped records and typed coverage, not raw API
+responses. Its credential is a keychain/broker reference and never enters SQLite, filters, cursors or
+diagnostics. Removing a source deletes Turn's cache/configuration only after imported items are explicitly
+kept detached or deleted; it never closes or deletes external items. A Turn close/reopen is an external
+functional mutation only when its separate revision-fenced receipt says so, and privacy deletion never
+silently performs it.
+
+Provider-native jobs and conversations are likewise provider-owned. Turn's dismiss/read-state is local
+metadata and is not provider deletion; provider cancel/disable/delete/rename/resume are explicit functional
+transfers whose target and consequence are named before dispatch. Deleting Turn metadata cannot erase a
+provider transcript, conversation or job. `ConversationInventory` search text and raw result page are
+memory-only; only the bounded mapped metadata rows above enter the cache, and transcript content still needs
+the independent transcript/content authority. Title read and provider rename never change the classification
+of titles as untrusted sensitive metadata.
+
+Web preview and Browser do not share storage. Web is inert and may retain only the validated private URL plus
+a bounded fetch receipt; Browser uses a per-node ephemeral isolated partition with no ambient browser
+profile. DOM, script state, cookies, local/session storage, form values, response bodies, page cache,
+downloads and navigation history are memory-only and destroyed on node close, scope loss or process exit.
+A reviewed local HTML file remains user-owned: Turn records canonical descriptor identity and content hash,
+does not copy the file or adjacent resources, and node deletion never touches it. A future opt-in persistent
+browser profile would be a new catalogue category and cannot ship under this contract.
+
+A remote/Companion permission response intentionally transmits one closed option over the authenticated
+encrypted channel. Encryption is a transport property, not permission to persist plaintext. Server and
+client retain only the bounded receipt/audit fields above; prompt detail and frame bodies are memory-only and
+cleared on resolution, expiry, disconnect or revocation. Credential/password prompts, host trust and grant
+administration remain local-only and have no remotely serialisable answer schema.
+
+Companion usage, context and activity are always keyed by AccountProfile before storage or transmission.
+An unavailable, expired or rate-limited sample is stored as that typed state, never numeric zero. Activity
+summary is bounded/redacted before caching and does not import provider message bodies. Signing out or losing
+scope clears that client's memory cache; server retention follows the exact per-profile controls below and
+cannot be queried through a sibling profile.
 
 An adopted AccountProfile auth/config root remains user/provider-owned external data: Turn may validate and
 use it only through the declared broker/sandbox and never exports, compacts or deletes that root. A root that
@@ -100,9 +152,10 @@ authenticated encrypted connection; the connection screen names server, client, 
 policy. The reduced companion receives only its negotiated projection. All client body caches are bounded,
 memory-only and cleared on scope loss, sign-out or process exit.
 
-Safe account references, provider conversation ids, host, cwd/worktree and link endpoints are sensitive
-metadata. A Web URL is private content, including its path: reports expose only a sanitised origin and
-exports redact the complete URL unless the operator explicitly selects that content category. Report/export
+Safe account references, provider conversation/job/external-item ids, host, cwd/worktree and link endpoints
+are sensitive metadata. A Web or Browser URL is private content, including its path: reports expose only a
+sanitised origin and exports redact the complete URL unless the operator explicitly selects that content
+category. A reviewed local-HTML path is redacted under the same rule. Report/export
 labels origin and scope, applies policy-aware redaction and never exports provider credentials, raw
 environment values or unbounded transcripts. Packet/message drafts are
 memory-only, but delivery—and every unreviewed-per-read ContextLink response authorised by a grant—can make
@@ -129,8 +182,9 @@ history. Provider transcripts are external and reported as outside Turn's deleti
 remote host may likewise retain an owner-only capability/socket/key artifact: delete completes logical
 revocation locally but reports `remote_residual`/`pending_purge`, retains a non-secret cleanup tombstone and
 performs an authenticated exact-host/generation purge when the host reconnects. Only purge proof changes
-that result to physically removed. Removing File/Diff/Web nodes never removes referenced user data or
-performs a Web request. Ending/archive revokes links permanently.
+that result to physically removed. Removing File/Diff/Web/Browser nodes never removes referenced user data,
+site data or provider data and performs no navigation; it clears only Turn's bounded metadata and ephemeral
+Browser partition. Ending/archive revokes links permanently.
 
 Live semantic records are not aged out: active Notes/Teams/dependencies, instances, current/bounded recent
 attempt detail, lineage, scopes and endpoints remain until their explicit owner deletion, under the exact
@@ -186,10 +240,13 @@ Scopes are `installation`, `workspace:<id>`, `session:<id>` and
 currently in force. Export uses owner-only, create-new file semantics: it never follows an existing
 destination symlink and never overwrites a file.
 
-The incompatible M11–M17 privacy protocol adds exact `node:<session-id>:<node-id>`,
+The incompatible M11–M17/ADR-064 privacy protocol adds exact `node:<session-id>:<node-id>`,
 `agent-instance:<id>`, `team:<id>`, `flow-run:<id>`, `note:<id>`, `work-item:<id>`,
-`resource:<id>`, `account-profile:<id>`, `runtime-target:<target-id>:<generation>` and
-`remote-client:<id>` scopes. A child scope includes only records canonically owned by that subject; references
+`work-item-source:<id>`, `resource:<id>`, `native-job:<id>`, `account-profile:<id>`,
+`runtime-target:<target-id>:<generation>` and `remote-client:<id>` scopes. ConversationInventory, provider
+title and Companion metric/activity records are children of their exact `account-profile` scope; Browser/Web
+records are children of their canonical `node` scope. A child scope includes only records canonically owned
+by that subject; references
 owned elsewhere are emitted as redacted links and named as retained external scopes. `runtime-target` export
 contains only Turn's bounded inventory metadata and reconciliation proof, never a fresh target query or raw
 process payload. `account-profile` contains safe metadata and validation receipts, never the auth/config root.
@@ -204,10 +261,12 @@ Selective deletion is authenticated through the live daemon:
 turn --privacy-delete session:sess_ab12
 turn --privacy-delete workspace:ws_ab12 --kill
 turn --privacy-delete agent:sess_ab12:proc_ab12
-# Accepted M11–M17 forms:
+# Accepted M11–M17/ADR-064 forms:
 turn --privacy-delete note:note_ab12
 turn --privacy-delete work-item:item_ab12
+turn --privacy-delete work-item-source:source_ab12
 turn --privacy-delete resource:res_ab12
+turn --privacy-delete native-job:job_ab12
 turn --privacy-delete flow-run:run_ab12
 turn --privacy-delete account-profile:profile_ab12
 turn --privacy-delete remote-client:client_ab12
@@ -231,6 +290,14 @@ removes safe metadata and only a still-matching Turn-created private root, never
 transcript. Remote-client deletion revokes its sessions/leases/capabilities and removes its audit at normal
 retention; it never destroys the Workspace. Runtime-target metadata has no standalone delete operation:
 target forget requires foreground confirmation, fences inventory generation and cannot terminate a runtime.
+
+WorkItemSource deletion revokes its credential reference and sync generation, then removes filter/cursor/cache
+and sync receipts; imported WorkItems require the explicit detach-or-delete choice and no provider item is
+mutated. NativeJob privacy deletion removes only Turn's projection, iteration history and local dismiss state;
+provider cancel/disable/delete is a different typed operation and is never implied. AccountProfile deletion
+also removes its ConversationInventory/title/usage/context/activity cache after fencing live references, but
+cannot delete provider conversations, titles, activity, quota history or jobs. Browser/Web node deletion
+clears the ephemeral Browser partition and bounded receipts without touching a local HTML file or origin.
 
 Installation deletion is offline because a process must not unlink its own open database:
 
@@ -266,12 +333,14 @@ The Settings hierarchy exposes these controls under **Records**:
 | `records.terminal_checkpoint_mib` | 4 MiB per Pane | Global |
 | `records.daemon_log_mib` | 4 MiB | Global |
 
-The accepted M11–M17 schemas must add the relevant exact controls below before their migrations ship; they
+The accepted M11–M17/ADR-064 schemas must add the relevant exact controls below before their migrations ship; they
 are not current v0.1 settings:
 
 | Target key | Default | Scope / behavior |
 | --- | ---: | --- |
 | `records.runtime_attempts_per_agent` | 100 | Global; current plus at most 99 ended detail records; older attempts fold into one constant-size aggregate receipt, never one digest each |
+| `records.session_activation_receipts_per_session` | 100 | Global; current plus newest safe preflight/outcome receipts; referenced uncertain/current attempt evidence is preserved |
+| `records.session_activation_receipt_days` | 30 days | Global; unreferenced terminal activation receipts older than the boundary compact even below count |
 | `records.lineage_edges_per_agent` | 256 | Global; refuses a new live edge at the bound and cascades on AgentInstance deletion |
 | `records.context_scopes_per_agent` | 32 | Global; active scopes are owner-lifetime and refuse creation at the bound |
 | `records.quota_scopes_per_account` | 32 | Global; bounded per safe provider/account owner and cascades when that owner is removed |
@@ -310,6 +379,9 @@ are not current v0.1 settings:
 | `records.work_item_comments_per_item` | 500 | Global; creation is refused at the bound; no comment is silently replaced |
 | `records.work_item_comment_kib` | 16 KiB | Global; one UTF-8 comment after control stripping |
 | `records.work_item_content_mib_per_workspace` | 64 MiB | Global; comments/tags/assignees/current and retained revisions; mutation is refused at the cap |
+| `records.work_item_sources_per_workspace` | 64 | Global; source metadata/credential references only; adding another source is refused |
+| `records.work_item_source_receipts` | 10,000 | Global; newest bounded sync/write/conflict receipts installation-wide |
+| `records.work_item_source_receipt_days` | 30 days | Global; receipts older than the boundary compact after current cursor/conflict references are preserved |
 | `records.delegated_resources_per_flow_run` | 1,000 | Global; live typed Resources owned by one FlowRun; further creation raises exact Attention |
 | `records.delegated_resource_max_kib` | 256 KiB | Global; one Turn-owned Resource body after schema validation |
 | `records.delegated_resource_mib_per_workspace` | 64 MiB | Global; mutation is refused rather than pruning an active Resource |
@@ -322,6 +394,14 @@ are not current v0.1 settings:
 | `records.runtime_inventory_observation_days` | 7 days | Global; only the latest complete/partial/gapped snapshot per live generation is owner-lifetime |
 | `records.runtime_reconciliation_receipts` | 10,000 | Global; newest safe adopt/ignore/terminate proofs installation-wide |
 | `records.runtime_reconciliation_receipt_days` | 180 days | Global; a receipt is removed when older even if fewer than 10,000 remain |
+| `records.native_jobs_per_profile` | 10,000 | Global; current provider-job projections; overflow marks inventory gapped rather than dropping a job silently |
+| `records.native_job_iterations_per_job` | 100 | Global; current plus newest 99 safe metadata-only iteration records; active/uncertain iteration is never compacted |
+| `records.native_job_iteration_days` | 180 days | Global; ended unreferenced iteration metadata older than the boundary compacts even below count |
+| `records.conversation_inventory_entries_per_profile` | 10,000 | Global; metadata-only bounded cache; overflow marks coverage gapped and refuses authoritative search/zero |
+| `records.conversation_inventory_cache_minutes` | 15 minutes | Global; expiry changes the cache to stale and never deletes provider data or fabricates an empty result |
+| `records.provider_title_observations_per_conversation` | 10 | Global; bounded untrusted requested/effective title observations and rename receipts |
+| `records.web_browser_navigation_receipts_per_node` | 100 | Global; safe origin/file identity, policy generation and outcome only; DOM/history/form/cookie bodies remain memory-only |
+| `records.web_browser_navigation_receipt_days` | 30 days | Global; unreferenced terminal receipts older than the boundary compact even below count |
 | `records.open_file_snapshots_per_client` | 16 | Global; memory-only open/edit/merge buffers; the seventeenth open is refused |
 | `records.file_snapshot_mib` | 8 MiB | Global; one memory-only decoded snapshot; larger files require an external tool |
 | `records.file_save_audit_limit` | 50,000 | Global; newest redacted save/conflict receipts installation-wide |
@@ -334,6 +414,10 @@ are not current v0.1 settings:
 | `records.remote_operator_audit_limit` | 50,000 | Global; newest redacted remote scope/action/revocation records installation-wide |
 | `records.remote_operator_audit_days` | 180 days | Global; records are compacted when older even if below the count bound |
 | `records.remote_replay_nonces` | 10,000 | Global; hashed nonce/id metadata only, expires after 10 minutes; overflow refuses a new remote mutation |
+| `records.remote_permission_receipts` | 10,000 | Global; newest redacted typed-option receipts, never prompt/frame/credential bodies |
+| `records.remote_permission_receipt_days` | 180 days | Global; resolved receipts compact at the boundary while active/uncertain reconciliation evidence remains |
+| `records.companion_activity_items_per_profile` | 1,000 | Global; newest bounded safe activity metadata per AccountProfile; overflow requires a gap/resync marker |
+| `records.companion_activity_days` | 30 days | Global; handled/unhandled provider activity metadata older than the boundary compacts without changing Attention |
 | `records.sync_journal_days` | 30 days | Global; earlier cursors must resnapshot and cannot replay mutations |
 | `records.sync_journal_mib_per_workspace` | 256 MiB | Global; compaction publishes a new minimum accepted revision before removing segments |
 | `records.client_tombstone_days` | 30 days | Global; compacted deletion is still fenced by minimum revision, non-reused ids and update-never-upserts rules |
@@ -344,7 +428,11 @@ are not current v0.1 settings:
 | `records.share_audit_days` | 180 days | Global; redacted scope/action/receipt metadata only |
 | `records.local_speech_models_mib` | 8,192 MiB | Global; M15 refuses install at the cap and never silently deletes the selected model |
 
-Live Node/Agent/Team/FlowRun/dependency/lineage/scope/endpoint records remain owner-lifetime data. Compaction applies
+Browser DOM/storage/history and ConversationInventory search text/raw pages intentionally have no retention
+setting because their durable count is zero. A migration that persists them fails the closed-catalogue gate
+rather than inheriting a permissive default.
+
+Live Node/Agent/Team/FlowRun/dependency/lineage/scope/endpoint/source/current-job records remain owner-lifetime data. Compaction applies
 the historical limits above, uses only one constant-size aggregate for pruned attempts and refuses new live
 records or remote artifacts at a declared bound; it never silently ages out active semantics or cleanup proof.
 
@@ -392,6 +480,15 @@ canaries appear only redacted in their declared owner scope. Count/time/byte bou
 limit minus one, limit and limit plus one; required Note pins survive compaction, overflow refuses atomically,
 and scoped delete reports every retained external/downstream owner without deleting a sibling, adopted root,
 file, runtime, provider transcript or Workspace.
+The ADR-064 fixture adds distinct canaries for a WorkItemSource credential/raw response/unselected field,
+permission prompt/frame/credential answer, native-job output, conversation body/search page, Web/Browser DOM,
+cookie/form value/local sibling file, provider title payload and both selected and sibling-profile Companion
+events. It proves those bytes are absent from report, every export category, SQLite/WAL, sync journal,
+diagnostics, Attention, crash artifacts and server/client caches after the declared memory lifetime. It also
+proves mapped source fields, safe job/conversation/title metadata, numeric usage with unit/window/freshness and
+typed permission receipts appear only in their exact source/profile/node/client scope; unavailable usage is
+never serialised as zero. Source/profile/node privacy deletion leaves external items, jobs, conversations,
+titles, local HTML and sites unchanged.
 When M15 ships, it must additionally seed recognisable PCM/transcript markers and prove they are absent from
 protocol captures, SQLite/WAL, filesystem, logs, events, Attention, journals, diagnostics, exports and crash
 artifacts before explicit delivery. It covers model/receipt/partial inventory, metadata-only export, signed-

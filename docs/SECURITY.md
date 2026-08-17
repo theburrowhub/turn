@@ -56,6 +56,11 @@ durable storage.
    contain symlink aliases, misleading text and collisions the filesystem layout does not isolate.
 6. **Agent names, relationship labels and Activity Preview source text.** They enter
    native navigation chrome even when they came from a hook or terminal line.
+7. **Every external integration response.** Work items, provider jobs/conversations/titles, usage/activity,
+   Web/Browser content, cursors and rate-limit metadata are network/file input, not authority merely because
+   authentication succeeded.
+8. **Every remote and Companion client request.** Authentication identifies a granted client; the server's
+   current scope, operation allowlist, object revisions and generations still decide each effect.
 
 **The boundary Turn does not defend, and cannot.** Malicious code running as the
 same user. The control socket checks the peer UID and requires the current owner-only
@@ -468,13 +473,19 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | WorkItem metadata cannot operate the runtime | fuzzed state/comment/assignee edits are bounded/CAS and produce zero lifecycle, turn, dependency, start, focus or Attention effect absent the separately reviewed policy |
 | File saves never escape or overwrite a conflict | local/remote descriptor, symlink/hardlink/mount/TOCTOU and external-revision fixtures leave destination and same-named local files unchanged on every refusal |
 | Provider profiles isolate managed children | sibling auth/config reads are denied by the declared sandbox/broker; unavailable isolation refuses concurrent profiles, and no attach/transcript/context/quota/default fallback crosses profile |
-| Remote operator authority stays server-limited | origin/CSRF/replay/storage attacks and every desktop-only forged operation fail before data/effect; local revocation closes streams/lease and reconnect requires a current snapshot |
+| Remote operator authority stays server-limited | origin/CSRF/replay/storage attacks and every operation outside the server's versioned default-deny allowlist fail before data/effect; an exact explicitly granted typed permission response is revision-fenced, local revocation closes streams/lease and reconnect requires a current snapshot |
 
-The daemon never relaunches unattended during restore: `SessionRepo::load_for_restore` downgrades
-every stored `Alive` to `Orphaned` and only reports recovery state. A connected window may issue a
-node-addressed `RelaunchNode` automatically for panes explicitly marked `Relaunch` and for
-commandless terminals, whose resolved launch is only the user's interactive shell. Consequential
-`ReattachOnly` commands never cross that automatic boundary.
+The daemon never relaunches unattended during restore: `SessionRepo::load_for_restore` downgrades every
+stored `Alive` to `Orphaned` and only reports recovery state. Reconnect, tree expansion, preview and Attention
+routing likewise launch nothing. Exactly one foreground selection of a canonical Session may issue one
+node-addressed activation for an existing eligible child, a pane explicitly marked `Relaunch`, or a
+commandless default terminal whose resolved launch is only the user's interactive shell. Before effect, the
+daemon revalidates Session/Node revision, selected WorkSurface, current authority/capability generation,
+ExecutionTarget, cwd/worktree containment, write lease and AccountProfile where applicable. The reserved
+attempt plus operation id makes selection idempotent; ambiguous launch is reconciled, never automatically
+repeated. Consequential `ReattachOnly`, permission, credential, host-trust or destructive commands never cross
+that automatic boundary. Refusal leaves zero process effect and reports exact recovery in the selected view
+and bottom status rather than exposing a generic secondary start action.
 
 ## 5. Fixed in this audit
 
@@ -733,13 +744,76 @@ cascade.
    local path, terminal write or Resource edit.
 7. **RemoteOperatorSurface uses a separate remote credential and origin.** Authenticated encryption,
    same-origin CSRF, exact WebSocket Origin and anti-replay checks precede snapshots or effects. Tokens never
-   enter URL/query/referrer/log/browser persistence; Web Nodes run in another isolated origin. Local visible
-   revocation closes bounded subscriptions/input leases. Permission, credential, grant/root-context, host
-   trust, destructive lifecycle, RuntimeInventory enumeration/termination and repository integration remain
-   absent and server-refused.
+   enter URL/query/referrer/log/browser persistence; Web/Browser Nodes run in another isolated origin. Local visible
+   revocation closes bounded subscriptions/input leases. The server publishes a versioned default-deny
+   operation allowlist for each remote scope; a client cannot add operations. Permission response is absent
+   except for the exact typed, revision-fenced operation independently required by ADR-064. Credential,
+   grant/root-context, host trust, destructive lifecycle, RuntimeInventory enumeration/termination and
+   repository integration remain absent and server-refused.
 8. **Board, recovery, account and remote views reveal least information.** Every projection is scoped to the
    authenticated Workspace/target/profile grant, preserves stale/partial labels and cannot borrow a sibling's
    action owner or content. Headless operation changes rendering only, never these server boundaries.
+
+**ADR-064 adds eight further independent security boundaries.** They are target contracts and do not weaken
+the same-uid limitation in §2:
+
+1. **Foreground activation is narrow, current intent.** Only the canonical Session selection gesture described
+   above can mint the one-shot activation operation; a forged tree label, reference, page load, restore,
+   reconnect, remote projection or Attention event cannot. Preflight freezes every authority-bearing input
+   before effect, rejects stale generations and reserves one attempt id. It can start only the already declared
+   safe child/default Shell. No stored provider output can supply argv, environment, cwd, profile, grant or
+   elevated mode, and a failed or uncertain attempt never falls back or repeats by display name.
+2. **WorkItemSource is untrusted synchronisation, not control.** Credentials remain in the exact profile-
+   scoped broker and the adapter authenticates/encrypts to the pinned source origin. Native items, pagination
+   cursors and webhooks are bounded, schema-validated and mapped through one versioned exhaustive table.
+   Identity is `(source_id, external_item_id)`, never title/URL/order. Complete, partial, gapped, expired and
+   rate-limited coverage remain distinct; cache cannot turn a failed poll into authoritative empty state.
+   Outbound create/edit/close/reopen uses the exact remote revision/ETag and operation id; conflict keeps both
+   values and never retries last-writer-wins. Assignee and item text remain inert metadata and cannot create,
+   start, focus, approve or control runtime work without a separate reviewed policy.
+3. **Remote permission response is one typed exception, not remote approval authority.** The server's
+   versioned allowlist and an explicit short-lived response grant issued/revoked only by authenticated local
+   foreground authority bind client, Workspace/Session, exact
+   AgentInstance/attempt/binding, interaction id, allowed closed options and expiry. The E2EE request also
+   carries expected interaction revision, connection generation, operation id and anti-replay nonce; the
+   daemon revalidates all values and the current adapter `permissions` capability before one dispatch. While
+   that recognised sensitive prompt is pending, raw remote/Companion PTY input to its binding is blocked.
+   Credential/password entry, host trust, grant administration and destructive/admin operations have no
+   remote schema. An opaque generic TUI cannot be proved sensitive: Turn labels that limitation, never calls
+   terminal text a permission decision and claims the byte-blocking invariant only for recognised typed
+   interactions.
+4. **Provider-native jobs are not Flow authority.** Every job and iteration is scoped to exact provider,
+   AccountProfile, ExecutionTarget, adapter generation and stable provider id; observations never inherit a
+   Flow grant. Dismiss changes only Turn projection, cancel names one current iteration, enable/disable names
+   one schedule revision and provider delete is a separate destructive operation. Each is operation-id and
+   revision fenced. Restart/timeout/ambiguous effect enters reconciliation and is not reissued by title,
+   schedule or last-seen ordinal. Provider output remains untrusted content and cannot author a job control.
+5. **ConversationInventory is scoped metadata, not transcript or identity by resemblance.** Enumeration and
+   search are bounded to exact provider, AccountProfile, ExecutionTarget and namespace, carry coverage/
+   freshness and never use a title as identity. Adopt must prove one live runtime/conversation and global
+   current ownership; resume mints one new attempt from one exact resumable key. Stale, duplicate, cross-
+   profile, ambiguous or gapped matches fail before attach/spawn. Inventory capability reveals no message body
+   and does not imply transcript, input, context or rename authority.
+6. **Web preview and Browser have different executable-content boundaries.** Web remains inert with scripts,
+   forms, downloads, storage and page-created focus disabled. Browser is a separately declared isolated
+   renderer with no Turn/daemon IPC bridge, ambient cookies/profile, provider credentials, filesystem access,
+   clipboard, downloads or implicit popup authority. Public navigation follows the existing address-pinning
+   rules. Localhost/private origins and canonical regular local HTML require a foreground review bound to the
+   exact origin/address set or file descriptor/hash and one Browser generation. Redirect, Back/Forward and
+   every popup revalidate that scope; history is not authority. A popup becomes a reviewed navigation request,
+   never a new window automatically. Local HTML is loaded as reviewed bytes without `file:` ambient access or
+   unreviewed sibling resources.
+7. **Title observation and provider rename are independent.** Provider titles are bounded, sanitised,
+   revisioned untrusted text; they cannot change stable id, parentage, action owner, Attention subject or local
+   alias. `title_read` never grants `rename`. Provider rename requires its own current capability, exact
+   conversation/profile/target, expected revision and requested/effective receipt; uncertain effect is
+   reconciled, not repeated. A local alias edit never claims or triggers a provider rename.
+8. **Companion account data cannot cross profiles or mint urgency.** Usage, context and activity queries bind
+   the negotiated client scope to one AccountProfile and source generation. Values carry unit/window,
+   observation/expiry and typed unavailable/rate-limited state; missing data is never zero. Activity payloads
+   are bounded/minimised before projection and unread state is not Attention. Paging/cache/reconnect cannot
+   borrow sibling profile values. The inbox grants no conversation body, credential, runtime input or control;
+   actions use only the same default-deny typed allowlist as the rest of Companion.
 
 **M14 resources are hostile content, not trusted UI.** Group is same-Session presentation only; deleting a
 non-empty Group explicitly reparents children and never cascades into runtimes or user data. Note content is
@@ -748,16 +822,28 @@ nothing. File/Diff uses the same descriptor-relative regular-file jail, hardlink
 as repository context. Markdown, SVG, HTML and similar content render inert with scripts and remote loads
 disabled.
 
-The initial Web node accepts only `https://host[:port]/path`; it rejects userinfo, every query/fragment,
+The inert Web node accepts only `https://host[:port]/path`; it rejects userinfo, every query/fragment,
 private/loopback/link-local/multicast/metadata addresses and `file:`, `data:`, `javascript:` or app/IPC
-schemes. The entire URL is private content and only a sanitised origin is safe projection metadata. Every
-connection and redirect validates all A/AAAA answers, rejects the set if any is non-public, and pins the
-socket to one approved address while preserving TLS SNI/HTTP Host; no second lookup or ambient proxy chooses
-the peer, and there is no scheme downgrade. Rendering uses an isolated origin
-with no inherited cookies, provider/daemon credentials, filesystem/IPC access, downloads, popups or implicit
-external navigation. Create/restore/background selection performs no request; only explicit foreground
-navigation loads content. URLs are sensitive metadata in privacy export, and page script cannot mutate the
-stored URL or gain a typed Turn operation.
+schemes. It renders a bounded non-interactive document with scripts, forms, storage, downloads, popups and
+page-created focus disabled. The entire URL is private content and only a sanitised origin is safe projection
+metadata. Every connection and redirect validates all A/AAAA answers, rejects the set if any is non-public,
+and pins the socket to one approved address while preserving TLS SNI/HTTP Host; no second lookup or ambient
+proxy chooses the peer, and there is no scheme downgrade. Create/restore/background selection performs no
+request; only explicit foreground preview loads content.
+
+An interactive Browser node is a different canonical kind and process boundary. Its renderer has a fresh
+ephemeral partition and isolated origin with no inherited cookies/browser profile, provider/daemon
+credentials, filesystem/IPC/Turn operation bridge, clipboard, downloads or implicit external navigation.
+Normal public `https` navigation uses the same DNS/address pinning on every redirect. Exact localhost/private
+origin or local HTML navigation is disabled until an authenticated foreground review names the resolved
+address set/port or canonical regular descriptor, file hash and Browser generation. Local HTML is served as
+the reviewed in-memory document under the isolated origin; it receives neither `file:` privileges nor access
+to adjacent files. Back/Forward/Reload revalidate the current grant, and an out-of-scope redirect stops before
+connection. `window.open`, target-new-window and script navigation cannot create a window or navigate another
+Node; each out-of-scope popup is an inert bounded request requiring explicit review. History is bounded
+memory-only routing state, not authority. Closing/scope loss destroys the partition. URLs/local paths remain
+sensitive metadata in privacy export, and page content can never mutate the stored address or invoke a typed
+Turn operation.
 
 **A worktree is not a general sandbox.** It isolates a Git worktree and index, not credential helpers, ports,
 containers, databases, caches or external services. Turn accepts those collisions for the MVP only when the

@@ -37,6 +37,13 @@ is off by default, downloads nothing until the operator explicitly installs a mo
 permission only on the first capture attempt. Hold-to-talk is the default; an accessible toggle mode exposes
 the same start/stop/cancel states without requiring a held key.
 
+Foreground Session selection may independently auto-attach/start its safe current/default Shell under
+`ACP-LIF-009`, but dictation never invokes or authorises that operation. Until activation has produced one
+current input-ready attempt, the microphone control is disabled with the exact preflight/starting reason and
+the shortcut opens no microphone. A shortcut pressed during activation is not queued or replayed. Browser,
+Web, NativeJob, ConversationInventory, WorkItem and Activity Inbox views have no dictation target merely
+because they are selected.
+
 At capture start, Turn freezes a client-local `DictationTarget`: one exact protocol `InputTarget` plus the
 capture generation and draft bound. It contains:
 
@@ -80,6 +87,8 @@ Voice is an input method, not an attention authority:
 - it may populate a verified question composer, but that question remains pending until the operator submits
   and adapter evidence confirms the exact interaction ended;
 - it cannot target a permission control, synthesize allow/deny or interpret words such as “yes” as a decision;
+- an explicitly granted remote/Companion typed permission response does not add a microphone, audio or
+  free-text answer path; dictation remains physical-foreground-client only;
 - transcription errors use operational status and do not masquerade as Agent failures or Attention demands.
 
 Capture, transcription and a visible voice draft set `UserContext.sensitive_operation` on that exact surface.
@@ -187,7 +196,7 @@ management plus one generic reviewed-text commit that typed/pasted input may als
 | `install_local_speech_model` | foreground surface, `operation_id`, closed `model_id` | `local_speech_model_state` |
 | `cancel_local_speech_model_install` | foreground surface, `operation_id`, `model_id`, expected generation | `local_speech_model_state` |
 | `remove_local_speech_model` | foreground surface, `operation_id`, `model_id`, expected generation | `local_speech_model_state` |
-| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, `insert|submit`, bounded UTF-8 text | `operator_text_delivery` |
+| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, either `insert` or `submit`, bounded UTF-8 text | `operator_text_delivery` |
 
 Model state/progress may be pushed, but carries no audio. `InputTarget` repeats the semantic subject, verified
 input owner, attempt/prompt generations and bound. `commit_operator_text` revalidates every identity,
@@ -263,6 +272,9 @@ M15 is not complete until native, daemon and adversarial tests prove:
 - zero target bytes before explicit **Insert**/**Send**; afterward only the verified editable owner receives
   one bounded fenced operation, with CR/LF/control/invisible input unable to escape bracketed paste or answer
   a permission;
+- Session autoactivation, Browser/Web selection, native-job controls, conversation adoption/resume and remote
+  permission response cannot be triggered by the dictate shortcut; capture attempted before input readiness
+  opens no device and is never queued/replayed;
 - attempt/prompt/surface/daemon generation changes fail closed, and an uncertain insertion is never replayed;
 - queue order, badge, unread and resolution state remain byte-for-byte equivalent apart from the operator's
   later explicit send; automatic Focus defers only on the exact sensitive surface and retains its route;

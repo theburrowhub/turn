@@ -122,6 +122,25 @@ average. ADR-063 adds this exact non-optional sub-fixture:
   handoff. Desktop-only operations remain rejected on every remote surface and count as correctness, not
   successful throughput.
 
+ADR-064 adds these independent non-optional sub-fixtures to the same run:
+
+- 1,000 foreground Session reselections mix existing runtimes, stopped restorable children, empty Sessions
+  that resolve a default Shell and preflight refusals; no case waits for a second operator action and no
+  reconnect/preview/background selection launches a process;
+- four external WorkItemSources deliver the 500 WorkItems through bounded pages, duplicated/out-of-order
+  deltas, one expired cursor, one rate limit, close/reopen and 50 compare-and-swap conflicts while preserving
+  a visibly stale cache;
+- 200 provider-native jobs and 2,000 bounded historical/current iterations update independently from 100
+  Turn Flow recurrences, including provider restart, dismiss, cancel, disable and delete receipts;
+- four profile-scoped ConversationInventories expose 10,000 metadata-only rows through search/pagination;
+  exact adopt/resume, duplicate ownership and stale/gapped results run concurrently with title-read and rename
+  collectors that degrade independently;
+- eight inert Web previews and eight isolated Browser nodes exercise cached switching, reviewed public,
+  localhost and local-HTML navigation, redirects, history and blocked popups without loading content into the
+  hierarchy projection; and
+- each Companion profile receives context/quota samples and a 1,000-row bounded activity inbox; ten recognised
+  remote permission prompts are answered through the typed encrypted path while raw PTY bytes are refused.
+
 The release gate uses a fixed minimum reference profile: base Apple M1 (8-core), 8 GiB RAM, internal SSD,
 supported macOS, 1,920×1,080 display, AC power, no swap at start and an optimised packaged build. The same
 workload is recorded on each claimed Linux platform, but a faster developer or CI host cannot replace the
@@ -136,11 +155,17 @@ artifact. Reported remote p95/p99 includes shaping, TLS/authentication, serializ
 client application; local daemon timestamps alone cannot satisfy it. Full-remote, headless and companion
 traffic each use a separate connection and queue. A test run with shaping disabled is diagnostic only.
 
+WorkItemSource and provider collector fixtures use separate deterministic integration endpoints behind the
+same network profile; their end-to-end timers include adapter transport, authentication, parsing and durable
+receipt. This is a repeatable Turn overhead budget, not a claim that an arbitrary live provider meets it. Live
+evidence records provider latency separately and cannot replace the deterministic minimum-profile run.
+
 | Dimension | Target budget / invariant |
 | --- | --- |
 | Terminal input enqueue | p99 below 1 ms; never waits for child creation, topology, usage or transcript work |
 | Attention route | daemon decision plus client application p95 below 50 ms and p99 below 100 ms on the minimum release profile |
 | WorkSurface switch | p95 below 50 ms and p99 below 100 ms on the minimum release profile for cached/metadata views; heavy content arrives by subscription |
+| Foreground Session activation | selection-to-cached-attach p95 below 50 ms/p99 below 100 ms; selection-to-durable start/refusal receipt p95 below 100 ms/p99 below 200 ms. Child readiness is asynchronous and timed separately; the UI never blocks and duplicate selection produces at most one attempt |
 | Remote Attention route | exact demand creation through full-remote/headless receipt p95 below 150 ms and p99 below 300 ms under the declared network profile |
 | Remote input/event | authenticated input-to-PTY enqueue and revision-event application each p95 below 125 ms and p99 below 250 ms; wrong lease/revision/profile has zero enqueue |
 | Remote WorkSurface switch | cached metadata view p95 below 175 ms and p99 below 350 ms; first bounded heavy subscription p95 below 400 ms and p99 below 800 ms |
@@ -150,6 +175,13 @@ traffic each use a separate connection and queue. A test run with shaping disabl
 | Shared endpoint | all five binding queues make progress; per-binding input/event p99 below 250 ms and endpoint restart convergence p99 below 5 s with zero cross-profile/conversation bytes |
 | Target inventory | 2,000-handle complete/partial/gapped reconciliation p95 below 100 ms and p99 below 200 ms CPU, below 16 MiB serialized, without blocking input or claiming exactness after a gap |
 | Board/Note/Resource | each projection/update p95 below 50 ms and p99 below 100 ms; progress compaction p99 below 200 ms; content bodies never enter the hierarchy snapshot |
+| External WorkItemSource | apply and project one 500-item page p95 below 100 ms/p99 below 200 ms locally and below 300/600 ms over the shaped remote source; filter/cursor/rate-limit/conflict handling never blocks input or turns stale cache into an empty exact result |
+| Native jobs | apply a 200-job/2,000-iteration snapshot or delta burst p95 below 100 ms/p99 below 200 ms; Flow recurrence remains independently responsive and no dismissed history is fetched/rendered eagerly |
+| Conversation inventory | cached metadata search over 10,000 rows p95 below 75 ms/p99 below 150 ms; one bounded provider page including shaping p95 below 400 ms/p99 below 800 ms; cancellation/reselection prevents an old page or title from replacing the current view |
+| Browser/Web | inert Web or cached Browser WorkSurface switch meets the normal switch budget; navigation dispatch never blocks GUI/input, history is bounded, and one noisy page cannot delay terminal input or Attention beyond their budgets |
+| Remote typed permission | exact encrypted response through durable accepted/refused/uncertain receipt p95 below 175 ms/p99 below 350 ms under shaping; stale/grantless/raw-PTY attempts meet the same refusal ceiling and enqueue zero bytes |
+| Title read/rename | a title observation or rename receipt applies p95 below 50 ms/p99 below 100 ms after adapter receipt; a slow title collector never delays launch, conversation inventory, tree selection or local alias editing |
+| Companion profile inbox | one 1,000-item activity page plus usage/context cells applies p95 below 100 ms/p99 below 200 ms; profile switch p95 below 50 ms/p99 below 100 ms from cache; expired/unavailable cells never wait to fabricate a value |
 | FileBackend conflict | 1 MiB local/remote snapshot open p95 below 100/400 ms and p99 below 200/800 ms; conflict detection/receipt p95 below 150 ms and p99 below 300 ms with zero overwritten bytes |
 | Hierarchy projection | below 8 MiB serialized at 1,000 nodes; no terminal/transcript/log/media body in the snapshot |
 | Lazy tree | only viewport + fixed overscan + explicit reveal target materialise text/paint/accessibility rows |
@@ -168,11 +200,15 @@ process-limit, store/disk/journal, shaped-network and collector pressure while t
 and types on all four surfaces. Every latency population has at least 10,000 observations (reconnect has 100),
 uses nearest-rank percentiles and reports misses/timeouts as infinite latency; warm-up samples are excluded.
 It fails on false zero counts, stale-route application, dropped Attention, duplicate effects, cross-binding or
-cross-profile bytes, unbounded growth, hidden inventory gaps, overwritten files or runtime termination as
-well as on latency regression.
+cross-profile bytes, duplicate auto-starts, background-selection launches, hidden WorkItemSource or
+conversation gaps, Flow/native-job conflation, stale title overwrite, remote permission PTY fallback,
+cross-profile Companion samples, unbounded Browser/history growth, overwritten files or runtime termination
+as well as on latency regression.
 
 Passing performance never substitutes for semantic acceptance. The complete cross-gate obligations are
 `ACP-FLW-008`, `ACP-ADP-005`, `ACP-VIE-011`, `ACP-FLW-012`, `ACP-ADP-010`, `ACP-LIF-008`,
-`ACP-RUN-010`, `ACP-CTX-012`, `ACP-OBS-008` and `ACP-SCL-001` through `ACP-SCL-009`; each named ACP must pass
+`ACP-RUN-010`, `ACP-CTX-012`, `ACP-OBS-008`, `ACP-SCL-001` through `ACP-SCL-009`, `ACP-LIF-009`,
+`ACP-VIE-012`, `ACP-ATT-011`, `ACP-ADP-011`, `ACP-CTX-013`, `ACP-RUN-011`, `ACP-OBS-009` and `ACP-SCL-010`;
+each named ACP must pass
 its functional, durability, loss, migration and privacy dimensions independently before these measurements
 can be release evidence.
