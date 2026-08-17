@@ -75,6 +75,30 @@ Linux has no single desktop API equivalent to the two AppKit preference properti
 Therefore High contrast and Reduce motion must always be testable through Turn's explicit
 Global controls even when the desktop cannot be inherited.
 
+## Accepted M15 local dictation checks
+
+These checks apply when ADR-060 ships and do not claim current support:
+
+1. The microphone control beside an eligible input is a named toggle with idle/recording/transcribing/error
+   state, exact target and keyboard shortcut. It is fully usable without holding a key; Escape always cancels.
+2. VoiceOver/Orca announces capture start, semantic Agent plus real input owner, elapsed-time milestones,
+   transcription completion, truncation/error and cancellation. It does not continuously announce waveform/
+   level updates.
+3. The bottom status-bar state and inline draft never rely on colour or motion. Reduced motion replaces every
+   pulsing/animated meter with static state plus elapsed text and does not hide microphone activity.
+4. The memory-only draft has a normal multiline text role, label and description; focus arrives once after
+   transcription. Insert, Send, Return to target, Copy and Discard have keyboard equivalents and disabled
+   reasons when target identity is stale.
+5. Permission, credential, provisional/unassigned and other ineligible targets expose neither a misleading
+   enabled mic control nor an unnamed placeholder. The reason is discoverable without pointer hover.
+6. OS microphone consent is announced by the platform and focus returns to the exact initiating control.
+   Denial leaves one accessible recovery action and never loops the prompt.
+7. At 300% zoom and the minimum window, target, on-device/model state, timer, draft and cancel/send controls
+   remain reachable; microphone state never covers the Attention status.
+
+Packaged macOS and Linux run records add microphone device, local model/engine and hold-versus-toggle result.
+The full acceptance matrix is `docs/LOCAL_VOICE_INPUT.md`.
+
 ## Run record
 
 Do not mark the manual pass complete without a row that another person can reproduce:

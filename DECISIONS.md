@@ -61,14 +61,19 @@ Status values:
 | [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
 | [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
 | [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
-| [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Accepted, implemented |
+| [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Superseded by ADR-059; retained as the v0.1 implementation record |
 | [049](#adr-049) | Coming back to a Session starts it; the daemon still starts nothing on its own | Accepted, implemented; overturns the restore half of the never-relaunch rule |
 | [050](#adr-050) | Ending is authoritative: a process Turn cannot stop is reported, never a veto | Accepted, implemented |
 | [051](#adr-051) | Settings resolve in the daemon through one explicit hierarchy | Accepted, implemented |
-| [052](#adr-052) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; supersedes ADR-036 |
+| [052](#adr-052) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; persistence retained and relaunch replacement narrowly superseded by ADR-059 |
 | [053](#adr-053) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
 | [054](#adr-054) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
 | [055](#adr-055) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
+| [056](#adr-056) | A compatible app update replaces files, never the live daemon | Accepted, implemented for macOS |
+| [057](#adr-057) | Local-data control is complete, inspectable and daemon-authoritative | Accepted, implemented |
+| [058](#adr-058) | Functional v0.1.0 has one evidence-backed release gate | Accepted, implemented |
+| [059](#adr-059) | Agent nodes select one WorkSurface view and keep instance, context and attention identity separate | Accepted, not yet implemented |
+| [060](#adr-060) | Local dictation is a reviewed exact-target input path, never an attention or approval authority | Accepted, not yet implemented |
 
 ---
 
@@ -2581,7 +2586,9 @@ daemon restart cannot know whether a PTY accepted a write before failure.
 Handoffs are limited to two distinct agentic nodes in the same non-archived Session. The source may be a
 historical Agent, but contributes only bounded, stable, visible Activity Preview facts. Raw PTY bytes,
 scrollback and inferred current-task prose are excluded. Labels, facts and the optional user instruction are
-sanitised and secret-redacted before the exact payload crosses the protocol.
+sanitised and passed through known-secret/secret-shaped redaction before the exact payload crosses the
+protocol. No pattern detector proves arbitrary free text secret-free, so exact review remains the final
+disclosure boundary.
 
 Preparation creates an in-memory `HandoffId` capability bound to the client, Session, source and destination;
 it performs no PTY write. Delivery names only that capability. The daemon revalidates all endpoints and
@@ -2590,14 +2597,19 @@ question or other interaction. The explicit Send action submits one bracketed pa
 connection may retry a confirmed success without another write. Any uncertain write consumes and fences the
 capability; Turn tells the user to inspect the Agent and never replays automatically.
 
-Sensitive bodies expire after ten minutes, disappear on client disconnect and are never persisted or placed
-in `Debug` output. The replay fence retains only ids/outcome metadata for one hour and is bounded. Pane state,
-tree selection, focus and layout are not part of the operation.
+The handoff subsystem creates no dedicated durable semantic body record: drafts expire after ten minutes,
+disappear on client disconnect and never enter `Debug` output or the Event row. The replay fence retains only
+ids/outcome metadata for one hour and is bounded. Once delivered, however, the bytes necessarily enter the
+destination program and may persist in its provider transcript, visible terminal/scrollback and ADR-052
+journal. Review must state that downstream boundary; disabling Session terminal history before launch is the
+available Turn-side control for especially sensitive PTY delivery. Pane state, tree selection, focus and
+layout are not part of the operation.
 
 ### Consequences
 
 - The user sees exactly what will be submitted and nothing is sent during Review.
-- Secrets and terminal control sequences do not gain a new durable or visual exfiltration path.
+- Secrets and terminal control sequences do not gain a dedicated handoff store; downstream provider and
+  terminal retention remains visible and outside that claim.
 - Handoffs work for background Agents without opening panes or destabilising a Session layout.
 - A handoff cannot masquerade as an answer to an existing permission or question prompt.
 - **Downside:** only stable Preview facts are transferred, so early or poorly integrated Agents may provide
@@ -2795,9 +2807,12 @@ screen. Transport is capped at 5,000 rows and 3 MiB inside the protocol's 8 MiB 
 Transcript from those rows and continues extending it from live updates.
 
 Recovered terminal state is display-only. The process remains `Orphaned` or `Lost`; history never produces
-`Alive`, `Reconnected` or a writable PTY. Relaunch creates a new node and deletes the retired node's archive.
-Unknown session/node directories are pruned on restore. Archiving or closing without deletion retains the
-archive with the Session.
+`Alive`, `Reconnected` or a writable PTY. The implemented v0.1 `RelaunchNode` creates a new node and deletes
+the retired node's archive. ADR-059 narrowly supersedes that replacement target: restart/resume will create
+a fenced RuntimeAttempt under the same Node/AgentInstance, while a fresh unverified conversation creates a
+new Node/AgentInstance. The attempt-aware journal migration must retain old display history without ever
+claiming it is the current writable runtime. Unknown session/node directories are pruned on restore.
+Archiving or closing without deletion retains the archive with the Session.
 
 Raw terminal history is enabled for persistent Sessions by default because it is the feature being promised.
 A sensitive Workspace/Session can set `TURN_TERMINAL_HISTORY=disabled` (also `0`, `false`, `off` or `no`)
@@ -3176,7 +3191,8 @@ invisible until it was used.
 <a id="adr-048"></a>
 ## ADR-048 — The tree points at one worker: click a managed node to show its pane, its owner to restore
 
-**Status:** Accepted, implemented.
+**Status:** Superseded by ADR-059. This remains the historical v0.1 implementation record; explicit Pane
+zoom still exists, but a tree click is no longer the accepted post-v0.1 gesture for it.
 
 ### Context
 
@@ -3321,6 +3337,7 @@ row's contextual `Start again` action without turning every recovered layout int
   report. The rule was defensible and the way it was applied was not, and the record should say
   that the owner was right and I was slow.
 
+<a id="adr-050"></a>
 ## ADR-050 — Ending is authoritative: a process Turn cannot stop is reported, never a veto
 
 **Status:** Accepted, implemented. Reverses the refusal added with `ensure_session_processes_stoppable`.
@@ -3561,6 +3578,16 @@ deletion and compaction. The Settings hierarchy owns bounded Event, Preview, ter
 log policy; writes enforce it immediately and a periodic pass prevents drift. There is no telemetry
 transport, and reports say so explicitly.
 
+ADR-059 extends this closed-catalogue obligation before its schema migration may open: AgentInstances,
+RuntimeAttempts, safe launch/resume and configuration-transition receipts, ContextLinks and broker-read audit, lineage, ContextPacket
+metadata, ContextScope/QuotaScope samples, AgentMessage hash/delivery metadata, DependencyEdge/results,
+Team roles/policy, safe RuntimeEndpoint fingerprints and resource-node records must all be classified. Account
+references, provider conversation ids, host/cwd/worktree, link/message endpoints and Web URLs are sensitive
+metadata with policy-aware redacted export. Agent/Session/Workspace deletion first revokes live link/broker
+capabilities, then cascades scoped samples, audit, delivery, dependency, Team, runtime-endpoint and lineage
+records. Their exact live-versus-history limits are configurable and the privacy report/export/delete/
+compact tests must fail if any new table or file category is omitted.
+
 Installation purge is a separate `turnd --delete-installation-data` mode. It acquires the canonical
 data-directory lock before touching files, follows no symlink, removes known and unclassified Turn-owned
 entries, and retains only the stable lock inode and `worktrees/` user work.
@@ -3611,3 +3638,247 @@ and a checked functional row cannot be used to imply that those distribution cla
   distribution and broad platform sign-off.
 - Future release criteria belong in the gate or its evidence map; closing another tracker without either is
   not sufficient proof.
+
+---
+
+<a id="adr-059"></a>
+## ADR-059 — Agent nodes select one WorkSurface view and keep instance, context and attention identity separate
+
+**Status:** Accepted, not yet implemented. Supersedes ADR-048's click-to-zoom interaction; extends ADR-040's
+hierarchy/view split and ADR-043's context boundary; preserves ADR-044's Shell ownership; narrows ADR-049
+auto-start to Session activation; and supersedes only ADR-052's relaunch-replaces-node target.
+
+### Context
+
+The v0.1 hierarchy correctly made background AgentNodes independent from Panes, but its two inspection
+paths do not satisfy the next use case. Quick Preview is intentionally a bounded status, while clicking a
+managed child maximises the nearest ancestor Pane. Several semantic children can therefore show the same
+terminal even though the operator selected different work. Relaunch also replaces `NodeId`, and the current
+inspector cannot distinguish requested launch configuration, effective runtime facts, conversation context
+and shared provider quota.
+
+The product now needs persistent agent identity, provider-conversation continuity, unique semantic child
+views, bounded pull context, one-shot work handoff, per-conversation context meters, account-scoped usage and
+explicit attention state. Those capabilities must extend Turn's accepted hierarchy and authority model as a
+coherent native domain, not as a second navigation metaphor or a loose set of UI widgets.
+
+Most importantly, adding richer views must not dilute Turn's thesis. The job is still to route the operator
+to the exact agent that needs a decision, permission, answer or result review. A dashboard that makes
+agents observable but leaves the operator hunting for the actionable terminal would be a regression.
+
+### Alternatives considered
+
+**Adopt a canvas and treat each terminal/agent as a card.** Rejected. It duplicates the hierarchy with
+spatial state, weakens keyboard scanning and makes the operator maintain a layout to discover attention.
+
+**Keep the saved Session Layout visible and use the narrow inspector for all semantic content.** Rejected.
+A subagent transcript, context packet, approval or stopped-agent history is primary content, not metadata
+that can be compressed beside an unrelated terminal grid.
+
+**Open or maximise a Pane for every tree selection.** Rejected. Semantic agents may have no PTY; shared
+ancestor PTYs are not unique content; and selection must not rewrite a carefully chosen Layout.
+
+**Treat a process, provider thread, Pane and Agent as one id.** Rejected. Their lifetimes diverge on warm
+attach, cold resume, restart, branch, deletion and multi-view attachment. Reusing one id would either lose
+history or falsely resurrect work.
+
+**Copy entire transcripts automatically between linked agents.** Rejected. It spends context before the
+target asks, creates an implicit disclosure boundary and makes revocation meaningless. It also turns
+transient provider data into Turn-owned retention without necessity.
+
+**Keep only the existing one-shot handoff.** Rejected. A reviewed snapshot is right for transferring work,
+but wasteful when a collaborating agent needs one current fact and wrong for an ongoing, revocable read
+relationship.
+
+### Decision
+
+Turn retains one Workspace → Session → optional explicit Group → Agent/Tool → Child tree. A Session remains
+the owner of checkout/worktree, Layout and Attention policy; a Group is presentation inside it. The region to its
+right is one `WorkSurface`. Selection chooses exactly one `WorkspaceView`, `SessionView` or typed `NodeView`;
+it changes no saved Layout, process, terminal focus or Attention state. Selecting a Session restores its
+unchanged Layout. The inspector becomes optional detail inside the active view. Explicit Pane/zoom commands
+remain available and are no longer bound to a tree click.
+
+Every agentic Node owns exactly one stable `AgentInstance`; non-agent nodes own none, and an instance never
+moves to another Node. Each launch/resume or verified in-place model/configuration switch creates a
+`RuntimeAttempt` epoch; warm view attachment selects the existing attempt. At most one attempt is current
+under a generation fence; provider conversation/thread,
+runtime/PTY and Pane ids remain
+separate. Fresh/unverified conversations create a new Node/AgentInstance plus lineage. Immutable launch
+specification and receipt records requested versus effective provider, model, account, permission/approval,
+sandbox, safe flags, host, cwd and worktree facts with capability, source and fallback evidence. Unknown or
+stale observations remain labelled as such. Conversation context consumption is separate from provider/
+account quota, whose shared scope and reset window must be explicit.
+Launch/resume epochs own launch receipts. A verified in-process switch owns a distinct configuration receipt
+and atomically transfers the same conversation/process binding; it never fabricates another launch.
+
+ADR-044 remains the local runtime ownership rule: Shell owns its PTY and Pane bindings, and Agent is its
+confirmed child. A NodeView may project that terminal only through a verified RuntimeBinding while naming
+the semantic Agent and the distinct input owner. Selecting an Agent is navigation and never launches or
+resumes it. Warm visual attach is automatic because it creates no process; cold resume/restart is a typed
+lifecycle operation, while ADR-049 auto-start remains limited to explicit connected-client Session
+activation under a fully resolved persisted contract. No generic “Start pane” step gates agent content.
+
+The daemon-owned global Attention Queue remains the only attention authority. An agentic entry carries a
+validated Node/AgentInstance pair plus optional current attempt/generation/pending id and, when different, a
+verified runtime interaction owner. vNext `route_attention` (successor to v4 `goto_attention`), badges,
+notifications and governor-approved automatic Focus all apply one daemon-resolved, generation-checked
+route. Exact subjects open their NodeView/action; authenticated parent/external or unassigned subjects open
+an evidence view without inventing a Node/input owner. Navigation never acknowledges a demand. A result
+becomes read only after its exact revision is primary content on a foreground surface. Submission stays
+pending until evidence confirms resolution. Telemetry alone cannot move focus or reorder the queue.
+
+Context uses separate typed edges:
+
+- a directional, revocable `ContextLink` grants bounded pull access within one Workspace through a narrow,
+  short-lived destination/current-attempt capability on a separate broker data plane—not the daemon control
+  token;
+- a reviewed `ContextPacket` transfers a bounded, sanitised snapshot with best-effort known-secret redaction
+  and records handoff/branch lineage;
+- neither edge reparents nodes, grants checkout writes, approves prompts or transfers execution control.
+
+“Foreground operator only” is a supported authenticated-flow invariant, not isolation from a compromised
+same-uid local process: without an active per-agent sandbox or UI-owned authority inaccessible to agents,
+such a process may steal the administrative capability and impersonate the UI. The broker bearer still
+provides narrower logical destination/attempt binding, replay resistance and separation from other OS users.
+
+Provider-normalised transcript turns may contribute to a packet only under adapter capability and budget.
+Older context is digested, recent complete turns are prioritised, most target context remains free for new
+work, and optional detail stays behind a short-lived scoped pull reference shown in review. Preparation
+creates only an expiring draft; new-target delivery is a fenced idempotent saga, not an external-process
+transaction. Launch, broker-bearer installation and context write are separately journalled external effects:
+an uncertain launch may only probe/adopt its preassigned identity, an uncertain install revokes that grant
+generation and an uncertain write is never retried. Turn creates no dedicated durable semantic body
+record, but delivered bytes may remain in provider transcripts, terminal screen/scrollback and ADR-052's
+journal; review names that downstream retention and revocation cannot recall it. Durable records contain
+provenance, hash, redaction/truncation facts and evidence-backed delivery state. `submitted`, `received`,
+`read` and `acted` are never inferred from one another.
+
+Short direct messages, observational dependency results and Teams are accepted, sequenced after context,
+and build on the same stable instance ids. They are non-tree coordination edges, have no independent focus/
+attention authority and cannot create hidden context access. A dependency result uses a bounded closed schema
+of state, producer/revision ids, hashes/verified references, provenance and at most stripped/redacted summary;
+raw runtime, transcript, diff/file, environment and provider payloads are invalid. It may project ready/
+blocked/failure evidence but never starts, advances or retries an Agent. User-directed coordination is in scope; autonomous
+workflow scheduling, approval and checkout authority remain out of scope. Session-owned Group, Note, File,
+Diff and Web resource nodes are accepted as M14 with explicit privacy/content-security acceptance; they own
+no runtime or checkout authority and deletion never removes referenced user data. Initial Web URLs forbid
+userinfo/query/fragment, remain private content and connect only by pinning an approved public address after
+validating every DNS answer for each request/redirect.
+
+Every new durable category is subject to ADR-057 before migration: closed inventory, redacted/policy-aware
+export, explicit count/byte bounds, revoke-before-delete cascade and report/export/delete/compact coverage.
+An offline remote artifact remains `pending_purge` behind a bounded tombstone until authenticated exact-host/
+generation purge proof; logical authority revocation never waits for that physical cleanup. Packet
+bodies remain absent from Turn's semantic store, without making a false promise about recipient retention.
+
+The complete domain, protocol target, failure behavior, delivery sequence, acceptance matrix and product
+boundaries are normative in `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`.
+
+### Consequences
+
+- Every semantic agent, including a PTY-less subagent, can have unique actionable content without growing
+  the saved Layout.
+- One attention action crosses Workspace/Session boundaries, opens the exact subject and reaches its safe
+  response control without erasing queue evidence.
+- Restart, resume, model switch, branch and handoff preserve semantic history while exposing each concrete
+  attempt and fallback honestly.
+- Agents can share just-in-time context or transfer a bounded snapshot without confusing access, ownership
+  and lineage.
+- Runtime headers can answer which model/account/mode/host/worktree actually ran and whether usage data is
+  current, unavailable or shared.
+- **Downside:** every core layer needs new ids, migrations, view models and tests; this is not a GUI-only
+  refactor and cannot be released honestly as a half-populated inspector.
+- **Downside:** adapter capabilities will differ. A semantic transcript, receipt or quota may be unavailable
+  for one provider, and the UI must carry that asymmetry rather than smoothing it into false parity.
+- **Downside:** review-before-send remains one deliberate interaction at the context disclosure boundary.
+  It is integrated into the NodeView, but minimising clicks does not justify invisible cross-agent data flow.
+- **Downside:** the implemented ADR-048 click behavior must be removed while preserving explicit zoom and
+  exact Layout restoration, which requires new native snapshots and keyboard/accessibility acceptance.
+
+---
+
+<a id="adr-060"></a>
+## ADR-060 — Local dictation is a reviewed exact-target input path, never an attention or approval authority
+
+**Status:** Accepted, not yet implemented. Depends on ADR-059's WorkSurface and stable instance/input identity;
+preserves ADR-016/018's single Attention authority, ADR-045's program-owned screen boundary, ADR-051's
+Settings hierarchy and ADR-057's closed local-data catalogue.
+
+### Context
+
+Spoken prompt entry can remove a large amount of repetitive typing while an operator supervises several
+Agents. It also combines unusually sharp risks: microphone capture, large third-party model files, native
+inference code, stale Agent targets and text that may become executable as soon as it reaches a terminal.
+Treating speech as “just another key” would bypass both Turn's exact identity model and the user's review
+boundary. Treating it as an agent event or command source would undermine the product entirely.
+
+The lowest-friction safe flow is still short: hold to speak, release into a focused inline draft, review and
+press the normal send key. The extra boundary is not a modal or a mouse requirement; it is the point at which
+the operator sees which Agent and real input owner will receive the text.
+
+### Alternatives considered
+
+**Insert into the PTY immediately after transcription, without Enter.** Rejected. A raw-mode program receives
+those bytes even without a newline, so “not submitted” is not the same as “not disclosed”. It also makes a
+stale-target race irreversible before the operator sees recognition errors.
+
+**Run inference inside `turn-gui` or `turnd`.** Rejected. Native model parsers can hang, abort, exhaust memory
+or crash on corrupt inputs. Dictation must not take down the window, daemon, Attention Queue or live PTYs.
+
+**Use an operating-system/cloud speech service or silently fall back when local inference fails.** Rejected.
+“Local” must name data placement, not merely the API invoked. PCM leaving the physical operator device is a
+different product authority and needs a future explicit design.
+
+**Interpret voice commands such as “approve”, “next agent” or “start”.** Rejected. Speech recognition is
+probabilistic input. It cannot become a permission, lifecycle, focus or Attention authority.
+
+### Decision
+
+M15 adds operator-device-only dictation through one packaged local Whisper-compatible engine. It is disabled
+with `input.dictation.model=none` by default and
+downloads nothing until the operator explicitly selects an allowlisted model. The native client owns OS
+microphone consent, bounded PCM and a memory-only inline draft. A sandboxed disposable `SpeechWorker`
+receives only one verified read-only model descriptor and one bounded audio channel; it has no network,
+daemon token, checkout, credentials or arbitrary filesystem access. Crash, hang, OOM and shutdown affect
+only that worker and never replay partial work.
+
+Starting capture snapshots an immutable exact `DictationTarget`: surface/connection/daemon generation,
+Workspace/Session/Node, optional AgentInstance, RuntimeAttempt/generation, verified input owner and optional
+pending free-text interaction revision. Selection, blur, Escape, device loss or surface close stops the mic
+and never retargets. The transcript is control-stripped, newline-normalised, bounded and displayed in the
+WorkSurface; zero bytes reach a PTY, adapter or provider before explicit **Insert** or **Send**. Permission,
+credential/password, provisional/unassigned, raw-TTY and unverified alternate-screen targets are ineligible.
+
+The protocol cannot start the microphone or request transcription. It exposes closed model install/list/
+cancel/remove operations and generic `commit_operator_text` with exact target, expected input revision,
+operation id and `insert|submit`. Every identity is revalidated immediately before the one fenced write;
+possibly partial delivery is `submitted_unconfirmed` and is never retried automatically. Dictation origin
+adds no confidence or capability. Questions stay pending until adapter evidence confirms the exact prompt
+ended, and speech can never answer a permission.
+
+Recording, transcription and draft review mark only their surface as `sensitive_operation`. Automatic Focus
+defers with its original exact route; queue, badges, unread and notifications remain intact. Manual Attention
+navigation wins and cancels live capture without redirecting a completed draft. Dictation itself never
+creates, ranks, acknowledges, resolves or routes Attention and never activates a Session or runtime.
+
+The daemon owns a signed, versioned closed model catalogue and model store. Every entry fixes HTTPS origin,
+size, digest, engine compatibility, provenance and licence. Downloads are explicit, streaming-size-bounded,
+owner-only, no-symlink, generation-fenced and atomically adopted only after full digest verification. Models,
+receipts, partials and settings enter ADR-057; PCM, partial hypotheses and drafts never enter protocol,
+SQLite/WAL, files, logs, journals, events, analytics, diagnostics or Turn crash reports. After explicit
+delivery, normal terminal/provider retention applies and is shown before enablement.
+
+The normative settings, protocol fields, failure behavior and adversarial/package acceptance matrix are in
+`docs/LOCAL_VOICE_INPUT.md`.
+
+### Consequences
+
+- Dictation reduces typing while keeping the existing send action and exact target visible.
+- Attention remains the single operator-routing authority even while voice input is active.
+- A native speech-engine failure cannot take down supervision or live work.
+- “Local audio” is testable: no PCM leaves the operator device or enters the daemon protocol.
+- **Downside:** model downloads are large installation-owned data and require supply-chain, storage, licence,
+  packaged-helper and cross-platform acceptance work.
+- **Downside:** Turn deliberately keeps one review/send action and refuses dictation on inputs it cannot
+  authenticate, so it will expose fewer voice affordances than a general OS dictation feature.

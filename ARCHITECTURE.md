@@ -27,6 +27,16 @@ simultaneous total — which is the reason the instruction is to reproduce them,
 | `turnd` | Built | reproduce | Atomic Session/lease lifecycle, PTYs, hierarchy projection and restore vertical. |
 | `turn-gui` | Built for v0.1.0 MVP | reproduce | Unified native tree, panes, previews, inspector, attention and GPU snapshots. |
 
+ADR-059 is an accepted, **not-yet-implemented** architecture target across these crates. It adds a
+selection-driven WorkSurface, stable AgentInstance/RuntimeAttempt identity, effective launch/configuration receipts,
+runtime/usage observations and explicit context channels. Its normative cross-layer contract is
+`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`; no row above claims those additions are built.
+
+ADR-060/M15 is likewise an accepted, **not-yet-implemented** local-dictation target. It adds a packaged
+sandboxed speech worker, daemon-owned verified model store and memory-only client draft after ADR-059's
+exact input identity exists. Its normative contract is `docs/LOCAL_VOICE_INPUT.md`; no current binary or
+status row claims microphone or speech-model support.
+
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
 `vitest` and no second lockfile.
 
@@ -1050,8 +1060,10 @@ reason to look at what the protocol *lacks*:
    and may target only an idle or done Agent.
 3. **Turn never runs a command it inferred.** Processes start from a Template, a Pane definition, or
    `Request::RelaunchNode`. There is no "run this" verb.
-4. **Turn never relaunches on its own.** A restore *reports* what it found and marks what could be started
-   again; the client turns that into an offer (`PaneRestoreOutcome`).
+4. **The unattended daemon never relaunches on its own.** It restores evidence and starts nothing. Under
+   ADR-049 a connected client may auto-start only a Session runtime whose persisted command and safety
+   contract are complete; ambiguous, remote, pending-prompt and provider-resume cases remain stopped and
+   visible rather than becoming guessed fresh work.
 
 **Compatibility.** Nothing uses `deny_unknown_fields`, deliberately: a newer daemon may add a field and an
 older client must ignore it rather than fail. A change that would make an older client *misread* a message
@@ -1346,6 +1358,121 @@ Built now: tree search/filter/manual order, daemon-authoritative rename and rela
 permanent Pane placement, contextual actions, IME composition coverage and the macOS package/update path.
 AccessKit tests require `Tree`/`TreeItem` roles for every hierarchy level and explicitly reject duplicate
 legacy `ListItem` navigation. Screen-reader acceptance on real macOS/Linux assistive technology remains.
+
+### 6.4 Accepted Agent Node architecture
+
+**Status: accepted, not yet implemented.** ADR-059 replaces the click-to-zoom behavior of ADR-048 without
+weakening ADR-040's Agent/Pane separation. Everything to the right of the hierarchy becomes one WorkSurface:
+
+```text
+selected HierarchyKey ──► ViewTarget ──► WorkspaceView | SessionView | NodeView
+                                      │
+                                      └── no Layout/process/Attention mutation
+```
+
+`SessionView` renders the existing saved Layout. `NodeView` renders content unique to the selected semantic
+node—a Shell's owned terminal, an Agent's projection of its verified Shell `RuntimeBinding`, structured
+activity/transcript for a provider subagent, or typed resource/process detail. ADR-044 remains authoritative:
+an Agent view never claims ownership of the Shell's PTY or Pane. Returning to the Session exposes the
+unchanged Layout. The existing inspector becomes an internal details region instead of a second right-hand
+destination.
+
+Runtime identity splits into `AgentInstance` (stable semantic history), `RuntimeAttempt` (one launch/resume or
+verified in-place configuration epoch), provider conversation/thread, PTY/runtime binding and Pane binding. Every agentic Node
+owns exactly one instance, with at most one current attempt; Node/instance pairs and attempt generations are
+daemon-validated and operation-id fenced. Relaunch/resume creates an attempt rather than a replacement
+semantic node only with verified provider-conversation continuity; a fresh or unverified conversation
+creates a new Node/instance with lineage. Immutable launch
+specification and receipt values keep requested, effective and current model/account/permission/sandbox/
+flags/host/worktree facts distinct, with source, confidence, observation time and unknown/stale state.
+Selection launches nothing; warm attachment only connects a view to an already live attempt. Launch/resume
+epochs carry immutable launch specs/receipts; an in-process model switch instead carries a verified
+configuration-transition receipt and transfers the same process/conversation binding under a new fence.
+
+The attention flow remains the system's primary path:
+
+```text
+provider/PTY evidence
+        │
+        ▼
+normalised TurnEvent ──► AttentionManager ──► one ordered AttentionQueue
+                                                │
+                                                ▼
+                                     exact subject NodeView
+                                                │
+                                      verified interaction owner
+```
+
+vNext `route_attention` (successor to v4 `goto_attention`), tree badges, notifications and governor-approved
+automatic Focus resolve through the daemon to a tagged subject. An exact Node/AgentInstance route carries
+current attempt/pending id and verified interaction owner; a provisional parent/external or unassigned
+demand opens its evidence view without inventing a node or input. They never acknowledge the entry.
+Selection does not clear unread; only the foreground surface proving it rendered the exact result revision
+may mark it read. A submitted answer stays pending until adapter evidence confirms resolution. Question,
+permission, unread-result and runtime lifecycle remain separate; context or quota telemetry cannot move
+focus merely because a percentage crossed a threshold.
+
+Context is another authority graph, not tree ownership. `ContextLink` grants bounded pull access from one
+AgentInstance to another through a separate short-lived, destination/current-attempt-bound broker
+capability—not the administrative socket. `ContextPacket` is a reviewed, redacted one-shot handoff with
+lineage and an evidence-backed delivery state. Branches, short messages, observational dependencies and
+Teams use their own typed edges and cannot grant context, checkout writes, approvals or focus; a dependency
+never starts, advances or retries work. Large node content uses a surface-scoped, revisioned, bounded
+subscription only for the visible subject so hierarchy snapshots keep their current bounded role.
+
+Foreground-operator authority is enforced by the supported authenticated flow, not by same-uid process
+isolation: an unsandboxed compromised agent may steal the administrative token and impersonate a UI. Every
+handoff external effect is independently journalled; uncertain launch is only probed/adopted by preassigned
+identity, uncertain broker installation is revoked and uncertain context write is never retried. Dependency
+results use a bounded closed schema and cannot retain raw runtime/provider content.
+
+Storage gains semantic/resource nodes, instance/attempt metadata, safe launch/configuration receipts, context grants/read
+audit, lineage, packet metadata and bounded context/quota scope samples under ADR-057's closed catalogue. It
+does not gain provider credentials, raw environment values, PTY handles, unbounded transcripts or a
+dedicated semantic handoff-body record. Delivered bytes may still persist downstream in provider transcripts
+and ADR-052 terminal history, which review discloses. Remote context reads execute through a source-host jail
+and never fall back to a same-named local path. The complete data shapes, lifecycle and adversarial
+acceptance are in `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`. Offline remote files remain reported
+`pending_purge` behind bounded tombstones until authenticated host/generation cleanup proof. Initial Web
+resources keep their full URL as private content and pin every request/redirect to an address from a wholly
+public validated DNS answer set.
+
+### 6.5 Accepted local voice-input architecture
+
+**Status: accepted, not yet implemented.** ADR-060 adds a packaged local Whisper-compatible dictation engine
+only after ADR-059 can identify one exact
+semantic subject and its verified input owner. The native client owns microphone consent/capture and an
+inline memory-only draft. The daemon owns the closed model catalogue, downloads/storage and final exact-
+target text commit, but never receives PCM or transcription requests.
+
+```text
+foreground turn-gui surface
+  ├── OS microphone ── bounded memory channel ──► sandboxed SpeechWorker
+  │                                                 │
+  │                                    bounded untrusted transcript
+  └── immutable InputTarget ◄──────── inline review draft
+                              │
+                              └── explicit Insert/Send ──► turnd revalidation ──► verified input owner
+```
+
+`SpeechWorker` is a disposable packaged helper with no network, daemon token, checkout, credentials or
+arbitrary filesystem access. A platform broker supplies one verified read-only model descriptor; PCM and
+results move directly between the foreground client and worker in bounded memory. Native crash, hang, OOM,
+cancel and shutdown retire only the worker generation and cannot affect the daemon, PTYs or Attention.
+
+Capture snapshots surface/connection/daemon, Node/AgentInstance, RuntimeAttempt, input owner and optional
+free-text prompt generations. Changing any of them never retargets the draft. The protocol cannot initiate
+capture: it manages allowlisted model artifacts and exposes generic `commit_operator_text` only after the
+operator reviews the draft. Permissions, credentials, provisional/unassigned demands and unverifiable raw
+inputs have no dictation target. Text is control-stripped and bounded; no target byte is written before
+explicit Insert/Send, and an uncertain delivery is never replayed.
+
+Dictation sets `UserContext.sensitive_operation` only for its surface. This defers automatic Focus while the
+global queue, badges, unread and exact deferred route stay live; manual Attention navigation wins. Voice
+never emits Attention, acknowledges an entry, activates work or chooses an approval. Model installation is
+explicit and verifies signed catalogue identity, origin, size, digest, compatibility and licence before
+atomic adoption. ADR-057 inventories model files/receipts/partials/settings, while audio and drafts have no
+durable category because persistence is forbidden. `docs/LOCAL_VOICE_INPUT.md` is the complete contract.
 
 ---
 

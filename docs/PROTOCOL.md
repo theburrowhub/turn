@@ -460,8 +460,10 @@ map on something it already has, without a round trip to learn the key.
 
 `session_id`, `workspace_id`, `pane_id`, `node_id`, `template_id`, `handoff_id`,
 `attention_id`, `checkout_id` and `lease_id` are the prefixed string ids from `turn_core::ids`.
-`HierarchyKey` is tagged `workspace`, `session` or `process`; a raw string is never accepted where the
-kind matters.
+The v4 `HierarchyKey` is tagged `workspace`, `session` or `process`; a raw string is never accepted where
+the kind matters. ADR-059's incompatible vNext key is instead tagged `workspace`, `session` or general
+`node`, with a closed node kind so Group/Note/File/Diff/Web never impersonate a process. Migration maps every
+v4 process key losslessly; protocol negotiation rejects a mixed-version guess.
 
 ### Unified hierarchy
 
@@ -527,6 +529,182 @@ relationship or creates a Pane. `PaneFocusView.node_id` names the node represent
 `attention_subject_node_id` names the unchanged semantic subject. A PreviewDetails-only temporary Pane is
 not an input channel; a client may close that ephemeral view with `keep_processes` before focusing the
 resolved runtime Pane.
+
+### Accepted Agent Node protocol target (not in v4)
+
+ADR-059 changes the presentation contract, not the v4 wire by documentation alone. Until the Rust enums,
+store migrations, catalogue tests and GUI ship together, the operations below are reserved target names and
+a v4 peer must not send or claim them:
+
+| Planned `op` | Principal fields | Planned answer |
+| --- | --- | --- |
+| `get_node_view` | `surface_id`, `key: HierarchyKey`, `known_revision?` | `node_view` |
+| `subscribe_node_view` | `surface_id`, exact key/revision, content kind, byte/item bounds | `node_view_subscription` |
+| `unsubscribe_node_view` | `surface_id`, subscription id | `ack` |
+| `route_attention` | `surface_id`, `surface_connection_generation`, `attention_id?`, `scope?`, daemon generation | `attention_route` |
+| `activate_session` | foreground `surface_id`, `session_id`, expected lifecycle generation | `session_activation` |
+| `update_surface_activity` | `surface_id`, connection generation, focused/foreground/typing/session/sensitive state | `effects` |
+| `create_agent_instance` | `operation_id`, `session_id`, launch spec, `parent?` | `agent_instance` |
+| `restart_agent_instance` | `operation_id`, node/instance, expected generation, resume, launch overrides | `agent_instance` |
+| `branch_agent_instance` | `operation_id`, source instance/attempt, target launch spec | `agent_instance` |
+| `delete_agent_instance` | foreground surface, exact node/instance, expected generation, process disposition | `deletion_result` |
+| `create_resource_node` | foreground surface, `session_id`, `group_id?`, closed kind, typed payload, `operation_id` | `node_view` |
+| `update_resource_node` | foreground surface, exact node, expected revision, typed patch | `node_view` |
+| `delete_resource_node` | foreground surface, exact node, expected revision, Group disposition? | `ack` |
+| `set_group_membership` | foreground surface, exact same-Session node, `group_id?`, expected revision | `node_view` |
+| `mark_node_result_read` | foreground `surface_id`, exact node/instance, result revision | `ack` |
+| `create_context_link` | foreground `surface_id`, `operation_id`, source/destination instance, purpose, scopes, cumulative limits, required expiry | `context_link` |
+| `update_context_link` | foreground `surface_id`, link id, expected generation, purpose/scopes/limits/expiry patch, `operation_id` | `context_link` |
+| `revoke_context_link` | foreground `surface_id`, `operation_id`, `context_link_id`, expected generation | `ack` |
+| `prepare_context_packet` | foreground `surface_id`, `surface_connection_generation`, daemon generation, source, existing/new target spec, intent, separate next instruction?, budget, optional reviewed grant | `context_packet` |
+| `deliver_context_packet` | `operation_id`, opaque reviewed packet capability | `context_packet_delivery` |
+| `get_context_packet_delivery` | `operation_id` or packet id | `context_packet_delivery` |
+| `respond_to_agent_interaction` | foreground surface, exact node/instance/attempt/generation/pending id and user-selected response | `ack` |
+| `prepare_agent_message` | foreground surface/connection/daemon generation, source/destination instance, purpose, exact bounded body, required expiry | `agent_message` |
+| `deliver_agent_message` | `operation_id`, opaque reviewed message capability | `agent_message_delivery` |
+| `set_dependency_edge` | foreground surface, `operation_id`, source/target node, typed result contract, expected generation? | `dependency_edge` |
+| `remove_dependency_edge` | foreground surface, edge id, expected generation | `ack` |
+| `create_team` | foreground surface, `operation_id`, Session, members/roles, policy | `team` |
+| `update_team` | foreground surface, team id, expected generation, member/role/policy patch | `team` |
+| `delete_team` | foreground surface, team id, expected generation | `ack` |
+| `get_runtime_continuity` | exact node/instance | `runtime_continuity` |
+| `attach_runtime_attempt` | `operation_id`, exact node/instance/generation, verified endpoint receipt | `agent_instance` |
+
+`select_tree_node` continues to persist only surface-scoped navigation. The client derives a `ViewTarget`
+and requests its content separately. A Node selection never opens, zooms or focuses a Pane, but it may
+replace the WorkSurface content; that distinction supersedes ADR-048. `get_node_view` repeats the requested
+key and carries a monotonic node-view revision so late answers can be discarded. Selection never launches,
+cold-resumes, acknowledges or marks a result read; warm attachment only connects to an already live runtime.
+
+`activate_session` is the separate ADR-049 user intent. One Session-row click may issue selection followed
+by activation, but an Agent/child selection, `route_attention`, notification or automatic Focus never issues
+it. Activation may start only that Session's complete persisted safe runtime contract after revalidation and
+returns each started/refused resource explicitly; it cannot resume an unverified provider conversation.
+
+Ordinary create and branch atomically insert their one-to-one Node + AgentInstance pair in `provisioning`
+inside the store, then run external launch as a visible idempotent saga. They cannot accept or smuggle an
+initial packet. A new handoff target uses the same pair-creation primitive only inside
+`deliver_context_packet`, after the exact packet and optional grant have been reviewed.
+
+`subscribe_node_view` is surface-scoped and valid only for the currently selected exact subject. The answer
+contains a subscription id, subject, content kind, initial revision and negotiated bounds. Every
+`node_view_changed` push repeats the subscription id, subject and monotonic revision. Reselection,
+replacement connection, disconnect or explicit unsubscribe retires it; bounded backpressure emits a typed
+gap and requires resubscription. Clients discard late pushes from any retired subscription or different
+subject.
+
+`route_attention` is the vNext successor to v4 `goto_attention`. The daemon chooses an omitted-id “next” or
+an aggregate-badge `scope` using the one global queue order and returns `AttentionRoute`: `surface_id`,
+`surface_connection_generation`, daemon generation, `attention_id`, Workspace/Session and a tagged subject:
+exact node/AgentInstance with optional
+current attempt/generation/pending id, authenticated provisional parent/external-worker scope, or unassigned
+Session demand. Only an exact subject may carry a verified interaction owner and bounded NodeView bootstrap;
+the others carry a `ProvisionalAttentionView` and never borrow input. Notification deep links carry only an
+opaque attention id plus daemon generation and are revalidated through this operation. The
+same route is embedded in governor-approved `focus` effects; deferred focus retains it, while denied focus
+never navigates. Thus shortcut, exact/aggregate badge, notification and automatic focus cannot land merely
+on a plausible Session or Pane. Routing is navigation only: even when it crosses Sessions, it never invokes
+`activate_session` or starts/resumes a runtime.
+
+`update_surface_activity` replaces the surface-less v4 activity shape. The daemon serially tracks exactly
+one `focus_target_surface_id`: the focused connected surface, or when the application is backgrounded, the
+most recently focused still-connected surface. Automatic Focus binds its route to that stored surface and
+connection generation. If it is absent, replaced or disconnected before application, the effect is denied/
+degraded to queue/badge and never transferred to another window. User-invoked routing always names the
+surface that received the gesture.
+
+Linked-context reads do not exist on the administrative protocol. The supported flow lets a foreground
+operator surface create/revoke the durable grant here; this rejects agent events but cannot distinguish a
+same-uid process that has stolen the administrative capability and impersonates that surface. The destination
+adapter reads through a distinct local-only `ContextBroker` with a short-
+lived capability bound to link generation, destination instance, current attempt, allowed source/scopes,
+purpose, cumulative limits and expiry. The broker derives destination from the capability, rotates it for
+every attempt, validates a local/remote source-host jail and never exposes the daemon control token.
+`update_context_link` is the only renew/expand operation: it requires a foreground surface, expected
+generation and operation id, creates a new generation/capability and never edits a grant in place.
+Manual create/update/revoke are operation-id idempotent, so a lost answer cannot duplicate authority or
+budget. Each live link counts against `records.active_context_links_per_agent` at both endpoints and create
+is refused at either bound. Archive/end/delete/expiry revocations are internal lifecycle transitions and
+require no UI surface.
+
+The broker request contains only that capability, a closed content kind, selector/range and requested byte/
+token bound; its response repeats grant generation, provenance, redaction/truncation and remaining budgets.
+It returns quoted untrusted data, never a control-protocol object that an agent can replay as authority.
+Responses are bounded/non-streaming: the broker atomically reserves the maximum budget, buffers data, then
+revalidates generation/expiry/endpoints and commits actual budget + audit immediately before exposing bytes.
+A revoke committed first yields no body; a read committed first is already disclosed and remains charged.
+Parallel reservations count against the cumulative limit. The high-entropy bearer prevents accidental/stale
+cross-wiring and other-user access, not theft by a malicious same-uid process absent per-agent OS isolation.
+If an offline source host prevents physical removal of a catalogued remote artifact, revoke/delete returns
+`remote_residual` with `pending_purge`, persists a bounded non-secret host/generation cleanup tombstone and
+keeps authority revoked. An authenticated purge result for that exact host/generation is the only transition
+to `removed`; reaching the tombstone bound refuses creation of new remote artifacts rather than forgetting
+cleanup evidence.
+
+Resource operations are M14 names, not v4 claims. Group is a direct Session child and cannot itself name a
+group. `set_group_membership` changes only one same-Session presentation membership for an Agent,
+Shell/Process or resource; it never rewrites runtime parentage. Deleting a non-empty Group accepts only the
+explicit safe `reparent_children` disposition and never cascades. Note stores bounded Turn-private text;
+File/Diff accept canonical checkout-confined references. Web accepts only HTTPS without userinfo/query/
+fragment, treats the complete URL as private content, validates all DNS answers and pins every connection/
+redirect to an approved public IP; it does not fetch during create/restore. Deletion removes only the Turn
+record. Every operation is revision/idempotency fenced and enters ADR-057 inventory/export/delete coverage
+before it ships.
+
+The M13 coordination names are likewise reserved, not v4 claims. The supported flow accepts create/change
+only from foreground operator operations; authenticated agent events may propose them and create an Attention
+review, never call these operations. This is not protection from an unsandboxed same-uid process that steals
+the administrative capability and impersonates a UI. Message preparation holds the exact body in one expiring client-bound
+draft. Message state is not one overloaded enum: `draft_state` is `live|consumed|lost`, `review_state` is
+`pending|reviewed|review_required`, and `delivery_state` is
+`not_started|queued|submitted|received|submitted_unconfirmed|failed`. The explicit deliver action moves a
+reviewed draft to `consumed/reviewed/queued`; later evidence advances only delivery state. Delivery assigns
+FIFO order per destination, submits once and persists only hash/metadata/evidence. An uncertain delivery is
+never replayed. Daemon loss preserves proven submission, marks an in-progress write
+`submitted_unconfirmed`, or marks a pre-write memory-only draft `lost/review_required/not_started`; the old
+operation is terminal, a hash is never replay material, and retry requires new preparation, review and
+operation id. Dependency edges store only closed bounded state, producer/revision
+ids, hashes/verified references, timestamped provenance/confidence and an optional bounded stripped/redacted
+summary; raw output, PTY, transcripts, diff/file bodies, environment and arbitrary provider payloads are
+invalid. They emit no start/retry operation. Teams store roles/policy only and confer no socket, context,
+checkout, approval or focus capability.
+
+`RuntimeContinuityView` reports endpoint kind/host, stable non-secret fingerprint, integration capability,
+conversation binding, last observation and attach/resume confidence—never a bearer token or descriptor.
+`attach_runtime_attempt` is warm attachment to a verified still-live endpoint and launches nothing; a cold
+resume remains `restart_agent_instance`. A reconnect to a configured provider-runtime/multiplexer is M13
+scope, while general Remote/SSH Session creation remains a later milestone.
+
+`respond_to_agent_interaction` is not permission automation. It exists only for a foreground, explicit user
+action against the exact typed prompt id and current attempt. The daemon refuses stale ids and adapter/
+prompt mismatches, records submission as pending, and waits for provider evidence before resolving
+Attention. A provider without that capability continues through verified PTY input.
+
+### Accepted local dictation protocol target (not in v4)
+
+ADR-060 adds no request that can open a microphone, capture PCM or run transcription. Those are foreground
+native-client acts. The reserved M15 operations manage only trusted model artifacts and an already reviewed
+text commit:
+
+| Planned `op` | Principal fields | Planned answer |
+| --- | --- | --- |
+| `list_local_speech_models` | none | `local_speech_models` |
+| `install_local_speech_model` | foreground surface, `operation_id`, closed `model_id` | `local_speech_model_state` |
+| `cancel_local_speech_model_install` | foreground surface, `operation_id`, model id/generation | `local_speech_model_state` |
+| `remove_local_speech_model` | foreground surface, `operation_id`, model id/generation | `local_speech_model_state` |
+| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, `insert|submit`, bounded UTF-8 text | `operator_text_delivery` |
+
+`InputTarget` repeats exact Workspace/Session/Node, optional AgentInstance, current RuntimeAttempt/generation,
+verified input owner and optional pending free-text interaction/revision. The daemon revalidates all of it
+immediately before one fenced write. Permission, credential/password, provisional/unassigned, raw-TTY and
+unverified alternate-screen targets are invalid. Text is independently control-stripped and bounded;
+`insert` cannot append Enter, while `submit` performs exactly one reviewed send. Dictation provenance grants
+no authority or confidence. An uncertain partial write is `submitted_unconfirmed` and is never replayed.
+
+Model list/state/progress contains closed model id, expected/observed digest and size, catalogue/engine
+compatibility, licence, generation and safe error code. It never contains PCM, transcript, device identity or
+arbitrary URL/path. Audio, hypotheses and the inline draft never cross this protocol. The full target,
+settings, privacy and acceptance contract is `docs/LOCAL_VOICE_INPUT.md`.
 
 ### Release/update preflight
 
@@ -649,6 +827,12 @@ map from command id to chord, and the daemon never sees a keystroke. An empty ch
 an absent entry inherits, which is why resetting a binding removes its entry rather than writing the
 default into it. `keymap.json` still loads at startup and the stored preference wins over it per
 command, so a command the preference does not mention keeps what the file said.
+
+ADR-060 reserves `keyboard.bindings["input.dictate"]` plus `input.dictation.model` (Global, default
+`none`), `input.dictation.language` (all levels, default `auto`) and `input.dictation.max_seconds` (Global,
+default 120, range 15–300), plus Global `records.local_speech_models_mib` (default 8,192). They remain
+unknown/refused in protocol v4 until M15 ships end to end; `none` means no microphone feature/model download,
+and no setting can enable cloud, auto-send or voice commands.
 
 `branch` and `task` fill `{branch}` and `{task}` in the template's name pattern.
 `panes` is a list of `NewPane`; absent means a single shell.
@@ -843,13 +1027,14 @@ process may be shown in more than one place.
 | `prepare_context_handoff` | `session_id`, `source_node_id`, `target_node_id`, `mode`, `instruction?` | `context_handoff` |
 | `deliver_context_handoff` | `session_id`, `handoff_id` | `ack` |
 
-This is a two-request, review-before-send capability. `prepare_context_handoff` verifies two distinct
+This is the **implemented v4** two-request, review-before-send capability. `prepare_context_handoff` verifies two distinct
 agentic nodes in one active Session and one of four explicit intents: `continue_with`, `review_handoff`,
 `second_opinion` or `promote_to_main`. It assembles a bounded packet containing Session objective/summary,
 real Git root/branch/HEAD/status/diff evidence, relevant files, stable Activity Preview decisions, pending
 work, commands and exit codes, tests, subagents, recent events, active processes and prior handoff metadata.
-Secrets are redacted and the response carries the **exact** text the daemon retains. It never reads raw
-terminal scrollback and never writes a PTY. Hidden previews remain hidden.
+Typed credential fields are omitted, known-secret/secret-shaped text is redacted, and the response carries
+the **exact** text the daemon retains for operator review. No pattern detector proves arbitrary free text
+secret-free. It never reads raw terminal scrollback and never writes a PTY. Hidden previews remain hidden.
 
 The returned `handoff_id` is an opaque, short-lived capability bound to the preparing client, Session and
 destination. `deliver_context_handoff` accepts only that id; a client cannot replace the reviewed body on
@@ -862,7 +1047,49 @@ is never replayed automatically. Drafts expire after ten minutes and are discard
 disconnects. Success means the payload was submitted to the PTY; it is not proof that the Agent accepted or
 acted on it. Handoffs deliberately cannot answer permission or question prompts; those remain explicit
 `write_pty` input. A metadata-only `context_handoff.finished` event records source, destination, intent and
-submitted/uncertain outcome under normal event-retention policy; the reviewed body is never persisted.
+submitted/uncertain outcome under normal event-retention policy. The handoff subsystem creates no dedicated
+durable semantic body record: its draft is memory-only. Once submitted, the same bytes may persist in the
+destination provider transcript, visible terminal/scrollback and ADR-052 terminal journal; Turn's review
+must disclose that downstream retention and revocation cannot recall it.
+
+ADR-059 retains this security boundary and specifies the planned `ContextPacket` successor. Its
+`prepare_context_packet`/`deliver_context_packet` operations replace rather than alias the v4 pair because
+their schemas and guarantees differ. Preparation creates only an expiring draft and optional target spec.
+Delivery can include adapter-normalised turns and reviewed short-lived pull grants, target a newly created
+stable Node + AgentInstance, carry a context-window-aware budget manifest and record evidence-backed
+submitted/received/read/acted observations independently. New-target provisioning/launch/delivery
+is a fenced idempotent saga; an uncertain write is never retried. It never creates a dedicated semantic
+packet-body record, substitutes
+an unreviewed delivery payload, writes into a pending interaction or treats submission as receipt;
+downstream provider/terminal retention still applies. `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` is normative
+for that target; the richer fields are not part of protocol v4.
+
+The vNext draft is client/surface/daemon-generation bound and memory-only. A disconnect before delivery is
+accepted discards it; after acceptance the same daemon may hold the bounded body only for the in-flight
+saga. Durable hash/manifest metadata cannot reconstruct it. Daemon restart reconciles effects already
+attempted but never advances a pre-write delivery: it preserves proven submission, marks an ambiguous write
+`submitted_unconfirmed`, or revokes any grant and records `draft_lost`/`review_required`. Sending to an
+already provisioned compatible target then requires a new prepare, operator review and operation id.
+
+`ContextPacketDeliveryView` is durable and queryable by operation id. It repeats packet/target identities,
+preassigned attempt/launch nonce, target generation and independent phase/evidence fields: provisioning,
+launch not started/in progress/confirmed/unconfirmed/failed, envelope/grant preparation and install, write
+not started/in progress/submitted/unconfirmed/failed, plus independently observed receipt/read/action
+timestamps and sources, plus draft `live|lost|review_required`. Launch, bearer installation and context write
+are distinct external effects with a durable intent before each. Within one daemon generation, recovery may
+resume only when evidence proves the next effect was never attempted and the reviewed body remains live.
+After a daemon-generation change it performs reconciliation only. An ambiguous launch is probed/adopted only
+by its preassigned identity and never respawned; ambiguous bearer installation revokes that link generation;
+an in-progress or ambiguous write is never retried.
+
+An optional reviewed ContextLink is committed `pending_activation` only after the target attempt is fenced.
+Its short-lived broker bearer is installed only through the adapter's inherited descriptor/owner-only
+attempt file; the packet envelope carries a non-secret link descriptor. A PTY-only adapter without that
+channel refuses grant-bearing delivery rather than writing authority into a terminal/transcript. It becomes
+usable immediately before the one write; launch failure, definite write failure or uncertain write revokes
+it, while evidenced submission keeps it only to its reviewed expiry/budget. A failed `provisioning` target
+remains visible with the exact phase/error and semantic retry or `delete_agent_instance` action; no timeout
+silently deletes it.
 
 ### Node control
 
@@ -896,6 +1123,13 @@ it.
 guards — pressing the shortcut is consent. It still resets the rate limiter so
 automatic focus does not immediately fight manual navigation.
 
+This paragraph is the implemented v4 behavior. ADR-059 does not silently extend this shape: incompatible
+vNext replaces it with surface-scoped `route_attention`, whose answer carries a tagged `exact`, `provisional`
+or `unassigned` subject. Only `exact` may include a verified interaction owner and Node View bootstrap; the
+other tags carry their exact provisional demand view and never borrow input. Selection/rendering still never
+acknowledges the entry, and a response remains pending until adapter evidence confirms that exact prompt
+ended.
+
 A muted session still badges. Muting silences the interruption, not the evidence, and its
 deadline is restored after a daemon restart. Snooze, dismiss, acknowledgement and explicit
 queue priority are stored with the queue before its reordered projection is pushed.
@@ -924,6 +1158,10 @@ queue priority are stored with the queue before its reordered projection is push
 
 This is `turn_core::attention::UserContext`, sent as itself. It is what the focus
 governor needs to decide whether it may move the user.
+
+This is likewise the v4 shape. ADR-059 replaces it with `update_surface_activity`, binding activity and any
+automatic route to one connected surface/connection generation as specified in the accepted target table;
+vNext never guesses a window from `active_session` alone.
 
 - Send state transitions immediately: the first keystroke of a burst, window focus,
   active Session and sensitive-operation changes. During a continuing burst, coalesce
@@ -1183,6 +1421,11 @@ A client **must not** treat `focus_deferred` or `focus_denied` as a jump. Only
 `focus` moves the user. Tags: `badge`, `highlight`, `play_sound`, `notify`,
 `enqueued`, `focus`, `focus_deferred`, `focus_denied`, `run_custom`, `cleared`.
 
+In the incompatible ADR-059 protocol, `notify`, `focus` and `focus_deferred` additionally carry the opaque
+`attention_id`, daemon generation and daemon-resolved `AttentionRoute` (or a route token resolving to the
+same immutable subject). Notification activation revalidates that id. A deferred effect keeps the route;
+clients never reconstruct a Node, Pane or Session target from notification text.
+
 ---
 
 ## 8. Server pushes — daemon → UI
@@ -1209,6 +1452,16 @@ request id because no request caused them.
 | `layout_changed` | `session_id`, `layout` |
 | `pty_resized` | `session_id`, `node_id`, `size` |
 | `restore_result` | `session_id`, `state`, `needs_explanation`, `panes` |
+
+The incompatible ADR-059 protocol adds `node_view_changed`, `runtime_attempt_changed`,
+`context_usage_changed`, `quota_scope_changed`, `context_link_changed` and `context_packet_changed`. Large
+content pushes are sent only for an active `NodeViewSubscription` and repeat its subscription id, exact
+subject and monotonic revision; a gap is explicit and cancels the stream. Context/quota pushes name their
+stable scope ids rather than duplicating a sample per Agent.
+
+M13 additionally reserves `agent_message_changed`, `dependency_edge_changed`, `team_changed` and
+`runtime_continuity_changed`. Each repeats its stable id/generation and carries bounded metadata/evidence,
+never a message body, runtime bearer or implicit execution instruction.
 
 `hierarchy_changed` sends the whole projection, not a structural diff. A client accepts only a strictly
 newer revision from the same daemon; a gap, reversal or daemon identity change requires `get_hierarchy`.
@@ -1474,6 +1727,43 @@ Raw hook bodies, raw PTY output and environment values are not representable her
 carry `Confidence`; clients must label provisional values as inferred and navigate through the accompanying
 stable key rather than guessing from a display name.
 
+### Planned `NodeView` — one visible semantic subject
+
+Not present in v4. The ADR-059 projection is tagged by node/content kind and carries `surface_id`, the exact
+`HierarchyKey`, node-view revision, semantic `AgentInstanceId?`, current `RuntimeAttemptId?`, safe content
+capability and bounded content/subscription descriptor. It composes rather than duplicates:
+
+- the exact subject's Attention entries and verified interaction owner;
+- stable identity, provider conversation capability and attempt history;
+- attempt start cause plus immutable launch/resume receipt or verified in-place configuration-transition
+  receipt, requested/effective/current runtime facts, provenance and fallback reasons;
+- conversation-scoped context usage and separately scoped provider/account quota samples;
+- hierarchy, context-link and lineage references;
+- the active terminal attachment, structured activity/transcript or truthful unavailable state.
+
+Every dynamic observation carries source, observed time and freshness. Shared quota names its account/host
+scope and is never projected as node-attributed consumption. Missing facts are absent with a typed
+unavailable reason, not zero/default values. Selecting the node does not acknowledge Attention; the daemon
+marks a result read only after `mark_node_result_read` names the rendered result revision.
+
+### Planned `AttentionRoute` and Node View subscription
+
+Not present in v4. `AttentionRoute` contains the requesting `surface_id`, its
+`surface_connection_generation`, daemon generation, exact `attention_id`, Workspace/Session and tagged
+`subject`. An exact subject contains `NodeId`, agentic
+`AgentInstanceId?`, current `RuntimeAttemptId?`/generation, exact pending interaction id, verified input-owner
+node and a bounded `NodeView` bootstrap with revision. A provisional subject contains only the authenticated
+parent/external-worker correlation scope; an unassigned subject contains only the owning Session. Both open
+a demand view, expose no borrowed input and are replaced by a new route revision if later evidence binds a
+node. The UI applies the route as one visual transaction and revalidates it after any generation change. An
+aggregate Workspace/Session badge never chooses locally; it asks the daemon for the first queue entry in
+that scope.
+
+`NodeViewSubscription` contains `subscription_id`, surface, exact key/subject, content kind, current revision
+and byte/item bounds. Its pushes carry the same identity and revision. Backpressure is bounded and explicit;
+a gap, reselection, disconnect or replacement connection retires the stream and cannot leak content from the
+previously selected node into the current view.
+
 ### `SessionSummary` — one Session projection
 
 Identity: `id`, `workspace_id`, `name`, `note`, `cwd`, `status`
@@ -1698,6 +1988,12 @@ descriptions has to argue with a test first.
 6. **Navigation cannot fabricate ownership.** There is no unconstrained `move_node`, no client-supplied
    confidence promotion and no `tree.node_selected` domain event. Audited, cycle-checked relationship
    correction is planned; protocol v4 refuses to approximate it with a local-only mutation.
+7. **The daemon protocol cannot listen.** M15 adds no start-microphone, PCM, audio-file, transcription or
+   background-listening request. An authenticated client can manage a closed local model id and commit text
+   the foreground operator already reviewed; it cannot make another client capture audio.
+8. **Dictation cannot become a permission or Attention shortcut.** `commit_operator_text` accepts only an
+   exact `FreeText` input target. It cannot approve/deny, route/acknowledge/dismiss Attention, activate a
+   Session, launch work or retarget to the current selection.
 
 One more, on the transport, which this crate does not implement but assumes:
 `$SOCKET` is owner-only, the kernel peer UID is checked, at most 32 connections are admitted and the

@@ -222,8 +222,10 @@ set `records.terminal_history` off at its Settings level; this immediately stops
 retained archive without stopping the process. The launch environment override
 `TURN_TERMINAL_HISTORY=disabled` remains supported (`0`, `false`, `off` and `no` are aliases), and
 `--no-persist` disables archives globally. A recovered archive is never a process capability: its node
-remains `Orphaned` or `Lost`, cannot accept input and is replaced/deleted when the user explicitly
-relaunches that Pane.
+remains `Orphaned` or `Lost` and cannot accept input. In implemented v0.1, explicit Pane relaunch replaces
+the node and deletes that archive. ADR-059's accepted target instead preserves the semantic
+Node/AgentInstance on verified restart/resume and appends a RuntimeAttempt; the recovered archive remains
+read-only historical evidence and never becomes the new writable attempt.
 
 ### 3.6.2 Local-data export and deletion
 
@@ -375,6 +377,44 @@ snapshots expose it only to that surface. The first client that bootstraps a sur
 connection and clears the old temporary binding before receiving its snapshot; disconnect and daemon
 restart clear it as well. Tree expansion/selection still persist. This prevents a reconnected UI from
 showing a `TEMP PANE` marker it cannot focus, while leaving the Agent and saved Layout untouched.
+
+### 3.11 Accepted local microphone, worker and model boundary
+
+**Not implemented in v0.1.** ADR-060/M15 permits capture only from an explicit foreground native-client
+gesture. The daemon protocol has no start-microphone, audio or transcription operation; a hook, Agent,
+repository, restore path, notification and background window therefore have no supported route to listen.
+OS permission belongs to `turn-gui`, capture stops on Escape/blur/device loss/selection change/window close,
+and one application-scoped lease prevents overlapping hidden recordings.
+As elsewhere, “foreground operator” describes the supported authenticated flow, not protection from a
+same-uid process that steals the administrative token; that process can impersonate input but still cannot
+use the daemon protocol to make `turn-gui` open its microphone or reveal its memory-only draft.
+
+PCM is bounded memory passed directly to a disposable sandboxed `SpeechWorker`. The worker receives only an
+inherited read-only descriptor for one verified model and a single audio/result channel. It has no network,
+daemon capability, checkout, credentials, environment secrets, clipboard, accessibility API or arbitrary
+filesystem access. Native crash/abort/segfault, hang, OOM, cancel and shutdown kill only that worker
+generation; a late result cannot mutate a newer draft and no partial result is delivered.
+
+Recognition output is untrusted operator input. Before review the client strips NUL/ESC/C1, bidi and unsafe
+invisible controls, normalises newlines and caps it at 32 KiB UTF-8. Zero bytes reach a runtime until the
+foreground operator explicitly chooses Insert or Send. The daemon then revalidates the exact surface,
+semantic subject, AgentInstance/RuntimeAttempt, input owner and free-text prompt revision; it refuses
+permission, password/credential, provisional/unassigned, raw-TTY and unverified alternate-screen targets.
+Insert cannot append Enter. Submit is one operation-id-fenced write, and ambiguity is never auto-retried.
+Words such as “yes” or “allow” confer no permission or Turn command authority.
+
+The model supply chain is closed. A signed versioned catalogue fixes id, HTTPS origin, size, digest, engine
+compatibility, provenance and licence. Install is explicit, byte-capped and free-space-checked; owner-only
+create-new partials are no-symlink/generation-fenced and atomically renamed only after the entire size/digest
+validates. Redirect policy cannot change the approved artifact origin; every direct connection validates all
+A/AAAA answers as public and pins its socket to an approved address while retaining TLS SNI/Host. Delete/download/load races fail
+closed, and the native parser never sees a header-only, partial, mismatched or arbitrary-path model.
+
+“Local” means the physical foreground operator device. The worker has no cloud, browser/server or Session-
+host fallback. Model download is a separately disclosed functional transfer and carries no audio/text. PCM,
+hypotheses and drafts never enter protocol, store, log, journal, events, diagnostics or Turn crash reports;
+after explicit Send, ordinary terminal/provider retention applies. The complete target is
+`docs/LOCAL_VOICE_INPUT.md`.
 
 ## 4. Product invariants, defended as security properties
 
@@ -551,11 +591,108 @@ lets agent-authored text misrepresent itself in the UI.
 
 **Passing context between Agents is an explicit prompt-injection boundary.** Turn includes only bounded,
 stable Activity Preview facts and an optional user instruction; it sanitises control and invisible
-characters, redacts secret-shaped values and shows the exact daemon-held body before Send. The capability
+characters, applies best-effort known-secret/secret-shaped redaction and shows the exact daemon-held body
+before Send. No detector proves arbitrary source text secret-free; typed exclusions, allowlists, bounds and
+operator review are the real disclosure boundary. The capability
 cannot target an Agent with a pending question or permission, cannot be edited at delivery time and is never
 replayed after an uncertain write. The payload still contains untrusted Agent-authored claims, so it tells
-the destination to verify assumptions rather than treating them as authority. Full bodies remain
-memory-only and expire.
+the destination to verify assumptions rather than treating them as authority. This paragraph describes the
+implemented v0.1 handoff. Its draft is memory-only and Turn creates no dedicated durable semantic body
+record, but delivery puts the bytes in the destination program: provider transcripts, visible terminal/
+scrollback and ADR-052's private journal may retain them. Review names that downstream boundary; revocation
+cannot recall it, and a sensitive Session can disable terminal history before launch.
+
+The accepted post-v0.1 `ContextPacket` keeps review, sanitisation/best-effort redaction, expiry, no-pending-
+prompt and no-dedicated-body-store boundaries while adding adapter-normalised turns and explicitly reviewed
+scoped pull grants. Preparation creates no node/process/grant. Delivery binds the reviewed canonical body
+hash and trusted encoder template/version to one opaque capability, provisions a new target as a durable
+fenced idempotent saga, and never retries an ambiguous external effect. Launch identity/nonce are durably
+preassigned: uncertain launch becomes `launch_unconfirmed` and may only probe/adopt that exact process,
+uncertain bearer installation revokes its generation, and uncertain context write becomes
+`submitted_unconfirmed`; none is automatically repeated. Native adapters may prove decoded body
+identity; PTY fallback proves deterministic submission only. No raw PTY or unbounded provider transcript
+becomes an event-log field. A reviewed grant bearer is installed only by inherited descriptor/owner-only
+attempt file; the packet carries a non-secret descriptor, and PTY-only delivery refuses the grant instead of
+pasting authority into terminal history.
+The reviewed body remains bounded memory in the current daemon generation; its durable hash/manifest cannot
+reconstruct it. After daemon loss, recovery only reconciles the preassigned launch and other attempted
+effects: without proven submission it revokes any grant, records `draft_lost`/`review_required` and requires
+a new prepare/review rather than sending from metadata.
+
+**A `ContextLink` is operator-granted authority, not tree inheritance.** The supported authenticated flow
+accepts create, expand or renew only from an explicit foreground UI action. This enforcement rejects agent
+events but, as the same-uid threat above states, a malicious unsandboxed process can steal the administrative
+token and impersonate that UI; “operator-only” is not a hostile-process boundary until a sandbox or UI-owned
+authority inaccessible to agents exists. Every grant has a purpose, closed scopes, cumulative byte/token/
+request limits, required expiry, fenced generation and audit. Foreground create/update/revoke are operation-
+id idempotent, and each live link counts against both endpoints' declared per-Agent bound; reaching it refuses
+creation. Ending/archive revokes it permanently, and expiry, revoke or endpoint deletion invalidate it before
+records disappear. An agent may propose a link but cannot authorise one. Agents never receive the daemon control token: a separate
+local-only broker issues a high-entropy short-lived bearer bound to the destination AgentInstance and current
+RuntimeAttempt, derives destination rather than trusting a caller id, rotates on every attempt and validates
+generation/scope/budget/expiry on every read. It travels by inherited descriptor or an owner-only no-symlink
+attempt file, never argv/env/log/terminal/transcript. This protects logical routing, replay, other OS users
+and cooperative adapters; as the same-uid threat above states, it is not isolation from a malicious local
+agent unless a future per-agent OS sandbox is active.
+
+Broker output is bounded and buffered. It atomically reserves budget, performs the read, then revalidates
+grant generation/endpoints/expiry and commits actual budget plus audit immediately before exposing bytes.
+A revoke committed first yields no body; a read committed first is already disclosed and cannot be recalled.
+Parallel reservations count toward cumulative limits. A live grant warns once that individual reads are not
+operator-reviewed and may persist in the destination provider.
+
+Summary/activity/transcript/repository responses are normalised, control-stripped, best-effort known-secret
+redacted, provenance-labelled and framed as untrusted data. Repository scope uses explicit canonical roots
+and path allowlists. It opens regular files descriptor-relative with no-follow/beneath/no-cross-device
+semantics, rejects unreviewed hardlinks/mounts and sensitive files by default, checks identity on the opened
+descriptor and caps files/bytes before and during reading locally and remotely.
+Continuous terminal history is not a link scope because VT archives cannot be reliably redacted; only an
+operator-selected, reviewed bounded excerpt may enter one packet. Remote reads require mutually
+authenticated pinned host identity, encrypted/integrity-protected transport, nonces/replay rejection and an
+online source authority for every read; no offline grant/body cache or local fallback exists. Remote token/
+socket/key files are owner-only, no-symlink and privacy-catalogued. A host that is offline during delete may
+retain them physically: logical authority still revokes online, while Turn reports `remote_residual`/
+`pending_purge`, retains a bounded non-secret tombstone and requires authenticated proof of an exact host/
+generation purge after reconnect before claiming physical deletion. The complete threat, lifecycle and
+product-boundary contract is in `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`.
+
+**M13 coordination confers no agent authority.** Only foreground operator requests create/change/deliver an
+`AgentMessage`, `DependencyEdge` or Team; authenticated agent/conductor input is an untrusted proposal that
+can create an Attention review, not invoke the operation. This is the same supported-flow invariant, not a
+claim against administrative-token theft by an unsandboxed same-uid process. A message is bounded, shown exactly before send,
+cannot target a pending interaction and is submitted once in FIFO order; uncertain delivery is not retried.
+Turn persists only message hash/metadata/evidence, while provider/terminal downstream retention is disclosed.
+A dependency stores a bounded closed result: state, producer/revision ids, hashes or verified references,
+timestamped provenance/confidence and at most a bounded stripped/redacted summary. Raw output, PTY,
+transcript, diff/file body, environment and arbitrary provider payloads are forbidden. It may project ready/
+blocked/failure, but never contains an executable next step or emits start/advance/retry. Team roles/policy grant no control token,
+context, checkout, approval or focus capability; only AttentionManager/governor can focus from typed evidence
+under operator policy.
+
+An M13 `RuntimeEndpoint` stores only safe host/endpoint fingerprints, conversation binding, capabilities and
+observations. Bearers, live descriptors and raw transcripts never persist or cross the UI protocol. Warm
+attach requires a mutually authenticated still-live endpoint and exact conversation/instance/generation;
+cold resume is separately fenced. Missing, mismatched or replayed endpoint evidence fails closed and cannot
+become a local/fresh launch. These records, remote keys/sockets and coordination metadata are subject to the
+ADR-057 catalogue, redacted export, retention and revoke/delete cascade.
+
+**M14 resources are hostile content, not trusted UI.** Group is same-Session presentation only; deleting a
+non-empty Group explicitly reparents children and never cascades into runtimes or user data. Note content is
+size-bounded private text stored exactly, while every projection escapes controls/markup and executes
+nothing. File/Diff uses the same descriptor-relative regular-file jail, hardlink/mount policy and byte limits
+as repository context. Markdown, SVG, HTML and similar content render inert with scripts and remote loads
+disabled.
+
+The initial Web node accepts only `https://host[:port]/path`; it rejects userinfo, every query/fragment,
+private/loopback/link-local/multicast/metadata addresses and `file:`, `data:`, `javascript:` or app/IPC
+schemes. The entire URL is private content and only a sanitised origin is safe projection metadata. Every
+connection and redirect validates all A/AAAA answers, rejects the set if any is non-public, and pins the
+socket to one approved address while preserving TLS SNI/HTTP Host; no second lookup or ambient proxy chooses
+the peer, and there is no scheme downgrade. Rendering uses an isolated origin
+with no inherited cookies, provider/daemon credentials, filesystem/IPC access, downloads, popups or implicit
+external navigation. Create/restore/background selection performs no request; only explicit foreground
+navigation loads content. URLs are sensitive metadata in privacy export, and page script cannot mutate the
+stored URL or gain a typed Turn operation.
 
 **A worktree is not a sandbox.** It isolates a Git worktree and index, not credential helpers, ports,
 containers, databases, caches or external services. Turn accepts those collisions for the MVP only when the

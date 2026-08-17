@@ -27,3 +27,15 @@ Inspector event rows contain bounded typed summaries and provenance, never raw h
 transcripts. Workspace and Session environment variables are projected by name only. Contextual actions use
 the same existing typed operations as the hierarchy; opening or closing the inspector changes no process,
 Pane, layout, lease or Attention state.
+
+## Post-v0.1 successor
+
+ADR-059 keeps every redaction, provenance, late-response and accessibility guarantee above, but moves Agent
+and Process detail inside the selected `NodeView` on the single WorkSurface. The inspector is no longer a
+second narrow destination for primary agent content. New acceptance must additionally cover requested versus
+effective launch facts, stable instance/attempt history, context usage versus shared quota, context links,
+handoff lineage and honest stale/unavailable observations. At least one authenticated live adapter must
+provide effective model plus context usage, at least one real provider/account must provide quota, and at
+least one provider transcript must support bounded pull/handoff; these may be different providers, while
+negative fixtures prove unsupported states remain unavailable rather than fabricated. See
+`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` §4, §6 and §11.
