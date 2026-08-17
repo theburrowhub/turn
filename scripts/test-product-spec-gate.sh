@@ -32,6 +32,7 @@ seed_case() {
   [[ ! -f "$repo_root/.gitignore" ]] || cp "$repo_root/.gitignore" "$case_dir/"
   cp -R "$repo_root/docs/." "$case_dir/docs/"
   cp "$repo_root/scripts/verify-product-spec.sh" \
+    "$repo_root/scripts/verify-product-capability-source.sh" \
     "$repo_root/scripts/verify-product-completion.sh" \
     "$repo_root/scripts/test-product-spec-gate.sh" "$case_dir/scripts/"
   cp "$repo_root/.github/workflows/ci.yml" "$case_dir/.github/workflows/"
@@ -98,6 +99,7 @@ refreeze_case() {
 }
 
 /bin/bash -n "$repo_root/scripts/verify-product-spec.sh" \
+  "$repo_root/scripts/verify-product-capability-source.sh" \
   "$repo_root/scripts/verify-product-completion.sh" \
   "$repo_root/scripts/test-product-spec-gate.sh"
 
