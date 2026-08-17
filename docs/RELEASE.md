@@ -124,6 +124,28 @@ opening a window or starting a companion. A version/protocol refusal is actionab
 terminal; the existing status bar displays the handshake's “which side is old” recovery
 message rather than attempting a partially compatible session.
 
+## Accepted M15 local dictation packaging
+
+This is an ADR-060 target, not part of the current three-binary v0.1 bundle. M15 adds a
+version-checked `turn-speech-worker` packaged sibling. Release preflight must include its Cargo/engine
+version and hash in `release.plist`, sign it with the hardened runtime before the outer app and reject a
+missing, mismatched, ad-hoc-substituted or independently downloaded helper. The worker must retain its
+no-network/no-arbitrary-files sandbox in the signed package; debug/source launch is not evidence for that
+boundary.
+
+The macOS bundle declares one clear microphone usage string and requests consent only after a foreground
+capture gesture. It contains the required hardened-runtime microphone entitlement for `turn-gui`, never for
+the daemon/worker. Linux packaging records the audio backend and portal/session used. Third-party notices
+include the inference engine and every catalogue model's licence/provenance before its installer is offered;
+no model weights are silently bundled with Turn.
+
+`make dictation-acceptance` must run deterministic fake-engine tests on both platforms. Packaged acceptance
+then uses one catalogue-verified real local model and microphone to prove consent, visible capture, exact-
+target draft, explicit Send, worker crash isolation, offline inference and zero network fallback. It scans
+the package/data dir, protocol capture, logs, journal, diagnostics and crash artifacts for seeded PCM/draft
+markers. Production release cannot advertise dictation until this packaged pass, VoiceOver/Orca checks and
+model download/delete/privacy inventory all pass for that architecture.
+
 ## Packaged Claude vertical
 
 The final notarized archive uses the same bundle topology as the authenticated harness.

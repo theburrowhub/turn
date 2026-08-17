@@ -46,6 +46,12 @@ restart instead of being attributed or resolved session-wide.
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Done for v0.1.0**; tree management, terminal UX and accessibility contract landed |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Done**; packaged Claude Code 2.1.226 run and UI reconnect passed |
 | M9 — Hardening | Measurement, restore semantics, packaging and release gates | **Functional baseline done**; public distribution and broad platform sign-off continue post-MVP |
+| M10 — Agent Node WorkSurface | Unique selection-driven node views and one-interaction Attention routing | **Accepted, not started**; ADR-059 |
+| M11 — Durable Agent instances | Stable instance/attempt identity, runtime receipts and lifecycle continuity | **Accepted, not started**; ADR-059 |
+| M12 — Context and observability | Context links/packets, lineage, model/account/runtime/context/quota truth | **Accepted, not started**; ADR-059 |
+| M13 — Coordination and durable runtime | Messages, observational dependencies, Teams and PTY/provider-runtime continuity | **Accepted, sequenced after M12; not started**; ADR-059 |
+| M14 — Resource nodes | Session-owned Group, Note, File, Diff and Web views | **Accepted, sequenced after M10–M12; not started**; ADR-059 |
+| M15 — Local dictation | On-device speech worker, reviewed exact-target input and trusted model lifecycle | **Accepted, sequenced after M10–M11; not started**; ADR-060 |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -422,29 +428,180 @@ every unchecked row is explicitly classified outside issue #21's MVP scope.
 
 ---
 
+## M10 — Agent Node WorkSurface · **Accepted, not started**
+
+**Delivers.** One WorkSurface to the right of the existing Workspace tree. Workspace/Session selection shows
+overview or the unchanged saved Layout; Agent, subagent and process selection shows a unique typed Node
+View. The same general Node target accepts M14 resource views when those kinds ship. The current inspector
+becomes detail inside that view. Tree clicks no longer zoom or create Panes; explicit Pane and zoom commands
+remain.
+
+The attention path lands on that surface in one interaction. `Next Attention`, badges, notifications and a
+governor-approved automatic Focus all apply the same daemon-resolved route: select the exact semantic node
+across Workspaces/Sessions, reveal the typed question/permission/failure/result action and focus only a
+verified interaction owner. Deferred Focus retains the same attention subject. Rendering never
+acknowledges a demand; response submission remains pending until adapter evidence confirms resolution.
+Unread result state stays separate from the Attention Queue and clears only after the exact revision is
+primary content on a foreground surface.
+
+A current node-less parent/external or unassigned demand opens its exact provisional evidence view and never
+borrows a Node/input owner. Automatic Focus is bound to one connected surface generation and degrades to
+queue/badge if that surface retires; no route activates a Session runtime.
+
+**Exit proof.** Native snapshots and daemon/GUI integration tests cover two PTY-less children sharing one
+ancestor, exact Layout restoration, cross-Session manual/automatic attention navigation, question-versus-
+approval controls, zero auto-ack, foreground revision-gated unread clearing, pending delivery confirmation
+and accessibility/keyboard parity. Selection launches/resumes nothing, no generic “Start pane” gate exists,
+and the old ADR-048 click-to-zoom path is absent.
+
+## M11 — Durable Agent instances · **Accepted, not started**
+
+**Delivers.** `AgentInstanceId` survives warm view attach; it survives cold resume, runtime restart and model
+switch only with verified continuity of the same provider conversation. `RuntimeAttemptId` is one launch/
+resume or verified in-place configuration epoch; provider conversation/thread, runtime/PTY and Pane remain separate identities. Every
+agentic node owns exactly one stable instance and at most one current attempt. Relaunch adds attempt history
+instead of deleting/replacing the semantic node; a fresh unverified conversation creates a new node and
+instance. Create, branch and handoff-target creation use fenced, idempotent sagas that do not mutate Layout
+or pretend an external launch rolled back atomically. They durably preassign attempt identity before spawn;
+an ambiguous spawn may only probe/adopt that identity and never auto-respawn.
+
+Every attempt receives immutable requested and effective launch evidence: provider/tool/model, safe
+account reference, permission/approval/sandbox modes, user versus Turn flags, host, cwd, checkout/worktree,
+adapter/CLI version, capabilities and explicit fallback/unsupported reasons. An in-process switch records a
+configuration receipt and transfers the binding without claiming another launch. The unattended daemon launches
+nothing; connected auto-start applies only to fully resolved safe runtimes. Remote/offline/missing-worktree
+paths fail closed without local or fresh-conversation substitution.
+
+**Exit proof.** Append-only migrations, protocol catalogue tests and restart/restore adversarial tests prove
+stable identity, one-current-attempt fencing, attempt-scoped capability cleanup, exact Attention retention,
+no silent downgrade, no resurrection after an authoritative delete and multi-surface attachment. UI close/
+reopen, daemon restart and machine restart cover live attach, honest loss and explicit auto-start/resume;
+recovered scrollback never claims liveness and a failed resume never becomes a fresh conversation. A shared
+provider runtime with isolated per-node conversations and a dedicated-process adapter both pass the same
+instance contract.
+
+## M12 — Context and observability · **Accepted, not started**
+
+**Delivers.** Directional, revocable, Workspace-scoped ContextLinks expose bounded pull operations through a
+separate destination/attempt-bound broker capability, never the administrative socket, with cumulative
+budgets, required expiry and source-host confinement. ContextPacket v2 replaces—not aliases—the implemented
+v4 handoff schema and adds optional adapter-normalised turns, target-aware token budgeting, a reviewed exact
+body/envelope, reviewed short-lived detail grants, lineage and evidence-backed submitted/received/read/acted
+states. New-target delivery is an idempotent provisioning/launch/grant-install/deliver saga; uncertain launch
+is only probed/adopted, uncertain bearer installation is revoked and uncertain context writes are never
+retried. Branching uses native provider identity only when verifiable and otherwise reports a normal handoff.
+
+The Node View header shows requested/effective/current model and runtime settings, account/host/worktree,
+conversation context consumption and separately scoped provider quota windows. Every value includes source,
+observation time and freshness; unavailable is not zero, and shared quota is not attributed to a node.
+
+**Exit proof.** Foreground-operator supported-flow authority plus the explicit unsandboxed same-uid
+impersonation limit, destination/attempt binding, capability rotation, revocation/delete/archive races,
+lost-response idempotency and active-link bounds, cross-Workspace refusal, local/remote path jail, offline
+`remote_residual`/authenticated purge behavior,
+sanitisation/best-effort-redaction and budget bounds, canonical-body/encoder hash identity with honest PTY
+submission-only semantics, pending-prompt refusal, uncertain-write fencing,
+downstream-retention disclosure, provider capability gaps and stale/unknown telemetry all have automated
+coverage. At least one authenticated live adapter reports effective model plus context use, at least one real
+provider/account reports a quota window and at least one provider transcript supports pull/handoff (not
+necessarily the same provider); negative fixtures prove honest unsupported states. Telemetry thresholds
+cannot focus or reorder Attention without a typed event. ADR-057 privacy report/export/delete/compact tests
+cover every new table and filesystem category.
+
+## M13 — Coordination and durable runtime · **Accepted, sequenced after M12; not started**
+
+**Delivers.** Bounded direct Agent messages, durable closed-schema dependency results and user-authorised Teams reuse the
+stable identities, context capabilities and single Attention authority from M10–M12. Dependencies are an
+observational cycle-free graph satisfied by typed results, not process idleness; they may mark work ready or
+blocked but never start, advance, interrupt or retry it. Member agents retain independent tree positions and
+prompts. Final synthesis/reconciliation is an operator-visible result with repository evidence.
+
+External multiplexing or provider-runtime services then close the daemon-death gap with explicit warm
+attach versus cold resume semantics. A missing remote host, account or conversation never becomes a local
+fresh launch. M13 covers reconnect to an already configured provider-runtime/multiplexer endpoint; general
+Remote/SSH Session creation remains later scope. Update compatibility continues to preserve live runtimes
+under ADR-056.
+
+**Exit proof.** FIFO/idempotent message delivery, expiry and uncertain receipt; dependency cycle/failure/
+cancel projections with zero automatic execution/retry and rejection of raw output/transcript/diff/file/
+environment/provider payloads; Team checkout/context/approval boundaries; daemon
+crash with live PTY; and controlled provider-runtime reconnect all pass adversarial integration tests.
+Agents cannot grant context, approve, take write authority or invoke focus directly; they emit typed
+evidence and only AttentionManager/governor may focus under operator policy.
+
+## M14 — Resource nodes · **Accepted, sequenced after M10–M12; not started**
+
+**Delivers.** Session-owned Group, Note, File, Diff and Web nodes use the same hierarchy and one WorkSurface.
+A Group is presentation only. A Note stores private Turn-owned text. File and Diff store canonical,
+checkout-confined references rather than owning user data. Web stores a validated URL and performs no load
+on restore or background selection. Removing a resource forgets Turn's record and never deletes the file,
+branch or site it references.
+
+**Exit proof.** The incompatible vNext `HierarchyKey.node` migration covers every resource kind. Creation,
+restore, selection, one-level Group membership/safe child reparent, reorder, archive/delete, late-response
+and subscription tests preserve runtime parentage, Session ownership and Layout. Descriptor-root/TOCTOU/
+symlink/hardlink/mount checks, inert File/Diff/Note rendering, query/userinfo/fragment refusal, all-answer DNS
+validation and approved-IP pinning per HTTPS connection/redirect, private URL/origin/credential isolation,
+no-load-on-restore, bounded Note storage and ADR-057 inventory/export/delete/retention tests pass before any
+resource kind is advertised.
+
+The normative requirements and complete acceptance matrix for M10–M14 are in
+`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`.
+
+## M15 — Local dictation · **Accepted, sequenced after M10–M11; not started**
+
+**Delivers.** A foreground operator can hold to speak, release into a focused inline draft and use the normal
+Insert/Send action against one immutable verified input target. Microphone audio and Whisper inference stay
+on the physical operator device in a sandboxed crash-isolated worker; the daemon never receives PCM. The
+feature is off by default, has no background listening, voice commands, auto-send, approval path or cloud/
+Session-host fallback. A closed signed model catalogue, explicit download, digest/size verification and
+owner-only atomic storage make model installation a separate auditable operation.
+
+Recording, transcription and draft review mark only their surface as a sensitive operation. Automatic Focus
+defers with its original exact route, while queue order, badges, unread and notifications remain live. Manual
+Attention navigation wins without retargeting the draft. Zero bytes reach a PTY/adapter/provider before the
+operator explicitly chooses Insert or Send; question delivery remains pending until exact adapter evidence.
+
+**Exit proof.** Packaged macOS/Linux acceptance covers OS microphone consent, hold and accessible toggle,
+blur/Escape/device loss/timeout, two windows and cross-Session target changes, stale attempt/prompt/surface
+generations, zero pre-review target bytes, control/newline/bracketed-paste injection, permissions/credential/
+provisional/raw-TTY refusal and no Attention mutation. Deterministic fake-engine tests plus a real local model
+cover model truncation/hash/size/symlink/download-delete races, worker crash/hang/OOM/shutdown, offline use,
+zero cloud fallback and absence of PCM/drafts from protocol, database, files, logs, journals, events,
+diagnostics and crash artifacts. ADR-057 inventory/export/delete covers model files, receipts, partials and
+settings. The normative contract is `docs/LOCAL_VOICE_INPUT.md`.
+
+---
+
 ## Post-MVP
 
 In rough order of how much they are wanted, not of how hard they are. `PRODUCT.md` §6 records why each waits
 and what must not be foreclosed.
 
-1. **tmux-backed Sessions** — closes the one honest gap in persistence: work does not survive the daemon
-   exiting. Flags and node kinds already exist in the model.
-2. **Codex `app-server`** (`--listen unix://PATH`, JSON-RPC) — `turn/started`, `turn/completed`,
+1. **M10 Agent Node WorkSurface and attention route.** Unique content per selected child, no Layout
+   mutation, and one interaction from every demand to its safe action.
+2. **M11 durable Agent instances and runtime receipts.** Stable identity across concrete attempts, with
+   requested/effective runtime truth and idempotent branch/handoff provisioning.
+3. **M12 context and observability.** Pull links, ContextPacket v2/lineage, separate context versus shared
+   quota telemetry and honest provider capability gaps.
+4. **Codex `app-server`** (`--listen unix://PATH`, JSON-RPC) — `turn/started`, `turn/completed`,
    `thread/status/changed`, `ProcessExited`, approval requests and token usage. Richer than hooks, and
    `EventSource::SideChannel` already accommodates it.
-3. **Binary output channel** — `OutputEncoding` is already negotiated in the handshake, so a length-prefixed
+5. **M13 coordination and durable runtime.** Messages, dependency results and Teams, followed by tmux or
+   another proved runtime substrate so work survives daemon exit.
+6. **M14 resource nodes.** Session-owned Group, Note, File, Diff and Web views with explicit privacy and
+   content-security boundaries.
+7. **M15 local dictation.** Reviewed on-device speech input bound to one exact Agent/runtime input without
+   weakening or becoming another source of Attention.
+8. **Binary output channel** — `OutputEncoding` is already negotiated in the handshake, so a length-prefixed
    side channel is additive rather than a protocol break.
-4. **Cost and token dashboards** — `AgentInfo` already has `tokens_used` and `cost_usd`;
-   `Capabilities::usage_events` is false today because the hooks Turn subscribes to do not carry usage.
-5. **Heuristic correction UI** — "this state is wrong". `EventSource::UserCorrection` already exists at
+9. **Heuristic correction UI** — "this state is wrong". `EventSource::UserCorrection` already exists at
    `Explicit` confidence, and `Inference` already carries the rule name so the UI can say why it guessed.
-6. **Agent resume after a process ends** — `AgentInfo::external_id` and `resumable` are stored precisely for
-   this, and it is the right answer to "bring my Agent back" rather than restoring a scrollback.
-7. **Remote and SSH Sessions.**
-8. **More adapters** — Gemini CLI at better than `Heuristic`, Aider, and whatever ships next.
-9. **Plugin API for third-party adapters** — once `AgentAdapter` has stopped moving.
-10. **Windows support.**
-11. **Session sharing / multi-user** — contradicts the 127.0.0.1-only posture; needs an auth model Turn does
+10. **Remote and SSH Sessions.** M11/M12 define the fail-closed identity and context seams first.
+11. **More adapters** — Gemini CLI at better than `Heuristic`, Aider, and whatever ships next.
+12. **Plugin API for third-party adapters** — once `AgentAdapter` has stopped moving.
+13. **Windows support.**
+14. **Session sharing / multi-user** — contradicts the 127.0.0.1-only posture; needs an auth model Turn does
     not have.
 
 ---

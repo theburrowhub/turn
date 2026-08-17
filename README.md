@@ -209,6 +209,10 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
 - [ROADMAP.md](ROADMAP.md) — milestones, open risks, technical debt, and release work.
 - [Unified hierarchy upgrade](docs/UNIFIED_HIERARCHY_UPGRADE.md) — tree, Agent/Pane separation,
   write leases, previews, and persistence contracts.
+- [Agent node views and context routing](docs/AGENT_NODE_VIEWS_AND_CONTEXT.md) — the accepted post-v0.1
+  WorkSurface, stable instance, runtime metadata, attention route, context-link and handoff contract.
+- [Local voice input](docs/LOCAL_VOICE_INPUT.md) — the accepted post-v0.1 local dictation, exact-target,
+  model-supply-chain, privacy and Attention-preservation contract.
 - [Authenticated Reviewer acceptance](docs/REVIEWER_ACCEPTANCE.md) — local macOS bundle,
   opt-in live-Claude harness, manual checklist, and honest run record.
 - [Attention policy acceptance](docs/ATTENTION_ACCEPTANCE.md) — hierarchical policy, focus,

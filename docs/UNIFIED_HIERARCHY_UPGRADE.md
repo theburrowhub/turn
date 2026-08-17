@@ -3,6 +3,11 @@
 **Status:** normative, accepted, implemented and audited for the first vertical.
 **Precedence:** this document supersedes earlier navigation, simultaneous-session and automatic-subagent-pane decisions wherever they conflict. See ADR-040.
 
+**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059 and
+`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` supersede its click/selection presentation for the accepted next
+architecture: the whole area to the right of the tree becomes one `WorkSurface`, and selecting a node
+chooses its unique view without mutating the saved Layout, process state, terminal focus or Attention.
+
 ## Product invariant
 
 Turn has one persistent navigation surface and one hierarchy projection:
@@ -18,7 +23,10 @@ Workspace
     └── Background Process
 ```
 
-The left tree is the source of truth for navigation, state and supervision. Workspace, Session, Agent and Process are not duplicated as persistent tabs, thumbnail strips or a second tree. The optional right inspector shows details for the selected node; it never repeats navigation. The centre contains only panes chosen by the user, a template, restoration, or an explicit automation.
+The left tree is the source of truth for navigation, state and supervision. Workspace, Session, Agent and Process are not duplicated as persistent tabs, thumbnail strips or a second tree. In the implemented v0.1
+baseline the optional right inspector shows details for the selected node and the centre contains only panes
+chosen by the user, a template, restoration, or an explicit automation. The accepted successor composes
+those regions as one WorkSurface with mutually exclusive Session and Node views; it does not add navigation.
 
 Normalised ownership remains in the existing Workspace/Session/process records; the tree does not replace
 those foreign keys. The UI keeps three independent values: `selected_tree_node`, `focused_pane` and pending
@@ -132,6 +140,13 @@ exact AgentNode. If a semantic subagent shares an ancestor's PTY, the daemon may
 Pane only across an integrated/explicit `spawned_by` or `owns_process` edge, returning both node identities.
 It never relabels the parent, crosses a distinct child runtime/provisional edge or creates a Pane. With no
 safe existing input Pane, selection remains on the subject and opening stays explicit.
+
+ADR-059 strengthens the last interaction without weakening the authority boundary: the route opens the
+exact semantic Node View and reveals its action in one operation. A verified ancestor may still own input,
+but the operator is never left looking at a generic ancestor terminal or asked to create a Pane merely to
+see why the child needs attention. If current evidence has only an authenticated parent/external worker or
+no node, the route opens an exact provisional demand view in the owning Session; it never fabricates a child
+or borrows input, and later binding produces a new route revision.
 
 ## Activity preview
 
