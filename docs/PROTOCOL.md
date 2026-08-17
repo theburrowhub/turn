@@ -462,8 +462,8 @@ map on something it already has, without a round trip to learn the key.
 `attention_id`, `checkout_id` and `lease_id` are the prefixed string ids from `turn_core::ids`.
 The v4 `HierarchyKey` is tagged `workspace`, `session` or `process`; a raw string is never accepted where
 the kind matters. ADR-059's incompatible vNext key is instead tagged `workspace`, `session` or general
-`node`, with a closed node kind so Group/Note/File/Diff/Web never impersonate a process. Migration maps every
-v4 process key losslessly; protocol negotiation rejects a mixed-version guess.
+`node`, with a closed node kind so Group/Note/File/Diff/WebPreview/Browser never impersonate a process.
+Migration maps every v4 process key losslessly; protocol negotiation rejects a mixed-version guess.
 
 ### Unified hierarchy
 
@@ -536,25 +536,76 @@ ADR-059 changes the presentation contract, not the v4 wire by documentation alon
 store migrations, catalogue tests and GUI ship together, the operations below are reserved target names and
 a v4 peer must not send or claim them:
 
+Every state-changing vNext request carries the same closed `MutationEnvelope`; the table below lists only
+operation-specific fields:
+
+```text
+MutationEnvelope = {
+  operation_id, authenticated_principal, capability_id,
+  daemon_generation, authority_generation,
+  state_streams[]: { state_stream_key, expected_stream_revision },
+  expected_object_revisions[],
+  foreground?: { surface_id, surface_connection_generation }
+}
+```
+
+Every object and edge read from one stream contributes its exact id/revision to
+`expected_object_revisions`; an operation touching more than one state stream carries every affected stream
+key/revision in canonical order. The daemon validates the entire envelope before the first durable or
+external effect. Reusing an operation id with the same canonical request returns the original durable
+receipt; reusing it with different bytes is `operation_id_conflict`. Missing/stale authority, domain,
+object, surface or connection generation has zero effect. Read-only requests omit this envelope unless they
+advance a cursor; such an acknowledgement is a mutation. No operation-specific row may weaken these rules,
+and a newly registered mutation is unreachable until the protocol registry declares its streams, revisions,
+authority class, idempotency fingerprint and remote policy.
+
 | Planned `op` | Principal fields | Planned answer |
 | --- | --- | --- |
 | `get_node_view` | `surface_id`, `key: HierarchyKey`, `known_revision?` | `node_view` |
 | `subscribe_node_view` | `surface_id`, exact key/revision, content kind, byte/item bounds | `node_view_subscription` |
 | `unsubscribe_node_view` | `surface_id`, subscription id | `ack` |
 | `route_attention` | `surface_id`, `surface_connection_generation`, `attention_id?`, `scope?`, daemon generation | `attention_route` |
-| `activate_session` | foreground `surface_id`, `session_id`, expected lifecycle generation | `session_activation` |
+| `activate_session` | foreground surface/connection, Session id/revision, exact preflighted activation-policy revision and exact bounded eligible descriptor set, or exactly one configured default Shell when that set is empty | `session_activation` |
 | `update_surface_activity` | `surface_id`, connection generation, focused/foreground/typing/session/sensitive state | `effects` |
 | `create_agent_instance` | foreground surface, `operation_id`, `session_id`, launch spec, `parent?` | `agent_instance` |
 | `restart_agent_instance` | foreground surface, `operation_id`, node/instance, expected generation, resume, launch overrides | `agent_instance` |
 | `branch_agent_instance` | foreground surface, `operation_id`, source instance/attempt, target launch spec | `agent_instance` |
+| `switch_agent_model` | foreground surface, exact node/instance/current attempt+generation, requested model, optional ModelEndpointProfile+revision and accepted preflight | `agent_instance` |
 | `delete_agent_instance` | foreground surface, exact node/instance, expected generation, process disposition | `deletion_result` |
+| `list_execution_targets` / `get_execution_target` | visible owner scope / exact target id | `execution_target_list` / `execution_target` |
+| `create_execution_target` / `adopt_execution_target` | foreground surface, closed local/ssh/custom inert descriptor / exact discovered descriptor and provenance | `execution_target` |
+| `probe_execution_target` | foreground surface, target id/revision, bounded non-mutating probe policy | `execution_target` |
+| `trust_execution_target` / `rotate_execution_target_trust` | local foreground surface, target id, expected fingerprint/trust generation, independently observed accepted fingerprint | `execution_target` |
+| `bind_execution_target_workspace` / `unbind_execution_target_workspace` | foreground surface, target id, Workspace id, closed read/runtime/file/repository scopes | `execution_target_binding` |
+| `retire_execution_target` / `delete_execution_target` | foreground surface, target id and explicit survivor/profile/backend disposition | `execution_target_result` |
+| `begin_workspace_onboarding` / `resume_workspace_onboarding` / `get_workspace_onboarding` | foreground surface, operation id, target generation and exact `create_directory`, `open_directory`, `clone_repository` or `adopt_ssh_target` intent / WorkspaceOnboardingId+revision / id | `workspace_onboarding` |
+| `cancel_workspace_onboarding` / `reconcile_workspace_onboarding` | foreground surface, onboarding id/revision and expected phase / same plus exact phase receipt and observed external identity | `workspace_onboarding` |
+| `publish_repository` | local foreground surface, exact target/repository/destination/visibility/branch/upstream/credential-reference revisions and consequence review | `repository_publish_receipt` |
 | `create_runtime_node` | foreground surface, `operation_id`, Session, closed non-agent NodeKind and launch spec | `node_view` |
 | `restart_runtime_owner` | foreground surface, `operation_id`, tagged AttemptOwner, expected active/latest attempt and generation | `node_view` |
 | `create_resource_node` | foreground surface, `session_id`, `group_id?`, closed kind, typed payload, `operation_id` | `node_view` |
+| `create_browser_node` | foreground surface, Session/Group, isolated partition policy, exact initial inert/no-load address spec | `node_view` |
+| `navigate_browser` / `browser_back` / `browser_forward` / `reload_browser` / `stop_browser` | foreground surface, exact Browser Node/partition/navigation revision and URL/history entry where applicable | `browser_navigation_receipt` |
+| `open_reviewed_browser_popup` | foreground surface, source Browser/navigation revision, exact popup origin/target/consequence review | `node_view` |
+| `accept_reviewed_browser_download` | foreground surface, Browser/navigation/download id, expected size/type/hash and confined destination policy | `node_view` |
+| `clear_browser_storage` | foreground surface, exact Browser Node/partition generation and consequence review | `browser_storage_receipt` |
 | `update_resource_node` | foreground surface, exact node, expected revision, typed patch | `node_view` |
-| `delete_resource_node` | foreground surface, exact node, expected revision, Group disposition? | `ack` |
-| `set_group_membership` | foreground surface, exact same-Session node, `group_id?`, expected revision | `node_view` |
+| `delete_resource_node` | foreground surface, exact node/revision; Group requires `refuse`, `promote_children` or `move_children_to_session` and GroupTreeRevision | `ack` |
+| `set_group_membership` / `move_group_subtree` | foreground surface, exact same-Session node or Group, parent Group?, expected Node+GroupTreeRevision | `node_view` / `group_tree` |
+| `repair_group_tree` | local foreground surface, exact corrupt GroupTreeRevision, bounded proved prefix and closed edge-removal/reparent repair plan | `group_tree` |
+| `create_checkout_scope` / `adopt_checkout_scope` | foreground surface, exact existing-or-preassigned Session, target/trust/repository/worktree, creator `turn_created` or `adopted`, optional preassigned Group projection; one composite operation id | `checkout_scope_provisioning_receipt` |
+| `bind_group_checkout_scope` / `unbind_group_checkout_scope` | foreground surface, same-Session Group+CheckoutScope and exact GroupTree/scope revisions | `checkout_scope_binding` |
+| `move_and_rehome` | foreground surface, exact subtree, target CheckoutScope, GroupTree revision and complete stopped-descriptor preflight | `group_tree_rehome_receipt` |
+| `unbind_checkout_scope` / `remove_checkout_scope` / `reconcile_checkout_scope` | foreground exact scope/revision and retained-worktree disposition / local consequence review with dirty/unpublished/owner/survivor inventory / exact scope+target inventory revisions | `checkout_scope` |
+| `get_display_name_facts` | exact Node/Group and revision | `display_name_facts` |
+| `set_local_display_name` / `unpin_local_display_name` | foreground surface, exact Node/Group revision and bounded sanitised alias / expected pinned fact revision | `display_name_facts` |
+| `generate_name_proposal` / `apply_name_proposal` | foreground surface, exact target/source/redaction/generator/bounds / exact NameProposalId, target revision and expiry | `name_proposal` / `display_name_facts` |
 | `update_work_item_metadata` | foreground surface, exact node/revision, closed state/priority/due/tags/comment/assignee patch | `node_view` |
+| `list_work_item_sources` / `query_work_items` | visible source/profile scope / exact WorkItemSource+profile+project, filters/sort, cursor and page bounds | `work_item_source_list` / `work_item_page` |
+| `create_external_work_item` / `edit_external_work_item` | foreground surface, exact source/profile/project and mapped fields / WorkItemKey, source revision/ETag and field patch | `work_item_mutation_receipt` |
+| `comment_external_work_item` / `assign_external_work_item` | foreground surface, WorkItemKey, source revision and bounded comment / mapped assignee | `work_item_mutation_receipt` |
+| `transition_external_work_item` / `close_external_work_item` / `reopen_external_work_item` | foreground surface, WorkItemKey, exact source revision and mapped transition/reason | `work_item_mutation_receipt` |
+| `resolve_work_item_conflict` | foreground surface, WorkItemKey, conflict/source/local revisions and closed per-field choices | `work_item_mutation_receipt` |
 | `open_file_for_edit` | foreground surface, exact FileBackend target/root/path, byte/encoding bounds | `file_edit_snapshot` |
 | `save_file_edit` | foreground surface, operation id, exact target/root/path/file identity/hash/revision and bounded bytes | `file_edit_receipt` |
 | `mark_node_result_read` | foreground `surface_id`, exact node/instance, result revision | `ack` |
@@ -573,6 +624,7 @@ a v4 peer must not send or claim them:
 | `update_team` | foreground surface, team id, expected generation, member/role/policy patch | `team` |
 | `delete_team` | foreground surface, team id, expected generation | `ack` |
 | `create_flow_definition` | foreground surface, operation id, portable schema, expected catalogue/policy revisions | `flow_definition` |
+| `get_flow_definition` | exact definition id and immutable revision | `flow_definition` |
 | `version_flow_definition` | foreground surface, definition id/revision, operation id, immutable replacement | `flow_definition` |
 | `archive_flow_definition` | foreground surface, definition id/revision, operation id | `ack` |
 | `preflight_flow_run` | foreground surface, definition revision, inputs, target/isolation receipts | `flow_preflight` |
@@ -582,16 +634,46 @@ a v4 peer must not send or claim them:
 | `cancel_flow_run` / `abort_flow_run` | foreground surface, run id, expected revision, operation id, declared dispositions | `flow_run` |
 | `retry_flow_step` / `reconcile_flow_run` | foreground surface, run/step/attempt, expected revision, operation id | `flow_run` |
 | `issue_delegation_grant` / `revoke_delegation_grant` | foreground surface, run/current agent attempt, exact scopes/budgets/expiry, operation id/generation | `delegation_grant` |
+| `get_delegation_grant` | exact grant id and generation; body visible only to its authorised operator scope | `delegation_grant` |
 | `submit_delegated_operation` | grant capability, exact agent attempt/generation, operation id, closed typed operation | `operation_receipt` |
 | `get_runtime_continuity` | exact node/instance | `runtime_continuity` |
+| `query_conversation_inventory` | exact provider/Profile/Target/namespace, declared predicates, cursor and page/scan bounds | `conversation_inventory_page` |
+| `adopt_conversation` | foreground surface, exact ConversationKey/inventory revision, destination Session and ownership proof | `agent_instance` |
+| `resume_conversation` | foreground surface, exact ConversationKey/inventory revision and launch/preflight inputs | `agent_instance` |
+| `read_conversation_title` | exact current ConversationKey and provider revision; requires `title_read` | `conversation_title_observation` |
+| `rename_conversation` | foreground surface, exact ConversationKey/provider revision and bounded requested title; requires `conversation_rename` | `conversation_rename_receipt` |
+| `list_native_jobs` / `get_native_job` | exact provider/Profile/Target/namespace plus cursor bounds / NativeJobKey and revision | `native_job_page` / `native_job` |
+| `create_native_job` / `update_native_job` | foreground surface, exact provider/Profile/Target/namespace, closed schedule/model/flag spec / NativeJobKey and revision | `native_job_receipt` |
+| `pause_native_job` / `resume_native_job` / `run_native_job_now` / `cancel_native_job_iteration` / `delete_native_job` | foreground surface, NativeJobKey/revision and exact iteration/disposition where applicable | `native_job_receipt` |
 | `get_runtime_inventory` | foreground surface, exact ExecutionTarget/fingerprint/generation, known watermark? | `runtime_inventory` |
+| `get_resource_inventory` / `subscribe_resource_inventory` / `unsubscribe_resource_inventory` | exact ResourceScopeKey and coverage watermark / same plus byte,row,cadence bounds / subscription id | `resource_inventory` / `resource_inventory_subscription` / `ack` |
+| `terminate_resource_owner` | local foreground consequence review, exact target/trust/handle generations, process start identity and expected resource observation; delegates to the same exact RuntimeInventory termination authority | `runtime_inventory_termination_receipt` |
+| `get_target_recovery_view` / `subscribe_target_recovery_view` / `unsubscribe_target_recovery_view` | local administrative surface, exact ExecutionTarget and target-stream revision / bounded subscription / subscription id | `target_recovery_view` / `target_recovery_subscription` / `ack` |
 | `adopt_runtime_inventory_item` | foreground surface, operation id, exact target/handle/inventory revision, destination Session and Node kind | `node_view` |
 | `ignore_runtime_inventory_item` / `terminate_runtime_inventory_item` | foreground surface, operation id, exact target/handle/inventory revision and expiry? / disposition | `operation_receipt` |
 | `attach_runtime_attempt` | foreground surface, `operation_id`, tagged AttemptOwner, expected active/latest attempt/generation, verified endpoint receipt | `node_view` |
+| `acquire_input_lease` / `renew_input_lease` / `handoff_input_lease` / `release_input_lease` | exact AttemptOwner/attempt/binding, client/surface/connection and expected lease generation | `input_lease_receipt` |
+| `write_runtime_input` | exact AttemptOwner/attempt/binding, lease id/generation, client/surface/connection, monotonic input sequence and bounded bytes | `runtime_input_receipt` |
+| `resize_runtime_input` | same exact owner/attempt/binding/lease/client fences, monotonic input sequence and bounded rows/columns/pixels | `runtime_input_receipt` |
 | `create_account_profile` / `adopt_account_profile` | foreground surface, operation id, provider+ExecutionTarget and isolated non-secret config/auth reference | `account_profile` |
+| `list_account_profiles` / `get_account_profile` | exact provider/ExecutionTarget scope / profile id | `account_profile_list` / `account_profile` |
 | `begin_account_authentication` / `validate_account_profile` | foreground surface, profile id/revision; external provider flow receipt / bounded validation policy | `account_profile` |
+| `rename_account_profile` | foreground surface, profile id/revision and bounded display name | `account_profile` |
 | `set_default_account_profile` | foreground surface, exact Workspace-or-target/provider scope, profile id and expected revision | `account_default` |
 | `retire_account_profile` / `delete_account_profile` | foreground surface, profile id/revision, operation id and explicit external-data disposition | `account_profile_result` |
+| `get_account_activity` / `subscribe_account_activity` / `unsubscribe_account_activity` | exact provider/Profile/Target, filters, cursor/item/byte bounds / same plus subscription / subscription id | `account_activity` / `account_activity_subscription` / `ack` |
+| `list_model_endpoint_profiles` / `get_model_endpoint_profile` | exact ExecutionTarget scope / profile id+revision | `model_endpoint_profile_list` / `model_endpoint_profile` |
+| `create_model_endpoint_profile` / `update_model_endpoint_profile` | local foreground surface, exact target/trust, canonical HTTPS origin, protocol/pin policy, eligibility and credential reference+generation / profile+revision patch | `model_endpoint_profile` |
+| `validate_model_endpoint_profile` / `discover_model_endpoint_models` | local foreground surface, exact profile/target/trust revision and bounded network/catalogue policy | `model_endpoint_profile` / `model_catalogue` |
+| `set_default_model_endpoint_profile` | local foreground surface, exact Workspace-or-target/provider scope, profile revision and expected default revision | `model_endpoint_default` |
+| `retire_model_endpoint_profile` / `delete_model_endpoint_profile` | local foreground surface, exact profile revision, operation id and survivor/default/secret-reference disposition | `model_endpoint_profile_result` |
+| `list_notification_endpoints` / `get_notification_endpoint` | local administrative scope / endpoint id+generation | `notification_endpoint_list` / `notification_endpoint` |
+| `pair_notification_endpoint` | local foreground surface, endpoint public key/token reference, device/profile, exact scopes/classes/privacy/rate/batch bounds and expiry | `delivery_grant` |
+| `revoke_delivery_grant` | local foreground surface, exact endpoint/grant/generation and expected revision | `delivery_grant` |
+| `get_notification_outbox` / `flush_notification_outbox` | local administrative exact endpoint/grant generation and bounded cursor / same plus current queue+presence revision | `notification_outbox` / `notification_flush_receipt` |
+| `subscribe_live_notification_status` / `unsubscribe_live_notification_status` | exact authorised endpoint/scope and bounded subscription / subscription id | `live_notification_subscription` / `ack` |
+| `issue_remote_permission_response_grant` / `revoke_remote_permission_response_grant` | local foreground surface, exact client/provider/profile/Session/Node/instance/attempt/generation/interaction/options/scope/expiry | `remote_permission_response_grant` |
+| `submit_permission_response` | remote/Companion capability, exact grant/client/interaction/option/revisions/binding+connection generation and anti-replay nonce | `permission_response_receipt` |
 
 `select_tree_node` continues to persist only surface-scoped navigation. The client derives a `ViewTarget`
 and requests its content separately. A Node selection never opens, zooms or focuses a Pane, but it may
@@ -601,8 +683,95 @@ cold-resumes, acknowledges or marks a result read; warm attachment only connects
 
 `activate_session` is the separate ADR-049 user intent. One Session-row click may issue selection followed
 by activation, but an Agent/child selection, `route_attention`, notification or automatic Focus never issues
-it. Activation may start only that Session's complete persisted safe runtime contract after revalidation and
-returns each started/refused resource explicitly; it cannot resume an unverified provider conversation.
+it. One accepted operation restores the saved Layout, attaches proved live attempts and materialises every
+eligible stopped runtime descriptor in the exact bounded preflighted plan. If the Session has no runtime
+descriptor, the same operation may create/start exactly its configured default Shell. The plan fixes Session
+revision, descriptor ids and each target/profile/cwd/isolation/command/authority generation; every element is
+revalidated before the first spawn. A stale/changed/ambiguous/unsafe element rejects the whole materialisation
+before external effect and returns one consolidated typed recovery result. Restore, background clients,
+child selection and Attention routing never activate, and activation cannot resume an unverified provider
+conversation. No generic follow-up “Start pane” operation exists.
+
+`WorkspaceOnboarding` is one resumable operation family, not four unrelated wizards. Its closed intent is
+`create_directory|open_directory|clone_repository|adopt_ssh_target`. Before its first effect it freezes the
+operation id, intended Workspace identity, ExecutionTarget, canonical path, repository/remote identity,
+authentication reference and target generation. Each directory, fetched object, checkout, trust decision
+and cleanup result receives an exact receipt. Cancellation and daemon loss preserve partial/uncertain facts;
+resume reconciles by operation id plus repository/remote identity and cannot clone twice. SSH identity/path
+remain pinned and no remote failure falls back to a same-named local path. Open/adopt is inert until required
+local capability consent is decided. `publish_repository` is a separate local-foreground, consequence-
+reviewed operation fixing destination, visibility, branch/upstream and credential reference; onboarding
+never publishes implicitly. Every writer receives an isolated checkout and the operator's primary `main`
+checkout remains unoccupied and switchable.
+
+```text
+WorkspaceOnboardingState = prepared
+                | running(phase)
+                | cancel_requested(last_proved_phase)
+                | reconcile_required(last_proved_phase, possible_effect)
+                | completed | cancelled | failed(reason, residuals[])
+phase = preflight | path_probe | directory | target_adoption |
+        remote_fetch | checkout | workspace_commit | cleanup
+```
+
+Each intent freezes one finite ordered phase plan before `prepared → running(preflight)`; execution may move
+only to the next phase in that plan. Any possible-but-unproved external effect enters `reconcile_required`
+and no resume repeats it. `running → cancel_requested` fences new effects;
+`cancel_requested → running(cleanup)|cancelled|reconcile_required`, and cleanup may end only cancelled or
+reconcile-required until every created artifact is classified. Reconciliation may return to the proved next
+phase, cleanup or one terminal only from an exact phase receipt and observed external identity. Completed,
+cancelled and failed are terminal for the WorkspaceOnboardingId; continuing work requires a new id. Every
+state revision retains the full bounded phase-receipt vector and residual disposition.
+
+`ExecutionTarget` is a stable installation-owned object, not a Workspace-shaped hostname. Its closed record
+is `{ ExecutionTargetId, kind=local|ssh|custom, display_label, endpoint_descriptor,
+authenticated_fingerprint, trust_generation, path_namespace, backend_capability_revisions,
+connectivity_freshness, non_secret_credential_reference, state, revision }`. State is closed:
+
+| From | May transition to |
+| --- | --- |
+| `proposed` | `probing`, `retired`, `deleted` |
+| `probing` | `trust_pending`, `connected`, `disconnected`, `mismatch`, `retired` |
+| `trust_pending` | `connected`, `mismatch`, `retired` |
+| `connected` | `disconnected`, `mismatch`, `retired` |
+| `disconnected` | `probing`, `connected`, `mismatch`, `retired` |
+| `mismatch` | `trust_pending`, `retired` |
+| `retired` | `probing`, `deleted` |
+| `deleted` | none; permanent id tombstone |
+
+Create stores inert endpoint text as proposed. Adopt/probe is bounded and cannot mutate the remote; local
+foreground trust pins the proved fingerprint, and rotation is a separate consequence-labelled operation.
+Reconnect or same-named host discovery never changes identity/trust implicitly. Exactly one installation
+owns a target; revisioned Workspace grants expose a closed subset of `observe|runtime|file|repository` and
+removing one neither deletes target state nor another grant. Retire prevents new launch while retaining
+survivors/evidence. Delete requires zero active runtimes, profiles, jobs, Workspace defaults, backend/
+Recovery items and retained audit/authority references; no lifecycle operation broad-kills a host.
+
+Runtime inventory and recovery are owned by the `ExecutionTarget` state stream. Every unmatched handle is
+addressable from one installation-level `TargetRecoveryView` even if no Workspace is bound or its former
+Workspace was deleted. A Workspace may receive only references permitted by its binding; it never owns or
+hides the canonical item. Enumeration, adopt, ignore and terminate are local-administrative operations.
+Adopt alone names an explicit destination Session and mints a Node/AttemptOwner; ignore is exact-revision and
+bounded; terminate revalidates target/fingerprint/generation/handle/inventory revision. The canonical view
+survives Workspace deletion and never fabricates a Session merely to place a row.
+
+`ResourceInventoryObservation` extends that same target snapshot family. Its canonical keys are
+`ResourceScopeKey=(ExecutionTargetId,target_generation)` and
+`RuntimeResourceRowKey=(ExecutionTargetId,target_generation,backend_handle,handle_generation)`. The host
+observation carries physical memory total/available/used, swap total/free, measured pressure, accounting
+method, observed time and `complete|partial|gapped|unavailable|unsupported|stale` coverage, plus an explicit
+`measured_nonempty|measured_empty|unmeasured` result. An absent optional fact, collector error or remote read
+failure never serialises as numeric zero.
+
+Each process row uses reuse-safe `(target_boot_id,pid,process_start_time)`, bounded parent edges, own RSS and
+deduplicated descendant RSS. Attribution names exact RuntimeAttempt, Node and Session when proved, with
+`owned_current|owned_closed_session|unmatched_survivor|ambiguous`; a surviving process of a closed Session
+keeps the closed owner. Cycles, inaccessible processes, shared RuntimeEndpoints and overlapping trees are
+partial/shared buckets, never double-counted or guessed. Aggregates repeat numerator, denominator, coverage
+and revision. Observation has no effect. `terminate_resource_owner` re-probes and revalidates target/trust,
+handle generation, process start identity and expected resource observation before invoking the exact
+RuntimeInventory termination route. PID/name-only, host-wide and remote-to-local fallback shapes do not
+exist; a late target-generation response affects no sibling.
 
 Ordinary create and branch atomically insert their one-to-one Node + AgentInstance pair in `provisioning`
 inside the store, then run external launch as a visible idempotent saga. They cannot accept or smuggle an
@@ -652,11 +821,21 @@ generation and operation id, creates a new generation/capability and never edits
 No direct mutation/prepare endpoint accepts a `DelegationGrantExercise`. Delegated variants enter only
 through `submit_delegated_operation`, whose closed payload is
 `CreateAgent|CreateRuntime|CreateResource|UpdateResource|CreateContextLink|PrepareContextPacket|
-PrepareAgentMessage|SetDependency|CreateOrUpdateTeam|PublishProgress`. The daemon ignores caller-supplied
+DeliverContextPacket|PrepareAgentMessage|DeliverAgentMessage|SetDependency|CreateOrUpdateTeam|
+PublishProgress`. The daemon ignores caller-supplied
 authority fields and derives exact source/destination/kind/schema/path/budget/revision/generation from the
 immutable Flow grant; a mismatch refuses before disclosure or effect. Root update/renew/expand/revoke,
 resource delete/reparent, permissions, credentials, destructive lifecycle and repository integration have
 no delegated variant.
+`DeliverContextPacket` and `DeliverAgentMessage` contain only the prepared object id, its preparation receipt
+id and canonical content hash. The referenced preparation must have been created by the same FlowRun, grant,
+AgentInstance, RuntimeAttempt and authority generation and must carry a still-current preauthorised
+deterministic recipe; an ad-hoc/operator draft can never be delegated. The daemon retains the sealed
+single-use delivery capability, revalidates destination readiness and all cumulative budgets, and charges it
+exactly once before the external write. The agent receives only a durable accepted/refused/uncertain receipt,
+never the bearer. A different body, destination, recipe/policy revision, generation or second delivery is
+refused before effect. Thus prepare without deliver is harmless, while a current immutable grant can actually
+complete the bounded send promised by the Flow.
 Root issue/update/revoke and delegated exercise are operation-id idempotent and retain operator operation,
 grant and authority generation, so a lost answer cannot duplicate authority or budget. Each live link counts
 against `records.active_context_links_per_agent` at both endpoints and create
@@ -681,21 +860,135 @@ keeps authority revoked. An authenticated purge result for that exact host/gener
 to `removed`; reaching the tombstone bound refuses creation of new remote artifacts rather than forgetting
 cleanup evidence.
 
-Resource operations are M14 names, not v4 claims. Group is a direct Session child and cannot itself name a
-group. `set_group_membership` changes only one same-Session presentation membership for an Agent,
-Shell/Process or resource; it never rewrites runtime parentage. Deleting a non-empty Group accepts only the
-explicit safe `reparent_children` disposition and never cascades. Note stores bounded Turn-private text;
-File/Diff accept canonical checkout-confined references. Web accepts only HTTPS without userinfo/query/
+Resource operations are M14 names, not v4 claims. Groups form one same-Session forest with maximum depth
+128. A Group may name one parent Group or the owning Session; every create/reparent/subtree move/remove is
+one compare-and-swap over the Session-scoped `GroupTreeRevision` and revalidates same-Session ownership,
+uniqueness, depth and acyclicity after concurrent changes. `set_group_membership` changes only one
+same-Session presentation membership and never rewrites runtime parentage. Removing a non-empty Group accepts
+exactly `refuse|promote_children|move_children_to_session` and never cascades into runtime, context,
+Attention or checkout deletion. Deterministic display chooses explicit Group, strongest verified Spawn,
+strongest verified Process, then Session; equal strongest parents remain unassigned rather than using an id
+tie-break. Traversal has visited-set plus depth/node bounds; existing duplicate/cycle/depth corruption returns
+typed `group_tree_corrupt`, exposes only a bounded proved prefix and blocks ordinary mutation. Only a separate
+exact foreground repair operation may change it. Note stores bounded Turn-private text;
+File/Diff accept canonical checkout-confined references. `WebPreview` accepts only HTTPS without userinfo/query/
 fragment, treats the complete URL as private content, validates all DNS answers and pins every connection/
-redirect to an approved public IP; it does not fetch during create/restore. Deletion removes only the Turn
+redirect to an approved public IP; it does not fetch during create/restore and renders with script, forms,
+navigation, popups, downloads, ambient credentials, daemon access and local files disabled. Deletion removes only the Turn
 record. Every operation is revision/idempotency fenced and enters ADR-057 inventory/export/delete coverage
 before it ships.
 
-`update_work_item_metadata` changes canonical Node metadata only. Its closed WorkItemState transition,
-priority/due/tag/comment/assignee fields never mutate runtime/turn/dependency state or Attention directly;
-board/list/search clients project the returned Node revision. File edit snapshots and saves are FileBackend
-capabilities, bind exact target/root/path/file identity/hash/revision, enforce descriptor/root confinement
-and return conflict without overwrite when any external fact changed. They never use terminal input.
+One Group may project one `CheckoutScopeBinding`, but `CheckoutScopeBindingId`, `CheckoutScopeId`, GroupId
+and canonical repository/worktree identity remain distinct and Session-owned. `CheckoutScopeBindingState` is
+exactly
+`bound → unbound`, terminal for that binding id. `unbind_group_checkout_scope` drops only that projection and
+leaves an active CheckoutScope unchanged; `unbind_checkout_scope` is the separate scope lifecycle operation.
+The binding grants no runtime or repository authority;
+it supplies default cwd/isolation only for new descendants or an explicit `move_and_rehome`. A presentation
+move alone never changes a running cwd. Rehome atomically preflights every affected stopped descriptor and
+refuses live writers. `CheckoutScopeState` is closed:
+
+```text
+provisioning -> active | reconcile_required
+active -> missing | conflicted | unbinding | removing
+missing | conflicted -> active | unbinding | reconcile_required
+unbinding -> unbound | reconcile_required
+removing -> removed | reconcile_required
+reconcile_required -> only a state proved by fresh exact inventory
+unbound | removed -> terminal for that CheckoutScopeId
+```
+
+Create/adopt/bind/unbind/remove/reconcile name exact Session, target/trust generation, repository/worktree
+identity, `creator=turn_created|adopted`, scope revision and operation id. Missing or foreign worktrees become `missing|conflicted`, never a
+same-looking local fallback. Unbind and Group deletion preserve the worktree. Remove is separately
+consequence-labelled and requires fresh dirty, unpublished, path-owner, repository and live-writer proof;
+adopted scopes default to unbind. Agent-per-branch Flow members keep separately owned scopes and a Group only
+projects one of them. A single create/adopt request may preassign the CheckoutScope, Session and optional
+Group/binding ids and drive their external-effect saga under one composite operation id. Its provisioning
+receipt records each worktree/Session/Group boundary; a partial effect remains `reconcile_required` and can
+neither duplicate the worktree nor expose an ownerless invisible resource.
+
+`Browser` is a different explicitly created Node and capability, never a mode selected from WebPreview. It
+owns one process-isolated cookie/storage partition and revisioned address/history/load/TLS/error/permission/
+popup/download state. Only the typed operations in the target table may navigate or mutate it; page content,
+links and script messages are hostile data and cannot become protocol operations, Attention resolution or
+authority. Popups are blocked until a foreground exact-origin/consequence review creates a separate Browser
+Node without opener authority. Downloads are quarantined non-executable and become an inert File Resource
+only after exact size/type/hash/confined-path review; they never auto-open. Device/clipboard/filesystem and
+ambient Turn/provider credentials are denied. Local HTML is descriptor-copied from one reviewed confined root
+into a synthetic origin; `file://`, live Workspace access and symlink/hardlink/mount escape are invalid. A
+loopback URL requires a short-lived capability binding scheme, resolved IP set, port, target fingerprint/
+generation and expiry; every navigation/redirect revalidates against DNS rebinding and host/port/fallback.
+Restore/history never loads a page automatically, and destroy clears only the partition, not server data.
+
+`update_work_item_metadata` changes canonical Node metadata only. Its schema is closed:
+`WorkItemState=backlog|ready|active|blocked|review|done|cancelled`,
+`Priority=unset|low|normal|high|urgent`, optional UTC due instant, bounded unique normalised tags, append-only
+bounded comments `{ comment_id, author, body, created_at, revision }`, and
+`Assignee=none|AgentInstance(id)|TeamRole(team_id,role)`. A state field omitted from a patch does not move;
+supplying its current value is a metadata no-op. The only non-self transitions are:
+
+| From | May transition to |
+| --- | --- |
+| `backlog` | `ready`, `cancelled` |
+| `ready` | `backlog`, `active`, `blocked`, `cancelled` |
+| `active` | `blocked`, `review`, `done`, `cancelled` |
+| `blocked` | `ready`, `active`, `cancelled` |
+| `review` | `active`, `blocked`, `done`, `cancelled` |
+| `done` | `ready` only with an explicit bounded reopen reason |
+| `cancelled` | `backlog` only with an explicit bounded reopen reason |
+
+The daemon compare-and-swaps the complete Node/WorkItem revision; comments never overwrite, and assignee is
+display responsibility rather than control authority. These fields never mutate runtime/turn/dependency
+state, satisfy a Flow result or emit Attention directly. Board/list/search clients project the returned
+canonical Node revision.
+
+An external binding is keyed only by
+`WorkItemKey=(source_id, source_profile_id, project_namespace, external_item_id)`. One key maps to at most
+one canonical Node, and one Node has zero-or-one current external binding plus immutable rebinding lineage;
+title, URL and page order are never identity. A versioned `WorkItemSource` declares field/state/assignee
+mappings, per-field `external|turn|overlay` authority, supported predicates/sorts, cursor/page/cache bounds,
+webhook/poll mechanism, rate budget and a target-keystore credential reference. Snapshot/delta pages carry
+source epoch, cursor/watermark, item revision/ETag, coverage and freshness. Partial/rate-limited/gapped data
+may add or stale items but cannot prove deletion or exact zero.
+
+Create, edit, comment, assign, transition, close and reopen are separate advertised capabilities and exact
+operation variants. Every write compare-and-swaps the source revision and waits for an external receipt
+before advancing the local projection. Timeout after a possible effect becomes
+`reconcile_required(WorkItemKey,operation_id)` and is probed by key/revision, never replayed. Divergent field
+revisions preserve external and local values in one conflict record until foreground per-field resolution or
+a previously declared deterministic policy commits a new source revision. Deleting Turn's projection,
+dismissing Attention, permission loss, unknown assignee, mapping change or stale cache never closes/deletes
+the source item or invents a successful sync.
+
+`ProgressUpdate` is also a closed record, not an alternate StepAttempt state:
+
+```text
+ProgressUpdate = {
+  progress_id, flow_run_id, step_id, step_attempt_id, grant_id, operation_id,
+  producer_instance_id, producer_attempt_id, producer_generation,
+  sequence, expected_previous_revision, phase, percent?,
+  message_key?, bounded_message_arguments?,
+  bounded_artifact_or_result_refs[], observed_at
+}
+phase = queued | running | blocked | succeeded | failed | cancelled
+```
+
+`sequence` is strictly increasing within one `progress_id`; duplicate sequence with identical bytes returns
+the first receipt and different bytes conflicts. Legal non-self phase transitions are `queued →
+running|blocked|failed|cancelled`, `running → blocked|succeeded|failed|cancelled` and `blocked →
+running|failed|cancelled`; terminal phases do not transition. `percent`, when present, is an integer `0..100`
+and cannot decrease within one uninterrupted running phase. After `blocked → running`, the next value must
+retain the prior floor or carry a closed explicit reset reason. A higher sequence commits only with the exact
+expected prior revision, atomically replaces the current projection and retains bounded receipt history.
+Result references are exact closed artifact/operation hashes, never raw output. Message key/arguments,
+percent, references and terminal phase are untrusted evidence: a ProgressUpdate cannot transition FlowRun,
+StepAttempt, Lifecycle, TurnState, DependencyResult or Attention; the corresponding authoritative reducer
+must independently consume its own typed result/receipt.
+
+File edit snapshots and saves are FileBackend capabilities, bind exact target/root/path/file identity/hash/
+revision, enforce descriptor/root confinement and return conflict without overwrite when any external fact
+changed. They never use terminal input.
 
 Runtime inventory is a target-wide snapshot/delta stream with endpoint fingerprint/generation and closed
 coverage, independent of Workspace-owned attempts. Unmatched handles remain recovery items rather than
@@ -703,10 +996,62 @@ invented Nodes. Adopt/ignore/terminate revalidate exact target+handle+inventory 
 Node and tagged AttemptOwner, and terminate can affect no sibling/host-wide pattern.
 
 AccountProfile records are non-secret provider+ExecutionTarget identities pointing to isolated external
-auth/config storage. Authentication opens a provider-owned flow and stores only its receipt. Default
-resolution is explicit launch, immutable Flow/Template, Workspace, then target/provider; LaunchReceipt pins
-the result, and changing a default never migrates active instances. Cross-profile attach/transcript/quota/
-config-root reuse and fallback after missing credentials are server-side refusals.
+auth/config storage. Their closed state is
+`draft|authenticating|validating|active|auth_failed|expired|revoked|retired|deleted`; deleted retains a
+permanent id tombstone. Legal transitions are:
+
+| From | May transition to |
+| --- | --- |
+| `draft` | `authenticating`, `validating`, `retired`, `deleted` |
+| `authenticating` | `validating`, `auth_failed`, `retired` |
+| `validating` | `active`, `auth_failed`, `expired`, `revoked`, `retired` |
+| `active` | `validating`, `expired`, `revoked`, `retired` |
+| `auth_failed` | `authenticating`, `validating`, `retired`, `deleted` |
+| `expired` | `authenticating`, `validating`, `revoked`, `retired` |
+| `revoked` | `authenticating`, `retired` |
+| `retired` | `authenticating`, `deleted` |
+| `deleted` | none |
+
+Create allocates an empty isolated credential reference in `draft`; adopt binds an exact existing provider
+config reference into `draft` without reading credentials. Authentication opens a provider-owned flow,
+stores only its receipt and moves to `authenticating`; validation separately proves provider/account identity
+and capability before `active`. Rename changes only bounded display metadata under CAS. A default may
+reference only an `active` profile on the exact trusted target generation with proved isolation and required
+capability. Default resolution is explicit
+launch, immutable Flow/Template, Workspace, then target/provider; LaunchReceipt pins the result, and changing
+a default never migrates active instances. When a default becomes ineligible it is explicitly unset; Turn
+never selects another profile silently. `expired|revoked|auth_failed` never falls back to another account.
+Retire removes launch/default eligibility and preserves evidence; delete is allowed only from the declared
+draft/auth-failed/retired transitions with zero active attempts, current bindings, defaults, grants or
+retained required references, and never deletes provider-side data without a separately typed disposition.
+Every verb has its own operation id, expected profile/target generation and receipt. Cross-profile attach/
+transcript/quota/config-root reuse and missing-credential fallback are server-side refusals.
+
+`AccountActivityProjection` is keyed by exact provider, AccountProfile and ExecutionTarget. Its bounded
+cursor page keeps independently timestamped conversation-context observations, each provider quota window/
+reset and exact conversation/NativeJobIteration/Attention inbox references. Every value carries source,
+coverage, confidence, freshness and `unknown|unsupported|stale|rate_limited|fetch_failed`; absence or partial
+page is never numeric zero or an authoritative empty inbox, and caches/cursors never cross profiles. Filter is
+read-only. `mark_result_read`/`dismiss` mutate only the exact named projection or canonical Attention revision;
+they do not acknowledge provider work, resolve a prompt or retire/delete a native job.
+
+Display names are local metadata, not identity or provider authority. `DisplayNameFact` names one Node/Group,
+source revision, exact source `declared|structured_task|provider_observed|generated|operator_alias|fallback`,
+confidence, observed time and bounded sanitised label. `NameMode=follow_source|pinned`; an operator edit or
+exact `apply_name_proposal` pins until explicit unpin, so provider/reconnect/generated facts cannot overwrite
+it. Resolution precedence is pinned `operator_alias`, otherwise newest current fact at
+`declared > structured_task > provider_observed > generated > fallback`; source revision then observation
+time resolves one tier, and an unresolved equality remains explicit. Local rename emits neither
+`conversation_rename` nor terminal bytes. Migrated v4 `rename_node` is exactly a local pinned
+`set_local_display_name` for its resolved Node; it is not a second vNext mutation or provider operation.
+
+`NameProposalId` binds the bounded captured source bytes/hash, target scope, Node/Group revision, generator
+identity/model, redaction policy and expiry. Generation is on-demand unless a reviewed local policy sets its
+exact bounds. Target-aware acquisition cannot send raw remote output to an undeclared local/network generator;
+controls, bidi/invisible injection, paths, secrets and multiline labels are rejected. Applying a stale
+proposal has zero effect. Group proposals consume bounded member summaries, never concatenated transcripts.
+Captured source bytes are memory-only; persistence retains only proposal id, bounded metadata, content hash,
+expiry and accepted/refused receipt.
 
 The M13 coordination names are likewise reserved, not v4 claims. Direct endpoints accept create/change only
 from foreground operator operations. An exact current Agent attempt carrying an unexpired ADR-061
@@ -714,19 +1059,49 @@ from foreground operator operations. An exact current Agent attempt carrying an 
 other authenticated agent events may only propose them and create an Attention review. This is not
 protection from an unsandboxed same-uid process that steals the administrative capability
 and impersonates a UI. Message preparation holds the exact body in one expiring client-bound draft outside
-an already reviewed Flow; a Flow stores only its reviewed deterministic body recipe. Message state has
-the exact closed `BodyAuthority × Transport × Evidence` variants from the master contract §5.3. Transport is
-`prepared|queued|submitted|submitted_unconfirmed|refused|failed|expired`; `received`, `read` and `acted` are
-independent optional evidence facts permitted only after a submitted or unconfirmed write and never imply
-one another. The decoder rejects every undeclared cross-axis combination. Delivery assigns FIFO order under
-declared per-destination count/byte/TTL bounds, refuses overflow, requires a structured idle endpoint with no
-pending interaction/human draft, never falls back to PTY, submits once and persists only
-hash/metadata/evidence. An uncertain delivery is never replayed. Daemon loss preserves proven submission,
-marks an in-progress write `submitted_unconfirmed`, or marks a pre-write ad-hoc draft
-`lost/review_required/failed(body_lost)`; an invalidated Flow recipe becomes
-`lost/review_required/failed(policy_invalid)`. The old operation is terminal, a hash is never replay material,
-and retry requires new preparation/review or deterministic still-valid Flow reassembly plus a new operation
-id. Independently correlated late evidence may refine `submitted_unconfirmed → submitted` without writing.
+an already reviewed Flow; a Flow stores only its reviewed deterministic body recipe. Message state is the
+following closed product; decoder and store migration reject every unlisted combination:
+
+```text
+BodyAuthority = AdHoc(body=live|consumed|lost,
+                      review=pending|reviewed|review_required)
+              | FlowRecipe(policy_revision,
+                           body=reassemblable|consumed|lost,
+                           review=preauthorised|review_required)
+Transport     = prepared | queued | submitted | submitted_unconfirmed | refused | failed | expired
+Evidence      = { received?: EvidenceFact, read?: EvidenceFact, acted?: EvidenceFact }
+```
+
+| BodyAuthority | Legal transport/evidence |
+| --- | --- |
+| ad-hoc `live/pending` | `prepared`, empty evidence |
+| ad-hoc `live/reviewed` | `prepared\|refused\|failed\|expired`, empty evidence |
+| ad-hoc `consumed/reviewed` | `queued\|submitted\|submitted_unconfirmed\|refused\|failed(queue_body_lost)\|expired`; evidence empty unless submitted/unconfirmed |
+| ad-hoc `lost/review_required` | only `failed(body_lost)`, empty evidence |
+| Flow `reassemblable/preauthorised` | `prepared\|refused\|failed\|expired`, empty evidence |
+| Flow `consumed/preauthorised` | `queued\|submitted\|submitted_unconfirmed\|refused\|failed\|expired`; evidence empty unless submitted/unconfirmed |
+| Flow `lost/review_required` | only `failed(policy_invalid\|policy_reassembly_required)`, empty evidence |
+
+Transport transitions are only `prepared → queued|refused|failed|expired`, `queued →
+submitted|submitted_unconfirmed|refused|failed|expired`, and `submitted_unconfirmed → submitted` from
+independently correlated evidence; every other transport terminal has no successor. Queue acceptance consumes
+the body. `received`, `read` and `acted` are independent monotonic optional facts permitted only after a
+submitted or unconfirmed write and never imply one another. Delivery assigns FIFO order under declared
+per-destination count/byte/TTL bounds, refuses overflow, requires a structured idle endpoint with no pending
+interaction/human draft, never falls back to PTY, submits once and persists only hash/metadata/evidence.
+
+Recovery classifies the exact external-effect boundary. Proven submission stays `submitted`; possible write
+is `submitted_unconfirmed` and is never replayed. A definitely unstarted ad-hoc draft whose bytes die becomes
+`lost/review_required/failed(body_lost)`; an accepted queued ad-hoc body whose bytes die before any possible
+write preserves `consumed/reviewed` and becomes `failed(queue_body_lost)`. A queued Flow operation whose
+assembled bytes die becomes `lost/review_required/failed(policy_reassembly_required)`; only a new message and
+operation id may reassemble its still-current recipe after policy/destination/grant revalidation. An invalid
+recipe becomes `failed(policy_invalid)`. The old operation is terminal and a hash is never replay material.
+A destination disconnect before any possible write leaves Transport exactly `queued` with separate
+`dispatch_ineligible(disconnected)` only while the body and authority remain available/current; reconnect
+revalidates endpoint generation, while a mismatch reaches the declared `refused|failed` result. There is no
+`suspended` AgentMessage state. Independently correlated late evidence may refine
+`submitted_unconfirmed → submitted` without writing.
 Dependency edges store only closed bounded state, producer/revision
 ids, hashes/verified references, timestamped provenance/confidence and an optional bounded stripped/redacted
 summary; raw output, PTY, transcripts, diff/file bodies, environment and arbitrary provider payloads are
@@ -734,7 +1109,7 @@ invalid. Outside a FlowRun they emit no start/retry operation; inside one only t
 policy may consume a current result through a separately idempotent operation. Teams store roles/policy only
 and confer no socket, context, checkout, approval or focus capability beyond an explicit DelegationGrant.
 
-`FlowRunState` is `preflighting|provisioning|running|paused(resume_state)|cancelling|
+`FlowRunState` is `preflighting|provisioning|running|paused(resume_state)|failing|cancelling|
 reconcile_required(last_proved,desired_terminal?)|completed|failed|cancelled|aborted`, with the legal
 transition, desired-terminal, StepAttempt and deterministic result-aggregation rules in the master contract.
 Definition revisions are immutable; FlowRun receipts are append-only. Pause starts no
@@ -746,69 +1121,314 @@ the expected definition/run/authority revision plus operation id; a stale reques
 duplicate returns the original receipt. The exact recurrence timezone/DST/missed/overlap/occurrence bounds in
 the product contract are wire fields, not free-form settings.
 
+A required failure with `on_failure=fail_run` never commits terminal `failed` while another step/effect is
+active or unclassified. It enters `failing`, atomically prevents new starts and revokes every run grant. The immutable definition supplies each active
+step's `leave_running|interrupt_then_terminate|terminate` failure disposition and each not-started step's
+`skip|cancel` disposition. Reconciliation records every step as terminal, policy-skipped/cancelled, or an
+explicit detached survivor with exact Node/AttemptOwner and last evidence; every external disposition has a
+definite receipt. Only then may `failing → failed`. An uncertain disposition enters
+`reconcile_required(last_proved=failing,desired_terminal=failed)`; it cannot infer success or retry. A `leave_running` survivor remains visible and may
+continue to emit runtime-continuity evidence, but it is detached from scheduling and later evidence cannot
+rewrite the immutable failed run result. Cancel/abort may strengthen a pending failed desire to
+`cancelled|aborted` according to the master transition table, never clear the failure or restart work.
+
+The adapter capability schema is versioned and closed to exactly 22 facts:
+`launch|resume|branch|stop|structured_status|questions|permissions|subagents|transcript|context_usage|
+provider_quota|model_switch|messaging|context_transfer|shared_identity|durable_attach|delegated_control|
+native_jobs|conversation_inventory|title_read|conversation_rename|model_gateway`. Each fact is independently
+keyed by adapter/CLI version, provider, AccountProfile, ExecutionTarget, endpoint, attempt/generation and
+observation epoch as applicable and reports `supported|unsupported|degraded|unknown`, mechanism, bounds,
+freshness and expiry. Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok each use a dedicated
+adapter and the complete matrix; provider-name branches and executable-name inference are invalid substitutes.
+Kimi and MiniMax are first-class profile-scoped quota/activity connectors only until a separate launch
+adapter is advertised, so those connectors expose no launch, transcript, conversation or control authority.
+The generic terminal adapter advertises only facts it proves. RuntimeBackend, broker, endpoint and delegated-
+authority capabilities remain separate and an operation uses their intersection, never their union.
+The vNext `welcome` reports `adapter_capability_schema_version` and its canonical registry hash. The frozen
+`docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv` source-capability ledger is release authority, not a runtime payload:
+no request may read, import or mutate it, and its rationale/evidence digests never cross the wire.
+
 `RuntimeContinuityView` reports endpoint kind/host, stable non-secret fingerprint/generation, integration
 capability and a list of independently keyed `RuntimeEndpointBinding`s: provider/account/host,
 AgentInstance/RuntimeAttempt, conversation, last observation and attach/resume confidence—never a bearer
-token or descriptor. One endpoint may multiplex many bindings, but conversation ownership is unique within
-its generation and every input/transcript/context/Attention operation names one binding. Duplicate or
-cross-account claims fail without changing siblings. `attach_runtime_attempt` is warm attachment to a
-verified still-live endpoint and launches nothing; a cold
-resume remains `restart_agent_instance`. A reconnect to a configured provider-runtime/multiplexer is part of
-the continuity seam; general Remote/SSH Session creation is M16.
+token or descriptor. Semantic conversation ownership is keyed independently of transport:
+
+```text
+ConversationKey=(provider_id, AccountProfileId, ExecutionTargetId, provider_namespace, normalized_provider_conversation_id)
+BindingState = proposed | current | refused | stale | unbound | retired
+```
+
+`normalized_provider_conversation_id` is exact private identity and the adapter declares the namespace that makes it
+unique; target and profile prevent cross-host/account aliasing. Across all endpoint records and generations,
+one `ConversationKey` has at most one `current` AgentInstance owner and one AgentInstance has at most one
+current binding. Endpoint generation fences the transport only; it cannot make the same conversation a
+second semantic identity. Binding transitions are closed: `proposed → current|refused`, `current →
+stale|unbound|retired`, `stale → current|unbound|retired`, `unbound → proposed|retired`, and
+`refused|retired` are terminal for that binding id. A duplicate current claim is rejected before input,
+transcript or context authority and cannot displace the proved owner. Endpoint mismatch, generation
+discontinuity, ownership conflict or stale proof changes only BindingState/connectivity, never
+`Lifecycle::Lost`; only an independent bounded RuntimeBackend/provider absence proof may produce Lost.
+
+Every input/transcript/context/Attention operation names binding id and binding generation as well as the
+ConversationKey hash. One endpoint may multiplex many current bindings, but duplicate or cross-account/
+target claims fail without changing siblings. `attach_runtime_attempt` is warm attachment to a verified
+still-live endpoint and launches nothing; a cold resume remains `restart_agent_instance`. Reconnect first
+creates/revalidates a `proposed|stale|unbound` binding and promotes it atomically only after the global uniqueness check.
+A configured provider-runtime/multiplexer is part of the continuity seam; general Remote/SSH Session creation
+is M16. Acceptance creates competing endpoint records and generations for one ConversationKey and proves
+that no observation can produce two current owners.
+
+`ConversationInventory` is a private bounded adapter query over one exact provider, AccountProfile,
+ExecutionTarget and provider namespace. Pages contain ConversationKey, optional provider title, created/
+updated time, native status, model/mode hints, ownership/resumability evidence, source revision, coverage and
+freshness—never ambient transcript bodies. The adapter declares provider-side versus complete-cache search,
+predicates/normalisation, cursor/page/scan/cache/rate bounds; gaps, partial pages, rate limiting and
+unsupported search cannot prove absence or exact zero. Exact-key proof may bind; title/text similarity is
+advisory only. Adopt creates one stopped Node/AgentInstance and `proposed|current` binding without launch.
+Resume is a separate preflighted operation that creates a RuntimeAttempt only after resumability and global
+ConversationKey ownership revalidation. Title observation requires `title_read`; provider mutation requires
+the distinct capability `conversation_rename`, exact expected provider revision and an idempotent receipt with
+requested/effective title. Unsupported or uncertain rename may create only an explicitly local alias and
+never claims provider mutation.
+
+Provider-native work is keyed by
+`NativeJobKey=(provider_id, AccountProfileId, ExecutionTargetId, provider_namespace, provider_job_id)`.
+Exactly one current Job Node owns a key; ordered `NativeJobIteration`s carry ordinal/native id, scheduled/
+started/finished time, result/error and optional exact AgentInstance/RuntimeAttempt reference. The normalised
+job state is `scheduled|running|paused|completed|failed|cancelled|unknown`, with total adapter mapping and
+native value retained. `native_jobs` independently advertises list/create/update/pause/resume/run-now/cancel-
+iteration/delete. Every mutation carries exact job revision and profile/target generation; an ambiguous
+effect reconciles by NativeJobKey before retry. Dismissing Attention, hiding/deleting the Turn projection or
+ending a Session never cancels/deletes provider work. Portable packages may carry only inert job
+configuration text, never provider_job_id, activation or authority.
+
+`ModelEndpointProfileId` is a non-secret stable id scoped to one ExecutionTarget. Its
+`ModelEndpointProfile` record contains canonical
+HTTPS origin, target/trust generation, TLS/pin policy, supported wire protocols, bounded discovered model
+catalogue, provider/AccountProfile eligibility, health/freshness, revision and one non-secret credential
+reference. The closed wire kind is
+`CredentialReferenceKind=environment|os_keystore|target_host_agent|external_broker`; a read can reveal its
+kind/name and availability, never its value.
+`ModelEndpointProfileState` is closed:
+
+```text
+draft -> validating | retired | deleted
+validating -> active | invalid | retired
+active -> validating | degraded | retired
+degraded -> validating | active | retired
+invalid -> validating | retired | deleted
+retired -> validating | deleted
+deleted -> terminal tombstone
+```
+
+Create/update/validate/set-default/retire/delete are distinct operation-idempotent, revision-fenced local-
+foreground mutations. Validation bounds redirects, response bytes/time/model count, pins network identity and
+rejects non-HTTPS, userinfo, DNS rebinding, loopback/private/metadata destinations unless target policy has
+explicitly adopted that exact origin. Raw credentials are write-only at the secret broker and absent from
+protocol reads, argv, durable environment, logs, diagnostics and exports. Launch preflight intersects
+`model_gateway`, endpoint protocol, current profile/target/account/model and credential reference. LaunchSpec
+freezes requested route/model; LaunchReceipt records effective endpoint revision, wire route/model and
+redacted credential-reference kind. Discovery labels are bounded untrusted data and cannot inject flags or
+environment. Profile/default/health changes affect only future attempts and never cause provider, endpoint,
+model, AccountProfile or local/remote fallback.
+`switch_agent_model` is the sole in-place model-route mutation. It requires current `model_switch` and
+`model_gateway` facts as applicable, exact instance/attempt/profile generations and a fresh preflight. Only a
+provider proof of the same conversation may atomically close the old configuration epoch and create the new
+RuntimeAttempt/receipt. Any refusal, timeout or uncertain configuration proof leaves the prior attempt/input
+authority current and visible; it never silently branches, restarts, changes defaults or selects another
+route. A provider that cannot prove continuity offers an explicit Branch/new-instance operation instead.
 
 `respond_to_agent_interaction` is not permission automation. It exists only for a foreground, explicit user
 action against the exact typed prompt id and current attempt. The daemon refuses stale ids and adapter/
 prompt mismatches, records submission as pending, and waits for provider evidence before resolving
-Attention. A provider without that capability continues through verified PTY input.
+Attention. A local operator may continue through verified PTY input when the provider lacks the typed
+capability. Remote bytes do not inherit that fallback: the remote InputSafetyState policy below refuses a
+sensitive or unclassifiable prompt.
 
 ### Accepted multi-client, companion and remote-backend target (not in v4)
 
-`StateStreamKey` is daemon generation plus Workspace. `state_snapshot` closes at revision/watermark `R`;
-`state_event` begins at `R+1` and is strictly sequenced; `ack_state_revision` advances one client's cursor.
-`state_gap`, a compacted cursor or generation change requires a new snapshot before mutation. Every mutation
-carries expected Workspace/object revision and operation id. Edge add/remove commutes by edge id, scalar
-state is compare-and-swap, FlowDefinition revisions are immutable, FlowRun receipts are append-only,
-deletion wins over older mutation and lifecycle effects converge by operation id. Updates never upsert and ids
-are never reused, so the compacted minimum accepted revision remains a permanent resurrection fence.
+State ownership uses a closed tagged stream key, not a fictitious Workspace for global/target state:
+
+```text
+StateStreamKey = Installation(daemon_generation)
+               | Workspace(daemon_generation, WorkspaceId)
+               | ExecutionTarget(daemon_generation, ExecutionTargetId, target_generation)
+StateWatermark = sorted[{ StateStreamKey, revision }]
+```
+
+Installation owns the ExecutionTarget/AccountProfile catalogue, one logical Attention order, notification
+endpoints/grants/outbox and target-independent policy; Workspace owns its Sessions/Nodes/relationships/Flows,
+GroupTree/CheckoutScope projections, display-name facts and Workspace defaults; ExecutionTarget owns backend
+connectivity, RuntimeInventory/ResourceInventory/Recovery, NativeJobs, RuntimeEndpoints,
+ModelEndpointProfiles and target/profile observations. A projection may reference another stream id but
+cannot mutate or revision it. A client
+subscribes to an authorised set. Each `state_snapshot` closes its named stream at revision `R`; that stream's
+`state_event` is strictly sequenced from `R+1`, and
+`ack_state_revision` advances only the named cursor.
+
+A transaction touching multiple streams has one operation/transaction id and repeats its complete sorted
+pre/post `StateWatermark` on every fragment. The client applies it atomically only after every authorised
+fragment arrives; a hidden unauthorised fragment is represented by a non-content causal marker so order is
+preserved without disclosure. A missing fragment, compacted cursor, `state_gap`, target/daemon generation
+change or mismatched watermark blocks mutation and forces a bounded snapshot at the affected vector. Every
+mutation carries every affected stream and object revision through `MutationEnvelope`. Edge add/remove
+commutes by edge id, scalar state is compare-and-swap, FlowDefinition revisions are immutable, FlowRun
+receipts are append-only, deletion wins over older mutation and lifecycle effects converge by operation id.
+Updates never upsert and ids are never reused, so each stream's compacted minimum accepted revision remains a
+permanent resurrection fence. There is no invented total order across independent streams. Global Attention
+routing validates the Installation revision plus the exact subject-stream revision; a Workspace default
+pointing to an AccountProfile or ModelEndpointProfile validates Workspace and ExecutionTarget revisions.
+CheckoutScope create/adopt/rehome likewise validates its Workspace/GroupTree and exact target inventory vector.
+Target Recovery and profile changes therefore converge without being smuggled into whichever Workspace
+happened to be open.
 
 `acquire_input_lease`, `renew_input_lease`, `handoff_input_lease` and `release_input_lease` carry exact
 runtime/input owner, client/surface/generation and expected lease generation. A lease expires after 15 seconds
 and renews no more often than five; handoff changes generation atomically and both clients observe it before
-new bytes are accepted. Draft bodies are not protocol state and never transfer between clients.
+new bytes are accepted. `write_runtime_input` and `resize_runtime_input` repeat the exact AttemptOwner,
+RuntimeAttempt id/generation, optional current RuntimeEndpointBinding id/generation, lease id/generation,
+client id, surface/connection generation and a monotonically increasing per-lease input sequence inside their
+`MutationEnvelope`. Validation and byte/resize enqueue are one serial action; any mismatch accepts zero bytes
+and returns a typed receipt. A duplicate operation/sequence with identical bytes returns the first receipt;
+different bytes conflict. Lease handoff/expiry closes the old sequence space before the new owner is visible.
+The v4 `write_pty`/`resize_pty` shape is available only to a negotiated local single-client v4 connection.
+Negotiating vNext state streams, any remote role or multi-client operation makes those legacy requests
+`unsupported_protocol`; they cannot bypass lease, attempt, binding or surface fences. Draft bodies are not
+protocol state and never transfer between clients.
+
+Background notification is an Installation-stream projection of canonical Attention keyed by
+`NotificationEndpointId`, never a second queue. A foreground-paired `DeliveryGrantId` binds endpoint public
+key/token reference, device/profile, allowed Workspaces/ExecutionTargets, event classes, privacy detail,
+rate/batch bounds, generation and expiry. `DeliveryGrantState` is closed:
+`proposed → active|invalid|revoked`,
+`active → expired|invalid|revoked`; terminal states never reactivate. Tokens/private keys remain in the
+keystore or target agent and are absent from reads, exports, logs and diagnostics. A 401/403 or revocation
+invalidates only the exact generation.
+
+```text
+NotificationDeliveryState:
+eligible -> held_present | queued | superseded | expired
+held_present -> queued | superseded | expired
+queued -> submitted | superseded | expired
+submitted -> accepted | failed_retryable | failed_terminal | superseded | expired
+failed_retryable -> queued | failed_terminal | superseded | expired
+accepted | failed_terminal | superseded | expired -> terminal
+```
+
+One `NotificationDeliveryId` survives the bounded retry edge; each return to queued increments an attempt
+counter and applies declared jitter/rate limits, with exhaustion forcing `failed_terminal`. Gateway
+`accepted` proves neither device delivery, reading nor demand resolution. Collapse identity is split:
+`CollapseFamilyKey=(NotificationEndpointId,complete AttentionSubject identity,demand_kind)` is stable across
+revisions, and `CollapseKey=(CollapseFamilyKey,subject_revision)` identifies one delivery. Only a newer
+current revision in the same family may supersede an older delivery. Insert and flush both revalidate grant,
+queue revision, resolution and presence. The bounded E2EE payload excludes transcript/path/command/secret;
+failure changes no Attention, unread or runtime state. Deep links carry opaque ids and must resnapshot and
+route the exact current Attention before display or action.
+
+Live status uses `LiveStreamKey=(NotificationEndpointId,AttentionSubject identity,attempt_generation)` plus
+monotonic event revision. Start/update/end are collapse-aware and end/tombstone fences every late tick.
+Presence may hold an alert but never pauses the authoritative stream; release enqueues only a still-current
+demand. `NotificationHostMode=owner_local|loopback_observer` accepts authenticated owner-local or loopback
+observation input and makes outbound HTTPS delivery only. It ignores public bind host/port and exposes zero
+public inbound listeners. It is not a `RemoteOperatorSurface`; notification or headless delivery grants no
+input/control/credential authority, and remote GUI/headless protocol clients remain separately authenticated.
 
 `CompanionAction` is closed to `route_attention|mark_result_read|acknowledge|snooze|dismiss|
-submit_free_text_response|interrupt|request_writer_lease`. Each request names capability, expected queue/
-subject/interaction/authority revisions, expiry and operation id. Permission approval, credential/password
-entry, grant issuance, host trust/rotation, force kill/destroy, checkout integration and publish/merge have no
-companion operation. An offline client stores only an encrypted local draft; stale reconnect refuses rather
-than replaying it. Every accepted/refused action returns a receipt.
+submit_free_text_response|submit_permission_response|interrupt|request_writer_lease`. Each request names
+capability, expected queue/subject/interaction/authority revisions, expiry and operation id. Free text is
+valid only for a verified non-sensitive question/decision. `submit_permission_response` is the only permission
+variant and requires the single-use grant below; it is distinct from legacy `approve_permission` and never
+accepts free-form/credential bytes. Credential/password entry, response-grant administration, host trust/
+rotation, force kill/destroy, checkout integration and publish/merge have no companion operation. An offline
+client stores only an encrypted local draft; stale reconnect refuses rather than replaying it. Every accepted/
+refused/uncertain action returns a receipt.
 
-`RemoteOperatorSurface` is a full protocol client role, not a CompanionAction superset and not a Web Node
+`RemoteOperatorSurface` is a full protocol client role, not a CompanionAction superset and not a WebPreview or Browser Node
 origin. Its invitation/session capability is distinct from the local administrative token, binds authenticated
 origin, operator, Workspace/scope, surface/connection generation, expiry and negotiated view/mutation/input
 capabilities, and is transported only over authenticated encryption with anti-replay. HTTP mutations require
 same-origin CSRF proof; WebSocket upgrade validates the exact Origin and capability before any snapshot.
-Tokens never enter URL/query, logs, referrers or browser persistent storage. Web Node content runs in a
-separate isolated origin and cannot reach this channel.
+Tokens never enter URL/query, logs, referrers or browser persistent storage. WebPreview and Browser Node
+content runs in separate isolated origins and cannot reach this channel.
 
 After negotiation it consumes the same `state_snapshot/state_event`, NodeView subscriptions, terminal stream,
-AttentionRoute and input-lease operations as desktop and may call ordinary direct operations allowed by its
-scope. Permission/credential response, DelegationGrant/root-context authority, host trust/key rotation,
-runtime force-kill/destroy, runtime-inventory enumeration/terminate and repository integration/publish/merge
-are absent and refused server-side even if a client forges their wire shape. Subscriptions retain normal
-byte/count/backpressure bounds; reconnect/gap requires resnapshot, offline drafts never replay, local
-revocation closes streams and leases, and every mutation/denial is visible in the local audit surface.
-Headless clients use the same role and objects without claiming rendering support.
+AttentionRoute and input-lease operations as desktop. Remote dispatch is default-deny. The versioned protocol
+registry assigns every exact operation name one `remote_class=read|mutate|input|denied`; its canonical sorted
+manifest hash is returned in the handshake and covered by compatibility tests. An absent/new name is
+`denied` until a new protocol version classifies it. For this target the complete non-denied sets are:
+
+```text
+read = get_node_view, subscribe_node_view, unsubscribe_node_view, route_attention,
+       state_snapshot, state_event, ack_state_revision,
+       get_flow_definition, get_flow_run, get_runtime_continuity, open_file_for_edit,
+       list_work_item_sources, query_work_items, query_conversation_inventory,
+       read_conversation_title, list_native_jobs, get_native_job,
+       get_account_activity, subscribe_account_activity, unsubscribe_account_activity
+mutate = select_tree_node, update_surface_activity, activate_session,
+         create_agent_instance, restart_agent_instance, branch_agent_instance,
+         create_runtime_node, create_resource_node, update_resource_node,
+         set_group_membership, update_work_item_metadata, save_file_edit,
+         mark_node_result_read, set_dependency_edge, remove_dependency_edge,
+         create_team, update_team, create_flow_definition, version_flow_definition,
+         preflight_flow_run, start_flow_run, pause_flow_run, resume_flow_run,
+         retry_flow_step, respond_to_agent_interaction(non_authorising_only),
+         submit_permission_response(single_use_grant_only)
+input = acquire_input_lease, renew_input_lease, handoff_input_lease,
+        release_input_lease, write_runtime_input, resize_runtime_input
+```
+
+Membership is necessary but not sufficient: the invitation's exact Workspace/stream/object/capability scope,
+MutationEnvelope and server policy must also allow the request. Every other operation—including credential/
+secret entry, permission-response grant issue/expand/revoke, AccountProfile/auth/default or
+ModelEndpointProfile/default/discovery, DeliveryGrant/notification administration,
+DelegationGrant/root-context/message authority, ExecutionTarget trust/administration, WorkspaceOnboarding,
+CheckoutScope removal/rehome, destructive delete/cancel/abort/stop/terminate,
+RuntimeInventory/ResourceInventory/Recovery enumeration or control and repository integration/publish/merge—
+is server-refused even if a client forges its wire shape.
+
+`RemotePermissionResponseGrantId` names one `RemotePermissionResponseGrant` issued/revoked only by a local
+foreground operator. It is single-use and
+binds client, provider/profile, Workspace/Session, Node/AgentInstance/RuntimeAttempt/generation, exact
+PendingInteraction id/revision, provider-offered closed response ids, maximum scope/duration and expiry.
+`submit_permission_response` repeats that grant, exact typed option, every interaction/authority revision,
+binding/connection generation, operation id and anti-replay nonce inside an authenticated encrypted envelope.
+The daemon revalidates the current adapter `permissions` capability immediately before dispatch; the option
+cannot widen the provider offer. Denial is a typed option. The durable accepted/refused/uncertain receipt is
+provider-correlated, and Attention closes only from later provider evidence. This vNext operation is distinct
+from legacy local `approve_permission`; no remote alias or PTY fallback exists.
+
+Input has a separate guard. Each agent attempt exposes
+`InputSafetyState=ordinary|non_authorising_interaction(id,revision)|sensitive_interaction(class,id,revision)|
+unknown`, where sensitive class is `permission|credential|host_trust|grant|destructive_confirmation`.
+Remote raw bytes are accepted only in `ordinary`; a non-authorising question/decision uses the exact typed
+`respond_to_agent_interaction` route. A recognised permission accepts only matching
+`submit_permission_response` under the grant above; credential, host-trust, grant, destructive-confirmation
+and unknown states accept neither a remote response nor bytes. A provider that cannot classify prompts with
+a verified structured adapter advertises no remote input for that attempt.
+Generic Shell/TUI raw input cannot promise command-level safety: granting it is explicitly labelled
+`raw_terminal_execution_authority` and permits every command available inside that runtime's enforced
+sandbox. Server refusal guarantees apply to Turn's typed control-plane operations, not to arbitrary commands
+the invited terminal writer can execute. The UI and audit must disclose that distinction before grant.
+
+Subscriptions retain normal byte/count/backpressure bounds; reconnect/gap requires resnapshot, offline drafts
+never replay, local revocation closes streams and leases, and every mutation/denial is visible in the local
+audit surface. Headless clients use the same role and objects without claiming rendering support.
 
 `RuntimeBackend`, `FileBackend` and `RepositoryBackend` requests use disjoint capability tags. File and
 repository operations bind ExecutionTarget host/generation, confined root/repository id, expected revision
 and operation id; repository verbs are the closed list in the product contract. Wrong/offline remote targets
 return scoped refusal/uncertain receipts and cannot resolve or mutate a same-named local target.
 
-Portable export carries package-local ids only. Import remints all Workspace/Session/Node/Team/Flow and edge
-ids through one package map; attempts, provider/runtime/process/PTY ids, revisions, operation receipts,
-grants, tombstones, credentials and machine/host identity are invalid fields. Collisions and unresolved
-references create inert errors, never update/create by caller-selected local id.
+Portable export carries package-local ids only. Import remints Workspace, Session, inert Node shape, Team,
+FlowDefinition and relationship ids through one package map. A `FlowRun` is never portable: attempts,
+provider conversation/NativeJob/runtime/process/PTY ids, revisions, operation receipts, grants, tombstones, credentials and machine/
+host identity are constitutive run authority/evidence and are invalid package fields. An optional
+`PortableRunReport` is a different inert type containing only package-local definition/step references,
+origin content hash, terminal label, bounded redacted summaries, artifact content hashes and timestamps with
+untrusted provenance. Import may display/link that report, but cannot decode it as FlowRun, satisfy a
+dependency/result, emit Attention, authorise work, resume/retry/reconcile, or supply a launch receipt. To run
+again the operator adopts the reminted FlowDefinition and creates a fresh preflight/FlowRun id. Collisions and
+unresolved references create inert errors, never update/create by caller-selected local id.
 
 ### Accepted local dictation protocol target (not in v4)
 
@@ -822,7 +1442,7 @@ text commit:
 | `install_local_speech_model` | foreground surface, `operation_id`, closed `model_id` | `local_speech_model_state` |
 | `cancel_local_speech_model_install` | foreground surface, `operation_id`, model id/generation | `local_speech_model_state` |
 | `remove_local_speech_model` | foreground surface, `operation_id`, model id/generation | `local_speech_model_state` |
-| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, `insert|submit`, bounded UTF-8 text | `operator_text_delivery` |
+| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, `insert` or `submit`, bounded UTF-8 text | `operator_text_delivery` |
 
 `InputTarget` repeats exact Workspace/Session/Node, optional AgentInstance, current RuntimeAttempt/generation,
 verified input owner and optional pending free-text interaction/revision. The daemon revalidates all of it
@@ -1158,6 +1778,9 @@ is the distinct saved-Layout operation.
 
 Addressed to the **node**, not the pane: the pty belongs to the process, and one
 process may be shown in more than one place.
+These are v4-only local single-client operations. A vNext, remote or multi-client peer must use the
+lease/attempt/binding-fenced `write_runtime_input` and `resize_runtime_input` target operations above; the
+daemon refuses this legacy shape after such negotiation.
 
 ### Agent context handoff
 
@@ -1203,23 +1826,75 @@ an unreviewed delivery payload, writes into a pending interaction or treats subm
 downstream provider/terminal retention still applies. `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` is normative
 for that target; the richer fields are not part of protocol v4.
 
-The vNext draft is client/surface/daemon-generation bound and memory-only. A disconnect before delivery is
-accepted discards it; after acceptance the same daemon may hold the bounded body only for the in-flight
-saga. Durable hash/manifest metadata cannot reconstruct it. Daemon restart reconciles effects already
-attempted but never advances a pre-write delivery: it preserves proven submission, marks an ambiguous write
-`submitted_unconfirmed`, or revokes any grant and records `draft_lost`/`review_required`. Sending to an
-already provisioned compatible target then requires a new prepare, operator review and operation id.
+The vNext packet has one closed control state, an independent body-authority variant and append-only semantic
+evidence:
+
+```text
+PacketAuthority = AdHocDraft(body=live|consumed|lost,
+                             review=pending|reviewed|review_required)
+                | FlowRecipe(policy_revision, recipe_hash,
+                             body=reassemblable|live|consumed|lost,
+                             review=preauthorised|review_required)
+DeliveryState = draft | reviewed |
+                delivery_started(phase) |
+                launch_unconfirmed | grant_install_unconfirmed |
+                submitted_unconfirmed | finished |
+                failed(reason) | draft_lost
+phase = provisioning | launching | grant_pending | submitting | awaiting_evidence
+reason = expired | refused | target_incompatible | launch_failed | grant_failed |
+         write_definitely_failed | policy_invalid | operator_cancelled
+Evidence = { submitted?: EvidenceFact, received?: EvidenceFact,
+             read?: EvidenceFact, acted?: EvidenceFact }
+```
+
+The legal transitions are total:
+
+| From | May transition to |
+| --- | --- |
+| `draft` | `reviewed`, `draft_lost`, `failed(expired\|refused\|policy_invalid\|operator_cancelled)` |
+| `reviewed` | `delivery_started(provisioning\|grant_pending\|submitting)`, `draft_lost`, `failed(expired\|refused\|target_incompatible\|policy_invalid\|operator_cancelled)` |
+| `delivery_started(provisioning)` | `delivery_started(launching\|grant_pending\|submitting)`, `failed(target_incompatible\|launch_failed\|operator_cancelled)` |
+| `delivery_started(launching)` | `delivery_started(grant_pending\|submitting)`, `launch_unconfirmed`, `failed(launch_failed\|operator_cancelled)` |
+| `delivery_started(grant_pending)` | `delivery_started(submitting)`, `grant_install_unconfirmed`, `failed(grant_failed\|operator_cancelled)` |
+| `delivery_started(submitting)` | `delivery_started(awaiting_evidence)`, `submitted_unconfirmed`, `failed(write_definitely_failed)` |
+| `delivery_started(awaiting_evidence)` | `finished`, `submitted_unconfirmed` |
+| `launch_unconfirmed` | `delivery_started(launching\|grant_pending\|submitting)` after explicit exact reconciliation with the live body, or `draft_lost\|failed(launch_failed\|operator_cancelled)` |
+| `submitted_unconfirmed` | `finished` only from independently correlated submission/receipt evidence |
+| terminal `grant_install_unconfirmed\|finished\|failed\|draft_lost` | none for the same operation id |
+
+Cancellation after an external-effect intent can select `operator_cancelled` only after that effect is
+proved not to have started; otherwise the corresponding unconfirmed state is mandatory.
+Body-authority transitions are also closed. Ad-hoc preparation is `live/pending + draft`; review makes it
+`live/reviewed`. Flow preparation is `reassemblable/preauthorised + draft|reviewed`; accepting delivery
+materialises the deterministic bytes as `live/preauthorised` before the first effect. Pre-write phases require
+a live reviewed/preauthorised body. Committing the write intent atomically changes `live → consumed`; only a
+consumed body may reach awaiting-evidence, submitted-unconfirmed or finished. A terminal pre-write refusal,
+expiry, cancellation, draft loss or uncertain/revoked grant discards bytes as `lost/review_required`.
+`launch_unconfirmed` may retain a live body only in the same daemon generation; after body loss it may only
+reconcile the process and then enter draft-lost/failed, never a write phase. `failed(write_definitely_failed)`
+and every submitted state retain `consumed`; `failed(policy_invalid)` requires Flow `lost/review_required`.
+Evidence is empty through `delivery_started(submitting)` except for durable effect intents. It may accrue
+only in `awaiting_evidence|submitted_unconfirmed|finished`; every field has its own source/revision/time and
+none implies another. `finished` requires independently proved submission but does not require receipt/read/
+acted. The decoder/store rejects any state/phase/reason/evidence combination not listed above.
+
+An ad-hoc draft is client/surface/daemon-generation bound and memory-only. A disconnect before delivery
+acceptance changes `draft|reviewed → draft_lost`; after acceptance the same daemon may hold the bounded body
+only for the in-flight saga. Durable hash/manifest metadata cannot reconstruct it. A still-valid Flow recipe
+may be reassembled only into a new packet and operation id; the old delivery never advances from a hash.
+Daemon restart first classifies each durable effect intent: proven submission becomes `finished`, a possible
+write becomes `submitted_unconfirmed`, ambiguous launch becomes `launch_unconfirmed`, and ambiguous bearer
+installation becomes terminal `grant_install_unconfirmed` after revocation. Every definitely pre-write state
+whose body died becomes `draft_lost`; a Flow recipe may then create a new operation only if its exact policy,
+grant and destination remain current. Restart itself never launches, installs or writes. Within one daemon
+generation, `launch_unconfirmed` may advance only after an explicit operator reconciliation proves/adopts the
+preassigned process or proves no launch and the same reviewed body remains live. No ambiguous effect is
+replayed.
 
 `ContextPacketDeliveryView` is durable and queryable by operation id. It repeats packet/target identities,
-preassigned attempt/launch nonce, target generation and independent phase/evidence fields: provisioning,
-launch not started/in progress/confirmed/unconfirmed/failed, envelope/grant preparation and install, write
-not started/in progress/submitted/unconfirmed/failed, plus independently observed receipt/read/action
-timestamps and sources, plus draft `live|lost|review_required`. Launch, bearer installation and context write
-are distinct external effects with a durable intent before each. Within one daemon generation, recovery may
-resume only when evidence proves the next effect was never attempted and the reviewed body remains live.
-After a daemon-generation change it performs reconciliation only. An ambiguous launch is probed/adopted only
-by its preassigned identity and never respawned; ambiguous bearer installation revokes that link generation;
-an in-progress or ambiguous write is never retried.
+preassigned attempt/launch nonce, target generation, PacketAuthority metadata without body, the exact closed
+DeliveryState and independent Evidence. Launch, bearer installation and context write are distinct external
+effects with a durable intent before each.
 
 An optional reviewed ContextLink is committed `pending_activation` only after the target attempt is fenced.
 Its short-lived broker bearer is installed only through the adapter's inherited descriptor/owner-only
@@ -1813,7 +2488,7 @@ anything yet.
 - `lifecycle`: current daemon restart reports `orphaned` (the stored PID may still be alive but the PTY is
   out of reach) or `lost` (the former runtime cannot be found). `reconnected` is reserved for a future
   backend that can prove it reattached the original PTY; this build does not emit that claim on restore.
-- **Nothing here has been relaunched.** Every outcome retains its durable `node_id`; `can_relaunch: true` is
+- **Nothing in this v4 restore event has been relaunched.** Every outcome retains its durable `node_id`; `can_relaunch: true` is
   an offer to relaunch that exact node, not a newly invented process. `command` is descriptive so accepting
   is informed. The user answers with `relaunch_node` or does not, and nothing happens until they do.
 - A UI reconnect to the same still-running daemon is a different path: it reattaches to the daemon-owned
@@ -2141,23 +2816,29 @@ descriptions has to argue with a test first.
    through the focus governor. `EventSource::PtyHeuristic` caps `Confidence` at
    `inferred_high`, and `AttentionPolicy::resolve` degrades any focus action from a
    provisional event to a badge.
-2. **Turn never approves a permission.** No request says so — not
-   `approve_permission`, not `respond_permission`. Pending questions and permissions
-   are answered only through `write_pty`: the human typing. A context handoff is
-   refused while the destination has a pending interaction.
-3. **Turn never runs a command it inferred from agent output.** There is no "run
-   this" verb. Processes start from a template, a pane definition, or
-   `relaunch_node`, all of which the user chose.
-4. **Restore safe panes without making the user operate them.** `relaunch_node` remains the only
-   path back. The daemon never invokes it unattended during boot; a connected window invokes it
-   automatically for panes marked `Relaunch` and for commandless terminals. Consequential
-   `ReattachOnly` commands remain stopped.
+2. **Turn never chooses an operator response.** Legacy local v4 has no
+   `approve_permission` or `respond_permission`; the operator types through `write_pty`. vNext may transport
+   an exact operator-selected non-authorising response through `respond_to_agent_interaction`, or an exact
+   provider-offered permission option through `submit_permission_response` under its single-use local-
+   foreground-issued grant. Neither path infers, widens or automatically selects an answer, and a context
+   handoff is refused while the destination has a pending interaction.
+3. **Turn never runs a command it inferred from agent output.** There is no "run this" verb. A process can
+   start only from an explicit lifecycle intent, an immutable reviewed Flow/Template, or the exact bounded
+   eligible descriptor set (or one configured default Shell) accepted by `activate_session`; agent output
+   never becomes any of those authorities.
+4. **Restore does not require pane ceremony and does not invent work.** Boot restore only reconstructs state
+   and attaches proved-live attempts. A foreground `activate_session` may materialise its exact bounded
+   eligible descriptor set—or exactly one configured default Shell when that set is empty—after atomic
+   preflight. A stopped individual runtime outside that operation still requires its specific explicit
+   recovery intent. No generic “Start pane” gate exists, and consequential or ambiguous descriptors remain
+   stopped with one consolidated recovery result.
 5. **A client cannot request an unarbitrated primary-checkout writer.** Session mode is closed, creation
    goes through daemon lease arbitration, and conflict recovery is one of the typed alternatives. There is
    no force/steal flag; generation mismatch is a conflict, not a retry loop.
 6. **Navigation cannot fabricate ownership.** There is no unconstrained `move_node`, no client-supplied
-   confidence promotion and no `tree.node_selected` domain event. Audited, cycle-checked relationship
-   correction is planned; protocol v4 refuses to approximate it with a local-only mutation.
+   confidence promotion and no `tree.node_selected` domain event. Protocol v4 refuses to approximate
+   relationship correction with a local-only mutation; vNext accepts only its audited, cycle-checked exact
+   operation.
 7. **The daemon protocol cannot listen.** M15 adds no start-microphone, PCM, audio-file, transcription or
    background-listening request. An authenticated client can manage a closed local model id and commit text
    the foreground operator already reviewed; it cannot make another client capture audio.
@@ -2189,8 +2870,9 @@ with independent per-node tokens. Never `0.0.0.0` and never reuse an IPC token a
    Ask for `stream: "bytes"` only if you need the escape stream itself, and then feed
    `replay` into your emulator and apply `pane_output`, re-attaching on
    `pane_output_gap`.
-6. Forward keystrokes as `write_pty` and window resizes as `resize_pty`. Pipeline
-   freely.
+6. On v4 local single-client connections, forward keystrokes as `write_pty` and window resizes as
+   `resize_pty`. On vNext use only the current input-lease-fenced `write_runtime_input`/
+   `resize_runtime_input` operations and preserve their per-lease sequence; never fall back across versions.
 7. Send `update_user_activity` immediately on activity transitions. During continuous typing, send only a
    coalesced bounded heartbeat before the typing grace can expire; never one request per character or idle
    periodic traffic.
