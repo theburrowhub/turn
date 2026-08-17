@@ -201,7 +201,9 @@ advertises the successor control plane must extend package/preflight/live eviden
   preassigned operation without duplicate clone or implicit publish. Local/generated Node and Group naming
   proves revision/redaction/manual pinning and sends no provider/terminal rename; and
 - the release commit passes the exact 84-row neutral capability ledger plus 152 PRD/ACP trace and adversarial
-  mutation suite. The recorded authority root and protected repository pin must match the merged commit;
+  mutation suite. Before freezing a changed ledger, the generic source verifier recomputes the opaque snapshot
+  tree and all 84 evidence-blob digests from an independent clone. The recorded authority root and protected
+  repository pin must match the merged commit;
   deleting, weakening or marking a row unknown cannot be compensated by a product badge or manual smoke.
 
 The release manifest records which of these capabilities passed for each architecture, adapter, provider and

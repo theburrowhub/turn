@@ -532,8 +532,9 @@ proves mapped source fields, safe job/conversation/title metadata, numeric usage
 typed permission receipts appear only in their exact source/profile/node/client scope; unavailable usage is
 never serialised as zero. Source/profile/node privacy deletion leaves external items, jobs, conversations,
 titles, local HTML and sites unchanged.
-The ADR-065 fixture adds independent canaries for worktree/repository content, clone/SSH output, each of six
-adapter transcripts and two quota-provider raw pages, model-gateway secret/discovery body, process argv/env,
+The ADR-065 fixture adds independent canaries for worktree/repository content, clone/SSH output, each of the
+six adapters' transcript/event routes where supported plus explicit unsupported/degraded negative routes,
+two quota-provider raw pages, model-gateway secret/discovery body, process argv/env,
 automatic-name raw capture and notification token/plaintext. It proves only bounded sanitised roster,
 CheckoutScope, onboarding, quota, route/model, resource-aggregate, name-fact and encrypted-delivery metadata
 appear in their exact target/profile/node/endpoint scope. No canary appears in report/export, SQLite/WAL,

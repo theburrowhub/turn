@@ -596,7 +596,7 @@ authority class, idempotency fingerprint and remote policy.
 | `create_checkout_scope` / `adopt_checkout_scope` | foreground surface, exact existing-or-preassigned Session, target/trust/repository/worktree, creator `turn_created` or `adopted`, optional preassigned Group projection; one composite operation id | `checkout_scope_provisioning_receipt` |
 | `bind_group_checkout_scope` / `unbind_group_checkout_scope` | foreground surface, same-Session Group+CheckoutScope and exact GroupTree/scope revisions | `checkout_scope_binding` |
 | `move_and_rehome` | foreground surface, exact subtree, target CheckoutScope, GroupTree revision and complete stopped-descriptor preflight | `group_tree_rehome_receipt` |
-| `unbind_checkout_scope` / `remove_checkout_scope` / `reconcile_checkout_scope` | foreground exact scope/revision and retained-worktree disposition / local consequence review with dirty/unpublished/owner/survivor inventory / exact scope+target inventory revisions | `checkout_scope` |
+| `unbind_checkout_scope` / `remove_checkout_scope` / `reconcile_checkout_scope` | foreground exact scope plus optional binding/GroupTree revisions and retained-worktree disposition / local consequence review with the same revisions plus dirty/unpublished/owner/survivor inventory / exact scope+target inventory revisions | `checkout_scope` |
 | `get_display_name_facts` | exact Node/Group and revision | `display_name_facts` |
 | `set_local_display_name` / `unpin_local_display_name` | foreground surface, exact Node/Group revision and bounded sanitised alias / expected pinned fact revision | `display_name_facts` |
 | `generate_name_proposal` / `apply_name_proposal` | foreground surface, exact target/source/redaction/generator/bounds / exact NameProposalId, target revision and expiry | `name_proposal` / `display_name_facts` |
@@ -880,9 +880,12 @@ before it ships.
 
 One Group may project one `CheckoutScopeBinding`, but `CheckoutScopeBindingId`, `CheckoutScopeId`, GroupId
 and canonical repository/worktree identity remain distinct and Session-owned. `CheckoutScopeBindingState` is
-exactly
-`bound → unbound`, terminal for that binding id. `unbind_group_checkout_scope` drops only that projection and
-leaves an active CheckoutScope unchanged; `unbind_checkout_scope` is the separate scope lifecycle operation.
+closed: `proposed → current|refused`, `current → stale|unbound`, `stale → current|unbound`; `refused|unbound`
+are terminal for that binding id. `unbind_group_checkout_scope` drops only that projection and leaves an
+active CheckoutScope unchanged; `unbind_checkout_scope` is the separate scope lifecycle operation and
+retains the worktree. A scope leaving `active` makes a current binding `stale`; scope unbind/remove carries
+the expected scope, `GroupTreeRevision` and binding revision and atomically terminalises any `current|stale`
+binding as `unbound`, so no Group retains a default to a released or removed scope.
 The binding grants no runtime or repository authority;
 it supplies default cwd/isolation only for new descendants or an explicit `move_and_rehome`. A presentation
 move alone never changes a running cwd. Rehome atomically preflights every affected stopped descriptor and

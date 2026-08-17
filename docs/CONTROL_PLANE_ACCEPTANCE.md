@@ -196,7 +196,7 @@ never sufficient by itself.
 | `ACP-SAF-011` | `PRD-SAF-011` | A, D | Imports with colliding/hostile ids remint every semantic object through one package map, omit all forbidden runtime/authority ids, preserve inert origin hash and cannot mutate or resurrect pre-existing state. |
 | `ACP-SAF-012` | `PRD-SAF-012` | A, D, P | Every CompanionAction passes allowlist/scope/revision/expiry/receipt and offline-stale cases; free text works only for verified non-sensitive questions/decisions, only ACP-ATT-011's exact typed permission response is admitted, every secret/authority/admin/destructive/trust/integration action is absent/refused remotely, and writer handoff is visible before bytes are accepted. |
 | `ACP-SAF-013` | `PRD-SAF-013` | A, D, P | Boundary clocks/counts enforce each §14 retention value, referenced Flow revisions survive, compacted journals retain deletion fences, ephemeral presence/drafts are absent and export/delete accounts for every retained record. |
-| `ACP-SAF-014` | `PRD-SAF-014` | A, D | The verifier accepts exactly the frozen ledger schema/snapshot/count and one unique row per stable feature id with allowed disposition, nonempty rationale, 64-hex evidence and existing PRD/ACP/ADR links; fixtures for an unknown disposition, deleted/duplicated/weakened row, broken link, altered snapshot/digest and coordinated local authority rewrite all fail before specification completion. |
+| `ACP-SAF-014` | `PRD-SAF-014` | A, D | The verifier accepts exactly the frozen ledger schema/snapshot/count and one unique row per stable feature id with allowed disposition, nonempty rationale, 64-hex evidence and existing PRD/ACP/ADR links; given any Git repository containing the opaque frozen snapshot, the source verifier recomputes the complete tree digest and all 84 exact evidence-blob digests without using its checked-out branch. Fixtures for absent/wrong source objects, an unknown disposition, deleted/duplicated/weakened row, broken link, altered snapshot/digest and coordinated local authority rewrite all fail before specification completion. |
 | `ACP-SCL-001` | `PRD-SCL-001` | A, M, P | The fixed minimum profile runs 50 Sessions, 100 live runtimes and 1,000 nodes with concurrent Attention for the declared duration while all correctness and latency budgets pass. |
 | `ACP-SCL-002` | `PRD-SCL-002` | A, D, M | Viewport materialisation and large-payload subscriptions remain bounded; queue saturation recovers by revision and terminal input is never blocked. |
 | `ACP-SCL-003` | `PRD-SCL-003` | A, D, M | Every §13 pressure source degrades/refuses and recovers as declared, preserves every runtime absent an external OS kill and records that Turn issued no undeclared signal; proposed intervention appears as exact Attention. |
@@ -335,9 +335,11 @@ publish. The primary `main` checkout stays available and a corrupt persisted cyc
 
 ### E2E-15 — background Attention, resource pressure and routed model truth
 
-All six dedicated adapters start through two independently scoped ModelEndpointProfiles while Kimi/MiniMax
-quota-only connectors update two profiles. One missing secret and one late discovery fail without fallback;
-the valid LaunchReceipts retain exact effective route/model/credential generation. Local and remote resource
+All six dedicated adapters exercise the independent `model_gateway` capability cell. At least two adapter/
+profile combinations with current supported evidence start through independently scoped ModelEndpointProfiles;
+every unsupported/degraded/unknown combination refuses without fallback while Kimi/MiniMax quota-only
+connectors update two profiles and expose no launch path. One missing secret and one late discovery fail
+without fallback; the valid LaunchReceipts retain exact effective route/model/credential generation. Local and remote resource
 snapshots then attribute current, closed-Session and unmatched processes, preserve partial/error versus zero
 and permit only one exact re-probed termination. Two same-titled children raise demands while the GUI is
 backgrounded: revocable endpoint grants produce two minimal encrypted notifications, duplicate replay

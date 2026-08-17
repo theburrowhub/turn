@@ -81,6 +81,7 @@ normative_paths() {
     docs/TERMINAL_ACCEPTANCE.md \
     docs/UNIFIED_HIERARCHY_UPGRADE.md \
     scripts/test-product-spec-gate.sh \
+    scripts/verify-product-capability-source.sh \
     scripts/verify-product-completion.sh \
     scripts/verify-product-spec.sh
 }

@@ -186,7 +186,7 @@ The target schema never aliases these ids, including during migration. Cardinali
 | Job Node ↔ NativeJob | exactly one-to-one; one job has ordered stable iteration ids, and any runtime/agent spawned by an iteration remains a separate referenced Node |
 | ExecutionTarget → ModelEndpointProfile | zero-to-many non-secret route profiles; one launch/switch receipt freezes exactly one profile revision/model/credential generation or explicitly none, never an implicit fallback |
 | WorkspaceOnboardingId → Workspace | one operation preassigns zero-or-one intended Workspace identity and yields at most one completed Workspace; retries reuse the operation and never create a second target/repository clone |
-| NotificationEndpoint → DeliveryGrant → Delivery | one endpoint has zero-or-many grant generations with at most one active equivalent scope; one DeliveryId carries one exact Attention revision and retry history, while a collapse family may supersede older revisions only |
+| NotificationEndpoint → DeliveryGrant → Delivery | one endpoint has zero-or-many grant generations with at most one active equivalent scope; one NotificationDeliveryId carries one exact Attention revision and retry history, while a collapse family may supersede older revisions only |
 
 Legacy rows that reused a `NodeId` as an instance id are migrated atomically to freshly minted ids with an
 alias tombstone used only to resolve old references; new protocol responses never expose the alias as the
@@ -364,16 +364,19 @@ redacted diagnostic receipt; remote trust and host identity require a separate e
 `clone_repository` and `adopt_ssh_target`. It freezes an operation id, intended Workspace identity,
 ExecutionTarget, canonical path, repository/remote identity, authentication reference and current target
 generation before any effect. `WorkspaceOnboardingId` is allocated before work and every command carries it,
-the idempotency operation id and expected onboarding/target revision. `OnboardingState` is closed:
-`draft → preflighting|cancelled`, `preflighting → provisioning|failed|cancelled`, `provisioning → committing|
-cancel_requested|reconcile_required`, `committing → completed|reconcile_required`, `cancel_requested →
-cancelled|reconcile_required`; `completed|failed|cancelled` are terminal, while `reconcile_required` retains
-the last proved phase plus optional desired `cancelled|failed` and may advance only from fresh effect evidence.
-`OnboardingPhase` is the closed current step `resolve_target|validate_path|review_import|create_directory|
-fetch_repository|checkout_repository|persist_workspace|connect_ssh|verify_result`; every phase appends a
-bounded started/definite/uncertain/no-effect receipt. `cancel_workspace_onboarding` prevents new phases and
-cancels only the currently declared cancellable effect; `reconcile_workspace_onboarding` probes the exact
-preassigned directory/repository/remote identity and never repeats an ambiguous effect. Open/adopt is inert
+the idempotency operation id and expected onboarding/target revision. `WorkspaceOnboardingState` is closed:
+`prepared|running(phase)|cancel_requested(last_proved_phase)|reconcile_required(last_proved_phase,
+possible_effect)|completed|cancelled|failed(reason,residuals)`. `OnboardingPhase` is the closed current step
+`preflight|path_probe|directory|target_adoption|remote_fetch|checkout|workspace_commit|cleanup`; each intent
+freezes one finite ordered phase plan before `prepared → running(preflight)`. `prepared` may also move to
+`cancelled`; `running(phase)` may advance only to the plan's next phase, `completed`, `failed`,
+`cancel_requested` or `reconcile_required`. `cancel_requested` fences new effects and moves only to
+`running(cleanup)|cancelled|reconcile_required`. Reconciliation may select a proved next phase, cleanup or a
+terminal result only from the exact phase receipt and observed target/repository identity. `completed|
+cancelled|failed` are terminal. Every phase appends a bounded started/definite/uncertain/no-effect receipt.
+`cancel_workspace_onboarding` prevents new phases and cancels only the currently declared cancellable effect;
+`reconcile_workspace_onboarding` probes the exact preassigned directory/repository/remote identity and never
+repeats an ambiguous effect. Open/adopt is inert
 until local capability consent has been decided; clone is
 cancel-safe and reports each created directory, fetched object, checkout and uncertain cleanup state rather
 than hiding a partial repository. A retry reconciles by operation id and remote/repository identity instead of
@@ -825,7 +828,8 @@ be locally adopted; provider job ids, authority and schedule activation never cr
 `ModelEndpointProfile` is a non-secret, revisioned routing object for a provider-compatible gateway or direct
 endpoint. Its stable id is scoped to one ExecutionTarget and records display label, canonical HTTPS origin,
 TLS/pin policy, supported wire protocols, bounded discovered model catalogue, provider/account eligibility,
-health/freshness and only an OS-keystore/agent/environment credential reference. Raw API keys are write-only
+health/freshness and only a
+`CredentialReferenceKind=environment|os_keystore|target_host_agent|external_broker`. Raw API keys are write-only
 at the secret broker boundary and never enter protocol reads, argv, durable environment values, logs,
 diagnostics, exports or shared configuration. An environment reference exposes its variable name and
 availability, never its value.
@@ -874,13 +878,19 @@ same-named host discovery never changes identity or trust implicitly.
 `CheckoutScope` owns worktree lifecycle independently of its optional Group projection. It is keyed by stable
 `CheckoutScopeId`, Session, ExecutionTarget/trust generation, canonical repository identity, worktree identity,
 branch/ref and creator provenance `turn_created|adopted`; state is closed: `provisioning → active|
-reconcile_required`, `active → missing|conflicted|removing`, `missing|conflicted → active|removing|
-reconcile_required`, `removing → removed|reconcile_required`, and `reconcile_required` may advance only to a
-state proved by fresh exact inventory or return to its retained last-proved state. `removed` is terminal for
-the scope id. A separate `CheckoutScopeBindingId` relates at most one Group projection to a scope; its closed
-state is `proposed → current|refused`, `current → stale|unbound`, `stale → current|unbound`, with
-`refused|unbound` terminal. Unbinding only removes that presentation/default relationship and never changes the
-CheckoutScope state or worktree. One catalogue action may create/adopt the worktree, create its Session and
+reconcile_required`, `active → missing|conflicted|unbinding|removing`, `missing|conflicted → active|unbinding|
+reconcile_required`, `unbinding → unbound|reconcile_required`, `removing → removed|reconcile_required`, and
+`reconcile_required` may advance only to a state proved by fresh exact inventory or return to its retained
+last-proved state. `unbound|removed` are terminal for the scope id. A separate `CheckoutScopeBindingId`
+relates at most one Group projection to a scope; its closed state is `proposed → current|refused`, `current →
+stale|unbound`, `stale → current|unbound`, with `refused|unbound` terminal.
+`unbind_group_checkout_scope` removes only that presentation/default relationship and never changes the
+CheckoutScope state or worktree. The distinct `unbind_checkout_scope` releases Turn's scope ownership and
+reaches terminal `unbound` while preserving the worktree; `remove_checkout_scope` is the only path that may
+delete the proved worktree and reaches terminal `removed`. A scope leaving `active` makes its current binding
+`stale`; scope unbind/remove compare-and-swaps the scope, GroupTree and binding revisions and terminalises any
+`current|stale` binding as `unbound` in the same transaction, so no Group can retain a default to a released
+or removed scope. One catalogue action may create/adopt the worktree, create its Session and
 optional Group projection, then select it; a partial effect persists exact reconciliation receipts.
 
 Repository inventory distinguishes a complete empty/list result from read failure, partial/gapped data and a
@@ -1209,13 +1219,13 @@ Its state is `proposed → active|invalid|revoked`, `active → expired|invalid|
 reactivated. Tokens and private keys remain in the keystore/agent and are absent from UI reads, store exports,
 logs and diagnostic payloads. Revocation or 401/403 invalidates only the exact grant generation.
 
-`NotificationDeliveryState` is closed for one stable `DeliveryId`: `eligible → held_present|queued|superseded|
+`NotificationDeliveryState` is closed for one stable `NotificationDeliveryId`: `eligible → held_present|queued|superseded|
 expired`, `held_present → queued|superseded|expired`, `queued → submitted|superseded|expired`, `submitted →
 accepted|failed_retryable|failed_terminal|superseded|expired`, and `failed_retryable → queued|failed_terminal|
-superseded|expired`. Retry retains DeliveryId, increments a bounded attempt counter and fixes next-eligible
+superseded|expired`. Retry retains NotificationDeliveryId, increments a bounded attempt counter and fixes next-eligible
 time; exhaustion becomes failed_terminal. Gateway acceptance never means device delivery, reading or demand
 resolution. `CollapseFamilyKey` includes endpoint, stable tagged Attention subject identity and demand kind;
-`CollapseKey` adds the exact subject/evidence revision. A newer current revision supersedes older family
+`CollapseKey` adds the exact subject revision. A newer current revision supersedes older family
 members, while different children or kinds never collapse by title. Outbox insertion and flush both revalidate
 grant, current queue revision, resolution and presence. Batching, bounded retry/jitter, per-endpoint rate limit
 and encrypted minimal payloads prevent transcript/path/command/secret disclosure. Delivery failure changes no Attention,

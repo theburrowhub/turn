@@ -28,6 +28,7 @@ TURN_SOCKET ?= /tmp/turn.sock
 TURN_DATA_DIR ?= $(HOME)/.local/share/turn-dev
 LINUX_IMAGE ?= rust:1-bookworm
 LINUX_TARGET_DIR ?= /tmp/turn-linux-target
+CAPABILITY_SOURCE_REPOSITORY ?=
 
 .PHONY: help
 help: ## Show this help
@@ -47,12 +48,20 @@ verify: product-spec-acceptance fmt-check lint test ## Everything CI checks, in 
 
 .PHONY: product-spec-acceptance
 product-spec-acceptance: ## Verify the frozen semantic inventory, proof mapping and mutation resistance
+	bash -n scripts/verify-product-capability-source.sh
 	@if [ -n "$${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" ] || [ "$${CI:-}" = true ]; then \
 	  ./scripts/verify-product-spec.sh verify; \
 	else \
 	  ./scripts/verify-product-spec.sh --verify-local; \
 	fi
 	./scripts/test-product-spec-gate.sh
+
+.PHONY: product-capability-source-acceptance
+product-capability-source-acceptance: ## Verify every frozen capability locator/hash against an audited source clone
+	@test -n "$(CAPABILITY_SOURCE_REPOSITORY)" || { \
+		echo "set CAPABILITY_SOURCE_REPOSITORY=/path/to/audited-source-repository" >&2; exit 2; \
+	}
+	./scripts/verify-product-capability-source.sh "$(CAPABILITY_SOURCE_REPOSITORY)"
 
 .PHONY: product-completion-acceptance
 product-completion-acceptance: verify ## Require every product requirement to be implemented with evidence

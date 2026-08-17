@@ -93,11 +93,14 @@ packaged measurements rather than treating their design as evidence.
 
 ```sh
 make product-spec-acceptance
+make product-capability-source-acceptance CAPABILITY_SOURCE_REPOSITORY=/path/to/audited-source-repository
 git grep -nE 'PRD-[A-Z]+-[0-9]{3}' -- docs/PRODUCT_REQUIREMENTS.md
 git grep -nE 'ACP-[A-Z]+-[0-9]{3}' -- docs/CONTROL_PLANE_ACCEPTANCE.md
 git status --short
 ```
 
 The first command must report 152 requirements, 152 proof obligations, the exact manifest revision and the
-honest current-state distribution above. The last command is included so an audit records the exact tree
-whose claims it evaluated.
+honest current-state distribution above. Given a Git clone containing the frozen opaque snapshot, the second
+command recomputes its complete tree digest and all 84 evidence-blob digests; it neither fetches nor trusts the
+caller's current branch. The last command is included so an audit records the exact tree whose claims it
+evaluated.

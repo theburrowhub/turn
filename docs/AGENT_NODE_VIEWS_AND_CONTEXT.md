@@ -124,9 +124,13 @@ repair is a separate exact foreground recovery operation, never an inferred repa
 
 A Group may project one optional `CheckoutScopeBinding`, but its `CheckoutScopeBindingId`, the Session-owned
 `CheckoutScopeId`, canonical repository/worktree identity and GroupId stay distinct.
-`CheckoutScopeBindingState` is only
-`bound → unbound`, terminal for that binding id; dropping the projection leaves an active CheckoutScope
-unchanged, while `unbind_checkout_scope` is the separate operation that drives scope `unbinding → unbound`.
+`CheckoutScopeBindingState` is closed:
+`proposed → current|refused`, `current → stale|unbound`, `stale → current|unbound`; `refused|unbound` are
+terminal for that binding id. `unbind_group_checkout_scope` drops only the projection and leaves an active
+CheckoutScope unchanged, while `unbind_checkout_scope` is the separate operation that drives scope
+`unbinding → unbound` and retains the worktree. A scope leaving `active` makes a current binding `stale`;
+scope unbind/remove fences the scope, GroupTree and binding revisions and atomically terminalises any
+`current|stale` binding as `unbound`.
 The Group gains no runtime or repository authority;
 the binding supplies only default cwd/isolation for new descendants and for explicit `move_and_rehome`.
 Merely moving a live Node is presentation-only. `move_and_rehome` preflights every affected stopped

@@ -734,8 +734,9 @@ response, per-profile companion projections, privacy, security, accessibility an
 **Exit proof.** Every row in `docs/PRODUCT_REQUIREMENTS.md` has evidence from its matching
 `docs/CONTROL_PLANE_ACCEPTANCE.md` oracle on the same commit. All named end-to-end journeys pass, including
 the 50-Session/100-live-runtime/1,000-node fixed-profile sustained envelope with p50/p95/p99 measurements.
-Every one of the 84 frozen capability rows retains a valid disposition/evidence/PRD/ACP/ADR trace and every
-deletion, unknown, weakening or broken link mutation fails. At least two non-authors perform adversarial
+Every one of the 84 frozen capability rows retains a valid disposition/evidence/PRD/ACP/ADR trace; an
+independent clone reproduces the opaque snapshot tree plus all evidence-blob hashes, and every deletion,
+unknown, weakening or broken link mutation fails. At least two non-authors perform adversarial
 cross-document and implementation audits with zero unresolved
 P0/P1/P2. CI is green on the exact
 commit merged to `main`. A documentation contract alone cannot close M17.
