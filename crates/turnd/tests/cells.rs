@@ -473,6 +473,13 @@ async fn resizing_hands_the_client_a_whole_screen_at_its_new_geometry() {
         "the client must be given the screen at the size it is now rendering"
     );
 
+    // The screen model changing is not enough: the program on the slave side of
+    // the pty must receive the same geometry (and the corresponding SIGWINCH), or
+    // a full-screen application will keep painting into its old 80-column box.
+    // This is the user-visible regression that left most of a large Pane empty.
+    type_line(&mut ui, &session, &pane, "stty size").await;
+    ui.wait_for_screen("30 100").await;
+
     daemon.shutdown().await;
 }
 
