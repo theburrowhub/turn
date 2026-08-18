@@ -14,9 +14,12 @@ use crate::{risk, text};
 use serde_json::Value;
 use std::path::Path;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Version of OpenCode whose official schemas the fixture was recorded from.
 pub const CONTRACT_VERSION: &str = "1.18.16";
+
+const OPENCODE_AUTO: &str = "--auto";
 
 const PLUGIN: &str = r#"export const TurnObserver = async () => {
   const send = (event) => {
@@ -78,15 +81,14 @@ fn resolve_opencode_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    const AUTO: &str = "--auto";
-    let auto = args.iter().any(|arg| arg == AUTO);
+    let auto = args.iter().any(|arg| arg == OPENCODE_AUTO);
     match profile_id {
         SAFE_PROFILE_ID => {
             if auto {
                 return Err(AdapterError::LaunchProfileConflict {
                     adapter_id: "opencode".to_string(),
                     profile_id: profile_id.to_string(),
-                    detail: format!("the explicit {AUTO} argument"),
+                    detail: format!("the explicit {OPENCODE_AUTO} argument"),
                 });
             }
             Ok(ResolvedLaunchProfile::safe("opencode", args))
@@ -94,13 +96,13 @@ fn resolve_opencode_profile(
         AUTONOMOUS_PROFILE_ID => {
             let mut resolved = args.to_vec();
             if !auto {
-                resolved.push(AUTO.to_string());
+                resolved.push(OPENCODE_AUTO.to_string());
             }
             Ok(ResolvedLaunchProfile::autonomous(
                 "opencode",
                 LaunchPermissionPosture::AutoApproveUnlessDenied,
                 resolved,
-                vec![AUTO.to_string()],
+                vec![OPENCODE_AUTO.to_string()],
             ))
         }
         _ => Err(AdapterError::UnknownLaunchProfile {
@@ -156,6 +158,21 @@ impl AgentAdapter for OpenCodeAdapter {
         user_args: &[String],
     ) -> Result<ResolvedLaunchProfile, AdapterError> {
         resolve_opencode_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        if args.iter().any(|arg| arg == OPENCODE_AUTO) {
+            configuration.approval_mode = Some("auto unless denied".into());
+            if profile.role.is_none() {
+                configuration.permission_mode = Some("Custom · auto-approve unless denied".into());
+            }
+        }
+        configuration
     }
 
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {

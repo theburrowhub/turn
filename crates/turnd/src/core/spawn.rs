@@ -41,13 +41,14 @@ use super::{hosting, Core, Process};
 use crate::paths;
 use std::path::{Path, PathBuf};
 use turn_agents::{
-    AdapterRegistry, IntegrationLevel, LaunchContext, LaunchPlan, OutputHeuristic, Selection,
+    launch_fact_configurations, AdapterRegistry, IntegrationLevel, LaunchContext, LaunchPlan,
+    OutputHeuristic, ResolvedLaunchProfile, Selection,
 };
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{
-    AgentLaunchProfileRef, NodeKind, PaneKind, ProcessNode, Relation, Session, SessionMode,
-    WorkspaceCheckout,
+    AgentLaunchProfileRef, NodeKind, Observable, ObservationSource, ObservationSourceKind,
+    PaneKind, ProcessNode, Relation, Session, SessionMode, WorkspaceCheckout,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
@@ -520,7 +521,7 @@ impl Core {
         let node_id = node.id.clone();
 
         let (endpoint, token) = self.hook_endpoint(session_id, &node_id, &selection);
-        let plan = self.prepare_launch(
+        let prepared = self.prepare_launch(
             session_id,
             &node_id,
             command,
@@ -529,6 +530,15 @@ impl Core {
             &selection,
             token.as_deref(),
         )?;
+        record_launch_facts(
+            &mut node,
+            &request.args,
+            &prepared.plan.args,
+            &prepared.profile,
+            selection.adapter.as_ref(),
+            now_ms,
+        );
+        let plan = prepared.plan;
 
         let mut env = request.env.clone();
         // The adapter's own environment goes last so it wins: a hook URL it just
@@ -842,7 +852,7 @@ impl Core {
         let agent_id = agent.id.clone();
 
         let (endpoint, token) = self.hook_endpoint(session_id, &agent_id, selection);
-        let plan = self.prepare_launch(
+        let prepared = self.prepare_launch(
             session_id,
             &agent_id,
             command,
@@ -851,6 +861,15 @@ impl Core {
             selection,
             token.as_deref(),
         )?;
+        record_launch_facts(
+            &mut agent,
+            &request.args,
+            &prepared.plan.args,
+            &prepared.profile,
+            selection.adapter.as_ref(),
+            now_ms,
+        );
+        let plan = prepared.plan;
         // What actually runs, which is not what the user typed: the adapter has added
         // the flags that make the tool report back. The tree shows the truth.
         agent.command = plan.command.clone();
@@ -927,7 +946,7 @@ impl Core {
         endpoint: turn_agents::HookEndpoint,
         selection: &Selection,
         token: Option<&str>,
-    ) -> std::result::Result<LaunchPlan, ProtoError> {
+    ) -> std::result::Result<PreparedLaunch, ProtoError> {
         let launch = LaunchContext {
             session_id: session_id.clone(),
             node_id: node_id.clone(),
@@ -938,26 +957,42 @@ impl Core {
             endpoint,
             scratch_dir: paths::node_scratch(&self.data_dir, session_id, node_id),
         };
-        selection.adapter.prepare(&launch).map_err(|error| {
-            self.revoke(token);
-            let detail = error.to_string();
-            if matches!(
-                error,
-                turn_agents::AdapterError::UnknownLaunchAdapter { .. }
-                    | turn_agents::AdapterError::UnknownLaunchProfile { .. }
-                    | turn_agents::AdapterError::LaunchProfileAdapterMismatch { .. }
-                    | turn_agents::AdapterError::LaunchProfileConflict { .. }
-            ) {
-                ProtoError::invalid("This agent launch profile cannot be applied")
-                    .with_detail(detail)
-            } else {
-                ProtoError::new(
-                    ErrorCode::Unavailable,
-                    "Turn could not write the configuration this agent needs",
-                )
-                .with_detail(detail)
-            }
-        })
+        // Resolve once at the daemon boundary and retain the provider-owned receipt.
+        // Adapters remain the sole authority for profile flags and conflicts; Turn only
+        // projects this receipt into privacy-safe launch facts after preparation.
+        let profile = selection
+            .adapter
+            .resolve_context_launch_profile(&launch)
+            .map_err(|error| self.launch_prepare_error(token, error))?;
+        let plan = selection
+            .adapter
+            .prepare(&launch)
+            .map_err(|error| self.launch_prepare_error(token, error))?;
+        Ok(PreparedLaunch { plan, profile })
+    }
+
+    fn launch_prepare_error(
+        &self,
+        token: Option<&str>,
+        error: turn_agents::AdapterError,
+    ) -> ProtoError {
+        self.revoke(token);
+        let detail = error.to_string();
+        if matches!(
+            error,
+            turn_agents::AdapterError::UnknownLaunchAdapter { .. }
+                | turn_agents::AdapterError::UnknownLaunchProfile { .. }
+                | turn_agents::AdapterError::LaunchProfileAdapterMismatch { .. }
+                | turn_agents::AdapterError::LaunchProfileConflict { .. }
+        ) {
+            ProtoError::invalid("This agent launch profile cannot be applied").with_detail(detail)
+        } else {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Turn could not write the configuration this agent needs",
+            )
+            .with_detail(detail)
+        }
     }
 
     /// Opens the pty, revoking the launch's token if it cannot be opened.
@@ -1282,6 +1317,12 @@ pub(crate) struct PaneRequest {
     pub cwd: String,
 }
 
+/// A launch plan together with the provider-owned semantic receipt that produced it.
+struct PreparedLaunch {
+    plan: LaunchPlan,
+    profile: ResolvedLaunchProfile,
+}
+
 /// What a terminal pane runs, and whether a shell stands between Turn and it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneLaunch {
@@ -1466,6 +1507,50 @@ fn describe_agent(node: &mut ProcessNode, selection: &Selection) {
         };
         agent.resumable = selection.capabilities.resumable;
     }
+}
+
+/// Records the launch truth known before a provider has emitted any runtime fact.
+///
+/// `current` deliberately stays `Waiting`: argv and an adapter plan are not evidence
+/// that a provider accepted or retained a configuration after it started.
+fn record_launch_facts(
+    node: &mut ProcessNode,
+    requested_args: &[String],
+    effective_args: &[String],
+    profile: &ResolvedLaunchProfile,
+    adapter: &dyn turn_agents::AgentAdapter,
+    now_ms: i64,
+) {
+    let Some(agent) = node.agent.as_mut() else {
+        return;
+    };
+    let facts = launch_fact_configurations(adapter, requested_args, effective_args, profile);
+    let adapter_id = adapter.id();
+    agent.runtime.launch.requested = Observable::observed(
+        facts.requested,
+        ObservationSource::new(ObservationSourceKind::LaunchRequest, "pane argv"),
+        now_ms,
+        None,
+    );
+    agent.runtime.launch.effective = Observable::observed(
+        facts.effective,
+        ObservationSource::new(ObservationSourceKind::Adapter, adapter_id),
+        now_ms,
+        None,
+    );
+    agent.runtime.launch.current = Observable::Waiting;
+    // OpenCode currently exposes neither a stable transcript parser nor a provider
+    // context endpoint. Say that once instead of leaving an eternal spinner. The
+    // other built-ins do have an observation path and remain Waiting for its first
+    // authenticated fact. Account quota is populated independently.
+    agent.runtime.context = if adapter_id == "opencode" {
+        Observable::unsupported(
+            ObservationSource::new(ObservationSourceKind::Adapter, adapter_id),
+            now_ms,
+        )
+    } else {
+        Observable::Waiting
+    };
 }
 
 /// The program a command names, without its path.
@@ -1969,6 +2054,130 @@ mod tests {
         assert!(node_kind(PaneKind::Terminal, IntegrationLevel::Heuristic).is_agentic());
     }
 
+    #[test]
+    fn a_new_agent_records_request_and_adapter_receipts_but_not_an_invented_current_state() {
+        let session = SessionId::from_stored("sess_launch_receipt");
+        let mut node = ProcessNode::agent(session, "codex", "/repo", 40);
+        let requested = vec![
+            "--model".to_string(),
+            "gpt-5.6-sol".to_string(),
+            "--api-key=must-not-survive".to_string(),
+        ];
+        let effective = requested
+            .iter()
+            .cloned()
+            .chain(["--dangerously-bypass-approvals-and-sandbox".into()])
+            .collect::<Vec<_>>();
+        let profile = ResolvedLaunchProfile {
+            adapter_id: "codex".into(),
+            profile_id: "autonomous".into(),
+            role: Some(turn_agents::LaunchProfileRole::Autonomous),
+            posture: turn_agents::LaunchPermissionPosture::BypassApprovalsAndSandbox,
+            args: effective.clone(),
+            effective_flag_names: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+        };
+
+        let adapter = turn_agents::CodexAdapter::new();
+        record_launch_facts(&mut node, &requested, &effective, &profile, &adapter, 42);
+        let runtime = &node.agent.as_ref().unwrap().runtime;
+        let Observable::Observed {
+            value: requested,
+            source: requested_source,
+            observed_at_ms: requested_at,
+            ..
+        } = &runtime.launch.requested
+        else {
+            panic!("the request must be observed")
+        };
+        assert_eq!(requested.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            requested.permission_mode.as_deref(),
+            Some("Autonomous · bypass approvals and sandbox")
+        );
+        assert_eq!(requested_source.kind, ObservationSourceKind::LaunchRequest);
+        assert_eq!(requested_source.label.as_deref(), Some("pane argv"));
+        assert_eq!(*requested_at, 42);
+
+        let Observable::Observed {
+            value: effective,
+            source: effective_source,
+            observed_at_ms: effective_at,
+            ..
+        } = &runtime.launch.effective
+        else {
+            panic!("the adapter plan must be observed")
+        };
+        assert_eq!(effective.approval_mode.as_deref(), Some("bypassed"));
+        assert_eq!(effective.sandbox_mode.as_deref(), Some("disabled"));
+        assert_eq!(effective_source.kind, ObservationSourceKind::Adapter);
+        assert_eq!(effective_source.label.as_deref(), Some("codex"));
+        assert_eq!(*effective_at, 42);
+        assert!(matches!(runtime.launch.current, Observable::Waiting));
+        assert!(matches!(runtime.context, Observable::Waiting));
+        assert!(matches!(runtime.quota, Observable::Waiting));
+
+        let serialised = serde_json::to_string(&runtime.launch).unwrap();
+        assert!(!serialised.contains("must-not-survive"));
+    }
+
+    #[test]
+    fn opencode_context_is_explicitly_unsupported_while_observable_providers_wait() {
+        let profile = ResolvedLaunchProfile {
+            adapter_id: "opencode".into(),
+            profile_id: "safe".into(),
+            role: Some(turn_agents::LaunchProfileRole::Safe),
+            posture: turn_agents::LaunchPermissionPosture::StandardSafeguards,
+            args: Vec::new(),
+            effective_flag_names: Vec::new(),
+        };
+        let session = SessionId::from_stored("sess_context_capability");
+        let mut opencode = ProcessNode::agent(session.clone(), "opencode", "/repo", 40);
+        let opencode_adapter = turn_agents::OpenCodeAdapter::new();
+        record_launch_facts(&mut opencode, &[], &[], &profile, &opencode_adapter, 43);
+        assert!(matches!(
+            opencode.agent.as_ref().unwrap().runtime.context,
+            Observable::Unsupported {
+                source: ObservationSource {
+                    kind: ObservationSourceKind::Adapter,
+                    ref label,
+                },
+                observed_at_ms: 43,
+            } if label.as_deref() == Some("opencode")
+        ));
+        assert!(matches!(
+            opencode.agent.as_ref().unwrap().runtime.quota,
+            Observable::Waiting
+        ));
+
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+            Box::new(turn_agents::ClaudeCodeAdapter::new()),
+            Box::new(turn_agents::CodexAdapter::new()),
+            Box::new(turn_agents::GeminiCliAdapter::new()),
+        ];
+        for adapter in adapters {
+            let adapter_id = adapter.id();
+            let mut agent = ProcessNode::agent(session.clone(), adapter_id, "/repo", 40);
+            let mut provider_profile = profile.clone();
+            provider_profile.adapter_id = adapter_id.into();
+            record_launch_facts(
+                &mut agent,
+                &[],
+                &[],
+                &provider_profile,
+                adapter.as_ref(),
+                43,
+            );
+            assert!(matches!(
+                agent.agent.as_ref().unwrap().runtime.context,
+                Observable::Waiting
+            ));
+            assert!(matches!(
+                agent.agent.as_ref().unwrap().runtime.quota,
+                Observable::Waiting
+            ));
+        }
+    }
+
     /// The one thing a shell in the middle must not be allowed to do: reinterpret what
     /// Turn injected. The real Claude Code adapter's `--settings` path and its
     /// `TURN_HOOK_URL` now travel through a shell, and Turn's own data directory can sit
@@ -2118,10 +2327,35 @@ mod tests {
             .materialise_pane(&session.id, &pane, 3)
             .expect("a contained directory starts")
             .expect("a hosted agent answers with the agent's node");
+        let session_id = session.id.clone();
         let session = &harness.core.sessions[&session.id];
         let agent = session.tree.get(&started).expect("the agent node");
         assert_eq!(agent.kind, NodeKind::Agent);
         assert_eq!(agent.relation, Relation::Confirmed);
+        let runtime = &agent.agent.as_ref().unwrap().runtime;
+        assert!(matches!(
+            runtime.launch.requested,
+            Observable::Observed {
+                source: ObservationSource {
+                    kind: ObservationSourceKind::LaunchRequest,
+                    ..
+                },
+                observed_at_ms: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            runtime.launch.effective,
+            Observable::Observed {
+                source: ObservationSource {
+                    kind: ObservationSourceKind::Adapter,
+                    ..
+                },
+                observed_at_ms: 3,
+                ..
+            }
+        ));
+        assert!(matches!(runtime.launch.current, Observable::Waiting));
         let shell = agent.parent.clone().expect("the shell it runs in");
         assert_eq!(session.tree.get(&shell).unwrap().kind, NodeKind::Shell);
         assert_eq!(
@@ -2152,6 +2386,55 @@ mod tests {
         let canonical = std::fs::canonicalize(&root).unwrap();
         assert_eq!(agent.cwd, canonical.to_string_lossy());
         assert_eq!(shell_node.cwd, canonical.to_string_lossy());
+
+        // The hosted relaunch path calls the same preparation boundary and therefore
+        // mints a new, timestamped receipt rather than carrying the old attempt's facts.
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .get_mut(&started)
+            .unwrap()
+            .lifecycle = Lifecycle::Exited { code: 0 };
+        let replacement = match harness
+            .core
+            .dispatch(
+                crate::core::command::ClientId(1),
+                turn_proto::Request::RelaunchNode {
+                    session_id: session_id.clone(),
+                    node_id: started.clone(),
+                    resume: false,
+                },
+                4,
+            )
+            .expect("the hosted agent can be started again in its surviving shell")
+        {
+            turn_proto::Response::Node { node } => node.node_id,
+            other => panic!("unexpected relaunch response: {other:?}"),
+        };
+        assert_ne!(replacement, started);
+        let replacement = harness.core.sessions[&session_id]
+            .tree
+            .get(&replacement)
+            .expect("the replacement agent");
+        let runtime = &replacement.agent.as_ref().unwrap().runtime;
+        assert!(matches!(
+            runtime.launch.requested,
+            Observable::Observed {
+                observed_at_ms: 4,
+                ..
+            }
+        ));
+        assert!(matches!(
+            runtime.launch.effective,
+            Observable::Observed {
+                observed_at_ms: 4,
+                ..
+            }
+        ));
+        assert!(matches!(runtime.launch.current, Observable::Waiting));
     }
 
     #[tokio::test]

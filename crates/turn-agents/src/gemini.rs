@@ -15,6 +15,7 @@ use crate::{risk, text};
 use serde_json::{json, Value};
 use std::path::Path;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Version of Gemini CLI whose documented hook contract the fixture covers.
 pub const CONTRACT_VERSION: &str = "0.46.0";
@@ -106,13 +107,24 @@ fn gemini_approval_modes(args: &[String]) -> Vec<Option<&str>> {
         .collect()
 }
 
+fn gemini_yolo_flag(args: &[String]) -> Option<&str> {
+    args.iter()
+        .find(|arg| matches!(arg.as_str(), "--yolo" | "-y"))
+        .map(String::as_str)
+}
+
+fn observed_gemini_approval_mode(args: &[String]) -> Option<&str> {
+    let mode = gemini_approval_modes(args).into_iter().last().flatten()?;
+    ["default", "auto_edit", "yolo", "plan"]
+        .contains(&mode)
+        .then_some(mode)
+}
+
 fn resolve_gemini_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    let yolo_flag = args
-        .iter()
-        .find(|arg| matches!(arg.as_str(), "--yolo" | "-y"));
+    let yolo_flag = gemini_yolo_flag(args);
     let approval_modes = gemini_approval_modes(args);
     let yolo_mode = approval_modes.contains(&Some("yolo"));
     let conflicting_mode = approval_modes.iter().any(|mode| *mode != Some("yolo"));
@@ -138,7 +150,7 @@ fn resolve_gemini_profile(
             }
             let mut resolved = args.to_vec();
             let effective_flag = if let Some(flag) = yolo_flag {
-                flag.as_str()
+                flag
             } else if yolo_mode {
                 "--approval-mode"
             } else {
@@ -205,6 +217,24 @@ impl AgentAdapter for GeminiCliAdapter {
         user_args: &[String],
     ) -> Result<ResolvedLaunchProfile, AdapterError> {
         resolve_gemini_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        let approval = if gemini_yolo_flag(args).is_some() {
+            Some("yolo")
+        } else {
+            observed_gemini_approval_mode(args)
+        };
+        configuration.approval_mode = approval.map(str::to_string);
+        if profile.role.is_none() && approval == Some("yolo") {
+            configuration.permission_mode = Some("Custom · yolo approval mode".into());
+        }
+        configuration
     }
 
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::AgentLaunchProfileRef;
+use turn_core::model::{AgentLaunchProfileRef, LaunchConfiguration};
 
 /// Stable ids understood by every provider catalogue. The adapter owns what each
 /// id means for its CLI; callers never need to know a vendor flag.
@@ -326,6 +326,20 @@ pub trait AgentAdapter: Send + Sync {
             });
         }
         self.resolve_launch_profile(&requested.profile_id, &ctx.user_args)
+    }
+
+    /// Privacy-safe launch facts for this provider's argv.
+    ///
+    /// The adapter owns policy option semantics just as it owns profile
+    /// resolution. The default understands the universal long model option and
+    /// retains flag names only; providers override this beside their existing
+    /// conflict logic for short model spellings and explicit custom policies.
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        crate::launch_facts::base_launch_configuration(args, profile, false)
     }
 
     /// Whether this adapter handles a given command line.

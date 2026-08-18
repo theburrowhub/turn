@@ -86,6 +86,7 @@ use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::Value;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Hook events Turn subscribes to, in the only spelling Codex acts on.
 ///
@@ -220,12 +221,13 @@ fn is_codex_policy_option(arg: &str) -> bool {
         || arg.starts_with("-s=")
 }
 
+const CODEX_BYPASS_POLICY: &str = "--dangerously-bypass-approvals-and-sandbox";
+
 fn resolve_codex_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
-    let bypass = args.iter().any(|arg| arg == BYPASS);
+    let bypass = args.iter().any(|arg| arg == CODEX_BYPASS_POLICY);
 
     match profile_id {
         SAFE_PROFILE_ID => {
@@ -248,13 +250,13 @@ fn resolve_codex_profile(
             }
             let mut resolved = args.to_vec();
             if !bypass {
-                resolved.push(BYPASS.to_string());
+                resolved.push(CODEX_BYPASS_POLICY.to_string());
             }
             Ok(ResolvedLaunchProfile::autonomous(
                 "codex",
                 LaunchPermissionPosture::BypassApprovalsAndSandbox,
                 resolved,
-                vec![BYPASS.to_string()],
+                vec![CODEX_BYPASS_POLICY.to_string()],
             ))
         }
         _ => Err(AdapterError::UnknownLaunchProfile {
@@ -313,6 +315,36 @@ impl AgentAdapter for CodexAdapter {
         user_args: &[String],
     ) -> Result<ResolvedLaunchProfile, AdapterError> {
         resolve_codex_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        if args.iter().any(|arg| arg == CODEX_BYPASS_POLICY) {
+            configuration.approval_mode = Some("bypassed".into());
+            configuration.sandbox_mode = Some("disabled".into());
+            if profile.role.is_none() {
+                configuration.permission_mode =
+                    Some("Custom · bypass approvals and sandbox".into());
+            }
+            return configuration;
+        }
+        configuration.approval_mode = crate::launch_facts::known_option_value(
+            args,
+            &["--ask-for-approval", "-a"],
+            &["untrusted", "on-failure", "on-request", "never"],
+        )
+        .map(str::to_string);
+        configuration.sandbox_mode = crate::launch_facts::known_option_value(
+            args,
+            &["--sandbox", "-s"],
+            &["read-only", "workspace-write", "danger-full-access"],
+        )
+        .map(str::to_string);
+        configuration
     }
 
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {

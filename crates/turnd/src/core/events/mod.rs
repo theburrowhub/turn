@@ -25,7 +25,10 @@ use super::{Core, DeferredRuntimeInput, FailedIngestCheckpoint};
 use turn_agents::IntegrationLevel;
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::NodeId;
-use turn_core::model::{AgentIdentitySource, NodeKind, PendingPermission, ProcessNode};
+use turn_core::model::{
+    AgentIdentitySource, LaunchConfiguration, NodeKind, Observable, ObservationSource,
+    ObservationSourceKind, PendingPermission, ProcessNode,
+};
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::ServerEvent;
 
@@ -107,6 +110,13 @@ fn normalise_untrusted_tree_fields(event: &mut TurnEvent) {
                 safe_untrusted_label(&cwd, MAX_DISCOVERED_CWD_CHARS)
                     .unwrap_or_else(|| UNPRINTABLE_LABEL.into())
             });
+        }
+        EventKind::AgentStarted { tool, model, .. } => {
+            *tool = safe_untrusted_label(tool, turn_pty::MAX_TITLE_CHARS)
+                .unwrap_or_else(|| "agent".into());
+            *model = model
+                .take()
+                .and_then(|model| turn_agents::safe_model_name(&model));
         }
         _ => {}
     }
@@ -789,8 +799,35 @@ impl Core {
                 }
                 let agent = node.agent.get_or_insert_with(Default::default);
                 agent.agent.tool = Some(tool.clone());
-                if model.is_some() {
-                    agent.agent.model = model.clone();
+                if let Some(model) = model {
+                    let mut configuration = match &agent.runtime.launch.current {
+                        Observable::Observed { value, .. } => value.clone(),
+                        Observable::Waiting
+                        | Observable::Unsupported { .. }
+                        | Observable::Stale { .. }
+                        | Observable::Failed { .. } => LaunchConfiguration::default(),
+                    };
+                    configuration.model = Some(model.clone());
+                    let observed = Observable::observed(
+                        configuration,
+                        ObservationSource::new(
+                            ObservationSourceKind::Provider,
+                            format!("{tool} event"),
+                        ),
+                        event.timestamp_ms,
+                        None,
+                    );
+                    agent.runtime.launch.current =
+                        std::mem::take(&mut agent.runtime.launch.current).prefer_newer(observed);
+                    if let Some(current_model) = agent
+                        .runtime
+                        .launch
+                        .current
+                        .value()
+                        .and_then(|configuration| configuration.model.clone())
+                    {
+                        agent.agent.model = Some(current_model);
+                    }
                 }
                 // The tool's own session id, which is what a resume needs and what a
                 // later hook callback identifies itself by.

@@ -24,6 +24,7 @@ pub mod codex;
 pub mod context;
 pub mod gemini;
 pub mod heuristic;
+pub mod launch_facts;
 pub mod opencode;
 pub mod quota;
 pub mod registry;
@@ -44,6 +45,7 @@ pub use context::{
 };
 pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
+pub use launch_facts::{launch_fact_configurations, safe_model_name, LaunchFactConfigurations};
 pub use opencode::OpenCodeAdapter;
 pub use quota::{
     account_quota_source_for_tool, parse_codex_account_quota_response, probe_codex_account_quota,

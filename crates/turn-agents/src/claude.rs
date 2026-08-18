@@ -38,6 +38,7 @@ use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::{json, Value};
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 use turn_core::state::AwaitingReason;
 
 /// How hook callbacks reach Turn.
@@ -277,13 +278,30 @@ fn claude_permission_modes(args: &[String]) -> Vec<Option<&str>> {
         .collect()
 }
 
+fn claude_skips_permissions(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--dangerously-skip-permissions")
+}
+
+fn observed_claude_permission_mode(args: &[String]) -> Option<&str> {
+    let mode = claude_permission_modes(args).into_iter().last().flatten()?;
+    [
+        "default",
+        "acceptEdits",
+        "plan",
+        "dontAsk",
+        "bypassPermissions",
+        "delegate",
+    ]
+    .contains(&mode)
+    .then_some(mode)
+}
+
 fn resolve_claude_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    let skip_flag = args
-        .iter()
-        .any(|arg| arg == "--dangerously-skip-permissions");
+    let skip_flag = claude_skips_permissions(args);
     let permission_modes = claude_permission_modes(args);
     let bypass_mode = permission_modes.contains(&Some("bypassPermissions"));
 
@@ -380,6 +398,24 @@ impl AgentAdapter for ClaudeCodeAdapter {
         user_args: &[String],
     ) -> Result<ResolvedLaunchProfile, AdapterError> {
         resolve_claude_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration =
+            crate::launch_facts::base_launch_configuration(args, profile, false);
+        if profile.role.is_none() {
+            let explicit = observed_claude_permission_mode(args);
+            if claude_skips_permissions(args) || explicit == Some("bypassPermissions") {
+                configuration.permission_mode = Some("Custom · bypass permissions".into());
+            } else if let Some(mode) = explicit {
+                configuration.permission_mode = Some(format!("Custom · {mode}"));
+            }
+        }
+        configuration
     }
 
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
