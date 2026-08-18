@@ -439,16 +439,22 @@ impl TurnView<'_> {
         };
         // A separate interaction object and a filtered outcome are both intentional:
         // measuring this larger read-only mirror must not resize or focus the saved Pane.
-        terminal::show(
+        terminal::show_pane(
             ui,
-            theme,
-            terminal_rect,
-            content.grid,
             interaction,
-            options,
-            ui.id()
-                .with(("node-terminal-mirror", node.node_id.as_str())),
+            terminal::PaneInput {
+                theme,
+                rect: terminal_rect,
+                grid: content.grid,
+                options,
+                id: ui
+                    .id()
+                    .with(("node-terminal-mirror", node.node_id.as_str())),
+                runtime_id: None,
+                chrome: None,
+            },
         )
+        .actions
         .into_iter()
         .filter_map(|action| match action {
             PaneAction::Copy(_) | PaneAction::Scroll(_) => Some(ViewAction::Pane {

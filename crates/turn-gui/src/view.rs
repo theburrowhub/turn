@@ -8665,15 +8665,20 @@ impl<'a> TurnView<'a> {
                             scrolled: content.scrolled,
                             history_complete: content.history_complete,
                         };
-                        let pane_actions = terminal::show(
+                        let pane_actions = terminal::show_pane(
                             ui,
-                            theme,
-                            body,
-                            content.grid,
                             state.pane(&pane_id),
-                            options,
-                            ui.id().with(("floating-terminal", pane_id.as_str())),
-                        );
+                            terminal::PaneInput {
+                                theme,
+                                rect: body,
+                                grid: content.grid,
+                                options,
+                                id: ui.id().with(("floating-terminal", pane_id.as_str())),
+                                runtime_id: content.runtime_id.as_ref(),
+                                chrome: None,
+                            },
+                        )
+                        .actions;
                         window_actions.extend(pane_actions.into_iter().map(|action| {
                             ViewAction::Pane {
                                 pane_id: pane_id.clone(),
@@ -8810,7 +8815,21 @@ impl<'a> TurnView<'a> {
                 let pane_id = temporary.pane.binding.pane_id.clone();
                 let interaction = state.pane(&pane_id);
                 let id = ui.id().with(("temporary-terminal", pane_id.as_str()));
-                for action in terminal::show(ui, theme, body, grid, interaction, options, id) {
+                for action in terminal::show_pane(
+                    ui,
+                    interaction,
+                    terminal::PaneInput {
+                        theme,
+                        rect: body,
+                        grid,
+                        options,
+                        id,
+                        runtime_id: Some(&temporary.pane.binding.node_id),
+                        chrome: None,
+                    },
+                )
+                .actions
+                {
                     actions.push(ViewAction::Pane {
                         pane_id: pane_id.clone(),
                         action,

@@ -1120,39 +1120,6 @@ pub struct PaneInput<'a> {
     pub chrome: Option<PaneChrome<'a>>,
 }
 
-/// Draws a pane and collects what the user did to it.
-///
-/// The older entry point, kept because it is what the window still calls. It has no menu
-/// and never produces a [`PaneRequest`]; [`show_pane`] is the complete one.
-pub fn show(
-    ui: &mut Ui,
-    theme: &Theme,
-    rect: Rect,
-    grid: &Grid,
-    state: &mut PaneInteraction,
-    options: PaneOptions,
-    id: egui::Id,
-) -> Vec<PaneAction> {
-    let outcome = show_pane(
-        ui,
-        state,
-        PaneInput {
-            theme,
-            rect,
-            grid,
-            options,
-            id,
-            runtime_id: None,
-            chrome: None,
-        },
-    );
-    debug_assert!(
-        outcome.requests.is_empty(),
-        "a pane with no chrome has nothing to ask the window for"
-    );
-    outcome.actions
-}
-
 /// Draws a pane, with its context menu, and collects everything the user did to it.
 pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>) -> PaneOutcome {
     let PaneInput {

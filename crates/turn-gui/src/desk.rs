@@ -201,12 +201,20 @@ pub struct Desk {
     /// A screen per pane the window has attached to.
     feeds: BTreeMap<PaneId, PaneFeed>,
     attaching: HashSet<PaneId>,
-    /// The size each pane's pty was last told, so a resize is sent on a change.
-    pty_sizes: HashMap<PaneId, PtySize>,
+    /// The runtime and size each Pane last reported, so deduplication is per process rather
+    /// than per durable visual Pane. The size is also reused for the next attachment, which
+    /// lets a replacement start at the already-measured live geometry instead of 80x24.
+    pty_sizes: HashMap<PaneId, PtySizeReport>,
     queue: Vec<AttentionView>,
     /// The last arrangement drawn, for directional pane navigation — which is a question
     /// about rectangles and therefore needs the ones that were on screen.
     arrangement: Arrangement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PtySizeReport {
+    runtime_id: Option<NodeId>,
+    size: PtySize,
 }
 
 impl Default for Desk {
@@ -842,7 +850,9 @@ impl Desk {
         self.companion_notice = None;
         self.feeds.clear();
         self.attaching.clear();
-        self.pty_sizes.clear();
+        // Pane geometry belongs to this still-open window, not to one daemon connection.
+        // Retaining it lets a restored attachment start at the size already on screen;
+        // `remember_layout` prunes entries for Panes that no longer exist.
         self.layouts.clear();
         self.trees.clear();
         self.policies.clear();
@@ -1336,9 +1346,9 @@ impl Desk {
                 if stale {
                     // Restore, close and relaunch can all cross an in-flight AttachPane.
                     // Runtime identity must still match the current Layout before a
-                    // screen is accepted under this visual PaneId.
+                    // screen is accepted under this visual PaneId. Its measured geometry
+                    // is window state, though, and remains valid for the current attach.
                     self.feeds.remove(&pane_id);
-                    self.pty_sizes.remove(&pane_id);
                     return Vec::new();
                 }
                 self.feeds.insert(pane_id, PaneFeed::attach(&attachment));
@@ -1815,9 +1825,21 @@ impl Desk {
                 size,
             } => {
                 // Another client resized a pty we share. The feed follows so the window
-                // draws the right shape rather than the one it asked for.
-                let _ = (session_id, node_id);
-                for feed in self.feeds.values_mut() {
+                // draws the right shape rather than the one it asked for. One runtime may
+                // have several views, but an unrelated runtime's screen must not be erased.
+                let panes: Vec<PaneId> = self
+                    .feeds
+                    .keys()
+                    .filter(|pane_id| {
+                        self.pane_owner.get(*pane_id) == Some(&session_id)
+                            && self.node_of(pane_id).as_ref() == Some(&node_id)
+                    })
+                    .cloned()
+                    .collect();
+                for pane_id in panes {
+                    let Some(feed) = self.feeds.get_mut(&pane_id) else {
+                        continue;
+                    };
                     if feed.size() != size {
                         // A resize has no row correspondence, so the screen is refetched
                         // rather than reshaped locally.
@@ -1839,7 +1861,6 @@ impl Desk {
                 for outcome in &panes {
                     self.feeds.remove(&outcome.pane_id);
                     self.attaching.remove(&outcome.pane_id);
-                    self.pty_sizes.remove(&outcome.pane_id);
                 }
                 // Nothing is started here. The sweep in `autostart_stopped_panes` does it, over
                 // every stopped pane the window knows about — this event only fires when the
@@ -2311,10 +2332,11 @@ impl Desk {
         for pane in rebound {
             // Pane identity is visual; its feed is runtime identity. A relaunch keeps
             // PaneId but changes node_id, so retaining this feed would leave the new
-            // process running behind the dead process's final screen.
+            // process running behind the dead process's final screen. Keep the measured
+            // geometry: the replacement can then attach at the full visible size before
+            // its first frame, while the runtime-scoped report still permits one Resize.
             self.feeds.remove(&pane);
             self.attaching.remove(&pane);
-            self.pty_sizes.remove(&pane);
         }
         let temporary = self
             .temporary_pane
@@ -2396,7 +2418,7 @@ impl Desk {
                     size: self
                         .pty_sizes
                         .get(&pane_id)
-                        .copied()
+                        .map(|report| report.size)
                         .unwrap_or(INITIAL_SIZE),
                     // Cells, always. This window has no VT emulator and does not want
                     // one; the daemon has already parsed the screen.
@@ -4152,11 +4174,16 @@ impl Desk {
                 }]
             }
             PaneAction::Resize(size) => {
-                if self.pty_sizes.get(&pane_id) == Some(&size) {
+                let runtime_id = self.node_of(&pane_id);
+                let report = PtySizeReport {
+                    runtime_id: runtime_id.clone(),
+                    size,
+                };
+                if self.pty_sizes.get(&pane_id) == Some(&report) {
                     return Vec::new();
                 }
-                self.pty_sizes.insert(pane_id.clone(), size);
-                let Some(node_id) = self.node_of(&pane_id) else {
+                self.pty_sizes.insert(pane_id.clone(), report);
+                let Some(node_id) = runtime_id else {
                     return Vec::new();
                 };
                 vec![Reaction::Send {
@@ -5368,7 +5395,13 @@ mod tests {
         desk.feeds
             .insert(pane_id.clone(), PaneFeed::blank(INITIAL_SIZE));
         desk.attaching.insert(pane_id.clone());
-        desk.pty_sizes.insert(pane_id.clone(), INITIAL_SIZE);
+        desk.pty_sizes.insert(
+            pane_id.clone(),
+            PtySizeReport {
+                runtime_id: None,
+                size: INITIAL_SIZE,
+            },
+        );
 
         desk.apply_inbound(
             Inbound::Event(Box::new(ServerEvent::SessionRemoved {
@@ -5655,17 +5688,28 @@ mod tests {
 
         let replacement = NodeId::from_stored("node_replacement_pty");
         session.layout.get_mut(&pane_id).unwrap().node_id = Some(replacement.clone());
-        let _ = desk.apply_inbound(
+        let rebound = desk.apply_inbound(
             answer(Response::Layout {
                 session_id: session.id.clone(),
                 layout: session.layout.clone(),
             }),
             T0 + 1,
         );
+        assert!(
+            matches!(
+                sent(&rebound).as_slice(),
+                [Request::AttachPane {
+                    pane_id: attached,
+                    size,
+                    ..
+                }] if attached == &pane_id && *size == visible
+            ),
+            "the replacement attaches at the Pane's already-measured geometry: {rebound:?}"
+        );
 
         match sent(&desk.apply_view_action(
             ViewAction::Pane {
-                pane_id,
+                pane_id: pane_id.clone(),
                 action: PaneAction::Resize(visible),
             },
             T0 + 2,
@@ -5679,6 +5723,173 @@ mod tests {
             }
             other => panic!("the replacement pty did not receive its full visible size: {other:?}"),
         }
+        assert!(sent(&desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id,
+                action: PaneAction::Resize(visible),
+            },
+            T0 + 3,
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_reconnected_runtime_attaches_at_the_last_real_pane_geometry() {
+        let (session, pane_id, _) = session_with_agent("Restored geometry");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        let visible = PtySize::new(47, 172);
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::Pane {
+                    pane_id: pane_id.clone(),
+                    action: PaneAction::Resize(visible),
+                },
+                T0,
+            ))
+            .as_slice(),
+            [Request::ResizePty { size, .. }] if *size == visible
+        ));
+
+        // A daemon generation is discarded, but the still-open window has not changed
+        // shape. When the same live runtime is restored, its very first AttachPane must
+        // use that measured shape rather than shrinking it back to the 80x24 fallback.
+        desk.apply_inbound(connected(), T0 + 1);
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0 + 2,
+        );
+        let restored = desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0 + 3,
+        );
+        assert!(
+            matches!(
+                sent(&restored).as_slice(),
+                [Request::AttachPane {
+                    pane_id: attached,
+                    size,
+                    ..
+                }] if attached == &pane_id && *size == visible
+            ),
+            "the restored runtime must see every visible row and column immediately: {restored:?}"
+        );
+    }
+
+    #[test]
+    fn a_pty_resize_only_resets_feeds_bound_to_the_exact_session_runtime() {
+        let (mut session, first_pane, resized_node) = session_with_agent("Scoped resize");
+
+        // Two durable views may intentionally share one runtime. Both have to follow its
+        // resize, while a neighbouring runtime in the same Session remains untouched.
+        let mut second_view = Pane::new(PaneKind::Agent).with_title("same runtime");
+        let second_pane = second_view.id.clone();
+        second_view.node_id = Some(resized_node.clone());
+        assert!(session
+            .layout
+            .split(&first_pane, Direction::Horizontal, second_view));
+
+        let mut unrelated = ProcessNode::process(
+            session.id.clone(),
+            NodeKind::Shell,
+            "unrelated shell",
+            "/repo",
+            T0,
+        );
+        unrelated.lifecycle = Lifecycle::Alive;
+        let unrelated_node = session.tree.insert(unrelated);
+        let mut unrelated_view = Pane::new(PaneKind::Shell).with_title("other runtime");
+        let unrelated_pane = unrelated_view.id.clone();
+        unrelated_view.node_id = Some(unrelated_node.clone());
+        assert!(session
+            .layout
+            .split(&second_pane, Direction::Vertical, unrelated_view));
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        assert_eq!(desk.node_of(&first_pane).as_ref(), Some(&resized_node));
+        assert_eq!(desk.node_of(&second_pane).as_ref(), Some(&resized_node));
+        assert_eq!(
+            desk.node_of(&unrelated_pane).as_ref(),
+            Some(&unrelated_node)
+        );
+
+        let first_screen = Grid::from_lines(&["first view"], 80);
+        let second_screen = Grid::from_lines(&["second view"], 80);
+        let unrelated_screen = Grid::from_lines(&["leave me alone"], 80);
+        let feed = |grid: Grid, next_seq| {
+            let size = PtySize::new(grid.rows, grid.cols);
+            let mut feed = PaneFeed::blank(size);
+            feed.resync(grid, next_seq);
+            feed
+        };
+        desk.feeds
+            .insert(first_pane.clone(), feed(first_screen.clone(), 7));
+        desk.feeds
+            .insert(second_pane.clone(), feed(second_screen.clone(), 11));
+        desk.feeds
+            .insert(unrelated_pane.clone(), feed(unrelated_screen.clone(), 13));
+        desk.refresh_screens();
+
+        // Matching only the runtime is insufficient: a resize event is scoped by both
+        // protocol keys, so a stale/wrong-Session event changes nothing.
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::PtyResized {
+                session_id: SessionId::from_stored("sess_wrong_resize_scope"),
+                node_id: resized_node.clone(),
+                size: PtySize::new(31, 101),
+            })),
+            T0 + 1,
+        );
+        desk.refresh_screens();
+        assert_eq!(desk.pane_grid(&first_pane), Some(&first_screen));
+        assert_eq!(desk.pane_grid(&second_pane), Some(&second_screen));
+        assert_eq!(desk.pane_grid(&unrelated_pane), Some(&unrelated_screen));
+
+        let resized = PtySize::new(31, 101);
+        desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::PtyResized {
+                session_id: session.id.clone(),
+                node_id: resized_node,
+                size: resized,
+            })),
+            T0 + 2,
+        );
+        desk.refresh_screens();
+        let blank = Grid::blank(resized.rows, resized.cols);
+        assert_eq!(desk.pane_grid(&first_pane), Some(&blank));
+        assert_eq!(desk.pane_grid(&second_pane), Some(&blank));
+        assert_eq!(
+            desk.pane_grid(&unrelated_pane),
+            Some(&unrelated_screen),
+            "a resize for one runtime must not erase a neighbouring Pane's screen"
+        );
     }
 
     /// A session of two side-by-side panes, drawn once so the arrangement exists.

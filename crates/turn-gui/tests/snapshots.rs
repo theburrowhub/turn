@@ -110,7 +110,11 @@ impl Fixture {
             .iter()
             .map(|(pane_id, grid)| PaneContent {
                 pane_id: pane_id.clone(),
-                runtime_id: None,
+                runtime_id: self
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.get(pane_id))
+                    .and_then(|pane| pane.node_id.clone()),
                 title: self
                     .titles
                     .get(pane_id)
@@ -4601,6 +4605,122 @@ fn a_detached_pane_restores_as_a_floating_view() {
     let mut h = harness(fixture);
     h.run_steps(2);
     h.snapshot("floating_pane");
+}
+
+fn pane_resizes(actions: &[ViewAction], pane_id: &PaneId) -> Vec<PtySize> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ViewAction::Pane {
+                pane_id: resized,
+                action: PaneAction::Resize(size),
+            } if resized == pane_id => Some(*size),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs the real `TurnView` renderer with one durable Pane. A fresh/restored window must
+/// immediately report every measured row and column, then the visual Pane and its rectangle
+/// stay put while its process identity changes, exactly as they do on relaunch.
+fn assert_replacement_runtime_is_resized_once(floating: bool) {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("active Pane");
+    let previous = NodeId::from_stored("node_previous_rendered_pty");
+    fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .get_mut(&pane_id)
+        .expect("active Pane in Layout")
+        .node_id = Some(previous);
+    if floating {
+        assert!(fixture.layout.as_mut().expect("layout").float(
+            &pane_id,
+            PaneGeometry {
+                x: 340.0,
+                y: 80.0,
+                width: 860.0,
+                height: 560.0,
+            },
+        ));
+    } else {
+        fixture.layout.as_mut().expect("layout").zoomed = Some(pane_id.clone());
+    }
+
+    let mut h = harness(fixture);
+    h.run_steps(1);
+    let visible = h
+        .state()
+        .state
+        .panes
+        .get(&pane_id)
+        .and_then(PaneInteraction::reported_size)
+        .expect("the live Pane reported its measured geometry");
+    let terminal_rect = h.get_by_label_contains("Terminal, 40 rows").rect();
+    let measured = turn_gui::panes::size_in_cells(terminal_rect, measured_cell(&Theme::dark()));
+    assert_eq!(
+        visible, measured,
+        "Resize must use the exact body rectangle and the same measured cell the renderer paints"
+    );
+    assert!(
+        visible.rows > 24 && visible.cols > 80,
+        "the test Pane must exceed the 80x24 fallback to cover the large-TUI regression: {visible:?}"
+    );
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![visible],
+        "the initial/restored runtime receives the Pane's real geometry on its first frame"
+    );
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        pane_resizes(&h.state().actions, &pane_id).is_empty(),
+        "an unchanged initial runtime is not resized again"
+    );
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window
+            .fixture
+            .layout
+            .as_mut()
+            .expect("layout")
+            .get_mut(&pane_id)
+            .expect("durable Pane")
+            .node_id = Some(NodeId::from_stored("node_replacement_rendered_pty"));
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![visible],
+        "the replacement runtime receives the unchanged live geometry exactly once"
+    );
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        pane_resizes(&h.state().actions, &pane_id).is_empty(),
+        "the next frame must not repeat the replacement runtime's resize"
+    );
+}
+
+#[test]
+fn a_replacement_runtime_is_resized_once_through_the_tiled_render_path() {
+    assert_replacement_runtime_is_resized_once(false);
+}
+
+#[test]
+fn a_replacement_runtime_is_resized_once_through_the_floating_render_path() {
+    assert_replacement_runtime_is_resized_once(true);
 }
 
 #[test]
