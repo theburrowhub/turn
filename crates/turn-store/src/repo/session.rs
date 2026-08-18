@@ -452,6 +452,7 @@ struct StoredTreeState {
     surface_id: String,
     node_kind: String,
     expanded: bool,
+    expansion_set: bool,
     selected: bool,
     manual_order: Option<i32>,
     visibility_mode: Option<String>,
@@ -460,8 +461,8 @@ struct StoredTreeState {
 
 fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT surface_id, node_kind, expanded, selected, manual_order, visibility_mode, \
-                updated_ms \
+        "SELECT surface_id, node_kind, expanded, expansion_set, selected, manual_order, \
+                visibility_mode, updated_ms \
          FROM tree_ui_state WHERE node_id = ?1 AND node_kind IN ('agent', 'process')",
     )?;
     let rows = stmt.query_map(params![from.as_str()], |row| {
@@ -469,6 +470,7 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
             surface_id: row.get("surface_id")?,
             node_kind: row.get("node_kind")?,
             expanded: row.get("expanded")?,
+            expansion_set: row.get("expansion_set")?,
             selected: row.get("selected")?,
             manual_order: row.get("manual_order")?,
             visibility_mode: row.get("visibility_mode")?,
@@ -481,7 +483,7 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
     for old in retired {
         let existing = conn
             .query_row(
-                "SELECT surface_id, node_kind, expanded, selected, manual_order, \
+                "SELECT surface_id, node_kind, expanded, expansion_set, selected, manual_order, \
                         visibility_mode, updated_ms \
                  FROM tree_ui_state \
                  WHERE surface_id = ?1 AND node_kind = ?2 AND node_id = ?3",
@@ -491,6 +493,7 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
                         surface_id: row.get("surface_id")?,
                         node_kind: row.get("node_kind")?,
                         expanded: row.get("expanded")?,
+                        expansion_set: row.get("expansion_set")?,
                         selected: row.get("selected")?,
                         manual_order: row.get("manual_order")?,
                         visibility_mode: row.get("visibility_mode")?,
@@ -507,6 +510,13 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
 
         if let Some(current) = existing {
             let old_is_newer = old.updated_ms >= current.updated_ms;
+            let (expanded, expansion_set) = match (old.expansion_set, current.expansion_set) {
+                (true, true) if old_is_newer => (old.expanded, true),
+                (true, true) => (current.expanded, true),
+                (true, false) => (old.expanded, true),
+                (false, true) => (current.expanded, true),
+                (false, false) => (old.expanded || current.expanded, false),
+            };
             let manual_order = if old_is_newer {
                 old.manual_order.or(current.manual_order)
             } else {
@@ -518,14 +528,15 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
                 current.visibility_mode.or(old.visibility_mode)
             };
             conn.execute(
-                "UPDATE tree_ui_state SET expanded = ?4, selected = ?5, manual_order = ?6, \
-                        visibility_mode = ?7, updated_ms = ?8 \
+                "UPDATE tree_ui_state SET expanded = ?4, expansion_set = ?5, selected = ?6, \
+                        manual_order = ?7, visibility_mode = ?8, updated_ms = ?9 \
                  WHERE surface_id = ?1 AND node_kind = ?2 AND node_id = ?3",
                 params![
                     old.surface_id,
                     old.node_kind,
                     to.as_str(),
-                    old.expanded || current.expanded,
+                    expanded,
+                    expansion_set,
                     old.selected || current.selected,
                     manual_order,
                     visibility_mode,
@@ -535,14 +546,15 @@ fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<
         } else {
             conn.execute(
                 "INSERT INTO tree_ui_state \
-                     (surface_id, node_kind, node_id, expanded, selected, manual_order, \
-                      visibility_mode, updated_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (surface_id, node_kind, node_id, expanded, expansion_set, selected, \
+                      manual_order, visibility_mode, updated_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     old.surface_id,
                     old.node_kind,
                     to.as_str(),
                     old.expanded,
+                    old.expansion_set,
                     old.selected,
                     old.manual_order,
                     old.visibility_mode,
@@ -820,6 +832,7 @@ mod tests {
                 node_kind: HierarchyNodeKind::Process,
                 node_id: survivor.to_string(),
                 expanded: false,
+                expansion_set: false,
                 selected: true,
                 manual_order: Some(8),
                 visibility_mode: None,
@@ -830,6 +843,7 @@ mod tests {
                 node_kind: HierarchyNodeKind::Process,
                 node_id: retired.to_string(),
                 expanded: true,
+                expansion_set: true,
                 selected: false,
                 manual_order: Some(3),
                 visibility_mode: Some("expanded".into()),
@@ -923,6 +937,67 @@ mod tests {
     }
 
     #[test]
+    fn a_node_identity_remap_preserves_the_newest_explicit_collapse() {
+        let store = testing::store();
+        let (mut session, retired, survivor, _) = session_with_duplicate_agents(&store);
+
+        for state in [
+            TreeUiState {
+                surface_id: "collapse-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: survivor.to_string(),
+                expanded: true,
+                expansion_set: true,
+                selected: false,
+                manual_order: None,
+                visibility_mode: None,
+                updated_ms: T0 + 2,
+            },
+            TreeUiState {
+                surface_id: "collapse-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: retired.to_string(),
+                expanded: false,
+                expansion_set: true,
+                selected: false,
+                manual_order: None,
+                visibility_mode: None,
+                updated_ms: T0 + 3,
+            },
+            TreeUiState {
+                surface_id: "moved-collapse-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: retired.to_string(),
+                expanded: false,
+                expansion_set: true,
+                selected: false,
+                manual_order: None,
+                visibility_mode: None,
+                updated_ms: T0 + 4,
+            },
+        ] {
+            store.hierarchy().save_tree_state(&state).unwrap();
+        }
+
+        session.tree.remove(&retired);
+        store
+            .sessions()
+            .save_after_node_remaps(&session, &[(retired.clone(), survivor.clone())])
+            .unwrap();
+
+        for surface_id in ["collapse-window", "moved-collapse-window"] {
+            let tree = store.hierarchy().tree_state(surface_id).unwrap();
+            let state = tree
+                .iter()
+                .find(|state| state.node_id == survivor.as_str())
+                .expect("the explicit collapse follows the canonical identity");
+            assert!(!state.expanded);
+            assert!(state.expansion_set);
+            assert!(!tree.iter().any(|state| state.node_id == retired.as_str()));
+        }
+    }
+
+    #[test]
     fn a_failed_node_identity_remap_rolls_back_every_reference_and_the_node_prune() {
         let store = testing::store();
         let (mut session, retired, survivor, _) = session_with_duplicate_agents(&store);
@@ -942,6 +1017,7 @@ mod tests {
                 node_kind: HierarchyNodeKind::Process,
                 node_id: retired.to_string(),
                 expanded: true,
+                expansion_set: true,
                 selected: false,
                 manual_order: None,
                 visibility_mode: None,
