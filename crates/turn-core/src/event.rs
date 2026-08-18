@@ -6,7 +6,9 @@
 //! produced an event, only how much to trust it.
 
 use crate::ids::{EventId, HandoffId, NodeId, SessionId, WorkspaceId};
-use crate::model::{ContextHandoffMode, ContextHandoffOutcome, RelationshipKind};
+use crate::model::{
+    AgentRuntimeMetadata, ContextHandoffMode, ContextHandoffOutcome, RelationshipKind,
+};
 use crate::state::AwaitingReason;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -111,7 +113,7 @@ pub enum Severity {
 }
 
 /// What actually happened. One variant per event in the product brief.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {
     #[serde(rename = "process.started")]
@@ -183,6 +185,18 @@ pub enum EventKind {
     AgentFailed { reason: String },
     #[serde(rename = "agent.idle")]
     AgentIdle,
+    /// A partial, metadata-only refresh of observable agent runtime facts.
+    ///
+    /// Providers may expose launch, context and account-capacity facts through
+    /// independent channels. Unobserved fields remain `Waiting`; the reducer
+    /// merges this projection by each fact's observation time instead of
+    /// replacing the whole runtime record. Raw provider payloads, transcript
+    /// contents and transcript paths never belong in this event.
+    #[serde(rename = "agent.runtime_observed")]
+    AgentRuntimeObserved {
+        #[serde(default)]
+        runtime: Box<AgentRuntimeMetadata>,
+    },
     /// A child agent was declared by its parent or an integrated runtime.
     ///
     /// `declared_name` is intentionally separate from `agent_type`: tools often
@@ -270,6 +284,7 @@ impl EventKind {
             | Self::AgentTaskCompleted { .. }
             | Self::AgentFailed { .. }
             | Self::AgentIdle
+            | Self::AgentRuntimeObserved { .. }
             | Self::AgentSpawned { .. }
             | Self::AgentSubagentStopped { .. }
             | Self::AgentRenamed { .. }
@@ -309,7 +324,7 @@ pub struct AgentRef {
 /// `Explicit` and so reach the focus channel — and a cap enforced only in the
 /// constructor is no cap at all once events travel over a socket or come back out
 /// of SQLite. Both of those are paths Turn actually uses.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "WireEvent")]
 pub struct TurnEvent {
     pub id: EventId,
@@ -470,6 +485,7 @@ fn default_severity(kind: &EventKind) -> Severity {
         | EventKind::ProcessExited { .. }
         | EventKind::ProcessSpawnedChild { .. }
         | EventKind::AgentStarted { .. }
+        | EventKind::AgentRuntimeObserved { .. }
         | EventKind::AgentSpawned { .. }
         | EventKind::AgentSubagentStopped { .. }
         | EventKind::AgentRenamed { .. }
@@ -498,6 +514,7 @@ fn kind_slug(kind: &EventKind) -> Cow<'static, str> {
         EventKind::AgentTaskCompleted { .. } => "agent.task_completed".into(),
         EventKind::AgentFailed { .. } => "agent.failed".into(),
         EventKind::AgentIdle => "agent.idle".into(),
+        EventKind::AgentRuntimeObserved { .. } => "agent.runtime_observed".into(),
         EventKind::AgentSpawned { .. } => "agent.spawned".into(),
         EventKind::AgentSubagentStopped { .. } => "agent.subagent_stopped".into(),
         EventKind::AgentRenamed { .. } => "agent.renamed".into(),
@@ -520,6 +537,10 @@ pub fn event_name(kind: &EventKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        ContextUsageSnapshot, Observable, ObservationSource, ObservationSourceKind,
+        UsageMeasurement, UsageMeasurementKind, UsageUnit,
+    };
 
     fn sess() -> SessionId {
         SessionId::from_stored("sess_test00000001")
@@ -578,6 +599,48 @@ mod tests {
         );
         assert_eq!(a.dedup_key, b.dedup_key);
         assert_ne!(a.id, b.id, "each occurrence still gets its own id");
+    }
+
+    #[test]
+    fn a_runtime_observation_serialises_only_typed_metadata() {
+        let runtime = AgentRuntimeMetadata {
+            context: Observable::observed(
+                ContextUsageSnapshot {
+                    scope_id: Some("conversation-42".into()),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::Used,
+                        amount: 12_345.0,
+                        unit: UsageUnit::Tokens,
+                        total: Some(200_000.0),
+                    },
+                    effective_window: None,
+                    window_size_tokens: None,
+                    used_percentage: None,
+                    remaining_percentage: None,
+                    current_usage: None,
+                },
+                ObservationSource::new(ObservationSourceKind::Provider, "codex transcript"),
+                1_700_000_000_000,
+                None,
+            ),
+            ..AgentRuntimeMetadata::default()
+        };
+        let kind = EventKind::AgentRuntimeObserved {
+            runtime: Box::new(runtime),
+        };
+
+        let encoded = serde_json::to_string(&kind).unwrap();
+        assert!(encoded.contains(r#""event":"agent.runtime_observed""#));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["runtime"]["context"]
+                ["value"]["measurement"]["amount"],
+            serde_json::json!(12_345.0)
+        );
+        assert!(!encoded.contains("transcript_path"));
+        assert!(!encoded.contains("raw"));
+        let decoded: EventKind = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, kind);
+        assert_eq!(event_name(&decoded), "agent.runtime_observed");
     }
 
     #[test]

@@ -169,6 +169,9 @@ struct Owed {
 /// One pane a client is watching.
 #[derive(Debug)]
 pub struct Attachment {
+    /// Monotonic identity of this exact subscription generation. Pane ids are reused
+    /// across layout rebinding, so events and conditional cleanup carry this fence.
+    pub attachment_id: u64,
     /// The process behind the pane, if it has one. A pane can be attached with no
     /// process — an empty slot after a partial restore, or one of Turn's own views.
     pub node_id: Option<NodeId>,
@@ -197,6 +200,9 @@ pub struct Client {
     /// rather than with the daemon's newest, so a rollout window means something.
     pub agreed_version: u32,
     pub attachments: HashMap<AttachmentKey, Attachment>,
+    /// Source for attachment generations on this connection. Zero is reserved for
+    /// old protocol peers that did not carry a fence.
+    pub next_attachment_id: u64,
     /// Stable window identity supplied by `get_hierarchy`.
     pub surface_id: Option<String>,
     /// Whether this window explicitly opened the Archived view. Hierarchy pushes must
@@ -220,6 +226,7 @@ impl Client {
             frames,
             agreed_version,
             attachments: HashMap::new(),
+            next_attachment_id: 0,
             surface_id: None,
             include_archived: false,
             dropped_frames: 0,
@@ -627,6 +634,7 @@ impl Core {
                 let gap = ServerEvent::PaneOutputGap {
                     session_id: session.clone(),
                     pane_id: pane.clone(),
+                    attachment_id: attachment.attachment_id,
                     dropped: attachment.owed_gap,
                     resume_seq: attachment.next_seq,
                 };
@@ -647,10 +655,12 @@ impl Core {
                     break;
                 };
                 let seq = attachment.next_seq;
+                let attachment_id = attachment.attachment_id;
                 attachment.next_seq += 1;
                 let event = ServerEvent::PaneOutput {
                     session_id: session.clone(),
                     pane_id: pane.clone(),
+                    attachment_id,
                     node_id: Some(node.clone()),
                     seq,
                     data: chunk.clone(),

@@ -26,8 +26,8 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind, PanePlacement,
-    PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
+    AgentLaunchProfileRef, Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind,
+    PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
     TreeVisibilityMode,
 };
 use turn_core::privacy::PrivacyScope;
@@ -112,6 +112,10 @@ pub struct NewPane {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Provider-owned launch policy. Omitted by old clients and for custom/raw
+    /// command lines, which keeps their arguments untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -127,6 +131,7 @@ impl NewPane {
             title: None,
             command: None,
             args: Vec::new(),
+            launch_profile: None,
             cwd: None,
             env: Vec::new(),
             restore: RestoreBehaviour::default(),
@@ -721,10 +726,12 @@ pub enum Request {
     AttachPane {
         session_id: SessionId,
         pane_id: PaneId,
-        /// The size the client will render at. Applied to the pty before the screen
-        /// is taken, so what comes back matches the client's geometry. Refused with
-        /// `invalid_argument` when `rows * cols` exceeds the `max_screen_cells` the
-        /// handshake announced.
+        /// The client's best geometry hint for an empty/unowned Pane. Attaching never
+        /// resizes a live PTY: it is an observational operation, so a stale request
+        /// cannot mutate a runtime before the client rejects its answer. Once attached,
+        /// the elected visible owner sends one measured [`Request::ResizePty`]. Refused
+        /// with `invalid_argument` when `rows * cols` exceeds the `max_screen_cells`
+        /// announced by the handshake.
         size: PtySize,
         /// Cells or bytes. Absent means cells, which is what a renderer without its
         /// own terminal emulator needs and what the daemon can supply for nothing,
@@ -744,6 +751,10 @@ pub enum Request {
     ResyncPane {
         session_id: SessionId,
         pane_id: PaneId,
+        /// Subscription generation the caller is repairing. Older clients omit it;
+        /// current clients fence a delayed resync from an ABA rebound Pane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<u64>,
     },
     /// Fetches the pixels of one inline image a pane's screen refers to.
     ///
@@ -766,6 +777,10 @@ pub enum Request {
     DetachPane {
         session_id: SessionId,
         pane_id: PaneId,
+        /// Remove only this subscription generation. This makes delayed cleanup safe
+        /// after the same visual Pane has already attached to another subject.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attachment_id: Option<u64>,
     },
     /// A screen-shaped window of a pane's history, as cells.
     ///

@@ -206,6 +206,7 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
     assert!(!Request::ResyncPane {
         session_id: session(),
         pane_id: PaneId::from_stored("pane_a"),
+        attachment_id: Some(7),
     }
     .is_mutating());
     // Reading history and searching it are reads. A search borrows the parser's
@@ -403,6 +404,19 @@ fn a_new_pane_omits_everything_it_was_not_given() {
         json, "{\"kind\":\"shell\",\"restore\":\"reattach_only\"}",
         "a pane with no command must not carry empty arrays"
     );
+}
+
+#[test]
+fn a_new_pane_round_trips_its_semantic_launch_profile() {
+    let mut pane = NewPane::new(PaneKind::Agent).with_command("gemini");
+    pane.launch_profile = Some(turn_core::model::AgentLaunchProfileRef::new(
+        "gemini-cli",
+        "autonomous",
+    ));
+    let json = serde_json::to_string(&pane).unwrap();
+    assert!(json.contains("\"adapter_id\":\"gemini-cli\""));
+    assert!(!json.contains("--approval-mode"));
+    assert_eq!(serde_json::from_str::<NewPane>(&json).unwrap(), pane);
 }
 
 #[test]
@@ -761,6 +775,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::ResyncPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: Some(7),
         },
         Request::PaneImage {
             session_id: session_id.clone(),
@@ -770,6 +785,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::DetachPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: Some(7),
         },
         Request::GetPaneHistory {
             session_id: session_id.clone(),

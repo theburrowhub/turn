@@ -30,10 +30,10 @@ use turn_core::ids::{
     AttentionId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
-    PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour,
-    RestoreState, SessionMode, SessionStatus, Template, TreeFilter, TreeVisibilityMode,
-    WorkspaceWriteLease,
+    ActivityPreview, AgentLaunchProfileRef, Direction, DropZone, Layout, LayoutPreset, LeaseState,
+    NodeKind, Pane, PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind,
+    RestoreBehaviour, RestoreState, SessionMode, SessionStatus, Template, TreeFilter,
+    TreeVisibilityMode, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
@@ -157,6 +157,9 @@ impl QueueItem {
 #[derive(Debug)]
 pub struct PaneContent<'a> {
     pub pane_id: PaneId,
+    /// Exact runtime currently bound to this durable Pane. Pane identity survives a
+    /// relaunch; runtime identity does not.
+    pub runtime_id: Option<NodeId>,
     pub title: String,
     pub grid: &'a Grid,
     pub focused: bool,
@@ -170,6 +173,8 @@ pub struct PaneContent<'a> {
 #[derive(Debug)]
 pub struct TemporaryPaneContent<'a> {
     pub pane: &'a NodePaneView,
+    /// Concrete PTY runtime, distinct from the semantic Agent in `pane.binding`.
+    pub runtime_id: Option<NodeId>,
     pub node: Option<&'a TreeNodeView>,
     pub previews: &'a [ActivityPreview],
     pub grid: Option<&'a Grid>,
@@ -468,6 +473,19 @@ impl std::fmt::Debug for LogoTexture {
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
+    /// The live binding for every terminal interaction above.
+    ///
+    /// PaneIds are durable view identities, so a daemon update may legitimately keep one
+    /// while replacing the process it shows. Remembering the binding separately lets the
+    /// next frame discard selections, links and GPU-backed image textures from the previous
+    /// process instead of lending them to its replacement.
+    pane_interaction_bindings: HashMap<PaneId, PaneInteractionBinding>,
+    /// Exactly one visible operational Pane owns each runtime's PTY geometry. Duplicate
+    /// Panes are mirrors until focus (or an explicit temporary Pane) transfers this lease.
+    resize_owners: HashMap<NodeId, ResizeOwner>,
+    /// Monotonic window-local epoch used to make every ownership transfer observable by the
+    /// PaneInteraction that wins it, including A -> B -> A at an unchanged geometry.
+    next_resize_owner_epoch: u64,
     /// The checked-in product mark, decoded and uploaded once for the lifetime of the window.
     /// Keeping the handle here avoids allocating a GPU texture on every immediate-mode frame.
     logo_texture: LogoTexture,
@@ -577,9 +595,6 @@ pub struct ViewState {
     /// Exact Node whose bounded activity projection was last requested for the
     /// WorkSurface. The response cache is keyed by NodeId as a second stale fence.
     pub node_preview_key: Option<NodeId>,
-    /// Read-only terminal mirrors have interaction state separate from saved Panes.
-    /// In particular, measuring a full-surface mirror can never resize the Layout Pane.
-    pub node_terminal_views: HashMap<NodeId, PaneInteraction>,
     /// Current closed navigation target and measured Node surface, for diagnostics and
     /// deterministic geometry acceptance. Neither value is persisted in the Layout.
     pub work_surface_target: Option<ViewTarget>,
@@ -587,6 +602,30 @@ pub struct ViewState {
     hierarchy_actions: Vec<HierarchyAction>,
     observed_tree_state: Option<TreeSurfaceState>,
     observed_temporary_pane: Option<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResizeOwner {
+    pane_id: PaneId,
+    epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneInteractionBinding {
+    session_id: SessionId,
+    semantic_node_id: Option<NodeId>,
+    runtime_id: Option<NodeId>,
+}
+
+impl PaneInteractionBinding {
+    fn is_replaced_by(&self, next: &Self) -> bool {
+        self.session_id != next.session_id
+            || self.semantic_node_id != next.semantic_node_id
+            || matches!(
+                (&self.runtime_id, &next.runtime_id),
+                (Some(previous), Some(current)) if previous != current
+            )
+    }
 }
 
 #[derive(Default)]
@@ -605,6 +644,13 @@ impl ViewState {
     /// The interaction state for a pane, created on first sight.
     pub fn pane(&mut self, id: &PaneId) -> &mut PaneInteraction {
         self.panes.entry(id.clone()).or_default()
+    }
+
+    pub(crate) fn resize_owner_epoch(&self, runtime_id: &NodeId, pane_id: &PaneId) -> Option<u64> {
+        self.resize_owners
+            .get(runtime_id)
+            .filter(|owner| &owner.pane_id == pane_id)
+            .map(|owner| owner.epoch)
     }
 
     /// Whether anything is on screen that must not be interrupted.
@@ -822,7 +868,11 @@ pub struct NewPaneDraft {
     pub title: String,
     pub program: String,
     pub arguments: String,
+    /// Provider-owned semantic launch policy. Raw permission flags never need to
+    /// be remembered by the operator.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     pub cwd: String,
+    pub advanced: bool,
     pub placement: PanePlacement,
     pub error: Option<String>,
 }
@@ -835,13 +885,29 @@ impl NewPaneDraft {
             title: String::new(),
             program: String::new(),
             arguments: String::new(),
+            launch_profile: None,
             cwd: String::new(),
+            advanced: false,
             placement: match placement {
                 PanePlacement::Temporary => PanePlacement::SplitRight,
                 placement => placement,
             },
             error: None,
         }
+    }
+
+    fn agent(target_pane_id: PaneId, placement: PanePlacement) -> Self {
+        let mut draft = Self::new(target_pane_id, placement);
+        draft.kind = PaneKind::Agent;
+        let choice = AGENT_QUICK_CHOICES[0];
+        select_agent_program(
+            &mut draft.program,
+            &mut draft.arguments,
+            &mut draft.launch_profile,
+            choice,
+        );
+        draft.title = choice.label.to_string();
+        draft
     }
 }
 
@@ -984,6 +1050,9 @@ pub struct CellCommandDraft {
     pub program: String,
     /// Shell-style quoting is parsed into argv, but operators are not evaluated.
     pub arguments: String,
+    /// `None` preserves a legacy/custom argv exactly. A semantic profile lets the
+    /// provider adapter own its current permission flags.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     /// Optional working directory, relative to the Workspace unless absolute.
     pub cwd: String,
     /// One `NAME=value` pair per line. Parsed as data, never evaluated by a shell.
@@ -996,6 +1065,7 @@ impl CellCommandDraft {
         Self {
             program: pane.command.clone().unwrap_or_default(),
             arguments: shell_words::join(&pane.args),
+            launch_profile: pane.launch_profile.clone(),
             cwd: pane.cwd.clone().unwrap_or_default(),
             environment: format_environment(&pane.env),
             restore: pane.restore,
@@ -1152,6 +1222,7 @@ impl LayoutTemplateDraft {
                 pane.kind = PaneKind::Shell;
                 pane.command = None;
                 pane.args.clear();
+                pane.launch_profile = None;
                 pane.title = Some("shell".into());
             } else {
                 let args = shell_words::split(command.arguments.trim())
@@ -1163,6 +1234,14 @@ impl LayoutTemplateDraft {
                 };
                 pane.command = Some(program.to_string());
                 pane.args = args;
+                pane.launch_profile = agent_choice_for_program(program)
+                    .filter(|choice| {
+                        command
+                            .launch_profile
+                            .as_ref()
+                            .is_some_and(|profile| profile.adapter_id == choice.adapter_id)
+                    })
+                    .and(command.launch_profile.clone());
                 pane.title = Some(program.rsplit('/').next().unwrap_or(program).to_string());
             }
             pane.node_id = None;
@@ -1200,18 +1279,139 @@ impl LayoutTemplateDraft {
     }
 
     fn cell_label(&self, pane_id: &PaneId) -> String {
-        self.cells
-            .get(pane_id)
-            .map(|cell| cell.program.trim())
-            .filter(|program| !program.is_empty())
-            .unwrap_or("Shell")
-            .to_string()
+        let Some(cell) = self.cells.get(pane_id) else {
+            return "Shell".into();
+        };
+        let program = cell.program.trim();
+        if program.is_empty() {
+            return "Shell".into();
+        }
+        match agent_choice_for_program(program) {
+            Some(choice) => {
+                let mode = match selected_launch_profile(cell.launch_profile.as_ref()) {
+                    SAFE_LAUNCH_PROFILE => "Safe",
+                    AUTONOMOUS_LAUNCH_PROFILE => "Autonomous",
+                    _ => "Custom",
+                };
+                format!("{} · {mode}", choice.label)
+            }
+            None => program.to_string(),
+        }
     }
 }
 
 fn nonempty(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+const SAFE_LAUNCH_PROFILE: &str = "safe";
+const AUTONOMOUS_LAUNCH_PROFILE: &str = "autonomous";
+
+/// One first-class agent choice. The UI knows stable adapter identities and
+/// executables; each adapter remains the sole owner of the arguments that make a
+/// profile Safe or Autonomous.
+#[derive(Clone, Copy)]
+struct AgentQuickChoice {
+    label: &'static str,
+    adapter_id: &'static str,
+    program: &'static str,
+    autonomous_description: &'static str,
+}
+
+const AGENT_QUICK_CHOICES: [AgentQuickChoice; 4] = [
+    AgentQuickChoice {
+        label: "Claude",
+        adapter_id: "claude-code",
+        program: "claude",
+        autonomous_description: "Runs without Claude permission prompts.",
+    },
+    AgentQuickChoice {
+        label: "Codex",
+        adapter_id: "codex",
+        program: "codex",
+        autonomous_description: "Bypasses Codex approvals and sandboxing.",
+    },
+    AgentQuickChoice {
+        label: "Gemini",
+        adapter_id: "gemini-cli",
+        program: "gemini",
+        autonomous_description: "Uses Gemini's autonomous approval mode.",
+    },
+    AgentQuickChoice {
+        label: "OpenCode",
+        adapter_id: "opencode",
+        program: "opencode",
+        autonomous_description:
+            "Auto-approves unless OpenCode policy explicitly denies the action.",
+    },
+];
+
+fn agent_choice_for_program(program: &str) -> Option<AgentQuickChoice> {
+    let executable = program
+        .split_whitespace()
+        .next()
+        .unwrap_or(program)
+        .rsplit('/')
+        .next()
+        .unwrap_or(program);
+    AGENT_QUICK_CHOICES
+        .iter()
+        .copied()
+        .find(|choice| choice.program == executable)
+}
+
+fn launch_profile(adapter_id: &str, profile_id: &str) -> AgentLaunchProfileRef {
+    AgentLaunchProfileRef::new(adapter_id, profile_id)
+}
+
+fn quick_agent_pane(choice: AgentQuickChoice, profile_id: &str) -> NewPane {
+    let mut pane = NewPane::new(PaneKind::Agent).with_command(choice.program);
+    pane.title = Some(choice.label.to_string());
+    pane.launch_profile = Some(launch_profile(choice.adapter_id, profile_id));
+    pane
+}
+
+fn selected_launch_profile(profile: Option<&AgentLaunchProfileRef>) -> &'static str {
+    match profile.map(|profile| profile.profile_id.as_str()) {
+        Some(SAFE_LAUNCH_PROFILE) => SAFE_LAUNCH_PROFILE,
+        Some(AUTONOMOUS_LAUNCH_PROFILE) => AUTONOMOUS_LAUNCH_PROFILE,
+        _ => "custom",
+    }
+}
+
+fn select_agent_program(
+    program: &mut String,
+    arguments: &mut String,
+    profile: &mut Option<AgentLaunchProfileRef>,
+    choice: AgentQuickChoice,
+) {
+    let retained_role = selected_launch_profile(profile.as_ref());
+    if program.trim() != choice.program {
+        arguments.clear();
+    }
+    *program = choice.program.to_string();
+    *profile = Some(launch_profile(
+        choice.adapter_id,
+        if retained_role == AUTONOMOUS_LAUNCH_PROFILE {
+            AUTONOMOUS_LAUNCH_PROFILE
+        } else {
+            SAFE_LAUNCH_PROFILE
+        },
+    ));
+}
+
+fn profile_description(
+    choice: AgentQuickChoice,
+    profile: Option<&AgentLaunchProfileRef>,
+) -> String {
+    match selected_launch_profile(profile) {
+        SAFE_LAUNCH_PROFILE => {
+            "Standard provider safeguards remain active. Turn adds only its integration.".into()
+        }
+        AUTONOMOUS_LAUNCH_PROFILE => choice.autonomous_description.into(),
+        _ => "Custom argv: Turn preserves the arguments exactly as written below.".into(),
+    }
 }
 
 fn format_environment(values: &[(String, String)]) -> String {
@@ -2848,6 +3048,235 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    /// Reconciles window-local terminal resources with the surfaces this frame can draw.
+    ///
+    /// `PaneInteraction` owns more than small input state: its image cache may hold several
+    /// megabytes of CPU pixels and GPU textures. Immediate-mode rendering does not destroy
+    /// that state when a Pane closes, so the window must make those lifetimes explicit here.
+    fn reconcile_terminal_view_state(
+        &self,
+        state: &mut ViewState,
+        hierarchy: Option<&HierarchySnapshot>,
+    ) {
+        let session_is_live = |session_id: &SessionId| {
+            hierarchy.is_none_or(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.sessions)
+                    .any(|session| &session.session.id == session_id)
+            })
+        };
+        let layout_is_live = self.selected.as_ref().is_some_and(&session_is_live);
+        let mut live_bindings = HashMap::new();
+        if let Some(layout) = self.layout.as_ref().filter(|_| layout_is_live) {
+            let session_id = self
+                .selected
+                .as_ref()
+                .expect("a live Layout has a selected Session");
+            for pane in layout
+                .panes()
+                .into_iter()
+                .filter(|pane| pane.kind.is_terminal())
+            {
+                let observed_runtime_id = self
+                    .panes
+                    .iter()
+                    .find(|content| content.pane_id == pane.id)
+                    .and_then(|content| content.runtime_id.clone());
+                let previous_runtime_id = state
+                    .pane_interaction_bindings
+                    .get(&pane.id)
+                    .filter(|previous| {
+                        previous.session_id == *session_id
+                            && previous.semantic_node_id == pane.node_id
+                    })
+                    .and_then(|previous| previous.runtime_id.clone());
+                live_bindings.insert(
+                    pane.id.clone(),
+                    PaneInteractionBinding {
+                        session_id: session_id.clone(),
+                        semantic_node_id: pane.node_id.clone(),
+                        // A missing feed is an attach/relaunch gap, not evidence that the
+                        // runtime changed. Preserve the last observed owner until a new
+                        // PaneContent can identify its replacement.
+                        runtime_id: observed_runtime_id.or(previous_runtime_id),
+                    },
+                );
+            }
+        }
+        if let Some(temporary) = self.temporary_pane.as_ref().filter(|temporary| {
+            matches!(
+                temporary.pane.capability,
+                NodePaneCapability::Terminal { .. }
+            ) && session_is_live(&temporary.pane.binding.session_id)
+        }) {
+            let previous_runtime_id = state
+                .pane_interaction_bindings
+                .get(&temporary.pane.binding.pane_id)
+                .filter(|previous| {
+                    previous.session_id == temporary.pane.binding.session_id
+                        && previous.semantic_node_id.as_ref()
+                            == Some(&temporary.pane.binding.node_id)
+                })
+                .and_then(|previous| previous.runtime_id.clone());
+            live_bindings.insert(
+                temporary.pane.binding.pane_id.clone(),
+                PaneInteractionBinding {
+                    session_id: temporary.pane.binding.session_id.clone(),
+                    semantic_node_id: Some(temporary.pane.binding.node_id.clone()),
+                    runtime_id: temporary.runtime_id.clone().or(previous_runtime_id),
+                },
+            );
+        }
+
+        // A stable PaneId with a different binding is a replacement, not a continuation.
+        // Drop the old interaction before recording the new owner so TextureHandles are
+        // released in this frame and no stale selection/search/link state crosses runtimes.
+        for (pane_id, binding) in &live_bindings {
+            if state
+                .pane_interaction_bindings
+                .get(pane_id)
+                .is_some_and(|previous| previous.is_replaced_by(binding))
+            {
+                // The interaction is process-owned and must be replaced wholesale, but
+                // complete-cell availability belongs to the unchanged visual Pane. Carry
+                // only that one bit into a fresh interaction so the new runtime can win a
+                // resize epoch before paint and receive the already-visible geometry in
+                // this frame. Selection, links, reported claims and image textures all die.
+                let geometry_available = state
+                    .panes
+                    .remove(pane_id)
+                    .is_some_and(|previous| previous.geometry_available);
+                if geometry_available {
+                    let mut replacement = PaneInteraction::default();
+                    replacement.geometry_available = true;
+                    state.panes.insert(pane_id.clone(), replacement);
+                }
+            }
+        }
+        state
+            .panes
+            .retain(|pane_id, _| live_bindings.contains_key(pane_id));
+        state.pane_interaction_bindings = live_bindings;
+
+        // Geometry is useful only while the corresponding Pane is still floating in the
+        // selected Layout. This also runs while a Workspace or Node surface is selected,
+        // where `floating_panes` itself is intentionally not rendered.
+        state.floating_geometry.retain(|pane_id, _| {
+            layout_is_live
+                && self.layout.as_ref().is_some_and(|layout| {
+                    layout.is_floating(pane_id) && layout.get(pane_id).is_some()
+                })
+        });
+    }
+
+    /// Chooses one geometry writer per live runtime before any Pane is rendered.
+    ///
+    /// An explicit temporary terminal is the operator's current view and therefore wins.
+    /// Otherwise the focused Layout Pane wins; without either, the lexical PaneId is a
+    /// deterministic fallback. This makes duplicate and floating views read-only mirrors
+    /// instead of competing PTY resize authorities.
+    fn reconcile_resize_owners(&self, state: &mut ViewState, primary: Option<&PaneId>) -> bool {
+        let previous = state.resize_owners.clone();
+        let mut desired: HashMap<NodeId, PaneId> = HashMap::new();
+
+        // Start with a stable fallback. `self.panes` may arrive in Layout order, but process
+        // geometry must not depend on a split-tree traversal changing after a relocation.
+        for content in &self.panes {
+            if !state
+                .panes
+                .get(&content.pane_id)
+                .is_some_and(|pane| pane.geometry_available)
+            {
+                continue;
+            }
+            let Some(runtime_id) = &content.runtime_id else {
+                continue;
+            };
+            desired
+                .entry(runtime_id.clone())
+                .and_modify(|candidate| {
+                    if content.pane_id.as_str() < candidate.as_str() {
+                        *candidate = content.pane_id.clone();
+                    }
+                })
+                .or_insert_with(|| content.pane_id.clone());
+        }
+
+        // Persisted focus outranks the fallback whether the Pane is tiled or floating.
+        for content in &self.panes {
+            if let Some(runtime_id) = &content.runtime_id {
+                if content.focused
+                    && state
+                        .panes
+                        .get(&content.pane_id)
+                        .is_some_and(|pane| pane.geometry_available)
+                {
+                    desired.insert(runtime_id.clone(), content.pane_id.clone());
+                }
+            }
+        }
+
+        // Switching the hierarchy to an exact Process/Agent view makes that large
+        // work surface primary. Its Pane owns geometry even when another saved split
+        // remains the persisted keyboard focus behind the view.
+        if let Some(primary) = primary {
+            if let Some(content) = self
+                .panes
+                .iter()
+                .find(|content| &content.pane_id == primary)
+            {
+                if let Some(runtime_id) = &content.runtime_id {
+                    desired.insert(runtime_id.clone(), content.pane_id.clone());
+                }
+            }
+        }
+
+        // A temporary terminal is an explicit operator choice and sits above the Layout.
+        if let Some(temporary) = self.temporary_pane.as_ref().filter(|temporary| {
+            matches!(
+                temporary.pane.capability,
+                NodePaneCapability::Terminal { .. }
+            )
+        }) {
+            if let Some(runtime_id) = &temporary.runtime_id {
+                desired.insert(runtime_id.clone(), temporary.pane.binding.pane_id.clone());
+            }
+        }
+
+        state
+            .resize_owners
+            .retain(|runtime_id, _| desired.contains_key(runtime_id));
+        for (runtime_id, pane_id) in desired {
+            let unchanged = state
+                .resize_owners
+                .get(&runtime_id)
+                .is_some_and(|owner| owner.pane_id == pane_id);
+            if unchanged {
+                continue;
+            }
+            state.next_resize_owner_epoch = state.next_resize_owner_epoch.wrapping_add(1).max(1);
+            state.resize_owners.insert(
+                runtime_id,
+                ResizeOwner {
+                    pane_id,
+                    epoch: state.next_resize_owner_epoch,
+                },
+            );
+        }
+        state.resize_owners != previous
+    }
+
+    /// Geometry availability is observed while rendering. Ownership for this frame
+    /// consumes the previous observation, then every Pane must prove itself again; a
+    /// view that disappeared cannot retain a resize lease merely because it used to fit.
+    fn begin_geometry_frame(&self, state: &mut ViewState) {
+        for pane in state.panes.values_mut() {
+            pane.geometry_available = false;
+        }
+    }
+
     fn preferred_pane_placement(&self) -> PanePlacement {
         match self
             .settings
@@ -2987,7 +3416,6 @@ impl<'a> TurnView<'a> {
             }
             state.observed_temporary_pane = temporary_pane_id;
         }
-
         actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref(), state));
         if let Some(permission) = &self.permission {
             actions.extend(self.permission_banner(ui, theme, permission));
@@ -3034,6 +3462,15 @@ impl<'a> TurnView<'a> {
                 self.selected.as_ref(),
             )
         });
+        self.reconcile_terminal_view_state(state, hierarchy.as_ref());
+        let primary_pane = match work_target {
+            Some(work_surface::ResolvedViewTarget::Node { node, .. }) => self
+                .exact_terminal(node)
+                .map(|(binding, _)| binding.pane_id.clone()),
+            _ => None,
+        };
+        let _ = self.reconcile_resize_owners(state, primary_pane.as_ref());
+        self.begin_geometry_frame(state);
         state.work_surface_target = work_target.map(work_surface::ResolvedViewTarget::public);
         state.work_surface_geometry = None;
         if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), work_target) {
@@ -3193,6 +3630,14 @@ impl<'a> TurnView<'a> {
                 }
                 actions.extend(temporary_actions);
             });
+        }
+        // Geometry is learned while a Pane is painted. A newly attached ordinary
+        // Layout Pane therefore cannot own its PTY until this post-render pass sees
+        // its complete-cell body. Schedule exactly one immediate follow-up frame when
+        // that election changes; otherwise an idle/reduced-motion window could remain
+        // at the daemon's 80x24 baseline forever.
+        if self.reconcile_resize_owners(state, primary_pane.as_ref()) {
+            ui.ctx().request_repaint();
         }
         if status_height > 0.0 {
             actions.extend(self.window_status_bar(
@@ -3464,7 +3909,7 @@ impl<'a> TurnView<'a> {
             full.center(),
             Vec2::new(
                 560.0_f32.min((full.width() - 32.0).max(320.0)),
-                440.0_f32.min((full.height() - 32.0).max(300.0)),
+                420.0_f32.min((full.height() - 32.0).max(300.0)),
             ),
         );
         ui.painter()
@@ -3480,33 +3925,118 @@ impl<'a> TurnView<'a> {
             describe_dialog(ui, "New Pane", false);
             ui.heading("New Pane");
             ui.label(
-                RichText::new("Run any executable directly; arguments are parsed without a shell.")
+                RichText::new("Choose an agent and operating mode. Turn owns the provider-specific flags.")
                     .color(theme.text_dim),
             );
             ui.add_space(8.0);
-            egui::ComboBox::from_label("View type")
-                .selected_text(format!("{:?}", draft.kind))
-                .show_ui(ui, |ui| {
-                    for (label, kind) in pane_kind_choices() {
-                        ui.selectable_value(&mut draft.kind, kind, label);
+            ui.label(RichText::new("START").small().strong().color(theme.text_dim));
+            ui.horizontal_wrapped(|ui| {
+                let shell_selected = draft.kind == PaneKind::Shell
+                    && draft.program.trim().is_empty();
+                if ui.selectable_label(shell_selected, "Shell").clicked() {
+                    draft.kind = PaneKind::Shell;
+                    draft.program.clear();
+                    draft.arguments.clear();
+                    draft.launch_profile = None;
+                }
+                for choice in AGENT_QUICK_CHOICES {
+                    let selected = draft.kind == PaneKind::Agent
+                        && agent_choice_for_program(&draft.program)
+                            .is_some_and(|current| current.adapter_id == choice.adapter_id);
+                    if ui.selectable_label(selected, choice.label).clicked() {
+                        draft.kind = PaneKind::Agent;
+                        select_agent_program(
+                            &mut draft.program,
+                            &mut draft.arguments,
+                            &mut draft.launch_profile,
+                            choice,
+                        );
+                        if draft.title.trim().is_empty() {
+                            draft.title = choice.label.to_string();
+                        }
+                    }
+                }
+                let custom_selected = !shell_selected
+                    && agent_choice_for_program(&draft.program).is_none();
+                if ui.selectable_label(custom_selected, "Other…").clicked() {
+                    draft.kind = PaneKind::Terminal;
+                    draft.launch_profile = None;
+                    draft.advanced = true;
+                }
+            });
+
+            if let Some(choice) = agent_choice_for_program(&draft.program) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("MODE").small().strong().color(theme.text_dim));
+                    for (id, label) in [
+                        (SAFE_LAUNCH_PROFILE, "Safe"),
+                        (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                        ("custom", "Custom"),
+                    ] {
+                        let selected = selected_launch_profile(draft.launch_profile.as_ref()) == id;
+                        if ui.selectable_label(selected, label).clicked() {
+                            draft.launch_profile = (id != "custom")
+                                .then(|| launch_profile(choice.adapter_id, id));
+                            if id == "custom" {
+                                draft.advanced = true;
+                            }
+                        }
                     }
                 });
+                ui.label(
+                    RichText::new(profile_description(choice, draft.launch_profile.as_ref()))
+                        .small()
+                        .color(theme.text_faint),
+                );
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Title");
                 ui.text_edit_singleline(&mut draft.title);
             });
-            ui.horizontal(|ui| {
-                ui.label("Program");
-                ui.text_edit_singleline(&mut draft.program);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Arguments");
-                ui.text_edit_singleline(&mut draft.arguments);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Working directory");
-                ui.text_edit_singleline(&mut draft.cwd);
-            });
+            egui::CollapsingHeader::new("Advanced command & pane settings")
+                .id_salt("new-pane-advanced")
+                .default_open(draft.advanced)
+                .show(ui, |ui| {
+                    egui::ComboBox::from_label("View type")
+                        .selected_text(format!("{:?}", draft.kind))
+                        .show_ui(ui, |ui| {
+                            for (label, kind) in pane_kind_choices() {
+                                if ui.selectable_value(&mut draft.kind, kind, label).clicked()
+                                    && kind != PaneKind::Agent
+                                {
+                                    draft.launch_profile = None;
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Program");
+                        if ui.text_edit_singleline(&mut draft.program).changed() {
+                            let matches_profile = agent_choice_for_program(&draft.program)
+                                .zip(draft.launch_profile.as_ref())
+                                .is_some_and(|(choice, profile)| {
+                                    choice.adapter_id == profile.adapter_id
+                                });
+                            if !matches_profile {
+                                draft.launch_profile = None;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Arguments");
+                        ui.text_edit_singleline(&mut draft.arguments);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Working directory");
+                        ui.text_edit_singleline(&mut draft.cwd);
+                    });
+                    ui.label(
+                        RichText::new("Arguments become argv directly; Turn never evaluates an implicit shell script.")
+                            .small()
+                            .color(theme.text_faint),
+                    );
+                });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.radio_value(
@@ -3548,6 +4078,7 @@ impl<'a> TurnView<'a> {
                     pane.command = (!draft.program.trim().is_empty())
                         .then(|| draft.program.trim().to_string());
                     pane.args = args;
+                    pane.launch_profile = draft.launch_profile.clone();
                     pane.cwd = (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().to_string());
                     return vec![ViewAction::CreatePane {
                         target_pane_id: draft.target_pane_id,
@@ -6375,8 +6906,41 @@ impl<'a> TurnView<'a> {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Agent · split right").clicked() {
-                            actions.push(ViewAction::Run(Command::LaunchAgent));
+                        ui.label(RichText::new("AGENTS").small().strong().color(theme.text_dim));
+                        let target = self
+                            .layout
+                            .as_ref()
+                            .and_then(|layout| layout.active.clone());
+                        for choice in AGENT_QUICK_CHOICES {
+                            ui.horizontal(|ui| {
+                                for (profile, mode) in [
+                                    (SAFE_LAUNCH_PROFILE, "Safe"),
+                                    (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                                ] {
+                                    if ui
+                                        .add_enabled(
+                                            target.is_some(),
+                                            egui::Button::new(format!("{} · {mode}", choice.label)),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(ViewAction::CreatePane {
+                                            target_pane_id: target.clone().expect("enabled above"),
+                                            placement: self.preferred_pane_placement(),
+                                            pane: quick_agent_pane(choice, profile),
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        if ui.button("Agent options…").clicked() {
+                            if let Some(target) = target {
+                                state.new_pane = Some(NewPaneDraft::agent(
+                                    target,
+                                    self.preferred_pane_placement(),
+                                ));
+                            }
                             ui.close();
                         }
                         ui.separator();
@@ -7248,52 +7812,102 @@ impl<'a> TurnView<'a> {
                 .strong(),
             );
             if let Some(command) = draft.cells.get_mut(&draft.selected) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Quick choice").color(theme.text_dim).small());
-                    for (label, program) in [
-                        ("Shell", ""),
-                        ("Claude", "claude"),
-                        ("Codex", "codex"),
-                        ("Gemini", "gemini"),
-                    ] {
-                        if ui.selectable_label(command.program == program, label).clicked() {
-                            command.program = program.to_string();
-                            command.arguments.clear();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("START").color(theme.text_dim).small().strong());
+                    if ui
+                        .selectable_label(command.program.trim().is_empty(), "Shell")
+                        .clicked()
+                    {
+                        command.program.clear();
+                        command.arguments.clear();
+                        command.launch_profile = None;
+                    }
+                    for choice in AGENT_QUICK_CHOICES {
+                        let selected = agent_choice_for_program(&command.program)
+                            .is_some_and(|current| current.adapter_id == choice.adapter_id);
+                        if ui.selectable_label(selected, choice.label).clicked() {
+                            select_agent_program(
+                                &mut command.program,
+                                &mut command.arguments,
+                                &mut command.launch_profile,
+                                choice,
+                            );
                         }
                     }
                 });
-                ui.columns(2, |columns| {
-                    columns[0].label(
-                        RichText::new("Program (blank = workspace shell)")
-                            .color(theme.text_dim)
-                            .small(),
+                if let Some(choice) = agent_choice_for_program(&command.program) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("MODE").color(theme.text_dim).small().strong());
+                        for (id, label) in [
+                            (SAFE_LAUNCH_PROFILE, "Safe"),
+                            (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                            ("custom", "Custom"),
+                        ] {
+                            let selected =
+                                selected_launch_profile(command.launch_profile.as_ref()) == id;
+                            if ui.selectable_label(selected, label).clicked() {
+                                command.launch_profile = (id != "custom")
+                                    .then(|| launch_profile(choice.adapter_id, id));
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(profile_description(
+                            choice,
+                            command.launch_profile.as_ref(),
+                        ))
+                        .color(theme.text_faint)
+                        .small(),
                     );
-                    columns[0].add(
-                        egui::TextEdit::singleline(&mut command.program)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("npm"),
-                    );
-                    columns[1].label(
-                        RichText::new("Arguments")
-                            .color(theme.text_dim)
-                            .small(),
-                    );
-                    columns[1].add(
-                        egui::TextEdit::singleline(&mut command.arguments)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("run dev -- --watch"),
-                    );
-                });
-                ui.label(
-                    RichText::new(
-                        "Arguments support quotes and become argv. Turn never evaluates them as an implicit shell script.",
-                    )
-                    .color(theme.text_faint)
-                    .small(),
-                );
-                egui::CollapsingHeader::new("Cell working directory, environment & restore")
+                }
+                let custom_command = selected_launch_profile(command.launch_profile.as_ref())
+                    == "custom"
+                    && !command.program.trim().is_empty();
+                egui::CollapsingHeader::new("Advanced command, directory & restore")
                     .id_salt("template-cell-advanced")
+                    .default_open(custom_command)
                     .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            columns[0].label(
+                                RichText::new("Program (blank = workspace shell)")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            if columns[0]
+                                .add(
+                                    egui::TextEdit::singleline(&mut command.program)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("npm"),
+                                )
+                                .changed()
+                            {
+                                let matches_profile = agent_choice_for_program(&command.program)
+                                    .zip(command.launch_profile.as_ref())
+                                    .is_some_and(|(choice, profile)| {
+                                        choice.adapter_id == profile.adapter_id
+                                    });
+                                if !matches_profile {
+                                    command.launch_profile = None;
+                                }
+                            }
+                            columns[1].label(
+                                RichText::new("Arguments")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            columns[1].add(
+                                egui::TextEdit::singleline(&mut command.arguments)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("run dev -- --watch"),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Arguments become argv directly; Turn never evaluates an implicit shell script.",
+                            )
+                            .color(theme.text_faint)
+                            .small(),
+                        );
                         ui.columns(2, |columns| {
                             columns[0].label(
                                 RichText::new("Working directory")
@@ -8133,6 +8747,9 @@ impl<'a> TurnView<'a> {
                     });
                 }
                 (None, Some(content)) => {
+                    let resize_epoch = content.runtime_id.as_ref().and_then(|runtime_id| {
+                        state.resize_owner_epoch(runtime_id, &placed.pane_id)
+                    });
                     let options = PaneOptions {
                         focused,
                         accepts_input: focused && accepts_terminal_input,
@@ -8155,6 +8772,12 @@ impl<'a> TurnView<'a> {
                             grid: content.grid,
                             options,
                             id,
+                            resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                                resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                    runtime_id,
+                                    owner_epoch,
+                                })
+                            }),
                             chrome: Some(terminal::PaneChrome {
                                 shortcuts: &shortcuts,
                                 context: &pane_context,
@@ -8262,15 +8885,6 @@ impl<'a> TurnView<'a> {
             return Vec::new();
         };
         let mut actions = Vec::new();
-        let live_ids: HashSet<PaneId> = layout
-            .floating
-            .iter()
-            .map(|floating| floating.pane_id.clone())
-            .collect();
-        state
-            .floating_geometry
-            .retain(|pane_id, _| live_ids.contains(pane_id));
-
         for floating in &layout.floating {
             let Some(pane) = layout.get(&floating.pane_id) else {
                 continue;
@@ -8329,6 +8943,10 @@ impl<'a> TurnView<'a> {
                     ui.separator();
                     let body = ui.available_rect_before_wrap();
                     if let Some(content) = content {
+                        let resize_epoch = content
+                            .runtime_id
+                            .as_ref()
+                            .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &pane_id));
                         let options = PaneOptions {
                             focused: layout.active.as_ref() == Some(&pane_id),
                             accepts_input: !state.is_sensitive()
@@ -8338,15 +8956,25 @@ impl<'a> TurnView<'a> {
                             scrolled: content.scrolled,
                             history_complete: content.history_complete,
                         };
-                        let pane_actions = terminal::show(
+                        let pane_actions = terminal::show_pane(
                             ui,
-                            theme,
-                            body,
-                            content.grid,
                             state.pane(&pane_id),
-                            options,
-                            ui.id().with(("floating-terminal", pane_id.as_str())),
-                        );
+                            terminal::PaneInput {
+                                theme,
+                                rect: body,
+                                grid: content.grid,
+                                options,
+                                id: ui.id().with(("floating-terminal", pane_id.as_str())),
+                                resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                                    resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                        runtime_id,
+                                        owner_epoch,
+                                    })
+                                }),
+                                chrome: None,
+                            },
+                        )
+                        .actions;
                         window_actions.extend(pane_actions.into_iter().map(|action| {
                             ViewAction::Pane {
                                 pane_id: pane_id.clone(),
@@ -8481,9 +9109,31 @@ impl<'a> TurnView<'a> {
                     history_complete: true,
                 };
                 let pane_id = temporary.pane.binding.pane_id.clone();
+                let resize_epoch = temporary.runtime_id.as_ref().and_then(|runtime_id| {
+                    state.resize_owner_epoch(runtime_id, &temporary.pane.binding.pane_id)
+                });
                 let interaction = state.pane(&pane_id);
                 let id = ui.id().with(("temporary-terminal", pane_id.as_str()));
-                for action in terminal::show(ui, theme, body, grid, interaction, options, id) {
+                for action in terminal::show_pane(
+                    ui,
+                    interaction,
+                    terminal::PaneInput {
+                        theme,
+                        rect: body,
+                        grid,
+                        options,
+                        id,
+                        resize_claim: temporary.runtime_id.as_ref().and_then(|runtime_id| {
+                            resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                runtime_id,
+                                owner_epoch,
+                            })
+                        }),
+                        chrome: None,
+                    },
+                )
+                .actions
+                {
                     actions.push(ViewAction::Pane {
                         pane_id: pane_id.clone(),
                         action,
@@ -12199,7 +12849,7 @@ mod tests {
         SessionMode, Workspace,
     };
     use turn_core::state::{Lifecycle, Turn};
-    use turn_proto::{SessionSummary, TreeSurfaceState, WorkspaceSummary};
+    use turn_proto::{ImagePayload, SessionSummary, TreeSurfaceState, WorkspaceSummary};
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -12284,6 +12934,131 @@ mod tests {
             }],
         };
         (snapshot, root_id, child_id, session_id)
+    }
+
+    fn cache_test_image(interaction: &mut PaneInteraction, value: u8) {
+        let payload = ImagePayload::new(1, 1, vec![value; 4]).expect("a one-pixel image");
+        interaction
+            .images
+            .insert(&egui::Context::default(), &payload);
+        assert_eq!(interaction.images.len(), 1);
+        assert_eq!(interaction.images.bytes(), 4);
+    }
+
+    #[test]
+    fn closing_a_terminal_pane_releases_its_interaction_and_floating_geometry() {
+        let session_id = SessionId::from_stored("sess_cache_close");
+        let mut terminal = Pane::new(PaneKind::Agent);
+        terminal.node_id = Some(NodeId::from_stored("proc_cache_close"));
+        let terminal_id = terminal.id.clone();
+        let mut layout = Layout::single(terminal);
+        assert!(layout.split(
+            &terminal_id,
+            Direction::Horizontal,
+            Pane::new(PaneKind::EventLog)
+        ));
+        assert!(layout.float(&terminal_id, PaneGeometry::default()));
+
+        let mut view = TurnView {
+            selected: Some(session_id),
+            layout: Some(layout),
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+        view.reconcile_terminal_view_state(&mut state, None);
+        cache_test_image(state.pane(&terminal_id), 7);
+        state
+            .floating_geometry
+            .insert(terminal_id.clone(), PaneGeometry::default());
+        view.reconcile_terminal_view_state(&mut state, None);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.floating_geometry.len(), 1);
+
+        assert!(view
+            .layout
+            .as_mut()
+            .expect("the active layout")
+            .close(&terminal_id));
+        view.reconcile_terminal_view_state(&mut state, None);
+
+        assert!(state.panes.is_empty());
+        assert!(state.pane_interaction_bindings.is_empty());
+        assert!(state.floating_geometry.is_empty());
+    }
+
+    #[test]
+    fn a_pane_rebind_or_removed_session_cannot_inherit_terminal_resources() {
+        let session_id = SessionId::from_stored("sess_cache_rebind");
+        let semantic_node = NodeId::from_stored("proc_cache_agent");
+        let old_runtime = NodeId::from_stored("proc_cache_shell_old");
+        let new_runtime = NodeId::from_stored("proc_cache_shell_new");
+        let mut pane = Pane::new(PaneKind::Agent);
+        pane.node_id = Some(semantic_node);
+        let pane_id = pane.id.clone();
+        let grid = Grid::blank(1, 1);
+        let mut view = TurnView {
+            selected: Some(session_id),
+            layout: Some(Layout::single(pane)),
+            panes: vec![PaneContent {
+                pane_id: pane_id.clone(),
+                runtime_id: Some(old_runtime),
+                title: "hosted agent".into(),
+                grid: &grid,
+                focused: true,
+                scrolled: false,
+                history_complete: true,
+            }],
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+        view.reconcile_terminal_view_state(&mut state, None);
+        cache_test_image(state.pane(&pane_id), 11);
+        state.pane(&pane_id).geometry_available = true;
+
+        view.panes.clear();
+        view.reconcile_terminal_view_state(&mut state, None);
+        assert_eq!(
+            state.panes[&pane_id].images.bytes(),
+            4,
+            "an attach gap is not a runtime replacement"
+        );
+
+        view.panes.push(PaneContent {
+            pane_id: pane_id.clone(),
+            runtime_id: Some(new_runtime.clone()),
+            title: "hosted agent".into(),
+            grid: &grid,
+            focused: true,
+            scrolled: false,
+            history_complete: true,
+        });
+        view.reconcile_terminal_view_state(&mut state, None);
+
+        let replacement = state
+            .panes
+            .get(&pane_id)
+            .expect("the visual Pane keeps only its measured availability");
+        assert!(replacement.geometry_available);
+        assert!(
+            replacement.images.is_empty(),
+            "the former runtime owns the cache"
+        );
+        assert_eq!(replacement.reported_size(), None);
+        assert_eq!(
+            state
+                .pane_interaction_bindings
+                .get(&pane_id)
+                .and_then(|binding| binding.runtime_id.as_ref()),
+            Some(&new_runtime)
+        );
+        cache_test_image(state.pane(&pane_id), 13);
+
+        let removed = HierarchySnapshot::empty("cache-test", 2);
+        view.reconcile_terminal_view_state(&mut state, Some(&removed));
+
+        assert!(state.panes.is_empty());
+        assert!(state.pane_interaction_bindings.is_empty());
+        assert!(state.floating_geometry.is_empty());
     }
 
     #[test]
@@ -12492,6 +13267,107 @@ mod tests {
                 .map(HierarchyRow::depth),
             Some(4),
             "Technical mode restores the honest full process ancestry"
+        );
+    }
+
+    #[test]
+    fn a_coordinator_with_shell_plumbing_projects_only_its_three_real_workers() {
+        let (mut snapshot, root_id, first_worker_id, _) = hierarchy_fixture();
+        let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
+        let first_index = nodes
+            .iter()
+            .position(|node| node.node_id == first_worker_id)
+            .unwrap();
+        nodes[first_index].title = "phrase-1".into();
+        nodes[first_index].command = "claude worker phrase-1".into();
+
+        let first_wrapper_id = NodeId::from_stored("proc_phrase_1_shell");
+        let mut first_wrapper = nodes[first_index].clone();
+        first_wrapper.node_id = first_wrapper_id.clone();
+        first_wrapper.parent = Some(root_id.clone());
+        first_wrapper.kind = NodeKind::Shell;
+        first_wrapper.is_agentic = false;
+        first_wrapper.title = "sh".into();
+        first_wrapper.command = "sh".into();
+        first_wrapper.turn = None;
+        first_wrapper.agent = None;
+        first_wrapper.relationship_is_provisional = true;
+        first_wrapper.child_count = 1;
+        first_wrapper.pane_bindings.clear();
+        nodes[first_index].parent = Some(first_wrapper_id.clone());
+
+        let mut second_wrapper = first_wrapper.clone();
+        second_wrapper.node_id = NodeId::from_stored("proc_phrase_2_bash");
+        second_wrapper.title = "bash".into();
+        second_wrapper.command = "bash".into();
+        let mut second_worker = nodes[first_index].clone();
+        second_worker.node_id = NodeId::from_stored("agent_phrase_2");
+        second_worker.parent = Some(second_wrapper.node_id.clone());
+        second_worker.title = "phrase-2".into();
+        second_worker.command = "claude worker phrase-2".into();
+
+        let mut third_wrapper = first_wrapper.clone();
+        third_wrapper.node_id = NodeId::from_stored("proc_phrase_3_shell");
+        let mut third_worker = nodes[first_index].clone();
+        third_worker.node_id = NodeId::from_stored("agent_phrase_3");
+        third_worker.parent = Some(third_wrapper.node_id.clone());
+        third_worker.title = "phrase-3".into();
+        third_worker.command = "claude worker phrase-3".into();
+        third_worker.lifecycle = Lifecycle::Exited { code: 0 };
+
+        // Extra inferred leaf processes are the `sh`/`bash` noise visible in the
+        // original failure: they are implementation details, not operator work.
+        let mut leaf_shell = first_wrapper.clone();
+        leaf_shell.node_id = NodeId::from_stored("proc_leaf_shell");
+        leaf_shell.child_count = 0;
+        let mut leaf_bash = second_wrapper.clone();
+        leaf_bash.node_id = NodeId::from_stored("proc_leaf_bash");
+        leaf_bash.child_count = 0;
+
+        nodes.extend([
+            first_wrapper,
+            second_wrapper,
+            second_worker.clone(),
+            third_wrapper,
+            third_worker,
+            leaf_shell,
+            leaf_bash,
+        ]);
+        nodes
+            .iter_mut()
+            .find(|node| node.node_id == root_id)
+            .unwrap()
+            .child_count = 5;
+
+        let mut state = ViewState::default();
+        let visible_processes: Vec<_> = visible_hierarchy_rows(&snapshot, &state, false)
+            .into_iter()
+            .filter_map(|row| match row {
+                HierarchyRow::Process { node, .. } => {
+                    Some((node.title.as_str(), node.node_id.clone()))
+                }
+                HierarchyRow::Workspace(_) | HierarchyRow::Session { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            visible_processes
+                .iter()
+                .map(|(title, _)| *title)
+                .collect::<Vec<_>>(),
+            ["claude", "phrase-1", "phrase-2", "phrase-3"],
+            "normal operation must expose semantic work, not sh/bash plumbing"
+        );
+
+        state.selected_tree = Some(HierarchyKey::process(second_worker.node_id.clone()));
+        assert_eq!(
+            work_surface::resolve(
+                &snapshot,
+                effective_selection(&snapshot, &state).as_ref(),
+                None,
+            )
+            .map(work_surface::ResolvedViewTarget::public),
+            Some(ViewTarget::Node(second_worker.node_id)),
+            "selecting phrase-2 must never substitute the coordinator or its shell wrapper"
         );
     }
 
@@ -13327,6 +14203,41 @@ mod tests {
     }
 
     #[test]
+    fn discovering_the_first_complete_geometry_owner_requests_exactly_one_follow_up() {
+        let pane_id = PaneId::from_stored("pane_first_geometry_owner");
+        let runtime_id = NodeId::from_stored("proc_first_geometry_owner");
+        let grid = Grid::blank(24, 80);
+        let view = TurnView {
+            panes: vec![PaneContent {
+                pane_id: pane_id.clone(),
+                runtime_id: Some(runtime_id.clone()),
+                title: "first frame".into(),
+                grid: &grid,
+                focused: true,
+                scrolled: false,
+                history_complete: true,
+            }],
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+
+        assert!(
+            !view.reconcile_resize_owners(&mut state, None),
+            "before paint there is no complete-cell geometry to own"
+        );
+        state.pane(&pane_id).geometry_available = true;
+        assert!(
+            view.reconcile_resize_owners(&mut state, None),
+            "post-paint discovery must request the one follow-up frame that emits Resize"
+        );
+        assert_eq!(state.resize_owner_epoch(&runtime_id, &pane_id), Some(1));
+        assert!(
+            !view.reconcile_resize_owners(&mut state, None),
+            "stable ownership must not keep an idle reduced-motion window repainting"
+        );
+    }
+
+    #[test]
     fn a_secret_draft_is_redacted_from_window_diagnostics() {
         let secret = "token-that-must-never-reach-a-log";
         let mut state = ViewState::default();
@@ -13402,6 +14313,7 @@ mod tests {
             CellCommandDraft {
                 program: "npm".into(),
                 arguments: "run dev -- --port 3000".into(),
+                launch_profile: None,
                 cwd: "frontend".into(),
                 environment: "CELL=left".into(),
                 restore: RestoreBehaviour::Skip,
@@ -13438,6 +14350,115 @@ mod tests {
         assert_eq!(restored.cells[&selected].cwd, "frontend");
         assert_eq!(restored.cells[&selected].environment, "CELL=left");
         assert_eq!(restored.cells[&selected].restore, RestoreBehaviour::Skip);
+    }
+
+    #[test]
+    fn changing_agent_provider_keeps_the_semantic_autonomous_intent_without_reusing_flags() {
+        let mut program = "claude".to_string();
+        let mut arguments = "--model opus --dangerously-skip-permissions".to_string();
+        let mut profile = Some(launch_profile("claude-code", AUTONOMOUS_LAUNCH_PROFILE));
+
+        select_agent_program(
+            &mut program,
+            &mut arguments,
+            &mut profile,
+            AGENT_QUICK_CHOICES[1],
+        );
+
+        assert_eq!(program, "codex");
+        assert!(arguments.is_empty(), "Claude argv cannot leak into Codex");
+        assert_eq!(
+            profile,
+            Some(launch_profile("codex", AUTONOMOUS_LAUNCH_PROFILE))
+        );
+    }
+
+    #[test]
+    fn every_quick_agent_action_is_a_complete_zero_memory_pane_request() {
+        for choice in AGENT_QUICK_CHOICES {
+            for profile_id in [SAFE_LAUNCH_PROFILE, AUTONOMOUS_LAUNCH_PROFILE] {
+                let pane = quick_agent_pane(choice, profile_id);
+                assert_eq!(pane.kind, PaneKind::Agent);
+                assert_eq!(pane.command.as_deref(), Some(choice.program));
+                assert_eq!(pane.title.as_deref(), Some(choice.label));
+                assert!(
+                    pane.args.is_empty(),
+                    "the UI must persist intent, never provider flags"
+                );
+                assert_eq!(
+                    pane.launch_profile,
+                    Some(launch_profile(choice.adapter_id, profile_id))
+                );
+            }
+        }
+
+        let draft = NewPaneDraft::agent(
+            PaneId::from_stored("pane_agent_options"),
+            PanePlacement::SplitBelow,
+        );
+        assert_eq!(draft.kind, PaneKind::Agent);
+        assert_eq!(draft.program, "claude");
+        assert_eq!(
+            draft.launch_profile,
+            Some(launch_profile("claude-code", SAFE_LAUNCH_PROFILE))
+        );
+    }
+
+    #[test]
+    fn quick_agent_choices_cannot_drift_from_the_provider_owned_catalogue() {
+        let catalogue = turn_agents::AdapterRegistry::with_builtin().launch_catalogue();
+        assert_eq!(catalogue.len(), AGENT_QUICK_CHOICES.len());
+        for choice in AGENT_QUICK_CHOICES {
+            let provider = catalogue
+                .iter()
+                .find(|provider| provider.adapter_id == choice.adapter_id)
+                .unwrap_or_else(|| panic!("{} disappeared from the registry", choice.adapter_id));
+            assert!(
+                provider
+                    .executables
+                    .iter()
+                    .any(|name| name == choice.program),
+                "{} is no longer an executable owned by {}",
+                choice.program,
+                choice.adapter_id
+            );
+            assert!(
+                provider
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == SAFE_LAUNCH_PROFILE)
+                    && provider
+                        .profiles
+                        .iter()
+                        .any(|profile| profile.id == AUTONOMOUS_LAUNCH_PROFILE),
+                "{} no longer offers both semantic modes",
+                choice.adapter_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_layout_cell_persists_autonomous_intent_instead_of_provider_flags() {
+        let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
+        let selected = draft.selected.clone();
+        draft.cells.insert(
+            selected.clone(),
+            CellCommandDraft {
+                program: "gemini".into(),
+                arguments: "--model gemini-3".into(),
+                launch_profile: Some(launch_profile("gemini-cli", AUTONOMOUS_LAUNCH_PROFILE)),
+                ..CellCommandDraft::default()
+            },
+        );
+
+        let layout = draft.materialized_layout().unwrap();
+        let pane = layout.get(&selected).unwrap();
+        assert_eq!(pane.args, ["--model", "gemini-3"]);
+        assert_eq!(
+            pane.launch_profile,
+            Some(launch_profile("gemini-cli", AUTONOMOUS_LAUNCH_PROFILE))
+        );
+        assert_eq!(draft.cell_label(&selected), "Gemini · Autonomous");
     }
 
     #[test]

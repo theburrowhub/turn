@@ -30,13 +30,15 @@
 //! it, so Turn adds nothing and says what that costs.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::{json, Value};
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 use turn_core::state::AwaitingReason;
 
 /// How hook callbacks reach Turn.
@@ -258,9 +260,105 @@ impl ClaudeCodeAdapter {
 /// Turn does not get to be the one that wins. Replacing a user's configuration to
 /// make Turn's own detection work would be Turn deciding something on their behalf,
 /// and losing Turn's hooks while still claiming `Structured` would be worse.
+/// This is deliberately conservative across separate, `=`, repeated, malformed
+/// and inline-JSON occurrences in the option-bearing prefix. A `--settings` after
+/// the first exact `--` is prompt text and must never disable integration or be
+/// reinterpreted as a control.
 fn user_supplied_settings(args: &[String]) -> bool {
-    args.iter()
+    control_arguments(args)
+        .iter()
         .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
+}
+
+fn claude_permission_modes(args: &[String]) -> Vec<Option<&str>> {
+    let controls = control_arguments(args);
+    controls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            if arg == "--permission-mode" {
+                Some(controls.get(index + 1).map(String::as_str))
+            } else {
+                arg.strip_prefix("--permission-mode=").map(Some)
+            }
+        })
+        .collect()
+}
+
+fn claude_skips_permissions(args: &[String]) -> bool {
+    control_arguments(args)
+        .iter()
+        .any(|arg| arg == "--dangerously-skip-permissions")
+}
+
+fn observed_claude_permission_mode(args: &[String]) -> Option<&str> {
+    let mode = claude_permission_modes(args).into_iter().last().flatten()?;
+    [
+        "default",
+        "acceptEdits",
+        "plan",
+        "dontAsk",
+        "bypassPermissions",
+        "delegate",
+    ]
+    .contains(&mode)
+    .then_some(mode)
+}
+
+fn resolve_claude_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    let skip_flag = claude_skips_permissions(args);
+    let permission_modes = claude_permission_modes(args);
+    let bypass_mode = permission_modes.contains(&Some("bypassPermissions"));
+
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if skip_flag || !permission_modes.is_empty() {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "claude-code".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "an explicit Claude Code permission policy argument".to_string(),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("claude-code", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            if permission_modes
+                .iter()
+                .any(|mode| *mode != Some("bypassPermissions"))
+            {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "claude-code".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "the explicit --permission-mode argument".to_string(),
+                });
+            }
+            let effective_flag = if skip_flag {
+                "--dangerously-skip-permissions"
+            } else if bypass_mode {
+                "--permission-mode"
+            } else {
+                "--dangerously-skip-permissions"
+            };
+            let resolved = if skip_flag || bypass_mode {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, ["--dangerously-skip-permissions".to_string()])
+            };
+            Ok(ResolvedLaunchProfile::autonomous(
+                "claude-code",
+                LaunchPermissionPosture::BypassPermissions,
+                resolved,
+                vec![effective_flag.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "claude-code".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
+    }
 }
 
 impl AgentAdapter for ClaudeCodeAdapter {
@@ -286,19 +384,75 @@ impl AgentAdapter for ClaudeCodeAdapter {
             permission_events: true,
             subagent_events: true,
             resumable: true,
-            usage_events: false,
+            // Stop identifies the provider transcript, whose bounded tail gives
+            // Turn exact input-context consumption after each completed turn.
+            usage_events: true,
             external_session_id: true,
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe(
+                "Claude Code keeps its normal permission checks in force.",
+            ),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::BypassPermissions,
+                "Claude Code skips permission checks for this launch.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_claude_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration =
+            crate::launch_facts::base_launch_configuration(args, profile, false);
+        if profile.role.is_none() {
+            let explicit = observed_claude_permission_mode(args);
+            if claude_skips_permissions(args) || explicit == Some("bypassPermissions") {
+                configuration.permission_mode = Some("Custom · bypass permissions".into());
+            } else if let Some(mode) = explicit {
+                configuration.permission_mode = Some(format!("Custom · {mode}"));
+            }
+        }
+        configuration
+    }
+
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        if profile.role != Some(crate::LaunchProfileRole::Autonomous) {
+            return true;
+        }
+        if profile.adapter_id != self.id()
+            || profile.posture != LaunchPermissionPosture::BypassPermissions
+        {
+            return false;
+        }
+        let modes = claude_permission_modes(args);
+        let modes_are_bypass = modes.iter().all(|mode| *mode == Some("bypassPermissions"));
+        modes_are_bypass
+            && (claude_skips_permissions(args) || modes.contains(&Some("bypassPermissions")))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let user_args = resolved_profile.args;
         std::fs::create_dir_all(&ctx.scratch_dir)?;
         let settings_path = ctx.scratch_dir.join("claude-hooks.json");
-        let (document, undeliverable) = self.subscriptions(ctx);
-        write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
         // The directory too: the file name is fixed and the path travels in argv,
         // so a readable directory is as good as a readable file.
         restrict_directory(&ctx.scratch_dir);
+        let (mut document, undeliverable) = self.subscriptions(ctx);
 
         let env = vec![
             ("TURN_SESSION_ID".into(), ctx.session_id.to_string()),
@@ -308,14 +462,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
             // the URL carries the session's token; an environment variable is at
             // least restricted to the same user.
             ("TURN_HOOK_URL".into(), ctx.endpoint.url()),
+            // The status-line fan-out reads this from the environment. The
+            // authenticated URL never appears in the wrapper command or argv.
+            ("TURN_STATUSLINE_URL".into(), ctx.endpoint.status_line_url()),
         ];
 
         // The user's own `--settings` stands, and the file Turn wrote is named so
         // they can merge it if they want Turn's detection as well.
-        if user_supplied_settings(&ctx.user_args) {
+        if user_supplied_settings(&user_args) {
+            write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
             return Ok(LaunchPlan {
                 command: ctx.command.clone(),
-                args: ctx.user_args.clone(),
+                args: user_args,
                 env,
                 level: IntegrationLevel::GenericTerminal,
                 note: format!(
@@ -328,16 +486,33 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
-        let mut args = ctx.user_args.clone();
-        // Appended, which is where an argument Turn adds belongs: the user's own
-        // arguments keep the order and the meaning they were written with. The one
-        // case where appending would decide something on their behalf — a second
-        // `--settings`, which Claude Code cannot honour alongside this one — is
-        // refused above rather than quietly won.
-        args.push("--settings".to_string());
-        args.push(settings_path.to_string_lossy().to_string());
+        // Claude Code gives this `--settings` layer priority over local, project
+        // and user settings. Preserve their effective status line through a
+        // private fan-out before adding Turn's higher-priority value.
+        let status_line = crate::claude_status::prepare(ctx);
+        if let Some(setting) = status_line.setting {
+            document
+                .as_object_mut()
+                .expect("Turn's settings document is always an object")
+                .insert("statusLine".into(), setting);
+        }
+        write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
 
-        let (level, note) = self.achieved(&undeliverable);
+        // Provider controls belong before the first option terminator. Everything
+        // from `--` onward is the operator's literal prompt and remains untouched.
+        // A real CLI-owned settings occurrence in the option prefix was refused
+        // above rather than quietly shadowed.
+        let args = insert_control_arguments(
+            &user_args,
+            [
+                "--settings".to_string(),
+                settings_path.to_string_lossy().to_string(),
+            ],
+        );
+
+        let (level, mut note) = self.achieved(&undeliverable);
+        note.push(' ');
+        note.push_str(status_line.note);
         Ok(LaunchPlan {
             command: ctx.command.clone(),
             args,
@@ -787,6 +962,7 @@ mod tests {
             cwd: "/repo".into(),
             command: "claude".into(),
             user_args: vec!["--permission-mode".into(), "acceptEdits".into()],
+            launch_profile: None,
             endpoint: crate::adapter::HookEndpoint {
                 base_url: "http://127.0.0.1:51234".into(),
                 token: "tok_abc".into(),
@@ -863,9 +1039,7 @@ mod tests {
 
         assert_eq!(plan.command, "claude");
         // The user's own flags survive.
-        assert!(plan
-            .args
-            .starts_with(&["--permission-mode".to_string(), "acceptEdits".to_string()]));
+        assert!(plan.args.ends_with(&ctx.user_args));
         let settings_index = plan.args.iter().position(|a| a == "--settings").unwrap();
         let path = PathBuf::from(&plan.args[settings_index + 1]);
         assert!(path.exists(), "the settings file must actually be written");
@@ -1023,13 +1197,34 @@ mod tests {
     #[test]
     fn a_users_own_settings_flag_is_left_in_place_and_the_cost_is_reported() {
         let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.local.json"),
+            br#"{"statusLine":{"type":"command","command":"private command Turn must not copy"}}"#,
+        )
+        .unwrap();
         let adapter = ClaudeCodeAdapter::new();
 
         for user_flag in [
-            vec!["--settings".to_string(), "/home/me/mine.json".to_string()],
-            vec!["--settings=/home/me/mine.json".to_string()],
+            vec!["--settings".into(), "/home/me/mine.json".into()],
+            vec!["--settings=/home/me/mine.json".into()],
+            vec!["--settings".into(), r#"{"model":"sonnet"}"#.into()],
+            vec![r#"--settings={"model":"sonnet"}"#.into()],
+            vec![
+                r#"--settings={"disableAllHooks":true,"statusLine":{"type":"command","command":"printf cli-owned"}}"#
+                    .into(),
+            ],
+            vec![
+                "--settings".into(),
+                "/home/me/first.json".into(),
+                "--settings=/home/me/second.json".into(),
+            ],
+            vec!["--settings".into()],
         ] {
-            let mut ctx = launch_ctx(dir.path());
+            let mut ctx = launch_ctx(&scratch);
+            ctx.cwd = project.to_string_lossy().into_owned();
             ctx.user_args = user_flag.clone();
 
             let plan = adapter.prepare(&ctx).unwrap();
@@ -1042,8 +1237,11 @@ mod tests {
                     .iter()
                     .filter(|a| a.starts_with("--settings"))
                     .count(),
-                1,
-                "Turn must not add a second --settings: {:?}",
+                user_flag
+                    .iter()
+                    .filter(|a| a.starts_with("--settings"))
+                    .count(),
+                "Turn must not add or remove any --settings occurrence: {:?}",
                 plan.args
             );
             assert_eq!(
@@ -1057,7 +1255,101 @@ mod tests {
                 "the note must explain the collision and where Turn's file is: {}",
                 plan.note
             );
+            assert!(!plan.note.contains("private command"));
+            assert!(!scratch.join("claude-statusline-original.sh").exists());
+            assert!(!scratch.join("claude-statusline-turn.sh").exists());
+            assert!(!std::fs::read_to_string(scratch.join("claude-hooks.json"))
+                .unwrap()
+                .contains("private command"));
         }
+    }
+
+    #[test]
+    fn settings_that_only_look_like_flags_inside_the_prompt_do_not_block_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut ctx = launch_ctx(&scratch);
+        ctx.cwd = project.to_string_lossy().into_owned();
+        ctx.user_args = vec![
+            "--setting-sources=".into(),
+            "--model".into(),
+            "opus".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "--settings=/literal/prompt.json".into(),
+            "--settings".into(),
+            "still literal".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let requested_boundary = ctx.user_args.iter().position(|arg| arg == "--").unwrap();
+
+        let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
+        let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
+        assert!(plan.args.ends_with(&ctx.user_args));
+        assert_eq!(
+            &plan.args[effective_boundary..],
+            &ctx.user_args[requested_boundary..],
+            "the complete prompt suffix must remain literal and exact"
+        );
+        let settings_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        assert!(settings_index < effective_boundary, "{:?}", plan.args);
+        assert!(std::path::Path::new(&plan.args[settings_index + 1]).starts_with(&scratch));
+        assert_eq!(plan.level, IntegrationLevel::Structured, "{}", plan.note);
+        assert!(plan.note.contains("Hooks injected via --settings"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_effective_status_command_stays_out_of_launch_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        let private_command = "printf status-command-private-sentinel";
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": private_command,
+                    "padding": 5
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ctx = launch_ctx(&scratch);
+        ctx.cwd = project.to_string_lossy().into_owned();
+        ctx.user_args = vec!["--setting-sources=project".into()];
+
+        let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
+        assert!(!plan
+            .args
+            .iter()
+            .any(|value| value.contains(private_command)));
+        assert!(!plan.env.iter().any(|(key, value)| {
+            key.contains(private_command) || value.contains(private_command)
+        }));
+        assert!(!plan.note.contains(private_command));
+        let settings_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        let settings = std::fs::read_to_string(&plan.args[settings_index + 1]).unwrap();
+        assert!(!settings.contains(private_command));
+        assert!(settings.contains("claude-statusline-turn.sh"));
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("claude-statusline-original.sh")).unwrap(),
+            format!("#!/bin/sh\n{private_command}\n")
+        );
     }
 
     /// The fallback transport runs the helper. It must not hand it the URL as an

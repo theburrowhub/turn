@@ -160,7 +160,9 @@ fn a_full_working_conversation_completes_over_the_real_framing() {
             attachment: Box::new(PaneAttachment {
                 session_id: session.id.clone(),
                 pane_id: pane_id.clone(),
+                attachment_id: 7,
                 node_id: Some(node_id.clone()),
+                runtime_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(screen.clone())),
                 scrollback: turn_proto::Scrollback::default(),
@@ -305,7 +307,9 @@ fn a_ui_restart_rebuilds_its_terminals_without_touching_the_processes() {
             attachment: Box::new(PaneAttachment {
                 session_id: session.id.clone(),
                 pane_id,
-                node_id: Some(node_id),
+                attachment_id: 7,
+                node_id: Some(node_id.clone()),
+                runtime_id: Some(node_id),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(Grid::from_lines(&["still waiting"], 80))),
                 scrollback: turn_proto::Scrollback::default(),
@@ -374,7 +378,9 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
             attachment: Box::new(PaneAttachment {
                 session_id: session.id.clone(),
                 pane_id: pane_id.clone(),
+                attachment_id: 7,
                 node_id: Some(node_id.clone()),
+                runtime_id: Some(node_id.clone()),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(daemon_screen.clone())),
                 scrollback: turn_proto::Scrollback::default(),
@@ -412,6 +418,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
     wire.daemon_sends(&ServerFrame::event(ServerEvent::PaneScreen {
         session_id: session.id.clone(),
         pane_id: pane_id.clone(),
+        attachment_id: 7,
         node_id: Some(node_id.clone()),
         seq: 0,
         update,
@@ -439,6 +446,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
     wire.daemon_sends(&ServerFrame::event(ServerEvent::PaneScreen {
         session_id: session.id.clone(),
         pane_id: pane_id.clone(),
+        attachment_id: 7,
         node_id: Some(node_id.clone()),
         seq: 2,
         update: ScreenUpdate::between(&client_screen, &daemon_screen),
@@ -458,6 +466,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
         Request::ResyncPane {
             session_id: session.id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: Some(7),
         },
     ));
     assert_eq!(wire.daemon_reads().len(), 1);
@@ -466,6 +475,7 @@ fn a_client_rendering_cells_stays_in_step_with_the_daemon_across_a_missed_update
         Response::Screen {
             session_id: session.id.clone(),
             pane_id,
+            attachment_id: 7,
             node_id: Some(node_id),
             next_seq: 3,
             grid: Box::new(daemon_screen.clone()),
@@ -719,6 +729,7 @@ fn a_firehose_of_output_reassembles_in_order_and_admits_what_was_dropped() {
         wire.daemon_sends(&ServerFrame::event(ServerEvent::PaneOutput {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: 7,
             node_id: None,
             seq,
             data: chunk.clone(),
@@ -730,6 +741,7 @@ fn a_firehose_of_output_reassembles_in_order_and_admits_what_was_dropped() {
     wire.daemon_sends(&ServerFrame::event(ServerEvent::PaneOutputGap {
         session_id,
         pane_id,
+        attachment_id: 7,
         dropped: 12,
         resume_seq: seq + 12,
     }));
@@ -971,6 +983,7 @@ fn a_client_can_predict_the_response_shape_before_it_arrives() {
             Request::ResyncPane {
                 session_id: session_id.clone(),
                 pane_id: PaneId::from_stored("pane_a"),
+                attachment_id: Some(7),
             },
             "screen",
         ),

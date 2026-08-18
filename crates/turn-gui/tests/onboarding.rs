@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use turn_core::ids::{SessionId, WorkspaceId};
 use turn_core::model::{LeaseState, PaneKind, SessionMode};
 use turn_gui::desk::{Desk, Reaction};
-use turn_gui::transport::{ConnectionState, DaemonLink};
+use turn_gui::transport::{ConnectionState, DaemonLink, SendOutcome};
 use turn_gui::view::{TurnView, ViewAction};
 use turn_proto::HierarchyKey;
 
@@ -44,9 +44,14 @@ impl GuiHarness {
     /// Performs the I/O half of `TurnApp::perform`; non-I/O reactions are retained so
     /// the test can prove the creation lifecycle reached the window.
     fn route(&mut self, reactions: Vec<Reaction>) {
-        for reaction in reactions {
+        let mut pending: std::collections::VecDeque<Reaction> = reactions.into();
+        while let Some(reaction) = pending.pop_front() {
             match reaction {
-                Reaction::Send { ask, request } => self.link.send(ask, request),
+                Reaction::Send { ask, request } => {
+                    if let SendOutcome::Rejected(inbound) = self.link.send(ask, request) {
+                        pending.extend(self.desk.apply_inbound(inbound, turn_core::now_ms()));
+                    }
+                }
                 other => self.observed.push(other),
             }
         }

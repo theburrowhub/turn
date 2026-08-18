@@ -171,6 +171,29 @@ pub enum LayoutPreset {
     Grid,
 }
 
+/// A stable, provider-owned launch policy for an agent pane.
+///
+/// The reference deliberately stores semantic ids rather than command-line flags.
+/// Flags are an adapter implementation detail and can change between CLI versions;
+/// a saved Template should continue to mean "start Codex autonomously", not "append
+/// these bytes and hope they still mean that".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentLaunchProfileRef {
+    /// The adapter that owns `profile_id`, for example `claude-code` or `codex`.
+    pub adapter_id: String,
+    /// A stable profile id from that adapter's launch catalogue.
+    pub profile_id: String,
+}
+
+impl AgentLaunchProfileRef {
+    pub fn new(adapter_id: impl Into<String>, profile_id: impl Into<String>) -> Self {
+        Self {
+            adapter_id: adapter_id.into(),
+            profile_id: profile_id.into(),
+        }
+    }
+}
+
 /// One visual pane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
@@ -187,6 +210,10 @@ pub struct Pane {
     /// The command to run when this pane is materialised.
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Semantic agent launch policy. Missing means a legacy/custom command line:
+    /// adapters preserve its arguments byte-for-byte for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     /// Working directory, absolute or relative to the session's cwd.
     pub cwd: Option<String>,
     pub env: Vec<(String, String)>,
@@ -223,6 +250,7 @@ impl Pane {
             title_is_user_set: false,
             command: None,
             args: Vec::new(),
+            launch_profile: None,
             cwd: None,
             env: Vec::new(),
             node_id: None,
@@ -232,6 +260,11 @@ impl Pane {
 
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
         self.command = Some(command.into());
+        self
+    }
+
+    pub fn with_launch_profile(mut self, launch_profile: AgentLaunchProfileRef) -> Self {
+        self.launch_profile = Some(launch_profile);
         self
     }
 
@@ -2002,6 +2035,40 @@ mod tests {
         let back: Layout = serde_json::from_str(&json).unwrap();
         assert_eq!(l, back);
         assert_eq!(back.pane_count(), 3);
+    }
+
+    #[test]
+    fn agent_launch_profiles_survive_layout_and_template_round_trips() {
+        let pane = Pane::new(PaneKind::Agent)
+            .with_command("codex")
+            .with_launch_profile(AgentLaunchProfileRef::new("codex", "autonomous"));
+        let layout = Layout::single(pane);
+
+        let json = serde_json::to_string(&layout).unwrap();
+        let restored: Layout = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.panes()[0].launch_profile,
+            Some(AgentLaunchProfileRef::new("codex", "autonomous"))
+        );
+
+        let template = crate::model::Template::from_layout("autonomous codex", &restored, 42);
+        let instantiated = template.instantiate();
+        assert_eq!(
+            instantiated.panes()[0].launch_profile,
+            restored.panes()[0].launch_profile
+        );
+        assert_ne!(instantiated.panes()[0].id, restored.panes()[0].id);
+    }
+
+    #[test]
+    fn a_legacy_pane_without_a_launch_profile_still_deserialises_as_custom() {
+        let pane = Pane::new(PaneKind::Agent).with_command("claude");
+        let json = serde_json::to_string(&pane).unwrap();
+        assert!(!json.contains("launch_profile"));
+
+        let restored: Pane = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.launch_profile, None);
+        assert_eq!(restored.command.as_deref(), Some("claude"));
     }
 
     #[test]

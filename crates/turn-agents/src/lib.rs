@@ -20,23 +20,41 @@
 
 pub mod adapter;
 pub mod claude;
+mod claude_status;
 pub mod codex;
+pub mod context;
 pub mod gemini;
 pub mod heuristic;
+pub mod launch_facts;
 pub mod opencode;
+pub mod quota;
 pub mod registry;
 pub mod risk;
 pub mod server;
 pub mod text;
 
 pub use adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, HookEndpoint, IntegrationLevel,
-    LaunchContext, LaunchPlan,
+    insert_control_arguments, validate_effective_arguments, AdapterError, AgentAdapter,
+    Capabilities, EventContext, HookEndpoint, IntegrationLevel, LaunchContext,
+    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, LaunchProfileRole,
+    ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 pub use claude::{ClaudeCodeAdapter, HookTransport};
 pub use codex::{CodexAdapter, CodexTransport};
+pub use context::{
+    parse_context_tail, read_context_tail, ContextObservation, ContextTailRead, TranscriptFormat,
+    MAX_CONTEXT_TAIL_BYTES,
+};
 pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
+pub use launch_facts::{launch_fact_configurations, safe_model_name, LaunchFactConfigurations};
 pub use opencode::OpenCodeAdapter;
-pub use registry::{AdapterRegistry, GenericTerminalAdapter, Selection};
+pub use quota::{
+    account_quota_source_for_tool, parse_codex_account_quota_response, probe_codex_account_quota,
+    AccountCredits, AccountQuotaBucket, AccountQuotaObservation, AccountQuotaParseError,
+    AccountQuotaSource, AccountQuotaWindow, AccountSpendControl, QuotaProbeError,
+    MAX_ACCOUNT_QUOTA_MESSAGE_BYTES, MAX_ACCOUNT_QUOTA_PROBE_TIMEOUT,
+    MIN_ACCOUNT_QUOTA_REFRESH_INTERVAL,
+};
+pub use registry::{AdapterLaunchCatalogue, AdapterRegistry, GenericTerminalAdapter, Selection};
 pub use server::{HookServer, HookStats, ServerError};

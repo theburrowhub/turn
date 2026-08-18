@@ -2,7 +2,7 @@
 
 use super::sessions::pane_from_spec;
 use super::workspaces::store;
-use super::Answer;
+use super::{validate_terminal_size, Answer};
 use crate::core::clients::Attachment;
 use crate::core::{ClientId, Core};
 use turn_core::ids::{PaneId, SessionId};
@@ -12,9 +12,8 @@ use turn_core::model::{
 };
 use turn_proto::{
     CloseDisposition, ErrorCode, FocusTarget, NewPane, PaneAttachment, PaneStream, ProtoError,
-    PtySize, Response, ServerEvent,
+    PtySize, Response,
 };
-use turn_pty::ScreenSize;
 
 pub(super) struct PaneDestination<'a> {
     pub target: &'a PaneId,
@@ -712,9 +711,9 @@ impl Core {
     /// Subscribes a client to a pane and hands back what rebuilds it.
     ///
     /// This is the request the whole daemon exists for. The pty has been running all
-    /// along; attaching applies the client's geometry and hands over the screen the
-    /// daemon has been keeping. A UI that restarted looks exactly as it did, because
-    /// nothing about the terminal ever belonged to the window.
+    /// along; attaching observes its current geometry and hands over the screen the
+    /// daemon has been keeping. The elected visible owner follows with `ResizePty` if
+    /// its measured body differs, so a stale attachment can never shrink a shared PTY.
     ///
     /// Cells by default, because the daemon has already parsed the screen and a
     /// renderer without its own terminal emulator can draw them directly. Bytes on
@@ -727,32 +726,17 @@ impl Core {
         size: PtySize,
         stream: PaneStream,
     ) -> Answer {
-        let requested = PtySize::new(size.rows, size.cols);
         // Refused rather than clamped: a client asking to render a screen this size has
         // a layout bug, and silently drawing it something else would hide it. The limit
         // is announced in `welcome`, so it is one the client could have checked.
-        let cells = requested.rows as usize * requested.cols as usize;
-        if cells > turn_proto::MAX_SCREEN_CELLS {
-            return Err(ProtoError::invalid(format!(
-                "A screen of {}x{} is {cells} cells, which is too large: the limit is {}",
-                requested.rows,
-                requested.cols,
-                turn_proto::MAX_SCREEN_CELLS
-            )));
-        }
+        let requested = validate_terminal_size(size)?;
 
         let session = self.session(session_id)?;
-        let node_id = match session.layout.get(pane_id) {
-            // A permanent Agent Pane binds to the semantic Agent identity even
-            // when its screen belongs to the hosting shell. Resolve the terminal
-            // at attach time, exactly as temporary panes already do.
-            Some(pane) => pane.node_id.as_ref().map(|node| {
-                // Hosted Agents resolve to their shell's PTY. A direct binding remains
-                // direct even when its process is currently absent: attachments carry
-                // identity as well as bytes, and dropping it here would make two
-                // Sessions with the same PaneId indistinguishable to the client.
-                self.terminal_node(node).unwrap_or_else(|| node.clone())
-            }),
+        let binding_node_id = match session.layout.get(pane_id) {
+            // A permanent Agent Pane stays bound to the semantic Agent identity even
+            // when its screen belongs to the hosting shell. PTY ownership is resolved
+            // separately below and both identities are returned to the client.
+            Some(pane) => pane.node_id.clone(),
             None => {
                 let surface_id = self
                     .clients
@@ -770,26 +754,26 @@ impl Core {
                             && binding.surface_id.as_deref() == surface_id
                     })
                     .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
-                // Resolved rather than taken literally: an agent hosted in a pane's
-                // shell has a terminal — the shell's — and that is the screen this
-                // attachment has to be fed from.
-                match self.terminal_node(&binding.node_id) {
-                    Some(node) => Some(node),
-                    None => {
-                        return Err(ProtoError::new(
-                            ErrorCode::Conflict,
-                            "This Agent has semantic preview details but no attachable terminal",
-                        ));
-                    }
-                }
+                Some(binding.node_id)
             }
+        };
+        let runtime_id = match binding_node_id.as_ref() {
+            Some(node) => match self.terminal_node(node) {
+                Some(runtime) => Some(runtime),
+                None if session.layout.get(pane_id).is_some() => Some(node.clone()),
+                None => {
+                    return Err(ProtoError::new(
+                        ErrorCode::Conflict,
+                        "This Agent has semantic preview details but no attachable terminal",
+                    ));
+                }
+            },
+            None => None,
         };
 
         let mut truncated = false;
         let mut bytes_seen = 0u64;
-        let mut resized = false;
-
-        if let Some(node) = &node_id {
+        if let Some(node) = &runtime_id {
             // Subscribed *before* the screen is taken. The subscription happens the
             // moment this is called, not when the pump task first runs, so nothing the
             // process writes in between falls between the two. A row that arrives twice
@@ -798,14 +782,10 @@ impl Core {
             self.start_pump(node);
 
             if let Some(process) = self.processes.get_mut(node) {
-                let screen = ScreenSize::new(requested.rows, requested.cols);
-                // Applied before the screen is taken, so what comes back matches the
-                // geometry the client is about to render it at.
-                resized = process.size != screen;
-                if let Err(error) = process.pty.resize(screen) {
-                    tracing::warn!(%node, %error, "could not resize a pty on attach");
-                }
-                process.size = screen;
+                // Attaching is deliberately observational. A stale attach response must
+                // not mutate a PTY before the client can reject it, and a semantic Agent
+                // view cannot know its hosting runtime until this answer arrives. The
+                // renderer follows with one measured ResizePty from the elected owner.
                 if let Ok(buffer) = process.pty.buffer().lock() {
                     truncated = buffer.is_truncated();
                     bytes_seen = buffer.bytes_seen();
@@ -818,43 +798,49 @@ impl Core {
             // retained output is never treated as proof that its process is alive.
         }
 
-        let attached_size = node_id
+        let attached_size = runtime_id
             .as_ref()
             .map(|node| self.node_size(node, requested))
             .unwrap_or(requested);
 
+        let client_entry = self
+            .clients
+            .get_mut(&client)
+            .ok_or_else(|| ProtoError::internal("this connection is not registered"))?;
+        client_entry.next_attachment_id = client_entry.next_attachment_id.wrapping_add(1).max(1);
+        let attachment_id = client_entry.next_attachment_id;
         let attachment = Attachment {
-            node_id: node_id.clone(),
+            attachment_id,
+            node_id: runtime_id.clone(),
             stream,
             next_seq: 0,
             owed_gap: 0,
             owes_full_screen: false,
         };
-        let client_entry = self
-            .clients
-            .get_mut(&client)
-            .ok_or_else(|| ProtoError::internal("this connection is not registered"))?;
         // Keyed by session as well as pane: two sessions that share a pane id must not
         // share an attachment.
-        client_entry
+        let replaced_runtime = client_entry
             .attachments
-            .insert((session_id.clone(), pane_id.clone()), attachment);
+            .insert((session_id.clone(), pane_id.clone()), attachment)
+            .and_then(|previous| previous.node_id)
+            .filter(|previous| runtime_id.as_ref() != Some(previous));
+        // Reattaching the same durable Pane may follow a process relaunch. The new
+        // subscription is live now; release the superseded runtime's pump if this was
+        // its last watcher instead of leaking one background task per relaunch.
+        if let Some(previous) = replaced_runtime {
+            self.stop_pump_if_unwatched(&previous);
+        }
 
         // Exactly one of the two payloads, decided by what the client asked for.
         let mut screen = None;
         let mut scrollback = turn_proto::Scrollback::default();
         let mut replay = turn_proto::TerminalBytes::default();
-        match (stream, &node_id) {
+        match (stream, &runtime_id) {
             (PaneStream::Cells, Some(node)) => {
                 let grid = self.screen_for_attach(node, attached_size);
                 let (history, history_truncated) = self.scrollback_for_attach(node);
                 scrollback = history;
                 truncated |= history_truncated;
-                if resized {
-                    // The geometry moved, so every other client's baseline is the wrong
-                    // shape and a row diff against it would be meaningless.
-                    self.push_full_screen(node, Some(client));
-                }
                 screen = Some(Box::new(grid));
             }
             // A pane with no process still gets a screen: a blank one at the client's
@@ -878,22 +864,13 @@ impl Core {
             (PaneStream::Bytes, None) => {}
         }
 
-        if let Some(node) = &node_id {
-            self.push_others(
-                client,
-                ServerEvent::PtyResized {
-                    session_id: session_id.clone(),
-                    node_id: node.clone(),
-                    size: attached_size,
-                },
-            );
-        }
-
         Ok(Response::Attached {
             attachment: Box::new(PaneAttachment {
                 session_id: session_id.clone(),
                 pane_id: pane_id.clone(),
-                node_id,
+                attachment_id,
+                node_id: binding_node_id,
+                runtime_id,
                 stream,
                 screen,
                 scrollback,
@@ -917,6 +894,7 @@ impl Core {
         client: ClientId,
         session_id: &SessionId,
         pane_id: &PaneId,
+        expected_attachment_id: Option<u64>,
     ) -> Answer {
         self.session(session_id)?;
         let key = (session_id.clone(), pane_id.clone());
@@ -930,6 +908,13 @@ impl Core {
                     "This connection is not attached to that pane",
                 )
             })?;
+        if expected_attachment_id.is_some_and(|expected| expected != attachment.attachment_id) {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "That pane attachment was replaced; resync its current generation",
+            ));
+        }
+        let attachment_id = attachment.attachment_id;
         if attachment.stream.is_bytes() {
             // There is no honest cells answer for a byte attachment: what it lost was
             // bytes, and the way back is to attach again and take a replay.
@@ -958,6 +943,7 @@ impl Core {
         Ok(Response::Screen {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id,
             node_id,
             next_seq,
             grid: Box::new(grid),
@@ -978,13 +964,22 @@ impl Core {
         client: ClientId,
         session_id: &SessionId,
         pane_id: &PaneId,
+        expected_attachment_id: Option<u64>,
     ) -> Answer {
         self.session(session_id)?;
         let key = (session_id.clone(), pane_id.clone());
-        let removed = self
-            .clients
-            .get_mut(&client)
-            .and_then(|client| client.attachments.remove(&key));
+        let Some(client_entry) = self.clients.get_mut(&client) else {
+            return Err(ProtoError::internal("this connection is not registered"));
+        };
+        let current = client_entry.attachments.get(&key);
+        if expected_attachment_id.is_some_and(|expected| {
+            current.is_none_or(|attachment| expected != attachment.attachment_id)
+        }) {
+            // Conditional cleanup is deliberately idempotent. A late detach must not
+            // remove the new ABA generation, and there is nothing left to clean up.
+            return Ok(Response::Ack);
+        }
+        let removed = client_entry.attachments.remove(&key);
         let Some(attachment) = removed else {
             return Err(ProtoError::new(
                 ErrorCode::PaneNotAttached,

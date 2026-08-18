@@ -24,6 +24,7 @@
 //!   `docs/SECURITY.md` for what this does and does not defend against.
 
 use crate::adapter::{AgentAdapter, EventContext, HookEndpoint};
+use crate::context::{read_context_tail, ContextObservation, TranscriptFormat};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
@@ -43,8 +44,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, Sleep};
-use turn_core::event::TurnEvent;
+use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, SessionId};
+use turn_core::model::{
+    AgentLaunchFacts, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration, Observable,
+    ObservationSource, ObservationSourceKind, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+};
 
 /// Largest hook payload accepted, before the body is buffered at all.
 ///
@@ -69,6 +74,19 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// have nothing to do with hooks.
 pub const MAX_CONNECTIONS: usize = 128;
 
+/// Provider transcript tails read concurrently.
+///
+/// Filesystem access is detached from the hook response and each read is capped
+/// by `context::MAX_CONTEXT_TAIL_BYTES`. This independent cap also keeps a slow
+/// or remote filesystem from filling Tokio's blocking pool when many agents end
+/// a turn together. When all slots are occupied, the newest refresh is skipped;
+/// the next turn-end callback retries it.
+pub const MAX_CONTEXT_READS: usize = 8;
+
+/// Longest authenticated transcript path accepted from a provider callback.
+/// The path is used ephemerally and is never copied into an event or log.
+pub const MAX_TRANSCRIPT_PATH_CHARS: usize = 4_096;
+
 /// How long a connection may make no progress before it is dropped.
 ///
 /// Measured from the last byte read or written, not from accept, so a client that
@@ -89,6 +107,7 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Limits {
     pub max_connections: usize,
     pub idle_timeout: Duration,
+    pub max_context_reads: usize,
 }
 
 impl Default for Limits {
@@ -96,6 +115,7 @@ impl Default for Limits {
         Self {
             max_connections: MAX_CONNECTIONS,
             idle_timeout: IDLE_TIMEOUT,
+            max_context_reads: MAX_CONTEXT_READS,
         }
     }
 }
@@ -156,6 +176,9 @@ struct ServerState {
     /// Shared with the listener, which counts the connections it refuses before
     /// any request exists to attribute them to.
     counters: Arc<Counters>,
+    /// Permits are acquired without waiting before a detached transcript read
+    /// is spawned. This bounds both live reads and pending blocking tasks.
+    context_reads: Arc<Semaphore>,
 }
 
 impl ServerState {
@@ -213,6 +236,7 @@ impl HookServer {
             registrations: RwLock::new(HashMap::new()),
             events: events_tx,
             counters: Arc::clone(&counters),
+            context_reads: Arc::new(Semaphore::new(limits.max_context_reads.max(1))),
         });
 
         // 127.0.0.1 explicitly, never 0.0.0.0: nothing off this machine has any
@@ -230,6 +254,7 @@ impl HookServer {
 
         let router = Router::new()
             .route("/hook/{token}", post(receive))
+            .route("/hook/{token}/status-line", post(receive_status_line))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(Arc::clone(&state));
 
@@ -564,32 +589,351 @@ async fn receive(
     };
 
     let ctx = EventContext {
+        session_id: session_id.clone(),
+        node_id: node_id.clone(),
+        timestamp_ms: turn_core::now_ms(),
+    };
+    for event in adapter.normalise(&payload, &ctx) {
+        try_emit(&state, event);
+    }
+
+    // Scheduling is deliberately the final operation and never awaited. A slow
+    // disk, a locked file, or a saturated observation cap must not hold open the
+    // provider hook that declared the turn complete.
+    schedule_context_observation(
+        &state,
+        adapter.as_ref(),
+        &payload,
+        session_id,
+        node_id,
+        ctx.timestamp_ms,
+    );
+
+    StatusCode::OK.into_response()
+}
+
+/// Claude Code's status-line callback. It uses the same per-node token as hooks
+/// but a distinct path and schema, so lifecycle normalisation never has to guess
+/// what an object without `hook_event_name` means.
+async fn receive_status_line(
+    State(state): State<Arc<ServerState>>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some((session_id, node_id, adapter)) = lookup(&state, &token) else {
+        state.counters.refused.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            token_len = token.len(),
+            "refused a status-line post with an unknown token"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    state.counters.accepted.fetch_add(1, Ordering::Relaxed);
+
+    // Only Claude Code currently owns this documented contract. A valid token
+    // associated with another adapter is acknowledged but cannot create facts.
+    if adapter.id() != "claude-code" {
+        return StatusCode::OK.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            state.counters.unparsable.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(adapter = adapter.id(), "unreadable status-line payload");
+            return StatusCode::OK.into_response();
+        }
+    };
+    let ctx = EventContext {
         session_id,
         node_id,
         timestamp_ms: turn_core::now_ms(),
     };
-    for event in adapter.normalise(&payload, &ctx) {
-        // try_send, never send: the agent is holding a connection open while we
-        // do this, so a slow daemon must cost us the event and not the turn.
-        match state.events.try_send(event) {
-            Ok(()) => {
-                state.counters.emitted.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(mpsc::error::TrySendError::Full(dropped)) => {
-                state.counters.dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    kind = turn_core::event::event_name(&dropped.kind),
-                    "dropped an event: the daemon is not draining the hook channel"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                state.counters.dropped.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!("dropped an event: nothing is listening any more");
-            }
+    if let Some(event) = crate::claude_status::observation_event(&payload, &ctx) {
+        try_emit(&state, event);
+    }
+    StatusCode::OK.into_response()
+}
+
+/// Sends without backpressure. Hook delivery and detached observation delivery
+/// share the same bounded channel and accounting semantics.
+fn try_emit(state: &ServerState, event: TurnEvent) {
+    match state.events.try_send(event) {
+        Ok(()) => {
+            state.counters.emitted.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(mpsc::error::TrySendError::Full(dropped)) => {
+            state.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind = turn_core::event::event_name(&dropped.kind),
+                "dropped an event: the daemon is not draining the hook channel"
+            );
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            state.counters.dropped.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("dropped an event: nothing is listening any more");
         }
     }
+}
 
-    StatusCode::OK.into_response()
+#[derive(Debug, Clone)]
+struct ContextProbe {
+    path: PathBuf,
+    format: TranscriptFormat,
+    provider: String,
+    tool: String,
+    scope_id: Option<String>,
+}
+
+/// Extracts the one ephemeral input needed for a transcript observation.
+///
+/// Only the authenticated runtime's own turn-end callback qualifies. In
+/// particular, `SubagentStop.agent_transcript_path` is intentionally ignored:
+/// that callback arrives through the parent's endpoint and attributing the
+/// worker transcript to the parent would make its capacity display false.
+fn context_probe(adapter: &dyn AgentAdapter, payload: &serde_json::Value) -> Option<ContextProbe> {
+    let event_name = payload.get("hook_event_name")?.as_str()?;
+    let format = match (adapter.id(), event_name) {
+        ("claude-code", "Stop") => TranscriptFormat::Claude,
+        ("codex", "Stop") => TranscriptFormat::Codex,
+        ("gemini-cli", "AfterAgent") => TranscriptFormat::Gemini,
+        _ => return None,
+    };
+    let raw_path = payload.get("transcript_path")?.as_str()?;
+    let path_len = raw_path.chars().count();
+    if path_len == 0 || path_len > MAX_TRANSCRIPT_PATH_CHARS {
+        return None;
+    }
+
+    Some(ContextProbe {
+        path: PathBuf::from(raw_path),
+        format,
+        provider: adapter.provider().to_string(),
+        tool: adapter.id().to_string(),
+        scope_id: payload
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(crate::text::identifier),
+    })
+}
+
+fn schedule_context_observation(
+    state: &Arc<ServerState>,
+    adapter: &dyn AgentAdapter,
+    payload: &serde_json::Value,
+    session_id: SessionId,
+    node_id: NodeId,
+    sampled_at_ms: i64,
+) {
+    // `sampled_at_ms` is captured on the authenticated callback path, before
+    // detaching. Completion order is filesystem scheduling, not evidence order.
+    let Some(probe) = context_probe(adapter, payload) else {
+        return;
+    };
+    let Ok(permit) = Arc::clone(&state.context_reads).try_acquire_owned() else {
+        tracing::debug!(
+            tool = probe.tool,
+            "skipped a transcript context refresh: observation slots are full"
+        );
+        return;
+    };
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let failed_probe = probe.clone();
+        // `read_context_tail` performs synchronous metadata/seek/read calls. It
+        // belongs on Tokio's blocking pool, behind the permit acquired above.
+        let read = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = read_context_tail(&probe.path, probe.format);
+            (probe, result)
+        })
+        .await;
+
+        let (probe, observation) = match read {
+            Ok((probe, Ok(read))) if read.parse_failed => {
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        probe,
+                        "provider transcript contained an unreadable context record",
+                        sampled_at_ms,
+                    ),
+                );
+                return;
+            }
+            Ok((probe, Ok(read))) => (probe, read.observation),
+            Ok((probe, Err(error))) => {
+                tracing::debug!(
+                    tool = probe.tool,
+                    error_kind = ?error.kind(),
+                    "could not read an agent transcript context tail"
+                );
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        probe,
+                        context_read_failure_message(error.kind()),
+                        sampled_at_ms,
+                    ),
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("agent transcript observation task failed");
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        failed_probe,
+                        "provider transcript observation failed",
+                        sampled_at_ms,
+                    ),
+                );
+                return;
+            }
+        };
+        let Some(observation) = observation else {
+            return;
+        };
+        let Some(event) =
+            runtime_observation_event(session_id, node_id, probe, observation, sampled_at_ms)
+        else {
+            return;
+        };
+        try_emit(&state, event);
+    });
+}
+
+fn context_read_failure_message(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "provider transcript is unavailable",
+        std::io::ErrorKind::PermissionDenied => "provider transcript access was denied",
+        std::io::ErrorKind::InvalidInput => "provider transcript is not a regular file",
+        _ => "provider transcript could not be read",
+    }
+}
+
+fn context_failure_event(
+    session_id: SessionId,
+    node_id: NodeId,
+    probe: ContextProbe,
+    message: &'static str,
+    observed_at_ms: i64,
+) -> TurnEvent {
+    let source = ObservationSource::new(
+        ObservationSourceKind::Provider,
+        format!("{} transcript", probe.tool),
+    );
+    TurnEvent::new(
+        session_id,
+        EventKind::AgentRuntimeObserved {
+            runtime: Box::new(AgentRuntimeMetadata {
+                context: Observable::failed(source, observed_at_ms, message),
+                ..AgentRuntimeMetadata::default()
+            }),
+        },
+        EventSource::SideChannel {
+            tool: probe.tool.clone(),
+            channel: "provider transcript".into(),
+        },
+        Confidence::Explicit,
+        observed_at_ms,
+    )
+    .with_node(node_id)
+    .with_agent(AgentRef {
+        provider: Some(probe.provider),
+        tool: Some(probe.tool),
+        model: None,
+        external_id: probe.scope_id,
+    })
+}
+
+fn runtime_observation_event(
+    session_id: SessionId,
+    node_id: NodeId,
+    probe: ContextProbe,
+    mut observation: ContextObservation,
+    observed_at_ms: i64,
+) -> Option<TurnEvent> {
+    let used_tokens = exact_token_amount(observation.used_tokens)?;
+    let total_tokens = match observation.window_tokens {
+        Some(tokens) => Some(exact_token_amount(tokens)?),
+        None => None,
+    };
+    observation.model = observation.model.as_deref().and_then(crate::text::field);
+    let source = ObservationSource::new(
+        ObservationSourceKind::Provider,
+        format!("{} transcript", probe.tool),
+    );
+    let context = ContextUsageSnapshot {
+        scope_id: probe.scope_id.clone(),
+        measurement: UsageMeasurement {
+            kind: UsageMeasurementKind::Used,
+            amount: used_tokens,
+            unit: UsageUnit::Tokens,
+            total: total_tokens,
+        },
+        effective_window: None,
+        window_size_tokens: observation.window_tokens,
+        used_percentage: None,
+        remaining_percentage: None,
+        current_usage: None,
+    };
+    let launch = observation
+        .model
+        .as_ref()
+        .map_or_else(AgentLaunchFacts::default, |model| AgentLaunchFacts {
+            current: Observable::observed(
+                LaunchConfiguration {
+                    model: Some(model.clone()),
+                    ..LaunchConfiguration::default()
+                },
+                source.clone(),
+                observed_at_ms,
+                None,
+            ),
+            ..AgentLaunchFacts::default()
+        });
+    let runtime = AgentRuntimeMetadata {
+        launch,
+        context: Observable::observed(context, source, observed_at_ms, None),
+        ..AgentRuntimeMetadata::default()
+    };
+    let model = observation.model;
+
+    Some(
+        TurnEvent::new(
+            session_id,
+            EventKind::AgentRuntimeObserved {
+                runtime: Box::new(runtime),
+            },
+            EventSource::SideChannel {
+                tool: probe.tool.clone(),
+                channel: "provider transcript".into(),
+            },
+            Confidence::Explicit,
+            observed_at_ms,
+        )
+        .with_node(node_id)
+        .with_agent(AgentRef {
+            provider: Some(probe.provider),
+            tool: Some(probe.tool),
+            model,
+            external_id: probe.scope_id,
+        }),
+    )
+}
+
+/// Usage measurements are stored as `f64` because provider quotas may be
+/// fractional. Transcript tokens are integers, so reject a value the storage
+/// type cannot represent exactly instead of rounding provider evidence.
+fn exact_token_amount(tokens: u64) -> Option<f64> {
+    const MAX_EXACT_F64_INTEGER: u64 = 1_u64 << 53;
+    (tokens <= MAX_EXACT_F64_INTEGER).then_some(tokens as f64)
 }
 
 /// Resolves a token without holding the lock across normalisation.
@@ -612,6 +956,9 @@ fn lookup(state: &ServerState, token: &str) -> Option<(SessionId, NodeId, Arc<dy
 mod tests {
     use super::*;
     use crate::claude::ClaudeCodeAdapter;
+    use crate::codex::CodexAdapter;
+    use crate::gemini::GeminiCliAdapter;
+    use crate::opencode::OpenCodeAdapter;
     use serde_json::json;
     use turn_core::event::{Confidence, EventKind};
 
@@ -710,6 +1057,379 @@ mod tests {
         assert_eq!(event.confidence, Confidence::Explicit);
         assert_eq!(server.stats().emitted, 1);
         assert_eq!(server.stats().refused, 0);
+    }
+
+    #[test]
+    fn transcript_reads_are_only_scheduled_for_each_runtimes_own_turn_end() {
+        let path = "/tmp/provider-transcript.jsonl";
+        let claude = ClaudeCodeAdapter::new();
+        let codex = CodexAdapter::new();
+        let gemini = GeminiCliAdapter::new();
+        let opencode = OpenCodeAdapter::new();
+
+        assert_eq!(
+            context_probe(
+                &claude,
+                &json!({ "hook_event_name": "Stop", "transcript_path": path })
+            )
+            .unwrap()
+            .format,
+            TranscriptFormat::Claude
+        );
+        assert_eq!(
+            context_probe(
+                &codex,
+                &json!({ "hook_event_name": "Stop", "transcript_path": path })
+            )
+            .unwrap()
+            .format,
+            TranscriptFormat::Codex
+        );
+        assert_eq!(
+            context_probe(
+                &gemini,
+                &json!({ "hook_event_name": "AfterAgent", "transcript_path": path })
+            )
+            .unwrap()
+            .format,
+            TranscriptFormat::Gemini
+        );
+        assert!(context_probe(
+            &claude,
+            &json!({
+                "hook_event_name": "SubagentStop",
+                "transcript_path": "/tmp/parent.jsonl",
+                "agent_transcript_path": "/tmp/worker.jsonl"
+            })
+        )
+        .is_none());
+        assert!(context_probe(
+            &claude,
+            &json!({ "hook_event_name": "Stop", "agent_transcript_path": path })
+        )
+        .is_none());
+        assert!(context_probe(
+            &opencode,
+            &json!({ "hook_event_name": "Stop", "transcript_path": path })
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_known_provider_window_is_the_context_measurements_exact_total() {
+        let event = runtime_observation_event(
+            SessionId::from_stored("sess_context_total"),
+            NodeId::from_stored("proc_context_total"),
+            ContextProbe {
+                path: PathBuf::from("/never/read/or/persisted.jsonl"),
+                format: TranscriptFormat::Codex,
+                provider: "openai".into(),
+                tool: "codex".into(),
+                scope_id: Some("thread-42".into()),
+            },
+            ContextObservation {
+                used_tokens: 42_000,
+                window_tokens: Some(272_000),
+                model: Some("gpt-5.6-sol".into()),
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+
+        let EventKind::AgentRuntimeObserved { runtime } = event.kind else {
+            unreachable!()
+        };
+        let context = runtime.context.value().unwrap();
+        assert_eq!(context.scope_id.as_deref(), Some("thread-42"));
+        assert_eq!(context.measurement.amount, 42_000.0);
+        assert_eq!(context.measurement.total, Some(272_000.0));
+        assert_eq!(context.effective_window, None);
+        assert_eq!(runtime.context.observed_at_ms(), Some(1_700_000_000_000));
+        assert_eq!(
+            runtime.context.source().unwrap().label.as_deref(),
+            Some("codex transcript")
+        );
+        assert_eq!(exact_token_amount((1_u64 << 53) + 1), None);
+    }
+
+    #[tokio::test]
+    async fn a_stop_reads_context_off_the_hook_path_and_emits_only_typed_metadata() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript_path = transcript_dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"user\",\"message\":{\"content\":\"secret source text\"}}\n",
+                "{\"type\":\"assistant\",\"message\":{",
+                "\"model\":\"claude-opus-4-1\\nunsafe\",",
+                "\"usage\":{\"input_tokens\":12000,",
+                "\"cache_read_input_tokens\":3000,",
+                "\"cache_creation_input_tokens\":500}}}\n"
+            ),
+        )
+        .unwrap();
+        let (server, mut rx, endpoint) = server_with_node().await;
+
+        let status = post(
+            &endpoint.url(),
+            json!({
+                "hook_event_name": "Stop",
+                "session_id": "84cde77e-f54f-41e7-bb05-2716cb61b6bf",
+                "transcript_path": transcript_path,
+                "last_assistant_message": "OK"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the read is not on the response path"
+        );
+
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("the event channel stays open");
+                if matches!(event.kind, EventKind::AgentRuntimeObserved { .. }) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("the detached bounded read must finish");
+
+        let EventKind::AgentRuntimeObserved { runtime } = &observed.kind else {
+            unreachable!()
+        };
+        let context = runtime.context.value().expect("observed context usage");
+        assert_eq!(context.measurement.amount, 15_500.0);
+        assert_eq!(context.measurement.total, None);
+        assert_eq!(context.measurement.kind, UsageMeasurementKind::Used);
+        assert_eq!(context.measurement.unit, UsageUnit::Tokens);
+        let source = runtime.context.source().unwrap();
+        assert_eq!(source.kind, ObservationSourceKind::Provider);
+        assert_eq!(source.label.as_deref(), Some("claude-code transcript"));
+        assert_eq!(
+            runtime.context.observed_at_ms(),
+            Some(observed.timestamp_ms)
+        );
+        assert_eq!(
+            observed.agent.model.as_deref(),
+            Some("claude-opus-4-1 unsafe")
+        );
+        assert_eq!(observed.raw, None);
+
+        let persisted_shape = serde_json::to_string(&observed).unwrap();
+        assert!(!persisted_shape.contains("transcript_path"));
+        assert!(!persisted_shape.contains("secret source text"));
+        assert!(!persisted_shape.contains(&transcript_path.to_string_lossy().to_string()));
+        assert_eq!(server.stats().emitted, 2);
+    }
+
+    #[tokio::test]
+    async fn status_line_endpoint_emits_only_typed_runtime_metadata() {
+        let (server, mut rx, endpoint) = server_with_node().await;
+        let status = post(
+            &endpoint.status_line_url(),
+            json!({
+                "session_id":"claude-session-1",
+                "transcript_path":"/must/not/persist.jsonl",
+                "model":{"id":"claude-opus-5","display_name":"Opus"},
+                "context_window":{
+                    "total_input_tokens":15000,
+                    "total_output_tokens":1000,
+                    "context_window_size":200000,
+                    "used_percentage":8,
+                    "remaining_percentage":92,
+                    "current_usage":{"input_tokens":7000,"output_tokens":1000}
+                },
+                "effort":{"level":"xhigh"},
+                "thinking":{"enabled":true},
+                "rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let event = rx.recv().await.unwrap();
+        let EventKind::AgentRuntimeObserved { runtime } = &event.kind else {
+            panic!("unexpected event: {:?}", event.kind)
+        };
+        assert_eq!(
+            runtime
+                .launch
+                .current
+                .value()
+                .unwrap()
+                .effort_level
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            runtime.quota.value().unwrap().windows[0].measurement.amount,
+            76.5
+        );
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("transcript_path"));
+        assert!(!encoded.contains("must/not/persist"));
+        assert_eq!(server.stats().accepted, 1);
+        assert_eq!(server.stats().emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn transcript_read_and_parse_failures_become_safe_failed_context_observations() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let missing = transcript_dir.path().join("private-secret-name.jsonl");
+        let malformed = transcript_dir.path().join("malformed.jsonl");
+        std::fs::write(
+            &malformed,
+            b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":\"bad\"}}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, endpoint) = server_with_node().await;
+
+        for path in [&missing, &malformed] {
+            assert_eq!(
+                post(
+                    &endpoint.url(),
+                    json!({"hook_event_name":"Stop","transcript_path":path})
+                )
+                .await,
+                StatusCode::OK
+            );
+            let failed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = rx.recv().await.unwrap();
+                    if let EventKind::AgentRuntimeObserved { runtime } = &event.kind {
+                        if matches!(runtime.context, Observable::Failed { .. }) {
+                            break event;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let EventKind::AgentRuntimeObserved { runtime } = &failed.kind else {
+                unreachable!()
+            };
+            let Observable::Failed { message, .. } = &runtime.context else {
+                unreachable!()
+            };
+            assert!(message.starts_with("provider transcript"), "{message}");
+            let encoded = serde_json::to_string(&failed).unwrap();
+            assert!(!encoded.contains(&path.to_string_lossy().to_string()));
+            assert!(!encoded.contains("private-secret-name"));
+            assert!(!encoded.contains("os error"));
+            assert_eq!(failed.raw, None);
+        }
+        assert_eq!(server.stats().emitted, 4);
+    }
+
+    #[tokio::test]
+    async fn detached_transcript_results_keep_their_trigger_sample_time() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let valid = transcript_dir.path().join("valid.jsonl");
+        let missing = transcript_dir.path().join("missing.jsonl");
+        std::fs::write(
+            &valid,
+            b"{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus\",\"usage\":{\"input_tokens\":42}}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, _endpoint) = server_with_node().await;
+        let adapter = ClaudeCodeAdapter::new();
+
+        for (path, sampled_at_ms, expected_failure) in
+            [(valid, 101_i64, false), (missing, 202_i64, true)]
+        {
+            schedule_context_observation(
+                &server.state,
+                &adapter,
+                &json!({"hook_event_name":"Stop", "transcript_path":path}),
+                SessionId::from_stored("sess_server01"),
+                NodeId::from_stored("proc_server01"),
+                sampled_at_ms,
+            );
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let EventKind::AgentRuntimeObserved { runtime } = event.kind else {
+                panic!("unexpected detached event")
+            };
+            assert_eq!(event.timestamp_ms, sampled_at_ms);
+            assert_eq!(runtime.context.observed_at_ms(), Some(sampled_at_ms));
+            assert_eq!(
+                matches!(runtime.context, Observable::Failed { .. }),
+                expected_failure
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_transcript_without_usage_remains_waiting_for_the_next_event() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript = transcript_dir.path().join("not-yet.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, endpoint) = server_with_node().await;
+        assert_eq!(
+            post(
+                &endpoint.url(),
+                json!({"hook_event_name":"Stop","transcript_path":transcript})
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(matches!(
+            rx.recv().await.unwrap().kind,
+            EventKind::AgentTurnCompleted { .. }
+        ));
+        eventually("the no-usage transcript read to finish", || {
+            server.state.context_reads.available_permits() == MAX_CONTEXT_READS
+        })
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_saturated_context_reader_never_waits_on_the_hook_response() {
+        let (server, mut rx, endpoint) = server_with_limits(Limits {
+            max_context_reads: 1,
+            ..Limits::default()
+        })
+        .await;
+        let held = Arc::clone(&server.state.context_reads)
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            post(
+                &endpoint.url(),
+                json!({
+                    "hook_event_name": "Stop",
+                    "transcript_path": "/a/read/that/must/not/be/queued.jsonl"
+                }),
+            ),
+        )
+        .await
+        .expect("capacity must be checked without waiting");
+        assert_eq!(response, StatusCode::OK);
+        assert!(matches!(
+            rx.recv().await.unwrap().kind,
+            EventKind::AgentTurnCompleted { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(held);
     }
 
     /// The security property: knowing the port is not enough.
@@ -1120,6 +1840,7 @@ mod tests {
         let (server, mut rx, endpoint) = server_with_limits(Limits {
             max_connections: 4,
             idle_timeout: Duration::from_millis(150),
+            ..Limits::default()
         })
         .await;
 
@@ -1163,6 +1884,7 @@ mod tests {
         let (server, mut rx, endpoint) = server_with_limits(Limits {
             max_connections: 8,
             idle_timeout: Duration::from_millis(150),
+            ..Limits::default()
         })
         .await;
 

@@ -108,6 +108,9 @@ pub struct Deadlines {
     pub typing_expires_at: Option<i64>,
     /// The next reconnect attempt, so the status line's countdown stays honest.
     pub reconnect_at: Option<i64>,
+    /// A terminal resize rejected by bounded transport pressure. This only exists
+    /// while a concrete geometry write is waiting to retry.
+    pub resize_retry_at: Option<i64>,
 }
 
 impl Deadlines {
@@ -120,6 +123,7 @@ impl Deadlines {
                 self.elapsed_tick_at,
                 self.typing_expires_at,
                 self.reconnect_at,
+                self.resize_retry_at,
             ],
         )
     }
@@ -181,6 +185,20 @@ mod tests {
             deadlines.plan(T0),
             RepaintPlan::After(Duration::from_millis(500))
         );
+    }
+
+    #[test]
+    fn a_rejected_terminal_intent_waits_for_its_backoff_then_returns_to_idle() {
+        let waiting = Deadlines {
+            resize_retry_at: Some(T0 + 100),
+            ..Deadlines::default()
+        };
+        assert_eq!(
+            waiting.plan(T0),
+            RepaintPlan::After(Duration::from_millis(100))
+        );
+        assert_eq!(waiting.plan(T0 + 100), RepaintPlan::After(Duration::ZERO));
+        assert!(Deadlines::default().plan(T0 + 101).is_idle());
     }
 
     /// A deadline that has already passed means "draw now", not a negative wait.

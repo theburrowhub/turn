@@ -311,7 +311,7 @@ impl Client {
         pane_id: &PaneId,
         size: PtySize,
     ) -> PaneAttachment {
-        let attachment = attachment_of(
+        let mut attachment = attachment_of(
             self.ask(Request::AttachPane {
                 session_id: session_id.clone(),
                 pane_id: pane_id.clone(),
@@ -328,6 +328,30 @@ impl Client {
         let key = (session_id.clone(), pane_id.clone());
         self.screens.insert(key.clone(), *screen);
         self.expected_seq.insert(key, attachment.next_seq);
+
+        // Attach is deliberately observational: subscribing must never resize a PTY
+        // before the client has accepted the daemon-resolved semantic/runtime binding.
+        // This test client follows the same two-step contract as the GUI, then returns
+        // the post-resize view so existing end-to-end assertions describe what is drawn.
+        if attachment.size != size {
+            if let Some(runtime_id) = attachment.runtime_id.clone() {
+                self.ask(Request::ResizePty {
+                    session_id: session_id.clone(),
+                    node_id: runtime_id,
+                    size,
+                })
+                .await;
+                self.poll_screens().await;
+                let key = (session_id.clone(), pane_id.clone());
+                attachment.size = size;
+                attachment.screen = self.screens.get(&key).cloned().map(Box::new);
+                attachment.next_seq = self
+                    .expected_seq
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(attachment.next_seq);
+            }
+        }
         attachment
     }
 
@@ -467,6 +491,7 @@ impl Client {
             .ask(Request::ResyncPane {
                 session_id: session_id.clone(),
                 pane_id: pane_id.clone(),
+                attachment_id: None,
             })
             .await;
         let (grid, next_seq) = match response {

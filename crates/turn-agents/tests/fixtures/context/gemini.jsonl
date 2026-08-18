@@ -1,0 +1,4 @@
+{"sessionId":"fixture","kind":"main"}
+{"type":"gemini","tokens":{"input":16761,"output":95,"cached":0,"thoughts":62,"tool":0,"total":16918},"model":"gemini-3.5-flash"}
+{"$set":{"messages":[{"type":"gemini","tokens":{"input":999999999},"model":"spoofed-nested-model"}]}}
+{"type":"gemini","tokens":{"input":17149,"output":29,"cached":7760,"thoughts":171,"tool":0,"total":17349},"model":"gemini-3.5-flash"}

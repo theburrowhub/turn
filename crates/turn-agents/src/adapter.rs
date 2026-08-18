@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, SessionId};
+use turn_core::model::{AgentLaunchProfileRef, LaunchConfiguration};
+
+/// Stable ids understood by every provider catalogue. The adapter owns what each
+/// id means for its CLI; callers never need to know a vendor flag.
+pub const SAFE_PROFILE_ID: &str = "safe";
+pub const AUTONOMOUS_PROFILE_ID: &str = "autonomous";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -18,6 +24,211 @@ pub enum AdapterError {
     Serialise(#[from] serde_json::Error),
     #[error("{tool} is not installed or not on PATH")]
     NotInstalled { tool: String },
+    #[error("unknown agent adapter `{adapter_id}`")]
+    UnknownLaunchAdapter { adapter_id: String },
+    #[error("adapter `{adapter_id}` has no launch profile `{profile_id}`")]
+    UnknownLaunchProfile {
+        adapter_id: String,
+        profile_id: String,
+    },
+    #[error(
+        "launch profile `{profile_id}` belongs to `{requested_adapter}`, but `{selected_adapter}` would run this command"
+    )]
+    LaunchProfileAdapterMismatch {
+        requested_adapter: String,
+        selected_adapter: String,
+        profile_id: String,
+    },
+    #[error("launch profile `{profile_id}` for `{adapter_id}` conflicts with {detail}")]
+    LaunchProfileConflict {
+        adapter_id: String,
+        profile_id: String,
+        detail: String,
+    },
+    #[error(
+        "adapter `{adapter_id}` could not preserve the operator's argument boundary while adding launch controls"
+    )]
+    ArgumentBoundaryViolation { adapter_id: String },
+    #[error(
+        "adapter `{adapter_id}` did not prove that autonomous launch profile `{profile_id}` is effective in the final argument vector"
+    )]
+    LaunchProfileNotGrounded {
+        adapter_id: String,
+        profile_id: String,
+    },
+}
+
+/// The option-bearing part of an agent argv.
+///
+/// The first exact `--` is a semantic boundary owned by the provider CLI: every
+/// subsequent value is positional prompt input, even when it looks like a flag.
+/// Adapter policy, conflict detection and launch receipts must therefore inspect
+/// this prefix only.
+pub(crate) fn control_arguments(args: &[String]) -> &[String] {
+    let end = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    &args[..end]
+}
+
+/// Adds Turn-owned CLI controls without moving or reinterpreting user argv.
+///
+/// Generated values are prepended as one self-contained group. This is stronger
+/// than inserting immediately before `--`: an incomplete or variadic user option
+/// can only consume values to its right, so it can never consume a Turn-owned
+/// control. The complete user argv stays byte-for-byte and order-for-order exact,
+/// including positional prompts that do not use an explicit terminator.
+pub fn insert_control_arguments(
+    args: &[String],
+    generated: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let generated: Vec<String> = generated.into_iter().collect();
+    let mut resolved = Vec::with_capacity(args.len() + generated.len());
+    resolved.extend(generated);
+    resolved.extend_from_slice(args);
+    resolved
+}
+
+/// Proves that an adapter plan only inserted controls before the user's prompt.
+///
+/// This is the daemon's fail-closed boundary for present and future adapters.
+/// The complete requested argv must be an exact suffix of the effective argv.
+/// Everything before it is adapter-owned, and no generated exact `--` is allowed.
+/// Besides preserving an explicit prompt suffix, this prevents a dangling user
+/// option from consuming the first generated control without requiring Turn to
+/// duplicate every provider's argument grammar.
+pub fn validate_effective_arguments(
+    adapter_id: &str,
+    requested: &[String],
+    effective: &[String],
+) -> Result<(), AdapterError> {
+    let generated_len = effective.len().saturating_sub(requested.len());
+    let valid = effective.len() >= requested.len()
+        && effective.ends_with(requested)
+        && effective[..generated_len]
+            .iter()
+            .all(|argument| argument != "--");
+    valid
+        .then_some(())
+        .ok_or_else(|| AdapterError::ArgumentBoundaryViolation {
+            adapter_id: adapter_id.to_string(),
+        })
+}
+
+/// The product-level choice presented to an operator.
+///
+/// This is an enum, not a `yolo: bool`: providers have materially different
+/// autonomous policies, recorded separately in [`LaunchPermissionPosture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchProfileRole {
+    Safe,
+    Autonomous,
+}
+
+/// What a provider profile actually changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPermissionPosture {
+    /// No Turn-selected policy; arguments came from a legacy or advanced launch.
+    Custom,
+    /// The provider's normal permission and sandbox policy remains in force.
+    StandardSafeguards,
+    /// Claude Code skips its permission checks.
+    BypassPermissions,
+    /// Codex bypasses both approvals and its sandbox.
+    BypassApprovalsAndSandbox,
+    /// Gemini runs in its `yolo` approval mode.
+    YoloApprovalMode,
+    /// OpenCode auto-approves requests except those explicitly denied by policy.
+    AutoApproveUnlessDenied,
+}
+
+/// One provider-owned choice suitable for a UI or template editor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfileDefinition {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub role: LaunchProfileRole,
+    pub posture: LaunchPermissionPosture,
+}
+
+impl LaunchProfileDefinition {
+    pub fn safe(description: impl Into<String>) -> Self {
+        Self {
+            id: SAFE_PROFILE_ID.to_string(),
+            label: "Safe".to_string(),
+            description: description.into(),
+            role: LaunchProfileRole::Safe,
+            posture: LaunchPermissionPosture::StandardSafeguards,
+        }
+    }
+
+    pub fn autonomous(posture: LaunchPermissionPosture, description: impl Into<String>) -> Self {
+        Self {
+            id: AUTONOMOUS_PROFILE_ID.to_string(),
+            label: "Autonomous".to_string(),
+            description: description.into(),
+            role: LaunchProfileRole::Autonomous,
+            posture,
+        }
+    }
+}
+
+/// A semantic profile resolved against a concrete argument vector.
+///
+/// `effective_flag_names` contains flag names only, never values, so callers can
+/// explain the launch without turning a model name, path or token into metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLaunchProfile {
+    pub adapter_id: String,
+    pub profile_id: String,
+    pub role: Option<LaunchProfileRole>,
+    pub posture: LaunchPermissionPosture,
+    pub args: Vec<String>,
+    pub effective_flag_names: Vec<String>,
+}
+
+impl ResolvedLaunchProfile {
+    fn custom(adapter_id: &str, args: &[String]) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: "custom".to_string(),
+            role: None,
+            posture: LaunchPermissionPosture::Custom,
+            args: args.to_vec(),
+            effective_flag_names: Vec::new(),
+        }
+    }
+
+    pub fn safe(adapter_id: &str, args: &[String]) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: SAFE_PROFILE_ID.to_string(),
+            role: Some(LaunchProfileRole::Safe),
+            posture: LaunchPermissionPosture::StandardSafeguards,
+            args: args.to_vec(),
+            effective_flag_names: Vec::new(),
+        }
+    }
+
+    pub fn autonomous(
+        adapter_id: &str,
+        posture: LaunchPermissionPosture,
+        args: Vec<String>,
+        effective_flag_names: Vec<String>,
+    ) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: AUTONOMOUS_PROFILE_ID.to_string(),
+            role: Some(LaunchProfileRole::Autonomous),
+            posture,
+            args,
+            effective_flag_names,
+        }
+    }
 }
 
 /// How well Turn understands a given tool. The brief's four levels.
@@ -85,6 +296,13 @@ impl HookEndpoint {
             self.token
         )
     }
+
+    /// Authenticated endpoint reserved for Claude Code's status-line schema.
+    /// Kept distinct from ordinary hooks so an object without
+    /// `hook_event_name` can never be mistaken for a provider lifecycle event.
+    pub fn status_line_url(&self) -> String {
+        format!("{}/status-line", self.url())
+    }
 }
 
 /// Everything an adapter needs to prepare a launch.
@@ -96,6 +314,9 @@ pub struct LaunchContext {
     /// The command the user asked for, e.g. `claude` plus their own flags.
     pub command: String,
     pub user_args: Vec<String>,
+    /// A persisted semantic choice. `None` is deliberately distinct from Safe:
+    /// it represents a legacy/custom command line that must remain untouched.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     pub endpoint: HookEndpoint,
     /// Directory the adapter may write throwaway configuration into. Turn owns
     /// it and deletes it with the session, so the user's own config is never
@@ -140,6 +361,78 @@ pub trait AgentAdapter: Send + Sync {
     fn best_level(&self) -> IntegrationLevel;
 
     fn capabilities(&self) -> Capabilities;
+
+    /// Provider-owned launch choices. Generic integrations expose only Safe;
+    /// concrete agent adapters add the exact Autonomous policy they support.
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![LaunchProfileDefinition::safe(
+            "Use the command line without changing its permission policy.",
+        )]
+    }
+
+    /// Applies one semantic profile to user arguments.
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        match profile_id {
+            SAFE_PROFILE_ID => Ok(ResolvedLaunchProfile::safe(self.id(), user_args)),
+            _ => Err(AdapterError::UnknownLaunchProfile {
+                adapter_id: self.id().to_string(),
+                profile_id: profile_id.to_string(),
+            }),
+        }
+    }
+
+    /// Resolves the persisted reference only after adapter selection, preventing a
+    /// Template saved for one provider from silently applying to another command.
+    fn resolve_context_launch_profile(
+        &self,
+        ctx: &LaunchContext,
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        let resolved = if let Some(requested) = &ctx.launch_profile {
+            if requested.adapter_id != self.id() {
+                return Err(AdapterError::LaunchProfileAdapterMismatch {
+                    requested_adapter: requested.adapter_id.clone(),
+                    selected_adapter: self.id().to_string(),
+                    profile_id: requested.profile_id.clone(),
+                });
+            }
+            self.resolve_launch_profile(&requested.profile_id, &ctx.user_args)?
+        } else {
+            ResolvedLaunchProfile::custom(self.id(), &ctx.user_args)
+        };
+        validate_effective_arguments(self.id(), &ctx.user_args, &resolved.args)?;
+        Ok(resolved)
+    }
+
+    /// Privacy-safe launch facts for this provider's argv.
+    ///
+    /// The adapter owns policy option semantics just as it owns profile
+    /// resolution. The default understands the universal long model option and
+    /// retains flag names only; providers override this beside their existing
+    /// conflict logic for short model spellings and explicit custom policies.
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        crate::launch_facts::base_launch_configuration(args, profile, false)
+    }
+
+    /// Whether the final provider argv actually establishes a semantic profile.
+    ///
+    /// `effective_flag_names` is display metadata, not evidence: value-bearing
+    /// options, repetition and precedence are provider grammar. Future adapters
+    /// therefore fail closed for Autonomous until they implement this method.
+    fn launch_profile_is_grounded(
+        &self,
+        _args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> bool {
+        profile.role != Some(LaunchProfileRole::Autonomous)
+    }
 
     /// Whether this adapter handles a given command line.
     fn handles(&self, command: &str) -> bool {
@@ -264,5 +557,107 @@ mod tests {
     fn which_rejects_a_directory_that_shares_a_binarys_name() {
         // `/tmp` is a directory, not an executable, and must not be returned.
         assert!(!is_executable(std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn generated_controls_are_prepended_before_the_complete_requested_argv() {
+        let requested = vec![
+            "--model".into(),
+            "opus".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "--settings=/not-an-option.json".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let effective =
+            insert_control_arguments(&requested, ["--settings".into(), "/turn/owned.json".into()]);
+        assert_eq!(
+            effective,
+            vec![
+                "--settings",
+                "/turn/owned.json",
+                "--model",
+                "opus",
+                "--",
+                "literal prompt",
+                "--settings=/not-an-option.json",
+                "--",
+                "tail",
+            ]
+        );
+        validate_effective_arguments("test", &requested, &effective).unwrap();
+
+        let dangling = vec!["--model".into(), "--".into(), "prompt".into()];
+        let protected = insert_control_arguments(&dangling, ["--auto".into()]);
+        assert_eq!(protected, vec!["--auto", "--model", "--", "prompt"]);
+        validate_effective_arguments("test", &dangling, &protected).unwrap();
+
+        let positional = vec!["literal prompt without terminator".into()];
+        let protected = insert_control_arguments(&positional, ["--auto".into()]);
+        assert_eq!(
+            protected,
+            vec!["--auto", "literal prompt without terminator"]
+        );
+        validate_effective_arguments("test", &positional, &protected).unwrap();
+
+        let resumed = insert_control_arguments(&dangling, ["--resume".into(), "session-1".into()]);
+        let profiled = insert_control_arguments(&resumed, ["--auto".into()]);
+        let integrated = insert_control_arguments(&profiled, ["-c".into(), "hooks={...}".into()]);
+        assert_eq!(
+            integrated,
+            vec![
+                "-c",
+                "hooks={...}",
+                "--auto",
+                "--resume",
+                "session-1",
+                "--model",
+                "--",
+                "prompt"
+            ]
+        );
+        validate_effective_arguments("test", &dangling, &integrated).unwrap();
+    }
+
+    #[test]
+    fn argument_boundary_validation_refuses_prompt_rewrites_and_late_controls() {
+        let requested = vec!["--".into(), "prompt".into(), "--flag".into()];
+        for unsafe_plan in [
+            vec![
+                "--".into(),
+                "prompt".into(),
+                "--flag".into(),
+                "--auto".into(),
+            ],
+            vec!["--".into(), "changed".into(), "--flag".into()],
+            vec![
+                "--".into(),
+                "--auto".into(),
+                "prompt".into(),
+                "--flag".into(),
+            ],
+            vec![
+                "--auto".into(),
+                "--".into(),
+                "--".into(),
+                "prompt".into(),
+                "--flag".into(),
+            ],
+        ] {
+            assert!(matches!(
+                validate_effective_arguments("future-adapter", &requested, &unsafe_plan),
+                Err(AdapterError::ArgumentBoundaryViolation { adapter_id })
+                    if adapter_id == "future-adapter"
+            ));
+        }
+
+        let no_boundary = vec!["prompt".into()];
+        assert!(validate_effective_arguments(
+            "future-adapter",
+            &no_boundary,
+            &["prompt".into(), "--".into(), "late".into()]
+        )
+        .is_err());
     }
 }

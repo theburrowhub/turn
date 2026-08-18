@@ -83,6 +83,7 @@ fn launch_ctx() -> LaunchContext {
         cwd: "/repo".into(),
         command: "codex".into(),
         user_args: Vec::new(),
+        launch_profile: None,
         endpoint: HookEndpoint {
             base_url: "http://127.0.0.1:51234".into(),
             token: "tok_contract".into(),

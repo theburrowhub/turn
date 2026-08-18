@@ -503,6 +503,7 @@ mod tests {
     use turn_agents::{IntegrationLevel, OutputHeuristic};
     use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::PaneId;
+    use turn_core::model::{Observable, ObservationSourceKind};
 
     const NOW: i64 = 1_775_000_000_000;
 
@@ -1256,6 +1257,79 @@ mod tests {
                 .map(String::as_str),
             Some("native")
         );
+
+        let runtime = &node.agent.as_ref().unwrap().runtime;
+        assert!(matches!(
+            &runtime.launch.current,
+            Observable::Observed {
+                value,
+                source,
+                observed_at_ms,
+                ..
+            } if value.model.as_deref() == Some("gemini-2.5-pro")
+                && source.kind == ObservationSourceKind::Provider
+                && source.label.as_deref() == Some("gemini-cli event")
+                && *observed_at_ms == NOW + 1
+        ));
+
+        // AgentStarted is also the provider's safe mid-turn metadata refresh. A
+        // later model must replace `current` without resetting the active turn.
+        harness.core.ingest(
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentStarted {
+                    tool: "gemini-cli".into(),
+                    model: Some("gemini-2.5-flash".into()),
+                    external_id: None,
+                },
+                EventSource::Hook {
+                    tool: "gemini-cli".into(),
+                    event_name: "BeforeModel".into(),
+                },
+                Confidence::Explicit,
+                NOW + 2,
+            )
+            .with_node(node_id.clone()),
+            NOW + 2,
+        );
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap();
+        assert_eq!(node.turn, Some(Turn::Active));
+        assert_eq!(
+            node.agent.as_ref().unwrap().agent.model.as_deref(),
+            Some("gemini-2.5-flash")
+        );
+        assert!(matches!(
+            &node.agent.as_ref().unwrap().runtime.launch.current,
+            Observable::Observed {
+                value,
+                source,
+                observed_at_ms,
+                ..
+            } if value.model.as_deref() == Some("gemini-2.5-flash")
+                && source.kind == ObservationSourceKind::Provider
+                && *observed_at_ms == NOW + 2
+        ));
+
+        let durable = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .expect("the runtime checkpoint persists the Session");
+        let durable = durable.tree.get(&node_id).unwrap().agent.as_ref().unwrap();
+        assert!(matches!(
+            &durable.runtime.launch.current,
+            Observable::Observed {
+                value,
+                observed_at_ms,
+                ..
+            } if value.model.as_deref() == Some("gemini-2.5-flash")
+                && *observed_at_ms == NOW + 2
+        ));
     }
 
     #[tokio::test]

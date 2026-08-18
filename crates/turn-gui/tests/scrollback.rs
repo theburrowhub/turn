@@ -388,6 +388,7 @@ async fn a_search_finds_output_that_scrolled_off_the_screen_and_the_window_can_r
         .ask(Request::ResyncPane {
             session_id: session_id.clone(),
             pane_id: pane.clone(),
+            attachment_id: None,
         })
         .await
     {

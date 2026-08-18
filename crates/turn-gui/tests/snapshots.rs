@@ -26,10 +26,12 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk, Severity};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane,
-    PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement, PreviewSource, ProcessNode, Relation,
-    RestoreState, Session, SessionMode, Template, Workspace, WorkspaceCheckout,
-    WorkspaceWriteLease,
+    ActivityPreview, AgentInfo, AgentLaunchProfileRef, AgentName, ContextUsageSnapshot, Direction,
+    DropZone, LaunchConfiguration, Layout, LeaseState, NodeKind, Observable, ObservationSource,
+    ObservationSourceKind, Pane, PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement,
+    PreviewSource, ProcessNode, QuotaSnapshot, QuotaWindow, Relation, RestoreState, Session,
+    SessionMode, Template, UsageMeasurement, UsageMeasurementKind, UsageUnit, Workspace,
+    WorkspaceCheckout, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
@@ -108,6 +110,11 @@ impl Fixture {
             .iter()
             .map(|(pane_id, grid)| PaneContent {
                 pane_id: pane_id.clone(),
+                runtime_id: self
+                    .layout
+                    .as_ref()
+                    .and_then(|layout| layout.get(pane_id))
+                    .and_then(|pane| pane.node_id.clone()),
                 title: self
                     .titles
                     .get(pane_id)
@@ -130,6 +137,7 @@ impl Fixture {
             });
             TemporaryPaneContent {
                 pane,
+                runtime_id: Some(pane.binding.node_id.clone()),
                 node,
                 previews: &self.temporary_previews,
                 grid: self.grids.get(&pane.binding.pane_id),
@@ -382,6 +390,77 @@ fn add_preview(
     preview
 }
 
+fn add_runtime_metadata(info: &mut AgentInfo, model: &str) {
+    let request_source = ObservationSource::new(ObservationSourceKind::LaunchRequest, "template");
+    let adapter_source = ObservationSource::new(ObservationSourceKind::Adapter, "claude adapter");
+    let provider_source =
+        ObservationSource::new(ObservationSourceKind::Provider, "claude statusline");
+    let configuration = LaunchConfiguration {
+        model: Some(model.into()),
+        model_display_name: None,
+        permission_mode: Some("default".into()),
+        approval_mode: Some("prompt".into()),
+        sandbox_mode: Some("workspace write".into()),
+        effort_level: None,
+        thinking_enabled: None,
+        safe_flags: vec!["--permission-mode default".into()],
+    };
+    info.runtime.launch.requested =
+        Observable::observed(configuration.clone(), request_source, T0 + 3_000, None);
+    info.runtime.launch.effective =
+        Observable::observed(configuration.clone(), adapter_source, T0 + 3_010, None);
+    let mut current = configuration;
+    current.model_display_name = Some("Claude 3.5 Sonnet".into());
+    current.effort_level = Some("high".into());
+    current.thinking_enabled = Some(true);
+    info.runtime.launch.current = Observable::observed(
+        current,
+        provider_source.clone(),
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+    info.runtime.context = Observable::observed(
+        ContextUsageSnapshot {
+            scope_id: Some("conversation-main".into()),
+            measurement: UsageMeasurement {
+                kind: UsageMeasurementKind::Used,
+                amount: 54_000.0,
+                unit: UsageUnit::Tokens,
+                total: Some(200_000.0),
+            },
+            effective_window: None,
+            window_size_tokens: None,
+            used_percentage: None,
+            remaining_percentage: None,
+            current_usage: None,
+        },
+        provider_source.clone(),
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+    info.runtime.quota = Observable::observed(
+        QuotaSnapshot {
+            scope_id: Some("anthropic-team".into()),
+            scope_label: Some("Team account".into()),
+            windows: vec![QuotaWindow {
+                label: "five hour".into(),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Remaining,
+                    amount: 72.0,
+                    unit: UsageUnit::Percent,
+                    total: None,
+                },
+                resets_at_ms: Some(T0 + 3_600_000),
+                exhausted: None,
+                hard_limit: Some(true),
+            }],
+        },
+        provider_source,
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+}
+
 /// A production-shaped hierarchy fixture. It is built from domain entities and projected
 /// through the same protocol views as `turnd`; no `SessionRow` or second agent tree is
 /// fabricated for the screenshot.
@@ -428,6 +507,8 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         model: Some("claude-3.5-sonnet".into()),
         external_id: Some("claude-main".into()),
     };
+    claude_info.permission_mode = Some("default".into());
+    add_runtime_metadata(claude_info, "claude-3.5-sonnet");
     claude_info.current_task = Some("Fix the climbing transition and verify it".into());
     add_preview(
         &mut claude,
@@ -456,6 +537,8 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         model: Some("claude-3.5-sonnet".into()),
         external_id: Some("reviewer".into()),
     };
+    reviewer_info.permission_mode = Some("default".into());
+    add_runtime_metadata(reviewer_info, "claude-3.5-sonnet");
     reviewer_info.current_task = Some("Review the climbing logic changes".into());
     add_preview(
         &mut reviewer,
@@ -1112,6 +1195,49 @@ fn selecting_a_semantic_subagent_opens_its_exact_full_work_surface_without_touch
 }
 
 #[test]
+fn exact_agent_runtime_effort_thinking_and_safe_launch_facts_are_accessible_at_a_glance() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let accessible = all_text(&h);
+    assert!(
+        accessible.iter().any(|text| text == "EFFORT  high"),
+        "live effort is a compact accessible fact: {accessible:?}"
+    );
+    assert!(
+        accessible.iter().any(|text| text == "THINK  enabled"),
+        "live thinking state is a compact accessible fact: {accessible:?}"
+    );
+    let accessible = accessible.join("\n");
+    assert!(accessible.contains("model claude-3.5-sonnet (Claude 3.5 Sonnet)"));
+    assert!(accessible.contains("effort high · thinking enabled"));
+    assert!(accessible.contains("flags --permission-mode default"));
+}
+
+#[test]
 fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
     let mut fixture = busy_desk();
     fixture.permission = None;
@@ -1422,6 +1548,10 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     });
     safe_agent.pending_question = Some("[redacted question]".into());
     safe_agent.permission_mode = Some("[redacted permission mode]".into());
+    // Force the compact runtime header through the safe legacy projection. The
+    // poisoned hierarchy below must never override it while details are loading
+    // or after they arrive.
+    safe_agent.runtime = Default::default();
     safe_agent.git_branch = Some("[redacted branch]".into());
 
     let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
@@ -1465,6 +1595,51 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     });
     raw_agent.pending_question = Some(format!("Question containing {SECRET}"));
     raw_agent.permission_mode = Some(format!("mode {SECRET}"));
+    let poisoned_source = ObservationSource::new(
+        ObservationSourceKind::Provider,
+        format!("runtime source {SECRET}"),
+    );
+    raw_agent.runtime.launch.current = Observable::observed(
+        LaunchConfiguration {
+            model: Some(format!("runtime model {SECRET}")),
+            model_display_name: Some(format!("runtime display {SECRET}")),
+            permission_mode: Some(format!("runtime mode {SECRET}")),
+            approval_mode: Some(format!("runtime approval {SECRET}")),
+            sandbox_mode: Some(format!("runtime sandbox {SECRET}")),
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
+            safe_flags: vec![format!("--profile={SECRET}")],
+        },
+        poisoned_source.clone(),
+        T0 + 13_000,
+        None,
+    );
+    raw_agent.runtime.context = Observable::failed(
+        poisoned_source.clone(),
+        T0 + 13_000,
+        format!("runtime failure {SECRET}"),
+    );
+    raw_agent.runtime.quota = Observable::observed(
+        QuotaSnapshot {
+            scope_id: Some(format!("quota scope {SECRET}")),
+            scope_label: Some(format!("quota account {SECRET}")),
+            windows: vec![QuotaWindow {
+                label: format!("quota window {SECRET}"),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Remaining,
+                    amount: 1.0,
+                    unit: UsageUnit::Percent,
+                    total: None,
+                },
+                resets_at_ms: None,
+                exhausted: None,
+                hard_limit: None,
+            }],
+        },
+        poisoned_source,
+        T0 + 13_000,
+        None,
+    );
     raw_agent.git_branch = Some(format!("branch/{SECRET}"));
 
     let mut h = harness(fixture);
@@ -1642,24 +1817,40 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
 }
 
 #[test]
-fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
+fn an_exact_terminal_binding_renders_as_the_operational_node_view() {
     let mut fixture = busy_desk();
     fixture.permission = None;
     fixture.queue.clear();
-    let node = fixture
-        .hierarchy
-        .as_mut()
-        .expect("hierarchy")
-        .workspaces
-        .iter_mut()
-        .flat_map(|workspace| &mut workspace.sessions)
-        .flat_map(|session| &mut session.nodes)
-        .find(|node| node.title == "Claude Code")
-        .expect("Claude Code");
-    let node_id = node.node_id.clone();
-    node.pane_capability = NodePaneCapability::Terminal {
-        streams: vec![PaneStream::Cells],
+    let (node_id, pane_id) = {
+        let node = fixture
+            .hierarchy
+            .as_mut()
+            .expect("hierarchy")
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.sessions)
+            .flat_map(|session| &mut session.nodes)
+            .find(|node| node.title == "Claude Code")
+            .expect("Claude Code");
+        node.pane_capability = NodePaneCapability::Terminal {
+            streams: vec![PaneStream::Cells],
+        };
+        (
+            node.node_id.clone(),
+            node.pane_bindings
+                .first()
+                .expect("the exact Agent has a durable Pane")
+                .pane_id
+                .clone(),
+        )
     };
+    fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .get_mut(&pane_id)
+        .expect("the bound Pane")
+        .node_id = Some(node_id.clone());
     fixture
         .hierarchy
         .as_mut()
@@ -1669,23 +1860,60 @@ fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
     fixture.inspector = Some(node_inspector(&fixture, &node_id));
     let expected_layout = serde_json::to_vec(fixture.layout.as_ref().expect("saved layout"))
         .expect("serialise Layout");
-    let mut h = harness(fixture);
-    h.run();
-    h.run();
+    let mut window = window(fixture);
+    window.theme = Theme::with_appearance(&AppearanceSettings {
+        reduced_motion: true,
+        cursor_blink: false,
+        ..AppearanceSettings::default()
+    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                window.theme.install(ui.ctx());
+                window.actions.extend(window.fixture.view().ui(
+                    ui,
+                    &window.theme,
+                    &window.keymap,
+                    &mut window.state,
+                ));
+            },
+            window,
+        );
+    let steps = h.run();
+    assert!(
+        steps <= 6,
+        "the exact terminal needed {steps} frames to settle under reduced motion"
+    );
 
     assert_eq!(
         h.state().state.work_surface_target,
-        Some(ViewTarget::Node(node_id))
+        Some(ViewTarget::Node(node_id.clone()))
+    );
+    let terminal_rect = h.get_by_label_contains("Terminal, 40 rows").rect();
+    let expected = turn_gui::panes::size_in_cells(terminal_rect, measured_cell(&h.state().theme));
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![expected],
+        "the exact Node surface must size its runtime from the entire operational rectangle"
+    );
+    assert_eq!(
+        h.state()
+            .state
+            .panes
+            .get(&pane_id)
+            .and_then(PaneInteraction::reported_size),
+        Some(expected)
     );
     let text = all_text(&h).join("\n");
     assert!(group_labels(&h)
         .iter()
-        .any(|label| label == "Exact read-only terminal mirror for Claude Code"));
+        .any(|label| label == "Exact operational terminal for Claude Code"));
     assert!(text.contains("I'll fix the climbing bug. Running the tests first."));
     assert!(h.state().actions.iter().all(|action| !matches!(
         action,
         ViewAction::Pane {
-            action: PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_),
+            action: PaneAction::Write(_),
             ..
         } | ViewAction::ZoomPane { .. }
     )));
@@ -2031,7 +2259,9 @@ fn the_custom_pane_editor_is_a_named_modal_dialog() {
         title: String::new(),
         program: String::new(),
         arguments: String::new(),
+        launch_profile: None,
         cwd: String::new(),
+        advanced: false,
         placement: PanePlacement::SplitRight,
         error: None,
     });
@@ -2039,6 +2269,83 @@ fn the_custom_pane_editor_is_a_named_modal_dialog() {
     h.run();
 
     assert_modal(&h, egui::accesskit::Role::Dialog, "New Pane");
+}
+
+#[test]
+fn an_agent_pane_exposes_provider_and_mode_without_requiring_flags() {
+    let fixture = busy_desk();
+    let target_pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("an active pane");
+    let mut h = harness(fixture);
+    h.state_mut().state.new_pane = Some(NewPaneDraft {
+        target_pane_id,
+        kind: PaneKind::Agent,
+        title: "Claude".into(),
+        program: "claude".into(),
+        arguments: String::new(),
+        launch_profile: Some(AgentLaunchProfileRef::new("claude-code", "autonomous")),
+        cwd: String::new(),
+        advanced: false,
+        placement: PanePlacement::SplitRight,
+        error: None,
+    });
+    h.run();
+    h.run();
+
+    let labels = all_text(&h).join("\n");
+    assert!(labels.contains("Claude"), "visible text: {labels}");
+    assert!(labels.contains("Autonomous"), "visible text: {labels}");
+    assert!(
+        labels.contains("Runs without Claude permission prompts."),
+        "visible text: {labels}"
+    );
+    assert!(
+        !labels.contains("dangerously-skip-permissions"),
+        "the fast path must communicate intent without asking the operator for argv"
+    );
+    h.snapshot("agent_pane_profiles");
+}
+
+#[test]
+fn the_pane_menu_launches_any_provider_mode_without_opening_advanced_settings() {
+    let mut h = harness(busy_desk());
+    h.run();
+    h.run();
+    h.query_by_label("+ Pane")
+        .expect("the Session toolbar has a Pane menu")
+        .click();
+    h.run();
+
+    for label in [
+        "Claude · Safe",
+        "Claude · Autonomous",
+        "Codex · Safe",
+        "Codex · Autonomous",
+        "Gemini · Safe",
+        "Gemini · Autonomous",
+        "OpenCode · Safe",
+        "OpenCode · Autonomous",
+    ] {
+        assert!(
+            h.query_by_label(label).is_some(),
+            "the zero-memory Pane menu is missing {label:?}"
+        );
+    }
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Codex · Autonomous").unwrap().click();
+    h.run();
+    assert!(h.state().actions.iter().any(|action| matches!(
+        action,
+        ViewAction::CreatePane { pane, .. }
+            if pane.command.as_deref() == Some("codex")
+                && pane.args.is_empty()
+                && pane.launch_profile.as_ref().is_some_and(|profile|
+                    profile.adapter_id == "codex" && profile.profile_id == "autonomous")
+    )));
 }
 
 #[test]
@@ -4403,6 +4710,495 @@ fn a_detached_pane_restores_as_a_floating_view() {
     h.snapshot("floating_pane");
 }
 
+fn pane_resizes(actions: &[ViewAction], pane_id: &PaneId) -> Vec<PtySize> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ViewAction::Pane {
+                pane_id: resized,
+                action: PaneAction::Resize(size),
+            } if resized == pane_id => Some(*size),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs the real `TurnView` renderer with one durable Pane. A fresh/restored window must
+/// immediately report every measured row and column, then the visual Pane and its rectangle
+/// stay put while its process identity changes, exactly as they do on relaunch.
+fn assert_replacement_runtime_is_resized_once(floating: bool) {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("active Pane");
+    let previous = NodeId::from_stored("node_previous_rendered_pty");
+    fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .get_mut(&pane_id)
+        .expect("active Pane in Layout")
+        .node_id = Some(previous);
+    if floating {
+        assert!(fixture.layout.as_mut().expect("layout").float(
+            &pane_id,
+            PaneGeometry {
+                x: 340.0,
+                y: 80.0,
+                width: 860.0,
+                height: 560.0,
+            },
+        ));
+    } else {
+        fixture.layout.as_mut().expect("layout").zoomed = Some(pane_id.clone());
+    }
+
+    let mut h = harness(fixture);
+    h.run_steps(1);
+    let visible = h
+        .state()
+        .state
+        .panes
+        .get(&pane_id)
+        .and_then(PaneInteraction::reported_size)
+        .expect("the live Pane reported its measured geometry");
+    let terminal_rect = h.get_by_label_contains("Terminal, 40 rows").rect();
+    let measured = turn_gui::panes::size_in_cells(terminal_rect, measured_cell(&Theme::dark()));
+    assert_eq!(
+        visible, measured,
+        "Resize must use the exact body rectangle and the same measured cell the renderer paints"
+    );
+    assert!(
+        visible.rows > 24 && visible.cols > 80,
+        "the test Pane must exceed the 80x24 fallback to cover the large-TUI regression: {visible:?}"
+    );
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![visible],
+        "the initial/restored runtime receives the Pane's real geometry on its first frame"
+    );
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        pane_resizes(&h.state().actions, &pane_id).is_empty(),
+        "an unchanged initial runtime is not resized again"
+    );
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window
+            .fixture
+            .layout
+            .as_mut()
+            .expect("layout")
+            .get_mut(&pane_id)
+            .expect("durable Pane")
+            .node_id = Some(NodeId::from_stored("node_replacement_rendered_pty"));
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![visible],
+        "the replacement runtime receives the unchanged live geometry exactly once"
+    );
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        pane_resizes(&h.state().actions, &pane_id).is_empty(),
+        "the next frame must not repeat the replacement runtime's resize"
+    );
+}
+
+#[test]
+fn a_replacement_runtime_is_resized_once_through_the_tiled_render_path() {
+    assert_replacement_runtime_is_resized_once(false);
+}
+
+#[test]
+fn a_replacement_runtime_is_resized_once_through_the_floating_render_path() {
+    assert_replacement_runtime_is_resized_once(true);
+}
+
+#[test]
+fn mixed_splits_fill_each_runtime_initially_and_during_both_divider_drags() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let pane_ids: Vec<PaneId> = fixture
+        .layout
+        .as_ref()
+        .expect("the mixed layout")
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect();
+    assert_eq!(pane_ids.len(), 3);
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        fixture
+            .layout
+            .as_mut()
+            .expect("the mixed layout")
+            .get_mut(pane_id)
+            .expect("the Pane")
+            .node_id = Some(NodeId::from_stored(format!("proc_mixed_geometry_{index}")));
+    }
+
+    // Start settled without PaneContent, then let all three runtimes appear at once. This
+    // isolates the one post-paint wakeup that first complete-cell geometry requires; cursor
+    // animation cannot accidentally provide a second frame because reduced motion disables it.
+    let grids = std::mem::take(&mut fixture.grids);
+    let mut window = window(fixture);
+    window.theme = Theme::with_appearance(&AppearanceSettings {
+        reduced_motion: true,
+        cursor_blink: false,
+        ..AppearanceSettings::default()
+    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                window.theme.install(ui.ctx());
+                window.actions.extend(window.fixture.view().ui(
+                    ui,
+                    &window.theme,
+                    &window.keymap,
+                    &mut window.state,
+                ));
+            },
+            window,
+        );
+    h.run();
+    h.state_mut().fixture.grids = grids;
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "the first paint discovers geometry; its follow-up owns the Resize"
+    );
+    let first_delay = h
+        .output()
+        .viewport_output
+        .values()
+        .map(|viewport| viewport.repaint_delay)
+        .min()
+        .unwrap_or(std::time::Duration::MAX);
+    assert_eq!(
+        first_delay,
+        std::time::Duration::ZERO,
+        "first geometry discovery must wake a reduced-motion window exactly once"
+    );
+    h.run_steps(1);
+
+    let terminal_rects = |h: &Harness<'static, Window>| {
+        let mut rects: Vec<egui::Rect> = h
+            .query_all_by_role(egui::accesskit::Role::Terminal)
+            .map(|node| node.rect())
+            .collect();
+        rects.sort_by(|left, right| {
+            left.min
+                .x
+                .total_cmp(&right.min.x)
+                .then_with(|| left.min.y.total_cmp(&right.min.y))
+        });
+        assert_eq!(rects.len(), 3, "one terminal rectangle per runtime");
+        rects
+    };
+    let rects = terminal_rects(&h);
+    for (pane_id, rect) in pane_ids.iter().zip(&rects) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(
+            pane_resizes(&h.state().actions, pane_id),
+            vec![expected],
+            "each distinct runtime receives its complete split rectangle"
+        );
+    }
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(pane_ids
+        .iter()
+        .all(|pane_id| pane_resizes(&h.state().actions, pane_id).is_empty()));
+
+    // Drag the outer horizontal divider. Apply the daemon-shaped layout answer, then
+    // verify the frame while the pointer is still held resizes all three affected runtimes.
+    let rects = terminal_rects(&h);
+    let horizontal_start = egui::pos2((rects[0].max.x + rects[1].min.x) / 2.0, rects[1].center().y);
+    let horizontal_end = horizontal_start + egui::vec2(96.0, 0.0);
+    h.hover_at(horizontal_start);
+    h.run_steps(1);
+    h.drag_at(horizontal_start);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.hover_at(horizontal_end);
+    h.run_steps(1);
+    let horizontal = h
+        .state()
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            ViewAction::ResizeDivider {
+                before,
+                after,
+                fraction,
+            } => Some((before.clone(), after.clone(), *fraction)),
+            _ => None,
+        })
+        .expect("dragging the horizontal divider emits its delta");
+    assert_eq!((&horizontal.0, &horizontal.1), (&pane_ids[0], &pane_ids[1]));
+    assert!(h
+        .state_mut()
+        .fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .resize_divider(&horizontal.0, &horizontal.1, horizontal.2));
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    let rects = terminal_rects(&h);
+    for (pane_id, rect) in pane_ids.iter().zip(&rects) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(pane_resizes(&h.state().actions, pane_id), vec![expected]);
+    }
+    h.drop_at(horizontal_end);
+    h.run_steps(1);
+
+    // The nested vertical divider changes only its two children; the tall left Pane must
+    // neither resize nor wait for release before the right-hand TUIs fill their new rows.
+    let rects = terminal_rects(&h);
+    // A terminal's accessibility rectangle excludes the Pane header. The divider is
+    // immediately below the upper terminal, not midway through the lower Pane's header.
+    let vertical_start = egui::pos2(
+        rects[1].center().x,
+        rects[1].max.y + turn_gui::panes::DIVIDER_THICKNESS / 2.0,
+    );
+    let vertical_end = vertical_start + egui::vec2(0.0, 72.0);
+    h.hover_at(vertical_start);
+    h.run_steps(1);
+    h.drag_at(vertical_start);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.hover_at(vertical_end);
+    h.run_steps(1);
+    let vertical = h
+        .state()
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            ViewAction::ResizeDivider {
+                before,
+                after,
+                fraction,
+            } => Some((before.clone(), after.clone(), *fraction)),
+            _ => None,
+        })
+        .expect("dragging the nested vertical divider emits its delta");
+    assert_eq!((&vertical.0, &vertical.1), (&pane_ids[1], &pane_ids[2]));
+    assert!(h
+        .state_mut()
+        .fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .resize_divider(&vertical.0, &vertical.1, vertical.2));
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    let rects = terminal_rects(&h);
+    assert!(pane_resizes(&h.state().actions, &pane_ids[0]).is_empty());
+    for (pane_id, rect) in pane_ids[1..].iter().zip(&rects[1..]) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(pane_resizes(&h.state().actions, pane_id), vec![expected]);
+    }
+    h.drop_at(vertical_end);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(pane_ids
+        .iter()
+        .all(|pane_id| pane_resizes(&h.state().actions, pane_id).is_empty()));
+}
+
+#[test]
+fn one_runtime_has_one_geometry_owner_across_duplicates_floating_and_temporary_views() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let layout = fixture.layout.as_mut().expect("layout");
+    let first = layout.active.clone().expect("active Pane");
+    let runtime = NodeId::from_stored("node_shared_geometry_runtime");
+    layout.get_mut(&first).expect("first Pane").node_id = Some(runtime.clone());
+    let duplicate = layout.duplicate(&first).expect("duplicate Pane");
+    assert_eq!(
+        layout
+            .get(&duplicate)
+            .and_then(|pane| pane.node_id.as_ref()),
+        Some(&runtime)
+    );
+    assert!(layout.float(
+        &duplicate,
+        PaneGeometry {
+            x: 710.0,
+            y: 120.0,
+            width: 310.0,
+            height: 210.0,
+        },
+    ));
+    layout.active = Some(first.clone());
+    fixture.focused = Some(first.clone());
+    fixture.grids.insert(duplicate.clone(), agent_screen());
+    fixture
+        .titles
+        .insert(duplicate.clone(), "shared mirror".into());
+
+    let mut h = harness(fixture);
+    h.run_steps(1);
+    let first_size = h
+        .state()
+        .state
+        .panes
+        .get(&first)
+        .and_then(PaneInteraction::reported_size)
+        .expect("focused owner measured its geometry");
+    assert_eq!(pane_resizes(&h.state().actions, &first), vec![first_size]);
+    assert!(
+        pane_resizes(&h.state().actions, &duplicate).is_empty(),
+        "the unequal floating duplicate must be a read-only geometry mirror"
+    );
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window.fixture.layout.as_mut().expect("layout").active = Some(duplicate.clone());
+        window.fixture.focused = Some(duplicate.clone());
+    }
+    h.run_steps(1);
+    let duplicate_size = h
+        .state()
+        .state
+        .panes
+        .get(&duplicate)
+        .and_then(PaneInteraction::reported_size)
+        .expect("new focused owner measured its floating geometry");
+    assert_eq!(
+        pane_resizes(&h.state().actions, &duplicate),
+        vec![duplicate_size],
+        "focus transfers geometry ownership exactly once"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "stationary duplicates must not ping-pong the shared PTY"
+    );
+
+    let temporary_id = PaneId::from_stored("pane_shared_runtime_temporary");
+    let selected = h
+        .state()
+        .fixture
+        .selected
+        .clone()
+        .expect("selected Session");
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window
+            .fixture
+            .grids
+            .insert(temporary_id.clone(), agent_screen());
+        window.fixture.temporary_pane = Some(NodePaneView {
+            binding: PaneNodeBinding {
+                pane_id: temporary_id.clone(),
+                session_id: selected,
+                node_id: runtime.clone(),
+                temporary: true,
+                surface_id: Some("window-snapshot".into()),
+                opened_ms: T0,
+            },
+            capability: NodePaneCapability::Terminal {
+                streams: vec![PaneStream::Cells],
+            },
+        });
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &temporary_id).len(),
+        1,
+        "the explicit temporary terminal takes ownership once"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+    assert!(pane_resizes(&h.state().actions, &duplicate).is_empty());
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window.fixture.temporary_pane = None;
+        window.fixture.grids.remove(&temporary_id);
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &duplicate),
+        vec![duplicate_size],
+        "closing the temporary view returns ownership to the focused Pane even at its old size"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "the owner returned by temporary close must settle after one report"
+    );
+}
+
 #[test]
 fn a_write_lease_conflict_offers_only_explicit_safe_alternatives() {
     let mut fixture = busy_desk();
@@ -5574,6 +6370,7 @@ fn interactive_pane(
                     grid: &grid,
                     options,
                     id: ui.id().with("pane-under-test"),
+                    resize_claim: None,
                     chrome: None,
                 },
             );
@@ -5727,7 +6524,9 @@ fn new_output_while_scrolled_back_leaves_the_view_where_it_was() {
     let mut feed = PaneFeed::attach(&PaneAttachment {
         session_id: SessionId::from_stored("sess_scroll01"),
         pane_id: PaneId::from_stored("pane_scroll01"),
+        attachment_id: 7,
         node_id: None,
+        runtime_id: None,
         stream: PaneStream::Cells,
         screen: Some(Box::new(daemon.clone())),
         scrollback: turn_proto::Scrollback::default(),

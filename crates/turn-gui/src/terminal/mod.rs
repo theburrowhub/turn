@@ -52,6 +52,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use turn_core::ids::NodeId;
 use turn_core::model::Direction;
 use turn_proto::cells::{CellAttrs, CellRun, Grid, Rgb};
 use turn_proto::PtySize;
@@ -78,6 +79,9 @@ pub enum PaneAction {
     Write(Vec<u8>),
     /// The pane is a different size in cells and the pty must be told.
     Resize(PtySize),
+    /// The body cannot display one complete cell. It must relinquish any remembered
+    /// geometry so a visible mirror can become the runtime's owner.
+    GeometryUnavailable,
     /// The user clicked in this pane.
     Focus,
     /// Text to put on the clipboard.
@@ -191,6 +195,16 @@ pub struct PaneInteraction {
     /// The size in cells last reported, so a resize request is sent on a change rather
     /// than every frame.
     reported_size: Option<PtySize>,
+    /// Runtime ownership claim that received [`Self::reported_size`]. A durable visual Pane
+    /// can be rebound to a replacement process while keeping the same PaneId and geometry;
+    /// and two visual Panes can mirror one process. The claim epoch changes whenever this
+    /// Pane becomes that process's sole geometry owner, so reacquiring ownership costs one
+    /// resize even when this interaction measured the same rectangle before.
+    reported_resize_claim: Option<(NodeId, u64)>,
+    /// Whether this Pane produced at least one complete cell from its actual body in
+    /// the previous frame. Geometry ownership excludes sub-cell/negative bodies so a
+    /// collapsed focused Pane cannot block a healthy visible mirror.
+    pub(crate) geometry_available: bool,
     /// The links on the grid as it was when they were last found — see [`links`].
     ///
     /// Built only while the pointer is over the pane, and reused across frames until the
@@ -1106,42 +1120,25 @@ pub struct PaneInput<'a> {
     /// Distinguishes panes so `egui` tracks their interaction independently, which is what
     /// lets two panes hold separate selections.
     pub id: egui::Id,
+    /// The exact process and renderer-owned epoch when this Pane is the sole authority for
+    /// its PTY geometry. `None` makes the surface a mirror: it may paint and scroll, but it
+    /// can never emit [`PaneAction::Resize`].
+    pub resize_claim: Option<ResizeClaim<'a>>,
     /// `None` for a caller that has not wired the pane menu: the pane then offers no menu
     /// and produces no [`PaneRequest`], which is exactly how it behaved before the menu
     /// existed.
     pub chrome: Option<PaneChrome<'a>>,
 }
 
-/// Draws a pane and collects what the user did to it.
+/// One render surface's temporary lease to size exactly one runtime.
 ///
-/// The older entry point, kept because it is what the window still calls. It has no menu
-/// and never produces a [`PaneRequest`]; [`show_pane`] is the complete one.
-pub fn show(
-    ui: &mut Ui,
-    theme: &Theme,
-    rect: Rect,
-    grid: &Grid,
-    state: &mut PaneInteraction,
-    options: PaneOptions,
-    id: egui::Id,
-) -> Vec<PaneAction> {
-    let outcome = show_pane(
-        ui,
-        state,
-        PaneInput {
-            theme,
-            rect,
-            grid,
-            options,
-            id,
-            chrome: None,
-        },
-    );
-    debug_assert!(
-        outcome.requests.is_empty(),
-        "a pane with no chrome has nothing to ask the window for"
-    );
-    outcome.actions
+/// The epoch is window-local and deliberately opaque to the daemon. It exists so changing
+/// owner A -> B -> A produces one report at each hand-off even if both panes have already
+/// measured the same number of rows and columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeClaim<'a> {
+    pub runtime_id: &'a NodeId,
+    pub owner_epoch: u64,
 }
 
 /// Draws a pane, with its context menu, and collects everything the user did to it.
@@ -1152,12 +1149,16 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         grid,
         options,
         id,
+        resize_claim,
         chrome,
     } = input;
     let mut outcome = PaneOutcome::default();
     // Nothing can be drawn or reported without a measured cell, and a size reported from a
     // guessed one is the bug in the report: a program laid out for a width Turn never drew.
     let Some(cell) = theme.cell_size(ui) else {
+        state.geometry_available = false;
+        state.reported_resize_claim = None;
+        outcome.actions.push(PaneAction::GeometryUnavailable);
         return outcome;
     };
     let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -1166,9 +1167,40 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // `resize_pty` per frame during a window drag would be hundreds of requests. Measured
     // from the *live* geometry, without the scroll marker's strip: the pty's size must not
     // change just because the user looked at history.
-    let size = size_in_cells(rect, cell);
-    if state.reported_size != Some(size) {
+    let measurable = rect.width().is_finite()
+        && rect.height().is_finite()
+        && cell.x.is_finite()
+        && cell.y.is_finite()
+        && cell.x > 0.0
+        && cell.y > 0.0
+        && rect.width() >= cell.x
+        && rect.height() >= cell.y;
+    state.geometry_available = measurable;
+    if !measurable {
+        // Re-entering a usable geometry must report again even if the same Pane/runtime
+        // wins ownership at the same dimensions it had before collapsing.
+        state.reported_resize_claim = None;
+        outcome.actions.push(PaneAction::GeometryUnavailable);
+    }
+    let size = measurable.then(|| size_in_cells(rect, cell));
+    // Runtime identity can change while Pane identity and its interaction state stay
+    // put (restore/relaunch is the common case). The replacement pty starts at its
+    // initial 80x24 size, so `reported_size == size` is not proof that *this* pty has
+    // ever received the live geometry. Runtime identity is the missing half of that
+    // acknowledgement: one request per (runtime, geometry), never one per frame while
+    // the daemon is still returning the old-sized grid.
+    if size.is_some_and(|size| {
+        should_report_size(
+            state.reported_size,
+            state.reported_resize_claim.as_ref(),
+            size,
+            resize_claim,
+        )
+    }) {
+        let size = size.expect("a reportable terminal body has a measured size");
         state.reported_size = Some(size);
+        state.reported_resize_claim =
+            resize_claim.map(|claim| (claim.runtime_id.clone(), claim.owner_epoch));
         outcome.actions.push(PaneAction::Resize(size));
     }
 
@@ -1298,6 +1330,21 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         );
     }
     outcome
+}
+
+fn should_report_size(
+    reported_size: Option<PtySize>,
+    reported_claim: Option<&(NodeId, u64)>,
+    size: PtySize,
+    claim: Option<ResizeClaim<'_>>,
+) -> bool {
+    let Some(claim) = claim else {
+        return false;
+    };
+    reported_size != Some(size)
+        || reported_claim.is_none_or(|(runtime_id, owner_epoch)| {
+            runtime_id != claim.runtime_id || *owner_epoch != claim.owner_epoch
+        })
 }
 
 /// Whether the pointer is over the search bar rather than over the pane's cells.
@@ -2797,6 +2844,91 @@ mod tests {
         );
     }
 
+    /// A relaunch keeps the visual Pane and its interaction state, but the new pty
+    /// starts at 80x24. Remembering that this rectangle was reported to the old
+    /// process must not strand the replacement application in a narrow grid.
+    #[test]
+    fn a_replaced_pty_is_resized_once_even_when_the_visible_geometry_did_not_change() {
+        let cell = Vec2::new(8.0, 16.0);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(cell.x * 160.0, cell.y * 45.0));
+        let visible = size_in_cells(rect, cell);
+        assert_eq!(visible, PtySize::new(45, 160));
+
+        let previous = NodeId::from_stored("node_previous_pty");
+        let replacement = NodeId::from_stored("node_replacement_pty");
+        let previous_report = (previous, 4);
+        assert!(
+            should_report_size(
+                Some(visible),
+                Some(&previous_report),
+                visible,
+                Some(ResizeClaim {
+                    runtime_id: &replacement,
+                    owner_epoch: 5,
+                }),
+            ),
+            "the replacement runtime must receive the unchanged visible geometry"
+        );
+
+        let replacement_report = (replacement.clone(), 5);
+        assert!(
+            !should_report_size(
+                Some(visible),
+                Some(&replacement_report),
+                visible,
+                Some(ResizeClaim {
+                    runtime_id: &replacement,
+                    owner_epoch: 5,
+                }),
+            ),
+            "the same runtime and geometry must not emit another resize while its grid catches up"
+        );
+        assert!(should_report_size(
+            Some(visible),
+            Some(&replacement_report),
+            visible,
+            Some(ResizeClaim {
+                runtime_id: &replacement,
+                owner_epoch: 6,
+            }),
+        ));
+        assert!(
+            !should_report_size(Some(visible), Some(&replacement_report), visible, None),
+            "a mirror without a geometry claim can never resize"
+        );
+    }
+
+    #[test]
+    fn a_subcell_pane_relinquishes_geometry_without_sending_a_one_by_one_resize() {
+        let grid = Grid::blank(24, 80);
+        let runtime = NodeId::from_stored("runtime_tiny001");
+        egui::__run_test_ui(|ui| {
+            let mut state = PaneInteraction::default();
+            let outcome = show_pane(
+                ui,
+                &mut state,
+                PaneInput {
+                    theme: &Theme::dark(),
+                    rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, 1.0)),
+                    grid: &grid,
+                    options: PaneOptions::default(),
+                    id: ui.id().with("subcell-terminal"),
+                    resize_claim: Some(ResizeClaim {
+                        runtime_id: &runtime,
+                        owner_epoch: 1,
+                    }),
+                    chrome: None,
+                },
+            );
+            assert!(outcome.actions.contains(&PaneAction::GeometryUnavailable));
+            assert!(!outcome
+                .actions
+                .iter()
+                .any(|action| matches!(action, PaneAction::Resize(_))));
+            assert!(!state.geometry_available);
+        });
+    }
+
     /// The user must be told when the history they are looking at does not go all the
     /// way back, rather than being left to assume it does.
     #[test]
@@ -3293,6 +3425,25 @@ mod tests {
                 "{composed:?} must reach the program"
             );
         }
+    }
+
+    #[test]
+    fn shift_enter_reaches_the_program_as_multiline_input() {
+        let outcome = input_event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::default()
+            },
+        });
+        assert_eq!(
+            outcome.actions,
+            vec![PaneAction::Write(b"\x1b\r".to_vec())],
+            "the focused pane must receive one multiline chord, not a submitting carriage return"
+        );
     }
 
     /// What is still being composed is not sent.

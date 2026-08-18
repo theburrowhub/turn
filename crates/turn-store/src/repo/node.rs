@@ -467,6 +467,7 @@ mod tests {
             tokens_used: Some(12_345),
             cost_usd: Some(0.42),
             permission_mode: Some("default".into()),
+            runtime: Default::default(),
             git_branch: Some("fix/climbing".into()),
             resumable: true,
         });

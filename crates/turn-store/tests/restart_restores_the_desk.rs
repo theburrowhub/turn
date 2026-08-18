@@ -204,7 +204,7 @@ fn a_whole_desk_survives_a_restart_and_reports_what_it_cannot_vouch_for() {
 
     let restored = store
         .sessions()
-        .load_for_restore(&session_id)
+        .load_for_restore(&session_id, T0)
         .unwrap()
         .expect("the session is back");
 
@@ -328,7 +328,7 @@ fn a_partial_restore_is_recorded_so_the_ui_can_explain_itself() {
     let store = Store::open_in(temp.path()).unwrap();
     let mut restored = store
         .sessions()
-        .load_for_restore(&session_id)
+        .load_for_restore(&session_id, T0)
         .unwrap()
         .unwrap();
     let ids: Vec<_> = restored.tree.iter().map(|n| n.id.clone()).collect();
@@ -355,7 +355,7 @@ fn a_partial_restore_is_recorded_so_the_ui_can_explain_itself() {
     // `Lost` is terminal, so it is never re-orphaned into looking alive again.
     let for_restore = store
         .sessions()
-        .load_for_restore(&session_id)
+        .load_for_restore(&session_id, T0)
         .unwrap()
         .unwrap();
     assert_eq!(

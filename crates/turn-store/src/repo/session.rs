@@ -106,8 +106,10 @@ impl<'a> SessionRepo<'a> {
     /// when we last wrote". It is not downgraded to `Lost`: deciding that a
     /// process is gone requires looking at the process table, which is the
     /// supervisor's job, not the store's. Nothing is relaunched and nothing is
-    /// rewritten on disk — this is a projection at read time.
-    pub fn load_for_restore(&self, id: &SessionId) -> Result<Option<Session>> {
+    /// rewritten on disk — this is a projection at read time. Provider facts
+    /// whose deadline has elapsed at `now_ms` retain their value but restore as
+    /// stale.
+    pub fn load_for_restore(&self, id: &SessionId, now_ms: i64) -> Result<Option<Session>> {
         let Some(mut session) = self.get(id)? else {
             return Ok(None);
         };
@@ -121,6 +123,9 @@ impl<'a> SessionRepo<'a> {
                     Lifecycle::Alive | Lifecycle::Spawning | Lifecycle::Reconnected
                 ) {
                     node.lifecycle = Lifecycle::Orphaned;
+                }
+                if let Some(agent) = node.agent.as_mut() {
+                    agent.runtime = std::mem::take(&mut agent.runtime).stale_if_expired(now_ms);
                 }
                 node
             })
@@ -1261,7 +1266,7 @@ mod tests {
 
         let restored = store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, T0)
             .unwrap()
             .expect("the session survived the restart");
         assert_eq!(restored.layout.pane_count(), pane_count);
@@ -1292,6 +1297,99 @@ mod tests {
             verbatim.tree.primary_agent().unwrap().lifecycle,
             Lifecycle::Alive
         );
+    }
+
+    #[test]
+    fn restore_materialises_elapsed_context_and_quota_deadlines_at_now_ms() {
+        use turn_core::model::{
+            ContextUsageSnapshot, Observable, ObservationSource, ObservationSourceKind,
+            QuotaSnapshot, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+        };
+
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "runtime-expiry");
+        let mut session = session_with_three_panes(&workspace.id);
+        let mut node = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
+        let source = ObservationSource::new(ObservationSourceKind::Provider, "provider status");
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::observed(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            source.clone(),
+            T0,
+            Some(T0 + 10),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("provider-account".into()),
+                scope_label: None,
+                windows: Vec::new(),
+            },
+            source,
+            T0,
+            Some(T0 + 10),
+        );
+        session.tree.insert(node);
+        let session_id = session.id.clone();
+        store.sessions().save(&session).unwrap();
+
+        let before = store
+            .sessions()
+            .load_for_restore(&session_id, T0 + 9)
+            .unwrap()
+            .unwrap();
+        let before = &before
+            .tree
+            .primary_agent()
+            .unwrap()
+            .agent
+            .as_ref()
+            .unwrap()
+            .runtime;
+        assert!(matches!(before.context, Observable::Observed { .. }));
+        assert!(matches!(before.quota, Observable::Observed { .. }));
+
+        let expired = store
+            .sessions()
+            .load_for_restore(&session_id, T0 + 10)
+            .unwrap()
+            .unwrap();
+        let expired = &expired
+            .tree
+            .primary_agent()
+            .unwrap()
+            .agent
+            .as_ref()
+            .unwrap()
+            .runtime;
+        assert!(matches!(expired.context, Observable::Stale { .. }));
+        assert!(matches!(expired.quota, Observable::Stale { .. }));
+
+        let verbatim = store.sessions().get(&session_id).unwrap().unwrap();
+        assert!(matches!(
+            verbatim
+                .tree
+                .primary_agent()
+                .unwrap()
+                .agent
+                .as_ref()
+                .unwrap()
+                .runtime
+                .quota,
+            Observable::Observed { .. }
+        ));
     }
 
     #[test]

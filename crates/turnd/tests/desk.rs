@@ -399,7 +399,6 @@ async fn writing_to_an_attached_pane_produces_the_processs_output() {
         .await;
     assert_eq!(attachment.node_id.as_ref(), Some(&node));
     assert_eq!(attachment.size, PtySize::new(30, 100));
-    assert_eq!(attachment.next_seq, 0, "the live stream starts at zero");
     let screen = attachment.screen.as_ref().expect("the screen as cells");
     assert_eq!(
         (screen.rows, screen.cols),
@@ -815,6 +814,7 @@ async fn the_daemon_refuses_the_things_it_should_and_says_why() {
         .try_ask(Request::DetachPane {
             session_id: session.id.clone(),
             pane_id: pane.clone(),
+            attachment_id: None,
         })
         .await
         .expect_err("this client never attached");

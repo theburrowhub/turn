@@ -6,16 +6,20 @@
 //! changed plugin contract can cost an event, never an OpenCode interaction.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::{risk, text};
 use serde_json::Value;
 use std::path::Path;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Version of OpenCode whose official schemas the fixture was recorded from.
 pub const CONTRACT_VERSION: &str = "1.18.16";
+
+const OPENCODE_AUTO: &str = "--auto";
 
 const PLUGIN: &str = r#"export const TurnObserver = async () => {
   const send = (event) => {
@@ -44,10 +48,14 @@ impl OpenCodeAdapter {
         PLUGIN
     }
 
-    fn fallback(ctx: &LaunchContext, reason: impl std::fmt::Display) -> LaunchPlan {
+    fn fallback(
+        ctx: &LaunchContext,
+        args: Vec<String>,
+        reason: impl std::fmt::Display,
+    ) -> LaunchPlan {
         LaunchPlan {
             command: ctx.command.clone(),
-            args: ctx.user_args.clone(),
+            args,
             env: base_env(ctx),
             level: IntegrationLevel::Heuristic,
             note: format!(
@@ -66,6 +74,44 @@ impl OpenCodeAdapter {
         restrict_directory(&plugins);
         write_private(&plugins.join("turn-observer.js"), PLUGIN.as_bytes())?;
         Ok(config_dir)
+    }
+}
+
+fn resolve_opencode_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    let auto = control_arguments(args)
+        .iter()
+        .any(|arg| arg == OPENCODE_AUTO);
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if auto {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "opencode".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: format!("the explicit {OPENCODE_AUTO} argument"),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("opencode", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            let resolved = if auto {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, [OPENCODE_AUTO.to_string()])
+            };
+            Ok(ResolvedLaunchProfile::autonomous(
+                "opencode",
+                LaunchPermissionPosture::AutoApproveUnlessDenied,
+                resolved,
+                vec![OPENCODE_AUTO.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "opencode".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
     }
 }
 
@@ -97,13 +143,69 @@ impl AgentAdapter for OpenCodeAdapter {
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe(
+                "OpenCode keeps its configured permission policy in force.",
+            ),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::AutoApproveUnlessDenied,
+                "OpenCode auto-approves permission requests, while explicit deny rules remain in force.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_opencode_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        if control_arguments(args)
+            .iter()
+            .any(|arg| arg == OPENCODE_AUTO)
+        {
+            configuration.approval_mode = Some("auto unless denied".into());
+            if profile.role.is_none() {
+                configuration.permission_mode = Some("Custom · auto-approve unless denied".into());
+            }
+        }
+        configuration
+    }
+
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        profile.role != Some(crate::LaunchProfileRole::Autonomous)
+            || (profile.adapter_id == self.id()
+                && profile.posture == LaunchPermissionPosture::AutoApproveUnlessDenied
+                && control_arguments(args)
+                    .iter()
+                    .any(|arg| arg == OPENCODE_AUTO))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
-        if ctx.user_args.iter().any(|arg| arg == "--pure") {
-            return Ok(Self::fallback(ctx, "--pure explicitly disables plugins"));
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let profile_args = resolved_profile.args;
+        if control_arguments(&profile_args)
+            .iter()
+            .any(|arg| arg == "--pure")
+        {
+            return Ok(Self::fallback(
+                ctx,
+                profile_args,
+                "--pure explicitly disables plugins",
+            ));
         }
         let config_dir = match self.install(ctx) {
             Ok(path) => path,
-            Err(error) => return Ok(Self::fallback(ctx, error)),
+            Err(error) => return Ok(Self::fallback(ctx, profile_args, error)),
         };
         let mut env = base_env(ctx);
         env.push((
@@ -112,7 +214,7 @@ impl AgentAdapter for OpenCodeAdapter {
         ));
         Ok(LaunchPlan {
             command: ctx.command.clone(),
-            args: ctx.user_args.clone(),
+            args: profile_args,
             env,
             level: IntegrationLevel::Heuristic,
             note: format!(

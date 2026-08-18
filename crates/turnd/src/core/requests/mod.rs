@@ -21,10 +21,32 @@ mod workspaces;
 use super::command::ClientId;
 use super::Core;
 use turn_core::model::DropZone;
-use turn_proto::{ProtoError, Request, Response};
+use turn_proto::{ProtoError, PtySize, Request, Response};
 
 /// The result every handler returns: a typed response, or the one error shape.
 pub type Answer = std::result::Result<Response, ProtoError>;
+
+/// Validates every client-supplied terminal geometry before it can reach a PTY or screen
+/// allocator. Attach and Resize share the same advertised cell limit; accepting a geometry
+/// on one path that the other refuses would make the protocol's `welcome` limit untrue.
+fn validate_terminal_size(size: PtySize) -> Result<PtySize, ProtoError> {
+    if PtySize::was_degenerate(size.rows, size.cols) {
+        return Err(ProtoError::invalid(
+            "A terminal size must contain at least one row and one column",
+        ));
+    }
+    let requested = PtySize::new(size.rows, size.cols);
+    let cells = requested.rows as usize * requested.cols as usize;
+    if cells > turn_proto::MAX_SCREEN_CELLS {
+        return Err(ProtoError::invalid(format!(
+            "A screen of {}x{} is {cells} cells, which is too large: the limit is {}",
+            requested.rows,
+            requested.cols,
+            turn_proto::MAX_SCREEN_CELLS
+        )));
+    }
+    Ok(requested)
+}
 
 impl Core {
     /// Routes one request to its handler.
@@ -537,11 +559,13 @@ impl Core {
             Request::ResyncPane {
                 session_id,
                 pane_id,
-            } => self.resync_pane(client, &session_id, &pane_id),
+                attachment_id,
+            } => self.resync_pane(client, &session_id, &pane_id, attachment_id),
             Request::DetachPane {
                 session_id,
                 pane_id,
-            } => self.detach_pane(client, &session_id, &pane_id),
+                attachment_id,
+            } => self.detach_pane(client, &session_id, &pane_id, attachment_id),
             Request::GetPaneHistory {
                 session_id,
                 pane_id,

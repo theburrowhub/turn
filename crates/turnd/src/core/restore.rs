@@ -77,7 +77,7 @@ impl Core {
         for id in &stored {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
-            if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
+            if let Some(mut session) = self.store.sessions().load_for_restore(id, now_ms)? {
                 let mut protected_nodes = protected_attention_nodes.clone();
                 protected_nodes.extend(session.tree.iter().filter_map(|node| {
                     std::fs::symlink_metadata(paths::node_terminal_history(
@@ -927,6 +927,14 @@ fn merge_legacy_claude_alias_pair(
         agent.permission_mode = lifecycle_info
             .and_then(|candidate| candidate.permission_mode.clone())
             .or_else(|| team_info.and_then(|candidate| candidate.permission_mode.clone()));
+        agent.runtime = team_info
+            .map(|candidate| candidate.runtime.clone())
+            .unwrap_or_default()
+            .prefer_newer(
+                lifecycle_info
+                    .map(|candidate| candidate.runtime.clone())
+                    .unwrap_or_default(),
+            );
         agent.git_branch = lifecycle_info
             .and_then(|candidate| candidate.git_branch.clone())
             .or_else(|| team_info.and_then(|candidate| candidate.git_branch.clone()));
@@ -987,6 +995,7 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
         pane.title = Some("shell".into());
         pane.command = None;
         pane.args.clear();
+        pane.launch_profile = None;
         pane.cwd = None;
         pane.env.clear();
         pane.node_id = None;
@@ -1103,7 +1112,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1294,7 +1303,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         let repairs = repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new());
@@ -1448,7 +1457,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         let protected = HashSet::from([lifecycle_id.clone()]);

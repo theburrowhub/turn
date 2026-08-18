@@ -5,8 +5,8 @@ use turn_core::attention::AttentionPolicy;
 use turn_core::event::AgentRef;
 use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{
-    AgentName, Layout, PendingPermission, ProcessNode, RestoreState, Session, SessionMode,
-    SessionStatus,
+    AgentName, AgentRuntimeMetadata, Layout, PendingPermission, ProcessNode, RestoreState, Session,
+    SessionMode, SessionStatus,
 };
 use turn_core::state::{DisplayState, Turn};
 
@@ -39,6 +39,10 @@ pub struct AgentSummary {
     pub tokens_used: Option<u64>,
     pub cost_usd: Option<f64>,
     pub permission_mode: Option<String>,
+    /// Structured launch, context, and provider-quota observations. This is a
+    /// safe inspector projection, not raw argv or provider output.
+    #[serde(default)]
+    pub runtime: AgentRuntimeMetadata,
     pub git_branch: Option<String>,
     /// Whether this agent can be resumed once its process ends. Drives whether
     /// the UI offers to bring it back — and it only ever *offers*.
@@ -46,8 +50,9 @@ pub struct AgentSummary {
 }
 
 impl AgentSummary {
-    /// Projects the agent detail of a node, or `None` for a plain process.
-    pub fn from_node(node: &ProcessNode) -> Option<Self> {
+    /// Projects the agent detail of a node at `now_ms`, aging elapsed provider
+    /// observations to stale, or returns `None` for a plain process.
+    pub fn from_node(node: &ProcessNode, now_ms: i64) -> Option<Self> {
         let info = node.agent.as_ref()?;
         Some(Self {
             node_id: node.id.clone(),
@@ -63,6 +68,7 @@ impl AgentSummary {
             tokens_used: info.tokens_used,
             cost_usd: info.cost_usd,
             permission_mode: info.permission_mode.clone(),
+            runtime: info.runtime.clone().stale_if_expired(now_ms),
             git_branch: info.git_branch.clone(),
             resumable: info.resumable,
         })
@@ -195,7 +201,7 @@ impl SessionSummary {
             primary_agent: session
                 .tree
                 .primary_agent()
-                .and_then(AgentSummary::from_node),
+                .and_then(|node| AgentSummary::from_node(node, now_ms)),
         }
     }
 
@@ -333,6 +339,91 @@ mod tests {
         let pending = agent.pending_permission.expect("the permission is carried");
         assert_eq!(pending.cwd.as_deref(), Some("/repo"));
         assert_eq!(pending.risk, Risk::High);
+    }
+
+    #[test]
+    fn agent_summary_carries_runtime_observations_without_reinterpreting_them() {
+        use turn_core::model::{
+            ContextUsageSnapshot, Observable, ObservationSource, ObservationSourceKind,
+            UsageMeasurement, UsageMeasurementKind, UsageUnit,
+        };
+
+        let mut node = ProcessNode::agent(session().id, "codex", "/repo", T0);
+        node.agent.as_mut().unwrap().runtime.context = Observable::stale(
+            ContextUsageSnapshot {
+                scope_id: Some("thread-1".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Remaining,
+                    amount: 81_000.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            ObservationSource::new(ObservationSourceKind::Provider, "codex app server"),
+            T0,
+            Some(T0 + 1),
+        );
+
+        let summary = AgentSummary::from_node(&node, T0).unwrap();
+        assert_eq!(summary.runtime, node.agent.unwrap().runtime);
+        assert!(matches!(summary.runtime.context, Observable::Stale { .. }));
+    }
+
+    #[test]
+    fn agent_summary_ages_provider_context_and_quota_at_now_ms() {
+        use turn_core::model::{
+            ContextUsageSnapshot, Observable, ObservationSource, ObservationSourceKind,
+            QuotaSnapshot, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+        };
+
+        let source = ObservationSource::new(ObservationSourceKind::Provider, "provider status");
+        let mut node = ProcessNode::agent(session().id, "provider", "/repo", T0);
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::observed(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            source.clone(),
+            T0,
+            Some(T0 + 10),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("account".into()),
+                scope_label: None,
+                windows: Vec::new(),
+            },
+            source,
+            T0,
+            Some(T0 + 10),
+        );
+
+        let before = AgentSummary::from_node(&node, T0 + 9).unwrap();
+        assert!(matches!(
+            before.runtime.context,
+            Observable::Observed { .. }
+        ));
+        assert!(matches!(before.runtime.quota, Observable::Observed { .. }));
+
+        let expired = AgentSummary::from_node(&node, T0 + 10).unwrap();
+        assert!(matches!(expired.runtime.context, Observable::Stale { .. }));
+        assert!(matches!(expired.runtime.quota, Observable::Stale { .. }));
     }
 
     #[test]

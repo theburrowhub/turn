@@ -1,0 +1,4 @@
+{"type":"turn_context","payload":{"model":"gpt-5.5-codex"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17855,"cached_input_tokens":0,"output_tokens":100,"total_tokens":17955},"last_token_usage":{"input_tokens":17855,"cached_input_tokens":0,"output_tokens":100,"total_tokens":17955},"model_context_window":258400}}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":204277,"cached_input_tokens":170000,"output_tokens":4000,"total_tokens":208277},"last_token_usage":{"input_tokens":34635,"cached_input_tokens":33792,"output_tokens":303,"reasoning_output_tokens":70,"total_tokens":34938},"model_context_window":258400}}}

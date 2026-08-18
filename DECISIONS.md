@@ -1102,7 +1102,10 @@ tool's configuration surface accepts.
 `LaunchContext::scratch_dir` is a directory Turn owns and deletes with the Session. Adapters write
 throwaway configuration there and pass it by flag: `--settings <path>` for Claude Code, inline `-c` TOML
 for Codex (ADR-013). The user's files are never read for modification and never written. `--settings`
-is appended **after** the user's own args so their flags keep precedence.
+and every other Turn-owned control is prepended as a self-contained group before the operator's complete
+argv. This prevents an incomplete or variadic user option from consuming the first Turn-owned control
+without copying each provider's grammar. The user's complete argv retains its exact bytes and order; a
+conflicting provider policy is refused rather than silently shadowed.
 
 ### Consequences
 

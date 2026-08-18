@@ -44,10 +44,26 @@ use crate::view::{
 pub struct PaneAttachment {
     pub session_id: SessionId,
     pub pane_id: PaneId,
-    /// The process behind the pane. `None` for a pane that has no process yet —
-    /// an empty slot after a partial restore, or one of Turn's own views.
+    /// Monotonic daemon-issued identity for this exact subscription generation.
+    /// Reattaching the same Pane/runtime produces a new value, fencing late screen,
+    /// resync and detach traffic across ABA rebinding.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attachment_id: u64,
+    /// The semantic Process/Agent the Pane is bound to. `None` for a Pane that has no
+    /// process yet — an empty slot after a partial restore, or one of Turn's own views.
+    ///
+    /// This is deliberately not overloaded with PTY ownership. A hosted Agent remains
+    /// the selected subject while its screen and keyboard live on the shell runtime in
+    /// [`Self::runtime_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<NodeId>,
+    /// The concrete runtime whose terminal stream backs this attachment.
+    ///
+    /// Equal to `node_id` for an ordinary terminal and different for an Agent hosted
+    /// inside a shell. Keeping both identities prevents a semantic Agent view from
+    /// either rejecting its valid shell feed or resizing an unrelated/nonexistent PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<NodeId>,
     /// Which representation this attachment will receive from now on.
     #[serde(default)]
     pub stream: PaneStream,
@@ -68,7 +84,8 @@ pub struct PaneAttachment {
     /// receiving terminal.
     #[serde(default, skip_serializing_if = "TerminalBytes::is_empty")]
     pub replay: TerminalBytes,
-    /// The size the screen was taken at, which is the size the client asked for.
+    /// The authoritative current runtime size the screen was taken at. Attach is
+    /// observational; the elected visible owner changes geometry with `ResizePty`.
     pub size: PtySize,
     /// Whether output was dropped from the daemon's ring before this replay. The
     /// screen is still correct; the scrollback above it is incomplete, and the UI
@@ -82,6 +99,10 @@ pub struct PaneAttachment {
     /// a byte one. Lets a client detect a gap between what it was handed here and
     /// the live stream.
     pub next_seq: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A process Turn stopped short of and that may still be alive.
@@ -235,6 +256,8 @@ pub enum Response {
     Screen {
         session_id: SessionId,
         pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attachment_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<NodeId>,
         /// The sequence number the next update for this attachment will carry. The
@@ -457,7 +480,9 @@ pub(crate) mod tests {
             attachment: Box::new(PaneAttachment {
                 session_id: session().id,
                 pane_id: PaneId::from_stored("pane_a"),
+                attachment_id: 7,
                 node_id: Some(NodeId::from_stored("proc_a")),
+                runtime_id: Some(NodeId::from_stored("proc_a")),
                 stream: PaneStream::Cells,
                 screen: Some(Box::new(screen.clone())),
                 scrollback: Scrollback::default(),
@@ -488,6 +513,27 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn a_v4_attachment_without_generation_or_runtime_keeps_its_wire_sentinels() {
+        let json = serde_json::json!({
+            "session_id": "sess_legacy",
+            "pane_id": "pane_legacy",
+            "node_id": "proc_legacy_runtime",
+            "screen": Grid::blank(24, 80),
+            "size": { "rows": 24, "cols": 80 },
+            "scrollback_truncated": false,
+            "bytes_seen": 12,
+            "next_seq": 3
+        });
+        let attachment: PaneAttachment = serde_json::from_value(json).expect("v4 attachment");
+        assert_eq!(attachment.attachment_id, 0);
+        assert_eq!(attachment.runtime_id, None);
+        assert_eq!(
+            attachment.node_id.as_ref().map(NodeId::as_str),
+            Some("proc_legacy_runtime")
+        );
+    }
+
     /// The byte path is still here for whatever genuinely needs the stream itself,
     /// and it carries bytes rather than a grid.
     #[test]
@@ -498,7 +544,9 @@ pub(crate) mod tests {
         let attachment = PaneAttachment {
             session_id: session().id,
             pane_id: PaneId::from_stored("pane_a"),
+            attachment_id: 7,
             node_id: Some(NodeId::from_stored("proc_a")),
+            runtime_id: Some(NodeId::from_stored("proc_a")),
             stream: PaneStream::Bytes,
             screen: None,
             scrollback: Scrollback::default(),
@@ -523,6 +571,7 @@ pub(crate) mod tests {
         let response = Response::Screen {
             session_id: session().id,
             pane_id: PaneId::from_stored("pane_a"),
+            attachment_id: 7,
             node_id: Some(NodeId::from_stored("proc_a")),
             next_seq: 77,
             grid: Box::new(Grid::from_lines(&["recovered"], 20)),
@@ -538,7 +587,9 @@ pub(crate) mod tests {
         let attachment = PaneAttachment {
             session_id: session().id,
             pane_id: PaneId::from_stored("pane_empty"),
+            attachment_id: 7,
             node_id: None,
+            runtime_id: None,
             stream: PaneStream::Cells,
             // An empty pane still has a screen: a blank one at the client's size,
             // which is better than a renderer with nothing to draw.
@@ -779,7 +830,9 @@ pub(crate) mod tests {
                 attachment: Box::new(PaneAttachment {
                     session_id: s.id.clone(),
                     pane_id: s.layout.panes()[0].id.clone(),
+                    attachment_id: 7,
                     node_id: Some(NodeId::from_stored("proc_a")),
+                    runtime_id: Some(NodeId::from_stored("proc_a")),
                     stream: PaneStream::Cells,
                     screen: Some(Box::new(Grid::from_lines(&["ready"], 80))),
                     scrollback: Scrollback::default(),
@@ -793,6 +846,7 @@ pub(crate) mod tests {
             Response::Screen {
                 session_id: s.id.clone(),
                 pane_id: s.layout.panes()[0].id.clone(),
+                attachment_id: 7,
                 node_id: Some(NodeId::from_stored("proc_a")),
                 next_seq: 12,
                 grid: Box::new(Grid::blank(24, 80)),

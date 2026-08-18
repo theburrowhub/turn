@@ -100,6 +100,11 @@ pub enum ServerEvent {
     PaneScreen {
         session_id: SessionId,
         pane_id: PaneId,
+        /// Exact subscription generation this update belongs to. A late frame from
+        /// an attachment replaced under the same Pane id must never repaint the new
+        /// subject.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attachment_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<NodeId>,
         seq: u64,
@@ -114,6 +119,8 @@ pub enum ServerEvent {
     PaneOutput {
         session_id: SessionId,
         pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attachment_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<NodeId>,
         seq: u64,
@@ -130,6 +137,8 @@ pub enum ServerEvent {
     PaneOutputGap {
         session_id: SessionId,
         pane_id: PaneId,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attachment_id: u64,
         /// Frames lost between `resume_seq - dropped` and `resume_seq`.
         dropped: u64,
         resume_seq: u64,
@@ -258,6 +267,10 @@ pub enum ServerEvent {
         needs_explanation: bool,
         panes: Vec<PaneRestoreOutcome>,
     },
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl ServerEvent {

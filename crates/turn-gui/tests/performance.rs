@@ -245,6 +245,7 @@ fn harness() -> Harness<'static, Window> {
                 let active = &window.envelope.sessions[window.active];
                 let panes = vec![PaneContent {
                     pane_id: active.pane_id.clone(),
+                    runtime_id: None,
                     title: "claude · performance envelope".into(),
                     grid: &active.grid,
                     focused: true,

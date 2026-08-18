@@ -1377,7 +1377,7 @@ fn a_secret_survives_nowhere_even_after_the_daemon_restarts_and_prunes() {
     // Touch every read and write path a restarted daemon uses.
     let restored = store
         .sessions()
-        .load_for_restore(&session_id)
+        .load_for_restore(&session_id, T0)
         .unwrap()
         .expect("the session came back");
     store.sessions().save(&restored).unwrap();

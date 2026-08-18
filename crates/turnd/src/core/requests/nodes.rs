@@ -1,6 +1,6 @@
 //! Writing to processes, stopping them, and the one way one comes back.
 
-use super::Answer;
+use super::{validate_terminal_size, Answer};
 use crate::core::{ClientId, Core};
 use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::SessionStatus;
@@ -48,9 +48,18 @@ impl Core {
         size: PtySize,
     ) -> Answer {
         self.node_of(session_id, node_id)?;
-        let requested = PtySize::new(size.rows, size.cols);
+        let requested = validate_terminal_size(size)?;
         let screen = ScreenSize::new(requested.rows, requested.cols);
-        let process = self.running_process(node_id)?;
+        // Geometry belongs to the terminal runtime, not necessarily to the semantic
+        // Agent selected by the operator. Hosted Agents read and draw through their
+        // shell PTY just as writes and interrupts already do.
+        let tty = self.tty_node(session_id, node_id);
+        let process = self.running_process(&tty)?;
+        if process.size == screen {
+            // Attaching and owner hand-off may both observe the same geometry. Do not
+            // turn a no-op into another ioctl/SIGWINCH and a full-screen broadcast.
+            return Ok(Response::Ack);
+        }
         process
             .pty
             .resize(screen)
@@ -62,7 +71,7 @@ impl Core {
             client,
             ServerEvent::PtyResized {
                 session_id: session_id.clone(),
-                node_id: node_id.clone(),
+                node_id: tty.clone(),
                 size: requested,
             },
         );
@@ -70,7 +79,7 @@ impl Core {
         // resizing client included: rows do not correspond across a resize, so a diff
         // would be meaningless, and a program that does not redraw would otherwise
         // leave the client with nothing at its new size.
-        self.push_full_screen(node_id, None);
+        self.push_full_screen(&tty, None);
         Ok(Response::Ack)
     }
 

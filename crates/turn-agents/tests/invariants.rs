@@ -447,6 +447,7 @@ fn no_adapter_wraps_the_users_command_in_a_shell() {
         cwd: "/repo; rm -rf ~".into(),
         command: hostile.into(),
         user_args: vec!["--flag $(whoami)".into(), "`id`".into()],
+        launch_profile: None,
         endpoint: HookEndpoint {
             base_url: "http://127.0.0.1:51234".into(),
             token: "tok_invariant".into(),
@@ -478,7 +479,7 @@ fn no_adapter_wraps_the_users_command_in_a_shell() {
         // The user's own arguments survive untouched, as separate argv entries —
         // never spliced into one string a shell would re-split.
         assert!(
-            plan.args.starts_with(&ctx.user_args),
+            plan.args.ends_with(&ctx.user_args),
             "{} mangled the user's arguments: {:?}",
             adapter.id(),
             plan.args

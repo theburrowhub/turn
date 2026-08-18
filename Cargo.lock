@@ -3987,6 +3987,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "turn-agents",
  "turn-core",
  "turn-proto",
  "turn-pty",
@@ -3997,6 +3998,10 @@ dependencies = [
 [[package]]
 name = "turn-hook"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "turn-proto"

@@ -78,13 +78,15 @@
 //! means it.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
 use serde_json::Value;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Hook events Turn subscribes to, in the only spelling Codex acts on.
 ///
@@ -211,6 +213,61 @@ impl CodexAdapter {
     }
 }
 
+fn is_codex_policy_option(arg: &str) -> bool {
+    matches!(arg, "--ask-for-approval" | "-a" | "--sandbox" | "-s")
+        || arg.starts_with("--ask-for-approval=")
+        || arg.starts_with("-a=")
+        || arg.starts_with("--sandbox=")
+        || arg.starts_with("-s=")
+}
+
+const CODEX_BYPASS_POLICY: &str = "--dangerously-bypass-approvals-and-sandbox";
+
+fn resolve_codex_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    let controls = control_arguments(args);
+    let bypass = controls.iter().any(|arg| arg == CODEX_BYPASS_POLICY);
+
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if bypass || controls.iter().any(|arg| is_codex_policy_option(arg)) {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "codex".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "an explicit approval or sandbox policy argument".to_string(),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("codex", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            if let Some(conflict) = controls.iter().find(|arg| is_codex_policy_option(arg)) {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "codex".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: format!("the explicit `{conflict}` policy argument"),
+                });
+            }
+            let resolved = if bypass {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, [CODEX_BYPASS_POLICY.to_string()])
+            };
+            Ok(ResolvedLaunchProfile::autonomous(
+                "codex",
+                LaunchPermissionPosture::BypassApprovalsAndSandbox,
+                resolved,
+                vec![CODEX_BYPASS_POLICY.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "codex".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
+    }
+}
+
 impl AgentAdapter for CodexAdapter {
     fn id(&self) -> &'static str {
         "codex"
@@ -234,14 +291,81 @@ impl AgentAdapter for CodexAdapter {
             permission_events: true,
             subagent_events: true,
             resumable: true,
-            // Token usage is available over `codex app-server`, not over hooks or
-            // notify, so this launch path cannot claim it.
-            usage_events: false,
+            // Stop identifies the provider transcript. Its latest token_count
+            // record gives exact turn context usage; account quota remains a
+            // separate app-server observation.
+            usage_events: true,
             external_session_id: true,
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe(
+                "Codex keeps its configured approval policy and sandbox in force.",
+            ),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::BypassApprovalsAndSandbox,
+                "Codex bypasses approvals and runs without its sandbox for this launch.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_codex_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        if control_arguments(args)
+            .iter()
+            .any(|arg| arg == CODEX_BYPASS_POLICY)
+        {
+            configuration.approval_mode = Some("bypassed".into());
+            configuration.sandbox_mode = Some("disabled".into());
+            if profile.role.is_none() {
+                configuration.permission_mode =
+                    Some("Custom · bypass approvals and sandbox".into());
+            }
+            return configuration;
+        }
+        configuration.approval_mode = crate::launch_facts::known_option_value(
+            args,
+            &["--ask-for-approval", "-a"],
+            &["untrusted", "on-failure", "on-request", "never"],
+        )
+        .map(str::to_string);
+        configuration.sandbox_mode = crate::launch_facts::known_option_value(
+            args,
+            &["--sandbox", "-s"],
+            &["read-only", "workspace-write", "danger-full-access"],
+        )
+        .map(str::to_string);
+        configuration
+    }
+
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        if profile.role != Some(crate::LaunchProfileRole::Autonomous) {
+            return true;
+        }
+        let controls = control_arguments(args);
+        profile.adapter_id == self.id()
+            && profile.posture == LaunchPermissionPosture::BypassApprovalsAndSandbox
+            && controls.iter().any(|arg| arg == CODEX_BYPASS_POLICY)
+            && !controls.iter().any(|arg| is_codex_policy_option(arg))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let profile_args = resolved_profile.args;
         let url = ctx.endpoint.url();
 
         // Both mechanisms are command-based: Codex has no HTTP handler type, so
@@ -252,7 +376,7 @@ impl AgentAdapter for CodexAdapter {
         let Some(helper) = ctx.endpoint.helper_path.as_ref() else {
             return Ok(LaunchPlan {
                 command: ctx.command.clone(),
-                args: ctx.user_args.clone(),
+                args: profile_args,
                 env: base_env(ctx, &url),
                 level: IntegrationLevel::GenericTerminal,
                 note: "The turn-hook helper was not found, so Codex has no way to \
@@ -263,15 +387,16 @@ impl AgentAdapter for CodexAdapter {
         };
         let helper = helper.to_string_lossy().to_string();
 
-        let mut args = ctx.user_args.clone();
+        let mut generated = Vec::new();
         // Hooks are configured in both hook transports. The difference between them
         // is only what Turn is entitled to claim, never what Codex is told.
         if self.transport != CodexTransport::NotifyOnly {
-            args.push("-c".to_string());
-            args.push(self.hooks_config(&helper));
+            generated.push("-c".to_string());
+            generated.push(self.hooks_config(&helper));
         }
-        args.push("-c".to_string());
-        args.push(self.notify_config(&helper));
+        generated.push("-c".to_string());
+        generated.push(self.notify_config(&helper));
+        let args = insert_control_arguments(&profile_args, generated);
 
         // `--dangerously-bypass-hook-trust` would make the hooks run on the first
         // launch. It is deliberately never added: hooks run outside Codex's sandbox,
@@ -708,6 +833,7 @@ mod tests {
             cwd: "/repo".into(),
             command: "codex".into(),
             user_args: vec!["--model".into(), "gpt-5".into()],
+            launch_profile: None,
             endpoint: HookEndpoint {
                 base_url: "http://127.0.0.1:51234".into(),
                 token: "tok_codex".into(),
@@ -751,7 +877,10 @@ mod tests {
         assert!(!adapter.handles("claude"));
         assert!(!adapter.handles("codexx"));
         assert_eq!(adapter.best_level(), IntegrationLevel::Structured);
-        assert!(!adapter.capabilities().usage_events, "not over notify");
+        assert!(
+            adapter.capabilities().usage_events,
+            "the Stop transcript exposes context usage"
+        );
     }
 
     /// The shape here is the one that was seen firing. Every part of it was
@@ -866,9 +995,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.command, "codex");
-        assert!(plan
-            .args
-            .starts_with(&["--model".to_string(), "gpt-5".to_string()]));
+        let ctx = launch_ctx(Some("/usr/local/bin/turn-hook"));
+        assert!(plan.args.ends_with(&ctx.user_args));
         assert_eq!(
             plan.args.iter().filter(|a| *a == "-c").count(),
             2,
@@ -902,6 +1030,51 @@ mod tests {
             .find(|(k, _)| k == "TURN_HOOK_URL")
             .map(|(_, v)| v.as_str());
         assert_eq!(url, Some("http://127.0.0.1:51234/hook/tok_codex"));
+    }
+
+    #[test]
+    fn profile_hooks_and_notify_all_stay_before_literal_prompt_argv() {
+        let mut ctx = launch_ctx(Some("/usr/local/bin/turn-hook"));
+        ctx.launch_profile = Some(turn_core::model::AgentLaunchProfileRef::new(
+            "codex",
+            AUTONOMOUS_PROFILE_ID,
+        ));
+        ctx.user_args = vec![
+            "--model".into(),
+            "gpt-5".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "-c".into(),
+            "notify=[\"prompt-only\"]".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let requested_boundary = ctx.user_args.iter().position(|arg| arg == "--").unwrap();
+
+        let plan = CodexAdapter::new().prepare(&ctx).unwrap();
+        let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
+        assert!(plan.args.ends_with(&ctx.user_args));
+        assert_eq!(
+            &plan.args[effective_boundary..],
+            &ctx.user_args[requested_boundary..]
+        );
+        assert_eq!(
+            plan.args[..effective_boundary]
+                .iter()
+                .filter(|arg| *arg == "-c")
+                .count(),
+            2
+        );
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg == CODEX_BYPASS_POLICY));
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg.starts_with("hooks={")));
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg.starts_with("notify=[")));
     }
 
     /// Structured is reachable, but only once a hook has been seen firing.

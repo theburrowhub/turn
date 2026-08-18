@@ -6,10 +6,14 @@
 
 use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
+use turn_core::model::{
+    AgentRuntimeMetadata, LaunchConfiguration, Observable, ObservationSourceKind, QuotaSnapshot,
+    QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+};
 use turn_core::state::{AwaitingReason, Turn};
 use turn_proto::{
-    HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability, SessionTreeView,
-    TreeNodeView, WorkspaceTreeView,
+    AgentSummary, HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability,
+    SessionTreeView, TreeNodeView, WorkspaceTreeView,
 };
 
 use super::{
@@ -225,7 +229,16 @@ impl TurnView<'_> {
         let safe_details = safe_node.and(details);
 
         let attention_height: f32 = if node.needs_user { 34.0 } else { 0.0 };
-        let header_height = 76.0_f32.min(area.height());
+        // Three compact rows: identity/state, Session/provider, then the six
+        // runtime facts the operator must not have to open an inspector to see.
+        // A narrow WorkSurface needs one extra wrapped line; reserving it here
+        // keeps the quota fact visible instead of painting it behind the body.
+        let header_height = (if area.width() < 760.0 {
+            118.0_f32
+        } else {
+            98.0_f32
+        })
+        .min(area.height());
         let attention = Rect::from_min_size(
             area.min,
             Vec2::new(area.width(), attention_height.min(area.height())),
@@ -259,7 +272,15 @@ impl TurnView<'_> {
                 builder.set_label(copy);
             });
         }
-        paint_node_header(ui, theme, header, node, safe_node, safe_details);
+        paint_node_header(
+            ui,
+            theme,
+            header,
+            node,
+            safe_node,
+            safe_details,
+            self.now_ms,
+        );
 
         let stacked = body.width() < 760.0;
         let gap = 12.0_f32.min(body.width());
@@ -344,7 +365,7 @@ impl TurnView<'_> {
         actions
     }
 
-    fn exact_terminal<'a>(
+    pub(crate) fn exact_terminal<'a>(
         &'a self,
         node: &'a TreeNodeView,
     ) -> Option<(&'a turn_core::model::PaneNodeBinding, &'a PaneContent<'a>)> {
@@ -369,10 +390,10 @@ impl TurnView<'_> {
         ui: &mut Ui,
         theme: &Theme,
         rect: Rect,
-        surface_id: &str,
+        _surface_id: &str,
         node: &TreeNodeView,
         safe_node: Option<&TreeNodeView>,
-        binding: &turn_core::model::PaneNodeBinding,
+        _binding: &turn_core::model::PaneNodeBinding,
         content: &PaneContent<'_>,
         state: &mut ViewState,
     ) -> Vec<ViewAction> {
@@ -384,7 +405,7 @@ impl TurnView<'_> {
         ui.painter().text(
             strip.left_center() + Vec2::new(10.0, 0.0),
             Align2::LEFT_CENTER,
-            "EXACT TERMINAL · READ-ONLY MIRROR",
+            "EXACT TERMINAL",
             FontId::new(10.0, egui::FontFamily::Monospace),
             theme.text_dim,
         );
@@ -394,55 +415,60 @@ impl TurnView<'_> {
         ui.ctx().accesskit_node_builder(mirror_id, |builder| {
             builder.set_role(egui::accesskit::Role::Group);
             builder.set_label(format!(
-                "Exact read-only terminal mirror for {}",
+                "Exact operational terminal for {}",
                 work_surface_title(node, safe_node)
             ));
         });
-        let focus_rect = Rect::from_min_size(
-            strip.right_top() - Vec2::new(128.0, -3.0),
-            Vec2::new(122.0, 24.0),
-        );
-        if ui
-            .put(focus_rect, egui::Button::new("Focus exact Pane"))
-            .clicked()
-        {
-            state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
-                surface_id: surface_id.to_string(),
-                session_id: binding.session_id.clone(),
-                node_id: node.node_id.clone(),
-            });
-        }
         let terminal_rect = Rect::from_min_max(strip.left_bottom(), rect.max).shrink(6.0);
-        let interaction = state
-            .node_terminal_views
-            .entry(node.node_id.clone())
-            .or_default();
+        let resize_epoch = content
+            .runtime_id
+            .as_ref()
+            .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &content.pane_id));
         let options = PaneOptions {
-            focused: false,
-            accepts_input: false,
+            focused: true,
+            accepts_input: !state.is_sensitive()
+                && self.write_conflict.is_none()
+                && self.link_confirmation.is_none(),
             now_ms: self.now_ms,
             scrolled: content.scrolled,
             history_complete: content.history_complete,
         };
-        // A separate interaction object and a filtered outcome are both intentional:
-        // measuring this larger read-only mirror must not resize or focus the saved Pane.
-        terminal::show(
+        let interaction = state.pane(&content.pane_id);
+        // This exact-node view is the primary surface while selected, so its complete
+        // body owns the shared runtime geometry. The Pane identity remains the saved
+        // binding; changing views does not create a second terminal or lose selection.
+        terminal::show_pane(
             ui,
-            theme,
-            terminal_rect,
-            content.grid,
             interaction,
-            options,
-            ui.id()
-                .with(("node-terminal-mirror", node.node_id.as_str())),
+            terminal::PaneInput {
+                theme,
+                rect: terminal_rect,
+                grid: content.grid,
+                options,
+                id: ui
+                    .id()
+                    .with(("node-terminal-mirror", node.node_id.as_str())),
+                resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                    resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                        runtime_id,
+                        owner_epoch,
+                    })
+                }),
+                chrome: None,
+            },
         )
+        .actions
         .into_iter()
-        .filter_map(|action| match action {
-            PaneAction::Copy(_) | PaneAction::Scroll(_) => Some(ViewAction::Pane {
+        .map(|action| match action {
+            PaneAction::Copy(_)
+            | PaneAction::Scroll(_)
+            | PaneAction::Resize(_)
+            | PaneAction::GeometryUnavailable
+            | PaneAction::Focus
+            | PaneAction::Write(_) => ViewAction::Pane {
                 pane_id: content.pane_id.clone(),
                 action,
-            }),
-            PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_) => None,
+            },
         })
         .collect()
     }
@@ -455,6 +481,7 @@ fn paint_node_header(
     node: &TreeNodeView,
     safe_node: Option<&TreeNodeView>,
     details: Option<&InspectorDetails>,
+    now_ms: i64,
 ) {
     ui.painter().rect_filled(rect, 0.0, theme.panel);
     ui.painter()
@@ -496,13 +523,429 @@ fn paint_node_header(
                     if let Some(provider) = agent.agent.provider.as_deref() {
                         ui.label(RichText::new(provider).monospace().color(theme.text_faint));
                     }
-                    if let Some(model) = agent.agent.model.as_deref() {
-                        ui.label(RichText::new(model).monospace().color(theme.text_faint));
-                    }
                 }
             });
+            if node.is_agentic {
+                let facts = safe_node
+                    .and_then(|node| node.agent.as_ref())
+                    .map(|agent| agent_header_facts(agent, now_ms))
+                    .unwrap_or_else(CompactAgentFacts::loading);
+                ui.horizontal_wrapped(|ui| {
+                    // Wrapped facts are a dense status strip, not separate form
+                    // rows; no extra vertical gutter is needed between them.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    compact_fact(ui, theme, "MODEL", &facts.model);
+                    compact_fact(ui, theme, "MODE", &facts.mode);
+                    compact_fact(ui, theme, "EFFORT", &facts.effort);
+                    compact_fact(ui, theme, "THINK", &facts.thinking);
+                    compact_fact(ui, theme, "CONTEXT", &facts.context);
+                    compact_fact(ui, theme, "QUOTA", &facts.quota);
+                });
+            }
         },
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFactState {
+    Observed,
+    Waiting,
+    Unsupported,
+    Stale,
+    Failed,
+    Unreported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactFact {
+    value: String,
+    state: RuntimeFactState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactAgentFacts {
+    model: CompactFact,
+    mode: CompactFact,
+    effort: CompactFact,
+    thinking: CompactFact,
+    context: CompactFact,
+    quota: CompactFact,
+}
+
+impl CompactAgentFacts {
+    fn loading() -> Self {
+        let loading = || CompactFact {
+            value: "loading".into(),
+            state: RuntimeFactState::Waiting,
+        };
+        Self {
+            model: loading(),
+            mode: loading(),
+            effort: loading(),
+            thinking: loading(),
+            context: loading(),
+            quota: loading(),
+        }
+    }
+}
+
+fn compact_fact(ui: &mut Ui, theme: &Theme, label: &str, fact: &CompactFact) {
+    let colour = match fact.state {
+        RuntimeFactState::Observed => theme.text_dim,
+        RuntimeFactState::Waiting
+        | RuntimeFactState::Unsupported
+        | RuntimeFactState::Unreported => theme.text_faint,
+        RuntimeFactState::Stale => theme.provisional,
+        RuntimeFactState::Failed => theme.failure,
+    };
+    // A fact is one scanning unit. Let the wrapped row move the whole unit to
+    // the next line instead of splitting a value such as `54000/200000 tok`.
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!("{label}  {}", fact.value))
+                .monospace()
+                .small()
+                .color(colour),
+        )
+        .extend(),
+    );
+}
+
+fn agent_header_facts(agent: &AgentSummary, now_ms: i64) -> CompactAgentFacts {
+    CompactAgentFacts {
+        model: launch_header_fact(
+            &agent.runtime,
+            LaunchField::Model,
+            agent.agent.model.as_deref(),
+            now_ms,
+        ),
+        mode: launch_header_fact(
+            &agent.runtime,
+            LaunchField::PermissionMode,
+            agent.permission_mode.as_deref(),
+            now_ms,
+        ),
+        effort: launch_header_fact(&agent.runtime, LaunchField::EffortLevel, None, now_ms),
+        thinking: launch_header_fact(&agent.runtime, LaunchField::ThinkingEnabled, None, now_ms),
+        context: observation_header_fact(&agent.runtime.context, now_ms, |context| {
+            format_measurement(&context.measurement)
+        }),
+        quota: observation_header_fact(&agent.runtime.quota, now_ms, format_quota_compact),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LaunchField {
+    Model,
+    PermissionMode,
+    EffortLevel,
+    ThinkingEnabled,
+}
+
+fn launch_field(configuration: &LaunchConfiguration, field: LaunchField) -> Option<String> {
+    match field {
+        LaunchField::Model => compact_model(configuration),
+        LaunchField::PermissionMode => configuration.permission_mode.clone(),
+        LaunchField::EffortLevel => configuration.effort_level.clone(),
+        LaunchField::ThinkingEnabled => configuration
+            .thinking_enabled
+            .map(|enabled| if enabled { "enabled" } else { "disabled" }.to_string()),
+    }
+}
+
+fn compact_model(configuration: &LaunchConfiguration) -> Option<String> {
+    match (
+        configuration.model.as_deref(),
+        configuration.model_display_name.as_deref(),
+    ) {
+        (Some(model), _) => Some(model.to_string()),
+        (None, Some(display_name)) => Some(display_name.to_string()),
+        (None, None) => None,
+    }
+}
+
+fn launch_header_fact(
+    runtime: &AgentRuntimeMetadata,
+    field: LaunchField,
+    legacy: Option<&str>,
+    now_ms: i64,
+) -> CompactFact {
+    let observations = [
+        &runtime.launch.requested,
+        &runtime.launch.effective,
+        &runtime.launch.current,
+    ];
+    let mut values = Vec::<String>::new();
+    for observation in observations {
+        if let Some(value) = observation
+            .value()
+            .and_then(|configuration| launch_field(configuration, field))
+            .filter(|value| !value.is_empty())
+        {
+            if values.last() != Some(&value) {
+                values.push(value);
+            }
+        }
+    }
+
+    let current_state = observable_state_at(&runtime.launch.current, now_ms);
+    if values.is_empty() {
+        if let Some(legacy) = legacy.filter(|value| !value.is_empty()) {
+            values.push(legacy.to_string());
+        } else {
+            let (value, state) = match current_state {
+                RuntimeFactState::Observed => {
+                    ("unreported".to_string(), RuntimeFactState::Unreported)
+                }
+                RuntimeFactState::Stale => {
+                    ("stale · unreported".to_string(), RuntimeFactState::Stale)
+                }
+                RuntimeFactState::Waiting
+                | RuntimeFactState::Unsupported
+                | RuntimeFactState::Failed => {
+                    (runtime_state_label(current_state).into(), current_state)
+                }
+                RuntimeFactState::Unreported => unreachable!("observations cannot be unreported"),
+            };
+            return CompactFact { value, state };
+        }
+    }
+
+    let mut value = values.join("→");
+    let current_reports_field = runtime
+        .launch
+        .current
+        .value()
+        .and_then(|configuration| launch_field(configuration, field))
+        .is_some_and(|value| !value.is_empty());
+    let state = if current_reports_field {
+        match current_state {
+            RuntimeFactState::Stale => {
+                value.push_str(" · stale");
+                RuntimeFactState::Stale
+            }
+            _ => RuntimeFactState::Observed,
+        }
+    } else {
+        match current_state {
+            RuntimeFactState::Observed => {
+                value.push_str(" · current unreported");
+                RuntimeFactState::Unreported
+            }
+            RuntimeFactState::Waiting
+            | RuntimeFactState::Unsupported
+            | RuntimeFactState::Stale
+            | RuntimeFactState::Failed => {
+                value.push_str(" · current ");
+                value.push_str(runtime_state_label(current_state));
+                current_state
+            }
+            RuntimeFactState::Unreported => unreachable!("observations cannot be unreported"),
+        }
+    };
+    CompactFact { value, state }
+}
+
+fn observation_header_fact<T>(
+    observation: &Observable<T>,
+    now_ms: i64,
+    render: impl FnOnce(&T) -> String,
+) -> CompactFact {
+    let state = observable_state_at(observation, now_ms);
+    let value = match observation.value() {
+        Some(value) => {
+            let mut rendered = render(value);
+            if state == RuntimeFactState::Stale {
+                rendered.push_str(" · stale");
+            }
+            rendered
+        }
+        None => runtime_state_label(state).into(),
+    };
+    CompactFact { value, state }
+}
+
+fn observable_state_at<T>(observation: &Observable<T>, now_ms: i64) -> RuntimeFactState {
+    if observation.is_stale_at(now_ms) {
+        return RuntimeFactState::Stale;
+    }
+    match observation {
+        Observable::Waiting => RuntimeFactState::Waiting,
+        Observable::Observed { .. } => RuntimeFactState::Observed,
+        Observable::Unsupported { .. } => RuntimeFactState::Unsupported,
+        Observable::Stale { .. } => RuntimeFactState::Stale,
+        Observable::Failed { .. } => RuntimeFactState::Failed,
+    }
+}
+
+fn runtime_state_label(state: RuntimeFactState) -> &'static str {
+    match state {
+        RuntimeFactState::Observed => "observed",
+        RuntimeFactState::Waiting => "waiting",
+        RuntimeFactState::Unsupported => "unsupported",
+        RuntimeFactState::Stale => "stale",
+        RuntimeFactState::Failed => "failed",
+        RuntimeFactState::Unreported => "unreported",
+    }
+}
+
+fn format_quota_compact(quota: &QuotaSnapshot) -> String {
+    let scope = quota.scope_label.as_deref().or(quota.scope_id.as_deref());
+    match (scope, quota.windows.first()) {
+        (Some(scope), Some(window)) => {
+            format!(
+                "{scope} · {} {}",
+                window.label,
+                format_measurement(&window.measurement)
+            )
+        }
+        (None, Some(window)) => format!(
+            "{} {}",
+            window.label,
+            format_measurement(&window.measurement)
+        ),
+        (Some(scope), None) => format!("{scope} · no windows reported"),
+        (None, None) => "observed · no windows reported".into(),
+    }
+}
+
+fn format_measurement(measurement: &UsageMeasurement) -> String {
+    let amount = format_usage_amount(measurement.amount, &measurement.unit);
+    let amount = match measurement.total {
+        Some(total) => format!("{amount}/{}", format_usage_amount(total, &measurement.unit)),
+        None => amount,
+    };
+    let semantics = match measurement.kind {
+        UsageMeasurementKind::Used => "used",
+        UsageMeasurementKind::Remaining => "remaining",
+        UsageMeasurementKind::ProviderPercent => "provider",
+    };
+    format!("{amount} {semantics}")
+}
+
+fn format_usage_amount(amount: f64, unit: &UsageUnit) -> String {
+    let number = if amount.fract() == 0.0 {
+        format!("{amount:.0}")
+    } else {
+        format!("{amount:.1}")
+    };
+    match unit {
+        UsageUnit::Tokens => format!("{number} tok"),
+        UsageUnit::Percent => format!("{number}%"),
+        UsageUnit::Requests => format!("{number} req"),
+        UsageUnit::Credits => format!("{number} credits"),
+        UsageUnit::Other(unit) => format!("{number} {unit}"),
+    }
+}
+
+fn format_launch_configuration(configuration: &LaunchConfiguration) -> String {
+    let mut facts = Vec::new();
+    match (
+        configuration.model.as_deref(),
+        configuration.model_display_name.as_deref(),
+    ) {
+        (Some(model), Some(display_name)) if display_name != model => {
+            facts.push(format!("model {model} ({display_name})"));
+        }
+        (Some(model), _) => facts.push(format!("model {model}")),
+        (None, Some(display_name)) => facts.push(format!("model {display_name}")),
+        (None, None) => {}
+    }
+    if let Some(mode) = configuration.permission_mode.as_deref() {
+        facts.push(format!("permission {mode}"));
+    }
+    if let Some(mode) = configuration.approval_mode.as_deref() {
+        facts.push(format!("approval {mode}"));
+    }
+    if let Some(mode) = configuration.sandbox_mode.as_deref() {
+        facts.push(format!("sandbox {mode}"));
+    }
+    if let Some(effort) = configuration.effort_level.as_deref() {
+        facts.push(format!("effort {effort}"));
+    }
+    if let Some(enabled) = configuration.thinking_enabled {
+        facts.push(format!(
+            "thinking {}",
+            if enabled { "enabled" } else { "disabled" }
+        ));
+    }
+    if !configuration.safe_flags.is_empty() {
+        facts.push(format!("flags {}", configuration.safe_flags.join(" ")));
+    }
+    if facts.is_empty() {
+        "no launch fields reported".into()
+    } else {
+        facts.join(" · ")
+    }
+}
+
+fn inspector_runtime_observation<T>(
+    ui: &mut Ui,
+    theme: &Theme,
+    label: &str,
+    observation: &Observable<T>,
+    now_ms: i64,
+    render: impl FnOnce(&T) -> String,
+) {
+    let state = observable_state_at(observation, now_ms);
+    let value = match observation {
+        Observable::Observed { value, .. } | Observable::Stale { value, .. } => {
+            format!("{} · {}", runtime_state_label(state), render(value))
+        }
+        Observable::Failed { message, .. } => format!("failed · {message}"),
+        Observable::Waiting | Observable::Unsupported { .. } => {
+            runtime_state_label(state).to_string()
+        }
+    };
+    inspector_value(ui, theme, label, &value);
+
+    if let Some(source) = observation.source() {
+        let source = source.label.as_deref().unwrap_or(match source.kind {
+            ObservationSourceKind::Unknown => "unknown source",
+            ObservationSourceKind::LaunchRequest => "launch request",
+            ObservationSourceKind::Adapter => "adapter",
+            ObservationSourceKind::Provider => "provider",
+            ObservationSourceKind::Process => "process",
+            ObservationSourceKind::Cache => "cache",
+        });
+        inspector_value(ui, theme, &format!("{label} source"), source);
+    }
+    if let Some(observed_at_ms) = observation.observed_at_ms() {
+        inspector_value(
+            ui,
+            theme,
+            &format!("{label} observed"),
+            &format_relative_time(observed_at_ms, now_ms),
+        );
+    }
+    let expires_at_ms = match observation {
+        Observable::Observed { expires_at_ms, .. } | Observable::Stale { expires_at_ms, .. } => {
+            *expires_at_ms
+        }
+        Observable::Waiting | Observable::Unsupported { .. } | Observable::Failed { .. } => None,
+    };
+    if let Some(expires_at_ms) = expires_at_ms {
+        inspector_value(
+            ui,
+            theme,
+            &format!("{label} expires"),
+            &format_relative_time(expires_at_ms, now_ms),
+        );
+    }
+}
+
+fn format_relative_time(timestamp_ms: i64, now_ms: i64) -> String {
+    if timestamp_ms <= now_ms {
+        format!(
+            "{} ago",
+            format_duration(now_ms.saturating_sub(timestamp_ms))
+        )
+    } else {
+        format!(
+            "in {}",
+            format_duration(timestamp_ms.saturating_sub(now_ms))
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,9 +1077,7 @@ fn node_details(
                 if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     inspector_optional(ui, theme, "provider", agent.agent.provider.as_deref());
                     inspector_optional(ui, theme, "tool", agent.agent.tool.as_deref());
-                    inspector_optional(ui, theme, "model", agent.agent.model.as_deref());
                     inspector_optional(ui, theme, "Agent type", agent.agent_type.as_deref());
-                    inspector_optional(ui, theme, "permission mode", agent.permission_mode.as_deref());
                     inspector_optional(ui, theme, "branch", agent.git_branch.as_deref());
                 } else if node.is_agentic {
                     inspector_value(ui, theme, "agent metadata", "Loading safe details…");
@@ -658,19 +1099,87 @@ fn node_details(
                 }
 
                 if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
-                    inspector_section(ui, theme, "USAGE");
-                    inspector_optional_owned(
+                    inspector_section(ui, theme, "LAUNCH RECEIPT");
+                    inspector_runtime_observation(
                         ui,
                         theme,
-                        "tokens",
-                        agent.tokens_used.map(|tokens| tokens.to_string()),
+                        "requested",
+                        &agent.runtime.launch.requested,
+                        now_ms,
+                        format_launch_configuration,
                     );
-                    inspector_optional_owned(
+                    inspector_runtime_observation(
                         ui,
                         theme,
-                        "cost",
-                        agent.cost_usd.map(|cost| format!("${cost:.4}")),
+                        "effective",
+                        &agent.runtime.launch.effective,
+                        now_ms,
+                        format_launch_configuration,
                     );
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "current",
+                        &agent.runtime.launch.current,
+                        now_ms,
+                        format_launch_configuration,
+                    );
+
+                    inspector_section(ui, theme, "CONVERSATION CONTEXT");
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "usage",
+                        &agent.runtime.context,
+                        now_ms,
+                        |context| format_measurement(&context.measurement),
+                    );
+                    if let Some(context) = agent.runtime.context.value() {
+                        inspector_optional(ui, theme, "scope", context.scope_id.as_deref());
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "effective window",
+                            context
+                                .effective_window
+                                .as_ref()
+                                .map(format_measurement),
+                        );
+                    }
+
+                    inspector_section(ui, theme, "PROVIDER QUOTA");
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "quota",
+                        &agent.runtime.quota,
+                        now_ms,
+                        format_quota_compact,
+                    );
+                    if let Some(quota) = agent.runtime.quota.value() {
+                        inspector_optional(ui, theme, "scope id", quota.scope_id.as_deref());
+                        inspector_optional(ui, theme, "scope", quota.scope_label.as_deref());
+                        for window in &quota.windows {
+                            let value = format_quota_window(window, now_ms);
+                            inspector_value(ui, theme, &window.label, &value);
+                        }
+                    }
+
+                    if agent.tokens_used.is_some() || agent.cost_usd.is_some() {
+                        inspector_section(ui, theme, "SESSION TOTALS");
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "tokens",
+                            agent.tokens_used.map(|tokens| tokens.to_string()),
+                        );
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "cost",
+                            agent.cost_usd.map(|cost| format!("${cost:.4}")),
+                        );
+                    }
                 }
 
                 match details {
@@ -761,6 +1270,24 @@ fn node_details(
                 }
             });
     });
+}
+
+fn format_quota_window(window: &QuotaWindow, now_ms: i64) -> String {
+    let mut value = format_measurement(&window.measurement);
+    if let Some(reset) = window.resets_at_ms {
+        value.push_str(" · reset ");
+        value.push_str(&format_relative_time(reset, now_ms));
+    }
+    if window.exhausted == Some(true) {
+        value.push_str(" · exhausted");
+    }
+    match window.hard_limit {
+        Some(true) => value.push_str(" · hard limit"),
+        Some(false) => value.push_str(" · soft limit"),
+        None if window.exhausted == Some(true) => value.push_str(" · hardness unknown"),
+        None => {}
+    }
+    value
 }
 
 fn activity_card(ui: &mut Ui, theme: &Theme, preview: &turn_core::model::ActivityPreview) {
@@ -950,6 +1477,395 @@ mod tests {
             resolve(&snapshot, Some(&HierarchyKey::process(first.clone())), None)
                 .map(ResolvedViewTarget::public),
             Some(ViewTarget::Node(first))
+        );
+    }
+
+    fn source() -> turn_core::model::ObservationSource {
+        turn_core::model::ObservationSource::new(
+            ObservationSourceKind::Provider,
+            "provider runtime",
+        )
+    }
+
+    #[test]
+    fn compact_header_promotes_launch_mismatch_and_current_unsupported_state() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-runtime"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.launch.requested = Observable::observed(
+            LaunchConfiguration {
+                model: Some("sonnet".into()),
+                permission_mode: Some("default".into()),
+                effort_level: Some("medium".into()),
+                thinking_enabled: Some(false),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+        runtime.launch.effective = Observable::observed(
+            LaunchConfiguration {
+                model: Some("opus".into()),
+                permission_mode: Some("bypass".into()),
+                effort_level: Some("high".into()),
+                thinking_enabled: Some(true),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        runtime.launch.current = Observable::unsupported(source(), T0 + 2);
+
+        let facts = agent_header_facts(&AgentSummary::from_node(&node, T0).unwrap(), T0);
+        assert_eq!(facts.model.value, "sonnet→opus · current unsupported");
+        assert_eq!(facts.model.state, RuntimeFactState::Unsupported);
+        assert_eq!(facts.mode.value, "default→bypass · current unsupported");
+        assert_eq!(facts.effort.value, "medium→high · current unsupported");
+        assert_eq!(facts.effort.state, RuntimeFactState::Unsupported);
+        assert_eq!(
+            facts.thinking.value,
+            "disabled→enabled · current unsupported"
+        );
+        assert_eq!(facts.thinking.state, RuntimeFactState::Unsupported);
+    }
+
+    #[test]
+    fn compact_launch_facts_keep_waiting_stale_and_unreported_distinct() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-launch-states"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        let requested = LaunchConfiguration {
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
+            ..LaunchConfiguration::default()
+        };
+        runtime.launch.requested = Observable::observed(requested.clone(), source(), T0, None);
+        runtime.launch.effective = Observable::observed(requested.clone(), source(), T0 + 1, None);
+
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let waiting = agent_header_facts(&summary, T0 + 2);
+        assert_eq!(waiting.effort.value, "high · current waiting");
+        assert_eq!(waiting.effort.state, RuntimeFactState::Waiting);
+        assert_eq!(waiting.thinking.value, "enabled · current waiting");
+        assert_eq!(waiting.thinking.state, RuntimeFactState::Waiting);
+
+        summary.runtime.launch.current = Observable::stale(
+            LaunchConfiguration {
+                effort_level: Some("xhigh".into()),
+                thinking_enabled: Some(false),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            Some(T0 + 3),
+        );
+        let stale = agent_header_facts(&summary, T0 + 3);
+        assert_eq!(stale.effort.value, "high→xhigh · stale");
+        assert_eq!(stale.effort.state, RuntimeFactState::Stale);
+        assert_eq!(stale.thinking.value, "enabled→disabled · stale");
+        assert_eq!(stale.thinking.state, RuntimeFactState::Stale);
+
+        summary.runtime.launch.current =
+            Observable::observed(LaunchConfiguration::default(), source(), T0 + 4, None);
+        let unreported = agent_header_facts(&summary, T0 + 4);
+        assert_eq!(
+            unreported.effort.value, "high · current unreported",
+            "an observed partial sample must not invent a current effort"
+        );
+        assert_eq!(unreported.effort.state, RuntimeFactState::Unreported);
+        assert_eq!(unreported.thinking.value, "enabled · current unreported");
+        assert_eq!(unreported.thinking.state, RuntimeFactState::Unreported);
+
+        summary.runtime.launch.requested = Observable::Waiting;
+        summary.runtime.launch.effective = Observable::Waiting;
+        let absent = agent_header_facts(&summary, T0 + 4);
+        assert_eq!(absent.effort.value, "unreported");
+        assert_eq!(absent.effort.state, RuntimeFactState::Unreported);
+        assert_eq!(absent.thinking.value, "unreported");
+        assert_eq!(absent.thinking.state, RuntimeFactState::Unreported);
+
+        summary.runtime.launch.current = Observable::stale(
+            LaunchConfiguration::default(),
+            source(),
+            T0 + 5,
+            Some(T0 + 6),
+        );
+        let absent_stale = agent_header_facts(&summary, T0 + 6);
+        assert_eq!(absent_stale.effort.value, "stale · unreported");
+        assert_eq!(absent_stale.effort.state, RuntimeFactState::Stale);
+        assert_eq!(absent_stale.thinking.value, "stale · unreported");
+        assert_eq!(absent_stale.thinking.state, RuntimeFactState::Stale);
+    }
+
+    #[test]
+    fn compact_model_uses_display_only_and_keeps_id_and_label_unambiguous() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-model-display"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model_display_name: Some("Opus".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let display_only = agent_header_facts(&summary, T0);
+        assert_eq!(display_only.model.value, "Opus");
+        assert_eq!(display_only.model.state, RuntimeFactState::Observed);
+
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                model_display_name: Some("Opus 5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        let identified = agent_header_facts(&summary, T0 + 1);
+        assert_eq!(identified.model.value, "claude-opus-5");
+        assert_eq!(identified.model.state, RuntimeFactState::Observed);
+
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("same-name".into()),
+                model_display_name: Some("same-name".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            None,
+        );
+        assert_eq!(
+            agent_header_facts(&summary, T0 + 2).model.value,
+            "same-name",
+            "an identical provider label must not be repeated"
+        );
+
+        summary.runtime.launch.requested = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+        summary.runtime.launch.effective = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                model_display_name: Some("Opus 5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            None,
+        );
+        assert_eq!(
+            agent_header_facts(&summary, T0 + 2).model.value,
+            "claude-opus-5",
+            "adding a display label to the same id is enrichment, not a model transition"
+        );
+    }
+
+    #[test]
+    fn launch_receipt_formats_every_safe_field_without_omissions() {
+        let configuration = LaunchConfiguration {
+            model: Some("claude-opus-5".into()),
+            model_display_name: Some("Opus 5".into()),
+            permission_mode: Some("Autonomous".into()),
+            approval_mode: Some("bypassed".into()),
+            sandbox_mode: Some("disabled".into()),
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
+            safe_flags: vec!["--model".into(), "--permission-mode".into()],
+        };
+
+        assert_eq!(
+            format_launch_configuration(&configuration),
+            "model claude-opus-5 (Opus 5) · permission Autonomous · approval bypassed · \
+             sandbox disabled · effort high · thinking enabled · flags --model \
+             --permission-mode"
+        );
+        assert_eq!(
+            format_launch_configuration(&LaunchConfiguration::default()),
+            "no launch fields reported"
+        );
+    }
+
+    #[test]
+    fn compact_capacity_facts_keep_observed_stale_and_unsupported_distinct() {
+        use turn_core::model::{ContextUsageSnapshot, QuotaWindow};
+
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-capacity"),
+            "codex",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::stale(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42_000.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            source(),
+            T0,
+            Some(T0 + 1),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("account".into()),
+                scope_label: Some("team".into()),
+                windows: vec![QuotaWindow {
+                    label: "five hour".into(),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::ProviderPercent,
+                        amount: 61.0,
+                        unit: UsageUnit::Percent,
+                        total: None,
+                    },
+                    resets_at_ms: None,
+                    exhausted: None,
+                    hard_limit: None,
+                }],
+            },
+            source(),
+            T0,
+            None,
+        );
+
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let facts = agent_header_facts(&summary, T0);
+        assert_eq!(facts.context.value, "42000 tok used · stale");
+        assert_eq!(facts.context.state, RuntimeFactState::Stale);
+        assert_eq!(facts.quota.value, "team · five hour 61% provider");
+        assert_eq!(facts.quota.state, RuntimeFactState::Observed);
+        assert!(
+            !facts.context.value.contains('%') && !facts.context.value.contains("remaining"),
+            "no total means no derived percentage or complement"
+        );
+
+        summary.runtime.quota = Observable::unsupported(source(), T0 + 1);
+        let facts = agent_header_facts(&summary, T0);
+        assert_eq!(facts.quota.value, "unsupported");
+        assert_eq!(facts.quota.state, RuntimeFactState::Unsupported);
+    }
+
+    #[test]
+    fn compact_capacity_facts_age_after_a_received_projection_expires() {
+        use turn_core::model::ContextUsageSnapshot;
+
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-live-expiry"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::observed(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            source(),
+            T0,
+            Some(T0 + 10),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("account".into()),
+                scope_label: None,
+                windows: Vec::new(),
+            },
+            source(),
+            T0,
+            Some(T0 + 10),
+        );
+        let summary = AgentSummary::from_node(&node, T0).unwrap();
+        assert!(matches!(
+            summary.runtime.context,
+            Observable::Observed { .. }
+        ));
+
+        let facts = agent_header_facts(&summary, T0 + 10);
+        assert_eq!(facts.context.state, RuntimeFactState::Stale);
+        assert_eq!(facts.context.value, "42 tok used · stale");
+        assert_eq!(facts.quota.state, RuntimeFactState::Stale);
+        assert_eq!(facts.quota.value, "account · no windows reported · stale");
+    }
+
+    #[test]
+    fn exhausted_provider_limit_does_not_claim_unknown_hardness() {
+        let mut window = QuotaWindow {
+            label: "5h".into(),
+            measurement: UsageMeasurement {
+                kind: UsageMeasurementKind::Remaining,
+                amount: 0.0,
+                unit: UsageUnit::Percent,
+                total: Some(100.0),
+            },
+            resets_at_ms: None,
+            exhausted: Some(true),
+            hard_limit: None,
+        };
+
+        assert_eq!(
+            format_quota_window(&window, T0),
+            "0%/100% remaining · exhausted · hardness unknown"
+        );
+        window.hard_limit = Some(true);
+        assert_eq!(
+            format_quota_window(&window, T0),
+            "0%/100% remaining · exhausted · hard limit"
         );
     }
 }

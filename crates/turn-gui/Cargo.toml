@@ -49,6 +49,10 @@ libc = "0.2"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibility", "NSWorkspace"] }
 
 [dev-dependencies]
+# The GUI intentionally receives semantic profile references rather than linking
+# provider launch code. This test-only edge keeps its four quick choices locked to
+# the provider-owned registry catalogue so the two cannot drift silently.
+turn-agents = { workspace = true }
 # `eframe` lets the harness run the real `TurnApp` rather than only its view, which is
 # what makes the idle-repaint measurement a test of the application.
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot", "eframe"] }

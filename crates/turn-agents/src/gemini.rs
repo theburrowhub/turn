@@ -7,13 +7,15 @@
 //! structured integration only after an authenticated callback is observed.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::{risk, text};
 use serde_json::{json, Value};
 use std::path::Path;
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, Risk, TurnEvent};
+use turn_core::model::LaunchConfiguration;
 
 /// Version of Gemini CLI whose documented hook contract the fixture covers.
 pub const CONTRACT_VERSION: &str = "0.46.0";
@@ -61,10 +63,14 @@ impl GeminiCliAdapter {
         json!({ "hooks": hooks })
     }
 
-    fn fallback(ctx: &LaunchContext, reason: impl std::fmt::Display) -> LaunchPlan {
+    fn fallback(
+        ctx: &LaunchContext,
+        args: Vec<String>,
+        reason: impl std::fmt::Display,
+    ) -> LaunchPlan {
         LaunchPlan {
             command: ctx.command.clone(),
-            args: ctx.user_args.clone(),
+            args,
             env: base_env(ctx),
             level: IntegrationLevel::Heuristic,
             note: format!(
@@ -85,6 +91,83 @@ impl GeminiCliAdapter {
         let contents = serde_json::to_vec_pretty(&self.settings_document(helper))?;
         write_private(&settings, &contents)?;
         Ok(settings)
+    }
+}
+
+fn gemini_approval_modes(args: &[String]) -> Vec<Option<&str>> {
+    let controls = control_arguments(args);
+    controls
+        .iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            if arg == "--approval-mode" {
+                Some(controls.get(index + 1).map(String::as_str))
+            } else {
+                arg.strip_prefix("--approval-mode=").map(Some)
+            }
+        })
+        .collect()
+}
+
+fn gemini_yolo_flag(args: &[String]) -> Option<&str> {
+    control_arguments(args)
+        .iter()
+        .find(|arg| matches!(arg.as_str(), "--yolo" | "-y"))
+        .map(String::as_str)
+}
+
+fn observed_gemini_approval_mode(args: &[String]) -> Option<&str> {
+    let mode = gemini_approval_modes(args).into_iter().last().flatten()?;
+    ["default", "auto_edit", "yolo", "plan"]
+        .contains(&mode)
+        .then_some(mode)
+}
+
+fn resolve_gemini_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    let yolo_flag = gemini_yolo_flag(args);
+    let approval_modes = gemini_approval_modes(args);
+    let yolo_mode = approval_modes.contains(&Some("yolo"));
+    let conflicting_mode = approval_modes.iter().any(|mode| *mode != Some("yolo"));
+
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if yolo_flag.is_some() || !approval_modes.is_empty() {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "gemini-cli".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "an explicit Gemini approval policy argument".to_string(),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("gemini-cli", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            if conflicting_mode {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "gemini-cli".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "the explicit non-yolo --approval-mode argument".to_string(),
+                });
+            }
+            let effective_flag = yolo_flag.unwrap_or("--approval-mode");
+            let resolved = if yolo_flag.is_some() || yolo_mode {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, ["--approval-mode".to_string(), "yolo".to_string()])
+            };
+            Ok(ResolvedLaunchProfile::autonomous(
+                "gemini-cli",
+                LaunchPermissionPosture::YoloApprovalMode,
+                resolved,
+                vec![effective_flag.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "gemini-cli".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
     }
 }
 
@@ -111,18 +194,74 @@ impl AgentAdapter for GeminiCliAdapter {
             permission_events: true,
             subagent_events: false,
             resumable: true,
-            usage_events: false,
+            // AfterAgent identifies the provider transcript, whose bounded tail
+            // carries exact input-context consumption for the completed turn.
+            usage_events: true,
             external_session_id: true,
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe("Gemini keeps its normal approval mode in force."),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::YoloApprovalMode,
+                "Gemini uses its yolo approval mode for this launch.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_gemini_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
+        let approval = if gemini_yolo_flag(args).is_some() {
+            Some("yolo")
+        } else {
+            observed_gemini_approval_mode(args)
+        };
+        configuration.approval_mode = approval.map(str::to_string);
+        if profile.role.is_none() && approval == Some("yolo") {
+            configuration.permission_mode = Some("Custom · yolo approval mode".into());
+        }
+        configuration
+    }
+
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        if profile.role != Some(crate::LaunchProfileRole::Autonomous) {
+            return true;
+        }
+        let modes = gemini_approval_modes(args);
+        let modes_are_yolo = modes.iter().all(|mode| *mode == Some("yolo"));
+        profile.adapter_id == self.id()
+            && profile.posture == LaunchPermissionPosture::YoloApprovalMode
+            && modes_are_yolo
+            && (gemini_yolo_flag(args).is_some() || modes.contains(&Some("yolo")))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let profile_args = resolved_profile.args;
         let Some(helper) = ctx.endpoint.helper_path.as_deref() else {
-            return Ok(Self::fallback(ctx, "the turn-hook helper was not found"));
+            return Ok(Self::fallback(
+                ctx,
+                profile_args,
+                "the turn-hook helper was not found",
+            ));
         };
         let settings = match self.install(ctx, helper) {
             Ok(settings) => settings,
-            Err(error) => return Ok(Self::fallback(ctx, error)),
+            Err(error) => return Ok(Self::fallback(ctx, profile_args, error)),
         };
 
         let mut env = base_env(ctx);
@@ -132,7 +271,7 @@ impl AgentAdapter for GeminiCliAdapter {
         ));
         Ok(LaunchPlan {
             command: ctx.command.clone(),
-            args: ctx.user_args.clone(),
+            args: profile_args,
             env,
             // Configuration is not evidence that the user left hooks enabled.
             // The daemon promotes this as soon as the first callback arrives.
