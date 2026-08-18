@@ -408,8 +408,12 @@ fn add_runtime_metadata(info: &mut AgentInfo, model: &str) {
         Observable::observed(configuration.clone(), request_source, T0 + 3_000, None);
     info.runtime.launch.effective =
         Observable::observed(configuration.clone(), adapter_source, T0 + 3_010, None);
+    let mut current = configuration;
+    current.model_display_name = Some("Claude 3.5 Sonnet".into());
+    current.effort_level = Some("high".into());
+    current.thinking_enabled = Some(true);
     info.runtime.launch.current = Observable::observed(
-        configuration,
+        current,
         provider_source.clone(),
         T0 + 12_000,
         Some(T0 + 42_000),
@@ -1187,6 +1191,49 @@ fn selecting_a_semantic_subagent_opens_its_exact_full_work_surface_without_touch
         .actions
         .iter()
         .any(|action| matches!(action, ViewAction::ZoomPane { .. })));
+}
+
+#[test]
+fn exact_agent_runtime_effort_thinking_and_safe_launch_facts_are_accessible_at_a_glance() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let accessible = all_text(&h);
+    assert!(
+        accessible.iter().any(|text| text == "EFFORT  high"),
+        "live effort is a compact accessible fact: {accessible:?}"
+    );
+    assert!(
+        accessible.iter().any(|text| text == "THINK  enabled"),
+        "live thinking state is a compact accessible fact: {accessible:?}"
+    );
+    let accessible = accessible.join("\n");
+    assert!(accessible.contains("model claude-3.5-sonnet (Claude 3.5 Sonnet)"));
+    assert!(accessible.contains("effort high · thinking enabled"));
+    assert!(accessible.contains("flags --permission-mode default"));
 }
 
 #[test]

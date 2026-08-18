@@ -229,7 +229,7 @@ impl TurnView<'_> {
         let safe_details = safe_node.and(details);
 
         let attention_height: f32 = if node.needs_user { 34.0 } else { 0.0 };
-        // Three compact rows: identity/state, Session/provider, then the four
+        // Three compact rows: identity/state, Session/provider, then the six
         // runtime facts the operator must not have to open an inspector to see.
         // A narrow WorkSurface needs one extra wrapped line; reserving it here
         // keeps the quota fact visible instead of painting it behind the body.
@@ -527,13 +527,18 @@ fn paint_node_header(
                 }
             });
             if node.is_agentic {
+                let facts = safe_node
+                    .and_then(|node| node.agent.as_ref())
+                    .map(|agent| agent_header_facts(agent, now_ms))
+                    .unwrap_or_else(CompactAgentFacts::loading);
                 ui.horizontal_wrapped(|ui| {
-                    let facts = safe_node
-                        .and_then(|node| node.agent.as_ref())
-                        .map(|agent| agent_header_facts(agent, now_ms))
-                        .unwrap_or_else(CompactAgentFacts::loading);
+                    // Wrapped facts are a dense status strip, not separate form
+                    // rows; no extra vertical gutter is needed between them.
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     compact_fact(ui, theme, "MODEL", &facts.model);
                     compact_fact(ui, theme, "MODE", &facts.mode);
+                    compact_fact(ui, theme, "EFFORT", &facts.effort);
+                    compact_fact(ui, theme, "THINK", &facts.thinking);
                     compact_fact(ui, theme, "CONTEXT", &facts.context);
                     compact_fact(ui, theme, "QUOTA", &facts.quota);
                 });
@@ -549,6 +554,7 @@ enum RuntimeFactState {
     Unsupported,
     Stale,
     Failed,
+    Unreported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +567,8 @@ struct CompactFact {
 struct CompactAgentFacts {
     model: CompactFact,
     mode: CompactFact,
+    effort: CompactFact,
+    thinking: CompactFact,
     context: CompactFact,
     quota: CompactFact,
 }
@@ -574,6 +582,8 @@ impl CompactAgentFacts {
         Self {
             model: loading(),
             mode: loading(),
+            effort: loading(),
+            thinking: loading(),
             context: loading(),
             quota: loading(),
         }
@@ -583,15 +593,22 @@ impl CompactAgentFacts {
 fn compact_fact(ui: &mut Ui, theme: &Theme, label: &str, fact: &CompactFact) {
     let colour = match fact.state {
         RuntimeFactState::Observed => theme.text_dim,
-        RuntimeFactState::Waiting | RuntimeFactState::Unsupported => theme.text_faint,
+        RuntimeFactState::Waiting
+        | RuntimeFactState::Unsupported
+        | RuntimeFactState::Unreported => theme.text_faint,
         RuntimeFactState::Stale => theme.provisional,
         RuntimeFactState::Failed => theme.failure,
     };
-    ui.label(
-        RichText::new(format!("{label}  {}", fact.value))
-            .monospace()
-            .small()
-            .color(colour),
+    // A fact is one scanning unit. Let the wrapped row move the whole unit to
+    // the next line instead of splitting a value such as `54000/200000 tok`.
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!("{label}  {}", fact.value))
+                .monospace()
+                .small()
+                .color(colour),
+        )
+        .extend(),
     );
 }
 
@@ -609,6 +626,8 @@ fn agent_header_facts(agent: &AgentSummary, now_ms: i64) -> CompactAgentFacts {
             agent.permission_mode.as_deref(),
             now_ms,
         ),
+        effort: launch_header_fact(&agent.runtime, LaunchField::EffortLevel, None, now_ms),
+        thinking: launch_header_fact(&agent.runtime, LaunchField::ThinkingEnabled, None, now_ms),
         context: observation_header_fact(&agent.runtime.context, now_ms, |context| {
             format_measurement(&context.measurement)
         }),
@@ -620,12 +639,20 @@ fn agent_header_facts(agent: &AgentSummary, now_ms: i64) -> CompactAgentFacts {
 enum LaunchField {
     Model,
     PermissionMode,
+    EffortLevel,
+    ThinkingEnabled,
 }
 
 fn launch_field(configuration: &LaunchConfiguration, field: LaunchField) -> Option<&str> {
     match field {
         LaunchField::Model => configuration.model.as_deref(),
         LaunchField::PermissionMode => configuration.permission_mode.as_deref(),
+        LaunchField::EffortLevel => configuration.effort_level.as_deref(),
+        LaunchField::ThinkingEnabled => {
+            configuration
+                .thinking_enabled
+                .map(|enabled| if enabled { "enabled" } else { "disabled" })
+        }
     }
 }
 
@@ -656,37 +683,57 @@ fn launch_header_fact(
     let current_state = observable_state_at(&runtime.launch.current, now_ms);
     if values.is_empty() {
         if let Some(legacy) = legacy.filter(|value| !value.is_empty()) {
-            return CompactFact {
-                value: legacy.to_string(),
-                state: RuntimeFactState::Observed,
+            values.push(legacy.to_string());
+        } else {
+            let (value, state) = match current_state {
+                RuntimeFactState::Observed => {
+                    ("unreported".to_string(), RuntimeFactState::Unreported)
+                }
+                RuntimeFactState::Stale => {
+                    ("stale · unreported".to_string(), RuntimeFactState::Stale)
+                }
+                RuntimeFactState::Waiting
+                | RuntimeFactState::Unsupported
+                | RuntimeFactState::Failed => {
+                    (runtime_state_label(current_state).into(), current_state)
+                }
+                RuntimeFactState::Unreported => unreachable!("observations cannot be unreported"),
             };
+            return CompactFact { value, state };
         }
-        let decisive = [
-            &runtime.launch.current,
-            &runtime.launch.effective,
-            &runtime.launch.requested,
-        ]
-        .into_iter()
-        .map(|observation| observable_state_at(observation, now_ms))
-        .find(|state| *state != RuntimeFactState::Waiting)
-        .unwrap_or(RuntimeFactState::Waiting);
-        return CompactFact {
-            value: runtime_state_label(decisive).into(),
-            state: decisive,
-        };
     }
 
     let mut value = values.join("→");
-    let state = match current_state {
-        RuntimeFactState::Unsupported | RuntimeFactState::Failed
-            if runtime.launch.current.value().is_none() =>
-        {
-            value.push_str(" · current ");
-            value.push_str(runtime_state_label(current_state));
-            current_state
+    let current_reports_field = runtime
+        .launch
+        .current
+        .value()
+        .and_then(|configuration| launch_field(configuration, field))
+        .is_some_and(|value| !value.is_empty());
+    let state = if current_reports_field {
+        match current_state {
+            RuntimeFactState::Stale => {
+                value.push_str(" · stale");
+                RuntimeFactState::Stale
+            }
+            _ => RuntimeFactState::Observed,
         }
-        RuntimeFactState::Stale => RuntimeFactState::Stale,
-        _ => RuntimeFactState::Observed,
+    } else {
+        match current_state {
+            RuntimeFactState::Observed => {
+                value.push_str(" · current unreported");
+                RuntimeFactState::Unreported
+            }
+            RuntimeFactState::Waiting
+            | RuntimeFactState::Unsupported
+            | RuntimeFactState::Stale
+            | RuntimeFactState::Failed => {
+                value.push_str(" · current ");
+                value.push_str(runtime_state_label(current_state));
+                current_state
+            }
+            RuntimeFactState::Unreported => unreachable!("observations cannot be unreported"),
+        }
     };
     CompactFact { value, state }
 }
@@ -730,6 +777,7 @@ fn runtime_state_label(state: RuntimeFactState) -> &'static str {
         RuntimeFactState::Unsupported => "unsupported",
         RuntimeFactState::Stale => "stale",
         RuntimeFactState::Failed => "failed",
+        RuntimeFactState::Unreported => "unreported",
     }
 }
 
@@ -784,8 +832,16 @@ fn format_usage_amount(amount: f64, unit: &UsageUnit) -> String {
 
 fn format_launch_configuration(configuration: &LaunchConfiguration) -> String {
     let mut facts = Vec::new();
-    if let Some(model) = configuration.model.as_deref() {
-        facts.push(format!("model {model}"));
+    match (
+        configuration.model.as_deref(),
+        configuration.model_display_name.as_deref(),
+    ) {
+        (Some(model), Some(display_name)) if display_name != model => {
+            facts.push(format!("model {model} ({display_name})"));
+        }
+        (Some(model), _) => facts.push(format!("model {model}")),
+        (None, Some(display_name)) => facts.push(format!("model {display_name}")),
+        (None, None) => {}
     }
     if let Some(mode) = configuration.permission_mode.as_deref() {
         facts.push(format!("permission {mode}"));
@@ -796,11 +852,20 @@ fn format_launch_configuration(configuration: &LaunchConfiguration) -> String {
     if let Some(mode) = configuration.sandbox_mode.as_deref() {
         facts.push(format!("sandbox {mode}"));
     }
+    if let Some(effort) = configuration.effort_level.as_deref() {
+        facts.push(format!("effort {effort}"));
+    }
+    if let Some(enabled) = configuration.thinking_enabled {
+        facts.push(format!(
+            "thinking {}",
+            if enabled { "enabled" } else { "disabled" }
+        ));
+    }
     if !configuration.safe_flags.is_empty() {
         facts.push(format!("flags {}", configuration.safe_flags.join(" ")));
     }
     if facts.is_empty() {
-        "observed · no launch fields reported".into()
+        "no launch fields reported".into()
     } else {
         facts.join(" · ")
     }
@@ -1427,6 +1492,8 @@ mod tests {
             LaunchConfiguration {
                 model: Some("sonnet".into()),
                 permission_mode: Some("default".into()),
+                effort_level: Some("medium".into()),
+                thinking_enabled: Some(false),
                 ..LaunchConfiguration::default()
             },
             source(),
@@ -1437,6 +1504,8 @@ mod tests {
             LaunchConfiguration {
                 model: Some("opus".into()),
                 permission_mode: Some("bypass".into()),
+                effort_level: Some("high".into()),
+                thinking_enabled: Some(true),
                 ..LaunchConfiguration::default()
             },
             source(),
@@ -1449,6 +1518,110 @@ mod tests {
         assert_eq!(facts.model.value, "sonnet→opus · current unsupported");
         assert_eq!(facts.model.state, RuntimeFactState::Unsupported);
         assert_eq!(facts.mode.value, "default→bypass · current unsupported");
+        assert_eq!(facts.effort.value, "medium→high · current unsupported");
+        assert_eq!(facts.effort.state, RuntimeFactState::Unsupported);
+        assert_eq!(
+            facts.thinking.value,
+            "disabled→enabled · current unsupported"
+        );
+        assert_eq!(facts.thinking.state, RuntimeFactState::Unsupported);
+    }
+
+    #[test]
+    fn compact_launch_facts_keep_waiting_stale_and_unreported_distinct() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-launch-states"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        let requested = LaunchConfiguration {
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
+            ..LaunchConfiguration::default()
+        };
+        runtime.launch.requested = Observable::observed(requested.clone(), source(), T0, None);
+        runtime.launch.effective = Observable::observed(requested.clone(), source(), T0 + 1, None);
+
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let waiting = agent_header_facts(&summary, T0 + 2);
+        assert_eq!(waiting.effort.value, "high · current waiting");
+        assert_eq!(waiting.effort.state, RuntimeFactState::Waiting);
+        assert_eq!(waiting.thinking.value, "enabled · current waiting");
+        assert_eq!(waiting.thinking.state, RuntimeFactState::Waiting);
+
+        summary.runtime.launch.current = Observable::stale(
+            LaunchConfiguration {
+                effort_level: Some("xhigh".into()),
+                thinking_enabled: Some(false),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            Some(T0 + 3),
+        );
+        let stale = agent_header_facts(&summary, T0 + 3);
+        assert_eq!(stale.effort.value, "high→xhigh · stale");
+        assert_eq!(stale.effort.state, RuntimeFactState::Stale);
+        assert_eq!(stale.thinking.value, "enabled→disabled · stale");
+        assert_eq!(stale.thinking.state, RuntimeFactState::Stale);
+
+        summary.runtime.launch.current =
+            Observable::observed(LaunchConfiguration::default(), source(), T0 + 4, None);
+        let unreported = agent_header_facts(&summary, T0 + 4);
+        assert_eq!(
+            unreported.effort.value, "high · current unreported",
+            "an observed partial sample must not invent a current effort"
+        );
+        assert_eq!(unreported.effort.state, RuntimeFactState::Unreported);
+        assert_eq!(unreported.thinking.value, "enabled · current unreported");
+        assert_eq!(unreported.thinking.state, RuntimeFactState::Unreported);
+
+        summary.runtime.launch.requested = Observable::Waiting;
+        summary.runtime.launch.effective = Observable::Waiting;
+        let absent = agent_header_facts(&summary, T0 + 4);
+        assert_eq!(absent.effort.value, "unreported");
+        assert_eq!(absent.effort.state, RuntimeFactState::Unreported);
+        assert_eq!(absent.thinking.value, "unreported");
+        assert_eq!(absent.thinking.state, RuntimeFactState::Unreported);
+
+        summary.runtime.launch.current = Observable::stale(
+            LaunchConfiguration::default(),
+            source(),
+            T0 + 5,
+            Some(T0 + 6),
+        );
+        let absent_stale = agent_header_facts(&summary, T0 + 6);
+        assert_eq!(absent_stale.effort.value, "stale · unreported");
+        assert_eq!(absent_stale.effort.state, RuntimeFactState::Stale);
+        assert_eq!(absent_stale.thinking.value, "stale · unreported");
+        assert_eq!(absent_stale.thinking.state, RuntimeFactState::Stale);
+    }
+
+    #[test]
+    fn launch_receipt_formats_every_safe_field_without_omissions() {
+        let configuration = LaunchConfiguration {
+            model: Some("claude-opus-5".into()),
+            model_display_name: Some("Opus 5".into()),
+            permission_mode: Some("Autonomous".into()),
+            approval_mode: Some("bypassed".into()),
+            sandbox_mode: Some("disabled".into()),
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
+            safe_flags: vec!["--model".into(), "--permission-mode".into()],
+        };
+
+        assert_eq!(
+            format_launch_configuration(&configuration),
+            "model claude-opus-5 (Opus 5) · permission Autonomous · approval bypassed · \
+             sandbox disabled · effort high · thinking enabled · flags --model \
+             --permission-mode"
+        );
+        assert_eq!(
+            format_launch_configuration(&LaunchConfiguration::default()),
+            "no launch fields reported"
+        );
     }
 
     #[test]
