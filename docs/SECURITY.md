@@ -57,7 +57,7 @@ durable storage.
 6. **Agent names, relationship labels and Activity Preview source text.** They enter
    native navigation chrome even when they came from a hook or terminal line.
 7. **Every external integration response.** Work items, provider jobs/conversations/titles, usage/activity,
-   Web/Browser content, cursors and rate-limit metadata are network/file input, not authority merely because
+   WebPreview/Browser content, cursors and rate-limit metadata are network/file input, not authority merely because
    authentication succeeded.
 8. **Every remote and Companion client request.** Authentication identifies a granted client; the server's
    current scope, operation allowlist, object revisions and generations still decide each effect.
@@ -210,15 +210,168 @@ A Claude callback exists only as transient ingress while the adapter extracts ty
 `TurnEvent` does not carry its body. `EventRepo` independently drops `raw` for every hook source, and
 migration 005 physically deletes callback bodies from databases written by older builds. Key/shape
 redaction cannot prove arbitrary free text safe, and a `Write` payload can contain an entire source file.
-Diagnostic persistence would require an explicit opt-in, a separate short-lived store and its own threat
-review; it is not part of the event log.
+Diagnostic payload persistence would require an explicit opt-in, a separate short-lived store and its own
+threat review; it is not part of the event log. The vNext diagnostic surface therefore uses only the bounded
+current-daemon memory ring and durable body-free clear/replay metadata declared in `docs/PROTOCOL.md`.
 
 Adapters still minimise before any transient diagnostic rendering: members that carry bulk content rather
 than state — `content`, `old_string`, `new_string`, `patch`, `diff`, `stdout`, … — are dropped, the remainder
 is capped, and misleading Unicode/control content is stripped. That transform does not turn the result into
 durable product state.
 
-### 3.6.1 Raw terminal archives
+### 3.6.1 Diagnostic, settings and report-preparation boundaries
+
+The diagnostic pipeline redacts before count/byte reservation, not at paint/copy/export time. Its closed
+structured row contains no arbitrary body field. Tests plant distinct canaries in credentials, every environment
+value, command arguments, terminal cells/history, provider callbacks/responses, transcripts, HTTP bodies,
+repository diffs/files and unauthorised absolute paths; none may appear in the memory ring, page, subscription,
+filter result, clipboard projection, report seed, crash artifact or durable clear metadata. A failed redaction or
+oversized row becomes one typed gapped diagnostic fact without retaining a prefix. Diagnostic source overflow
+never blocks or changes the source operation.
+
+`clear_diagnostic_log` is local-desktop-foreground, exact-generation, revision-fenced and receipt-backed. A
+source/all clear advances the durable high-water before affected payload becomes unreachable, then invalidates
+old pages and subscriptions. Stale reconnect, daemon restart and delayed producers at or below the high-water
+cannot reinsert it. The allowlist makes StatusEvent, Attention, operation/audit/security receipts, terminal
+history and semantic recovery unaddressable by clear; a request that encodes one of those classes fails before
+mutation. Clearing diagnostics grants no acknowledgement, resolution, cleanup or deletion authority.
+
+The settings sidebar/search/deep-link registry is the exact independently frozen 23-section union and scope
+matrix. Deep links are navigation values only: unknown section/key, duplicate route, platform-unavailable row,
+stale registry or wrong scope cannot write. Section reset receives no caller-authored patch; the daemon derives
+the ordered key set from the exact registry+record revisions and apply repeats its digest. Secret references,
+AccountProfiles, credentials, trust, runtimes, Attention and data-deletion actions are not setting definitions
+and cannot appear in a preview. The generated registry and protocol manifests fail if a commercial licence,
+subscription, upgrade, seat or entitlement gate is added, even disabled.
+
+A report draft is local untrusted content until review. Preparation and local edits have no clipboard, file,
+Browser, network, issue or provider capability. Review resubmits the exact bounded body+inclusion manifest;
+the daemon repeats redaction, verifies source/draft/digest/revision, and binds one closed destination before any
+effect. The support-page registry accepts fixed HTTPS origin/path only; query and fragment are body-free and
+the existing isolated Browser policy handles redirects/rebinding. File export is create-new through FileBackend.
+Clipboard/file bytes equal the reviewed canonical digest. Ambiguous Browser/File effects reconcile by their
+preassigned identity and never redispatch; destination widening or body change needs a new review.
+
+Ephemeral collaborator chat uses only the authenticated encrypted full-GUI session and existing anti-replay
+nonce fence. The server revalidates client/session/Workspace/Surface/connection plus exact authorised
+ViewTarget/revision, rate, body and expiry before projection. Control characters, bidi overrides,
+credential-shaped values and multiline content
+are refused or redacted before admission; the message never enters logs, store, journal, diagnostics, export,
+notification or crash data. Its wire schema contains no target-input, context, command, Attention, focus,
+acknowledgement or capability field, so rendering text cannot exercise authority. Retraction/expiry emits only
+the exact live tombstone and a stale generation cannot hide or replace another sender's message.
+
+### 3.6.2 Documents, lifecycle automation and local side effects
+
+Image/PDF input is hostile even when its extension and MIME agree. The document worker receives one immutable
+descriptor/hash and no network, filesystem sibling, Browser cookie, clipboard, daemon socket or control API.
+It enforces byte/page/dimension/pixel/object/working-set limits before allocation; SVG, animation, script,
+forms, embedded files and encrypted/recursive/polyglot input are rejected. Object URLs are unguessable,
+view-scoped and revoked before cleanup. Printing is not a view callback: a local foreground review freezes the
+exact source/page/layout/printer revision, an isolated bounded spool strips active content, and durable dispatch
+precedes the native call. Crash ambiguity is `submitted_unconfirmed|reconcile_required`, never an automatic
+second print.
+
+Terminal clipboard control has one direction of authority: a current OS user gesture may copy the exact local
+selection or feed bounded paste/path-drop bytes through the current InputLease and InputSafety reducer. A
+remote client, remote target, background view or terminal byte stream cannot read or write the local clipboard.
+The VT parser swallows OSC 52 queries and assignments—including fragmentation, nesting, encoding and oversized
+forms—without reply. Clipboard bodies live only in the bounded local gesture buffer, are wiped on every
+terminal lifecycle edge and cannot enter logs, crash data, context, sync or a retry.
+
+Audio cues are derived from exact canonical `done|needs_you` revisions. Page text, terminal output and adapters
+cannot choose an audio asset or enqueue a cue. Signed built-in assets, mute, cooldown, replay fencing and a
+two-second deadline prevent content injection, alert storms and delayed spoofing. Audio success or failure has
+no Attention mutation authority.
+
+Bulk restart and Eco hibernation treat eligibility as security state, not UI labels. The daemon independently
+revalidates exact runtime, descendant, PendingInteraction, Attention, input-lease, delegated-effect, target,
+resume and checkout revisions immediately before each effect. Stale, unknown, remote, primary-checkout,
+working, waiting, blocked, background, recurrent or unresumable work cannot be caller-forced into the set.
+Bulk dispatch is sequential and canonical-receipt-backed. Eco is opt-in, rate-limited and uses a typed adapter
+hibernate/resume operation rather than injected shell bytes; an ambiguous exit or wake never retries blindly
+or claims completion. Wake failure remains visible/actionable and neither path can erase Attention evidence.
+
+Off-screen terminal parking has less authority than either lifecycle path. It may retire only a local renderer,
+PaneAttachment and reconstructible projection after exact proof that the daemon/backend retains the same
+RuntimeAttempt, PTY, output-gap and Attention observation. A view-owned live/plain PTY, working/waiting/
+blocked/unknown state, selected/focused/Attention-routed View, active InputLease/resize/IME/dictation/draft or
+uncertain detach fails closed. Reattach is automatic and generation-fenced; a≤4,096-byte/10-second input hold
+cannot flush until the same Attempt and lease are revalidated, and otherwise expires visibly. Park/reattach
+can never construct a shell/resume line, shadow input owner, process, runtime or permission response.
+
+Turn has no pressure-derived session reaper. Detached age/count, RSS/swap/PSI/PTY pressure, invisibility,
+missing client or cache saturation grants no terminate/kill/delete authority. The only automatic process exit
+is the independently enabled exact-eligibility Eco operation; all other lifecycle effects require the existing
+foreground typed operation and exact current handle. Tests enumerate every pressure callback, timer and
+settings registry and reject any path reaching a runtime signal or container deletion without that authority.
+
+Agent browser control has a narrower authority than human Browser use. A local foreground grant binds one
+Workspace, exact agent attempt and a finite public-HTTPS origin set. The agent may operate only Browser Nodes
+it created in a logged-out partition, through stable-revision `navigate|read|click|type` shapes. Raw script,
+selector, arbitrary request, upload/path, secret/password/payment field, localhost/private address, filesystem,
+clipboard, credentials, popup/download acceptance and human/other-agent Nodes are unrepresentable. Renderer
+content is untrusted and cannot cover the out-of-content owner badge/Stop control or mint a protocol request.
+Revoke/expiry/attempt loss fences the agent channel before queued work and possible effects remain charged for
+lookup-only reconciliation.
+
+Browser Memory Saver cannot treat hidden UI state as authority to destroy or reload work. The daemon pins the
+exact Node, partition, navigation and policy generations, waits five continuous minutes and revalidates every
+exclusion immediately before discard. Loading, audio, agent control, popup/download/print/action work and any
+unsubmitted form or POST state fail closed; page content cannot suppress or trigger the policy. `discarded`
+is published only after renderer/partition quiescence, so a hung cleanup retains its original capacity charge
+and cannot be exploited to over-admit renderers. Only a canonical public-HTTPS URL plus reviewed
+origin/policy/address revisions survives; DOM, form/POST, history bodies, cookies, storage and credentials do
+not. Reselection may mint one new navigation intent only under the still-current allow rule, with no ambient
+credential and no localhost/private/local-file fallback. Policy drift blocks with a typed reason, and crash
+reconcile only looks up the already durable intent—it never reloads or replays a possible request.
+
+Visibility settings never authorize removal of a safety route. The parser accepts only the closed eleven-id
+`HideableControlId` union; unknown, duplicated, stale or hand-edited ids fail visible. Attention, recovery,
+blocked status, Delete/End, Restart, Search, Close and every destructive consequence action are absent from
+that union and remain in chrome regardless of page/terminal/agent content, viewport or settings scope. Hiding
+an allowed optional slot cannot unregister or replace its CommandCatalogue entry, keyboard route, typed
+operation, authority check or receipt. A compromised renderer therefore cannot turn a dangerous effect into
+an invisible/pointer-only path or conceal the operator demand that should interrupt it.
+
+PTY pressure observation is target-bound security evidence. A stale, partial, failed or remote-to-local
+substituted reading is `unknown`, never healthy; used/ceiling/headroom and target/trust generations are
+revalidated at launch and remediation boundaries. Pressure may refuse a new PTY and route Attention, but it
+grants no broad kill/reap authority and cannot detach watched, tmux, unowned or live work. Privileged ceiling
+change accepts only a daemon-derived value through a fixed capability-declared platform provider after local
+foreground consequence review. Caller strings, PATH lookup, shell, arbitrary executable/config/service path,
+remote fallback and application-visible administrator credentials are unrepresentable. The durable intent
+pins exact kernel and confined persistent-config before identities; provider journal plus reread proves each
+phase and rollback. Target/provider drift, stale before-value, capacity N+1 or missing rollback capability
+refuses before elevation, while ambiguous/partial apply remains visible and is never retried or called fixed.
+
+Companion launch is likewise one explicit exception, not remote command execution. A desktop-reviewed≤24-hour
+grant contains immutable template/adapter/profile/target/safe-cwd/checkout entries. The phone selects one
+entry and supplies no command, env, flags, path, account, model, parent or checkout value. Preassigned canonical
+Node/Instance/Attempt/Checkout ids plus durable create/register receipts make replay, disconnect and crash
+at-most-once; primary `main` and changed/revoked grants refuse before filesystem or process effect.
+
+Corrupt-store handling is fail-closed against data loss and hostile replacement. Turn confines a regular
+descriptor, hashes it, atomically renames and fsyncs the exact bytes before publishing recovery state. A race,
+symlink/hardlink/mount alias, oversize file, full quarantine pool, permission error or fsync uncertainty leaves
+the original untouched and owner state read-only; it never falls through to an empty save. Recover, start
+fresh, export and discard are separate reviewed intents, and no timeout or successful export silently deletes
+the quarantine.
+
+Cross-client Workspace convergence trusts only authenticated typed daemon mutations and their StateStream
+sequence. Filesystem watcher events, mtime, replacement JSON and client-authored merged documents are not
+authority. The origin deduplicates only its exact operation id/revision; a gap forces a fresh snapshot, a
+field/domain conflict remains revisioned, and another client's new Session is additive without overwriting
+local drafts, selection or runtime identity. An internal-store descriptor change enters read-only quarantine,
+while an external package requires PortableImport validation and reminted ids. This prevents self-write loops,
+lost-session overwrite and a second device/file registry from bypassing grants or CAS.
+
+Product analytics, install counts and telemetry identifiers are rejected capabilities. Build-time registry,
+network allowlist, settings/protocol schema and instrumented lifecycle tests fail on any telemetry endpoint,
+queue, worker, stable id or event payload. Signed update discovery remains a fixed-purpose identifier-free
+request and cannot accept generic event fields or a telemetry destination.
+
+### 3.6.3 Raw terminal archives
 
 Terminal output is the exception that cannot be made safe by field redaction: it is an ordered VT byte
 stream whose text, escape sequences and binary fragments may all be meaningful. Persistent Sessions keep a
@@ -236,7 +389,7 @@ the node and deletes that archive. ADR-059's accepted target instead preserves t
 Node/AgentInstance on verified restart/resume and appends a RuntimeAttempt; the recovered archive remains
 read-only historical evidence and never becomes the new writable attempt.
 
-### 3.6.2 Local-data export and deletion
+### 3.6.4 Local-data export and deletion
 
 Privacy export is an authenticated daemon operation. SQLite text is passed through secret redaction again,
 unknown/secret Setting values are hidden, and terminal/log/scratch payloads are metadata-only. Destinations
@@ -340,6 +493,14 @@ A heartbeat timeout is evidence, never proof that the writer died. Daemon restar
 checks process ownership and otherwise asks the user. Closing the UI, archiving a live Session and
 `keep_processes` are not release events. Migration 003 creates no lease, changes no permissions and performs
 no filesystem/process action.
+
+End/delete is a total container reducer, not a cleanup permission oracle. It snapshots and revokes Session
+authority in one serial commit, fences prepared or possible-effect lifecycle/replacement launch intents, wipes
+wake/query/view buffers and retires terminal observers/writers. Definite absence cancels; uncertain external
+effect keeps the exact pre-reserved identity and ProcessCleanupCharge in lookup-only recovery. A hung process
+or worker cannot veto row removal, and a late receipt cannot publish into the tombstoned Session or restore
+input authority. Conversely, the profile/target-owned private transcript index and provider/user data are
+outside Session ownership and are never deleted as an End side effect.
 
 `read_only` always exposes `read_only_enforced`. On macOS true means the inherited write guard above is active.
 If the platform launcher or safe canonical metadata resolution is unavailable, the Session persists with
@@ -466,7 +627,7 @@ callback exclusion is now demonstrated at both adapter and SQLite boundaries:
 | Untrusted hierarchy text cannot forge or exhaust navigation | Workspace/Session/Template APIs reject C0/C1/ANSI/bidi/zero-width names; discovered Agent/process fields are sanitised and character/argv bounded before state, push and SQLite; restore and inspector tests assert the same projection |
 | Durable metadata free text cannot retain a recognisable credential | the byte-level DB/WAL suite plants one token in every durable metadata/diagnostic field and verifies redaction across direct saves, the atomic runtime checkpoint, restart and pruning; separately catalogued private Note/comment/terminal bodies remain exact only in their owner-only store and never leak into those projections; structural filesystem identities fail rather than mutate |
 | Legacy durable bytes receive the same boundary | a v8 fixture seeds every classified `TEXT` route, migration 009 redacts it transactionally, `secure_delete`/`VACUUM` plus checked WAL truncation remove physical remnants, and real busy-WAL/reopen tests prove the marker retries; structural credentials and correlation collisions fail closed |
-| Shared runtime siblings cannot cross-wire | five bindings across two profiles reject duplicate conversation ownership, sibling input/transcript/context/Attention, old generation and per-binding backpressure without changing another binding |
+| Shared runtime siblings cannot cross-wire | a canonical complete signed batch with five bindings across two profiles commits four current plus one independently stale invalid/unavailable claim; a bad root/MAC/key leaves all stale, while duplicate ownership, sibling input/transcript/context/Attention, old generation and per-binding backpressure never change valid siblings |
 | Runtime inventory cannot broaden observation into authority | partial/gapped/minimised snapshots mint no Node; forged host/handle/revision, companion/remote enumeration and broad terminate fail, while exact desktop adopt/ignore/terminate affects one item |
 | Live Note budget and revocation cannot be reset by editing | author/schema/source/revision races, edit-after-read and revoke/read linearisation expose only the declared exact revision and cumulative remaining budget, with no control decoding |
 | Delegated artifacts remain inert and bounded | wrong author/kind/schema/target/revision plus node/byte/rate/expiry excess, delete/reparent/file-write and content-as-control all fail before mutation |
@@ -654,8 +815,9 @@ sandbox or UI-owned authority inaccessible to agents exists. Every grant has a p
 cumulative byte/token/request limits, required expiry, fenced generation and audit. Foreground issue/update/
 revoke and delegated exercise are operation-id idempotent and retain issuer/grant provenance. Each live link
 counts against both endpoints' declared per-Agent bound; reaching it refuses
-creation. Ending/archive revokes it permanently, and expiry, revoke or endpoint deletion invalidate it before
-records disappear. An agent without the exact delegated capability may propose a link but cannot authorise
+creation. End/delete revokes it permanently; direct hide-only Archive instead suspends the retained link and
+revokes its bearer until explicit restore fully revalidates both endpoints and issues a fresh bearer without
+performing a read. Expiry, explicit revoke or endpoint deletion invalidate it before records disappear. An agent without the exact delegated capability may propose a link but cannot authorise
 one. Agents never receive the daemon control token: a separate
 local-only broker issues a high-entropy short-lived bearer bound to the destination AgentInstance and current
 RuntimeAttempt, derives destination rather than trusting a caller id, rotates on every attempt and validates
@@ -697,20 +859,34 @@ A dependency stores a bounded closed result: state, producer/revision ids, hashe
 timestamped provenance/confidence and at most a bounded stripped/redacted summary. Raw output, PTY,
 transcript, diff/file body, environment and arbitrary provider payloads are forbidden. It may project ready/
 blocked/failure. Outside a FlowRun it emits no start/advance/retry; inside one only the immutable reviewed
-start policy may consume the exact current result. Team roles/policy grant no control token, context,
+dependency-gated StepStartPolicy may consume the exact current result. Team roles/policy grant no control token, context,
 checkout, approval or focus capability beyond the explicit grant; only AttentionManager/governor can focus
 from typed evidence under operator policy.
 
 An M16 `RuntimeEndpoint` stores only safe host/endpoint fingerprints, capabilities and observations. A
-separate binding fixes endpoint generation, provider profile/host, instance, attempt and conversation;
+separate binding fixes endpoint generation, provider account-scope/host, instance, attempt and conversation;
 conversation ownership is unique per generation and every input/transcript/context/Attention operation
-names that binding. Sibling/account/old-generation operations and duplicate claims fail before data/effect.
+names that binding. Sibling/scope/old-generation operations and duplicate claims fail before data/effect.
+One endpoint admits≤64 bindings. Its proof authenticates one exact canonical complete batch at the root, then
+validates each claim independently: root/MAC/key/endpoint failure leaves all stale; one unavailable, replayed,
+stale or conflicted claim stays stale without blocking valid siblings. Root/per-binding sequence high-waters,
+expiry/skew and key epochs stop replay; duplicate/unknown encoding and missing/extra claims refuse. Key loss
+cannot remint a scope, and profile rebind is a local global-uniqueness CAS that moves no body or authority.
 One binding's backpressure or crash cannot block siblings. Bearers, live descriptors and raw transcripts
-never persist or cross the UI protocol. Warm attach requires a mutually authenticated still-live endpoint
+never persist or cross the UI protocol. Domain `attach_runtime_attempt` requires a mutually authenticated still-live endpoint
 and exact binding; cold resume/fallback is separately fenced per instance. Missing, mismatched or replayed
 evidence fails closed and cannot become a local/fresh launch. These records, remote keys/sockets and
 coordination metadata are subject to the ADR-057 catalogue, redacted export, retention and revoke/delete
 cascade.
+
+`ProviderAccountScope` is either a separately authorised profiled AccountProfile or an opaque
+endpoint-unscoped id minted into one durable RuntimeEndpoint. The latter is identity fencing, not
+authentication: it grants no credential, quota, activity, ConversationInventory, cross-endpoint or provider-
+account authority. It survives restart only with signed continuity of the exact endpoint root; mismatch makes
+bindings stale and cannot be repaired by a default profile or same thread label. An unscoped binding may use
+only typed capabilities on its already-bound thread. Profile association is a separate foreground rebind with
+exact endpoint/thread/profile proof, a new semantic key and retained lineage; no in-place cast or silent cache,
+transcript, input, context or Attention migration exists.
 
 **ADR-063 adds eight explicit security boundaries.** They are target contracts, not v0.1 claims:
 
@@ -725,6 +901,11 @@ cascade.
    that exposes only the selected profile root and denies sibling roots. If that boundary is unavailable,
    profile isolation is `unsupported` and concurrent cross-profile work is refused. The supported flow also
    rejects cross-profile attach, conversation, transcript, context, quota, config-root reuse and fallback.
+   External auth persists exact intent, target/config generations and provider correlation before launching a
+   broker/helper/Browser, after reserving count/byte/terminal/recovery and Turn-root quota. Post-dispatch
+   timeout is possible effect; reconciliation is lookup-only and never relaunches. Authenticated evidence moves
+   only to validating, and retire/revoke/delete fences late callbacks. If root write confinement/quota or exact
+   correlation lookup is unavailable, authentication is unsupported.
    This does not claim protection from an unrelated malicious same-uid process outside that sandbox.
 3. **A live Note link is inert bounded disclosure.** Pinned mode fixes one revision. Follow mode fixes exact
    authors/grants, schema, cumulative revision/byte/token budgets and expiry; edit cannot reset a budget or
@@ -742,15 +923,25 @@ cascade.
    an owner-only temporary beside the verified destination and atomically replaces only after the same
    descriptor/root/mount and compare-and-swap checks. Symlink, hardlink, mount, TOCTOU, external-change,
    permission, binary/size/encoding and remote-generation failures overwrite nothing and never fall back to a
-   local path, terminal write or Resource edit.
+   local path, terminal write or Resource edit. Before byte one, a bounded FileSaveIntent durably freezes
+   before/after hashes and temporary identity and reserves active/temp/terminal capacity. Ambiguous replace is
+   never retried: lookup-only reconcile can only prove exact applied, unchanged/no-effect, external conflict or
+   retain uncertainty. Temp cleanup requires terminal state plus exact descriptor/hash/no-open-handle proof.
 7. **RemoteOperatorSurface uses a separate remote credential and origin.** Authenticated encryption,
    same-origin CSRF, exact WebSocket Origin and anti-replay checks precede snapshots or effects. Tokens never
-   enter URL/query/referrer/log/browser persistence; Web/Browser Nodes run in another isolated origin. Local visible
+   enter URL/query/referrer/log/browser persistence; WebPreview/Browser Nodes run in another isolated origin. Local visible
    revocation closes bounded subscriptions/input leases. The server publishes a versioned default-deny
    operation allowlist for each remote scope; a client cannot add operations. Permission response is absent
    except for the exact typed, revision-fenced operation independently required by ADR-064. Credential,
-   grant/root-context, host trust, destructive lifecycle, RuntimeInventory enumeration/termination and
-   repository integration remain absent and server-refused.
+   grant/root-context, host trust, destructive lifecycle, RuntimeInventory enumeration/termination,
+   repository credential/profile/grant administration, push/pull/commit-and-push, merge/conflict resolution,
+   discard/cleanup and publish remain absent and server-refused; explicitly registry-allowed scoped stage/
+   unstage/commit/fetch/branch operations are unaffected.
+   The four ordinary subscribe families use one connection-owned daemon-minted registry with exact subject
+   keys, shared count/metadata/queue/shared-RSS reservations and a pre-reserved gap marker. Duplicate-key,
+   saturation, forged unsubscribe, scope loss and reconnect cannot multiply ids, retain payload or cross a
+   principal; terminal gap and revocation stop delivery before releasing the record. DirectoryWatch keeps its
+   own source count but charges the same queue pools.
 8. **Board, recovery, account and remote views reveal least information.** Every projection is scoped to the
    authenticated Workspace/target/profile grant, preserves stale/partial labels and cannot borrow a sibling's
    action owner or content. Headless operation changes rendering only, never these server boundaries.
@@ -771,33 +962,48 @@ the same-uid limitation in §2:
    Identity is `(source_id, source_profile_id, project_namespace, external_item_id)`, never title/URL/order.
    Complete, partial, gapped, expired and
    rate-limited coverage remain distinct; cache cannot turn a failed poll into authoritative empty state.
-   Outbound create/edit/close/reopen uses the exact remote revision/ETag and operation id; conflict keeps both
-   values and never retries last-writer-wins. Assignee and item text remain inert metadata and cannot create,
+   Outbound create uses a preassigned CreationId plus proved provider correlation; non-create mutations use
+   exact binding/source/mapping/item revision/ETag and operation id. Conflict keeps both values and never
+   retries last-writer-wins. Assignee and item text remain inert metadata and cannot create,
    start, focus, approve or control runtime work without a separate reviewed policy.
-3. **Remote permission response is one typed exception, not remote approval authority.** The server's
-   versioned allowlist and an explicit short-lived response grant issued/revoked only by authenticated local
-   foreground authority bind client, Workspace/Session, exact
-   AgentInstance/attempt/binding, interaction id, allowed closed options and expiry. The E2EE request also
-   carries expected interaction revision, connection generation, operation id and anti-replay nonce; the
-   daemon revalidates all values and the current adapter `permissions` capability before one dispatch. While
-   that recognised sensitive prompt is pending, raw remote/Companion PTY input to its binding is blocked.
-   Credential/password entry, host trust, grant administration and destructive/admin operations have no
-   remote schema. An opaque generic TUI cannot be proved sensitive: Turn labels that limitation, never calls
-   terminal text a permission decision and claims the byte-blocking invariant only for recognised typed
-   interactions.
-4. **Provider-native jobs are not Flow authority.** Every job and iteration is scoped to exact provider,
-   AccountProfile, ExecutionTarget, adapter generation and stable provider id; observations never inherit a
-   Flow grant. Dismiss changes only Turn projection, cancel names one current iteration, enable/disable names
-   one schedule revision and provider delete is a separate destructive operation. Each is operation-id and
-   revision fenced. Restart/timeout/ambiguous effect enters reconciliation and is not reissued by title,
-   schedule or last-seen ordinal. Provider output remains untrusted content and cannot author a job control.
+3. **Typed permission response is exact; remote response is one consumed exception, not approval authority.**
+   Only LocalDesktopForegroundAuthority may call `submit_local_permission_response` or issue/revoke an
+   immutable 120-second-maximum grant. The E2EE-delivered/acknowledged grant binds exact client/surface/
+   connection, Workspace/Session, route/owner/attempt/binding, interaction/options and permission-fact/typed-
+   transport revisions. `submit_remote_permission_response` atomically consumes it and persists dispatch
+   intent before provider effect; submit/revoke/expiry/reconnect/revision races have one winner, and receipt
+   recovery/reconciliation never resends. Fresh supported typed blocks raw bytes everywhere. Fresh supported
+   verified-local-PTY permits only a daemon-encoded desktop fallback; degraded/unknown/stale/unsupported/none,
+   remote/Companion/voice/hook/background and opaque TUIs get no semantic fallback. Credential/password entry,
+   host trust, grant administration and destructive/admin operations have no remote schema.
+4. **Provider-native jobs are not Flow authority.** Every job/iteration is scoped to provider, AccountProfile,
+   ExecutionTarget, adapter generation and non-reused incarnation. Adoption is a local global-ownership CAS;
+   every provider mutation first persists an operation/fingerprint/subject intent and requires side-effect-free
+   exact lookup. Restart/timeout/ambiguous effect never redispatches or infers success from matching state.
+   Requested and provider-proved effective configuration remain distinct; only exact provider tombstone or
+   correlated Turn delete proves deletion. Projection/privacy/container actions have zero provider effect,
+   retain replay/visibility fences and cannot lose Attention. Provider output remains untrusted content.
 5. **ConversationInventory is scoped metadata, not transcript or identity by resemblance.** Enumeration and
    search are bounded to exact provider, AccountProfile, ExecutionTarget and namespace, carry coverage/
-   freshness and never use a title as identity. Adopt must prove one live runtime/conversation and global
-   current ownership; resume mints one new attempt from one exact resumable key. Stale, duplicate, cross-
+   freshness and never use a title as identity. Adopt freezes one exact complete inventory descriptor and a
+   no-current-owner registry revision, atomically creates one stopped preassigned identity and emits no provider
+   or launch effect; Resume is only the canonical separately preflighted lifecycle operation for that owned
+   stopped Agent. Stale, duplicate, cross-
    profile, ambiguous or gapped matches fail before attach/spawn. Inventory capability reveals no message body
    and does not imply transcript, input, context or rename authority.
-6. **Web preview and Browser have different executable-content boundaries.** Web remains inert with scripts,
+   Private transcript body search is a separate local-desktop-only, opt-in encrypted index. Adapter-declared
+   roots are confined to the exact profiled account and target; regular-descriptor identity, symlink/mount/
+   device rejection and remote-no-local-fallback checks precede body read. Per-index key revocation fences
+   disable/delete before unlink; provider transcripts are untouched. The encrypted index may retain only its
+   bounded postings/metadata/snippets and final≤200-KiB normalised segment tail/document inside the same
+   ≤512-MiB profile/target and≤1-GiB installation caps. Selection reserves view/first-page/outbox capacity
+   before Surface CAS; a failed reservation exposes no tail and leaves the prior view intact. Body canaries may
+   occur only inside that encrypted index or an authorised request page, never logs/export/sync/telemetry/
+   context/Attention/clipboard. A result is untrusted private content and
+   can only reveal its exact read-only ViewTarget—never bind/adopt/resume/start/send, infer ownership, satisfy a
+   dependency, create/resolve Attention or cross a profile/target. Query/body/index saturation degrades
+   coverage before another read and cannot masquerade as a complete empty result.
+6. **WebPreview and Browser have different executable-content boundaries.** WebPreview remains inert with scripts,
    forms, downloads, storage and page-created focus disabled. Browser is a separately declared isolated
    renderer with no Turn/daemon IPC bridge, ambient cookies/profile, provider credentials, filesystem access,
    clipboard, downloads or implicit popup authority. Public navigation follows the existing address-pinning
@@ -809,8 +1015,12 @@ the same-uid limitation in §2:
 7. **Title observation and provider rename are independent.** Provider titles are bounded, sanitised,
    revisioned untrusted text; they cannot change stable id, parentage, action owner, Attention subject or local
    alias. `title_read` never grants `conversation_rename`. Provider rename requires its own current capability, exact
-   conversation/profile/target, expected revision and requested/effective receipt; uncertain effect is
-   reconciled, not repeated. A local alias edit never claims or triggers a provider rename.
+   conversation/profile/target, expected revision and requested/effective receipt. Before dispatch it persists
+   one bounded intent with tagged owned-or-proved-unowned subject, adapter/capability generations and lookup-
+   capable provider correlation; without exact receipt lookup the capability is unsupported. Uncertain effect
+   is lookup-reconciled, not repeated, and same-title observation is not proof. Count/byte/terminal/recovery
+   capacity reserves pre-effect. A local alias edit never claims or triggers a provider rename, and provider
+   uncertainty cannot change a pinned/local alias.
 8. **Companion account data cannot cross profiles or mint urgency.** Usage, context and activity queries bind
    the negotiated client scope to one AccountProfile and source generation. Values carry unit/window,
    observation/expiry and typed unavailable/rate-limited state; missing data is never zero. Activity payloads
@@ -818,7 +1028,70 @@ the same-uid limitation in §2:
    borrow sibling profile values. The inbox grants no conversation body, credential, runtime input or control;
    actions use only the same default-deny typed allowlist as the rest of Companion.
 
-**ADR-065 adds eight final target boundaries.** They are not v0.1 implementation claims:
+**ADR-066 adds four further utility boundaries.** They are target contracts distinct from ADR-064:
+
+1. **Media, projections and transfers remain inert data paths.** Descriptor-first import/transfer pins regular
+   identity, root/target generation, size/hash/MIME and owner-only temp files before bytes; alias/TOCTOU,
+   polyglot/bomb, overflow and destination conflict fail closed. Decoder and Markdown sandboxes have no network,
+   script, filesystem, clipboard, daemon/control or terminal-input route. Atomic completed output is
+   non-executable and never auto-opens/plays. Ticket/import reconciliation cannot duplicate bytes.
+2. **Repository-host authentication and commit proposals are separate authority seams.** Safe host/profile
+   metadata references but never reads external secrets. RepositoryBackend and WorkItemSource grants are
+   independent. Authenticate/rotate persists exact bounded intent, old/reserved-next credential generations,
+   host/account/scopes and provider correlation before effect; without lookup correlation it is unsupported.
+   Rotation degrades and revokes every grant before dispatch, correlated success reaches only validating, and
+   no late callback or validation auto-regrants/reactivates. Reconcile is lookup-only; count/byte/terminal/
+   recovery capacity reserves pre-effect and delete waits for terminal uncertainty. Commit proposal input is one exact redacted staged snapshot; the generator cannot scan
+   unstaged files or mutate repository state, and apply writes only an editor draft.
+3. **Catalogue, announcement and update signatures do not become general execution authority.** A command is
+   invocable only by a built-in, signed-extension or foreground-validated local-operator stable catalogue id
+   and typed schema after current capability checks. Local entries can reference only registered typed
+   operations and declared capabilities; repository/import/process content and labels cannot register a
+   command. Announcement markup/links are inert and never Status/Attention/
+   consent. Update manifest/package signature, digest, platform/architecture/compatibility and anti-rollback
+   epoch are verified before stage; only local foreground apply may change installation state.
+4. **Activity and undo are evidence/presentation, not effect replay.** WorkItem activity accepts one ordered
+   safe delta per committed source/local receipt with exact echo dedup and permission scope. Undo history's
+   type is a closed presentation whitelist; provider/source/repository/runtime/input/context/Attention/grant/
+   credential/destructive operations have no inverse variant and cannot be smuggled through stored payload.
+
+#### ADR-066 canonical signing and proposal-provider enforcement
+
+The signed-artifact domains are exactly `command_extension`, `product_announcement`, `update_manifest`,
+`update_package` and `voice_model_manifest`. Each has a different installation-owned, revisioned trust store; key lookup is scoped by
+domain before key id, and no key/root/high-water from another store is consulted. `SignedEnvelopeV1` is a
+closed schema containing domain, schema version 1, payload type/SHA-256, signer key id+monotonic epoch,
+issued/expiry instants, exact channel/platform/architecture/cohort audience, monotonic sequence,
+`algorithm=ed25519`, signature, and a parent-manifest SHA-256 required only for update packages.
+
+The signature preimage is the fixed `TURN-SIGNED-V1\0` UTF-8 prefix, big-endian length-prefixed domain and
+big-endian length-prefixed RFC-8785 canonical envelope bytes with `signature` omitted. Duplicate or unknown
+JSON fields reject before canonicalisation. Structured payloads hash their validated RFC-8785 canonical
+bytes; package payloads hash exact streamed bytes. A package's parent hash covers the complete canonical
+signed-manifest envelope including its signature, and manifest/package channel, platform, architecture,
+version, size and payload digest must agree. Platform code signing/notarisation is additional evidence.
+
+Trust-store rotation accepts only a higher epoch authorised under that domain's current root/threshold;
+revocation is terminal. Client input can name only an expected store revision, never a key or root. For one
+domain+audience, exact sequence+hash replay is idempotent, same sequence+different hash and every lower
+sequence reject, and high-water/revocation survive compaction and rotation. Wrong domain/root/audience,
+old/revoked epoch, not-yet-valid/expired envelope, mutated payload and package/manifest mix-and-match all
+fail before catalogue admission, announcement display/link, download, stage or apply. Signed command
+extensions can reference only operations/schemas/capabilities compiled into this build and contain no code,
+path, shell command or new operation; revocation disables their entries before invocation.
+
+Commit-proposal execution has an independently fenced `CommitProposalProviderProfile`. A sandboxed helper
+freezes canonical executable descriptor+SHA-256, policy revision and wall≤30s, CPU≤10s, processes≤4,
+RSS≤512 MiB, stdout≤8 KiB and stderr≤8 KiB. It runs in a fresh empty non-repository cwd with allowlisted
+non-secret environment, only fds 0/1/2, one sealed canonical redacted snapshot on stdin, no network and an
+enforced denial of repository/workspace/home/arbitrary filesystem, daemon/control sockets, credentials,
+keychain, clipboard, PTY and devices; only the executable/system libraries and empty temp cwd are readable.
+A ModelEndpointProfile variant spawns no helper and uses only its exact pinned broker. Unsupported sandbox,
+descriptor/hash/policy drift, canary read, child/resource limit, crash, signal, timeout or ambiguous broker
+result terminalises the persisted attempt and is never retried under the same operation id. Apply can mutate
+only the exact editor draft revision.
+
+**ADR-065 adds nine final target boundaries.** They are not v0.1 implementation claims:
 
 1. **Recursive Group mutation is bounded and cannot acquire execution authority.** Parent changes are one
    Session-scoped compare-and-swap over the complete Group tree and recheck unique parent, kind, same-Session,
@@ -826,39 +1099,54 @@ the same-uid limitation in §2:
    corrupt persisted cycles become isolated diagnostics, never hangs or arbitrary repair. Delete promotes or
    refuses as explicitly selected and cannot cascade into runtime, context, Attention or repository effects.
    A Group may only project a separately identified Session-owned CheckoutScope.
-2. **CheckoutScope owns branch/worktree consequences.** Repository and worktree identity, target generation,
+2. **Automatic tree arrangement is a pure projection.** Geometry is derived locally from revisioned logical
+   order and bounded row metrics; no node-supplied coordinate, title, output or resource content can cover,
+   hide or reorder another row. Reflow emits no domain operation, dirty/undo record, hierarchy mutation,
+   selection, input, runtime or Attention effect and exposes no tidy command that could be confused with
+   topology authority.
+3. **CheckoutScope owns branch/worktree consequences.** Repository and worktree identity, target generation,
    creator provenance and state remain distinct from GroupId. Failed/partial inventory never means gone;
    adopted worktrees default to unbind, and dirty/unpublished/live-writer/path-danger cases refuse remove.
    Presentation moves do not rewrite cwd. Migrate/relaunch, merge, publish and disk/branch removal are separate
    foreground operations; exact remote targeting and the primary-main invariant remain mandatory.
-3. **Background notification delivery grants no Attention authority.** A device DeliveryGrant fixes endpoint,
+   Before any Turn-managed writer, worktree creation or checkout lock effect, the Installation-owned
+   `CheckoutFenceRegistry` durably reserves its bounded record/bytes/inode slot and freezes canonical
+   repository/worktree, scope, target/trust, isolated generation and globally non-reused lease generation.
+   Registry or inode-cap N+1 refuses pre-effect. Crash reconciliation is lookup-only; no timeout, filename or
+   pid may free/reacquire a fence. A lock inode is removable only after a durable released terminal plus exact
+   ownerless exclusive-lock and fresh no-writer proof, so stale cleanup can never unlock or delete live work.
+4. **Background notification delivery grants no Attention authority.** A device DeliveryGrant fixes endpoint,
    key/token reference, scope, event classes, privacy, rate and expiry. Insert and flush revalidate the exact
    generation and canonical demand revision; encrypted payloads omit transcript, prompt/answer, command, path,
    account and secret bodies. Gateway acceptance cannot mark delivered/read/acknowledged/resolved. Revocation,
    expiry, dead token or failure mutates no canonical work. NotificationHostMode accepts owner-local/loopback
-   input, makes outbound HTTPS calls only and binds no public listener.
-4. **ResourceInventory measures without granting broad kill.** Host capacity and process rows are scoped to
+   input, makes outbound HTTPS calls only and binds no public listener. Pairing persists preassigned endpoint/
+   grant identity and peer correlation before dispatch; any post-dispatch timeout is reconcile-required and
+   lookup-only recovery never repeats pairing. Endpoint/grant/control/outbox/audit count+byte slots reserve
+   before effect. Retire revokes all grant generations and ciphertext locally; late peer/gateway success cannot
+   reactivate a retired/deleted endpoint. Exact non-reused id/generation and scope high-waters survive deletion.
+5. **ResourceInventory measures without granting broad kill.** Host capacity and process rows are scoped to
    exact ExecutionTarget/trust generation, use reuse-safe process identity and preserve complete/partial/gap/
    unavailable/stale plus measured-empty versus unmeasured. A failed remote read cannot disclose or substitute
    local facts. argv, environment and transcript remain excluded. Observation never signals a process; exact
    terminate re-probes target, handle generation, process start identity and observation revision and cannot
    fan out by pid/name.
-5. **Dedicated roster and quota-only connectors cannot borrow capability.** Six named adapters each prove all
+6. **Dedicated roster and quota-only connectors cannot borrow capability.** Six named adapters each prove all
    common cells at their exact version/profile/target/mechanism. Detection by executable label alone grants
    nothing. Kimi/MiniMax connectors expose only bounded AccountProfile-scoped quota/activity; they have no
    launch, transcript, conversation, input or control method, and cache/cursor data never crosses profiles.
-6. **ModelEndpointProfile is a secret and network boundary.** Raw API keys are write-only at a target-local
+7. **ModelEndpointProfile is a secret and network boundary.** Raw API keys are write-only at a target-local
    keystore/agent/broker and never enter protocol reads, argv, PTY, durable environment, shared config, logs,
    diagnostics or export. URL validation, TLS/pinning, DNS-rebind/redirect/private-metadata policy and bounded
    discovery precede launch. Preflight freezes route/model/profile/credential generations; missing/stale/locked
    evidence causes zero provider request or launch and never falls back to another route/provider/model/target.
    Secret migration commits the broker copy before replacing/scrubbing the only durable literal.
-7. **Workspace onboarding treats imported configuration and partial clone as hostile.** New/open/clone/SSH
+8. **Workspace onboarding treats imported configuration and partial clone as hostile.** New/open/clone/SSH
    adoption binds exact target/path/repository/remote and local capability consent. Crash/cancel retains
    bounded partial-effect receipts and reconciles by operation identity instead of deleting or cloning by
    guess. Host mismatch and outage never use a local namesake. Publish names destination, visibility, branch
    and credential reference in a separate foreground review; creation never publishes implicitly.
-8. **Generated display names are untrusted local proposals.** Source bytes are bounded, redacted and target-
+9. **Generated display names are untrusted local proposals.** Source bytes are bounded, redacted and target-
    scoped; control/bidi/invisible/multiline/secret output is refused. Node/Group revision and expiry fence apply;
    a manual pinned alias wins until explicit unpin. Applying a proposal changes no stable identity, provider
    title, command, input or Attention. The frozen capability ledger and authority gate ensure none of these
@@ -866,7 +1154,8 @@ the same-uid limitation in §2:
 
 The remote surface remains a deliberate adaptation: ordinary create, view, edit and terminal input may be
 granted through the closed versioned allowlist and visible lease, but credential entry, grant/authority issue,
-host trust, destructive process/repository lifecycle and publish/integration remain server-refused unless a
+host trust, destructive process lifecycle, repository push/pull/commit-and-push/merge/conflict-resolution/
+discard/cleanup and publish remain server-refused unless a
 future ADR supplies a stronger authority boundary. A source capability that is intentionally narrower is
 recorded as adapted in the frozen ledger, never silently omitted.
 
@@ -878,13 +1167,19 @@ nothing. File/Diff uses the same descriptor-relative regular-file jail, hardlink
 as repository context. Markdown, SVG, HTML and similar content render inert with scripts and remote loads
 disabled.
 
-The inert Web node accepts only `https://host[:port]/path`; it rejects userinfo, every query/fragment,
+The inert WebPreview node accepts only a canonical URL≤4 KiB/2,048 scalars of the form
+`https://host[:port]/path`; it rejects userinfo, every query/fragment,
 private/loopback/link-local/multicast/metadata addresses and `file:`, `data:`, `javascript:` or app/IPC
 schemes. It renders a bounded non-interactive document with scripts, forms, storage, downloads, popups and
 page-created focus disabled. The entire URL is private content and only a sanitised origin is safe projection
 metadata. Every connection and redirect validates all A/AAAA answers, rejects the set if any is non-public,
 and pins the socket to one approved address while preserving TLS SNI/HTTP Host; no second lookup or ambient
-proxy chooses the peer, and there is no scheme downgrade. Create/restore/background selection performs no
+proxy chooses the peer, and there is no scheme downgrade. Only the closed UTF-8 plain/Markdown/HTML MIME set,
+at most ten redirects, 8 MiB transferred compressed, 16 MiB decoded, 20:1 expansion and 30 seconds are admitted;
+sniff mismatch or any overflow closes without a partial render. The daemon fetches only the top-level body.
+It strips every external/internal subresource reference and sends one sanitised bundle over a one-way channel
+to a renderer with no sockets, fetch API, local-file or daemon access. Fetching commits before network and
+lookup-only reconciliation never performs DNS or HTTP again. Create/restore/background selection performs no
 request; only explicit foreground preview loads content.
 
 An interactive Browser node is a different canonical kind and process boundary. Its renderer has a fresh
@@ -892,14 +1187,31 @@ ephemeral partition and isolated origin with no inherited cookies/browser profil
 credentials, filesystem/IPC/Turn operation bridge, clipboard, downloads or implicit external navigation.
 Normal public `https` navigation uses the same DNS/address pinning on every redirect. Exact localhost/private
 origin or local HTML navigation is disabled until an authenticated foreground review names the resolved
-address set/port or canonical regular descriptor, file hash and Browser generation. Local HTML is served as
-the reviewed in-memory document under the isolated origin; it receives neither `file:` privileges nor access
-to adjacent files. Back/Forward/Reload revalidate the current grant, and an out-of-scope redirect stops before
+address set/port or canonical regular descriptor, file hash and Browser generation. Local HTML reserves and
+reads one descriptor-verified memory-only snapshot≤8 MiB under the isolated origin, with 32/256-MiB aggregate
+caps; it receives neither `file:` privileges nor access to adjacent files and no bytes persist across
+navigation/close/loss. Browser download bodies bypass renderer memory into a pre-body durable bounded
+BrowserDownloadQuarantine and owner-only non-executable temporary under the shared 4-GiB transfer pool. Only
+one sealed size/type/hash review may transfer exact descriptor ownership to a preassigned TransferTicket;
+reconcile never redownloads/copies and unsafe cleanup retains the charge/evidence. Back/Forward/Reload revalidate the current grant, and an out-of-scope redirect stops before
 connection. `window.open`, target-new-window and script navigation cannot create a window or navigate another
 Node; each out-of-scope popup is an inert bounded request requiring explicit review. History is bounded
 memory-only routing state, not authority. Closing/scope loss destroys the partition. URLs/local paths remain
 sensitive metadata in privacy export, and page content can never mutate the stored address or invoke a typed
 Turn operation.
+
+Every Browser URL is canonical≤4 KiB/2,048 scalars and each navigation follows at most ten redirects. Oversize
+input dispatches nothing; an oversize Location or eleventh redirect stops before follow/history commit and
+stores only a bounded reason/hash. History is≤8 KiB/entry and≤80 MiB aggregate under shared RSS, so hostile
+title/TLS/error metadata cannot become an allocation bypass.
+
+Browser Node creation and every navigation/history/reload/stop action cross separate durable pre-effect intent
+boundaries. A possible load is never inferred absent, retried or converted into success after lost renderer
+evidence: correlation-only reconciliation either proves the exact preassigned Node/navigation outcome or keeps
+reconcile-required, with terminal dispatched-unconfirmed evidence when proof is irrecoverably lost. Renderer,
+history and ephemeral partition count/byte caps reserve before launch/load; saturation has zero request. Storage
+clear is a scoped foreground domain mutation with consequence review, never page-issued authority, and remote
+full-GUI use is limited to the exact invited Browser scope.
 
 **A worktree is not a general sandbox.** It isolates a Git worktree and index, not credential helpers, ports,
 containers, databases, caches or external services. Turn accepts those collisions for the MVP only when the
@@ -914,13 +1226,14 @@ a process. The guard blocks checkout and resolved Git-metadata writes for descen
 same-user resource. Write-capable escalation is explicit and requires every guarded process to end first.
 Hiding either limitation is not accepted.
 
-**The primary `main` checkout is never a runtime target.** The post-v0.1 contract removes new
+**The primary `main` checkout is never a write-capable runtime target or a Turn writer.** The post-v0.1 contract removes new
 `MainCheckout` acquisition from every direct, Template, Flow, add-node/pane, activate, restore, resume,
 restart, recycle, switch and branch path. Write-capable work must resolve a dedicated worktree before any
 spawn and enter a platform enforcement boundary whose writable-root allowlist excludes the primary working
 tree plus Git index/lock identities after canonical path, symlink, mount and alias resolution. `chdir`, absolute
-paths and `git -C` do not escape it. Enforced read-only inspection may execute on the primary path without a
-write lease; if the platform cannot install the guard, it cannot launch. Attach/adopt of an already-running
+paths and `git -C` do not escape it. Enforced read-only inspection is the only managed runtime permitted on
+the primary path and may execute without a write lease; if the platform cannot install the guard, it cannot
+launch. Attach/adopt of an already-running
 process is refused as managed writable work unless equivalent containment is proved; it may be shown only as
 an unmanaged observation with no input/control capability. Legacy v4 main workers are quarantined and prevent
 release compliance until explicitly stopped or recreated outside the primary checkout. The final invariant

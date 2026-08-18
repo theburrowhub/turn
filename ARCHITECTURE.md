@@ -42,10 +42,11 @@ delegated control, plus one durable provider-neutral topology/capability contrac
 implemented**. `docs/OPERATOR_CONTROL_PLANE.md` is normative; `docs/PRODUCT_REQUIREMENTS.md` records the
 audited current gaps and `docs/CONTROL_PLANE_ACCEPTANCE.md` defines the one-to-one proof obligations.
 
-ADR-063/064/065 close the audited operational surface—recovery/account/file/remote objects, provider-retained
+ADR-063/064/065/066/067 close the audited operational surface—recovery/account/file/remote objects, provider-retained
 work and Browser/history, then recursive Groups/CheckoutScopes, background Attention delivery, resource
 capacity, six dedicated adapters plus quota-only connectors, model endpoint routing, Workspace onboarding and
-safe local naming. These are also **not yet implemented**. The neutral frozen capability ledger is
+safe local naming, and bounded media/search/SCM-host/proposal/transfer/catalogue/announcement/update/activity/
+presentation utilities without parallel authority. These are also **not yet implemented**. The neutral frozen capability ledger is
 `docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv`; its disposition/evidence trace is part of the specification gate.
 
 There is one command and one test runner: the frontend is Rust now (ADR-039), so there is no `pnpm`, no
@@ -241,7 +242,7 @@ snapshot pushes respectively. They are not forged into the session event log.
 | Wire name | Carries | Notes |
 | --- | --- | --- |
 | `process.started` | `pid`, `command` | |
-| `process.exited` | `code` | Resolves attention for the node. |
+| `process.exited` | `code` | May close only an exact runtime-bound interaction demand; it never clears a completed-turn/result review or unread result revision. |
 | `process.failed` | `code?`, `signal?` | `Severity::Error`. |
 | `process.spawned_child` | `child`, `pid`, `command`, relationship evidence | Runtime observation. The edge stores relationship kind and confidence separately from event confidence. |
 | `agent.started` | `tool`, `model?`, `external_id?` | `external_id` is the tool's own session/thread id, needed to resume it. |
@@ -265,9 +266,11 @@ Three properties of `TurnEvent` do real work:
   confidence; the source decides what it is allowed to have. Enforcement, not convention.
 - **`dedup_key`** defaults to `session|kind_slug` and is extended with the node id by `with_node`, so
   two subagents blocking simultaneously are two demands while one chatty Agent repeating itself is one.
-- **`attention_reason()`** is the single place where "an event happened" becomes "the user is needed".
-  The attention manager never pattern-matches event kinds itself. `agent.turn_completed` deliberately
-  returns `None`: finishing a turn is not, by itself, a demand.
+- **The typed event→policy projection** (`attention_reason()` plus the non-interruptive review trigger it
+  returns for turn boundaries) is the single place where "an event happened" becomes "the operator may need
+  it"; the attention manager never pattern-matches event kinds itself. `agent.turn_completed` produces a
+  typed `TurnComplete` review/unread trigger whose default is badge+queue and whose policy may focus, but it is
+  not fabricated as a question/permission or automatically acknowledged. Runtime exit cannot erase it.
 
 `raw: Option<String>` may keep an untouched payload in memory for debugging bad adapters. It is never
 rendered as-is and is not persisted by default; key-based environment redaction is insufficient for free
@@ -282,8 +285,9 @@ caches or other resources a worktree does not isolate. Path spelling is never th
 
 **`Session`** — the unit of work. Name in the user's words, cwd, env, `Layout`, `SessionTree`,
 `AttentionPolicy`, `SessionStatus` (`Active`/`Paused`/`Archived`), `RestoreState`, tags, git branch,
-linked PR reference, pin/favourite, `parent_session` for duplicates, checkout assignment and the closed
-`SessionMode` (`main_checkout`, `read_only`, `isolated_worktree`). `display_state()` returns `Idle`
+linked PR reference, pin/favourite, `parent_session` for duplicates, checkout assignment and the legacy-
+decodable closed `SessionMode` (`main_checkout`, `read_only`, `isolated_worktree`), where target creation can
+produce only enforced read-only or isolated-worktree modes. `display_state()` returns `Idle`
 for an empty tree — a Session whose processes have not started is not a mystery — and otherwise the
 tree's aggregate. `sidebar_rank()` returns `(pinned, demands_user, severity, last_activity_ms)` as a
 tuple rather than an `Ord` impl, because ordering is a presentation concern that may differ per view.
@@ -291,7 +295,9 @@ tuple rather than an `Ord` impl, because ordering is a presentation concern that
 is wrapped in the checkout write guard; false means the platform guard is unavailable and no process may
 start.
 
-**`WorkspaceWriteLease`** — daemon-owned exclusivity for the primary checkout, not for a window or focus.
+**`WorkspaceWriteLease` (v0.1 implementation history)** — daemon-owned exclusion for legacy primary writers
+and current non-primary checkout owners, not for a window or focus. In target steady state, a primary lease
+is quarantine/reconciliation evidence and cannot be newly acquired.
 The semantic record carries Workspace, Session and checkout identity, `ExclusiveWrite`, state, acquisition
 time and heartbeat. At most one non-released lease exists for a canonical primary checkout. Acquisition is
 atomic and precedes Session insertion, init commands and process/Pane materialisation. Heartbeat expiry is
@@ -936,7 +942,7 @@ through to a different unique child. Node-less Attention is durably scoped by au
 optional external worker id, so a prompt submission resolves only that exact provisional flow and cannot
 clear a sibling or another parent in the same Session.
 
-Creating a `main_checkout` Session is one authority boundary: canonicalise and validate the checkout plus
+**Historical protocol-v4 primary-writer path, unreachable in the target:** creating a `main_checkout` Session was one authority boundary: canonicalise and validate the checkout plus
 the effective Session/Pane working directories, acquire its host-global checkout lock, then atomically
 persist the Session/assignment and matching SQLite lease before running init commands or materialising
 processes/Panes. Working-directory
@@ -954,8 +960,9 @@ macOS `turn-pty` wraps every Pane, relaunch and init process with one inherited 
 command and arguments remain inside that wrapper, so descendants inherit the same boundary. Creation sets
 `read_only_enforced=true` only after constructing the profile; every later spawn reconstructs it rather than
 trusting the stored bit. If `/usr/bin/sandbox-exec` or a safe canonical target is unavailable, the Session
-persists visibly unenforced and launches nothing. Promotion is a separate lease request and is refused until
-all guarded processes have ended.
+persists visibly unenforced and launches nothing. Protocol v4 promotion was a separate lease request refused
+until all guarded processes ended. Target write escalation instead provisions a dedicated worktree and
+never promotes to primary.
 
 #### Why the daemon exists from day one, and exactly what it buys
 
@@ -968,8 +975,8 @@ the runtime node, not that view, owns the PTY buffer.
 daemon's file table, and `PtyProcess::drop` deliberately terminates the direct process it owns —
 `terminate()` then `kill()` — because closing a Session must not leave strays holding ptys, which are a
 finite kernel resource. Descendants can nevertheless ignore terminal loss or outlive that direct process. A
-main-checkout descendant inherits the checkout lock descriptor, so it remains a safety owner even though
-Turn can no longer reattach to its PTY.
+legacy quarantined main-checkout descendant retains its inherited lock as recovery evidence even though Turn
+cannot reattach; target writers are non-primary worktree owners.
 
 This is stated plainly rather than papered over, because the honest boundary is what `Lifecycle` is
 shaped around. `Orphaned` (stored runtime may still exist, handle lost) and `Lost` (the recorded runtime
@@ -979,10 +986,10 @@ restore. Making work survive the *daemon* is a different problem with a known
 solution — tmux, which the model already has flags for — and it is deliberately out of the MVP
 (ADR-007).
 
-**Turn never relaunches a process automatically on restore.** It offers; the user decides.
-`RestoreBehaviour::ReattachOnly` is the default, and `Relaunch` marks Panes whose command may be offered
-again, such as a shell; it is not authority to run them unprompted. `turn-proto` enforces this structurally: `Request::RelaunchNode` is
-the only request that starts anything, and it is user-initiated.
+**Background restore never launches a process.** `RestoreBehaviour::ReattachOnly` remains the metadata-load
+default. Foreground Session selection may execute only its current fully preflighted activation plan in the
+same interaction, and persisted reviewed Flow policy may advance only its declared step. A child/resource/
+history selection or ambiguous descriptor launches nothing; explicit lifecycle operations remain distinct.
 
 Before opening SQLite, running migrations or restoring state, `turnd` must own the non-blocking OS lock on
 the canonical data directory. A different socket path is not a second ownership domain. Only after that
@@ -999,7 +1006,7 @@ platform-data `checkout-locks` directory (independent of `TURN_DATA_DIR`) contai
 keyed by checkout device and
 inode plus atomically replaced owner metadata. A contender takes `LOCK_EX|LOCK_NB`; failure returns the
 other daemon's typed lease owner and only locally actionable read-only/worktree/cancel alternatives. A
-successful main-checkout spawn preserves only a CLOEXEC duplicate of that descriptor through
+historical protocol-v4 successful main-checkout spawn preserved only a CLOEXEC duplicate of that descriptor through
 portable-pty's pre-exec close pass and clears CLOEXEC in the forked child. The daemon and every descendant
 therefore share one open-file description; no code
 calls `LOCK_UN`, and the kernel releases authority only after the final daemon/process copy closes. Explicit
@@ -1093,11 +1100,12 @@ reason to look at what the protocol *lacks*:
 1. **A heuristic cannot move the user.** Focus is never something a client is told to do directly; it
    arrives as an `Effect` the attention manager already cleared through the focus governor, and
    `Confidence` travels with every event so a guess stays a guess.
-2. **Turn never approves a permission.** No request says so. Pending questions and permissions are answered
-   only by `Request::WritePty` — the human typing. A reviewed context handoff is refused at a pending prompt
-   and may target only an idle or done Agent.
-3. **Turn never runs a command it inferred.** Processes start from a Template, a Pane definition, or
-   `Request::RelaunchNode`. There is no "run this" verb.
+2. **Turn never chooses or infers a permission response.** Protocol v4 used only human `WritePty`; target
+   vNext also accepts exact revision-fenced `submit_local_permission_response` or a single-use grant-bound
+   remote response. Both carry the operator's selected typed option and neither authorises Turn to select it.
+3. **Turn never runs a command it inferred.** Processes start only from typed operator declarations,
+   a current fully preflighted Session activation or persisted reviewed Flow policy. Output prose has no
+   execution shape.
 4. **The unattended daemon never relaunches on its own.** It restores evidence and starts nothing. Under
    ADR-049 a connected client may auto-start only a Session runtime whose persisted command and safety
    contract are complete; ambiguous, remote, pending-prompt and provider-resume cases remain stopped and
@@ -1144,14 +1152,14 @@ place and lets `Request::expected_result` name the response for every operation 
 against the response catalogue. Three product rules are enforced by the *shape* of the protocol rather
 than by the daemon remembering to check them:
 
-- **There is no request that approves an agent's permission.** Answering a permission prompt is typing
-  into the agent's terminal, which is `Request::WritePty` — an explicit act by the human. The separate
-  reviewed context-handoff capability is refused while a question, permission or interaction is pending,
-  so it cannot become an approval side channel.
+- **Historical protocol-v4 shape:** permission response was only explicit human `WritePty`. Target vNext
+  adds exact typed local and single-use grant-bound remote response requests; Turn never chooses the answer,
+  and context handoff remains unable to become an approval side channel.
 - **There is no request that runs a command Turn inferred from output.** A process starts from a
   Template, a Pane definition or an explicit relaunch, all of which the user chose.
-- **`Request::RelaunchNode` exists and nothing else restarts anything.** Restore offers; the user
-  decides.
+- **Historical protocol-v4 shape:** `Request::RelaunchNode` was the only restart path. Target vNext uses
+  distinct activate/create/resume/restart/recycle/Flow requests under exact foreground or persisted policy;
+  background metadata restore and inferred output still start nothing.
 
 **Responses and errors.** Every success is a `Response` variant tagged with `result`. Failures never
 arrive as a `Response` — they arrive as `ServerMessage::Error` carrying a `ProtoError` with a
@@ -1213,7 +1221,10 @@ logical catalogue with metadata-only filesystem inventory, including an explicit
 future data-directory entries. The live daemon remains the only selective writer; full physical deletion is
 offline behind the canonical data-directory lock and retains user checkout roots.
 
-**Status: built, including the hierarchy repository and append-only migrations through 009.** Modules: `migrations`,
+**Status: built, including the hierarchy repository and append-only migrations through 011.** Planned vNext
+schema12 adds the closed semantic-recovery reservation pair and performs the exact schema11→12 census/backfill,
+registry-digest marker and user-version change in one lock-protected transaction; failure leaves schema11
+reopenable and post-open writers remain blocked until the pair bijection validates. Modules: `migrations`,
 `codec`, `redact`, `maintenance`, `location`, `error`,
 `repo/{workspace, session, node, event, attention, template, settings, hierarchy}`, behind a `Store` facade
 (`open_default`, `open_in`, `open_at`, `open_in_memory`, plus `schema_version`, `journal_mode`,
@@ -1437,7 +1448,9 @@ semantic node only with verified provider-conversation continuity; a fresh or un
 creates a new Node/instance with lineage. Immutable launch
 specification and receipt values keep requested, effective and current model/account/permission/sandbox/
 flags/host/worktree facts distinct, with source, confidence, observation time and unknown/stale state.
-Node selection launches nothing; warm attachment only connects a view to an already live attempt. Launch/resume
+Node selection launches nothing; it automatically uses presentation `attach_pane` only for an already live
+attempt. Domain `attach_runtime_attempt` is a separate receipt-backed continuity mutation over one proved
+existing attempt and is never inferred by selection; it launches/stops nothing. Launch/resume
 epochs carry immutable launch specs/receipts; an in-process model switch instead carries a verified
 configuration-transition receipt and transfers the same process/conversation binding under a new fence.
 
@@ -1542,20 +1555,20 @@ durable category because persistence is forbidden. `docs/LOCAL_VOICE_INPUT.md` i
 
 ### 6.6 Accepted operator-control-plane architecture
 
-**Status: accepted, not yet implemented.** ADR-061 through ADR-065 join creation, orchestration, provider topology,
+**Status: accepted, not yet implemented.** ADR-061 through ADR-067 join creation, orchestration, provider topology,
 runtime continuity, observability, remote/companion clients and scale around the existing daemon boundary.
 The cross-layer ownership is fixed before implementation:
 
 | Layer | New authority and responsibility |
 | --- | --- |
-| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun/native-job/CheckoutScope/notification/model-endpoint ids; independent relationship graphs including bounded acyclic Group forest; WorkItemState/WorkItemSource, Resource/Progress and AccountProfile invariants; Flow/start-policy/grant, delivery and route state machines; normalized topology, lifecycle, resource observation and Attention invariants. |
-| `turn-agents` | Open six-adapter registry plus honest generic/custom adapters, 22-cell capability vocabulary, provider event normalization, launch/control operations, bounded conversation/job/model inventory, transcript/context/usage/title sources, quota-only connectors, ModelEndpoint mapping, separately receipted provider rename and shared RuntimeEndpoint bindings isolated by profile/conversation. Provider dialects end here. |
-| `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles and reuse-safe host/process ResourceInventory; process evidence is provisional semantic evidence. |
+| `turn-core` | Stable Node/AgentInstance/RuntimeAttempt/FlowRun/native-job/CheckoutScope/notification/model-endpoint/media/import/transfer/proposal/update ids; independent relationship graphs including bounded acyclic Group forest; WorkItemState/WorkItemSource/activity, Resource/Progress, catalogue, signed-envelope, PresentationHistory and AccountProfile invariants; Flow/start-policy/grant, delivery and route state machines; normalized topology, lifecycle, resource observation and Attention invariants. |
+| `turn-agents` | Open six-adapter registry plus honest generic/custom adapters, 23-cell capability vocabulary, provider event normalization, launch/control operations, bounded profiled conversation/job/model inventory, transcript/context/usage/title sources, quota-only connectors, ModelEndpoint mapping, separately receipted provider rename and shared RuntimeEndpoint bindings isolated by closed account-scope/conversation. Provider dialects end here. |
+| `turn-pty` / RuntimeBackend | Local/durable/remote runtime create, attach, bounded catch-up, input/resize lease, signal and observation plus complete/partial target-wide inventory of linked and unmatched handles, reuse-safe host/process ResourceInventory and freshness-labelled PTY used/ceiling/headroom evidence; process/resource evidence is provisional semantic evidence and privileged remediation requires a separate closed provider. |
 | FileBackend / RepositoryBackend | Separately capability-gated local/remote confined file and SCM effects with host/generation/root/revision-bound receipts; FileBackend open/save is revisioned CAS with conflict and zero overwrite; access is never inferred from RuntimeBackend. |
-| `turn-store` | Append-only identities, Group/graph revisions, CheckoutScope/onboarding operations, immutable Flow runs/receipts, non-secret account/model/notification profiles, endpoint bindings, Resource/name revisions/provenance, bounded inventory/work-item/delivery caches, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential or unbounded transcript store. |
-| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces, encrypted revision-fenced remote/notification envelopes and bounded Group/Checkout/resource/model/onboarding/name schemas; no provider-specific UI messages. |
-| `turnd` | Single writer and reconciliation authority; preflight/provision/onboarding sagas; Group/Checkout transaction validation; Flow scheduling; adapter/runtime/model dispatch; exact Attention routing and delivery outbox; independent bounded collectors; authoritative multi-client snapshot/journal. |
-| `turn-gui` | One canonical recursive hierarchy and WorkSurface; catalog-driven creation/onboarding; Agent/Tool/Flow/resource/model/notification views; derived board, work-item and runtime/resource Recovery Views; integration/runtime/name truth; bottom status; no scheduling, provider inference or duplicated business rules. |
+| `turn-store` | Append-only identities, Group/graph revisions, CheckoutScope/onboarding operations, immutable Flow runs/receipts, non-secret account/model/notification/repository-host/proposal profiles, five signing trust stores, endpoint bindings, Resource/name/activity/history revisions/provenance, bounded inventory/work-item/delivery/transfer/update caches, semantic/runtime recovery inventories, operation journal, durable tombstones, observations and closed privacy inventory; no raw credential, signing private key or unbounded transcript store. |
+| `turn-proto` | Typed idempotent operations, capability/grant tokens, revisioned projections/subscriptions and exact ViewTarget/Attention/Input routes shared by desktop and full remote/headless surfaces, encrypted revision-fenced remote/notification envelopes and bounded Group/Checkout/resource/model/onboarding/name/media/search/SCM/proposal/transfer/catalogue/update/history schemas; logical sibling order is authoritative and row coordinates/arrange operations are absent; no provider-specific UI messages. |
+| `turnd` | Single writer and reconciliation authority; preflight/provision/onboarding/media/transfer/update sagas; Group/Checkout transaction validation; Flow scheduling; adapter/runtime/model/proposal dispatch; canonical signing verification; exact Attention routing and delivery outbox; independent bounded collectors; authoritative multi-client snapshot/journal. |
+| `turn-gui` | One canonical recursive hierarchy and WorkSurface, with automatic compact non-overlapping row projection in logical/accessibility order and no domain effects; catalogue-driven creation/onboarding and general actions; Agent/Tool/Flow/resource/media/browser/model/notification/SCM/activity/history views; derived board, work-item and runtime/resource Recovery Views; integration/runtime/name truth; bottom status; closed fail-visible optional-control projection with critical routes always present; no scheduling, signing trust, provider inference or duplicated business rules. |
 | remote/headless clients | Full capability-negotiated projections over the same snapshot/journal/routes; server policy refuses every desktop-only authority operation. NotificationHostMode is outbound-only and constructs no public listener/UI. |
 | companions | Reduced closed-action projections of daemon queue/revisions over authenticated encrypted channels; never another state or Attention authority. |
 
@@ -1568,11 +1581,14 @@ sequence gap, disconnect/restart or stale heartbeat invalidates it until asynchr
 coverage is a lower bound and absent coverage is unknown/unsupported rather than zero.
 
 A shared RuntimeEndpoint never becomes semantic identity. Every current binding fixes endpoint generation,
-AccountProfile, host, AgentInstance, RuntimeAttempt and conversation; conversation ownership is unique and
+closed `profiled|endpoint_unscoped` account scope, host, AgentInstance, RuntimeAttempt and conversation;
+conversation ownership is unique and
 sibling input, context, transcript cursors and Attention remain isolated. Runtime inventory is target-wide,
 never invents Nodes for unmatched handles and adopts, ignores or terminates only one exact
 target+handle+generation. AccountProfile stores only non-secret identity/external references, isolates auth,
-config, cache and quota roots, and never falls back or migrates active instances after a default change.
+config, cache and quota roots, and never falls back or migrates active instances after a default change. The
+unscoped endpoint id is stored inside the existing RuntimeEndpoint family, grants none of those AccountProfile
+categories and survives only signed continuity of that exact endpoint root.
 
 Group presentation is a Session-scoped acyclic forest with one parent and one tree revision; atomic subtree
 mutations validate kind/session/cycle/depth after concurrent changes. CheckoutScope is a separate Session-owned
@@ -1591,25 +1607,31 @@ ModelEndpointProfile is distinct from AccountProfile and RuntimeEndpoint. It own
 catalogue/network-trust metadata plus a secret reference whose raw value resolves only at the target broker.
 Launch/switch preflight freezes route/profile/credential/model revisions into its receipt. Late discovery,
 missing secrets and endpoint/TLS/DNS changes fail before provider request and cannot fall back. The six named
-dedicated adapters prove one 22-cell matrix; Kimi/MiniMax quota connectors consume AccountProfile-scoped
+dedicated adapters prove one 23-cell matrix; Kimi/MiniMax quota connectors consume AccountProfile-scoped
 collector contracts but expose no agent control method.
 
 An adapter's private `ConversationInventory` is scoped to one provider, AccountProfile and target. It exposes
 only bounded metadata needed for a paged search, with opaque cursors, cache TTL/byte/result limits, provenance
-and match confidence. Adopt/resume requires a foreground review and a second exact-identity probe; a stale or
-ambiguous match cannot launch, bind or cross a profile. Raw transcript bodies are neither indexed nor stored
+and match confidence. Adopt is one idempotent ownership CAS that creates a stopped preassigned identity and a
+proposed binding with zero provider/launch effect; the separate canonical Resume operation requires a fresh
+exact-identity/continuity preflight before one attempt. A stale or ambiguous match cannot launch, become a
+current runtime binding or cross a profile. Raw transcript bodies are neither indexed nor stored
 by this inventory.
 
-Provider-native scheduled, recurring and background work is observation, not a synthetic Flow. Its stable
-native job identity owns ordered iteration identities plus schedule, next-run, lifecycle and survival evidence
-across UI/daemon absence. Discovery and `pause`, `resume`, `run_now`, `cancel_iteration` and `delete_job` are
-separate adapter capabilities with revision-fenced receipts and explicit unsupported/unknown degradation.
-Dismissing its Attention/unread activity changes only that projection and never cancels or deletes the job.
+Provider-native scheduled, recurring and background work is observation, not a synthetic Flow. Create
+reserves a Session/optional-Group-owned Job Node and creation id before dispatch; create/run-now use proved
+correlation. Stable job/iteration identity has independent definition, schedule, iteration, presence,
+local-projection and mutation/reconciliation axes across UI/daemon absence. `list` and `get` are separate
+bounded observations; the seven mutation keys map one-to-one to revision-fenced operations with explicit
+unsupported/unknown degradation. Prepared-create cancel and local activity-hide/forget/restore are separate
+zero-provider-effect CAS operations. Dismissing Attention never cancels or deletes the job.
 
 Provider title observation and provider conversation rename are also distinct capabilities. Observed titles
-retain source/freshness and cannot override a user alias. Rename binds profile, conversation, attempt and
-expected provider revision and becomes effective only with an acknowledgement receipt; unsupported or
-uncertain rename leaves the provider untouched and may create only a labelled local alias.
+retain source/freshness and cannot override a user alias. Rename durably binds profile/target, conversation,
+tagged current owner with optional attempt or proved-unowned registry observation, adapter/capability
+generations, expected provider revision and lookup-capable correlation before dispatch. It becomes effective
+only with the correlated acknowledgement's effective title/new revision; same-title observation is not proof,
+reconcile never repeats the write, and unsupported/uncertain rename changes no provider or local/pinned alias.
 
 `WorkItemSource` adapters map stable source/profile/item identity to canonical Node ids through declarative
 field mappings. Snapshot and delta sync are cursor-based, bounded and rate-limited; every cached field keeps
@@ -1634,14 +1656,16 @@ revisions and resnapshot on gap/compaction. Object-specific conflicts and deleti
 One runtime input/resize lease has a 15-second TTL/5-second renewal and explicit atomic visible handoff;
 draft bytes never transfer between clients.
 
-Full remote/headless clients reuse those exact snapshots, journals, Node subscriptions and Attention routes.
-The companion keeps a reduced closed API. Either may answer a permission only when a foreground local
-operator has issued one short-lived grant bound to client/surface generation, Workspace/Session, request
-class and expiry. The authenticated end-to-end encrypted response envelope binds grant, pending request id
+Full remote/headless clients reuse their authorised portions of those exact snapshots, journals, Node
+subscriptions and Attention routes. The companion keeps a reduced closed API. Only a granted full-GUI remote
+or Companion client may answer a permission after a foreground local operator has issued one short-lived
+grant bound to client/surface generation, Workspace/Session, request class and expiry; headless status can
+never receive or submit such a grant. The authenticated end-to-end encrypted response envelope binds grant, pending request id
 and revision, exact typed answer, nonce and operation id; daemon compare-and-swap rejects expiry, replay,
 stale requests and grant widening and journals one terminal receipt. Credential entry, AccountProfile/auth
-mutation, grant administration, host trust, destructive control and repository integration remain local and
-are rejected by the daemon, not merely hidden.
+mutation, grant administration, host trust, destructive control, repository push/pull/commit-and-push/merge/
+conflict-resolution/discard/cleanup and publish remain local and are rejected by the daemon, not merely hidden;
+explicitly registry-allowed scoped stage/unstage/commit/fetch/branch operations are unaffected.
 
 Companion usage, context and activity-inbox payloads are bounded per AccountProfile and carry observation
 source, scope, coverage and freshness. Unknown, partial, stale, unavailable and unsupported are wire states,
@@ -1657,7 +1681,7 @@ construct the remote GUI/listener path. DisplayNameFact/NameProposal follows a s
 reducer, so generated or provider text changes neither identity nor provider conversation title.
 
 WorkspaceOnboarding is a daemon saga over new/open/clone/SSH adoption with operation-id reconciliation and
-partial-effect receipts. It shares CreationCatalog defaults but not publication authority: publish remains a
+partial-effect receipts. It shares CommandCatalogue creation defaults but not publication authority: publish remains a
 separate foreground repository operation. Imported configuration is inert until local capability consent,
 remote mismatch never falls back to a local path and every writer preserves the primary-main invariant.
 
@@ -1689,8 +1713,8 @@ The body limit (256 KiB) is applied by the server **before** the bytes are buffe
 
 Claude Code's hook protocol allows a response body that allows or denies a tool call. Turn always
 replies with an empty 200. Approving on the user's behalf is exactly what this product promises not to
-do, and the protocol layer reinforces it: `turn-proto` has no request that approves a permission at all
-(§6.1).
+do, and the protocol layer reinforces it: hook input and output have no approval authority. Target typed
+response requests exist only on authenticated exact-interaction operator paths (§6.1).
 
 ### 7.3 The process cannot drive the terminal's environment — **implemented**
 
@@ -1768,11 +1792,12 @@ callback is never a preview source. Free text cannot be made safe by environment
 
 Three hard rules, each enforced structurally rather than by convention:
 
-- Turn **never approves or denies a permission**. `risk::assess` colours a banner and orders a queue; it
-  authorises nothing. The hook server always replies with an empty 200. The protocol has no
-  approve request.
-- Turn **never relaunches a process automatically on restore**. `RestoreBehaviour::ReattachOnly` is the
-  default; `Request::RelaunchNode` is the only thing that restarts anything, and a user issues it.
+- Turn **never chooses or infers a permission answer**. `risk::assess` colours a banner and orders a queue;
+  it authorises nothing. The hook server always replies with an empty 200. Exact typed response operations
+  carry only a foreground operator selection or one separately granted single-use remote selection.
+- Turn **never launches from background metadata restore**. Foreground Session selection may execute its
+  current fully preflighted activation plan in the same interaction, and a persisted reviewed Flow may
+  advance only its declared step. All other restart/resume/recycle operations are explicit.
 - Turn **never executes a command it inferred from Agent output**. A command extracted from prose is
   display material only. This is why the heuristic layer produces events, never actions, and why
   `contract_codex` asserts that a tool-call payload is never turned into an approval or a command to run.
@@ -1810,9 +1835,9 @@ What still holds, and is what the security model actually rests on:
   the injection surface the webview had is gone rather than merely guarded. The escape-sequence classes that
   *are* dangerous are refused in the daemon before a client ever sees them (§7.2–§7.4: OSC 52, resize,
   title sanitising).
-- **The window still authorises nothing.** §7.6's three rules are enforced in the daemon and in the protocol
-  shape, not in the client, so a compromised or buggy client cannot approve a permission, relaunch a process
-  or run an inferred command — there is no request that would let it.
+- **The window invents no authority.** §7.6's rules are enforced in daemon request shapes and exact
+  capabilities: the client can submit the operator's typed choice or explicit lifecycle action, but cannot
+  derive either from agent output, widen a grant or bypass target/revision/fresh-transport checks.
 
 So the net position is: one injection vector removed, one containment layer removed. The first is worth more
 than the second in this specific product, because the containment only ever mattered if the injection
@@ -1857,15 +1882,15 @@ hardware and before/after profiles are recorded in `docs/PERFORMANCE.md`.
 
 | Property | Value | Status |
 | --- | --- | --- |
-| Retained raw bytes per Pane | 2 MiB (`DEFAULT_BYTE_CAPACITY`) | enforced |
-| vt100 scrollback per Pane | 5,000 rows (`DEFAULT_SCROLLBACK_ROWS`) | enforced |
-| Output channel depth per Pane | 512 chunks (`OUTPUT_CHANNEL_CAPACITY`) | enforced |
+| Retained raw bytes per resident PTY TerminalBuffer | 2 MiB (`DEFAULT_BYTE_CAPACITY`) | enforced |
+| vt100 scrollback per resident PTY TerminalBuffer | 5,000 rows (`DEFAULT_SCROLLBACK_ROWS`) | enforced |
+| Output channel depth per resident PTY | 512 chunks (`OUTPUT_CHANNEL_CAPACITY`) | enforced count in v0.1; successor adds byte/global admission below |
 | Read granularity | 64 KiB (`READ_CHUNK`) | enforced |
 | Exit detection latency | ≤ 100 ms (`WAIT_POLL_MS`) | enforced |
 | Hook body limit | 256 KiB (`MAX_BODY_BYTES`), applied before buffering | enforced |
 | Hook event buffer | 1,024 events (`EVENT_CHANNEL_CAPACITY`), then drop | enforced |
 | Hook callback timeout | 3 s configured in the agent; `turn-hook` socket timeout 2 s | enforced |
-| Protocol line limit | 8 MiB (`MAX_LINE_BYTES`); output chunk 256 KiB | enforced |
+| Protocol line limit | 8 MiB (`MAX_LINE_BYTES`); legacy v4 raw output chunk 256 KiB (base64 frame may be larger); vNext raw terminal push≤64 KiB/complete frame≤256 KiB | enforced v4; accepted vNext target separate |
 | Heuristic debounce / idle threshold | 750 ms / 2,000 ms | enforced |
 | Process-table scans | on demand only, never on a timer | enforced by absence |
 | Supervisor walk depth | 32 (`MAX_DEPTH`) | enforced |
@@ -1878,9 +1903,17 @@ hardware and before/after profiles are recorded in `docs/PERFORMANCE.md`.
 
 The optimised reference run measured a 32 MiB process peak RSS, 320 µs Session-switch p95, 55 µs output
 apply p95 and sub-microsecond input enqueue. Those numbers are observations, while the looser CI ceilings
-above are regression budgets that tolerate shared runners. Per-Pane byte rings remain hard-capped at 2 MiB,
+above are regression budgets that tolerate shared runners. Per-resident-PTY byte rings remain hard-capped at 2 MiB,
 and `TerminalBuffer::with_capacity` keeps the tuning lever explicit if future Pane kinds need different
 scrollback trade-offs.
+
+The accepted successor contract deliberately separates this implemented v0.1 fixture from vNext admission.
+The owner of TerminalBuffer is the exact PTY RuntimeAttempt/TerminalRuntimeState; PaneAttachment and client
+projection are different ephemeral families. VNext caps resident PTYs at128, raw rings at2 MiB/item/256 MiB,
+parsed current+scrollback at8 MiB/item/512 MiB, and output broadcast at512 chunks-or-8 MiB/PTY plus4,096
+chunks/256 MiB globally. The current count-only broadcast does **not** prove that target. Successor acceptance
+requires the byte/global owner-local gap, projection baseline/batch, chunked large-response and non-borrowable
+control/Attention outbox contracts in `docs/PROTOCOL.md` before it may be labelled implemented.
 
 Base64 on the protocol is the other known cost, quantified in `turn-proto`'s own docs: 33% inflation
 plus a pass each way, with `OutputEncoding` already negotiated in the handshake as the escape hatch.
@@ -1899,8 +1932,10 @@ mechanisms implement it, in three different currencies.
 
 **Terminal output (bytes):**
 
-1. **Bounded broadcast channel.** Each `PtyProcess` publishes into a `tokio::sync::broadcast` channel of
-   512 chunks. A subscriber that falls behind receives `RecvError::Lagged(n)` telling it exactly how
+1. **Bounded v0.1 broadcast channel.** Each `PtyProcess` currently publishes into a
+   `tokio::sync::broadcast` channel of 512 chunks. This is a count-only implementation bound, not evidence for
+   vNext's 8-MiB/PTY and256-MiB global byte admission. A subscriber that falls behind receives
+   `RecvError::Lagged(n)` telling it exactly how
    many messages it missed. Deliberately modest: falling behind should be detected and repaired quickly,
    not buffered indefinitely.
 2. **Resynchronise from a replay.** The recovery path is prescribed, not left to the caller: on
@@ -1908,7 +1943,7 @@ mechanisms implement it, in three different currencies.
    and continue from the live stream. This works because the *buffer*, not the channel, is
    authoritative — the reader thread writes the buffer before it broadcasts, so a dropped chunk is never
    lost data, only late data.
-3. **Bounded byte ring and bounded parser scrollback.** 2 MiB and 5,000 rows per Pane, with
+3. **Bounded byte ring and bounded parser scrollback.** 2 MiB and 5,000 rows per resident PTY state, with
    `is_truncated()` so a partial replay is known to be partial rather than silently wrong. A single
    write larger than the ring keeps its tail. An unbounded scrollback is a memory leak with a nice name.
 
@@ -1938,3 +1973,87 @@ Consequences worth being explicit about:
 - **The protocol carries the same contract to the UI.** `MAX_OUTPUT_CHUNK_BYTES` caps a frame, a bad
   line costs one line rather than the connection, and a UI that cannot keep up must be told it lagged
   and re-request a replay — exactly as an in-process subscriber does.
+
+### 8.3 Settings, diagnostics and report preparation in the successor control plane
+
+These utilities reuse the same authority split; none becomes another navigation, Attention or execution
+system. The daemon remains the sole resolver of Global→Workspace→Template→Session settings. A local Surface
+owns only its Temporary layer, one revision-fenced section-reset preview and one optional report draft. The
+independently frozen 23-section registry and allowed-scope matrix in `docs/PROTOCOL.md` are inputs to generated
+UI/schema checks, not output inferred from whatever rows happen to exist. Search, sidebar, keyboard and deep
+links all select one canonical settings editor. Section apply crosses the daemon once with an exact preview
+digest and returns the whole resolved document plus a durable owner-scoped receipt.
+
+Diagnostics are not `StatusEvent` and not raw adapter/terminal logging. Producers minimise and redact into one
+daemon-generation memory ring before admission; bounded pages/subscriptions carry explicit earliest sequence,
+gap and freshness. A durable body-free clear high-water prevents an old client/source from reintroducing rows,
+while clear can never erase StatusEvent, Attention, audit, operation or recovery evidence. Ring overflow and
+source-registry pressure degrade diagnostic coverage only; they cannot block a runtime, input or Attention.
+
+Report preparation copies a pinned, already-redacted diagnostic selection into one local Surface-owned draft.
+That draft is separate from agent input and Notes, survives no window owner and grants no effect. Only a later
+desktop-foreground review can copy the exact digest, create a new file, or open a fixed HTTPS support page in
+the existing isolated Browser path. Turn never uploads report bytes automatically and never places the body in
+a URL. Commercial licensing, subscription, seat and entitlement state is absent from all four layers—schema,
+protocol, authority and telemetry—rather than represented as a disabled feature gate.
+
+### 8.4 Audited document, lifecycle, browser and store boundaries
+
+ADR-067 keeps the remaining source-audited capabilities on existing authority seams:
+
+- the native client owns only short-lived `TerminalClipboardGesture` and derived `AttentionAudioCue` state;
+  paste/drop still crosses the daemon through the current InputLease/RuntimeInputReceipt, while copy never
+  becomes a daemon request and OSC 52 never reaches the OS;
+- document source truth remains in FileBackend. One connection+Surface owns revocable view/blob/cache/index
+  state, an isolated decoder owns a separately charged working set and the Workspace owns only the reviewed
+  durable print intent/receipt. View controls do not mutate source and native print cannot be called before
+  durable dispatch;
+- bulk restart and Eco are Workspace lifecycle reducers over canonical AgentInstance/RuntimeAttempt evidence.
+  They call the existing restart or typed adapter hibernate/resume operation one instance at a time; UI labels,
+  pressure and shell text are never execution authority;
+- off-screen terminal parking is split across `turn-gui` local `TerminalWarmViewPark`, independent
+  `TerminalOffscreenClientDetach`/wake-input state and the
+  daemon's ordinary PaneAttachment generations. A RuntimeBackend may add a fixed zero-PTY
+  `TerminalShadowObserver` plus one target-shared background-write control channel only for an exact durable
+  session handle; both feed the existing TerminalByteRing/InputLease receipts, are mutually exclusive with a
+  painter and own no second scrollback or execution authority. Resource pressure can retire only proved-safe
+  presentation/control clients. There is deliberately no detached-session reaper component, timer or signal
+  path; Eco remains the sole opt-in automatic runtime-exit reducer;
+- private transcript body search is a local desktop service between the adapter's profiled transcript-source
+  declaration, descriptor-confined FileBackend read seam, per-index secret and account-private encrypted
+  store. Its refresh/query workers have their own manifest owners and capacity; they never extend
+  ConversationInventory, StateStream hierarchy payloads, ContextBroker or provider mutation. A hit routes to
+  the canonical read-only ViewTarget and nowhere else;
+- dependency-gated convenience creation compiles to ADR-061's immutable FlowDefinition/FlowRun. Exact
+  DependencyResults are published only with producer terminal receipts, and `step_readiness` is a variant of
+  the existing durable FlowOperationReceipt; no renderer-local pending command, idle badge or deleted edge can
+  schedule work;
+- agent browser actions enter through an authenticated adapter principal and a locally adopted Workspace grant,
+  then reuse the same isolated Browser Node/partition and creation/navigation receipts. The page renderer owns
+  no Turn bridge; a non-content overlay owns the visible Stop control;
+- opt-in Browser Memory Saver is a daemon lifecycle reducer over exact Node/partition/navigation/policy
+  generations, not a renderer timer. It retains only safe public navigation metadata, releases the existing
+  renderer/partition charges after quiescence and rehydrates on same-daemon reselection through one fresh
+  BrowserNavigationIntent or a typed bottom-status refusal;
+- optional control visibility is one closed setting projected by `turn-gui`; it never edits the command
+  catalogue or authority. Critical Attention, recovery, lifecycle and consequence controls remain structurally
+  unhideable, while every hidden optional slot retains its palette/keyboard route;
+- PTY capacity observation belongs to the ExecutionTarget ResourceInventory seam. The daemon owns sampling,
+  classification and Attention; RuntimeBackend owns target measurement and an optional closed privileged
+  remediation provider. The GUI cannot supply a command or infer success, and platform mutation is a durable
+  phased intent with reread/rollback reconciliation;
+- Companion launch reuses RemoteSession/CompanionAction authentication, immutable safe Template references,
+  CheckoutScope and canonical agent creation. Preassigned ids mean there is no mobile project mirror;
+- advanced SCM verbs remain closed RepositoryBackend operations sharing RepositoryMutationIntent and the
+  non-primary checkout fence. They do not expose Git argv, and multi-phase/ref/provider uncertainty stays in
+  the existing repository recovery owner;
+- corrupt store bytes are an owner-only operational-store quarantine under `StoreOwnerKey`; they cannot be
+  interpreted as an empty document. Cross-client changes do not watch that file: the daemon remains single
+  writer and other-device work converges as authenticated StateStream mutations with CAS, echo dedup and gap
+  resnapshot; and
+- product analytics/install-count transport has no component. The updater's fixed signed metadata client is
+  purpose-bound and accepts neither a stable installation id nor a generic event schema.
+
+The generated `StateFamilyManifest.vNext` in `docs/PROTOCOL.md` is the component ownership denominator. A
+runtime buffer, queue, worker, intent, receipt or quarantine not present with its exact lifetime and owner is a
+build/spec gate failure; architecture prose cannot create a miscellaneous implementation bucket.

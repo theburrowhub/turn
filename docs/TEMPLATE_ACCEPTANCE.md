@@ -30,8 +30,8 @@ decisions regardless of the Template that created the Pane.
 
 ## Accepted successor boundary
 
-Templates may contribute defaults to the unified CreationCatalog and a foreground Session activation plan,
-but they remain inert configuration rather than external or provider authority. ADR-064/065 acceptance must
+Templates may contribute defaults to the unified CommandCatalogue creation filter and a foreground Session activation plan,
+but they remain inert configuration rather than external or provider authority. ADR-064/065/066 acceptance must
 prove:
 
 - applying or selecting a Session created from a Template needs no separate start interaction only when the
@@ -43,14 +43,14 @@ prove:
 - a Template can name a WorkItemSource definition only by a non-secret profile reference. It cannot contain
   source credentials, item revisions, assignee authority or an instruction that closes/reopens an external
   item. Source writes still require current capabilities, compare-and-swap and external receipts;
-- a provider-native Job definition imported or captured by a Template remains inert. Native job ids,
-  schedules already active at the provider, iteration ids and provider delete/cancel authority are never
-  copied. Activating a schedule is a separate consequence-labelled foreground operation, distinct from a
-  Turn Flow's bounded recurrence;
+- a provider-native Job definition imported or captured by a Template remains inert. Creation/invocation/job/
+  iteration ids, active provider schedules, receipts, deletion fences and provider mutation authority are never
+  copied. Adoption creates a new locally reviewed definition and separately reserves its Node/CreationId;
+  activation is a consequence-labelled provider operation distinct from Turn Flow recurrence;
 - ConversationInventory results, provider conversation ids, current ownership and resume authority are not
   captured as launchable Template state. A Template may hold a non-authoritative search/default descriptor;
   adoption and resume remain separate revision-fenced foreground operations;
-- a Web Resource Template stores only an inert bounded reference/snapshot. A Browser Template creates a new
+- a WebPreview Resource Template stores only an inert bounded reference/snapshot. A Browser Template creates a new
   empty isolated partition and cannot copy cookies, history, reviewed localhost/local-HTML bindings,
   downloads, ambient credentials or automatic navigation;
 - provider title-read and conversation-rename capabilities are not inferred from a saved display label, and
@@ -77,5 +77,20 @@ prove:
   active separately issued endpoint grant, but cannot pair, widen, persist or resolve through it.
 
 Full remote GUI clients may apply the same revision-fenced Template operation as the local WorkSurface only
-within an explicit invitation and lifecycle grant. Headless status clients and companions may inspect a
+when the exact operation is present in both the invitation capability set and current registry/role policy.
+Headless status clients and companions may inspect a
 bounded projection but cannot apply Templates or inherit activation authority.
+
+## ADR-067 Companion allowlisted launch
+
+`ACP-CRE-011` does not let a Template launch from a Companion by itself. Packaged and headless fixtures prove:
+
+- a local foreground grant may reference one immutable Template revision only after resolving its dedicated
+  adapter, AccountProfile, optional fixed model, exact Workspace/Session/target and confined safe-cwd root;
+- the grant copies no command/env/flags/path/credential/checkout authority from the Template. Its checkout
+  policy is closed to read-only or a fresh isolated worktree, and primary `main` is impossible;
+- the Companion selects one allowlist entry and preassigned Node/Instance/Attempt/Checkout identities; changed
+  Template/profile/target/catalogue revision, revoke or≤24-hour expiry refuses before launch;
+- duplicate/disconnect/crash at checkout, process and graph-registration boundaries returns one canonical
+  receipt and at most one ordinary hierarchy Node. The Template and grant remain separate records, and grant
+  revocation never edits the Template or kills an already registered agent.

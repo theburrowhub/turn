@@ -9,15 +9,17 @@ acceptance="$repo_root/docs/CONTROL_PLANE_ACCEPTANCE.md"
 contract="$repo_root/docs/OPERATOR_CONTROL_PLANE.md"
 gap_audit="$repo_root/docs/CONTROL_PLANE_GAP_AUDIT.md"
 coverage="$repo_root/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv"
+census="$repo_root/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv"
+mapping="$repo_root/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv"
 manifest="$repo_root/docs/PRODUCT_REQUIREMENTS_V1.manifest"
 authority="$repo_root/docs/PRODUCT_SPEC_V1.authority"
 authority_pin="$repo_root/docs/PRODUCT_SPEC_V1.sha256"
 decisions="$repo_root/DECISIONS.md"
 mode=${1:-verify}
 
-expected_requirement_count=152
-expected_acceptance_count=152
-expected_coverage_count=84
+expected_requirement_count=185
+expected_acceptance_count=185
+expected_coverage_count=112
 expected_coverage_snapshot=130cdc24bb493349d9b3f3c531198b7bb5fec3df
 expected_coverage_tree_sha256=721e0b9538fb8225f8c773b904b1e98c388ea3e518ad818e9ce3e5f0d8dde3ce
 
@@ -67,28 +69,46 @@ normative_paths() {
     docs/LIFECYCLE_ACCEPTANCE.md \
     docs/LOCAL_VOICE_INPUT.md \
     docs/MVP_ACCEPTANCE.md \
+    docs/OPERATION_REGISTRY_CAP105_112_VNEXT.tsv \
     docs/OPERATOR_CONTROL_PLANE.md \
     docs/PERFORMANCE.md \
     docs/PRIVACY.md \
     docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv \
+    docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv \
+    docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv \
     docs/PRODUCT_IMPLEMENTATION_EVIDENCE.md \
     docs/PRODUCT_REQUIREMENTS.md \
     docs/PROTOCOL.md \
     docs/RELEASE.md \
     docs/REVIEWER_ACCEPTANCE.md \
     docs/SECURITY.md \
+    docs/SEMANTIC_RECOVERY_FAMILY_CLASSIFICATION_VNEXT.tsv \
+    docs/SEMANTIC_RECOVERY_SUBJECTS_VNEXT.tsv \
+    docs/STATE_FAMILY_MANIFEST_VNEXT.tsv \
     docs/TEMPLATE_ACCEPTANCE.md \
     docs/TERMINAL_ACCEPTANCE.md \
     docs/UNIFIED_HIERARCHY_UPGRADE.md \
+    scripts/test-operation-registry-gate.sh \
     scripts/test-product-spec-gate.sh \
+    scripts/test-semantic-recovery-registry-gate.sh \
+    scripts/test-state-family-manifest-gate.sh \
+    scripts/verify-operation-registry.sh \
     scripts/verify-product-capability-source.sh \
     scripts/verify-product-completion.sh \
-    scripts/verify-product-spec.sh
+    scripts/verify-product-spec.sh \
+    scripts/verify-semantic-recovery-registry.sh \
+    scripts/verify-state-family-manifest.sh
 }
 
 origin_for_id() {
   case "$1" in
-    PRD-HIE-009|PRD-ATT-012|PRD-OBS-010|PRD-ADP-012|PRD-SAF-014|PRD-ADP-013|PRD-CRE-008|PRD-OBS-011)
+    PRD-VIE-015|PRD-CRE-011|PRD-ADP-014|PRD-LIF-010|PRD-LIF-011|PRD-RUN-017|PRD-RUN-018|PRD-RUN-019|PRD-RUN-020|PRD-RUN-021|PRD-RUN-022|PRD-OBS-012|PRD-ATT-013|PRD-SAF-016|PRD-SAF-017|PRD-SAF-018|PRD-SAF-019|PRD-SAF-020|PRD-SAF-021|PRD-SCL-011|PRD-SCL-012|PRD-SCL-013)
+      printf '%s\n' ADR-067
+      ;;
+    PRD-VIE-013|PRD-VIE-014|PRD-CRE-009|PRD-CRE-010|PRD-RUN-012|PRD-RUN-013|PRD-RUN-014|PRD-RUN-015|PRD-RUN-016|PRD-SAF-015)
+      printf '%s\n' ADR-066
+      ;;
+    PRD-HIE-009|PRD-HIE-010|PRD-ATT-012|PRD-OBS-010|PRD-ADP-012|PRD-SAF-014|PRD-ADP-013|PRD-CRE-008|PRD-OBS-011)
       printf '%s\n' ADR-065
       ;;
     PRD-VIE-012|PRD-ADP-011|PRD-LIF-009|PRD-RUN-011|PRD-CTX-013|PRD-OBS-009|PRD-ATT-011|PRD-SCL-010)
@@ -147,7 +167,7 @@ if [[ "$mode" == verify || "$mode" == --verify-local ]]; then
   fi
 fi
 
-for required_file in "$requirements" "$acceptance" "$contract" "$gap_audit" "$coverage" "$manifest" "$decisions"; do
+for required_file in "$requirements" "$acceptance" "$contract" "$gap_audit" "$coverage" "$census" "$mapping" "$manifest" "$decisions"; do
   [[ -s "$required_file" && ! -L "$required_file" ]] || die E_REQUIRED_FILE "missing, empty or symlinked ${required_file#$repo_root/}"
 done
 
@@ -471,7 +491,7 @@ emit_authority() {
     fi
     printf 'file\t%s\t%s\t%s\n' "$format" "$path" "$digest"
   done < <(normative_paths)
-  for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064 ADR-065; do
+  for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064 ADR-065 ADR-066 ADR-067; do
     printf 'section\t%s\tDECISIONS.md\t%s\n' "$decision" "$(decision_section_hash "$decision")"
   done
   sort "$scratch/manifest-origins" | while IFS=$'\t' read -r id decision; do
@@ -515,7 +535,7 @@ sort "$scratch/manifest-origins" >"$scratch/sorted-manifest-origins"
 diff -u "$scratch/authority-origins" "$scratch/sorted-manifest-origins" >/dev/null ||
   die E_ORIGIN "manifest decisions differ from frozen requirement origins"
 
-for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064 ADR-065; do
+for decision in ADR-059 ADR-060 ADR-061 ADR-062 ADR-063 ADR-064 ADR-065 ADR-066 ADR-067; do
   section="$scratch/$decision.section"
   awk -v heading="## $decision " '
     index($0, heading) == 1 { active=1 }

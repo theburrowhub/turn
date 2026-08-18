@@ -46,9 +46,21 @@ help: ## Show this help
 verify: product-spec-acceptance fmt-check lint test ## Everything CI checks, in CI's order
 	@echo "verify: ok"
 
+.PHONY: semantic-recovery-acceptance
+semantic-recovery-acceptance: ## Verify the closed semantic recovery registry and its mutation resistance
+	bash -n scripts/verify-semantic-recovery-registry.sh scripts/test-semantic-recovery-registry-gate.sh
+	bash scripts/verify-semantic-recovery-registry.sh
+	bash scripts/test-semantic-recovery-registry-gate.sh
+
 .PHONY: product-spec-acceptance
-product-spec-acceptance: ## Verify the frozen semantic inventory, proof mapping and mutation resistance
+product-spec-acceptance: semantic-recovery-acceptance ## Verify the frozen semantic inventory, proof mapping and mutation resistance
 	bash -n scripts/verify-product-capability-source.sh
+	bash -n scripts/verify-operation-registry.sh scripts/test-operation-registry-gate.sh
+	bash scripts/verify-operation-registry.sh
+	bash scripts/test-operation-registry-gate.sh
+	bash -n scripts/verify-state-family-manifest.sh scripts/test-state-family-manifest-gate.sh
+	bash scripts/verify-state-family-manifest.sh
+	bash scripts/test-state-family-manifest-gate.sh
 	@if [ -n "$${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" ] || [ "$${CI:-}" = true ]; then \
 	  ./scripts/verify-product-spec.sh verify; \
 	else \

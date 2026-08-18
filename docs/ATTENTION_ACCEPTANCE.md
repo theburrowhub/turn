@@ -9,23 +9,19 @@ This checklist exercises the user-visible boundary. The automated equivalents ru
 cargo test -p turnd attention_policy_resolves_all_four_persistent_levels_and_sessions_can_differ
 cargo test -p turnd queue_priority_is_reordered_and_persisted
 cargo test -p turnd a_session_mute_is_restored_after_attention_runtime_restarts
-cargo test -p turn-core a_configured_custom_action_emits_the_exact_command
 cargo test -p turn-core simultaneous_demands_never_become_a_timed_focus_cascade
 cargo test -p turn-core typing_defers_focus_rather_than_dropping_the_signal
-cargo test -p turn-gui a_custom_action_reaches_the_command_runner_exactly_once
 cargo test -p turn-gui selecting_a_tree_node_never_acknowledges_or_resolves_attention
 ```
 
-## Manual sound, notification and custom action
+## Manual sound and notification
 
 1. Open Settings with a Session selected. In “Attention, sounds and notifications”, select
    the Session level.
-2. Enable `sound`, `notify` and `custom` for “Question asked”. Choose the alert sound. Replace
-   the custom command with `touch /tmp/turn-attention-custom-accepted`.
+2. Enable `sound` and `notify` for “Question asked”. Choose the alert sound.
 3. Make that Session's Agent ask a question. Confirm that the OS notification names the
-   demand, the alert sounds once, and the file is created. Turn never displays the stored
-   command again; replacing it is deliberately blind because it may contain credentials.
-4. Delete the acceptance file when finished.
+   demand and the alert sounds once. Neither effect may execute a shell command, submit input,
+   resolve the demand or change its queue order.
 
 ## Manual hierarchy, focus and persistence
 
@@ -58,10 +54,13 @@ automated daemon/GUI tests and native snapshots that prove:
    on a foreground WorkSurface clears that node's matching unread revision.
    A separately queued `TurnComplete` review remains in the daemon's exact order until acknowledged,
    dismissed or superseded by a defined runtime event.
-4. Questions render their text/options and no approval buttons. Allow/deny appears only for an exact typed
-   pending approval id and records the operator's explicit choice as `delivery_pending`.
-5. Writing or submitting a response does not clear the demand. Only adapter evidence for the same instance,
-   runtime attempt and prompt id resolves it; unavailable evidence remains `submitted_unconfirmed`.
+4. Questions render their exact schema/options and use only `respond_to_agent_interaction`; they expose no
+   permission control. A recognised permission renders every provider-offered option and uses one attempt/
+   route-scoped PermissionResponseClaim through local typed, grant-bound remote typed or verified-local-PTY.
+5. Submission does not clear the demand. A question has its own response receipt pending provider evidence;
+   a permission exposes the distinct prepared/effect-armed/submitted/possible-effect dispatch axis and
+   pending/not-applied/resolved/cancelled/attempt-ended/reconcile-required evidence axis. Only correlated
+   evidence for the exact instance/attempt/interaction resolves either; uncertainty remains visible.
 6. Several simultaneous children preserve independent queue entries, unread state and prompt identity across
    relaunch. Attempt-scoped stale demands disappear without erasing valid instance-scoped review work.
 7. Context-window warnings, account quota percentages and profile activity summaries cannot focus, resolve
@@ -69,7 +68,7 @@ automated daemon/GUI tests and native snapshots that prove:
    policy/confidence resolution. Missing, partial, stale or failed observations remain explicitly unknown;
    they never render as zero usage, zero remaining quota or an authoritative empty inbox.
 8. Selecting an Agent, child, resource, historical conversation or job result never starts/resumes it and
-   never shows a generic “Start pane” gate. Warm attach to an already live runtime is automatic; cold
+   never shows a generic “Start pane” gate. Presentation `attach_pane` plus resync to an already live runtime is automatic; cold
    resume/restart requires its semantic lifecycle action. The only selection-triggered start exception is
    ADR-064's foreground Session activation contract below, which is typed, preflighted and fail-closed.
 9. An authenticated parent/external-worker or unassigned node-less demand opens its exact
@@ -94,43 +93,54 @@ single WorkSurface:
    Background restore, child/resource/history selection and merely viewing an ended Session still launch
    nothing.
 2. An externally sourced WorkItem and a provider-native Job/iteration have exact Attention subjects and
-   routes in the same tree. Dismiss, snooze, mark-read and Session deletion mutate neither the external item
-   nor the provider job. A close/reopen, job pause/resume/cancel or permission/result response advances the
-   projection only after a revision-fenced source/provider receipt; timeout-after-possible-write becomes
-   `reconcile_required`, never an automatic replay.
+   routes in the same tree. A forgotten Job uses the general provisional route fenced by immutable
+   AttentionId, Session, profile/target and observation revision; iteration/input-owner references require
+   proof. Dismiss, snooze, mark-read, local activity-hide/forget and Session deletion mutate neither external
+   object. All nine native-job adapter operations are distinct: list, get, create, update, pause, resume,
+   run-now, cancel-iteration and delete-job. Each mutation advances the projection only after its revision-
+   fenced receipt; external WorkItem close/reopen remain separately typed WorkItem mutation schemas and object
+   family reached through a source. Possible-write
+   timeout becomes exact-subject `reconcile_required` and lookup never replays the mutation.
 3. Conversation inventory search and similarity matches create no Attention, ownership or runtime. Adoption
    creates one stopped canonical Node and sends no provider input; resume is a separate foreground preflight
    and creates at most one new attempt. Current ownership is checked installation-wide across exact provider,
    profile, execution target, namespace and conversation id before any input or context authority exists.
-4. Inert Web preview and interactive Browser Nodes are distinct routes. Preview, page content, navigation,
+4. Inert WebPreview and interactive Browser Nodes are distinct routes. Preview, page content, navigation,
    popup, download and script messages cannot fabricate a typed demand, resolve Attention or become a control
    operation. A Browser action requiring operator review routes to the exact Browser Node; restoring history
    never reloads a page automatically.
 5. Provider title read and conversation rename are independently advertised. A read never exposes a rename
-   action without its own capability; a revision-fenced rename remains pending/reconciling until a correlated
-   provider receipt establishes the effective title. Usage, context and the bounded activity inbox remain
+   action without its own capability; a bounded pre-effect intent with tagged owner/proved-unowned subject and
+   lookup-capable correlation remains pending/reconciling until a correlated provider receipt establishes the
+   effective title/new revision. Same-title observation never resolves it and lookup never redispatches. Usage, context and the bounded activity inbox remain
    scoped to one AccountProfile and execution target with independent source, coverage and freshness.
-6. A full remote GUI or companion may answer a known typed permission only with a single-use, expiring,
-   foreground-desktop-issued, end-to-end-encrypted grant bound to the exact provider option, profile,
-   Session/Node/instance/attempt/generation and interaction/authority revisions. Allow and deny both wait for
-   provider evidence. Replay, widening, stale/offline use, cross-profile use and raw PTY input at that known
-   sensitive interaction are refused server-side. Credential entry, grant issuance/expansion, administration,
-   host trust and destructive authority stay local. For an unclassifiable generic TUI Turn makes no claim that
-   arbitrary input is a permission response and therefore never upgrades heuristics into this remote path.
+6. LocalDesktopForegroundAuthority may use exact `submit_local_permission_response`; a full remote GUI or
+   Companion may use only `submit_remote_permission_response` after exact E2EE grant delivery/ack. Grant
+   consumption races revoke/expiry/reconnect/interaction/attempt/binding/capability change with one CAS winner,
+   and dispatch/evidence receipt recovery never resends. Binary and non-binary options wait for provider
+   evidence. Typed transport blocks raw bytes everywhere; only fresh supported verified-local-PTY admits the
+   daemon-encoded desktop fallback. Offline drafts/replay, widening, stale/cross-profile use and every remote/
+   voice/hook/background fallback fail. Credential, grant administration, host trust and destructive authority
+   stay local; an opaque TUI gets no fabricated semantic guarantee.
 
 ## Accepted ADR-065 background delivery and live-status projection
 
 This post-v0.1 target proves `ACP-ATT-012`. It projects the canonical queue; it does not add another queue,
 resolution state or authority:
 
-1. Pairing creates one `NotificationEndpointId` and foreground-issued `DeliveryGrant` with endpoint public
-   key/token reference, exact Workspace/ExecutionTarget/event-class/privacy scopes, generation, batch/rate
-   bounds and expiry. Proposed, active, expired, invalid and revoked states follow the closed machine. Secret
-   canaries are absent from protocol reads, UI/store/export/logs; 401/403 invalidates only the exact generation.
+1. Pairing persists a preassigned non-reused endpoint/initial-grant pair, operation/fingerprint, peer
+   correlation, catalogue/generations and all count/byte/terminal/recovery reservations before dispatch. Every
+   prepared/dispatching/awaiting/reconcile crash and late peer reply returns that exact record without a second
+   pair. Prepared expiry at 600 seconds tombstones its endpoint/grant reservation; an awaiting deadline instead
+   reconciles. Endpoint reserved/active/retired/deleted and immutable proposed/active/expired/invalid/revoked grant
+   states follow their closed machines; retire revokes all generations/outbox/live state and late replies cannot
+   reactivate. Secret canaries are absent from protocol reads, UI/store/export/logs; 401/403 invalidates only
+   the exact generation. Regrant/rekey/widen always revokes then mints a new globally non-reused grant id.
 2. Outbox insert and flush independently revalidate grant, queue/subject revision, resolution and presence.
    `CollapseKey` includes endpoint, full tagged subject identity/revision and demand kind: replay of one demand
    emits at most one eligible alert, while two same-titled subagents or two demand kinds remain two. Batching,
-   jitter and retry remain within declared endpoint and global bounds.
+   jitter and exactly eight total submissions with≤15-minute backoff remain within declared endpoint and
+   global count/byte bounds; the ninth submission is structurally impossible.
 3. Payloads are end-to-end encrypted and contain only the minimum route/display class authorised by the
    privacy scope—never transcript, prompt/answer body, command, path, account, secret or raw provider payload.
    Gateway `accepted` is not `delivered`, `read`, `acknowledged` or `resolved`; retryable/terminal failure and
@@ -165,9 +175,11 @@ prove:
 3. Manual `Next Attention`, badge and notification routing still work. They cancel live microphone capture,
    preserve any completed memory-only draft under its original target and apply the exact demand route; the
    draft never follows selection.
-4. Zero target bytes exist before explicit Insert/Send. Dictation into an exact free-text question remains
-   `delivery_pending`/`submitted_unconfirmed` until evidence for that same instance/attempt/prompt proves
-   resolution. A spoken word never resolves it by itself.
+4. Zero target bytes exist before explicit Insert/Send. Dictation into an exact free-text question uses the
+   normal `respond_to_agent_interaction` response receipt: a definitely queued/submitted response and an
+   ambiguous `submitted_unconfirmed` write remain distinct until evidence for that same instance/attempt/
+   prompt proves resolution. Permission dispatch/evidence states are not available to dictation. A spoken
+   word never resolves anything by itself.
 5. Permission, password/credential, provisional/unassigned, raw-TTY and unverified alternate-screen demands
    expose no dictation action. “Yes”, “allow” and similar transcript text can neither invoke an approval nor
    call `route_attention`, `activate_session` or a lifecycle operation.
@@ -176,3 +188,20 @@ prove:
    the governor either applies its original still-valid route or degrades it under the normal policy.
 
 The complete local-input contract is `docs/LOCAL_VOICE_INPUT.md`.
+
+## Accepted ADR-067 Attention sound-cue boundary
+
+`ACP-ATT-013` is an independent oracle, not evidence from the visual queue tests:
+
+1. A deterministic canonical edge fixture emits `done` only for a fresh working→idle/completed result revision
+   with no actionable demand, and `needs_you` only for a fresh current PendingInteraction/Attention demand.
+   Running ticks, ordinary output, provider text, duplicate/replayed/stale revisions and chat/status events emit
+   no cue.
+2. Supported playback begins within300 ms, lasts≤2 seconds and distinguishes the two signed built-in assets.
+   Visible enable/mute,0..1000 volume,≥2-second per-subject cooldown,≤8 cues/client/10 seconds,16/client and
+   128/256-KiB installation limits are exact; late or saturated events drop rather than evict/replay.
+3. Every fixture proves the queue/route/focus/unread/result and PendingInteraction revisions are byte-for-byte
+   unchanged by enqueue, playback, mute, failure and completion. A cue cannot create, route, acknowledge,
+   snooze, dismiss or resolve Attention.
+4. Restart/reconnect restores no cue and never autoplays. Missing/failed audio remains labelled while visual,
+   screen-reader and structured Attention evidence stays complete and within its normal latency budget.

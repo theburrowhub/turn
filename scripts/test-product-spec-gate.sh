@@ -15,6 +15,14 @@ hash_file() {
   fi
 }
 
+hash_stream() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
 configure_repo() {
   fixture=$1
   git -C "$fixture" config user.name 'Turn gate fixture'
@@ -34,6 +42,12 @@ seed_case() {
   cp "$repo_root/scripts/verify-product-spec.sh" \
     "$repo_root/scripts/verify-product-capability-source.sh" \
     "$repo_root/scripts/verify-product-completion.sh" \
+    "$repo_root/scripts/verify-operation-registry.sh" \
+    "$repo_root/scripts/test-operation-registry-gate.sh" \
+    "$repo_root/scripts/verify-semantic-recovery-registry.sh" \
+    "$repo_root/scripts/test-semantic-recovery-registry-gate.sh" \
+    "$repo_root/scripts/verify-state-family-manifest.sh" \
+    "$repo_root/scripts/test-state-family-manifest-gate.sh" \
     "$repo_root/scripts/test-product-spec-gate.sh" "$case_dir/scripts/"
   cp "$repo_root/.github/workflows/ci.yml" "$case_dir/.github/workflows/"
   git -C "$case_dir" init -q --object-format="$object_format"
@@ -98,10 +112,486 @@ refreeze_case() {
   hash_file "$case_dir/docs/PRODUCT_SPEC_V1.authority" >"$case_dir/docs/PRODUCT_SPEC_V1.sha256"
 }
 
+seed_source_verifier_fixture() {
+  case_dir=$1
+  source_dir=$2
+  mkdir -p "$case_dir/scripts" "$case_dir/docs" "$source_dir/src/core" \
+    "$source_dir/src/renderer/lib" "$source_dir/src/shared/agents"
+  cp "$repo_root/scripts/verify-product-capability-source.sh" "$case_dir/scripts/"
+
+  git -C "$source_dir" init -q --object-format=sha1
+  configure_repo "$source_dir"
+  printf '%s\n' 'source fixture root' >"$source_dir/README.md"
+  printf '%s\n' 'export const evidence = true' >"$source_dir/src/evidence.ts"
+  printf '%s\n' 'export const PTY_DEVICE_HEADROOM = 4' >"$source_dir/src/core/pty-devices.ts"
+  printf '%s\n' \
+    'export const HIDEABLE_MENU_ITEMS = [' \
+    "  { id: 'group' }," \
+    "  { id: 'remove-from-group' }," \
+    "  { id: 'colors' }," \
+    "  { id: 'duplicate' }," \
+    "  { id: 'collapse' }," \
+    "  { id: 'markdown-view' }," \
+    "  { id: 'refresh-terminal' }" \
+    ']' \
+    'export const HIDEABLE_HEADER_BUTTONS = [' \
+    "  { id: 'refresh' }," \
+    "  { id: 'mic' }," \
+    "  { id: 'ai-name' }," \
+    "  { id: 'comments' }" \
+    ']' >"$source_dir/src/renderer/lib/ui-visibility.ts"
+  printf '%s\n' '.fixture-runtime-surface { display: block; }' >"$source_dir/src/renderer/styles.css"
+  printf '%s\n' 'export const IPC = {' "  ping: 'fixture:ping'" '}' >"$source_dir/src/shared/ipc.ts"
+  printf '%s\n' "export type NodeKind = 'fixture'" \
+    'export interface Settings {' \
+    '  fontSize: number' \
+    '}' \
+    "export type WorkspaceMigrationKind = 'exec' | 'v2'" >"$source_dir/src/shared/types.ts"
+  printf '%s\n' "export type BuiltinAgentId = 'fixture_agent'" \
+    "export const SUBAGENT_CAPABLE = ['fixture_agent'] as const" \
+    >"$source_dir/src/shared/agents/config.ts"
+  git -C "$source_dir" add .
+  git -C "$source_dir" commit -qm 'source evidence fixture'
+
+  source_snapshot=$(git -C "$source_dir" rev-parse HEAD)
+  source_tree=$(git -C "$source_dir" ls-tree -r --full-tree "$source_snapshot" | hash_stream)
+  root_digest=$(hash_file "$source_dir/README.md")
+  evidence_digest=$(hash_file "$source_dir/src/evidence.ts")
+  pty_devices_digest=$(hash_file "$source_dir/src/core/pty-devices.ts")
+  ui_visibility_digest=$(hash_file "$source_dir/src/renderer/lib/ui-visibility.ts")
+  renderer_css_digest=$(hash_file "$source_dir/src/renderer/styles.css")
+  ipc_digest=$(hash_file "$source_dir/src/shared/ipc.ts")
+  types_digest=$(hash_file "$source_dir/src/shared/types.ts")
+  agents_digest=$(hash_file "$source_dir/src/shared/agents/config.ts")
+  {
+    printf '%s\n' '# product-capability-coverage-version: 1'
+    printf '# source-snapshot: %s\n' "$source_snapshot"
+    printf '# source-tree-sha256: %s\n' "$source_tree"
+    printf '%s\n' '# source-tree-digest-algorithm: sha256(git ls-tree -r --full-tree source-snapshot)'
+    printf '%s\n' '# digest-algorithm: sha256(raw bytes of evidence_locator at source-snapshot)'
+    printf '%s\n' '# dispositions: adopted adapted rejected irrelevant'
+    printf '%s\n' '# expected-feature-count: 2'
+    printf '%s\n' $'feature_id\tcapability_key\tdescription\tdisposition\trequirement\tacceptance\tdecision\tevidence_locator\tevidence_sha256\trationale'
+    printf 'CAP-001\tfixture_root\tRoot evidence.\tadopted\tPRD-OUT-001\tACP-OUT-001\tADR-059\tREADME.md\t%s\tFixture root is verified.\n' "$root_digest"
+    printf 'CAP-002\tfixture_blob\tSecond responsibility in shared root evidence.\tadapted\tPRD-HIE-001\tACP-HIE-001\tADR-059\tREADME.md\t%s\tThe shared evidence module must retain both normalized relations.\n' "$root_digest"
+  } >"$case_dir/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv"
+  {
+    printf '%s\n' '# product-capability-source-census-version: 1'
+    printf '# source-snapshot: %s\n' "$source_snapshot"
+    printf '%s\n' '# candidate-selector-version: 1'
+    printf '%s\n' '# expected-module-count: 8'
+    printf '%s\n' '# expected-registry-count: 19'
+    printf '%s\n' '# expected-candidate-count: 27'
+    printf '%s\n' '# selector-v1 fixture'
+    printf '%s\n' $'candidate_id\tcandidate_kind\tsource_locator\tsurface_key\tsource_blob_sha256'
+    printf 'CEN-0001\tmodule\tREADME.md\t-\t%s\n' "$root_digest"
+    printf 'CEN-0002\tmodule\tsrc/core/pty-devices.ts\t-\t%s\n' "$pty_devices_digest"
+    printf 'CEN-0003\tmodule\tsrc/evidence.ts\t-\t%s\n' "$evidence_digest"
+    printf 'CEN-0004\tmodule\tsrc/renderer/lib/ui-visibility.ts\t-\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0005\tmodule\tsrc/renderer/styles.css\t-\t%s\n' "$renderer_css_digest"
+    printf 'CEN-0006\tmodule\tsrc/shared/agents/config.ts\t-\t%s\n' "$agents_digest"
+    printf 'CEN-0007\tmodule\tsrc/shared/ipc.ts\t-\t%s\n' "$ipc_digest"
+    printf 'CEN-0008\tmodule\tsrc/shared/types.ts\t-\t%s\n' "$types_digest"
+    printf 'CEN-0009\tregistry_agent_adapter\tsrc/shared/agents/config.ts\tfixture_agent\t%s\n' "$agents_digest"
+    printf 'CEN-0010\tregistry_closed_set\tsrc/core/pty-devices.ts\tPTY_DEVICE_HEADROOM=4\t%s\n' "$pty_devices_digest"
+    printf 'CEN-0011\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_HEADER_BUTTONS=header:ai-name->generate_name\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0012\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_HEADER_BUTTONS=header:comments->comments\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0013\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_HEADER_BUTTONS=header:mic->voice_dictation\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0014\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_HEADER_BUTTONS=header:refresh->header_refresh\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0015\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:collapse->collapse_expand\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0016\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:colors->colour\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0017\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:duplicate->duplicate\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0018\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:group->group_selection\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0019\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:markdown-view->markdown_projection\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0020\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:refresh-terminal->refresh_terminal\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0021\tregistry_closed_set\tsrc/renderer/lib/ui-visibility.ts\tHIDEABLE_MENU_ITEMS=menu:remove-from-group->remove_from_group\t%s\n' "$ui_visibility_digest"
+    printf 'CEN-0022\tregistry_closed_set\tsrc/shared/agents/config.ts\tSUBAGENT_CAPABLE=fixture_agent\t%s\n' "$agents_digest"
+    printf 'CEN-0023\tregistry_closed_union\tsrc/shared/types.ts\tWorkspaceMigrationKind=exec\t%s\n' "$types_digest"
+    printf 'CEN-0024\tregistry_closed_union\tsrc/shared/types.ts\tWorkspaceMigrationKind=v2\t%s\n' "$types_digest"
+    printf 'CEN-0025\tregistry_ipc\tsrc/shared/ipc.ts\tping\t%s\n' "$ipc_digest"
+    printf 'CEN-0026\tregistry_node_kind\tsrc/shared/types.ts\tfixture\t%s\n' "$types_digest"
+    printf 'CEN-0027\tregistry_setting_key\tsrc/shared/types.ts\tfontSize\t%s\n' "$types_digest"
+  } >"$case_dir/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv"
+  {
+    printf '%s\n' '# product-capability-source-mapping-version: 1'
+    printf '# source-snapshot: %s\n' "$source_snapshot"
+    printf '%s\n' '# expected-candidate-count: 27'
+    printf '%s\n' '# expected-mapping-count: 28'
+    printf '%s\n' '# resolutions: mapped supporting'
+    printf '%s\n' '# mapping-bases: ledger_evidence closed_registry manual_source_audit supporting_module_audit'
+    printf '%s\n' $'mapping_id\tcandidate_id\tresolution\tfeature_id\tfeature_disposition\tmapping_basis\tcandidate_rationale'
+    printf '%s\n' $'MAP-0001\tCEN-0001\tmapped\tCAP-001\tadopted\tledger_evidence\tREADME.md is the evidence anchor for CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0002\tCEN-0001\tmapped\tCAP-002\tadapted\tledger_evidence\tREADME.md is the shared evidence anchor for CAP-002 (fixture_blob).'
+    printf '%s\n' $'MAP-0003\tCEN-0002\tsupporting\tCAP-001\tadopted\tsupporting_module_audit\tsrc/core/pty-devices.ts supports CAP-001 (fixture_root) and adds no independent capability beyond the closed constant registry.'
+    printf '%s\n' $'MAP-0004\tCEN-0003\tsupporting\tCAP-002\tadapted\tsupporting_module_audit\tsrc/evidence.ts supports CAP-002 (fixture_blob) and adds no independent capability beyond the evidence root.'
+    printf '%s\n' $'MAP-0005\tCEN-0004\tsupporting\tCAP-001\tadopted\tsupporting_module_audit\tsrc/renderer/lib/ui-visibility.ts supports CAP-001 (fixture_root) and adds no independent capability beyond the closed visibility registry.'
+    printf '%s\n' $'MAP-0006\tCEN-0005\tsupporting\tCAP-001\tadopted\tsupporting_module_audit\tsrc/renderer/styles.css supports CAP-001 (fixture_root) and adds no independent capability beyond the runtime presentation surface.'
+    printf '%s\n' $'MAP-0007\tCEN-0006\tsupporting\tCAP-002\tadapted\tsupporting_module_audit\tsrc/shared/agents/config.ts supports CAP-002 (fixture_blob) and adds no independent capability beyond the closed adapter registries.'
+    printf '%s\n' $'MAP-0008\tCEN-0007\tsupporting\tCAP-001\tadopted\tsupporting_module_audit\tsrc/shared/ipc.ts supports CAP-001 (fixture_root) and adds no independent capability beyond the closed IPC registry.'
+    printf '%s\n' $'MAP-0009\tCEN-0008\tsupporting\tCAP-001\tadopted\tsupporting_module_audit\tsrc/shared/types.ts supports CAP-001 (fixture_root) and adds no independent capability beyond its closed type registries.'
+    printf '%s\n' $'MAP-0010\tCEN-0009\tmapped\tCAP-002\tadapted\tclosed_registry\tfixture_agent is a closed adapter surface mapped to CAP-002 (fixture_blob).'
+    printf '%s\n' $'MAP-0011\tCEN-0010\tmapped\tCAP-001\tadopted\tclosed_registry\tPTY_DEVICE_HEADROOM=4 is a closed constant surface mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0012\tCEN-0011\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_HEADER_BUTTONS=header:ai-name->generate_name is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0013\tCEN-0012\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_HEADER_BUTTONS=header:comments->comments is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0014\tCEN-0013\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_HEADER_BUTTONS=header:mic->voice_dictation is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0015\tCEN-0014\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_HEADER_BUTTONS=header:refresh->header_refresh is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0016\tCEN-0015\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:collapse->collapse_expand is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0017\tCEN-0016\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:colors->colour is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0018\tCEN-0017\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:duplicate->duplicate is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0019\tCEN-0018\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:group->group_selection is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0020\tCEN-0019\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:markdown-view->markdown_projection is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0021\tCEN-0020\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:refresh-terminal->refresh_terminal is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0022\tCEN-0021\tmapped\tCAP-001\tadopted\tclosed_registry\tHIDEABLE_MENU_ITEMS=menu:remove-from-group->remove_from_group is a closed visibility relation mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0023\tCEN-0022\tmapped\tCAP-002\tadapted\tclosed_registry\tSUBAGENT_CAPABLE=fixture_agent is a closed capability set member mapped to CAP-002 (fixture_blob).'
+    printf '%s\n' $'MAP-0024\tCEN-0023\tmapped\tCAP-001\tadopted\tclosed_registry\tWorkspaceMigrationKind=exec is a closed migration surface mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0025\tCEN-0024\tmapped\tCAP-001\tadopted\tclosed_registry\tWorkspaceMigrationKind=v2 is a closed migration surface mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0026\tCEN-0025\tmapped\tCAP-001\tadopted\tclosed_registry\tping is a closed IPC surface mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0027\tCEN-0026\tmapped\tCAP-001\tadopted\tclosed_registry\tfixture is a closed NodeKind surface mapped to CAP-001 (fixture_root).'
+    printf '%s\n' $'MAP-0028\tCEN-0027\tmapped\tCAP-001\tadopted\tclosed_registry\tfontSize is a closed Settings key mapped to CAP-001 (fixture_root).'
+  } >"$case_dir/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv"
+}
+
+clone_source_verifier_case() {
+  source_dir=$1
+  case_dir=$2
+  cp -R "$source_dir" "$case_dir"
+}
+
+run_source_verifier() {
+  case_dir=$1
+  source_dir=$2
+  /bin/bash "$case_dir/scripts/verify-product-capability-source.sh" "$source_dir"
+}
+
+normalize_source_mapping() {
+  mapping_file=$1
+  mapping_count=$(awk -F '\t' '$1 ~ /^MAP-[0-9][0-9][0-9][0-9]$/ { count++ } END { print count+0 }' "$mapping_file")
+  awk -F '\t' -v count="$mapping_count" '
+    BEGIN { OFS="\t" }
+    NR==4 { print "# expected-mapping-count: " count; next }
+    $1 ~ /^MAP-[0-9][0-9][0-9][0-9]$/ { sequence++; $1=sprintf("MAP-%04d", sequence) }
+    { print }
+  ' "$mapping_file" >"$mapping_file.normalized"
+  replace_file "$mapping_file" "$mapping_file.normalized"
+}
+
+retarget_source_verifier_case() {
+  case_dir=$1
+  source_dir=$2
+  next_snapshot=$(git -C "$source_dir" rev-parse HEAD)
+  next_tree=$(git -C "$source_dir" ls-tree -r --full-tree "$next_snapshot" | hash_stream)
+  awk -v snapshot="$next_snapshot" -v tree="$next_tree" '
+    NR==2 { print "# source-snapshot: " snapshot; next }
+    NR==3 { print "# source-tree-sha256: " tree; next }
+    { print }
+  ' "$case_dir/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$case_dir/docs/coverage.new"
+  replace_file "$case_dir/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$case_dir/docs/coverage.new"
+  for artifact in PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv; do
+    awk -v snapshot="$next_snapshot" '
+      NR==2 { print "# source-snapshot: " snapshot; next }
+      { print }
+    ' "$case_dir/docs/$artifact" >"$case_dir/docs/$artifact.new"
+    replace_file "$case_dir/docs/$artifact" "$case_dir/docs/$artifact.new"
+  done
+}
+
 /bin/bash -n "$repo_root/scripts/verify-product-spec.sh" \
   "$repo_root/scripts/verify-product-capability-source.sh" \
   "$repo_root/scripts/verify-product-completion.sh" \
+  "$repo_root/scripts/verify-operation-registry.sh" \
+  "$repo_root/scripts/test-operation-registry-gate.sh" \
+  "$repo_root/scripts/verify-semantic-recovery-registry.sh" \
+  "$repo_root/scripts/test-semantic-recovery-registry-gate.sh" \
+  "$repo_root/scripts/verify-state-family-manifest.sh" \
+  "$repo_root/scripts/test-state-family-manifest-gate.sh" \
   "$repo_root/scripts/test-product-spec-gate.sh"
+
+source_fixture_repository="$scratch/source-repository"
+source_fixture_base="$scratch/source-verifier-base"
+seed_source_verifier_fixture "$source_fixture_base" "$source_fixture_repository"
+run_source_verifier "$source_fixture_base" "$source_fixture_repository" >/dev/null
+expect_rejected 'source verifier extra argument' E_USAGE \
+  /bin/bash "$source_fixture_base/scripts/verify-product-capability-source.sh" \
+  "$source_fixture_repository" unexpected
+expect_rejected 'ambient source Git directory override' E_GIT_ENV \
+  env GIT_DIR="$source_fixture_repository/.git" \
+  /bin/bash "$source_fixture_base/scripts/verify-product-capability-source.sh" "$scratch"
+expect_rejected 'ambient source object directory override' E_GIT_ENV \
+  env GIT_OBJECT_DIRECTORY="$source_fixture_repository/.git/objects" \
+  /bin/bash "$source_fixture_base/scripts/verify-product-capability-source.sh" "$source_fixture_repository"
+
+source_fixture_bare="$scratch/source-repository-bare"
+git clone -q --bare "$source_fixture_repository" "$source_fixture_bare"
+run_source_verifier "$source_fixture_base" "$source_fixture_bare" >/dev/null
+
+source_bad_snapshot="$scratch/source-bad-snapshot"
+clone_source_verifier_case "$source_fixture_base" "$source_bad_snapshot"
+awk 'NR==2 { print "# source-snapshot: 0000000000000000000000000000000000000000"; next } { print }' \
+  "$source_bad_snapshot/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$source_bad_snapshot/docs/coverage.new"
+replace_file "$source_bad_snapshot/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$source_bad_snapshot/docs/coverage.new"
+for artifact in PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv; do
+  awk 'NR==2 { print "# source-snapshot: 0000000000000000000000000000000000000000"; next } { print }' \
+    "$source_bad_snapshot/docs/$artifact" >"$source_bad_snapshot/docs/$artifact.new"
+  replace_file "$source_bad_snapshot/docs/$artifact" "$source_bad_snapshot/docs/$artifact.new"
+done
+expect_rejected 'absent frozen source snapshot' E_SNAPSHOT run_source_verifier \
+  "$source_bad_snapshot" "$source_fixture_repository"
+
+source_bad_tree="$scratch/source-bad-tree"
+clone_source_verifier_case "$source_fixture_base" "$source_bad_tree"
+awk 'NR==3 { print "# source-tree-sha256: 0000000000000000000000000000000000000000000000000000000000000000"; next } { print }' \
+  "$source_bad_tree/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$source_bad_tree/docs/coverage.new"
+replace_file "$source_bad_tree/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$source_bad_tree/docs/coverage.new"
+expect_rejected 'wrong frozen source tree' E_TREE run_source_verifier \
+  "$source_bad_tree" "$source_fixture_repository"
+
+source_bad_locator="$scratch/source-bad-locator"
+clone_source_verifier_case "$source_fixture_base" "$source_bad_locator"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-002" { $8="src/missing.txt" } { print }' \
+  "$source_bad_locator/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$source_bad_locator/docs/coverage.new"
+replace_file "$source_bad_locator/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$source_bad_locator/docs/coverage.new"
+expect_rejected 'missing source evidence locator' E_LOCATOR run_source_verifier \
+  "$source_bad_locator" "$source_fixture_repository"
+
+source_bad_digest="$scratch/source-bad-digest"
+clone_source_verifier_case "$source_fixture_base" "$source_bad_digest"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CAP-002" { $9="0000000000000000000000000000000000000000000000000000000000000000" } { print }' \
+  "$source_bad_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" >"$source_bad_digest/docs/coverage.new"
+replace_file "$source_bad_digest/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" "$source_bad_digest/docs/coverage.new"
+expect_rejected 'wrong source evidence digest' E_DIGEST run_source_verifier \
+  "$source_bad_digest" "$source_fixture_repository"
+
+source_unknown_feature_mapping="$scratch/source-unknown-feature-mapping"
+clone_source_verifier_case "$source_fixture_base" "$source_unknown_feature_mapping"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="MAP-0003" { $4="CAP-999"; $7="src/core/pty-devices.ts anchors CAP-999 (unknown_fixture) for this mutation and adds no independent capability." } { print }' \
+  "$source_unknown_feature_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_unknown_feature_mapping/docs/mapping.new"
+replace_file "$source_unknown_feature_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_unknown_feature_mapping/docs/mapping.new"
+expect_rejected 'unknown source-mapping capability' E_MAPPING_FEATURE run_source_verifier \
+  "$source_unknown_feature_mapping" "$source_fixture_repository"
+
+source_unknown_candidate_mapping="$scratch/source-unknown-candidate-mapping"
+clone_source_verifier_case "$source_fixture_base" "$source_unknown_candidate_mapping"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="MAP-0011" { $2="CEN-9999" } { print }' \
+  "$source_unknown_candidate_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_unknown_candidate_mapping/docs/mapping.new"
+replace_file "$source_unknown_candidate_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_unknown_candidate_mapping/docs/mapping.new"
+expect_rejected 'unknown source-mapping candidate' E_MAPPING_CANDIDATE run_source_verifier \
+  "$source_unknown_candidate_mapping" "$source_fixture_repository"
+
+source_registry_supporting="$scratch/source-registry-supporting"
+clone_source_verifier_case "$source_fixture_base" "$source_registry_supporting"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="MAP-0024" { $3="supporting"; $6="supporting_module_audit"; $7="WorkspaceMigrationKind=exec supports CAP-001 (fixture_root) and adds no independent capability." } { print }' \
+  "$source_registry_supporting/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_registry_supporting/docs/mapping.new"
+replace_file "$source_registry_supporting/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_registry_supporting/docs/mapping.new"
+expect_rejected 'closed registry weakened to supporting' E_MAPPING_RESOLUTION run_source_verifier \
+  "$source_registry_supporting" "$source_fixture_repository"
+
+source_missing_mapping_anchor="$scratch/source-missing-mapping-anchor"
+clone_source_verifier_case "$source_fixture_base" "$source_missing_mapping_anchor"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="MAP-0003" { $7="CAP-002 (fixture_blob) has audited evidence without its source anchor." } { print }' \
+  "$source_missing_mapping_anchor/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_missing_mapping_anchor/docs/mapping.new"
+replace_file "$source_missing_mapping_anchor/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_missing_mapping_anchor/docs/mapping.new"
+expect_rejected 'mapping rationale missing exact source anchor' E_MAPPING_RATIONALE run_source_verifier \
+  "$source_missing_mapping_anchor" "$source_fixture_repository"
+
+source_wrong_mapping_disposition="$scratch/source-wrong-mapping-disposition"
+clone_source_verifier_case "$source_fixture_base" "$source_wrong_mapping_disposition"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="MAP-0004" { $5="adopted" } { print }' \
+  "$source_wrong_mapping_disposition/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_wrong_mapping_disposition/docs/mapping.new"
+replace_file "$source_wrong_mapping_disposition/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_wrong_mapping_disposition/docs/mapping.new"
+expect_rejected 'mapping disposition differs from ledger' E_MAPPING_DISPOSITION run_source_verifier \
+  "$source_wrong_mapping_disposition" "$source_fixture_repository"
+
+source_missing_evidence_relation="$scratch/source-missing-evidence-relation"
+clone_source_verifier_case "$source_fixture_base" "$source_missing_evidence_relation"
+awk -F '\t' '$1!="MAP-0002"' \
+  "$source_missing_evidence_relation/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_missing_evidence_relation/docs/mapping.new"
+replace_file "$source_missing_evidence_relation/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_missing_evidence_relation/docs/mapping.new"
+normalize_source_mapping "$source_missing_evidence_relation/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv"
+expect_rejected 'missing shared ledger-evidence relation' E_MAPPING_EVIDENCE run_source_verifier \
+  "$source_missing_evidence_relation" "$source_fixture_repository"
+
+source_unmapped_candidate="$scratch/source-unmapped-candidate"
+clone_source_verifier_case "$source_fixture_base" "$source_unmapped_candidate"
+awk -F '\t' '$1!="MAP-0003"' \
+  "$source_unmapped_candidate/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_unmapped_candidate/docs/mapping.new"
+replace_file "$source_unmapped_candidate/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_unmapped_candidate/docs/mapping.new"
+normalize_source_mapping "$source_unmapped_candidate/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv"
+expect_rejected 'selected source candidate has no mapping' E_MAPPING_COVERAGE run_source_verifier \
+  "$source_unmapped_candidate" "$source_fixture_repository"
+
+source_duplicate_mapping="$scratch/source-duplicate-mapping"
+clone_source_verifier_case "$source_fixture_base" "$source_duplicate_mapping"
+awk -F '\t' 'BEGIN { OFS="\t" } { print } $1=="MAP-0001" { $1="MAP-9999"; print }' \
+  "$source_duplicate_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_duplicate_mapping/docs/mapping.new"
+replace_file "$source_duplicate_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_duplicate_mapping/docs/mapping.new"
+normalize_source_mapping "$source_duplicate_mapping/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv"
+expect_rejected 'duplicate candidate-capability mapping' E_MAPPING_DUPLICATE run_source_verifier \
+  "$source_duplicate_mapping" "$source_fixture_repository"
+
+source_duplicate_candidate="$scratch/source-duplicate-candidate"
+clone_source_verifier_case "$source_fixture_base" "$source_duplicate_candidate"
+awk -F '\t' 'BEGIN { OFS="\t" } $1=="CEN-0024" { $4="WorkspaceMigrationKind=exec" } { print }' \
+  "$source_duplicate_candidate/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv" \
+  >"$source_duplicate_candidate/docs/census.new"
+replace_file "$source_duplicate_candidate/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv" \
+  "$source_duplicate_candidate/docs/census.new"
+expect_rejected 'duplicate selected source candidate' E_CENSUS_DUPLICATE run_source_verifier \
+  "$source_duplicate_candidate" "$source_fixture_repository"
+
+source_with_omitted_candidate="$scratch/source-with-omitted-candidate"
+clone_source_verifier_case "$source_fixture_base" "$source_with_omitted_candidate"
+source_repository_with_extra="$scratch/source-repository-with-extra"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_with_extra"
+printf '%s\n' 'export const newlyExposedSurface = true' >"$source_repository_with_extra/src/new-surface.ts"
+git -C "$source_repository_with_extra" add src/new-surface.ts
+git -C "$source_repository_with_extra" commit -qm 'add an unaccounted production surface'
+extra_snapshot=$(git -C "$source_repository_with_extra" rev-parse HEAD)
+extra_tree=$(git -C "$source_repository_with_extra" ls-tree -r --full-tree "$extra_snapshot" | hash_stream)
+awk -v snapshot="$extra_snapshot" -v tree="$extra_tree" '
+  NR==2 { print "# source-snapshot: " snapshot; next }
+  NR==3 { print "# source-tree-sha256: " tree; next }
+  { print }
+' "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" \
+  >"$source_with_omitted_candidate/docs/coverage.new"
+replace_file "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" \
+  "$source_with_omitted_candidate/docs/coverage.new"
+awk -v snapshot="$extra_snapshot" '
+  NR==2 { print "# source-snapshot: " snapshot; next }
+  { print }
+' "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv" \
+  >"$source_with_omitted_candidate/docs/census.new"
+replace_file "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv" \
+  "$source_with_omitted_candidate/docs/census.new"
+awk -v snapshot="$extra_snapshot" '
+  NR==2 { print "# source-snapshot: " snapshot; next }
+  { print }
+' "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  >"$source_with_omitted_candidate/docs/mapping.new"
+replace_file "$source_with_omitted_candidate/docs/PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv" \
+  "$source_with_omitted_candidate/docs/mapping.new"
+expect_rejected 'new source candidate omitted from census' E_CENSUS_SOURCE_SET run_source_verifier \
+  "$source_with_omitted_candidate" "$source_repository_with_extra"
+
+source_changed_closed_registry="$scratch/source-changed-closed-registry"
+clone_source_verifier_case "$source_fixture_base" "$source_changed_closed_registry"
+source_repository_changed_registry="$scratch/source-repository-changed-registry"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_changed_registry"
+awk '{ gsub(/ \| '\''v2'\''/, ""); print }' \
+  "$source_repository_changed_registry/src/shared/types.ts" \
+  >"$source_repository_changed_registry/src/shared/types.new"
+replace_file "$source_repository_changed_registry/src/shared/types.ts" \
+  "$source_repository_changed_registry/src/shared/types.new"
+git -C "$source_repository_changed_registry" add src/shared/types.ts
+git -C "$source_repository_changed_registry" commit -qm 'remove one closed registry member'
+changed_registry_snapshot=$(git -C "$source_repository_changed_registry" rev-parse HEAD)
+changed_registry_tree=$(git -C "$source_repository_changed_registry" ls-tree -r --full-tree \
+  "$changed_registry_snapshot" | hash_stream)
+awk -v snapshot="$changed_registry_snapshot" -v tree="$changed_registry_tree" '
+  NR==2 { print "# source-snapshot: " snapshot; next }
+  NR==3 { print "# source-tree-sha256: " tree; next }
+  { print }
+' "$source_changed_closed_registry/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" \
+  >"$source_changed_closed_registry/docs/coverage.new"
+replace_file "$source_changed_closed_registry/docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv" \
+  "$source_changed_closed_registry/docs/coverage.new"
+for artifact in PRODUCT_CAPABILITY_SOURCE_CENSUS_V1.tsv PRODUCT_CAPABILITY_SOURCE_MAPPING_V1.tsv; do
+  awk -v snapshot="$changed_registry_snapshot" '
+    NR==2 { print "# source-snapshot: " snapshot; next }
+    { print }
+  ' "$source_changed_closed_registry/docs/$artifact" >"$source_changed_closed_registry/docs/$artifact.new"
+  replace_file "$source_changed_closed_registry/docs/$artifact" \
+    "$source_changed_closed_registry/docs/$artifact.new"
+done
+expect_rejected 'closed registry member removed from source' E_CENSUS_SOURCE_SET run_source_verifier \
+  "$source_changed_closed_registry" "$source_repository_changed_registry"
+
+source_changed_capability_set="$scratch/source-changed-capability-set"
+clone_source_verifier_case "$source_fixture_base" "$source_changed_capability_set"
+source_repository_changed_capability_set="$scratch/source-repository-changed-capability-set"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_changed_capability_set"
+awk '!/SUBAGENT_CAPABLE/' \
+  "$source_repository_changed_capability_set/src/shared/agents/config.ts" \
+  >"$source_repository_changed_capability_set/src/shared/agents/config.new"
+replace_file "$source_repository_changed_capability_set/src/shared/agents/config.ts" \
+  "$source_repository_changed_capability_set/src/shared/agents/config.new"
+commit_case "$source_repository_changed_capability_set" 'remove one adapter capability-set member'
+retarget_source_verifier_case "$source_changed_capability_set" \
+  "$source_repository_changed_capability_set"
+expect_rejected 'adapter capability-set member removed from source' E_CENSUS_SOURCE_SET \
+  run_source_verifier "$source_changed_capability_set" "$source_repository_changed_capability_set"
+
+source_deleted_renderer_css="$scratch/source-deleted-renderer-css"
+clone_source_verifier_case "$source_fixture_base" "$source_deleted_renderer_css"
+source_repository_deleted_renderer_css="$scratch/source-repository-deleted-renderer-css"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_deleted_renderer_css"
+git -C "$source_repository_deleted_renderer_css" rm -q -- src/renderer/styles.css
+commit_case "$source_repository_deleted_renderer_css" 'delete a selected renderer runtime stylesheet'
+retarget_source_verifier_case "$source_deleted_renderer_css" "$source_repository_deleted_renderer_css"
+expect_rejected 'renderer runtime stylesheet removed from source' E_CENSUS_SOURCE_SET \
+  run_source_verifier "$source_deleted_renderer_css" "$source_repository_deleted_renderer_css"
+
+source_moved_hideable_control="$scratch/source-moved-hideable-control"
+clone_source_verifier_case "$source_fixture_base" "$source_moved_hideable_control"
+source_repository_moved_hideable_control="$scratch/source-repository-moved-hideable-control"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_moved_hideable_control"
+awk '
+  /group/ { sub(/group/, "__slot_swap__") }
+  /mic/ { sub(/mic/, "group") }
+  { sub(/__slot_swap__/, "mic"); print }
+' "$source_repository_moved_hideable_control/src/renderer/lib/ui-visibility.ts" \
+  >"$source_repository_moved_hideable_control/src/renderer/lib/ui-visibility.new"
+replace_file "$source_repository_moved_hideable_control/src/renderer/lib/ui-visibility.ts" \
+  "$source_repository_moved_hideable_control/src/renderer/lib/ui-visibility.new"
+commit_case "$source_repository_moved_hideable_control" 'move hideable controls between menu and header'
+retarget_source_verifier_case "$source_moved_hideable_control" \
+  "$source_repository_moved_hideable_control"
+expect_rejected 'hideable control moved between menu and header' E_CENSUS_SELECTOR \
+  run_source_verifier "$source_moved_hideable_control" "$source_repository_moved_hideable_control"
+
+source_changed_pty_constant="$scratch/source-changed-pty-constant"
+clone_source_verifier_case "$source_fixture_base" "$source_changed_pty_constant"
+source_repository_changed_pty_constant="$scratch/source-repository-changed-pty-constant"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_changed_pty_constant"
+awk '{ gsub(/PTY_DEVICE_HEADROOM = 4/, "PTY_DEVICE_HEADROOM = 5"); print }' \
+  "$source_repository_changed_pty_constant/src/core/pty-devices.ts" \
+  >"$source_repository_changed_pty_constant/src/core/pty-devices.new"
+replace_file "$source_repository_changed_pty_constant/src/core/pty-devices.ts" \
+  "$source_repository_changed_pty_constant/src/core/pty-devices.new"
+commit_case "$source_repository_changed_pty_constant" 'change an audited PTY safety constant'
+retarget_source_verifier_case "$source_changed_pty_constant" \
+  "$source_repository_changed_pty_constant"
+expect_rejected 'PTY safety constant value changed in source' E_CENSUS_SOURCE_SET \
+  run_source_verifier "$source_changed_pty_constant" "$source_repository_changed_pty_constant"
+
+source_deleted_setting_key="$scratch/source-deleted-setting-key"
+clone_source_verifier_case "$source_fixture_base" "$source_deleted_setting_key"
+source_repository_deleted_setting_key="$scratch/source-repository-deleted-setting-key"
+clone_source_verifier_case "$source_fixture_repository" "$source_repository_deleted_setting_key"
+awk '!/^[[:space:]]*fontSize: number/' \
+  "$source_repository_deleted_setting_key/src/shared/types.ts" \
+  >"$source_repository_deleted_setting_key/src/shared/types.new"
+replace_file "$source_repository_deleted_setting_key/src/shared/types.ts" \
+  "$source_repository_deleted_setting_key/src/shared/types.new"
+commit_case "$source_repository_deleted_setting_key" 'delete an audited Settings key'
+retarget_source_verifier_case "$source_deleted_setting_key" "$source_repository_deleted_setting_key"
+expect_rejected 'Settings key removed from source' E_CENSUS_SOURCE_SET \
+  run_source_verifier "$source_deleted_setting_key" "$source_repository_deleted_setting_key"
 
 baseline="$scratch/baseline"
 seed_case "$baseline"
@@ -203,9 +693,19 @@ printf '\nA weakened untracked promise.\n' >>"$normative_mutation/PRODUCT.md"
 commit_case "$normative_mutation" 'mutate normative prose'
 expect_rejected 'normative prose mutation' E_AUTHORITY_CONTENT run_spec "$normative_mutation"
 
+semantic_registry_mutation="$scratch/semantic-registry-mutation"
+clone_case "$baseline" "$semantic_registry_mutation"
+awk -F '\t' 'BEGIN { OFS="\t" } $2 == "runtime_launch" { $3="unreviewed_key" } { print }' \
+  "$semantic_registry_mutation/docs/SEMANTIC_RECOVERY_SUBJECTS_VNEXT.tsv" \
+  >"$semantic_registry_mutation/docs/semantic-subjects.new"
+replace_file "$semantic_registry_mutation/docs/SEMANTIC_RECOVERY_SUBJECTS_VNEXT.tsv" \
+  "$semantic_registry_mutation/docs/semantic-subjects.new"
+commit_case "$semantic_registry_mutation" 'mutate the semantic recovery registry'
+expect_rejected 'semantic recovery registry mutation' E_AUTHORITY_CONTENT run_spec "$semantic_registry_mutation"
+
 decision_mutation="$scratch/decision-mutation"
 clone_case "$baseline" "$decision_mutation"
-awk '/## ADR-064 / { print; print "\nUnfrozen weakening."; next } { print }' \
+awk '/## ADR-066 / { print; print "\nUnfrozen weakening."; next } { print }' \
   "$decision_mutation/DECISIONS.md" >"$decision_mutation/DECISIONS.new"
 replace_file "$decision_mutation/DECISIONS.md" "$decision_mutation/DECISIONS.new"
 commit_case "$decision_mutation" 'mutate an originating decision'
@@ -284,7 +784,7 @@ awk '!/`PRD-OUT-001`/' "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" >"$coedit
 replace_file "$coedited_delete/docs/PRODUCT_REQUIREMENTS.md" "$coedited_delete/docs/requirements.new"
 awk '!/`ACP-OUT-001`/' "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" >"$coedited_delete/docs/acceptance.new"
 replace_file "$coedited_delete/docs/CONTROL_PLANE_ACCEPTANCE.md" "$coedited_delete/docs/acceptance.new"
-awk '{ gsub(/expected_requirement_count=152/, "expected_requirement_count=151"); gsub(/expected_acceptance_count=152/, "expected_acceptance_count=151"); print }' \
+awk '{ gsub(/expected_requirement_count=185/, "expected_requirement_count=184"); gsub(/expected_acceptance_count=185/, "expected_acceptance_count=184"); print }' \
   "$coedited_delete/scripts/verify-product-spec.sh" >"$coedited_delete/scripts/verifier.new"
 replace_file "$coedited_delete/scripts/verify-product-spec.sh" "$coedited_delete/scripts/verifier.new"
 refreeze_case "$coedited_delete"

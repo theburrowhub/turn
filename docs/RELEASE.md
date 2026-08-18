@@ -119,6 +119,32 @@ This distinction matters because replacing files on disk does not replace the ex
 image of an already-running daemon. A compatible new UI reconnects to that old daemon.
 The newly installed `turnd` becomes active only after the old daemon has ended normally.
 
+The vNext in-app lifecycle uses the same safety contract, not a second installer policy.
+`ApplicationUpdate` has one current Installation-owned intent. Its pre-discovery QueryOnly record pins the
+operation, channel/platform/architecture/current version, both expected trust-store revisions and
+anti-rollback high-water without claiming an accepted manifest or package. Available/download states require
+accepted manifest evidence; verified and later release states require the separately accepted
+`SignedEnvelopeV1(update_package)` too. The package signature binds the SHA-256 of the complete canonical signed-manifest envelope,
+including its signature, and both envelopes must agree on channel/platform/architecture/version/size/digest/
+minimum-protocol/anti-rollback. It follows discover → bounded resumable download →
+verify → stage → explicit foreground apply → applied or phase-specific reconcile/rollback-required/rolling-
+back/rolled-back.
+Exact `TURN-SIGNED-V1`/RFC-8785 verification, payload/package digest, parent-manifest binding, current store
+revision, revocation/high-water, Team ID, platform, architecture, bundle id and downgrade checks all precede
+stage and are repeated immediately before apply; code signing/notarisation is additional, not a substitute.
+Apply reuses the live-state matrix above: it may preserve a compatible
+daemon, refuses an incompatible daemon with live PTYs, and never silently stops/restarts
+one. Discovery, offline/failure and a staged package leave every terminal usable; package
+bytes and credentials are absent from logs, diagnostics and privacy export.
+An exact-query retry returns the current intent; a different query while it is active or owns bytes refuses
+before network. Before byte one, the daemon reserves the declared size in one combined ≤2-GiB owner-only
+allocation shared by download temporary, downloaded, verified and staged states. Cancel/discard/replacement
+must prove those bytes absent; crash retains the owner/chunk ledger. Terminal replacement reserves one of at
+most 100 rich receipts and never discards independent signing, anti-rollback or operation replay fences.
+Apply and rollback persist intent before filesystem replacement. A crash/timeout enters
+`apply_reconcile_required` or `rollback_reconcile_required`; recovery inspects the exact installed bundle and
+backup identities and never repeats either effect.
+
 `turn --update-status [--socket PATH]` performs the same authenticated read without
 opening a window or starting a companion. A version/protocol refusal is actionable and
 terminal; the existing status bar displays the handshake's “which side is old” recovery
@@ -148,7 +174,7 @@ model download/delete/privacy inventory all pass for that architecture.
 
 ## Accepted control-plane release matrix
 
-ADR-064/065 are post-v0.1 targets and do not change the three-binary acceptance record below. A release that
+ADR-064/065/066 are post-v0.1 targets and do not change the three-binary acceptance record below. A release that
 advertises the successor control plane must extend package/preflight/live evidence as follows:
 
 - a fresh packaged foreground Session is selected once under a current safe activation plan and restores/
@@ -161,12 +187,13 @@ advertises the successor control plane must extend package/preflight/live eviden
   revision conflict and timeout reconciliation, and prove local projection deletion cannot close an external
   item;
 - each advertised provider-native Job capability has a deterministic contract test plus a current
-  authenticated smoke for provider-dependent survival and mutation receipts. Flow recurrence is reported
-  separately. A package must not advertise `native_jobs` from terminal heuristics;
+  authenticated smoke for all nine exact key/wire mappings, atomic Node/CreationId reservation, create/run-now
+  correlation, definition privacy, independent state axes, exact reconciliation, projection fences and
+  provider-dependent survival. Flow recurrence is separate, and terminal heuristics cannot advertise jobs;
 - advertised ConversationInventory, title read and rename paths record the exact adapter/provider/profile/
   target versions used. Live smoke proves bounded history/search and stopped adoption separately from resume,
   and proves `title_read` and `conversation_rename` degrade independently;
-- Web preview and Browser use different packaged capability paths. The inert renderer's no-script/no-network/
+- WebPreview and Browser use different packaged capability paths. The inert renderer's no-script/no-network/
   no-file/control boundary and the Browser's isolated partition, reviewed local/loopback origin and
   no-automatic-restore-load behaviour are tested in the sealed package. Any required rendering helper/engine
   identity and hash joins release metadata and signature verification rather than being downloaded silently;
@@ -177,16 +204,15 @@ advertises the successor control plane must extend package/preflight/live eviden
   classes. Release evidence proves the full GUI's scoped revision/input lease, the two bounded clients'
   smaller allowlists and fail-closed version skew independently. No package may describe a headless snapshot
   or companion as full remote control;
-- remote permission allow/deny is advertised only after an end-to-end test issues one narrow expiring grant
-  on the foreground desktop, transports one exact encrypted typed response, waits for provider evidence and
-  refuses replay, widening, stale/offline/cross-profile use and raw remote PTY input during that known
-  sensitive interaction. Credentials, grant changes, administration, host trust and destructive authority
-  remain local; no stronger guarantee is claimed for an unclassifiable generic TUI.
+- typed permission is advertised only after all fact/transport states pass: distinct local and remote ops,
+  E2EE grant delivery/ack, atomic consume, binary/non-binary option, race/crash/receipt-recovery and provider-
+  evidence cases. Raw typed-state bytes, offline replay, widening and remote fallback fail; only fresh supported
+  verified-local-PTY admits daemon-encoded desktop fallback. Credentials/admin/trust remain local.
 - a packaged 128-level recursive Group fixture plus Session-owned CheckoutScope create/adopt/missing/
   reconcile/unbind/remove proves cycle/depth/corruption bounds, non-cascading tree changes, retained adopted
   worktrees and a continuously switchable primary `main`. No package may label Group itself a repository or
   runtime owner;
-- the release adapter roster is exactly the six dedicated adapters, each with all 22 capability cells and
+- the release adapter roster is exactly the six dedicated adapters, each with all 23 capability cells and
   current versioned/live evidence where claimed. Kimi/MiniMax remain quota-only connector entries. Every
   shipped ModelEndpointProfile path proves target-local secret resolution, bounded discovery, route/model
   receipt, failed-switch continuity and absence of secret canaries from package/config/argv/PTY/log/export;
@@ -200,9 +226,22 @@ advertises the successor control plane must extend package/preflight/live eviden
 - New/Open/Clone/SSH onboarding in the package is cancelled/crashed at every phase and reconciles one exact
   preassigned operation without duplicate clone or implicit publish. Local/generated Node and Group naming
   proves revision/redaction/manual pinning and sends no provider/terminal rename; and
-- the release commit passes the exact 84-row neutral capability ledger plus 152 PRD/ACP trace and adversarial
+- packaged dense-tree snapshots exercise restore, collapse/filter, variable-height rows, resize/zoom and
+  topology churn with the exact bounded row-gap/prefix-sum invariant and zero overlap, cleanup control, extra
+  domain revision or focus/selection jump; and
+- bounded Directory/DAG/TextSearch, Media, repository-host/proposal, TransferTicket and content-projection
+  packaged paths hit their exact caps, crash/race states and sandbox/confinement checks while preserving the
+  terminal-input and Attention budgets;
+- all catalogue entry surfaces share one typed CommandCatalogue, all five signed-artifact domains pass
+  noncanonical/wrong-store/rotation/revocation/replay tests, announcement content remains inert and update
+  package verification proves the separate signature plus exact parent signed-manifest binding;
+- WorkItem activity ordering/gap/echo-dedup and all eight presentation-only undo/redo operations, including
+  constant-size expand-all, pass with
+  proofs that excluded runtime/provider/SCM/input/context/Attention/credential/destructive effects are
+  structurally absent; and
+- the release commit passes the exact 112-row neutral capability ledger plus 185 PRD/ACP trace, selector-v1 source census and adversarial
   mutation suite. Before freezing a changed ledger, the generic source verifier recomputes the opaque snapshot
-  tree and all 84 evidence-blob digests from an independent clone. The recorded authority root and protected
+  tree, all 112 evidence-reference digests (covering 89 unique locator/digest pairs) and the full selected candidate set from an independent clone. The recorded authority root and protected
   repository pin must match the merged commit;
   deleting, weakening or marking a row unknown cannot be compensated by a product badge or manual smoke.
 

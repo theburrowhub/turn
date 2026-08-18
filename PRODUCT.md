@@ -98,13 +98,18 @@ deliberately copies none of the live processes (`model::session::tests::duplicat
 the_shape_and_drops_the_processes`).
 
 Navigation begins one level above it. The accepted hierarchy is Workspace → Session → Agent/Tool →
-Child, shown once in the left tree. A Workspace's primary checkout has at most one active exclusive writer;
-concurrent work is technically read-only where viable or isolated in a worktree. AgentNodes live
+Child, shown once in the left tree. In the accepted post-v0.1 target, a Workspace's primary `main` checkout is
+always operator-only: Turn starts
+no writer, process, lease or lock there; writable work always uses a unique dedicated worktree, while an
+explicitly classified primary-checkout view may be read-only. The current v4 `main_checkout` path is a
+documented migration/release conflict, not evidence that this target is already implemented. AgentNodes live
 independently from Panes, so a subagent can
 run, preview, ask for attention and finish without changing the centre Layout. ADR-040 and
 `docs/UNIFIED_HIERARCHY_UPGRADE.md` define the implemented v0.1 domain and safety contract. ADR-059 and
 `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` define the accepted successor: every child keeps its place in this
-tree and selects one unique content view without becoming a Pane.
+tree and selects one unique content view without becoming a Pane. The successor continuously derives compact,
+non-overlapping visible rows in logical/accessibility order; it never asks the operator to tidy the hierarchy
+or persists geometry as another topology authority.
 
 ### 3.2 Agents form a hierarchy, and Turn never invents one
 
@@ -160,9 +165,11 @@ non-focus-worthy confidence degrades to a badge). See §6.10.
 
 ### 3.5 It must work with the tools as they exist today
 
-Turn integrates with agent CLIs through mechanisms those tools already ship: Claude Code's hook
-engine, Codex's hooks and `notify` callback, and — for everything else — the OS process table and the
-terminal output itself. No vendor cooperation is required, no forks, no patched binaries, and
+Turn integrates with agent CLIs through the mechanisms each tool already ships. The six dedicated adapters—
+Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok—use their current structured hooks/events,
+wrappers, session stores and provider APIs behind one versioned capability contract; Kimi and MiniMax remain
+quota-only connectors. Unknown/custom agents and ordinary tools use the generic process/PTY adapter with
+honest inferred/unsupported semantics. No vendor cooperation is required, no forks, no patched binaries, and
 crucially **no modification of the user's own configuration**. Claude Code hooks are injected with
 `--settings`, which adds a settings layer and leaves `~/.claude/settings.json` and
 `.claude/settings.json` untouched (`claude::tests::preparing_writes_a_settings_file_and_passes_it_
@@ -225,13 +232,15 @@ states plus revision-fenced priority, due, tag, comment and assignee edits; it c
 TurnState, dependencies, runtime execution or Attention. Activating any projection returns to the same
 canonical Node/ViewTarget.
 
-An optional external `WorkItemSource` is also projection authority only. Its stable source/account/item
-identity maps revision-fenced fields onto an existing canonical Node or an explicitly imported inert work
-item; it never becomes runtime, hierarchy, Flow or Attention authority. Initial and incremental sync use
-bounded pagination, opaque cursors, a size/age-capped cache and source-specific rate-limit/backoff state.
-Every field records source revision, trust and freshness. Writes are explicit compare-and-swap operations;
-remote divergence produces a reviewable field conflict and preserves both values instead of last-writer-wins
-overwrite. Remote descriptions, comments and links remain untrusted display data.
+An optional external `WorkItemSource` remains projection authority only. Local create mints one WorkItem/Node
+at backlog; external create reserves the same identities before provider dispatch and requires exact provider
+correlation. Installation-wide key ownership, explicit import/bind/rebind/detach, source CRUD/sync and local
+archive/forget/restore/delete have closed revisioned lifecycles and resurrection fences. Coverage, freshness,
+backoff and presence remain separate, and every page/webhook is source/mapping/filter/credential-generation
+fenced. Per-field external/Turn/reviewed-merge authority selects non-overlapping operations; external state
+observations may jump mapped states with provenance while local commands follow the local transition table.
+Possible writes and conflicts retain exact lookup-only reconciliation. Provider content stays untrusted, and
+no local projection, source-config or Attention operation mutates the provider object.
 
 ---
 
@@ -270,8 +279,8 @@ fill in the branch, and Session duplication that copies the shape without the pr
 ### Use cases the design is aimed at
 
 1. **Fan out one task across agents.** Two agents receive the same prompt in isolated worktrees, or one
-   works while the other reviews read-only; compare the results. The product never starts two unarbitrated
-   writers against the same primary checkout.
+   works while the other reviews read-only; compare the results. The product starts zero writers against the
+   operator-only primary `main` checkout and gives every writable task its own worktree.
 2. **Watch a long run without babysitting it.** Start an agent on a large refactor, keep working, get
    pulled into the foreground only when it is blocked; a finished turn still enters the ordered review/
    unread path without stealing focus unless that Session's policy explicitly asks it to.
@@ -323,10 +332,10 @@ requirement rather than an aspiration.
 
 **Domain and attention**
 - Workspaces, Sessions, Panes, Layouts, Templates.
-- Closed Session modes: `main_checkout`, `read_only`, `isolated_worktree`; daemon-owned arbitration that
-  allows at most one host/UID writer on the primary checkout even across canonical Turn data directories and
-  returns structured alternatives on conflict. The host-global device/inode lock is inherited by writers;
-  distinct Git worktrees retain independent authority.
+- Legacy-decodable Session modes: `main_checkout`, `read_only`, `isolated_worktree`. Target creation admits
+  only enforced read-only inspection or an isolated worktree; primary-main lease/arbitration remains solely
+  migration and quarantine evidence. Non-primary writers retain host-global ownership and distinct Git
+  worktrees retain independent authority.
 - The two-axis state model (`Lifecycle` × `Turn`) with a derived `DisplayState` for the UI.
 - The Attention Queue: deduplication, priority, ageing without starvation, snooze, acknowledge,
   dismiss, and a `next-attention` command that is deterministic rather than a lottery.
@@ -639,13 +648,13 @@ document. Unchecked items say what evidence or implementation is still missing, 
   secrets are redacted at the daemon boundary. The panel collapses, becomes an overlay on narrow windows
   and has an explicit AccessKit context. Reproduce the contract with `make inspector-acceptance`.
 
-### Checkout safety
+### Checkout safety — implemented v0.1 evidence and target migration
 
-- [x] **Creating a `main_checkout` Session stores its assignment and acquires the exclusive lease in one
+- [x] **Historical v0.1: creating a `main_checkout` Session stores its assignment and acquires the exclusive lease in one
   atomic transaction before any init command, process or Pane is materialised.** Failure rolls back the
   Session and performs no external side effect. `creating_a_main_session_and_lease_is_atomic_on_conflict`,
   `a_second_main_checkout_session_is_rejected_before_any_runtime_state_exists`.
-- [x] **A conflicting writer returns structured data naming the owner and the allowed alternatives:** focus
+- [x] **Historical v0.1: a conflicting primary writer returns structured data naming the owner and the allowed alternatives:** focus
   owner, read-only, isolated worktree or cancel. No client parses a human error string to construct them.
   `a_write_conflict_carries_owner_and_alternatives_as_typed_context`,
   `a_write_lease_conflict_offers_only_explicit_safe_alternatives`.
@@ -804,9 +813,10 @@ document. Unchecked items say what evidence or implementation is still missing, 
   pairing is load-bearing rather than documentation that might be stale.
   `contract::every_request_names_a_response_variant_that_exists`,
   `every_response_variant_is_produced_by_at_least_one_request`.
-- [x] **The protocol has no way to say "approve this permission", no way to say "run this command", and
-  exactly one way to restart anything.** Enforced by omission, which is the strongest form available to a
-  type definition. `request::tests`.
+- [x] **Protocol v4 has no semantic permission response, no inferred-command verb and one relaunch path.**
+  Target vNext deliberately adds exact typed local/grant-bound permission responses and distinct
+  activate/resume/restart/recycle operations; it preserves the real invariant that Turn never chooses an
+  answer, executes output-derived prose or launches from background metadata. `request::tests`.
 - [x] **A subagent appearing pushes a tree the client can draw without guessing.**
   `conversation::a_subagent_appearing_pushes_a_tree_the_client_can_draw_without_guessing`.
 - [x] **Protocol v4 bootstraps navigation with one `HierarchySnapshot` and a monotonic revision.** A missed
@@ -863,7 +873,9 @@ and voice contracts remain normative.
   freshness; their writes use compare-and-swap and preserve conflicts under source rate limits.
   Groups may nest to the bounded protocol depth with atomic cycle-safe subtree operations. They may project a
   separately owned CheckoutScope for agent-per-branch work without becoming runtime/repository authority or
-  changing an existing process cwd merely because its row moved.
+  changing an existing process cwd merely because its row moved. Visible rows arrange automatically without
+  overlap in stable logical/accessibility order after restore, resize, zoom, filtering or topology changes;
+  no cleanup action or arrangement pass mutates the domain.
 - [ ] **Fast creation and reusable execution Flows.** One catalog drives Workspace `+`, toolbar, palette and
   context actions; resumable setup discovers integrations; one operation can preflight and create a typed
   multi-agent/tool run with safe defaults and the fixed common-path interaction budgets. One foreground
