@@ -3139,7 +3139,20 @@ impl<'a> TurnView<'a> {
                 .get(pane_id)
                 .is_some_and(|previous| previous.is_replaced_by(binding))
             {
-                state.panes.remove(pane_id);
+                // The interaction is process-owned and must be replaced wholesale, but
+                // complete-cell availability belongs to the unchanged visual Pane. Carry
+                // only that one bit into a fresh interaction so the new runtime can win a
+                // resize epoch before paint and receive the already-visible geometry in
+                // this frame. Selection, links, reported claims and image textures all die.
+                let geometry_available = state
+                    .panes
+                    .remove(pane_id)
+                    .is_some_and(|previous| previous.geometry_available);
+                if geometry_available {
+                    let mut replacement = PaneInteraction::default();
+                    replacement.geometry_available = true;
+                    state.panes.insert(pane_id.clone(), replacement);
+                }
             }
         }
         state
@@ -13000,6 +13013,7 @@ mod tests {
         let mut state = ViewState::default();
         view.reconcile_terminal_view_state(&mut state, None);
         cache_test_image(state.pane(&pane_id), 11);
+        state.pane(&pane_id).geometry_available = true;
 
         view.panes.clear();
         view.reconcile_terminal_view_state(&mut state, None);
@@ -13020,7 +13034,16 @@ mod tests {
         });
         view.reconcile_terminal_view_state(&mut state, None);
 
-        assert!(state.panes.is_empty(), "the former binding owns the cache");
+        let replacement = state
+            .panes
+            .get(&pane_id)
+            .expect("the visual Pane keeps only its measured availability");
+        assert!(replacement.geometry_available);
+        assert!(
+            replacement.images.is_empty(),
+            "the former runtime owns the cache"
+        );
+        assert_eq!(replacement.reported_size(), None);
         assert_eq!(
             state
                 .pane_interaction_bindings
@@ -13028,7 +13051,6 @@ mod tests {
                 .and_then(|binding| binding.runtime_id.as_ref()),
             Some(&new_runtime)
         );
-        assert!(state.pane(&pane_id).images.is_empty());
         cache_test_image(state.pane(&pane_id), 13);
 
         let removed = HierarchySnapshot::empty("cache-test", 2);
