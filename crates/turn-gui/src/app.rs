@@ -186,7 +186,7 @@ impl TurnApp {
             desk,
             state: ViewState::default(),
             activity: ActivityTracker::new(),
-            announcer: Box::new(DesktopAnnouncer),
+            announcer: Box::new(DesktopAnnouncer::default()),
             companion_events,
             folder_dialog: FolderDialog::default(),
             pending_folder_request: None,

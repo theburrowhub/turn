@@ -21,6 +21,8 @@
 //! [`Announcer`], so the part that can be got wrong is testable and the part that
 //! cannot be tested is too small to get wrong.
 
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+
 use turn_core::attention::{Effect, Sound};
 use turn_core::ids::{NodeId, SessionId};
 
@@ -158,22 +160,111 @@ pub trait Announcer {
     fn run_custom(&self, command: &str);
 }
 
-/// The real one.
-#[derive(Debug, Default)]
-pub struct DesktopAnnouncer;
+/// Enough room for a burst of completions without letting an absent notification
+/// service turn attention events into an unbounded memory queue.
+const NOTIFICATION_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Debug)]
+struct DesktopNotification {
+    title: String,
+    body: String,
+    sound: Option<String>,
+}
+
+/// A single FIFO delivery thread for the platform notification binding.
+///
+/// In particular, this boundary is not optional on macOS. `notify-rust` waits for
+/// `NSUserNotificationCenter` delivery by spinning `NSRunLoop` when `show()` and its
+/// returned handle are dropped on the main thread. Calling it from inside winit's event
+/// callback therefore lets AppKit re-enter winit while the first event is still borrowed,
+/// which winit correctly rejects with a panic. On this worker the same dependency uses
+/// its condvar path instead, leaving the application run loop single-entry.
+#[derive(Debug)]
+struct NotificationWorker {
+    sender: SyncSender<DesktopNotification>,
+}
+
+impl NotificationWorker {
+    fn spawn<F>(capacity: usize, deliver: F) -> Self
+    where
+        F: Fn(DesktopNotification) + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(capacity);
+        if let Err(error) = std::thread::Builder::new()
+            .name("turn-desktop-notifications".into())
+            .spawn(move || {
+                while let Ok(notification) = receiver.recv() {
+                    deliver(notification);
+                }
+            })
+        {
+            // Keep construction and the UI alive. With no receiver, later try_send calls
+            // report Disconnected and preserve the same best-effort notification contract.
+            tracing::warn!(%error, "could not start the desktop notification worker");
+        }
+        Self { sender }
+    }
+
+    fn enqueue(
+        &self,
+        notification: DesktopNotification,
+    ) -> Result<(), TrySendError<DesktopNotification>> {
+        // Never wait in an eframe callback. A full queue means the visual badge and
+        // attention queue remain authoritative while this best-effort OS side effect drops.
+        self.sender.try_send(notification)
+    }
+}
+
+/// The real announcer. Platform notification calls are serialized away from the UI thread.
+#[derive(Debug)]
+pub struct DesktopAnnouncer {
+    notifications: NotificationWorker,
+}
+
+impl Default for DesktopAnnouncer {
+    fn default() -> Self {
+        Self {
+            notifications: NotificationWorker::spawn(
+                NOTIFICATION_QUEUE_CAPACITY,
+                post_desktop_notification,
+            ),
+        }
+    }
+}
+
+fn post_desktop_notification(request: DesktopNotification) {
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .summary(&request.title)
+        .body(&request.body)
+        .appname("Turn");
+    if let Some(sound) = request.sound.as_deref() {
+        notification.sound_name(sound);
+    }
+    if let Err(error) = notification.show() {
+        // Common and harmless: no notification daemon on a headless Linux box, or
+        // notifications switched off. The badge and the queue still say everything
+        // this would have.
+        tracing::debug!(%error, "could not post a notification");
+    }
+}
 
 impl Announcer for DesktopAnnouncer {
     fn notify(&self, title: &str, body: &str, sound: Option<&str>) {
-        let mut notification = notify_rust::Notification::new();
-        notification.summary(title).body(body).appname("Turn");
-        if let Some(sound) = sound {
-            notification.sound_name(sound);
-        }
-        if let Err(error) = notification.show() {
-            // Common and harmless: no notification daemon on a headless Linux box, or
-            // notifications switched off. The badge and the queue still say everything
-            // this would have.
-            tracing::debug!(%error, "could not post a notification");
+        let request = DesktopNotification {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            sound: sound.map(str::to_owned),
+        };
+        if let Err(error) = self.notifications.enqueue(request) {
+            match error {
+                TrySendError::Full(_) => {
+                    tracing::warn!("desktop notification queue is full; dropping notification")
+                }
+                TrySendError::Disconnected(_) => tracing::warn!(
+                    "desktop notification worker is unavailable; dropping notification"
+                ),
+            }
         }
     }
 
@@ -236,6 +327,9 @@ pub fn perform(announcement: &Announcement, announcer: &dyn Announcer) -> bool {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::mpsc as test_mpsc;
+    use std::thread;
+    use std::time::Duration;
     use turn_core::attention::{DeferReason, FocusDenial};
     use turn_core::ids::AttentionId;
 
@@ -261,6 +355,67 @@ mod tests {
 
     fn session() -> SessionId {
         SessionId::from_stored("sess_announce01")
+    }
+
+    fn desktop_notification(title: &str) -> DesktopNotification {
+        DesktopNotification {
+            title: title.into(),
+            body: "body".into(),
+            sound: None,
+        }
+    }
+
+    /// Regression for the macOS abort seen when an attention notification was emitted
+    /// from inside winit's event callback. Delivery must happen on the named worker, and
+    /// a stuck platform backend must fill a bounded queue rather than block/re-enter UI.
+    #[test]
+    fn desktop_delivery_is_off_thread_bounded_and_non_blocking() {
+        let caller = thread::current().id();
+        let (delivered_tx, delivered_rx) = test_mpsc::channel();
+        let (release_tx, release_rx) = test_mpsc::sync_channel(0);
+        let worker = NotificationWorker::spawn(1, move |notification| {
+            delivered_tx
+                .send((
+                    thread::current().id(),
+                    thread::current().name().map(str::to_owned),
+                    notification,
+                ))
+                .expect("test is listening for delivery");
+            release_rx.recv().expect("test releases each delivery");
+        });
+
+        worker
+            .enqueue(desktop_notification("first"))
+            .expect("first notification starts delivery");
+        let (delivery_thread, delivery_thread_name, first) = delivered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker receives the first notification");
+        assert_ne!(
+            delivery_thread, caller,
+            "the platform backend must never run in the caller/UI callback"
+        );
+        assert_eq!(
+            delivery_thread_name.as_deref(),
+            Some("turn-desktop-notifications")
+        );
+        assert_eq!(first.title, "first");
+
+        // The worker is deliberately stuck in the backend. One more item fits in its
+        // queue and the next reports Full immediately through try_send: no caller waits.
+        worker
+            .enqueue(desktop_notification("second"))
+            .expect("one queued notification fits behind the active delivery");
+        assert!(matches!(
+            worker.enqueue(desktop_notification("third")),
+            Err(TrySendError::Full(request)) if request.title == "third"
+        ));
+
+        release_tx.send(()).expect("release first delivery");
+        let (_, _, second) = delivered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("FIFO worker receives the queued notification");
+        assert_eq!(second.title, "second");
+        release_tx.send(()).expect("release second delivery");
     }
 
     fn every_effect() -> Vec<Effect> {
