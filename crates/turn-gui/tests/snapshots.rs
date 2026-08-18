@@ -26,8 +26,8 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk, Severity};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentInfo, AgentName, ContextUsageSnapshot, Direction, DropZone,
-    LaunchConfiguration, Layout, LeaseState, NodeKind, Observable, ObservationSource,
+    ActivityPreview, AgentInfo, AgentLaunchProfileRef, AgentName, ContextUsageSnapshot, Direction,
+    DropZone, LaunchConfiguration, Layout, LeaseState, NodeKind, Observable, ObservationSource,
     ObservationSourceKind, Pane, PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement,
     PreviewSource, ProcessNode, QuotaSnapshot, QuotaWindow, Relation, RestoreState, Session,
     SessionMode, Template, UsageMeasurement, UsageMeasurementKind, UsageUnit, Workspace,
@@ -2141,7 +2141,9 @@ fn the_custom_pane_editor_is_a_named_modal_dialog() {
         title: String::new(),
         program: String::new(),
         arguments: String::new(),
+        launch_profile: None,
         cwd: String::new(),
+        advanced: false,
         placement: PanePlacement::SplitRight,
         error: None,
     });
@@ -2149,6 +2151,44 @@ fn the_custom_pane_editor_is_a_named_modal_dialog() {
     h.run();
 
     assert_modal(&h, egui::accesskit::Role::Dialog, "New Pane");
+}
+
+#[test]
+fn an_agent_pane_exposes_provider_and_mode_without_requiring_flags() {
+    let fixture = busy_desk();
+    let target_pane_id = fixture
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.active.clone())
+        .expect("an active pane");
+    let mut h = harness(fixture);
+    h.state_mut().state.new_pane = Some(NewPaneDraft {
+        target_pane_id,
+        kind: PaneKind::Agent,
+        title: "Claude".into(),
+        program: "claude".into(),
+        arguments: String::new(),
+        launch_profile: Some(AgentLaunchProfileRef::new("claude-code", "autonomous")),
+        cwd: String::new(),
+        advanced: false,
+        placement: PanePlacement::SplitRight,
+        error: None,
+    });
+    h.run();
+    h.run();
+
+    let labels = all_text(&h).join("\n");
+    assert!(labels.contains("Claude"), "visible text: {labels}");
+    assert!(labels.contains("Autonomous"), "visible text: {labels}");
+    assert!(
+        labels.contains("Runs without Claude permission prompts."),
+        "visible text: {labels}"
+    );
+    assert!(
+        !labels.contains("dangerously-skip-permissions"),
+        "the fast path must communicate intent without asking the operator for argv"
+    );
+    h.snapshot("agent_pane_profiles");
 }
 
 #[test]

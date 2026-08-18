@@ -30,10 +30,10 @@ use turn_core::ids::{
     AttentionId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    ActivityPreview, Direction, DropZone, Layout, LayoutPreset, LeaseState, NodeKind, Pane,
-    PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour,
-    RestoreState, SessionMode, SessionStatus, Template, TreeFilter, TreeVisibilityMode,
-    WorkspaceWriteLease,
+    ActivityPreview, AgentLaunchProfileRef, Direction, DropZone, Layout, LayoutPreset, LeaseState,
+    NodeKind, Pane, PaneGeometry, PaneKind, PanePlacement, PreviewVisibility, RelationshipKind,
+    RestoreBehaviour, RestoreState, SessionMode, SessionStatus, Template, TreeFilter,
+    TreeVisibilityMode, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::Grid;
@@ -822,7 +822,11 @@ pub struct NewPaneDraft {
     pub title: String,
     pub program: String,
     pub arguments: String,
+    /// Provider-owned semantic launch policy. Raw permission flags never need to
+    /// be remembered by the operator.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     pub cwd: String,
+    pub advanced: bool,
     pub placement: PanePlacement,
     pub error: Option<String>,
 }
@@ -835,7 +839,9 @@ impl NewPaneDraft {
             title: String::new(),
             program: String::new(),
             arguments: String::new(),
+            launch_profile: None,
             cwd: String::new(),
+            advanced: false,
             placement: match placement {
                 PanePlacement::Temporary => PanePlacement::SplitRight,
                 placement => placement,
@@ -984,6 +990,9 @@ pub struct CellCommandDraft {
     pub program: String,
     /// Shell-style quoting is parsed into argv, but operators are not evaluated.
     pub arguments: String,
+    /// `None` preserves a legacy/custom argv exactly. A semantic profile lets the
+    /// provider adapter own its current permission flags.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     /// Optional working directory, relative to the Workspace unless absolute.
     pub cwd: String,
     /// One `NAME=value` pair per line. Parsed as data, never evaluated by a shell.
@@ -996,6 +1005,7 @@ impl CellCommandDraft {
         Self {
             program: pane.command.clone().unwrap_or_default(),
             arguments: shell_words::join(&pane.args),
+            launch_profile: pane.launch_profile.clone(),
             cwd: pane.cwd.clone().unwrap_or_default(),
             environment: format_environment(&pane.env),
             restore: pane.restore,
@@ -1152,6 +1162,7 @@ impl LayoutTemplateDraft {
                 pane.kind = PaneKind::Shell;
                 pane.command = None;
                 pane.args.clear();
+                pane.launch_profile = None;
                 pane.title = Some("shell".into());
             } else {
                 let args = shell_words::split(command.arguments.trim())
@@ -1163,6 +1174,14 @@ impl LayoutTemplateDraft {
                 };
                 pane.command = Some(program.to_string());
                 pane.args = args;
+                pane.launch_profile = agent_choice_for_program(program)
+                    .filter(|choice| {
+                        command
+                            .launch_profile
+                            .as_ref()
+                            .is_some_and(|profile| profile.adapter_id == choice.adapter_id)
+                    })
+                    .and(command.launch_profile.clone());
                 pane.title = Some(program.rsplit('/').next().unwrap_or(program).to_string());
             }
             pane.node_id = None;
@@ -1200,18 +1219,132 @@ impl LayoutTemplateDraft {
     }
 
     fn cell_label(&self, pane_id: &PaneId) -> String {
-        self.cells
-            .get(pane_id)
-            .map(|cell| cell.program.trim())
-            .filter(|program| !program.is_empty())
-            .unwrap_or("Shell")
-            .to_string()
+        let Some(cell) = self.cells.get(pane_id) else {
+            return "Shell".into();
+        };
+        let program = cell.program.trim();
+        if program.is_empty() {
+            return "Shell".into();
+        }
+        match agent_choice_for_program(program) {
+            Some(choice) => {
+                let mode = match selected_launch_profile(cell.launch_profile.as_ref()) {
+                    SAFE_LAUNCH_PROFILE => "Safe",
+                    AUTONOMOUS_LAUNCH_PROFILE => "Autonomous",
+                    _ => "Custom",
+                };
+                format!("{} · {mode}", choice.label)
+            }
+            None => program.to_string(),
+        }
     }
 }
 
 fn nonempty(value: String) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+const SAFE_LAUNCH_PROFILE: &str = "safe";
+const AUTONOMOUS_LAUNCH_PROFILE: &str = "autonomous";
+
+/// One first-class agent choice. The UI knows stable adapter identities and
+/// executables; each adapter remains the sole owner of the arguments that make a
+/// profile Safe or Autonomous.
+#[derive(Clone, Copy)]
+struct AgentQuickChoice {
+    label: &'static str,
+    adapter_id: &'static str,
+    program: &'static str,
+    autonomous_description: &'static str,
+}
+
+const AGENT_QUICK_CHOICES: [AgentQuickChoice; 4] = [
+    AgentQuickChoice {
+        label: "Claude",
+        adapter_id: "claude-code",
+        program: "claude",
+        autonomous_description: "Runs without Claude permission prompts.",
+    },
+    AgentQuickChoice {
+        label: "Codex",
+        adapter_id: "codex",
+        program: "codex",
+        autonomous_description: "Bypasses Codex approvals and sandboxing.",
+    },
+    AgentQuickChoice {
+        label: "Gemini",
+        adapter_id: "gemini-cli",
+        program: "gemini",
+        autonomous_description: "Uses Gemini's autonomous approval mode.",
+    },
+    AgentQuickChoice {
+        label: "OpenCode",
+        adapter_id: "opencode",
+        program: "opencode",
+        autonomous_description:
+            "Auto-approves unless OpenCode policy explicitly denies the action.",
+    },
+];
+
+fn agent_choice_for_program(program: &str) -> Option<AgentQuickChoice> {
+    let executable = program
+        .split_whitespace()
+        .next()
+        .unwrap_or(program)
+        .rsplit('/')
+        .next()
+        .unwrap_or(program);
+    AGENT_QUICK_CHOICES
+        .iter()
+        .copied()
+        .find(|choice| choice.program == executable)
+}
+
+fn launch_profile(adapter_id: &str, profile_id: &str) -> AgentLaunchProfileRef {
+    AgentLaunchProfileRef::new(adapter_id, profile_id)
+}
+
+fn selected_launch_profile(profile: Option<&AgentLaunchProfileRef>) -> &'static str {
+    match profile.map(|profile| profile.profile_id.as_str()) {
+        Some(SAFE_LAUNCH_PROFILE) => SAFE_LAUNCH_PROFILE,
+        Some(AUTONOMOUS_LAUNCH_PROFILE) => AUTONOMOUS_LAUNCH_PROFILE,
+        _ => "custom",
+    }
+}
+
+fn select_agent_program(
+    program: &mut String,
+    arguments: &mut String,
+    profile: &mut Option<AgentLaunchProfileRef>,
+    choice: AgentQuickChoice,
+) {
+    let retained_role = selected_launch_profile(profile.as_ref());
+    if program.trim() != choice.program {
+        arguments.clear();
+    }
+    *program = choice.program.to_string();
+    *profile = Some(launch_profile(
+        choice.adapter_id,
+        if retained_role == AUTONOMOUS_LAUNCH_PROFILE {
+            AUTONOMOUS_LAUNCH_PROFILE
+        } else {
+            SAFE_LAUNCH_PROFILE
+        },
+    ));
+}
+
+fn profile_description(
+    choice: AgentQuickChoice,
+    profile: Option<&AgentLaunchProfileRef>,
+) -> String {
+    match selected_launch_profile(profile) {
+        SAFE_LAUNCH_PROFILE => {
+            "Standard provider safeguards remain active. Turn adds only its integration.".into()
+        }
+        AUTONOMOUS_LAUNCH_PROFILE => choice.autonomous_description.into(),
+        _ => "Custom argv: Turn preserves the arguments exactly as written below.".into(),
+    }
 }
 
 fn format_environment(values: &[(String, String)]) -> String {
@@ -3464,7 +3597,7 @@ impl<'a> TurnView<'a> {
             full.center(),
             Vec2::new(
                 560.0_f32.min((full.width() - 32.0).max(320.0)),
-                440.0_f32.min((full.height() - 32.0).max(300.0)),
+                420.0_f32.min((full.height() - 32.0).max(300.0)),
             ),
         );
         ui.painter()
@@ -3480,33 +3613,118 @@ impl<'a> TurnView<'a> {
             describe_dialog(ui, "New Pane", false);
             ui.heading("New Pane");
             ui.label(
-                RichText::new("Run any executable directly; arguments are parsed without a shell.")
+                RichText::new("Choose an agent and operating mode. Turn owns the provider-specific flags.")
                     .color(theme.text_dim),
             );
             ui.add_space(8.0);
-            egui::ComboBox::from_label("View type")
-                .selected_text(format!("{:?}", draft.kind))
-                .show_ui(ui, |ui| {
-                    for (label, kind) in pane_kind_choices() {
-                        ui.selectable_value(&mut draft.kind, kind, label);
+            ui.label(RichText::new("START").small().strong().color(theme.text_dim));
+            ui.horizontal_wrapped(|ui| {
+                let shell_selected = draft.kind == PaneKind::Shell
+                    && draft.program.trim().is_empty();
+                if ui.selectable_label(shell_selected, "Shell").clicked() {
+                    draft.kind = PaneKind::Shell;
+                    draft.program.clear();
+                    draft.arguments.clear();
+                    draft.launch_profile = None;
+                }
+                for choice in AGENT_QUICK_CHOICES {
+                    let selected = draft.kind == PaneKind::Agent
+                        && agent_choice_for_program(&draft.program)
+                            .is_some_and(|current| current.adapter_id == choice.adapter_id);
+                    if ui.selectable_label(selected, choice.label).clicked() {
+                        draft.kind = PaneKind::Agent;
+                        select_agent_program(
+                            &mut draft.program,
+                            &mut draft.arguments,
+                            &mut draft.launch_profile,
+                            choice,
+                        );
+                        if draft.title.trim().is_empty() {
+                            draft.title = choice.label.to_string();
+                        }
+                    }
+                }
+                let custom_selected = !shell_selected
+                    && agent_choice_for_program(&draft.program).is_none();
+                if ui.selectable_label(custom_selected, "Other…").clicked() {
+                    draft.kind = PaneKind::Terminal;
+                    draft.launch_profile = None;
+                    draft.advanced = true;
+                }
+            });
+
+            if let Some(choice) = agent_choice_for_program(&draft.program) {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("MODE").small().strong().color(theme.text_dim));
+                    for (id, label) in [
+                        (SAFE_LAUNCH_PROFILE, "Safe"),
+                        (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                        ("custom", "Custom"),
+                    ] {
+                        let selected = selected_launch_profile(draft.launch_profile.as_ref()) == id;
+                        if ui.selectable_label(selected, label).clicked() {
+                            draft.launch_profile = (id != "custom")
+                                .then(|| launch_profile(choice.adapter_id, id));
+                            if id == "custom" {
+                                draft.advanced = true;
+                            }
+                        }
                     }
                 });
+                ui.label(
+                    RichText::new(profile_description(choice, draft.launch_profile.as_ref()))
+                        .small()
+                        .color(theme.text_faint),
+                );
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Title");
                 ui.text_edit_singleline(&mut draft.title);
             });
-            ui.horizontal(|ui| {
-                ui.label("Program");
-                ui.text_edit_singleline(&mut draft.program);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Arguments");
-                ui.text_edit_singleline(&mut draft.arguments);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Working directory");
-                ui.text_edit_singleline(&mut draft.cwd);
-            });
+            egui::CollapsingHeader::new("Advanced command & pane settings")
+                .id_salt("new-pane-advanced")
+                .default_open(draft.advanced)
+                .show(ui, |ui| {
+                    egui::ComboBox::from_label("View type")
+                        .selected_text(format!("{:?}", draft.kind))
+                        .show_ui(ui, |ui| {
+                            for (label, kind) in pane_kind_choices() {
+                                if ui.selectable_value(&mut draft.kind, kind, label).clicked()
+                                    && kind != PaneKind::Agent
+                                {
+                                    draft.launch_profile = None;
+                                }
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("Program");
+                        if ui.text_edit_singleline(&mut draft.program).changed() {
+                            let matches_profile = agent_choice_for_program(&draft.program)
+                                .zip(draft.launch_profile.as_ref())
+                                .is_some_and(|(choice, profile)| {
+                                    choice.adapter_id == profile.adapter_id
+                                });
+                            if !matches_profile {
+                                draft.launch_profile = None;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Arguments");
+                        ui.text_edit_singleline(&mut draft.arguments);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Working directory");
+                        ui.text_edit_singleline(&mut draft.cwd);
+                    });
+                    ui.label(
+                        RichText::new("Arguments become argv directly; Turn never evaluates an implicit shell script.")
+                            .small()
+                            .color(theme.text_faint),
+                    );
+                });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.radio_value(
@@ -3548,6 +3766,7 @@ impl<'a> TurnView<'a> {
                     pane.command = (!draft.program.trim().is_empty())
                         .then(|| draft.program.trim().to_string());
                     pane.args = args;
+                    pane.launch_profile = draft.launch_profile.clone();
                     pane.cwd = (!draft.cwd.trim().is_empty()).then(|| draft.cwd.trim().to_string());
                     return vec![ViewAction::CreatePane {
                         target_pane_id: draft.target_pane_id,
@@ -7248,52 +7467,102 @@ impl<'a> TurnView<'a> {
                 .strong(),
             );
             if let Some(command) = draft.cells.get_mut(&draft.selected) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Quick choice").color(theme.text_dim).small());
-                    for (label, program) in [
-                        ("Shell", ""),
-                        ("Claude", "claude"),
-                        ("Codex", "codex"),
-                        ("Gemini", "gemini"),
-                    ] {
-                        if ui.selectable_label(command.program == program, label).clicked() {
-                            command.program = program.to_string();
-                            command.arguments.clear();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("START").color(theme.text_dim).small().strong());
+                    if ui
+                        .selectable_label(command.program.trim().is_empty(), "Shell")
+                        .clicked()
+                    {
+                        command.program.clear();
+                        command.arguments.clear();
+                        command.launch_profile = None;
+                    }
+                    for choice in AGENT_QUICK_CHOICES {
+                        let selected = agent_choice_for_program(&command.program)
+                            .is_some_and(|current| current.adapter_id == choice.adapter_id);
+                        if ui.selectable_label(selected, choice.label).clicked() {
+                            select_agent_program(
+                                &mut command.program,
+                                &mut command.arguments,
+                                &mut command.launch_profile,
+                                choice,
+                            );
                         }
                     }
                 });
-                ui.columns(2, |columns| {
-                    columns[0].label(
-                        RichText::new("Program (blank = workspace shell)")
-                            .color(theme.text_dim)
-                            .small(),
+                if let Some(choice) = agent_choice_for_program(&command.program) {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("MODE").color(theme.text_dim).small().strong());
+                        for (id, label) in [
+                            (SAFE_LAUNCH_PROFILE, "Safe"),
+                            (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                            ("custom", "Custom"),
+                        ] {
+                            let selected =
+                                selected_launch_profile(command.launch_profile.as_ref()) == id;
+                            if ui.selectable_label(selected, label).clicked() {
+                                command.launch_profile = (id != "custom")
+                                    .then(|| launch_profile(choice.adapter_id, id));
+                            }
+                        }
+                    });
+                    ui.label(
+                        RichText::new(profile_description(
+                            choice,
+                            command.launch_profile.as_ref(),
+                        ))
+                        .color(theme.text_faint)
+                        .small(),
                     );
-                    columns[0].add(
-                        egui::TextEdit::singleline(&mut command.program)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("npm"),
-                    );
-                    columns[1].label(
-                        RichText::new("Arguments")
-                            .color(theme.text_dim)
-                            .small(),
-                    );
-                    columns[1].add(
-                        egui::TextEdit::singleline(&mut command.arguments)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("run dev -- --watch"),
-                    );
-                });
-                ui.label(
-                    RichText::new(
-                        "Arguments support quotes and become argv. Turn never evaluates them as an implicit shell script.",
-                    )
-                    .color(theme.text_faint)
-                    .small(),
-                );
-                egui::CollapsingHeader::new("Cell working directory, environment & restore")
+                }
+                let custom_command = selected_launch_profile(command.launch_profile.as_ref())
+                    == "custom"
+                    && !command.program.trim().is_empty();
+                egui::CollapsingHeader::new("Advanced command, directory & restore")
                     .id_salt("template-cell-advanced")
+                    .default_open(custom_command)
                     .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            columns[0].label(
+                                RichText::new("Program (blank = workspace shell)")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            if columns[0]
+                                .add(
+                                    egui::TextEdit::singleline(&mut command.program)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("npm"),
+                                )
+                                .changed()
+                            {
+                                let matches_profile = agent_choice_for_program(&command.program)
+                                    .zip(command.launch_profile.as_ref())
+                                    .is_some_and(|(choice, profile)| {
+                                        choice.adapter_id == profile.adapter_id
+                                    });
+                                if !matches_profile {
+                                    command.launch_profile = None;
+                                }
+                            }
+                            columns[1].label(
+                                RichText::new("Arguments")
+                                    .color(theme.text_dim)
+                                    .small(),
+                            );
+                            columns[1].add(
+                                egui::TextEdit::singleline(&mut command.arguments)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("run dev -- --watch"),
+                            );
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Arguments become argv directly; Turn never evaluates an implicit shell script.",
+                            )
+                            .color(theme.text_faint)
+                            .small(),
+                        );
                         ui.columns(2, |columns| {
                             columns[0].label(
                                 RichText::new("Working directory")
@@ -13402,6 +13671,7 @@ mod tests {
             CellCommandDraft {
                 program: "npm".into(),
                 arguments: "run dev -- --port 3000".into(),
+                launch_profile: None,
                 cwd: "frontend".into(),
                 environment: "CELL=left".into(),
                 restore: RestoreBehaviour::Skip,
@@ -13438,6 +13708,51 @@ mod tests {
         assert_eq!(restored.cells[&selected].cwd, "frontend");
         assert_eq!(restored.cells[&selected].environment, "CELL=left");
         assert_eq!(restored.cells[&selected].restore, RestoreBehaviour::Skip);
+    }
+
+    #[test]
+    fn changing_agent_provider_keeps_the_semantic_autonomous_intent_without_reusing_flags() {
+        let mut program = "claude".to_string();
+        let mut arguments = "--model opus --dangerously-skip-permissions".to_string();
+        let mut profile = Some(launch_profile("claude-code", AUTONOMOUS_LAUNCH_PROFILE));
+
+        select_agent_program(
+            &mut program,
+            &mut arguments,
+            &mut profile,
+            AGENT_QUICK_CHOICES[1],
+        );
+
+        assert_eq!(program, "codex");
+        assert!(arguments.is_empty(), "Claude argv cannot leak into Codex");
+        assert_eq!(
+            profile,
+            Some(launch_profile("codex", AUTONOMOUS_LAUNCH_PROFILE))
+        );
+    }
+
+    #[test]
+    fn a_layout_cell_persists_autonomous_intent_instead_of_provider_flags() {
+        let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
+        let selected = draft.selected.clone();
+        draft.cells.insert(
+            selected.clone(),
+            CellCommandDraft {
+                program: "gemini".into(),
+                arguments: "--model gemini-3".into(),
+                launch_profile: Some(launch_profile("gemini-cli", AUTONOMOUS_LAUNCH_PROFILE)),
+                ..CellCommandDraft::default()
+            },
+        );
+
+        let layout = draft.materialized_layout().unwrap();
+        let pane = layout.get(&selected).unwrap();
+        assert_eq!(pane.args, ["--model", "gemini-3"]);
+        assert_eq!(
+            pane.launch_profile,
+            Some(launch_profile("gemini-cli", AUTONOMOUS_LAUNCH_PROFILE))
+        );
+        assert_eq!(draft.cell_label(&selected), "Gemini · Autonomous");
     }
 
     #[test]
