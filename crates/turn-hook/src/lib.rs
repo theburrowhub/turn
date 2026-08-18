@@ -49,6 +49,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Default socket timeout. Short: the destination is a local port and Turn's
@@ -70,6 +72,20 @@ pub struct Options {
     pub timeout: Duration,
     /// Whether to explain failures on stderr. Off unless `TURN_HOOK_DEBUG` is set,
     /// because stderr from a hook lands in the middle of the user's agent output.
+    pub debug: bool,
+}
+
+/// Invocation details for Claude Code's status-line fan-out mode.
+pub struct StatusLineOptions {
+    /// Authenticated loopback destination. `None` still runs the user's command.
+    pub url: Option<String>,
+    /// Private script containing the user's effective status-line command.
+    /// `None` selects Turn's compact fallback renderer.
+    pub original_script: Option<PathBuf>,
+    /// This binary, used to detach the best-effort network forward from the
+    /// command whose stdout/stderr/exit Claude Code observes.
+    pub forwarder_exe: PathBuf,
+    pub timeout: Duration,
     pub debug: bool,
 }
 
@@ -165,6 +181,9 @@ pub enum Failure {
     NotLoopback(String),
     /// The socket could not be used.
     Transport(String),
+    /// The private status-line delegate could not be launched. The original
+    /// command itself is deliberately absent from this diagnostic.
+    StatusLineCommand,
 }
 
 impl std::fmt::Display for Failure {
@@ -186,6 +205,7 @@ impl std::fmt::Display for Failure {
                 "the destination resolved to {address}, which is not this machine"
             ),
             Failure::Transport(error) => write!(f, "{error}"),
+            Failure::StatusLineCommand => write!(f, "could not run the preserved status line"),
         }
     }
 }
@@ -395,6 +415,160 @@ pub fn run(options: &Options, stdin: &mut impl Read) -> Result<(), Failure> {
     let target = Target::parse(url).ok_or_else(|| Failure::BadUrl(url.to_string()))?;
     let payload = read_payload(options, stdin)?;
     post(&target, &payload, options.timeout)
+}
+
+/// Reads Claude's status JSON once, starts a detached best-effort forward, then
+/// supplies the exact same bytes to the user's original command. Network latency
+/// is never on the command's critical path; only a bounded in-memory pipe write
+/// occurs before delegation.
+pub fn run_status_line(
+    options: &StatusLineOptions,
+    stdin: &mut impl Read,
+    stdout: &mut impl Write,
+) -> Result<i32, Failure> {
+    let read_options = Options {
+        url: options.url.clone(),
+        timeout: options.timeout,
+        debug: options.debug,
+        ..Options::default()
+    };
+    let payload = read_payload(&read_options, stdin)?;
+    spawn_status_line_forwarder(options, &payload);
+
+    let Some(script) = options.original_script.as_deref() else {
+        stdout
+            .write_all(compact_status_line(&payload).as_bytes())
+            .map_err(|error| Failure::Transport(error.to_string()))?;
+        stdout
+            .write_all(b"\n")
+            .map_err(|error| Failure::Transport(error.to_string()))?;
+        return Ok(0);
+    };
+
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.arg(script);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/D").arg("/S").arg("/C").arg(script);
+        command
+    };
+    #[cfg(not(any(unix, windows)))]
+    return Err(Failure::StatusLineCommand);
+
+    #[cfg(any(unix, windows))]
+    {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|_| Failure::StatusLineCommand)?;
+        let child_stdin = child.stdin.take().ok_or(Failure::StatusLineCommand)?;
+        let writer_payload = payload.clone();
+        let writer = std::thread::spawn(move || {
+            let mut child_stdin = child_stdin;
+            let _ = child_stdin.write_all(&writer_payload);
+        });
+        let status = child.wait().map_err(|_| Failure::StatusLineCommand)?;
+        let _ = writer.join();
+        Ok(status.code().unwrap_or(1))
+    }
+}
+
+/// Spawn a second helper process whose only job is to POST the payload. Its
+/// stdin is filled before it performs any network I/O, so writing the bounded
+/// payload cannot wait on the daemon.
+fn spawn_status_line_forwarder(options: &StatusLineOptions, payload: &[u8]) {
+    let Some(url) = options.url.as_deref().filter(|url| !url.trim().is_empty()) else {
+        return;
+    };
+    let mut child = match Command::new(&options.forwarder_exe)
+        .arg("--statusline-forward")
+        .env("TURN_STATUSLINE_URL", url)
+        .env(
+            "TURN_STATUSLINE_TIMEOUT_MS",
+            options.timeout.as_millis().to_string(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    if let Some(mut pipe) = child.stdin.take() {
+        let payload = payload.to_vec();
+        // Do not put child scheduling or pipe pressure on Claude's status-line
+        // path. The payload is already bounded, and this disposable writer owns
+        // the pipe until either the forwarder reads it or exits.
+        let _ = std::thread::Builder::new()
+            .name("turn-statusline-forward".into())
+            .spawn(move || {
+                let _ = pipe.write_all(&payload);
+            });
+    }
+    // Intentionally not waited: the original status line owns stdout, stderr,
+    // exit and timeout. The network forward is disposable telemetry.
+}
+
+/// Useful, compact output when the operator had no status line of their own.
+/// Text fields are reduced to printable one-line ASCII before rendering.
+pub fn compact_status_line(payload: &[u8]) -> String {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return "TURN · Claude telemetry active".into();
+    };
+    let model = value
+        .pointer("/model/display_name")
+        .and_then(serde_json::Value::as_str)
+        .and_then(compact_field)
+        .or_else(|| {
+            value
+                .pointer("/model/id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(compact_field)
+        })
+        .unwrap_or_else(|| "Claude".into());
+    let mut parts = vec![format!("TURN · {model}")];
+    if let Some(used) = json_percentage(value.pointer("/context_window/used_percentage")) {
+        parts.push(format!("ctx {used:.0}% used"));
+    }
+    if let Some(used) = json_percentage(value.pointer("/rate_limits/five_hour/used_percentage")) {
+        parts.push(format!("5h {:.0}% left", 100.0 - used));
+    }
+    if let Some(used) = json_percentage(value.pointer("/rate_limits/seven_day/used_percentage")) {
+        parts.push(format!("7d {:.0}% left", 100.0 - used));
+    }
+    parts.join(" · ")
+}
+
+fn compact_field(value: &str) -> Option<String> {
+    let clean = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_' | '.') {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clean: String = clean.chars().take(80).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
+fn json_percentage(value: Option<&serde_json::Value>) -> Option<f64> {
+    value?
+        .as_f64()
+        .filter(|number| number.is_finite() && (0.0..=100.0).contains(number))
 }
 
 #[cfg(test)]
@@ -945,6 +1119,62 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn status_line_delegate_receives_identical_json_and_owns_the_exit_code() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("original.sh");
+        let captured = dir.path().join("captured.json");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf 'original-output\\n'\nprintf 'original-error\\n' >&2\nexit 17\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let payload = br#"{"model":{"display_name":"Opus"},"session_id":"same-bytes"}"#;
+        let options = StatusLineOptions {
+            url: None,
+            original_script: Some(script),
+            forwarder_exe: std::env::current_exe().unwrap(),
+            timeout: Duration::from_millis(10),
+            debug: false,
+        };
+
+        let code = run_status_line(
+            &options,
+            &mut std::io::Cursor::new(payload),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(code, 17);
+        assert_eq!(std::fs::read(captured).unwrap(), payload);
+    }
+
+    #[test]
+    fn fallback_status_line_is_compact_useful_and_uses_remaining_capacity() {
+        let payload = br#"{
+            "model":{"display_name":"Opus"},
+            "context_window":{"used_percentage":8.4},
+            "rate_limits":{
+                "five_hour":{"used_percentage":23.5},
+                "seven_day":{"used_percentage":41.2}
+            }
+        }"#;
+        assert_eq!(
+            compact_status_line(payload),
+            "TURN · Opus · ctx 8% used · 5h 76% left · 7d 59% left"
+        );
+        assert_eq!(
+            compact_status_line(b"not json"),
+            "TURN · Claude telemetry active"
+        );
+    }
+
     #[test]
     fn every_failure_can_be_explained_when_debugging_is_on() {
         for failure in [
@@ -954,6 +1184,7 @@ mod tests {
             Failure::PayloadTooLarge(9),
             Failure::NotLoopback("192.0.2.1".into()),
             Failure::Transport("refused".into()),
+            Failure::StatusLineCommand,
         ] {
             assert!(!failure.to_string().is_empty());
         }

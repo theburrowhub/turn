@@ -227,6 +227,13 @@ impl HookEndpoint {
             self.token
         )
     }
+
+    /// Authenticated endpoint reserved for Claude Code's status-line schema.
+    /// Kept distinct from ordinary hooks so an object without
+    /// `hook_event_name` can never be mistaken for a provider lifecycle event.
+    pub fn status_line_url(&self) -> String {
+        format!("{}/status-line", self.url())
+    }
 }
 
 /// Everything an adapter needs to prepare a launch.

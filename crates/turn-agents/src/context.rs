@@ -45,6 +45,9 @@ pub struct ContextObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextTailRead {
     pub observation: Option<ContextObservation>,
+    /// A provider-shaped candidate record existed but could not be decoded.
+    /// `false` with no observation means the transcript simply has no usage yet.
+    pub parse_failed: bool,
     /// Actual bytes read from disk. Never exceeds [`MAX_CONTEXT_TAIL_BYTES`].
     pub bytes_read: usize,
     /// Whether older source bytes were deliberately left unread.
@@ -68,7 +71,7 @@ pub fn parse_context_tail(
     } else {
         (transcript, false)
     };
-    parse_bounded_tail(format, tail, source_truncated)
+    parse_bounded_tail(format, tail, source_truncated).observation
 }
 
 /// Read and parse at most the final [`MAX_CONTEXT_TAIL_BYTES`] of a regular file.
@@ -104,9 +107,10 @@ pub fn read_context_tail(
         .read_to_end(&mut tail)?;
 
     let source_truncated = start > 0;
-    let observation = parse_bounded_tail(format, &tail, source_truncated);
+    let parsed = parse_bounded_tail(format, &tail, source_truncated);
     Ok(ContextTailRead {
-        observation,
+        observation: parsed.observation,
+        parse_failed: parsed.parse_failed,
         bytes_read: tail.len(),
         source_truncated,
     })
@@ -123,7 +127,7 @@ fn parse_bounded_tail(
     format: TranscriptFormat,
     tail: &[u8],
     source_truncated: bool,
-) -> Option<ContextObservation> {
+) -> ContextParseResult {
     debug_assert!(tail.len() <= MAX_CONTEXT_TAIL_BYTES);
     let complete_tail = discard_partial_first_line(tail, source_truncated);
     match format {
@@ -131,6 +135,11 @@ fn parse_bounded_tail(
         TranscriptFormat::Codex => parse_codex(complete_tail),
         TranscriptFormat::Gemini => parse_gemini(complete_tail),
     }
+}
+
+struct ContextParseResult {
+    observation: Option<ContextObservation>,
+    parse_failed: bool,
 }
 
 fn discard_partial_first_line(tail: &[u8], source_truncated: bool) -> &[u8] {
@@ -142,30 +151,37 @@ fn discard_partial_first_line(tail: &[u8], source_truncated: bool) -> &[u8] {
         .map_or(&[], |newline| &tail[newline + 1..])
 }
 
-fn parse_claude(tail: &[u8]) -> Option<ContextObservation> {
+fn parse_claude(tail: &[u8]) -> ContextParseResult {
     let mut used_tokens = None;
     let mut model = None;
+    let mut malformed_candidate = false;
 
     for line in tail.rsplit(|byte| *byte == b'\n') {
         if !contains(line, b"\"assistant\"") || !contains(line, b"\"usage\"") {
             continue;
         }
         let Some(value) = json_value(line) else {
+            malformed_candidate = true;
             continue;
         };
         let Some(root) = value.as_object() else {
+            malformed_candidate = true;
             continue;
         };
         if string_member(root, "type") != Some("assistant") {
+            malformed_candidate = true;
             continue;
         }
         let Some(message) = object_member(root, "message") else {
+            malformed_candidate = true;
             continue;
         };
         let Some(usage) = object_member(message, "usage") else {
+            malformed_candidate = true;
             continue;
         };
         let Some(used) = claude_input_tokens(usage) else {
+            malformed_candidate = true;
             continue;
         };
 
@@ -180,13 +196,17 @@ fn parse_claude(tail: &[u8]) -> Option<ContextObservation> {
         }
     }
 
-    used_tokens.map(|used_tokens| ContextObservation {
+    let observation = used_tokens.map(|used_tokens| ContextObservation {
         used_tokens,
         // Claude transcripts do not state the effective account/session window.
         // A model-family capability is not evidence that this session received it.
         window_tokens: None,
         model,
-    })
+    });
+    ContextParseResult {
+        parse_failed: observation.is_none() && malformed_candidate,
+        observation,
+    }
 }
 
 fn claude_input_tokens(usage: &Map<String, Value>) -> Option<u64> {
@@ -206,9 +226,10 @@ fn claude_input_tokens(usage: &Map<String, Value>) -> Option<u64> {
     (saw_input_field && total > 0).then_some(total)
 }
 
-fn parse_codex(tail: &[u8]) -> Option<ContextObservation> {
+fn parse_codex(tail: &[u8]) -> ContextParseResult {
     let mut usage = None;
     let mut model = None;
+    let mut malformed_candidate = false;
 
     for line in tail.rsplit(|byte| *byte == b'\n') {
         let may_have_usage = usage.is_none() && contains(line, b"\"last_token_usage\"");
@@ -217,14 +238,19 @@ fn parse_codex(tail: &[u8]) -> Option<ContextObservation> {
             continue;
         }
         let Some(value) = json_value(line) else {
+            malformed_candidate = true;
             continue;
         };
         let Some(root) = value.as_object() else {
+            malformed_candidate = true;
             continue;
         };
 
         if may_have_usage {
             usage = codex_usage(root);
+            if usage.is_none() {
+                malformed_candidate = true;
+            }
         }
         if may_have_model && string_member(root, "type") == Some("turn_context") {
             model =
@@ -235,11 +261,15 @@ fn parse_codex(tail: &[u8]) -> Option<ContextObservation> {
         }
     }
 
-    usage.map(|(used_tokens, window_tokens)| ContextObservation {
+    let observation = usage.map(|(used_tokens, window_tokens)| ContextObservation {
         used_tokens,
         window_tokens,
         model,
-    })
+    });
+    ContextParseResult {
+        parse_failed: observation.is_none() && malformed_candidate,
+        observation,
+    }
 }
 
 fn codex_usage(root: &Map<String, Value>) -> Option<(u64, Option<u64>)> {
@@ -257,35 +287,47 @@ fn codex_usage(root: &Map<String, Value>) -> Option<(u64, Option<u64>)> {
     Some((used_tokens, window_tokens))
 }
 
-fn parse_gemini(tail: &[u8]) -> Option<ContextObservation> {
+fn parse_gemini(tail: &[u8]) -> ContextParseResult {
+    let mut malformed_candidate = false;
     for line in tail.rsplit(|byte| *byte == b'\n') {
         if !contains(line, b"\"tokens\"") {
             continue;
         }
         let Some(value) = json_value(line) else {
+            malformed_candidate = true;
             continue;
         };
         let Some(root) = value.as_object() else {
+            malformed_candidate = true;
             continue;
         };
         if string_member(root, "type") != Some("gemini") {
+            malformed_candidate = true;
             continue;
         }
         let Some(tokens) = object_member(root, "tokens") else {
+            malformed_candidate = true;
             continue;
         };
         let Some(used_tokens) = positive_u64(tokens.get("input")) else {
+            malformed_candidate = true;
             continue;
         };
         let model = safe_model(root.get("model"));
         let window_tokens = model.as_deref().map(gemini_window);
-        return Some(ContextObservation {
-            used_tokens,
-            window_tokens,
-            model,
-        });
+        return ContextParseResult {
+            observation: Some(ContextObservation {
+                used_tokens,
+                window_tokens,
+                model,
+            }),
+            parse_failed: false,
+        };
     }
-    None
+    ContextParseResult {
+        observation: None,
+        parse_failed: malformed_candidate,
+    }
 }
 
 fn gemini_window(model: &str) -> u64 {
@@ -321,4 +363,28 @@ fn positive_u64(value: Option<&Value>) -> Option<u64> {
 
 fn safe_model(value: Option<&Value>) -> Option<String> {
     value?.as_str().and_then(crate::text::field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_usage_is_distinct_from_a_valid_transcript_without_usage_yet() {
+        let malformed = parse_bounded_tail(
+            TranscriptFormat::Claude,
+            br#"{"type":"assistant","message":{"usage":{"input_tokens":"not-a-number"}}}"#,
+            false,
+        );
+        assert!(malformed.observation.is_none());
+        assert!(malformed.parse_failed);
+
+        let waiting = parse_bounded_tail(
+            TranscriptFormat::Claude,
+            br#"{"type":"user","message":{"content":"hello"}}"#,
+            false,
+        );
+        assert!(waiting.observation.is_none());
+        assert!(!waiting.parse_failed);
+    }
 }

@@ -860,9 +860,12 @@ fn launch_configuration_for_persistence(
 ) -> LaunchConfiguration {
     LaunchConfiguration {
         model: redact_optional(&configuration.model),
+        model_display_name: redact_optional(&configuration.model_display_name),
         permission_mode: redact_optional(&configuration.permission_mode),
         approval_mode: redact_optional(&configuration.approval_mode),
         sandbox_mode: redact_optional(&configuration.sandbox_mode),
+        effort_level: redact_optional(&configuration.effort_level),
+        thinking_enabled: configuration.thinking_enabled,
         safe_flags: configuration
             .safe_flags
             .iter()
@@ -879,6 +882,10 @@ fn context_usage_for_persistence(context: &ContextUsageSnapshot) -> ContextUsage
             .effective_window
             .as_ref()
             .map(usage_measurement_for_persistence),
+        window_size_tokens: context.window_size_tokens,
+        used_percentage: context.used_percentage,
+        remaining_percentage: context.remaining_percentage,
+        current_usage: context.current_usage.clone(),
     }
 }
 
@@ -1562,9 +1569,12 @@ mod tests {
         agent.runtime.launch.current = Observable::observed(
             LaunchConfiguration {
                 model: Some(format!("model {SECRET}")),
+                model_display_name: Some(format!("display {SECRET}")),
                 permission_mode: Some(format!("mode {SECRET}")),
                 approval_mode: None,
                 sandbox_mode: None,
+                effort_level: Some("high".into()),
+                thinking_enabled: Some(true),
                 safe_flags: vec![format!("--profile={SECRET}")],
             },
             source.clone(),

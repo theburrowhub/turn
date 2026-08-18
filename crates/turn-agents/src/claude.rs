@@ -423,11 +423,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
         let user_args = resolved_profile.args;
         std::fs::create_dir_all(&ctx.scratch_dir)?;
         let settings_path = ctx.scratch_dir.join("claude-hooks.json");
-        let (document, undeliverable) = self.subscriptions(ctx);
-        write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
         // The directory too: the file name is fixed and the path travels in argv,
         // so a readable directory is as good as a readable file.
         restrict_directory(&ctx.scratch_dir);
+        let (mut document, undeliverable) = self.subscriptions(ctx);
 
         let env = vec![
             ("TURN_SESSION_ID".into(), ctx.session_id.to_string()),
@@ -437,11 +436,15 @@ impl AgentAdapter for ClaudeCodeAdapter {
             // the URL carries the session's token; an environment variable is at
             // least restricted to the same user.
             ("TURN_HOOK_URL".into(), ctx.endpoint.url()),
+            // The status-line fan-out reads this from the environment. The
+            // authenticated URL never appears in the wrapper command or argv.
+            ("TURN_STATUSLINE_URL".into(), ctx.endpoint.status_line_url()),
         ];
 
         // The user's own `--settings` stands, and the file Turn wrote is named so
         // they can merge it if they want Turn's detection as well.
         if user_supplied_settings(&user_args) {
+            write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
             return Ok(LaunchPlan {
                 command: ctx.command.clone(),
                 args: user_args,
@@ -457,6 +460,18 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
+        // Claude Code gives this `--settings` layer priority over local, project
+        // and user settings. Preserve their effective status line through a
+        // private fan-out before adding Turn's higher-priority value.
+        let status_line = crate::claude_status::prepare(ctx);
+        if let Some(setting) = status_line.setting {
+            document
+                .as_object_mut()
+                .expect("Turn's settings document is always an object")
+                .insert("statusLine".into(), setting);
+        }
+        write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
+
         let mut args = user_args;
         // Appended, which is where an argument Turn adds belongs: the user's own
         // arguments keep the order and the meaning they were written with. The one
@@ -466,7 +481,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
         args.push("--settings".to_string());
         args.push(settings_path.to_string_lossy().to_string());
 
-        let (level, note) = self.achieved(&undeliverable);
+        let (level, mut note) = self.achieved(&undeliverable);
+        note.push(' ');
+        note.push_str(status_line.note);
         Ok(LaunchPlan {
             command: ctx.command.clone(),
             args,

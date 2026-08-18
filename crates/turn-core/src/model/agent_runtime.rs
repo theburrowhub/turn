@@ -243,12 +243,22 @@ impl<T> Observable<T> {
 pub struct LaunchConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider-owned human label for the current model, when distinct from its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<String>,
+    /// Live provider reasoning effort. Kept separate from permission policy and
+    /// safe flags because it may change while an agent is already running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
+    /// Whether the provider reports extended thinking enabled for this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
     /// Flag names or already-sanitised non-secret values. Raw argv does not
     /// belong here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -320,6 +330,33 @@ pub struct ContextUsageSnapshot {
     /// distinct from the measurement's total.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_window: Option<UsageMeasurement>,
+    /// Provider-reported context-window size without converting it through a
+    /// floating-point measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size_tokens: Option<u64>,
+    /// Provider-owned percentages, retained independently from exact token
+    /// counts so Turn never invents one from the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percentage: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_percentage: Option<f64>,
+    /// Token counters from the provider's most recent API call. This is not the
+    /// same scope as the live context total and must not be added to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_usage: Option<ContextTokenUsage>,
+}
+
+/// Provider token counters for the most recent API call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextTokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
 }
 
 /// One account/provider quota window.
@@ -423,6 +460,10 @@ mod tests {
                 total: None,
             },
             effective_window: None,
+            window_size_tokens: None,
+            used_percentage: None,
+            remaining_percentage: None,
+            current_usage: None,
         };
         let quota = QuotaSnapshot {
             scope_id: Some("account-1".into()),

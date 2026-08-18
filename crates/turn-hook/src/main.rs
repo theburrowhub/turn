@@ -3,7 +3,8 @@
 //! The whole binary is "do the thing, then exit 0". See the crate docs in
 //! `lib.rs` for why the exit code is unconditional.
 
-use turn_hook::{run, Options};
+use std::time::Duration;
+use turn_hook::{run, run_status_line, Options, StatusLineOptions, DEFAULT_TIMEOUT_MS};
 
 fn main() {
     let arguments: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -14,6 +15,55 @@ fn main() {
     if arguments.len() == 1 && arguments[0] == "--build-info" {
         println!("component=turn-hook version={}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+
+    if arguments.first().and_then(|arg| arg.to_str()) == Some("--statusline-forward") {
+        let timeout = std::env::var("TURN_STATUSLINE_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, 30_000);
+        let options = Options::parse(
+            arguments
+                .into_iter()
+                .skip(1)
+                .filter_map(|arg| arg.into_string().ok()),
+            std::env::var("TURN_STATUSLINE_URL").ok(),
+            std::env::var_os("TURN_HOOK_DEBUG").is_some(),
+        );
+        let options = Options {
+            timeout: Duration::from_millis(timeout),
+            ..options
+        };
+        let mut stdin = std::io::stdin().lock();
+        if let Err(failure) = run(&options, &mut stdin) {
+            if options.debug {
+                eprintln!("turn-hook: status-line forward failed: {failure}");
+            }
+        }
+        std::process::exit(0);
+    }
+
+    if arguments.first().and_then(|arg| arg.to_str()) == Some("--statusline") {
+        let original_script = arguments.get(1).map(std::path::PathBuf::from);
+        let options = StatusLineOptions {
+            url: std::env::var("TURN_STATUSLINE_URL").ok(),
+            original_script,
+            forwarder_exe: std::env::current_exe().unwrap_or_else(|_| "turn-hook".into()),
+            timeout: Duration::from_millis(100),
+            debug: std::env::var_os("TURN_HOOK_DEBUG").is_some(),
+        };
+        let mut stdin = std::io::stdin().lock();
+        let mut stdout = std::io::stdout().lock();
+        match run_status_line(&options, &mut stdin, &mut stdout) {
+            Ok(code) => std::process::exit(code),
+            Err(failure) => {
+                if options.debug {
+                    eprintln!("turn-hook: status-line fan-out failed: {failure}");
+                }
+                std::process::exit(1);
+            }
+        }
     }
 
     let options = Options::from_process();

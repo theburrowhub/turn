@@ -1117,19 +1117,26 @@ mod tests {
     use turn_core::ids::{PaneId, SessionId};
     use turn_core::model::{
         AgentLaunchFacts, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration,
-        Observable, ObservationSource, ObservationSourceKind, UsageMeasurement,
-        UsageMeasurementKind, UsageUnit,
+        Observable, ObservationSource, ObservationSourceKind, QuotaSnapshot, QuotaWindow,
+        UsageMeasurement, UsageMeasurementKind, UsageUnit,
     };
 
     const NOW: i64 = 1_700_000_000_000;
 
-    fn observed_runtime(at_ms: i64, used: u64, model: &str) -> AgentRuntimeMetadata {
+    fn observed_runtime(
+        at_ms: i64,
+        used: u64,
+        model: &str,
+        effort: &str,
+        quota_remaining: f64,
+    ) -> AgentRuntimeMetadata {
         let source = ObservationSource::new(ObservationSourceKind::Provider, "provider transcript");
         AgentRuntimeMetadata {
             launch: AgentLaunchFacts {
                 current: Observable::observed(
                     LaunchConfiguration {
                         model: Some(model.into()),
+                        effort_level: Some(effort.into()),
                         ..LaunchConfiguration::default()
                     },
                     source.clone(),
@@ -1148,12 +1155,35 @@ mod tests {
                         total: Some(200_000.0),
                     },
                     effective_window: None,
+                    window_size_tokens: None,
+                    used_percentage: None,
+                    remaining_percentage: None,
+                    current_usage: None,
                 },
-                source,
+                source.clone(),
                 at_ms,
                 None,
             ),
-            ..AgentRuntimeMetadata::default()
+            quota: Observable::observed(
+                QuotaSnapshot {
+                    scope_id: None,
+                    scope_label: Some("provider account".into()),
+                    windows: vec![QuotaWindow {
+                        label: "5h".into(),
+                        measurement: UsageMeasurement {
+                            kind: UsageMeasurementKind::Remaining,
+                            amount: quota_remaining,
+                            unit: UsageUnit::Percent,
+                            total: Some(100.0),
+                        },
+                        resets_at_ms: Some(at_ms + 60_000),
+                        hard_limit: None,
+                    }],
+                },
+                source,
+                at_ms,
+                Some(at_ms + 60_000),
+            ),
         }
     }
 
@@ -1191,8 +1221,14 @@ mod tests {
             .with_node(node_id.clone())
         };
 
-        let newer = event(observed_runtime(NOW + 20, 82_000, "gpt-new"), NOW + 20);
-        let late_older = event(observed_runtime(NOW + 10, 41_000, "gpt-old"), NOW + 30);
+        let newer = event(
+            observed_runtime(NOW + 20, 82_000, "gpt-new", "xhigh", 76.5),
+            NOW + 20,
+        );
+        let late_older = event(
+            observed_runtime(NOW + 10, 41_000, "gpt-old", "low", 12.0),
+            NOW + 30,
+        );
         assert_eq!(
             harness.core.apply(&newer, NOW + 20).node,
             Some(node_id.clone())
@@ -1210,6 +1246,17 @@ mod tests {
         assert_eq!(node.turn, Some(Turn::Active));
         assert_eq!(agent.agent.model.as_deref(), Some("gpt-new"));
         assert_eq!(
+            agent
+                .runtime
+                .launch
+                .current
+                .value()
+                .unwrap()
+                .effort_level
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
             agent.runtime.context.observed_at_ms(),
             Some(NOW + 20),
             "a detached read that finishes late must not overwrite newer evidence"
@@ -1217,6 +1264,13 @@ mod tests {
         assert_eq!(
             agent.runtime.context.value().unwrap().measurement.amount,
             82_000.0
+        );
+        assert_eq!(
+            agent.runtime.quota.value().unwrap().windows[0]
+                .measurement
+                .amount,
+            76.5,
+            "late older provider capacity must not roll back the current quota"
         );
     }
 

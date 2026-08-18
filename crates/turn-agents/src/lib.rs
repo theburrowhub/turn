@@ -20,6 +20,7 @@
 
 pub mod adapter;
 pub mod claude;
+mod claude_status;
 pub mod codex;
 pub mod context;
 pub mod gemini;

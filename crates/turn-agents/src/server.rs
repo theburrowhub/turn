@@ -254,6 +254,7 @@ impl HookServer {
 
         let router = Router::new()
             .route("/hook/{token}", post(receive))
+            .route("/hook/{token}/status-line", post(receive_status_line))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(Arc::clone(&state));
 
@@ -604,6 +605,48 @@ async fn receive(
     StatusCode::OK.into_response()
 }
 
+/// Claude Code's status-line callback. It uses the same per-node token as hooks
+/// but a distinct path and schema, so lifecycle normalisation never has to guess
+/// what an object without `hook_event_name` means.
+async fn receive_status_line(
+    State(state): State<Arc<ServerState>>,
+    Path(token): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some((session_id, node_id, adapter)) = lookup(&state, &token) else {
+        state.counters.refused.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            token_len = token.len(),
+            "refused a status-line post with an unknown token"
+        );
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    state.counters.accepted.fetch_add(1, Ordering::Relaxed);
+
+    // Only Claude Code currently owns this documented contract. A valid token
+    // associated with another adapter is acknowledged but cannot create facts.
+    if adapter.id() != "claude-code" {
+        return StatusCode::OK.into_response();
+    }
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            state.counters.unparsable.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(adapter = adapter.id(), "unreadable status-line payload");
+            return StatusCode::OK.into_response();
+        }
+    };
+    let ctx = EventContext {
+        session_id,
+        node_id,
+        timestamp_ms: turn_core::now_ms(),
+    };
+    if let Some(event) = crate::claude_status::observation_event(&payload, &ctx) {
+        try_emit(&state, event);
+    }
+    StatusCode::OK.into_response()
+}
+
 /// Sends without backpressure. Hook delivery and detached observation delivery
 /// share the same bounded channel and accounting semantics.
 fn try_emit(state: &ServerState, event: TurnEvent) {
@@ -625,7 +668,7 @@ fn try_emit(state: &ServerState, event: TurnEvent) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ContextProbe {
     path: PathBuf,
     format: TranscriptFormat,
@@ -685,6 +728,7 @@ fn schedule_context_observation(
     };
     let state = Arc::clone(state);
     tokio::spawn(async move {
+        let failed_probe = probe.clone();
         // `read_context_tail` performs synchronous metadata/seek/read calls. It
         // belongs on Tokio's blocking pool, behind the permit acquired above.
         let read = tokio::task::spawn_blocking(move || {
@@ -695,6 +739,20 @@ fn schedule_context_observation(
         .await;
 
         let (probe, observation) = match read {
+            Ok((probe, Ok(read))) if read.parse_failed => {
+                let observed_at_ms = turn_core::now_ms();
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        probe,
+                        "provider transcript contained an unreadable context record",
+                        observed_at_ms,
+                    ),
+                );
+                return;
+            }
             Ok((probe, Ok(read))) => (probe, read.observation),
             Ok((probe, Err(error))) => {
                 tracing::debug!(
@@ -702,10 +760,32 @@ fn schedule_context_observation(
                     error_kind = ?error.kind(),
                     "could not read an agent transcript context tail"
                 );
+                let observed_at_ms = turn_core::now_ms();
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        probe,
+                        context_read_failure_message(error.kind()),
+                        observed_at_ms,
+                    ),
+                );
                 return;
             }
-            Err(error) => {
-                tracing::warn!(%error, "agent transcript observation task failed");
+            Err(_) => {
+                tracing::warn!("agent transcript observation task failed");
+                let observed_at_ms = turn_core::now_ms();
+                try_emit(
+                    &state,
+                    context_failure_event(
+                        session_id,
+                        node_id,
+                        failed_probe,
+                        "provider transcript observation failed",
+                        observed_at_ms,
+                    ),
+                );
                 return;
             }
         };
@@ -720,6 +800,50 @@ fn schedule_context_observation(
         };
         try_emit(&state, event);
     });
+}
+
+fn context_read_failure_message(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "provider transcript is unavailable",
+        std::io::ErrorKind::PermissionDenied => "provider transcript access was denied",
+        std::io::ErrorKind::InvalidInput => "provider transcript is not a regular file",
+        _ => "provider transcript could not be read",
+    }
+}
+
+fn context_failure_event(
+    session_id: SessionId,
+    node_id: NodeId,
+    probe: ContextProbe,
+    message: &'static str,
+    observed_at_ms: i64,
+) -> TurnEvent {
+    let source = ObservationSource::new(
+        ObservationSourceKind::Provider,
+        format!("{} transcript", probe.tool),
+    );
+    TurnEvent::new(
+        session_id,
+        EventKind::AgentRuntimeObserved {
+            runtime: Box::new(AgentRuntimeMetadata {
+                context: Observable::failed(source, observed_at_ms, message),
+                ..AgentRuntimeMetadata::default()
+            }),
+        },
+        EventSource::SideChannel {
+            tool: probe.tool.clone(),
+            channel: "provider transcript".into(),
+        },
+        Confidence::Explicit,
+        observed_at_ms,
+    )
+    .with_node(node_id)
+    .with_agent(AgentRef {
+        provider: Some(probe.provider),
+        tool: Some(probe.tool),
+        model: None,
+        external_id: probe.scope_id,
+    })
 }
 
 fn runtime_observation_event(
@@ -748,6 +872,10 @@ fn runtime_observation_event(
             total: total_tokens,
         },
         effective_window: None,
+        window_size_tokens: observation.window_tokens,
+        used_percentage: None,
+        remaining_percentage: None,
+        current_usage: None,
     };
     let launch = observation
         .model
@@ -1089,6 +1217,137 @@ mod tests {
         assert!(!persisted_shape.contains("secret source text"));
         assert!(!persisted_shape.contains(&transcript_path.to_string_lossy().to_string()));
         assert_eq!(server.stats().emitted, 2);
+    }
+
+    #[tokio::test]
+    async fn status_line_endpoint_emits_only_typed_runtime_metadata() {
+        let (server, mut rx, endpoint) = server_with_node().await;
+        let status = post(
+            &endpoint.status_line_url(),
+            json!({
+                "session_id":"claude-session-1",
+                "transcript_path":"/must/not/persist.jsonl",
+                "model":{"id":"claude-opus-5","display_name":"Opus"},
+                "context_window":{
+                    "total_input_tokens":15000,
+                    "total_output_tokens":1000,
+                    "context_window_size":200000,
+                    "used_percentage":8,
+                    "remaining_percentage":92,
+                    "current_usage":{"input_tokens":7000,"output_tokens":1000}
+                },
+                "effort":{"level":"xhigh"},
+                "thinking":{"enabled":true},
+                "rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let event = rx.recv().await.unwrap();
+        let EventKind::AgentRuntimeObserved { runtime } = &event.kind else {
+            panic!("unexpected event: {:?}", event.kind)
+        };
+        assert_eq!(
+            runtime
+                .launch
+                .current
+                .value()
+                .unwrap()
+                .effort_level
+                .as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            runtime.quota.value().unwrap().windows[0].measurement.amount,
+            76.5
+        );
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("transcript_path"));
+        assert!(!encoded.contains("must/not/persist"));
+        assert_eq!(server.stats().accepted, 1);
+        assert_eq!(server.stats().emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn transcript_read_and_parse_failures_become_safe_failed_context_observations() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let missing = transcript_dir.path().join("private-secret-name.jsonl");
+        let malformed = transcript_dir.path().join("malformed.jsonl");
+        std::fs::write(
+            &malformed,
+            b"{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":\"bad\"}}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, endpoint) = server_with_node().await;
+
+        for path in [&missing, &malformed] {
+            assert_eq!(
+                post(
+                    &endpoint.url(),
+                    json!({"hook_event_name":"Stop","transcript_path":path})
+                )
+                .await,
+                StatusCode::OK
+            );
+            let failed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let event = rx.recv().await.unwrap();
+                    if let EventKind::AgentRuntimeObserved { runtime } = &event.kind {
+                        if matches!(runtime.context, Observable::Failed { .. }) {
+                            break event;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let EventKind::AgentRuntimeObserved { runtime } = &failed.kind else {
+                unreachable!()
+            };
+            let Observable::Failed { message, .. } = &runtime.context else {
+                unreachable!()
+            };
+            assert!(message.starts_with("provider transcript"), "{message}");
+            let encoded = serde_json::to_string(&failed).unwrap();
+            assert!(!encoded.contains(&path.to_string_lossy().to_string()));
+            assert!(!encoded.contains("private-secret-name"));
+            assert!(!encoded.contains("os error"));
+            assert_eq!(failed.raw, None);
+        }
+        assert_eq!(server.stats().emitted, 4);
+    }
+
+    #[tokio::test]
+    async fn a_valid_transcript_without_usage_remains_waiting_for_the_next_event() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript = transcript_dir.path().join("not-yet.jsonl");
+        std::fs::write(
+            &transcript,
+            b"{\"type\":\"user\",\"message\":{\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, endpoint) = server_with_node().await;
+        assert_eq!(
+            post(
+                &endpoint.url(),
+                json!({"hook_event_name":"Stop","transcript_path":transcript})
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(matches!(
+            rx.recv().await.unwrap().kind,
+            EventKind::AgentTurnCompleted { .. }
+        ));
+        eventually("the no-usage transcript read to finish", || {
+            server.state.context_reads.available_permits() == MAX_CONTEXT_READS
+        })
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

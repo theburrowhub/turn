@@ -13,9 +13,9 @@ pub mod template;
 pub mod workspace;
 
 pub use agent_runtime::{
-    AgentLaunchFacts, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration, Observable,
-    ObservationSource, ObservationSourceKind, QuotaSnapshot, QuotaWindow, UsageMeasurement,
-    UsageMeasurementKind, UsageUnit,
+    AgentLaunchFacts, AgentRuntimeMetadata, ContextTokenUsage, ContextUsageSnapshot,
+    LaunchConfiguration, Observable, ObservationSource, ObservationSourceKind, QuotaSnapshot,
+    QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
 };
 pub use handoff::{ContextHandoffMode, ContextHandoffOutcome};
 pub use hierarchy::{
