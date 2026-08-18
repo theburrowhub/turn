@@ -21,6 +21,7 @@
 pub mod adapter;
 pub mod claude;
 pub mod codex;
+pub mod context;
 pub mod gemini;
 pub mod heuristic;
 pub mod opencode;
@@ -35,6 +36,10 @@ pub use adapter::{
 };
 pub use claude::{ClaudeCodeAdapter, HookTransport};
 pub use codex::{CodexAdapter, CodexTransport};
+pub use context::{
+    parse_context_tail, read_context_tail, ContextObservation, ContextTailRead, TranscriptFormat,
+    MAX_CONTEXT_TAIL_BYTES,
+};
 pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
 pub use opencode::OpenCodeAdapter;
