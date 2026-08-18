@@ -8,8 +8,9 @@ use crate::codec::{from_json, from_tag, json, tag};
 use crate::error::{Result, StoreError};
 use crate::redact::{redact_layout, session_for_persistence};
 use crate::repo::node::{build_tree, from_row as node_from_row, upsert_node};
-use rusqlite::{params, Connection, Row};
-use turn_core::ids::{CheckoutId, SessionId, TemplateId, WorkspaceId};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use std::collections::HashSet;
+use turn_core::ids::{CheckoutId, NodeId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::session::{RestoreState, SessionStatus};
 use turn_core::model::{Layout, ProcessNode, Session, SessionMode, SessionTree};
 use turn_core::state::Lifecycle;
@@ -44,6 +45,33 @@ impl<'a> SessionRepo<'a> {
     pub fn save(&self, session: &Session) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         save_in(&tx, session)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves a Session after two durable Process identities were proved to name
+    /// the same logical node.
+    ///
+    /// Every typed reference is canonicalised in the same transaction that
+    /// prunes the retired `process_nodes` row. A failed remap therefore leaves
+    /// both the old node and every piece of its history untouched.
+    pub fn save_after_node_remaps(
+        &self,
+        session: &Session,
+        remaps: &[(NodeId, NodeId)],
+    ) -> Result<()> {
+        if remaps.is_empty() {
+            return self.save(session);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        validate_node_remaps(&tx, session, remaps)?;
+        for (from, to) in remaps {
+            remap_node_references_in(&tx, &session.id, from, to)?;
+        }
+        save_in(&tx, session)?;
+        for (_, survivor) in remaps {
+            deduplicate_preview_history(&tx, survivor)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -323,6 +351,222 @@ pub(crate) fn save_in(conn: &Connection, session: &Session) -> Result<()> {
     Ok(())
 }
 
+fn validate_node_remaps(
+    conn: &Connection,
+    session: &Session,
+    remaps: &[(NodeId, NodeId)],
+) -> Result<()> {
+    let mut retired = HashSet::new();
+    for (from, to) in remaps {
+        let structurally_invalid = from == to
+            || !retired.insert(from.clone())
+            || session.tree.get(from).is_some()
+            || session.tree.get(to).is_none()
+            || session
+                .tree
+                .iter()
+                .any(|node| node.parent.as_ref() == Some(from))
+            || session
+                .layout
+                .panes()
+                .iter()
+                .any(|pane| pane.node_id.as_ref() == Some(from));
+        if structurally_invalid {
+            return Err(StoreError::InvalidSessionCreation {
+                session_id: session.id.to_string(),
+                reason: format!("invalid Process identity remap {from} -> {to}"),
+            });
+        }
+
+        for id in [from, to] {
+            let owner: Option<String> = conn
+                .query_row(
+                    "SELECT session_id FROM process_nodes WHERE id = ?1",
+                    params![id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if owner.as_deref() != Some(session.id.as_str()) {
+                return Err(StoreError::UnknownReference {
+                    what: "Process identity remap",
+                    missing: id.to_string(),
+                });
+            }
+        }
+    }
+    if remaps
+        .iter()
+        .any(|(_, to)| retired.iter().any(|from| from == to))
+    {
+        return Err(StoreError::InvalidSessionCreation {
+            session_id: session.id.to_string(),
+            reason: "Process identity remaps may not form chains".into(),
+        });
+    }
+    Ok(())
+}
+
+fn remap_node_references_in(
+    conn: &Connection,
+    session: &SessionId,
+    from: &NodeId,
+    to: &NodeId,
+) -> Result<()> {
+    super::event::remap_node_references_in(conn, session, from, to)?;
+    super::attention::remap_node_references_in(conn, session, from, to)?;
+
+    // These two tables have real Process-node foreign keys. Move them before
+    // `save_in` prunes `from`, otherwise ON DELETE CASCADE would erase history
+    // and bindings instead of canonicalising them.
+    conn.execute(
+        "UPDATE activity_previews SET node_id = ?2 WHERE node_id = ?1",
+        params![from.as_str(), to.as_str()],
+    )?;
+    conn.execute(
+        "UPDATE pane_node_bindings SET node_id = ?3 \
+         WHERE session_id = ?1 AND node_id = ?2",
+        params![session.as_str(), from.as_str(), to.as_str()],
+    )?;
+
+    remap_tree_ui_state(conn, from, to)?;
+    conn.execute(
+        "UPDATE tree_surface_preferences SET scroll_node_id = ?2 \
+         WHERE scroll_node_id = ?1 AND scroll_node_kind IN ('agent', 'process')",
+        params![from.as_str(), to.as_str()],
+    )?;
+
+    // The Claude repair currently accepts leaf nodes only. Keeping this update
+    // here makes the storage primitive honest if another proven identity merge
+    // later has children: no descendant can become invisible through a dangling
+    // parent reference.
+    conn.execute(
+        "UPDATE process_nodes SET parent = ?3 \
+         WHERE session_id = ?1 AND parent = ?2",
+        params![session.as_str(), from.as_str(), to.as_str()],
+    )?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct StoredTreeState {
+    surface_id: String,
+    node_kind: String,
+    expanded: bool,
+    selected: bool,
+    manual_order: Option<i32>,
+    visibility_mode: Option<String>,
+    updated_ms: i64,
+}
+
+fn remap_tree_ui_state(conn: &Connection, from: &NodeId, to: &NodeId) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT surface_id, node_kind, expanded, selected, manual_order, visibility_mode, \
+                updated_ms \
+         FROM tree_ui_state WHERE node_id = ?1 AND node_kind IN ('agent', 'process')",
+    )?;
+    let rows = stmt.query_map(params![from.as_str()], |row| {
+        Ok(StoredTreeState {
+            surface_id: row.get("surface_id")?,
+            node_kind: row.get("node_kind")?,
+            expanded: row.get("expanded")?,
+            selected: row.get("selected")?,
+            manual_order: row.get("manual_order")?,
+            visibility_mode: row.get("visibility_mode")?,
+            updated_ms: row.get("updated_ms")?,
+        })
+    })?;
+    let retired = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for old in retired {
+        let existing = conn
+            .query_row(
+                "SELECT surface_id, node_kind, expanded, selected, manual_order, \
+                        visibility_mode, updated_ms \
+                 FROM tree_ui_state \
+                 WHERE surface_id = ?1 AND node_kind = ?2 AND node_id = ?3",
+                params![old.surface_id, old.node_kind, to.as_str()],
+                |row| {
+                    Ok(StoredTreeState {
+                        surface_id: row.get("surface_id")?,
+                        node_kind: row.get("node_kind")?,
+                        expanded: row.get("expanded")?,
+                        selected: row.get("selected")?,
+                        manual_order: row.get("manual_order")?,
+                        visibility_mode: row.get("visibility_mode")?,
+                        updated_ms: row.get("updated_ms")?,
+                    })
+                },
+            )
+            .optional()?;
+        conn.execute(
+            "DELETE FROM tree_ui_state \
+             WHERE surface_id = ?1 AND node_kind = ?2 AND node_id = ?3",
+            params![old.surface_id, old.node_kind, from.as_str()],
+        )?;
+
+        if let Some(current) = existing {
+            let old_is_newer = old.updated_ms >= current.updated_ms;
+            let manual_order = if old_is_newer {
+                old.manual_order.or(current.manual_order)
+            } else {
+                current.manual_order.or(old.manual_order)
+            };
+            let visibility_mode = if old_is_newer {
+                old.visibility_mode.or(current.visibility_mode)
+            } else {
+                current.visibility_mode.or(old.visibility_mode)
+            };
+            conn.execute(
+                "UPDATE tree_ui_state SET expanded = ?4, selected = ?5, manual_order = ?6, \
+                        visibility_mode = ?7, updated_ms = ?8 \
+                 WHERE surface_id = ?1 AND node_kind = ?2 AND node_id = ?3",
+                params![
+                    old.surface_id,
+                    old.node_kind,
+                    to.as_str(),
+                    old.expanded || current.expanded,
+                    old.selected || current.selected,
+                    manual_order,
+                    visibility_mode,
+                    old.updated_ms.max(current.updated_ms),
+                ],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO tree_ui_state \
+                     (surface_id, node_kind, node_id, expanded, selected, manual_order, \
+                      visibility_mode, updated_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    old.surface_id,
+                    old.node_kind,
+                    to.as_str(),
+                    old.expanded,
+                    old.selected,
+                    old.manual_order,
+                    old.visibility_mode,
+                    old.updated_ms,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn deduplicate_preview_history(conn: &Connection, node: &NodeId) -> Result<()> {
+    conn.execute(
+        "DELETE FROM activity_previews \
+         WHERE node_id = ?1 AND id NOT IN ( \
+             SELECT MIN(id) FROM activity_previews WHERE node_id = ?1 \
+             GROUP BY raw_source_sequence, normalized_text, source_type, confidence, stable, \
+                      contains_sensitive_data, redacted, created_ms \
+         )",
+        params![node.as_str()],
+    )?;
+    Ok(())
+}
+
 fn write_layout(conn: &Connection, id: &SessionId, layout: &Layout, now_ms: i64) -> Result<()> {
     let safe = redact_layout(layout);
     conn.execute(
@@ -450,10 +694,17 @@ mod tests {
     use super::*;
     use crate::redact::REDACTED;
     use crate::testing;
+    use turn_core::attention::{AttentionDemandKind, AttentionEntry, EntryState};
+    use turn_core::event::{EventKind, EventSource, TurnEvent};
+    use turn_core::ids::AttentionId;
+    use turn_core::model::hierarchy::{
+        ActivityPreview, HierarchyNodeKind, PaneNodeBinding, PreviewSource, TreeSurfacePreferences,
+        TreeUiState,
+    };
     use turn_core::model::layout::{Direction, Pane, PaneKind, RestoreBehaviour};
     use turn_core::model::node::{NodeKind, Relation};
     use turn_core::state::{AwaitingReason, DisplayState, Turn};
-    use turn_core::AttentionPolicy;
+    use turn_core::{AttentionPolicy, Confidence};
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -479,6 +730,263 @@ mod tests {
         layout.active = Some(agent_id);
 
         Session::new(workspace.clone(), "Fix climbing bugs", "/repo", layout, T0)
+    }
+
+    fn session_with_duplicate_agents(
+        store: &crate::Store,
+    ) -> (Session, NodeId, NodeId, ActivityPreview) {
+        let workspace = testing::saved_workspace(store, "identity-remap");
+        let mut session = session_with_three_panes(&workspace.id);
+        let mut survivor = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0);
+        survivor.kind = NodeKind::Subagent;
+        let survivor_id = survivor.id.clone();
+        let survivor_preview = ActivityPreview {
+            node_id: survivor_id.clone(),
+            raw_source_sequence: Some(7),
+            normalized_text: "review complete".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: T0 + 7,
+        };
+        survivor.activity_preview = Some(survivor_preview.clone());
+
+        let mut retired = ProcessNode::agent(session.id.clone(), "claude", "/repo", T0 + 1);
+        retired.kind = NodeKind::Subagent;
+        let retired_id = retired.id.clone();
+        retired.activity_preview = Some(ActivityPreview {
+            node_id: retired_id.clone(),
+            ..survivor_preview.clone()
+        });
+        session.tree.insert(survivor);
+        session.tree.insert(retired);
+        store.sessions().save(&session).unwrap();
+        (session, retired_id, survivor_id, survivor_preview)
+    }
+
+    #[test]
+    fn a_node_identity_remap_preserves_typed_history_and_merges_navigation_state() {
+        let store = testing::store();
+        let (mut session, retired, survivor, preview) = session_with_duplicate_agents(&store);
+
+        let mut event = TurnEvent::new(
+            session.id.clone(),
+            EventKind::ProcessSpawnedChild {
+                child: retired.clone(),
+                pid: 42,
+                ppid: None,
+                command: format!("literal evidence mentions {retired}"),
+                args: Vec::new(),
+                cwd: None,
+                confirmed_parent: true,
+            },
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            T0 + 8,
+        )
+        .with_node(retired.clone())
+        .with_parent(retired.clone());
+        event.dedup_key = format!(
+            "{}|subject:{retired}|lifecycle-subject:{retired}",
+            event.dedup_key
+        );
+        let event_id = event.id.clone();
+        let original_source = event.source.clone();
+        store.events().append(&event).unwrap();
+
+        let attention = AttentionEntry {
+            id: AttentionId::new(),
+            session_id: session.id.clone(),
+            node_id: Some(retired.clone()),
+            parent_node_id: Some(retired.clone()),
+            subject_external_id: None,
+            reason: AwaitingReason::Permission,
+            summary: Some("approve".into()),
+            confidence: Confidence::Explicit,
+            created_ms: T0 + 9,
+            updated_ms: T0 + 9,
+            state: EntryState::Pending,
+            priority_boost: 0,
+            survives_owner_exit: false,
+            demand_kind: AttentionDemandKind::Interaction,
+        };
+        store.attention().upsert(&attention).unwrap();
+
+        for state in [
+            TreeUiState {
+                surface_id: "main-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: survivor.to_string(),
+                expanded: false,
+                selected: true,
+                manual_order: Some(8),
+                visibility_mode: None,
+                updated_ms: T0 + 2,
+            },
+            TreeUiState {
+                surface_id: "main-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: retired.to_string(),
+                expanded: true,
+                selected: false,
+                manual_order: Some(3),
+                visibility_mode: Some("expanded".into()),
+                updated_ms: T0 + 3,
+            },
+        ] {
+            store.hierarchy().save_tree_state(&state).unwrap();
+        }
+        let mut surface = TreeSurfacePreferences::normal("main-window");
+        surface.scroll_anchor_kind = Some(HierarchyNodeKind::Process);
+        surface.scroll_anchor_id = Some(retired.to_string());
+        store
+            .hierarchy()
+            .save_tree_surface_preferences(&surface)
+            .unwrap();
+        let temporary_pane = PaneNodeBinding {
+            pane_id: turn_core::ids::PaneId::new(),
+            session_id: session.id.clone(),
+            node_id: retired.clone(),
+            temporary: true,
+            surface_id: Some("main-window".into()),
+            opened_ms: T0 + 4,
+        };
+        store.hierarchy().bind_pane(&temporary_pane).unwrap();
+
+        session.tree.remove(&retired);
+        store
+            .sessions()
+            .save_after_node_remaps(&session, &[(retired.clone(), survivor.clone())])
+            .unwrap();
+
+        assert!(store.nodes().get(&retired).unwrap().is_none());
+        let remapped = store.events().get(&event_id).unwrap().unwrap();
+        assert_eq!(remapped.timestamp_ms, T0 + 8);
+        assert_eq!(remapped.source, original_source);
+        assert_eq!(remapped.node_id.as_ref(), Some(&survivor));
+        assert_eq!(remapped.parent_node_id.as_ref(), Some(&survivor));
+        assert!(remapped.dedup_key.contains(&format!("subject:{survivor}")));
+        assert!(!remapped.dedup_key.contains(retired.as_str()));
+        let EventKind::ProcessSpawnedChild { child, command, .. } = remapped.kind else {
+            panic!("typed child event")
+        };
+        assert_eq!(child, survivor);
+        assert_eq!(
+            command,
+            format!("literal evidence mentions {retired}"),
+            "free text is evidence, not an identity reference"
+        );
+
+        let attention = store.attention().list_for_session(&session.id).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].node_id.as_ref(), Some(&survivor));
+        assert_eq!(attention[0].parent_node_id.as_ref(), Some(&survivor));
+
+        let previews = store.hierarchy().preview_history(&survivor, 20).unwrap();
+        assert_eq!(previews.len(), 1, "identical histories collapse once");
+        assert_eq!(previews[0].normalized_text, preview.normalized_text);
+        assert!(store
+            .hierarchy()
+            .preview_history(&retired, 20)
+            .unwrap()
+            .is_empty());
+
+        let tree = store.hierarchy().tree_state("main-window").unwrap();
+        let merged = tree
+            .iter()
+            .find(|state| state.node_id == survivor.as_str())
+            .unwrap();
+        assert!(merged.expanded);
+        assert!(merged.selected);
+        assert_eq!(merged.manual_order, Some(3));
+        assert_eq!(merged.visibility_mode.as_deref(), Some("expanded"));
+        assert!(!tree.iter().any(|state| state.node_id == retired.as_str()));
+        assert_eq!(
+            store
+                .hierarchy()
+                .tree_surface_preferences("main-window")
+                .unwrap()
+                .scroll_anchor_id
+                .as_deref(),
+            Some(survivor.as_str())
+        );
+        assert!(store
+            .hierarchy()
+            .bindings_for_session(&session.id)
+            .unwrap()
+            .iter()
+            .any(
+                |binding| binding.pane_id == temporary_pane.pane_id && binding.node_id == survivor
+            ));
+    }
+
+    #[test]
+    fn a_failed_node_identity_remap_rolls_back_every_reference_and_the_node_prune() {
+        let store = testing::store();
+        let (mut session, retired, survivor, _) = session_with_duplicate_agents(&store);
+        let event = TurnEvent::new(
+            session.id.clone(),
+            EventKind::AgentIdle,
+            EventSource::Supervisor,
+            Confidence::Explicit,
+            T0 + 8,
+        )
+        .with_node(retired.clone());
+        store.events().append(&event).unwrap();
+        store
+            .hierarchy()
+            .save_tree_state(&TreeUiState {
+                surface_id: "rollback-window".into(),
+                node_kind: HierarchyNodeKind::Process,
+                node_id: retired.to_string(),
+                expanded: true,
+                selected: false,
+                manual_order: None,
+                visibility_mode: None,
+                updated_ms: T0 + 9,
+            })
+            .unwrap();
+        session.tree.remove(&retired);
+
+        store
+            .connection()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_identity_prune BEFORE DELETE ON process_nodes \
+                 WHEN OLD.id = '{}' BEGIN SELECT RAISE(ABORT, 'forced rollback'); END;",
+                retired.as_str()
+            ))
+            .unwrap();
+        store
+            .sessions()
+            .save_after_node_remaps(&session, &[(retired.clone(), survivor.clone())])
+            .expect_err("the forced prune failure must abort the transaction");
+
+        assert!(store.nodes().get(&retired).unwrap().is_some());
+        assert_eq!(
+            store.events().get(&event.id).unwrap().unwrap().node_id,
+            Some(retired.clone())
+        );
+        assert_eq!(
+            store
+                .hierarchy()
+                .preview_history(&retired, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .hierarchy()
+                .preview_history(&survivor, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        let tree = store.hierarchy().tree_state("rollback-window").unwrap();
+        assert!(tree.iter().any(|state| state.node_id == retired.as_str()));
+        assert!(!tree.iter().any(|state| state.node_id == survivor.as_str()));
     }
 
     /// Deleting a Session leaves nothing of it anywhere.

@@ -144,6 +144,62 @@ pub(crate) fn replace_all_in(conn: &Connection, queue: &AttentionQueue) -> Resul
     Ok(())
 }
 
+/// Repoints the typed owner/correlation scope of a Session's attention entries.
+///
+/// The Session slice is rebuilt oldest-first so two rows that become the same
+/// demand after canonicalisation collapse through [`AttentionQueue`]'s normal
+/// semantics instead of tripping the durable unique key or arbitrarily winning.
+pub(crate) fn remap_node_references_in(
+    conn: &Connection,
+    session: &SessionId,
+    from: &NodeId,
+    to: &NodeId,
+) -> Result<usize> {
+    let sql = format!(
+        "SELECT {COLUMNS} FROM attention_entries WHERE session_id = ?1 \
+         ORDER BY created_ms ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![session.as_str()])?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next()? {
+        entries.push(from_row(row)?);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let mut changed = 0usize;
+    for entry in &mut entries {
+        if entry.node_id.as_ref() == Some(from) {
+            entry.node_id = Some(to.clone());
+            changed += 1;
+        }
+        if entry.parent_node_id.as_ref() == Some(from) {
+            entry.parent_node_id = Some(to.clone());
+            changed += 1;
+        }
+    }
+    if changed == 0 {
+        return Ok(0);
+    }
+
+    let mut canonical = AttentionQueue::new();
+    for entry in entries {
+        canonical.upsert(entry);
+    }
+    conn.execute(
+        "DELETE FROM attention_entries WHERE session_id = ?1",
+        params![session.as_str()],
+    )?;
+    for entry in canonical
+        .iter()
+        .filter(|entry| &entry.session_id == session)
+    {
+        upsert_entry(conn, entry)?;
+    }
+    Ok(changed)
+}
+
 /// Writes one demand without opening a transaction, so a caller can batch.
 fn upsert_entry(conn: &Connection, entry: &AttentionEntry) -> Result<AttentionId> {
     let mut safe = entry.clone();

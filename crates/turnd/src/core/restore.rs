@@ -70,15 +70,26 @@ impl Core {
             .attention()
             .load_queue()?
             .iter()
-            .filter_map(|entry| entry.node_id.clone())
+            .flat_map(|entry| [entry.node_id.clone(), entry.parent_node_id.clone()])
+            .flatten()
             .collect();
         let mut subagent_alias_repairs = 0usize;
         for id in &stored {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
             if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
-                let repaired =
-                    repair_legacy_claude_subagent_aliases(&mut session, &protected_attention_nodes);
+                let mut protected_nodes = protected_attention_nodes.clone();
+                protected_nodes.extend(session.tree.iter().filter_map(|node| {
+                    std::fs::symlink_metadata(paths::node_terminal_history(
+                        &self.data_dir,
+                        &session.id,
+                        &node.id,
+                    ))
+                    .is_ok()
+                    .then_some(node.id.clone())
+                }));
+                let repairs = repair_legacy_claude_subagent_aliases(&mut session, &protected_nodes);
+                let repaired = repairs.len();
                 subagent_alias_repairs += repaired;
                 let navigation_migrated = migrate_obsolete_navigation_panes(&mut session);
                 let guard_downgraded =
@@ -108,7 +119,13 @@ impl Core {
                     // materialise the replacement Shell during restore. False is not
                     // upgraded here: legacy/orphaned processes may never have been
                     // sandboxed even when this platform can guard a future launch.
-                    self.store.sessions().save(&session)?;
+                    if repairs.is_empty() {
+                        self.store.sessions().save(&session)?;
+                    } else {
+                        self.store
+                            .sessions()
+                            .save_after_node_remaps(&session, &repairs)?;
+                    }
                 }
                 self.sessions.insert(session.id.clone(), session);
             }
@@ -643,7 +660,7 @@ struct LegacyAliasPair {
 fn repair_legacy_claude_subagent_aliases(
     session: &mut Session,
     attention_nodes: &HashSet<NodeId>,
-) -> usize {
+) -> Vec<(NodeId, NodeId)> {
     let mut protected = attention_nodes.clone();
     protected.extend(
         session
@@ -674,7 +691,7 @@ fn repair_legacy_claude_subagent_aliases(
         }
     }
 
-    let mut repaired = 0usize;
+    let mut repairs = Vec::new();
     for ((_parent, alias), pair) in pairs {
         let ([lifecycle_id], [team_id]) = (pair.lifecycle.as_slice(), pair.parent_spawn.as_slice())
         else {
@@ -729,9 +746,9 @@ fn repair_legacy_claude_subagent_aliases(
             alias,
             "repaired duplicate Claude subagent identities"
         );
-        repaired += 1;
+        repairs.push((removed_id, survivor_id));
     }
-    repaired
+    repairs
 }
 
 fn is_claude_parent(tree: &turn_core::model::SessionTree, parent: &NodeId) -> bool {
@@ -907,9 +924,10 @@ mod migration_tests {
     use crate::core::testing::Harness;
     use crate::core::FailedIngestCheckpoint;
     use turn_core::event::{Confidence, EventKind, EventSource, Risk, TurnEvent};
-    use turn_core::ids::{PaneId, WorkspaceId};
+    use turn_core::ids::{HandoffId, PaneId, WorkspaceId};
     use turn_core::model::{
-        AgentName, Direction, Layout, NameSource, Pane, PendingPermission, ProcessNode, Relation,
+        AgentName, ContextHandoffMode, ContextHandoffOutcome, Direction, Layout, NameSource, Pane,
+        PendingPermission, ProcessNode, Relation,
     };
     use turn_core::state::{AwaitingReason, Turn};
 
@@ -971,6 +989,39 @@ mod migration_tests {
         session.tree.insert(lifecycle);
         harness.core.persist_session(&session_id).unwrap();
 
+        let sent = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ContextHandoffFinished {
+                handoff_id: HandoffId::from_stored("handoff_legacy_sent"),
+                target_node_id: parent_id.clone(),
+                mode: ContextHandoffMode::ReviewHandoff,
+                outcome: ContextHandoffOutcome::Submitted,
+            },
+            EventSource::UserAction,
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_node(lifecycle_id.clone());
+        let received = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ContextHandoffFinished {
+                handoff_id: HandoffId::from_stored("handoff_legacy_received"),
+                target_node_id: lifecycle_id.clone(),
+                mode: ContextHandoffMode::SecondOpinion,
+                outcome: ContextHandoffOutcome::Submitted,
+            },
+            EventSource::UserAction,
+            Confidence::Explicit,
+            NOW + 5,
+        )
+        .with_node(parent_id);
+        harness
+            .core
+            .store
+            .events()
+            .append_all(&[sent, received])
+            .unwrap();
+
         let mut restored = harness
             .core
             .store
@@ -983,10 +1034,8 @@ mod migration_tests {
             2,
             "legacy duplicate fixture"
         );
-        assert_eq!(
-            repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new()),
-            1
-        );
+        let repairs = repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new());
+        assert_eq!(repairs.len(), 1);
         assert_eq!(restored.tree.subagent_count(), 1);
         assert!(restored.tree.get(&lifecycle_id).is_none());
         let worker = restored.tree.get(&team_id).unwrap();
@@ -1013,7 +1062,12 @@ mod migration_tests {
             team_id
         );
 
-        harness.core.store.sessions().save(&restored).unwrap();
+        harness
+            .core
+            .store
+            .sessions()
+            .save_after_node_remaps(&restored, &repairs)
+            .unwrap();
         let round_trip = harness
             .core
             .store
@@ -1034,6 +1088,29 @@ mod migration_tests {
                 .unwrap()
                 .id
         );
+        let handoffs = harness
+            .core
+            .store
+            .events()
+            .list_of_kind(&session_id, "context_handoff.finished", 10)
+            .unwrap();
+        assert_eq!(handoffs.len(), 2);
+        assert!(handoffs.iter().all(|event| {
+            event.node_id.as_ref() != Some(&lifecycle_id)
+                && matches!(
+                    &event.kind,
+                    EventKind::ContextHandoffFinished { target_node_id, .. }
+                        if target_node_id != &lifecycle_id
+                )
+        }));
+        assert!(handoffs
+            .iter()
+            .any(|event| event.node_id.as_ref() == Some(&team_id)));
+        assert!(handoffs.iter().any(|event| matches!(
+            &event.kind,
+            EventKind::ContextHandoffFinished { target_node_id, .. }
+                if target_node_id == &team_id
+        )));
     }
 
     #[test]
