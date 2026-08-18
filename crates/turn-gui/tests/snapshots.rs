@@ -391,9 +391,12 @@ fn add_runtime_metadata(info: &mut AgentInfo, model: &str) {
         ObservationSource::new(ObservationSourceKind::Provider, "claude statusline");
     let configuration = LaunchConfiguration {
         model: Some(model.into()),
+        model_display_name: None,
         permission_mode: Some("default".into()),
         approval_mode: Some("prompt".into()),
         sandbox_mode: Some("workspace write".into()),
+        effort_level: None,
+        thinking_enabled: None,
         safe_flags: vec!["--permission-mode default".into()],
     };
     info.runtime.launch.requested =
@@ -1545,9 +1548,12 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     raw_agent.runtime.launch.current = Observable::observed(
         LaunchConfiguration {
             model: Some(format!("runtime model {SECRET}")),
+            model_display_name: Some(format!("runtime display {SECRET}")),
             permission_mode: Some(format!("runtime mode {SECRET}")),
             approval_mode: Some(format!("runtime approval {SECRET}")),
             sandbox_mode: Some(format!("runtime sandbox {SECRET}")),
+            effort_level: Some("high".into()),
+            thinking_enabled: Some(true),
             safe_flags: vec![format!("--profile={SECRET}")],
         },
         poisoned_source.clone(),

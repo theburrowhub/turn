@@ -1295,7 +1295,13 @@ mod tests {
         let event = TurnEvent::new(
             session_id.clone(),
             EventKind::AgentRuntimeObserved {
-                runtime: Box::new(observed_runtime(NOW + 60_000, 42_000, "gpt-current")),
+                runtime: Box::new(observed_runtime(
+                    NOW + 60_000,
+                    42_000,
+                    "gpt-current",
+                    "high",
+                    58.0,
+                )),
             },
             EventSource::SideChannel {
                 tool: "codex".into(),

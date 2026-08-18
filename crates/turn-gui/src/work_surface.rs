@@ -605,7 +605,7 @@ enum LaunchField {
     PermissionMode,
 }
 
-fn launch_field<'a>(configuration: &'a LaunchConfiguration, field: LaunchField) -> Option<&'a str> {
+fn launch_field(configuration: &LaunchConfiguration, field: LaunchField) -> Option<&str> {
     match field {
         LaunchField::Model => configuration.model.as_deref(),
         LaunchField::PermissionMode => configuration.permission_mode.as_deref(),
@@ -805,17 +805,14 @@ fn inspector_runtime_observation<T>(
     inspector_value(ui, theme, label, &value);
 
     if let Some(source) = observation.source() {
-        let source = source
-            .label
-            .as_deref()
-            .unwrap_or_else(|| match source.kind {
-                ObservationSourceKind::Unknown => "unknown source",
-                ObservationSourceKind::LaunchRequest => "launch request",
-                ObservationSourceKind::Adapter => "adapter",
-                ObservationSourceKind::Provider => "provider",
-                ObservationSourceKind::Process => "process",
-                ObservationSourceKind::Cache => "cache",
-            });
+        let source = source.label.as_deref().unwrap_or(match source.kind {
+            ObservationSourceKind::Unknown => "unknown source",
+            ObservationSourceKind::LaunchRequest => "launch request",
+            ObservationSourceKind::Adapter => "adapter",
+            ObservationSourceKind::Provider => "provider",
+            ObservationSourceKind::Process => "process",
+            ObservationSourceKind::Cache => "cache",
+        });
         inspector_value(ui, theme, &format!("{label} source"), source);
     }
     if let Some(observed_at_ms) = observation.observed_at_ms() {

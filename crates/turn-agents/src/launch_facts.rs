@@ -53,9 +53,12 @@ pub(crate) fn base_launch_configuration(
 ) -> LaunchConfiguration {
     let mut configuration = LaunchConfiguration {
         model: model_argument(args, short_model),
+        model_display_name: None,
         permission_mode: profile.role.is_none().then(|| "Custom".into()),
         approval_mode: None,
         sandbox_mode: None,
+        effort_level: None,
+        thinking_enabled: None,
         safe_flags: safe_flag_names(args),
     };
     apply_profile_posture(&mut configuration, profile);
