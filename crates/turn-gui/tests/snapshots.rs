@@ -35,9 +35,10 @@ use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
     CloseDisposition, HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView,
-    NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext, PtySize,
-    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
-    TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
+    InspectorOriginView, NodePaneCapability, NodePaneView, PaneRestoreOutcome, PaneStream,
+    ProtoErrorContext, PtySize, SessionConflictAlternative, SessionSummary, SessionTreeView,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView,
+    WriteLeaseOwnerView,
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
@@ -47,10 +48,10 @@ use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
 use turn_gui::theme::{AppearanceSettings, Theme};
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    CloseTurnChoice, CloseTurnDraft, CloseTurnSession, LayoutEditorOrigin, LayoutTemplateDraft,
-    LifecycleConfirmation, NewPaneDraft, PaneContent, PanePlacementDraft, PanePlacementSource,
-    PendingPermission, QueueItem, SessionDraft, SessionRestoreView, SessionRow,
-    TemporaryPaneContent, TurnView, ViewAction, ViewState, WorkspaceDraft,
+    CloseTurnChoice, CloseTurnDraft, CloseTurnSession, HierarchyAction, LayoutEditorOrigin,
+    LayoutTemplateDraft, LifecycleConfirmation, NewPaneDraft, PaneContent, PanePlacementDraft,
+    PanePlacementSource, PendingPermission, QueueItem, SessionDraft, SessionRestoreView,
+    SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState, ViewTarget, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -655,7 +656,10 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
             revision: 23,
             tree_state: TreeSurfaceState {
                 surface_id: "window-snapshot".into(),
-                selected: Some(HierarchyKey::process(claude_id.clone())),
+                // The general-purpose fixture starts on the Session Layout. Tests for
+                // exact Node WorkSurfaces select their Node explicitly, just as the
+                // operator does, so pane/layout tests do not accidentally test a Node view.
+                selected: Some(HierarchyKey::session(session_id.clone())),
                 expanded: vec![
                     HierarchyKey::workspace(workspace_id.clone()),
                     HierarchyKey::session(session_id.clone()),
@@ -787,6 +791,49 @@ fn session_inspector(fixture: &Fixture) -> InspectorDetails {
             confidence: Confidence::Explicit,
             severity: Severity::Warning,
         }],
+    }
+}
+
+fn node_inspector(fixture: &Fixture, node_id: &NodeId) -> InspectorDetails {
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let session = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| session.nodes.iter().any(|node| &node.node_id == node_id))
+        .expect("node's Session");
+    let node = session
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == node_id)
+        .expect("inspected node")
+        .clone();
+    let session_name = session.session.name.clone();
+    if node.is_agentic {
+        InspectorDetails::Agent {
+            session_name,
+            node: Box::new(node),
+            parent: None,
+            process_group: None,
+            origin: InspectorOriginView {
+                label: "claude-code hook".into(),
+                confidence: Confidence::Explicit,
+            },
+            history: Vec::new(),
+            handoffs: Vec::new(),
+        }
+    } else {
+        InspectorDetails::Process {
+            session_name,
+            node: Box::new(node),
+            parent: None,
+            process_group: None,
+            origin: InspectorOriginView {
+                label: "structured adapter".into(),
+                confidence: Confidence::Explicit,
+            },
+            history: Vec::new(),
+        }
     }
 }
 
@@ -929,22 +976,32 @@ fn coming_back_to_a_session_has_no_manual_start_actions() {
     );
 }
 
-/// Pointing at one worker among many, and getting the layout back.
-///
-/// An agent managing four subagents runs all of them inside one pane, so the tree could list them
-/// and not show them: finding the one you cared about meant reading output from four. Clicking a
-/// subagent now maximises the pane it runs in, and clicking what owns it — its agent, its Session
-/// — puts the layout back.
 #[test]
-fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout() {
-    let fixture = busy_desk();
+fn selecting_a_semantic_subagent_opens_its_exact_full_work_surface_without_touching_layout() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+    let session_id = fixture.selected.clone().expect("active Session");
+    let expected_layout = fixture.layout.clone().expect("saved layout");
+    let expected_layout_bytes = serde_json::to_vec(&expected_layout).expect("serialise Layout");
     let mut h = harness(fixture);
     h.run();
     h.run();
 
-    // A subagent, which has no pane of its own.
     let rows = tree_row_labels(&h);
-    let subagent = rows
+    let reviewer = rows
         .iter()
         .find(|label| label.contains("Reviewer"))
         .unwrap_or_else(|| panic!("the fixture has a subagent row: {rows:?}"))
@@ -957,73 +1014,685 @@ fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout
     };
 
     h.state_mut().actions.clear();
-    click_tree_row(&h, &subagent);
-    h.run_steps(1);
-    let zoomed: Vec<&ViewAction> = h
-        .state()
-        .actions
-        .iter()
-        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
-        .collect();
+    click_tree_row(&h, &reviewer);
+    h.run();
+    h.run();
+
     assert_eq!(
-        zoomed.len(),
-        1,
-        "clicking a subagent asks for exactly one pane to be shown: {:?}",
-        h.state().actions
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id.clone()))
     );
-
-    // The layout the daemon answers with, so the window's next decision is made against the
-    // state the daemon reports rather than against a guess.
-    let pane = match zoomed[0] {
-        ViewAction::ZoomPane { pane_id, .. } => pane_id.clone(),
-        _ => unreachable!(),
-    };
-    let mut layout = h.state().fixture.layout.clone().expect("a layout");
-    assert!(layout.toggle_zoom(&pane), "the pane the click named exists");
-    assert_eq!(layout.zoomed.as_ref(), Some(&pane));
-    h.state_mut().fixture.layout = Some(layout);
-    h.run();
-    h.run();
-
-    // Clicking the same subagent again does *not* toggle it back off. `zoom_pane` toggles, so a
-    // second click on a row already being shown would un-maximise the pane and the tree would
-    // flicker instead of holding still.
-    h.state_mut().actions.clear();
-    click_tree_row(&h, &subagent);
-    h.run_steps(1);
     assert!(
-        !h.state()
-            .actions
-            .iter()
-            .any(|action| matches!(action, ViewAction::ZoomPane { .. })),
-        "a pane already being shown must not be un-maximised by pointing at it again: {:?}",
-        h.state().actions
+        h.query_all_by_role(egui::accesskit::Role::Group)
+            .filter_map(|group| group.accesskit_node().label())
+            .any(|label| label == "WorkSurface for exact SUBAGENT Reviewer"),
+        "the accessible surface names the semantic child, not its runtime owner"
+    );
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::ZoomPane { .. } | ViewAction::SelectSession(_)
+    )));
+    let hierarchy_actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &reviewer_id
+    )));
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Inspect {
+            key: HierarchyKey::Process { node_id },
+        } if node_id == &reviewer_id
+    )));
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::QuickPreview { node_id, .. } if node_id == &reviewer_id
+    )));
+    assert!(!hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+    assert_eq!(
+        serde_json::to_vec(h.state().fixture.layout.as_ref().expect("saved layout"))
+            .expect("serialise Layout"),
+        expected_layout_bytes,
+        "node navigation leaves active Pane, zoom and every Layout byte untouched"
     );
 
-    // And clicking the agent that owns it puts the layout back.
-    let owner = rows
+    let text = all_text(&h).join("\n");
+    assert!(text.contains("Review the climbing logic changes"));
+    assert!(text.contains("Reviewing climb_system.gd"));
+    assert!(text.contains("Checking state transitions and edge cases"));
+    assert!(!text.contains("I'll fix the climbing bug. Running the tests first."));
+    assert!(!text.contains("Do you want to allow this?"));
+    let buttons = button_labels(&h);
+    assert!(buttons.iter().all(|label| {
+        !label.starts_with("Start")
+            && !label.contains("Focus exact Pane")
+            && !label.contains("Open temporary pane")
+    }));
+
+    let geometry = h
+        .state()
+        .state
+        .work_surface_geometry
+        .expect("Node WorkSurface geometry");
+    assert!(!geometry.stacked);
+    assert!((240.0..=320.0).contains(&geometry.details_width));
+    assert!(geometry.width > 850.0 && geometry.height > 620.0);
+    assert!(geometry.primary_height > geometry.height * 0.72);
+    assert!(geometry.primary_width > geometry.details_width);
+    h.snapshot("subagent_work_surface");
+
+    // Returning to the Session is the exact saved Layout. It does not unzoom, focus,
+    // or otherwise compensate for the Node view because navigation changed none of it.
+    let session = rows
         .iter()
-        .find(|label| label.contains("Claude Code"))
-        .expect("the fixture has the owning agent")
+        .find(|label| label.contains("Session Fix climbing bugs"))
+        .expect("the fixture has the Session row")
         .clone();
     h.state_mut().actions.clear();
-    click_tree_row(&h, &owner);
-    h.run_steps(1);
-    let restored: Vec<&ViewAction> = h
+    click_tree_row(&h, &session);
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Session(session_id))
+    );
+    assert_eq!(h.state().fixture.layout.as_ref(), Some(&expected_layout));
+    assert!(!h
         .state()
         .actions
         .iter()
-        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
-        .collect();
+        .any(|action| matches!(action, ViewAction::ZoomPane { .. })));
+}
+
+#[test]
+fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let node_id = |title: &str| {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| node.title == title)
+            .map(|node| node.node_id.clone())
+            .unwrap_or_else(|| panic!("missing {title}"))
+    };
+    let reviewer_id = node_id("Reviewer");
+    let tests_id = node_id("Tests");
+    let reviewer_details = node_inspector(&fixture, &reviewer_id);
+    let tests_details = node_inspector(&fixture, &tests_id);
+    fixture.inspector = Some(reviewer_details);
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let click = |h: &Harness<'static, Window>, fragment: &str| {
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .find(|node| {
+                node.accesskit_node()
+                    .label()
+                    .is_some_and(|label| label.contains(fragment))
+            })
+            .unwrap_or_else(|| panic!("missing tree row containing {fragment:?}"))
+            .click();
+    };
+
+    click(&h, "SUBAGENT Reviewer");
+    h.run();
+    h.run();
     assert_eq!(
-        restored.len(),
-        1,
-        "clicking the owner asks for the maximised pane to be released: {:?}",
-        h.state().actions
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id))
+    );
+    assert!(all_text(&h)
+        .join("\n")
+        .contains("Review the climbing logic changes"));
+
+    h.state_mut().actions.clear();
+    let _ = h.state_mut().state.take_hierarchy_actions();
+    h.state_mut().fixture.inspector = Some(tests_details);
+    click(&h, "SUBAGENT Tests");
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(tests_id.clone()))
+    );
+    let text = all_text(&h).join("\n");
+    assert!(text.contains("Running integration tests — 12/18"));
+    assert!(!text.contains("Review the climbing logic changes"));
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::ZoomPane { .. } | ViewAction::SelectSession(_)
+    )));
+    let actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &tests_id
+    )));
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+}
+
+#[test]
+fn work_surface_controls_take_enter_without_breaking_tree_item_activation() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let node_id = |title: &str| {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| node.title == title)
+            .map(|node| node.node_id.clone())
+            .unwrap_or_else(|| panic!("missing {title}"))
+    };
+    let reviewer_id = node_id("Reviewer");
+    let tests_id = node_id("Tests");
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+    let mut h = harness(fixture);
+    h.run_steps(2);
+
+    h.query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Reviewer"))
+        })
+        .expect("Reviewer TreeItem")
+        .click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id.clone()))
+    );
+
+    h.query_by_label("Rename Agent…")
+        .expect("WorkSurface rename action")
+        .focus();
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Rename Agent…")
+            .expect("focused rename action")
+            .accesskit_node()
+            .is_focused(),
+        "AccessKit focus must leave the tree before Enter"
     );
     assert!(
-        matches!(restored[0], ViewAction::ZoomPane { pane_id, .. } if *pane_id == pane),
-        "and it names the pane that is maximised, which is what un-toggles it"
+        !h.state().state.tree_has_focus,
+        "real WorkSurface focus must release the synthetic tree lease"
+    );
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(
+        h.state().state.node_edit.is_some(),
+        "Enter on the focused WorkSurface action must open its editor"
+    );
+    h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Rename Agent");
+    assert!(matches!(
+        h.state().state.node_edit,
+        Some(turn_gui::view::NodeEditDraft::Rename { ref node_id, .. })
+            if node_id == &reviewer_id
+    ));
+
+    h.state_mut().state.node_edit = None;
+    let tests_details = node_inspector(&h.state().fixture, &tests_id);
+    h.state_mut().fixture.inspector = Some(tests_details);
+    h.run_steps(2);
+    h.query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Tests"))
+        })
+        .expect("Tests TreeItem")
+        .focus();
+    h.run_steps(2);
+    assert!(h
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Tests"))
+        })
+        .expect("focused Tests TreeItem")
+        .accesskit_node()
+        .is_focused());
+    let _ = h.state_mut().state.take_hierarchy_actions();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(tests_id.clone()))
+    );
+    let actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &tests_id
+    )));
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+}
+
+#[test]
+fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(820.0, 640.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window(fixture),
+        );
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id))
+    );
+    let geometry = h
+        .state()
+        .state
+        .work_surface_geometry
+        .expect("Node WorkSurface geometry");
+    assert!(geometry.stacked);
+    assert!(geometry.primary_height > 200.0);
+    assert!(geometry.details_width > 400.0);
+    assert!((geometry.primary_width - geometry.details_width).abs() < 1.0);
+    assert!(geometry.header_height + geometry.primary_height < geometry.height);
+    assert!(all_text(&h)
+        .join("\n")
+        .contains("Review the climbing logic changes"));
+    h.snapshot("subagent_work_surface_narrow");
+}
+
+#[test]
+fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load() {
+    const SECRET: &str = "sk-ant-turn-regression-secret-abcdefghijklmnopqrstuvwxyz";
+    const NAME_SECRET: &str = "ghp_turnagentnamesecretabcdefghijklmnopqrstuvwxyz012345";
+
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    let mut safe_details = node_inspector(&fixture, &reviewer_id);
+    let InspectorDetails::Agent { node, .. } = &mut safe_details else {
+        panic!("Reviewer inspector is agent detail");
+    };
+    node.title = "[redacted Agent name]".into();
+    node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    });
+    node.display_state = DisplayState::NeedsPermission;
+    node.state_label = DisplayState::NeedsPermission.label().into();
+    node.needs_user = true;
+    let safe_agent = node.agent.as_mut().expect("safe agent summary");
+    safe_agent.name = AgentName::declared("[redacted declared name]");
+    safe_agent.agent = AgentRef {
+        provider: Some("[redacted provider]".into()),
+        tool: Some("[redacted tool]".into()),
+        model: Some("[redacted model]".into()),
+        external_id: None,
+    };
+    safe_agent.external_id = None;
+    safe_agent.agent_type = Some("[redacted Agent type]".into());
+    safe_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    };
+    safe_agent.current_task = Some("[redacted task]".into());
+    safe_agent.last_message = Some("[redacted message]".into());
+    safe_agent.pending_permission = Some(turn_core::model::PendingPermission {
+        summary: "[redacted permission]".into(),
+        command: Some("[redacted command]".into()),
+        tool_name: Some("[redacted permission tool]".into()),
+        risk: Risk::High,
+        requested_ms: T0 + 13_000,
+        cwd: Some("[redacted permission cwd]".into()),
+    });
+    safe_agent.pending_question = Some("[redacted question]".into());
+    safe_agent.permission_mode = Some("[redacted permission mode]".into());
+    safe_agent.git_branch = Some("[redacted branch]".into());
+
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    snapshot.tree_state.selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    let raw_node = snapshot
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    raw_node.title = format!("Reviewer {NAME_SECRET}");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    });
+    raw_node.display_state = DisplayState::NeedsPermission;
+    raw_node.state_label = DisplayState::NeedsPermission.label().into();
+    raw_node.needs_user = true;
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.name = AgentName::declared(format!("Reviewer {NAME_SECRET}"));
+    raw_agent.agent = AgentRef {
+        provider: Some(format!("provider {SECRET}")),
+        tool: Some(format!("tool {SECRET}")),
+        model: Some(format!("model {SECRET}")),
+        external_id: Some(format!("external {SECRET}")),
+    };
+    raw_agent.external_id = Some(format!("thread {SECRET}"));
+    raw_agent.agent_type = Some(format!("type {SECRET}"));
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    };
+    raw_agent.current_task = Some(format!("Use credential {SECRET}"));
+    raw_agent.last_message = Some(format!("Credential echoed: {SECRET}"));
+    raw_agent.pending_permission = Some(turn_core::model::PendingPermission {
+        summary: format!("Approve {SECRET}"),
+        command: Some(format!("run {SECRET}")),
+        tool_name: Some(format!("tool {SECRET}")),
+        risk: Risk::High,
+        requested_ms: T0 + 13_000,
+        cwd: Some(format!("/tmp/{SECRET}")),
+    });
+    raw_agent.pending_question = Some(format!("Question containing {SECRET}"));
+    raw_agent.permission_mode = Some(format!("mode {SECRET}"));
+    raw_agent.git_branch = Some(format!("branch/{SECRET}"));
+
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let loading_text = all_text(&h).join("\n");
+    assert!(loading_text.contains("Loading safe task details…"));
+    assert!(loading_text.contains("Agent details loading…"));
+    assert!(
+        !loading_text.contains(SECRET),
+        "raw AgentSummary secrets must not enter painted or accessible text"
+    );
+    let tree_name_occurrences = tree_row_labels(&h).join("\n").matches(NAME_SECRET).count();
+    let unexpected_name_text: Vec<_> = all_text(&h)
+        .into_iter()
+        .filter(|text| {
+            text.contains(NAME_SECRET)
+                && !text.starts_with("SUBAGENT ")
+                && !text.starts_with("Stop agent ")
+                && !text.starts_with("Selection: ")
+        })
+        .collect();
+    assert_eq!(
+        tree_name_occurrences, 1,
+        "the poisoned hierarchy row is present"
+    );
+    assert_eq!(
+        unexpected_name_text,
+        Vec::<String>::new(),
+        "the raw hierarchy title must not escape navigation chrome into WorkSurface"
+    );
+    for action in [
+        "Rename Agent…",
+        "Correct relationship…",
+        "Pass context to Agent…",
+    ] {
+        h.query_by_label(action)
+            .unwrap_or_else(|| panic!("missing disabled {action}"))
+            .click();
+        h.run_steps(1);
+        assert!(h.state().state.node_edit.is_none());
+        assert!(h.state().state.context_handoff.is_none());
+    }
+
+    h.state_mut().fixture.inspector = Some(safe_details);
+    h.run();
+    h.run();
+
+    let safe_text = all_text(&h).join("\n");
+    assert!(safe_text.contains("[redacted task]"));
+    assert!(safe_text.contains("[redacted message]"));
+    assert!(safe_text.contains("[redacted Agent name]"));
+    assert!(safe_text.contains("[redacted permission]"));
+    assert!(safe_text.contains("[redacted provider]"));
+    assert!(safe_text.contains("[redacted tool]"));
+    assert!(safe_text.contains("[redacted model]"));
+    assert!(safe_text.contains("[redacted Agent type]"));
+    assert!(safe_text.contains("[redacted permission mode]"));
+    assert!(safe_text.contains("[redacted branch]"));
+    assert!(
+        !safe_text.contains(SECRET),
+        "only the inspector's redacted projection may supply Agent text"
+    );
+    let unexpected_name_text: Vec<_> = all_text(&h)
+        .into_iter()
+        .filter(|text| {
+            text.contains(NAME_SECRET)
+                && !text.starts_with("SUBAGENT ")
+                && !text.starts_with("Stop agent ")
+                && !text.starts_with("Selection: ")
+        })
+        .collect();
+    assert!(
+        unexpected_name_text.is_empty(),
+        "the safe inspector title must own WorkSurface and accessibility: {unexpected_name_text:?}"
+    );
+
+    // Exercise the question path independently: permission wins when both are present,
+    // so removing it proves a raw pending question cannot bypass the safe projection.
+    if let Some(InspectorDetails::Agent { node, .. }) = h.state_mut().fixture.inspector.as_mut() {
+        node.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        });
+        node.display_state = DisplayState::AskingQuestion;
+        node.state_label = DisplayState::AskingQuestion.label().into();
+        let agent = node.agent.as_mut().expect("safe agent summary");
+        agent.turn = Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        };
+        agent.pending_permission = None;
+        agent.pending_question = Some("[redacted question]".into());
+    }
+    let raw_node = h
+        .state_mut()
+        .fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    });
+    raw_node.display_state = DisplayState::AskingQuestion;
+    raw_node.state_label = DisplayState::AskingQuestion.label().into();
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    };
+    raw_agent.pending_permission = None;
+    let raw_node = h
+        .state_mut()
+        .state
+        .hierarchy
+        .as_mut()
+        .expect("rendered hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("rendered Reviewer row");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    });
+    raw_node.display_state = DisplayState::AskingQuestion;
+    raw_node.state_label = DisplayState::AskingQuestion.label().into();
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    };
+    raw_agent.pending_permission = None;
+    h.run();
+    h.run();
+    let question_text = all_text(&h).join("\n");
+    assert!(question_text.contains("[redacted question]"));
+    assert!(!question_text.contains(SECRET));
+
+    // Keep the visual artifact useful to a reviewer: the fake token remains in the
+    // low-latency hierarchy only for the assertions above, never in the snapshot.
+    let raw_node = h
+        .state_mut()
+        .fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    raw_node.title = "Reviewer".into();
+    let raw_node = h
+        .state_mut()
+        .state
+        .hierarchy
+        .as_mut()
+        .expect("rendered hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("rendered Reviewer row");
+    raw_node.title = "Reviewer".into();
+    h.run();
+    h.run();
+    h.snapshot("subagent_work_surface_redacted");
+}
+
+#[test]
+fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let node = fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.title == "Claude Code")
+        .expect("Claude Code");
+    let node_id = node.node_id.clone();
+    node.pane_capability = NodePaneCapability::Terminal {
+        streams: vec![PaneStream::Cells],
+    };
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(node_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &node_id));
+    let expected_layout = serde_json::to_vec(fixture.layout.as_ref().expect("saved layout"))
+        .expect("serialise Layout");
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(node_id))
+    );
+    let text = all_text(&h).join("\n");
+    assert!(group_labels(&h)
+        .iter()
+        .any(|label| label == "Exact read-only terminal mirror for Claude Code"));
+    assert!(text.contains("I'll fix the climbing bug. Running the tests first."));
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::Pane {
+            action: PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_),
+            ..
+        } | ViewAction::ZoomPane { .. }
+    )));
+    assert_eq!(
+        serde_json::to_vec(h.state().fixture.layout.as_ref().expect("saved layout"))
+            .expect("serialise Layout"),
+        expected_layout
     );
 }
 
@@ -3535,7 +4204,9 @@ fn a_full_screen_application_fills_its_pane() {
         surface_id: None,
         opened_ms: T0 + 15_000,
     });
-    snapshot.tree_state.selected = Some(HierarchyKey::process(fang.node_id.clone()));
+    let fang_id = fang.node_id.clone();
+    snapshot.tree_state.selected = Some(HierarchyKey::process(fang_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &fang_id));
     let mut h = harness(fixture);
     h.run();
     h.snapshot("alternate_screen");
@@ -4155,8 +4826,10 @@ fn every_hierarchy_level_is_a_reachable_tree_item() {
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(
-        selected.iter().any(|label| label.contains("Claude Code")),
-        "selection is independent and belongs to the selected AgentNode; found {selected:?}"
+        selected
+            .iter()
+            .any(|label| label.contains("Fix climbing bugs")),
+        "selection belongs to the exact Session target; found {selected:?}"
     );
 }
 

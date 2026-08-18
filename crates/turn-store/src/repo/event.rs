@@ -298,6 +298,108 @@ pub(crate) fn insert(conn: &Connection, event: &TurnEvent) -> Result<()> {
     Ok(())
 }
 
+/// Canonicalises typed references to one Process node without rewriting Event
+/// identity, provenance, time, or free text.
+///
+/// `kind_json` is decoded as [`EventKind`] before it is changed. A textual
+/// replacement here would also alter commands, prompts, summaries, or any other
+/// historical evidence that happened to mention the old id.
+pub(crate) fn remap_node_references_in(
+    conn: &Connection,
+    session: &SessionId,
+    from: &NodeId,
+    to: &NodeId,
+) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_id, parent_node_id, kind_json, dedup_key \
+         FROM events WHERE session_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![session.as_str()], |row| {
+        Ok((
+            row.get::<_, String>("id")?,
+            row.get::<_, Option<String>>("node_id")?,
+            row.get::<_, Option<String>>("parent_node_id")?,
+            row.get::<_, String>("kind_json")?,
+            row.get::<_, String>("dedup_key")?,
+        ))
+    })?;
+    let stored = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut changed = 0usize;
+    for (id, node_id, parent_node_id, kind_json, dedup_key) in stored {
+        let mut node_id = node_id.map(NodeId::from_stored);
+        let mut parent_node_id = parent_node_id.map(NodeId::from_stored);
+        let mut kind = from_json::<EventKind>("event kind", &id, &kind_json)?;
+
+        let node_changed = node_id.as_ref() == Some(from);
+        if node_changed {
+            node_id = Some(to.clone());
+        }
+        let parent_changed = parent_node_id.as_ref() == Some(from);
+        if parent_changed {
+            parent_node_id = Some(to.clone());
+        }
+        let kind_changed = kind.remap_node_reference(from, to);
+        let remapped_dedup = remap_structured_dedup_key(&dedup_key, from, to);
+        if !(node_changed || parent_changed || kind_changed || remapped_dedup.is_some()) {
+            continue;
+        }
+
+        let kind_json = if kind_changed {
+            redact_json(&json("event kind", &kind)?)
+        } else {
+            kind_json
+        };
+        conn.execute(
+            "UPDATE events SET node_id = ?2, parent_node_id = ?3, kind_json = ?4, \
+                    dedup_key = ?5 WHERE id = ?1 AND session_id = ?6",
+            params![
+                id,
+                node_id.as_ref().map(|node| node.as_str()),
+                parent_node_id.as_ref().map(|node| node.as_str()),
+                kind_json,
+                remapped_dedup.as_deref().unwrap_or(&dedup_key),
+                session.as_str(),
+            ],
+        )?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// Event dedup keys are an internal pipe-delimited projection. Canonicalise only
+/// fields whose grammar names a Process node; agent external ids and arbitrary
+/// segments remain byte-for-byte untouched.
+fn remap_structured_dedup_key(key: &str, from: &NodeId, to: &NodeId) -> Option<String> {
+    let from = from.as_str();
+    let mut changed = false;
+    let parts = key
+        .split('|')
+        .map(|part| {
+            let replacement = if part == from {
+                Some(to.to_string())
+            } else if let Some(node) = part.strip_prefix("subject:unresolved-under:") {
+                (node == from).then(|| format!("subject:unresolved-under:{to}"))
+            } else if let Some((external, parent)) = part.rsplit_once("-unresolved-under:") {
+                (part.starts_with("subject:external:") && parent == from)
+                    .then(|| format!("{external}-unresolved-under:{to}"))
+            } else if let Some(node) = part.strip_prefix("subject:") {
+                (node == from).then(|| format!("subject:{to}"))
+            } else if let Some(node) = part.strip_prefix("lifecycle-subject:") {
+                (node == from).then(|| format!("lifecycle-subject:{to}"))
+            } else {
+                None
+            };
+            if replacement.is_some() {
+                changed = true;
+            }
+            replacement.unwrap_or_else(|| part.to_string())
+        })
+        .collect::<Vec<_>>();
+    changed.then(|| parts.join("|"))
+}
+
 /// Returns the diagnostic note that may cross the durable boundary.
 ///
 /// Hook payloads never do. This repository-level check is intentional defence in

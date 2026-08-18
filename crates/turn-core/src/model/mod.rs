@@ -22,7 +22,10 @@ pub use layout::{
     Child, Direction, DropZone, FloatingPane, Layout, LayoutNode, LayoutPreset, Pane, PaneGeometry,
     PaneKind, PanePlacement, RestoreBehaviour, Split,
 };
-pub use node::{AgentInfo, NodeKind, PendingPermission, ProcessNode, Relation, SessionTree};
+pub use node::{
+    AgentIdentityAlias, AgentIdentitySource, AgentInfo, NodeKind, PendingPermission, ProcessNode,
+    Relation, SessionTree,
+};
 pub use session::{RestoreState, Session, SessionStatus};
 pub use template::Template;
 pub use workspace::Workspace;

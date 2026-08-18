@@ -79,6 +79,15 @@ pub struct AgentInfo {
     pub name: AgentName,
     /// The agent's own conversation/thread id, used to resume it.
     pub external_id: Option<String>,
+    /// Other tool-owned identities that refer to this same logical Agent.
+    ///
+    /// Some runtimes report a worker through more than one structured channel. The
+    /// lifecycle hook and the parent's spawn result can each assign their own id to
+    /// the same child. Keeping the aliases, including which channel established
+    /// them, lets lifecycle and attention events address either id without creating
+    /// two rows in the operator tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_aliases: Vec<AgentIdentityAlias>,
     /// Subagent type reported by the tool ("Explore", "code-reviewer").
     pub agent_type: Option<String>,
     pub current_task: Option<String>,
@@ -92,6 +101,66 @@ pub struct AgentInfo {
     pub git_branch: Option<String>,
     /// Whether this agent can be resumed after its process ends.
     pub resumable: bool,
+}
+
+/// The structured channel that assigned an Agent identity.
+///
+/// This is deliberately about semantics rather than a provider or hook name. Other
+/// adapters can use the same two roles when a runtime exposes both an actual worker
+/// lifecycle and a parent-side spawn declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIdentitySource {
+    /// The worker runtime's own start/stop lifecycle channel.
+    Lifecycle,
+    /// The parent runtime's structured result declaring the child it spawned.
+    ParentSpawn,
+}
+
+/// One exact external id known to identify an Agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentIdentityAlias {
+    pub source: AgentIdentitySource,
+    pub external_id: String,
+}
+
+impl AgentInfo {
+    /// Whether an external callback names this Agent through any known identity.
+    pub fn matches_external_id(&self, external_id: &str) -> bool {
+        self.external_id.as_deref() == Some(external_id)
+            || self.agent.external_id.as_deref() == Some(external_id)
+            || self
+                .identity_aliases
+                .iter()
+                .any(|alias| alias.external_id == external_id)
+    }
+
+    /// Whether this Agent already has an identity from a particular channel.
+    pub fn has_identity_source(&self, source: AgentIdentitySource) -> bool {
+        self.identity_aliases
+            .iter()
+            .any(|alias| alias.source == source)
+    }
+
+    /// Records an exact alias once. Repeating a hook is idempotent.
+    pub fn record_identity_alias(
+        &mut self,
+        source: AgentIdentitySource,
+        external_id: impl Into<String>,
+    ) {
+        let external_id = external_id.into();
+        if self
+            .identity_aliases
+            .iter()
+            .any(|alias| alias.source == source && alias.external_id == external_id)
+        {
+            return;
+        }
+        self.identity_aliases.push(AgentIdentityAlias {
+            source,
+            external_id,
+        });
+    }
 }
 
 /// A permission the agent is blocked on.
@@ -412,8 +481,7 @@ impl SessionTree {
         self.iter().find(|n| {
             n.agent
                 .as_ref()
-                .and_then(|a| a.external_id.as_deref())
-                .is_some_and(|id| id == external_id)
+                .is_some_and(|agent| agent.matches_external_id(external_id))
         })
     }
 

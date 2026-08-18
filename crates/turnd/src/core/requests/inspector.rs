@@ -625,4 +625,99 @@ mod tests {
         assert!(parent.unwrap().provisional);
         assert!(origin.confidence.is_provisional());
     }
+
+    #[tokio::test]
+    async fn handoff_history_follows_a_canonicalised_agent_identity() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_inspector_identity_remap");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+
+        let (parent_id, survivor_id, retired_id) = {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            let parent = ProcessNode::agent(session_id.clone(), "claude", "/repo", NOW);
+            let parent_id = parent.id.clone();
+
+            let mut survivor = ProcessNode::agent(session_id.clone(), "reviewer", "/repo", NOW + 1);
+            survivor.kind = turn_core::model::NodeKind::Subagent;
+            survivor.link_to(parent_id.clone(), Relation::Confirmed);
+            let survivor_id = survivor.id.clone();
+
+            let mut retired = ProcessNode::agent(session_id.clone(), "reviewer", "/repo", NOW + 2);
+            retired.kind = turn_core::model::NodeKind::Subagent;
+            retired.link_to(parent_id.clone(), Relation::Confirmed);
+            let retired_id = retired.id.clone();
+
+            session.tree.insert(parent);
+            session.tree.insert(survivor);
+            session.tree.insert(retired);
+            (parent_id, survivor_id, retired_id)
+        };
+        harness.core.persist_session(&session_id).unwrap();
+
+        let sent = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ContextHandoffFinished {
+                handoff_id: HandoffId::from_stored("handoff_identity_sent"),
+                target_node_id: parent_id.clone(),
+                mode: ContextHandoffMode::ReviewHandoff,
+                outcome: ContextHandoffOutcome::Submitted,
+            },
+            EventSource::UserAction,
+            Confidence::Explicit,
+            NOW + 3,
+        )
+        .with_node(retired_id.clone());
+        let received = TurnEvent::new(
+            session_id.clone(),
+            EventKind::ContextHandoffFinished {
+                handoff_id: HandoffId::from_stored("handoff_identity_received"),
+                target_node_id: retired_id.clone(),
+                mode: ContextHandoffMode::SecondOpinion,
+                outcome: ContextHandoffOutcome::Submitted,
+            },
+            EventSource::UserAction,
+            Confidence::Explicit,
+            NOW + 4,
+        )
+        .with_node(parent_id.clone());
+        harness
+            .core
+            .store
+            .events()
+            .append_all(&[sent, received])
+            .unwrap();
+
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .remove(&retired_id);
+        let canonical = harness.core.sessions[&session_id].clone();
+        harness
+            .core
+            .store
+            .sessions()
+            .save_after_node_remaps(&canonical, &[(retired_id.clone(), survivor_id.clone())])
+            .unwrap();
+
+        let Response::Inspector { details } = harness
+            .core
+            .get_inspector(HierarchyKey::process(survivor_id), NOW + 5)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let InspectorDetails::Agent { handoffs, .. } = *details else {
+            panic!("the canonical Reviewer must retain an Agent inspector")
+        };
+        assert_eq!(handoffs.len(), 2);
+        assert!(handoffs
+            .iter()
+            .any(|handoff| { handoff.direction == "sent" && handoff.peer_node_id == parent_id }));
+        assert!(handoffs.iter().any(|handoff| {
+            handoff.direction == "received" && handoff.peer_node_id == parent_id
+        }));
+    }
 }

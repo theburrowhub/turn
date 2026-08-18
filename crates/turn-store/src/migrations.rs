@@ -83,6 +83,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "tree_surface_preferences",
         statements: MIGRATION_011_TREE_SURFACE_PREFERENCES,
     },
+    Migration {
+        version: 12,
+        name: "explicit_tree_expansion",
+        statements: MIGRATION_012_EXPLICIT_TREE_EXPANSION,
+    },
 ];
 
 /// The schema version this build produces and understands.
@@ -907,6 +912,17 @@ CREATE TABLE tree_surface_preferences (
 ) STRICT;
 "#;
 
+/// Marks whether a per-node expansion value came from an expansion operation.
+///
+/// Existing rows default to false because older selection and ordering writes created
+/// rows with `expanded = 0`; treating those as explicit collapses would close unrelated
+/// live paths on upgrade. Existing `expanded = 1` rows remain usable as expands in the
+/// projection for backwards compatibility.
+const MIGRATION_012_EXPLICIT_TREE_EXPANSION: &str = r#"
+ALTER TABLE tree_ui_state
+ADD COLUMN expansion_set INTEGER NOT NULL DEFAULT 0;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,7 +989,8 @@ mod tests {
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
                 "setting_layers",
-                "tree_surface_preferences"
+                "tree_surface_preferences",
+                "explicit_tree_expansion"
             ]
         );
 
@@ -1107,19 +1124,11 @@ mod tests {
             .map(|table| (table.clone(), column_names(&conn, table)))
             .collect();
 
-        let applied = apply(&conn).unwrap();
-        assert_eq!(
-            applied.names,
-            vec![
-                "purge_legacy_durable_secrets",
-                "setting_layers",
-                "tree_surface_preferences"
-            ]
-        );
+        let applied = apply_to(&conn, 9).unwrap();
+        assert_eq!(applied.names, vec!["purge_legacy_durable_secrets"]);
         // What this test is about is that v9 schedules work rather than rebuilding anything,
-        // so the assertion is that **no existing table changed**. Later migrations may add
-        // tables — v10 adds `setting_layers` — and comparing the whole list would turn this
-        // into a test that fails every time the schema grows, which is not what it is for.
+        // so the assertion is that **no existing table changed**. Stop at v9 so later schema
+        // changes do not accidentally become part of this migration's contract.
         for table in &before_tables {
             assert!(
                 table_names(&conn).contains(table),
@@ -1138,6 +1147,66 @@ mod tests {
             )
             .unwrap();
         assert!(pending);
+    }
+
+    #[test]
+    fn v12_marks_only_future_expansion_writes_as_explicit() {
+        let conn = fresh();
+        apply_to(&conn, 11).unwrap();
+        assert!(!column_names(&conn, "tree_ui_state")
+            .iter()
+            .any(|column| column == "expansion_set"));
+
+        // Old builds created false expansion values as a side effect of selection and
+        // ordering. The migration must not reinterpret either row as a collapse.
+        conn.execute(
+            "INSERT INTO tree_ui_state \
+                 (surface_id, node_kind, node_id, expanded, selected, manual_order, updated_ms) \
+             VALUES ('window', 'workspace', 'ws_selected', 0, 1, NULL, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tree_ui_state \
+                 (surface_id, node_kind, node_id, expanded, selected, manual_order, updated_ms) \
+             VALUES ('window', 'workspace', 'ws_ordered', 0, 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tree_ui_state \
+                 (surface_id, node_kind, node_id, expanded, selected, manual_order, updated_ms) \
+             VALUES ('window', 'workspace', 'ws_expanded', 1, 0, NULL, 1)",
+            [],
+        )
+        .unwrap();
+
+        let applied = apply(&conn).unwrap();
+        assert_eq!(applied.names, vec!["explicit_tree_expansion"]);
+        assert!(column_names(&conn, "tree_ui_state")
+            .iter()
+            .any(|column| column == "expansion_set"));
+        let markers = conn
+            .prepare("SELECT node_id, expanded, expansion_set FROM tree_ui_state ORDER BY node_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            [
+                ("ws_expanded".into(), true, false),
+                ("ws_ordered".into(), false, false),
+                ("ws_selected".into(), false, false),
+            ]
+        );
     }
 
     #[test]
@@ -1174,7 +1243,8 @@ mod tests {
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
                 "setting_layers",
-                "tree_surface_preferences"
+                "tree_surface_preferences",
+                "explicit_tree_expansion"
             ]
         );
 
@@ -1223,7 +1293,8 @@ mod tests {
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
                 "setting_layers",
-                "tree_surface_preferences"
+                "tree_surface_preferences",
+                "explicit_tree_expansion"
             ]
         );
         let repaired: (String, String, Option<String>, bool) = conn
@@ -1365,7 +1436,8 @@ mod tests {
                 "postmortem_attention",
                 "purge_legacy_durable_secrets",
                 "setting_layers",
-                "tree_surface_preferences"
+                "tree_surface_preferences",
+                "explicit_tree_expansion"
             ]
         );
         let (required, state): (bool, String) = conn

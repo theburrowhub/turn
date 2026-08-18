@@ -53,6 +53,10 @@ use crate::terminal::{self, PaneAction, PaneInteraction, PaneOptions};
 use crate::theme::Theme;
 use crate::transport::ConnectionState;
 
+#[path = "work_surface.rs"]
+mod work_surface;
+pub use work_surface::{ViewTarget, WorkSurfaceGeometry};
+
 pub const OPEN_PANE_PLACEMENT_KEY: &str = "layout.open_pane_placement";
 pub const DEFAULT_TEMPLATE_KEY: &str = "templates.default";
 
@@ -570,6 +574,16 @@ pub struct ViewState {
     /// The row whose on-demand details have been requested. Distinct from the
     /// response cache so a selection change emits exactly one request.
     pub inspector_key: Option<HierarchyKey>,
+    /// Exact Node whose bounded activity projection was last requested for the
+    /// WorkSurface. The response cache is keyed by NodeId as a second stale fence.
+    pub node_preview_key: Option<NodeId>,
+    /// Read-only terminal mirrors have interaction state separate from saved Panes.
+    /// In particular, measuring a full-surface mirror can never resize the Layout Pane.
+    pub node_terminal_views: HashMap<NodeId, PaneInteraction>,
+    /// Current closed navigation target and measured Node surface, for diagnostics and
+    /// deterministic geometry acceptance. Neither value is persisted in the Layout.
+    pub work_surface_target: Option<ViewTarget>,
+    pub work_surface_geometry: Option<WorkSurfaceGeometry>,
     hierarchy_actions: Vec<HierarchyAction>,
     observed_tree_state: Option<TreeSurfaceState>,
     observed_temporary_pane: Option<PaneId>,
@@ -1758,7 +1772,7 @@ fn row_action_count(row: HierarchyRow<'_>) -> usize {
         // Decided by kind rather than by state: the control is there whether the worker is busy
         // or idle, because a control that appeared only when Turn thought something was wrong
         // would make its absence a claim Turn cannot support.
-        HierarchyRow::Process { session, node } => {
+        HierarchyRow::Process { session, node, .. } => {
             usize::from(crate::spotlight::is_managed(session, node))
         }
     }
@@ -1868,10 +1882,16 @@ enum HierarchyRow<'a> {
     Session {
         workspace: &'a WorkspaceTreeView,
         session: &'a SessionTreeView,
+        presentation_child_count: usize,
     },
     Process {
         session: &'a SessionTreeView,
         node: &'a TreeNodeView,
+        /// Depth and parent in the operator-facing projection. Technical wrappers may be
+        /// omitted without taking their useful descendants with them.
+        presentation_depth: usize,
+        presentation_parent: Option<&'a NodeId>,
+        presentation_child_count: usize,
     },
 }
 
@@ -1897,17 +1917,23 @@ impl HierarchyRow<'_> {
         match self {
             Self::Workspace(_) => 0,
             Self::Session { .. } => 1,
-            Self::Process { node, .. } => node.depth.saturating_add(2),
+            Self::Process {
+                presentation_depth, ..
+            } => presentation_depth.saturating_add(2),
         }
     }
 
     fn child_count(self) -> usize {
         match self {
             Self::Workspace(workspace) => workspace.sessions.len(),
-            Self::Session { session, .. } => {
-                session.nodes.iter().filter(|node| node.depth == 0).count()
+            Self::Session {
+                presentation_child_count,
+                ..
             }
-            Self::Process { node, .. } => node.child_count,
+            | Self::Process {
+                presentation_child_count,
+                ..
+            } => presentation_child_count,
         }
     }
 
@@ -1917,8 +1943,12 @@ impl HierarchyRow<'_> {
             Self::Session { workspace, .. } => {
                 Some(HierarchyKey::workspace(workspace.workspace.id.clone()))
             }
-            Self::Process { session, node } => Some(match &node.parent {
-                Some(parent) => HierarchyKey::process(parent.clone()),
+            Self::Process {
+                session,
+                presentation_parent,
+                ..
+            } => Some(match presentation_parent {
+                Some(parent) => HierarchyKey::process((*parent).clone()),
                 None => HierarchyKey::session(session.session.id.clone()),
             }),
         }
@@ -1929,7 +1959,9 @@ impl HierarchyRow<'_> {
             Self::Workspace(_) => 34.0,
             Self::Session { .. } => 46.0,
             Self::Process { .. } => match visibility {
-                TreeVisibilityMode::Normal => 40.0,
+                // Two compact lines still need room for the 10pt status line's descenders.
+                // At 32px the clip rectangle cut them on Retina displays.
+                TreeVisibilityMode::Normal => 36.0,
                 TreeVisibilityMode::Expanded => 56.0,
                 TreeVisibilityMode::Technical => 58.0,
             },
@@ -2159,6 +2191,104 @@ fn effective_selection(snapshot: &HierarchySnapshot, state: &ViewState) -> Optio
         .or_else(|| snapshot.tree_state.selected.clone())
 }
 
+fn hierarchy_projects_technical_nodes(state: &ViewState) -> bool {
+    state.tree_visibility == TreeVisibilityMode::Technical || !state.tree_query.trim().is_empty()
+}
+
+/// Moves a persisted selection off implementation plumbing when the current projection hides it.
+///
+/// A wrapper that becomes transparent must not remain the invisible subject of the WorkSurface.
+/// Prefer the first useful descendant promoted through that wrapper (using the same operational
+/// ordering as the tree), then the nearest useful ancestor, and finally the containing Session.
+/// The optimistic local selection prevents this from emitting another action on every frame while
+/// the daemon persists the replacement.
+fn rehome_hidden_technical_selection(snapshot: &HierarchySnapshot, state: &mut ViewState) {
+    if hierarchy_projects_technical_nodes(state) {
+        return;
+    }
+    let Some(HierarchyKey::Process { node_id }) = effective_selection(snapshot, state) else {
+        return;
+    };
+    let Some(session) = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| session.nodes.iter().any(|node| node.node_id == node_id))
+    else {
+        return;
+    };
+    let Some(hidden) = session.nodes.iter().find(|node| node.node_id == node_id) else {
+        return;
+    };
+    if !process_is_technical_wrapper(hidden) {
+        return;
+    }
+
+    let rank: HashMap<HierarchyKey, usize> = effective_manual_order(snapshot, state)
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+    let (projected, _) = projected_process_rows(session, &rank, false);
+    let descendant = projected.iter().find_map(|row| match row {
+        HierarchyRow::Process { node, .. }
+            if process_descends_from(session, &node.node_id, &node_id) =>
+        {
+            Some(HierarchyKey::process(node.node_id.clone()))
+        }
+        _ => None,
+    });
+
+    let replacement = descendant.or_else(|| {
+        let mut cursor = hidden.parent.as_ref();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = cursor {
+            if !visited.insert(parent_id.clone()) {
+                break;
+            }
+            let Some(parent) = session
+                .nodes
+                .iter()
+                .find(|candidate| &candidate.node_id == parent_id)
+            else {
+                break;
+            };
+            if !process_is_technical_wrapper(parent) {
+                return Some(HierarchyKey::process(parent.node_id.clone()));
+            }
+            cursor = parent.parent.as_ref();
+        }
+        None
+    });
+    let replacement =
+        replacement.unwrap_or_else(|| HierarchyKey::session(session.session.id.clone()));
+    set_hierarchy_selection(state, snapshot, replacement);
+}
+
+fn process_descends_from(session: &SessionTreeView, candidate: &NodeId, ancestor: &NodeId) -> bool {
+    let mut cursor = session
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == candidate)
+        .and_then(|node| node.parent.as_ref());
+    let mut visited = HashSet::new();
+    while let Some(parent_id) = cursor {
+        if parent_id == ancestor {
+            return true;
+        }
+        if !visited.insert(parent_id.clone()) {
+            break;
+        }
+        cursor = session
+            .nodes
+            .iter()
+            .find(|node| &node.node_id == parent_id)
+            .and_then(|node| node.parent.as_ref());
+    }
+    false
+}
+
 fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option<WorkspaceId> {
     match key {
         HierarchyKey::Workspace { workspace_id } => Some(workspace_id.clone()),
@@ -2180,11 +2310,45 @@ fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option
 }
 
 fn row_is_expanded(snapshot: &HierarchySnapshot, state: &ViewState, key: &HierarchyKey) -> bool {
-    state
-        .tree_expansion
-        .get(key)
-        .copied()
-        .unwrap_or_else(|| snapshot.tree_state.expanded.contains(key))
+    state.tree_expansion.get(key).copied().unwrap_or_else(|| {
+        !snapshot.tree_state.collapsed.contains(key)
+            && (snapshot.tree_state.expanded.contains(key)
+                || hierarchy_row_defaults_to_expanded(snapshot, key))
+    })
+}
+
+/// A fresh tree opens the live semantic path instead of making the operator unfold the
+/// same Workspace -> Session -> Agent chain on every launch. An explicit local collapse
+/// remains authoritative through `tree_expansion`.
+fn hierarchy_row_defaults_to_expanded(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> bool {
+    match key {
+        HierarchyKey::Workspace { workspace_id } => snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| &workspace.workspace.id == workspace_id)
+            .is_some_and(|workspace| !workspace.sessions.is_empty()),
+        HierarchyKey::Session { session_id } => snapshot
+            .workspaces
+            .iter()
+            .find_map(|workspace| {
+                workspace
+                    .sessions
+                    .iter()
+                    .find(|session| &session.session.id == session_id)
+            })
+            .is_some_and(|session| !session.nodes.is_empty()),
+        HierarchyKey::Process { node_id } => snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| &node.node_id == node_id)
+            .is_some_and(|node| {
+                node.child_count > 0
+                    && node.is_agentic
+                    && (node.lifecycle.is_running() || node.needs_user)
+            }),
+    }
 }
 
 /// The rows the tree shows, in order.
@@ -2201,12 +2365,16 @@ fn visible_hierarchy_rows<'a>(
     include_archived: bool,
 ) -> Vec<HierarchyRow<'a>> {
     let archived_filter = state.tree_filters.contains(&TreeFilter::Archived);
+    let query = state.tree_query.trim().to_ascii_lowercase();
+    // A search is an explicit request to inspect implementation details. It reveals
+    // technical wrappers just like Technical mode, while ordinary browsing stays semantic.
+    let include_technical = hierarchy_projects_technical_nodes(state);
     let ordered = ordered_hierarchy_rows(
         snapshot,
         include_archived || archived_filter,
         effective_manual_order(snapshot, state),
+        include_technical,
     );
-    let query = state.tree_query.trim().to_ascii_lowercase();
     let filtering = !query.is_empty() || !state.tree_filters.is_empty();
 
     // Search/filter results are a tree projection, not a flat list: keep every ancestor of
@@ -2218,13 +2386,7 @@ fn visible_hierarchy_rows<'a>(
         if let Some(parent) = row.parent_key() {
             parents.insert(key.clone(), parent);
         }
-        let ephemeral_hidden = matches!(row, HierarchyRow::Process { node, .. } if node.ephemeral)
-            && state.tree_visibility != TreeVisibilityMode::Technical
-            && query.is_empty();
-        if !ephemeral_hidden
-            && row_matches_query(*row, &query)
-            && row_matches_filters(*row, &state.tree_filters)
-        {
+        if row_matches_query(*row, &query) && row_matches_filters(*row, &state.tree_filters) {
             retained.insert(key);
         }
     }
@@ -2240,24 +2402,8 @@ fn visible_hierarchy_rows<'a>(
 
     let mut rows = Vec::new();
     let mut collapsed_depth: Option<usize> = None;
-    let mut hidden_ephemeral_depth: Option<usize> = None;
     for row in ordered {
         let depth = row.depth();
-        if let Some(hidden) = hidden_ephemeral_depth {
-            if depth > hidden {
-                continue;
-            }
-            hidden_ephemeral_depth = None;
-        }
-        if let HierarchyRow::Process { node, .. } = row {
-            if node.ephemeral
-                && state.tree_visibility != TreeVisibilityMode::Technical
-                && query.is_empty()
-            {
-                hidden_ephemeral_depth = Some(depth);
-                continue;
-            }
-        }
         if filtering {
             if retained.contains(&row.key()) {
                 rows.push(row);
@@ -2285,6 +2431,7 @@ fn ordered_hierarchy_rows<'a>(
     snapshot: &'a HierarchySnapshot,
     include_archived: bool,
     manual_order: &[HierarchyKey],
+    include_technical: bool,
 ) -> Vec<HierarchyRow<'a>> {
     let rank: HashMap<HierarchyKey, usize> = manual_order
         .iter()
@@ -2318,8 +2465,14 @@ fn ordered_hierarchy_rows<'a>(
             if session.session.status == SessionStatus::Archived && !include_archived {
                 continue;
             }
-            rows.push(HierarchyRow::Session { workspace, session });
-            append_ordered_process_rows(session, &rank, &mut rows);
+            let (process_rows, presentation_child_count) =
+                projected_process_rows(session, &rank, include_technical);
+            rows.push(HierarchyRow::Session {
+                workspace,
+                session,
+                presentation_child_count,
+            });
+            rows.extend(process_rows);
         }
     }
     rows
@@ -2336,11 +2489,56 @@ fn effective_manual_order<'a>(
     }
 }
 
-fn append_ordered_process_rows<'a>(
+#[derive(Clone, Copy)]
+struct ProjectedProcessRow<'a> {
+    node: &'a TreeNodeView,
+    presentation_depth: usize,
+    presentation_parent: Option<&'a NodeId>,
+    presentation_child_count: usize,
+}
+
+fn process_operational_priority(node: &TreeNodeView) -> u8 {
+    if node.needs_user || node.interaction_pending {
+        0
+    } else if node.display_state == DisplayState::Failed || node.lifecycle.is_failure() {
+        1
+    } else if node.is_agentic && node.lifecycle.is_running() {
+        2
+    } else if node.lifecycle.is_running() {
+        3
+    } else if node.is_agentic {
+        4
+    } else {
+        5
+    }
+}
+
+/// True only for implementation plumbing, never for a directly controlled terminal or a
+/// semantic Agent. Hidden wrappers are transparent: useful descendants are promoted to the
+/// nearest visible ancestor rather than disappearing with the wrapper.
+fn process_is_technical_wrapper(node: &TreeNodeView) -> bool {
+    if node.is_agentic
+        || !node.pane_bindings.is_empty()
+        || node.needs_user
+        || node.interaction_pending
+        || node.display_state == DisplayState::Failed
+        || node.lifecycle.is_failure()
+    {
+        return false;
+    }
+    node.ephemeral
+        || (node.relationship_is_provisional
+            && matches!(
+                node.kind,
+                NodeKind::Shell | NodeKind::Background | NodeKind::Unknown
+            ))
+}
+
+fn projected_process_rows<'a>(
     session: &'a SessionTreeView,
     rank: &HashMap<HierarchyKey, usize>,
-    rows: &mut Vec<HierarchyRow<'a>>,
-) {
+    include_technical: bool,
+) -> (Vec<HierarchyRow<'a>>, usize) {
     let known: HashSet<_> = session
         .nodes
         .iter()
@@ -2354,6 +2552,7 @@ fn append_ordered_process_rows<'a>(
     for siblings in children.values_mut() {
         siblings.sort_by_key(|(index, node)| {
             (
+                process_operational_priority(node),
                 rank.get(&HierarchyKey::process(node.node_id.clone()))
                     .copied()
                     .unwrap_or(usize::MAX),
@@ -2365,17 +2564,46 @@ fn append_ordered_process_rows<'a>(
         .get(&None)
         .into_iter()
         .flatten()
-        .map(|(_, node)| *node)
+        .map(|(_, node)| (*node, 0usize, None::<&'a NodeId>))
         .rev()
         .collect();
     let mut visited = HashSet::new();
-    while let Some(node) = stack.pop() {
+    let mut projected = Vec::<ProjectedProcessRow<'a>>::new();
+    let mut visible_indices = HashMap::<NodeId, usize>::new();
+    let mut root_count = 0usize;
+    while let Some((node, presentation_depth, presentation_parent)) = stack.pop() {
         if !visited.insert(node.node_id.clone()) {
             continue;
         }
-        rows.push(HierarchyRow::Process { session, node });
+        let hidden = !include_technical && process_is_technical_wrapper(node);
+        let (child_depth, child_parent) = if hidden {
+            (presentation_depth, presentation_parent)
+        } else {
+            if let Some(parent) = presentation_parent {
+                if let Some(index) = visible_indices.get(parent).copied() {
+                    projected[index].presentation_child_count += 1;
+                } else {
+                    root_count += 1;
+                }
+            } else {
+                root_count += 1;
+            }
+            visible_indices.insert(node.node_id.clone(), projected.len());
+            projected.push(ProjectedProcessRow {
+                node,
+                presentation_depth,
+                presentation_parent,
+                presentation_child_count: 0,
+            });
+            (presentation_depth.saturating_add(1), Some(&node.node_id))
+        };
         if let Some(descendants) = children.get(&Some(node.node_id.clone())) {
-            stack.extend(descendants.iter().rev().map(|(_, child)| *child));
+            stack.extend(
+                descendants
+                    .iter()
+                    .rev()
+                    .map(|(_, child)| (*child, child_depth, child_parent)),
+            );
         }
     }
     // Corrupt/cyclic input remains visible and bounded rather than disappearing.
@@ -2387,17 +2615,37 @@ fn append_ordered_process_rows<'a>(
         .collect();
     leftovers.sort_by_key(|(index, node)| {
         (
+            process_operational_priority(node),
             rank.get(&HierarchyKey::process(node.node_id.clone()))
                 .copied()
                 .unwrap_or(usize::MAX),
             *index,
         )
     });
-    rows.extend(
-        leftovers
+    for (_, node) in leftovers {
+        if include_technical || !process_is_technical_wrapper(node) {
+            root_count += 1;
+            projected.push(ProjectedProcessRow {
+                node,
+                presentation_depth: 0,
+                presentation_parent: None,
+                presentation_child_count: 0,
+            });
+        }
+    }
+    (
+        projected
             .into_iter()
-            .map(|(_, node)| HierarchyRow::Process { session, node }),
-    );
+            .map(|row| HierarchyRow::Process {
+                session,
+                node: row.node,
+                presentation_depth: row.presentation_depth,
+                presentation_parent: row.presentation_parent,
+                presentation_child_count: row.presentation_child_count,
+            })
+            .collect(),
+        root_count,
+    )
 }
 
 fn row_matches_query(row: HierarchyRow<'_>, query: &str) -> bool {
@@ -2689,6 +2937,13 @@ impl<'a> TurnView<'a> {
             .map(|snapshot| snapshot.tree_state.clone());
         if incoming_tree_state != state.observed_tree_state {
             let first_observation = state.observed_tree_state.is_none();
+            let surface_changed = state
+                .observed_tree_state
+                .as_ref()
+                .map(|tree| tree.surface_id.as_str())
+                != incoming_tree_state
+                    .as_ref()
+                    .map(|tree| tree.surface_id.as_str());
             let previous_selection = state
                 .observed_tree_state
                 .as_ref()
@@ -2705,7 +2960,12 @@ impl<'a> TurnView<'a> {
                 state.scroll_tree_to = next_selection.cloned();
             }
             state.selected_tree = None;
-            state.tree_expansion.clear();
+            // Keep explicit expansion choices while the daemon acknowledges another
+            // tree-state field. In particular, a user's collapse must not spring open
+            // again merely because selection or ordering was persisted on the same surface.
+            if surface_changed {
+                state.tree_expansion.clear();
+            }
             if let Some(tree) = &incoming_tree_state {
                 state.tree_filters = tree.filters.iter().copied().collect();
                 state.tree_visibility = tree.visibility_mode;
@@ -2761,15 +3021,33 @@ impl<'a> TurnView<'a> {
         let sidebar_width = SIDEBAR_WIDTH
             .min((body.width() * 0.42).max(80.0))
             .min(body.width());
+        if let Some(snapshot) = hierarchy.as_ref() {
+            rehome_hidden_technical_selection(snapshot, state);
+        }
         let current_tree_selection = hierarchy
             .as_ref()
             .and_then(|snapshot| effective_selection(snapshot, state));
+        let work_target = hierarchy.as_ref().and_then(|snapshot| {
+            work_surface::resolve(
+                snapshot,
+                current_tree_selection.as_ref(),
+                self.selected.as_ref(),
+            )
+        });
+        state.work_surface_target = work_target.map(work_surface::ResolvedViewTarget::public);
+        state.work_surface_geometry = None;
+        if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), work_target) {
+            work_surface::request_node_projection(state, snapshot, target);
+        }
         let inspector_target = hierarchy.as_ref().and_then(|snapshot| {
             current_tree_selection
                 .clone()
                 .filter(|key| hierarchy_contains_key(snapshot, key))
         });
-        if state.inspector_open && state.inspector_key != inspector_target {
+        if state.inspector_open
+            && !work_target.is_some_and(work_surface::ResolvedViewTarget::is_node)
+            && state.inspector_key != inspector_target
+        {
             state.inspector_key = inspector_target.clone();
             if let Some(key) = inspector_target.clone() {
                 state.push_hierarchy_action(HierarchyAction::Inspect { key });
@@ -2784,12 +3062,15 @@ impl<'a> TurnView<'a> {
             .as_ref()
             .and_then(|snapshot| active_session_context(snapshot, self.selected.as_ref()));
         let inspector_is_overlay = body.width() < 960.0;
-        let inspector_width =
-            if state.inspector_open && inspector_target.is_some() && !inspector_is_overlay {
-                INSPECTOR_WIDTH.min((body.width() - sidebar_width).max(0.0) * 0.4)
-            } else {
-                0.0
-            };
+        let inspector_width = if state.inspector_open
+            && inspector_target.is_some()
+            && !work_target.is_some_and(work_surface::ResolvedViewTarget::is_node)
+            && !inspector_is_overlay
+        {
+            INSPECTOR_WIDTH.min((body.width() - sidebar_width).max(0.0) * 0.4)
+        } else {
+            0.0
+        };
         let sidebar = Rect::from_min_size(body.min, Vec2::new(sidebar_width, body.height()));
         let centre = Rect::from_min_size(
             body.min + Vec2::new(sidebar_width, 0.0),
@@ -2812,7 +3093,13 @@ impl<'a> TurnView<'a> {
         ui.painter()
             .vline(centre.min.x, body.y_range(), Stroke::new(1.0, theme.border));
 
-        let context_height = if active_context.is_some() {
+        let selected_session_context = match work_target {
+            Some(work_surface::ResolvedViewTarget::Session { workspace, session }) => {
+                Some((workspace, session))
+            }
+            _ => None,
+        };
+        let context_height = if selected_session_context.is_some() {
             let wanted: f32 = if centre.height() < 120.0 { 24.0 } else { 46.0 };
             wanted.min(centre.height())
         } else {
@@ -2821,27 +3108,69 @@ impl<'a> TurnView<'a> {
         let context_rect =
             Rect::from_min_size(centre.min, Vec2::new(centre.width(), context_height));
         let pane_rect = Rect::from_min_max(centre.min + Vec2::new(0.0, context_height), centre.max);
-        if let Some((workspace, session)) = active_context {
+        if let Some((workspace, session)) = selected_session_context {
             ui.scope_builder(region(context_rect, "session-context"), |ui| {
                 actions.extend(self.session_context_bar(ui, theme, workspace, session, state));
             });
         }
-        ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
-            let pane_actions = self.pane_area(ui, theme, keymap, state, hierarchy.as_ref());
-            if pane_actions.iter().any(|action| {
-                matches!(
-                    action,
-                    ViewAction::Pane {
-                        action: PaneAction::Focus | PaneAction::Write(_),
-                        ..
-                    }
-                )
-            }) {
-                state.tree_has_focus = false;
+        match work_target {
+            Some(work_surface::ResolvedViewTarget::Workspace(workspace)) => {
+                ui.scope_builder(region(centre.shrink(1.0), "workspace-view"), |ui| {
+                    actions.extend(self.workspace_work_surface(ui, theme, workspace));
+                });
             }
-            actions.extend(pane_actions);
-        });
-        actions.extend(self.floating_panes(ui, theme, keymap, state));
+            Some(work_surface::ResolvedViewTarget::Node {
+                workspace,
+                session,
+                node,
+            }) => {
+                ui.scope_builder(region(centre.shrink(1.0), "node-view"), |ui| {
+                    actions.extend(self.node_work_surface(
+                        ui,
+                        theme,
+                        hierarchy.as_ref().expect("a resolved Node has a hierarchy"),
+                        workspace,
+                        session,
+                        node,
+                        inspector_details,
+                        state,
+                    ));
+                });
+            }
+            Some(work_surface::ResolvedViewTarget::Session { session, .. })
+                if self.selected.as_ref() != Some(&session.session.id) =>
+            {
+                ui.scope_builder(
+                    region(pane_rect.shrink(1.0), "pending-session-view"),
+                    |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new("Opening the saved Session layout…")
+                                    .color(theme.text_dim),
+                            );
+                        });
+                    },
+                );
+            }
+            Some(work_surface::ResolvedViewTarget::Session { .. }) | None => {
+                ui.scope_builder(region(pane_rect.shrink(1.0), "panes"), |ui| {
+                    let pane_actions = self.pane_area(ui, theme, keymap, state, hierarchy.as_ref());
+                    if pane_actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            ViewAction::Pane {
+                                action: PaneAction::Focus | PaneAction::Write(_),
+                                ..
+                            }
+                        )
+                    }) {
+                        state.tree_has_focus = false;
+                    }
+                    actions.extend(pane_actions);
+                });
+                actions.extend(self.floating_panes(ui, theme, keymap, state));
+            }
+        }
         if let Some(temporary) = &self.temporary_pane {
             ui.scope_builder(region(pane_rect.shrink(8.0), "temporary-pane"), |ui| {
                 let temporary_actions = self.temporary_pane_overlay(ui, theme, state, temporary);
@@ -2901,7 +3230,10 @@ impl<'a> TurnView<'a> {
                 })
                 .inner;
             actions.extend(inspector_actions);
-        } else if state.inspector_open && inspector_is_overlay {
+        } else if state.inspector_open
+            && inspector_is_overlay
+            && !work_target.is_some_and(work_surface::ResolvedViewTarget::is_node)
+        {
             if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), inspector_target.as_ref())
             {
                 actions.extend(self.inspector_overlay(
@@ -4146,58 +4478,6 @@ impl<'a> TurnView<'a> {
         actions
     }
 
-    /// What a click on a row does to the layout, as at most one request.
-    ///
-    /// Clicking a subagent — or a process an agent started — maximises the pane it is running
-    /// inside; clicking the agent, the Session or the Workspace that owns it puts the layout
-    /// back. Which pane, and which of the two, is [`spotlight`]'s decision; this turns it into a
-    /// request, and its whole remaining job is *not sending one when nothing would change*.
-    ///
-    /// That matters because `zoom_pane` toggles. Asking to show a pane that is already maximised
-    /// would un-maximise it, so clicking through four subagents that share a pane would flicker
-    /// the layout in and out instead of leaving it maximised. The state the daemon last reported
-    /// is what the comparison is against — the window does not keep its own idea of it.
-    fn spotlight_for(&self, row: HierarchyRow<'_>) -> Vec<ViewAction> {
-        let Some(layout) = self.layout.as_ref() else {
-            return Vec::new();
-        };
-        let zoomed = layout.zoomed.clone();
-        let restore = |zoomed: Option<PaneId>, session_id: SessionId| match zoomed {
-            // Toggling the pane that *is* maximised is how the layout comes back.
-            Some(pane) => vec![ViewAction::ZoomPane {
-                session_id,
-                pane_id: pane,
-            }],
-            None => Vec::new(),
-        };
-        match row {
-            // A Session or a Workspace owns everything under it, so picking one is asking to see
-            // the whole layout again.
-            HierarchyRow::Session { session, .. } => restore(zoomed, session.session.id.clone()),
-            HierarchyRow::Workspace(workspace) => workspace
-                .sessions
-                .iter()
-                .find(|session| Some(&session.session.id) == self.selected.as_ref())
-                .map(|session| restore(zoomed, session.session.id.clone()))
-                .unwrap_or_default(),
-            HierarchyRow::Process { session, node } => {
-                match crate::spotlight::for_node(session, node) {
-                    crate::spotlight::Spotlight::Show(pane) if zoomed.as_ref() != Some(&pane) => {
-                        vec![ViewAction::ZoomPane {
-                            session_id: session.session.id.clone(),
-                            pane_id: pane,
-                        }]
-                    }
-                    crate::spotlight::Spotlight::Show(_) => Vec::new(),
-                    crate::spotlight::Spotlight::Restore => {
-                        restore(zoomed, session.session.id.clone())
-                    }
-                    crate::spotlight::Spotlight::Leave => Vec::new(),
-                }
-            }
-        }
-    }
-
     fn lifecycle_confirmation_overlay(
         &self,
         ui: &mut Ui,
@@ -5120,6 +5400,7 @@ impl<'a> TurnView<'a> {
             });
         let restoring_scroll = state.scroll_tree_to.is_some();
         let mut first_visible = None;
+        let mut tree_item_has_focus = false;
         egui::ScrollArea::vertical()
             .id_salt("hierarchy-rows")
             .auto_shrink([false, false])
@@ -5179,7 +5460,7 @@ impl<'a> TurnView<'a> {
                             focused_pane,
                             active_session,
                             idle: match row {
-                                HierarchyRow::Process { session, node } => {
+                                HierarchyRow::Process { session, node, .. } => {
                                     crate::spotlight::idleness(session, node, self.now_ms)
                                 }
                                 _ => None,
@@ -5246,11 +5527,12 @@ impl<'a> TurnView<'a> {
                             set_hierarchy_expanded(state, snapshot, key.clone(), !expanded);
                         } else {
                             actions.extend(select_hierarchy_row(state, snapshot, *row));
-                            actions.extend(self.spotlight_for(*row));
                         }
                     }
                     if response.double_clicked() && !caret_clicked {
-                        actions.extend(open_or_focus_hierarchy_row(state, snapshot, *row));
+                        // Double-click is deliberately the same navigation as one click.
+                        // Opening, focusing and zooming a Pane remain explicit commands.
+                        actions.extend(select_hierarchy_row(state, snapshot, *row));
                     }
                     match row {
                         HierarchyRow::Workspace(workspace) => response.context_menu(|ui| {
@@ -5336,7 +5618,9 @@ impl<'a> TurnView<'a> {
                                 ui.close();
                             }
                         }),
-                        HierarchyRow::Session { workspace, session } => response.context_menu(|ui| {
+                        HierarchyRow::Session {
+                            workspace, session, ..
+                        } => response.context_menu(|ui| {
                             hierarchy_reorder_menu(ui, state, snapshot, *row);
                             if ui.button("Show details").clicked() {
                                 actions.extend(select_hierarchy_row(state, snapshot, *row));
@@ -5478,7 +5762,7 @@ impl<'a> TurnView<'a> {
                                 ui.close();
                             }
                         }),
-                        HierarchyRow::Process { session, node } => response.context_menu(|ui| {
+                        HierarchyRow::Process { session, node, .. } => response.context_menu(|ui| {
                             hierarchy_reorder_menu(ui, state, snapshot, *row);
                             let workspace = snapshot.workspaces.iter().find(|workspace| {
                                 workspace.workspace.id == session.session.workspace_id
@@ -5655,6 +5939,7 @@ impl<'a> TurnView<'a> {
                         response.request_focus();
                         set_hierarchy_selection(state, snapshot, key);
                     }
+                    tree_item_has_focus |= response.has_focus();
                 }
             });
 
@@ -5663,7 +5948,14 @@ impl<'a> TurnView<'a> {
             push_tree_presentation(state, snapshot);
         }
 
-        if hierarchy_accepts_keyboard(state) {
+        let real_widget_has_focus = ui.memory(|memory| memory.focused().is_some());
+        if real_widget_has_focus {
+            // `tree_has_focus` is also the synthetic lease used before a real row widget
+            // exists. Once egui/AccessKit names an actual owner, that owner wins: a
+            // WorkSurface, overlay or row control must receive its own Enter key.
+            state.tree_has_focus = tree_item_has_focus;
+        }
+        if hierarchy_accepts_keyboard(state, tree_item_has_focus, real_widget_has_focus) {
             let updated_rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
             actions.extend(handle_hierarchy_keyboard(
                 ui,
@@ -5822,7 +6114,9 @@ impl<'a> TurnView<'a> {
                     }
                 });
             }
-            HierarchyRow::Session { workspace, session } => {
+            HierarchyRow::Session {
+                workspace, session, ..
+            } => {
                 let summary = &session.session;
                 let key = summary.id.as_str();
                 let archived = summary.status == SessionStatus::Archived;
@@ -5902,7 +6196,7 @@ impl<'a> TurnView<'a> {
                     }
                 });
             }
-            HierarchyRow::Process { session, node } => {
+            HierarchyRow::Process { session, node, .. } => {
                 // Only a worker an agent is managing, which is what reserved the room above.
                 if !crate::spotlight::is_managed(session, node) || node.lifecycle.is_terminal() {
                     return actions;
@@ -10796,7 +11090,12 @@ fn set_hierarchy_expanded(
 }
 
 fn set_hierarchy_expanded_all(state: &mut ViewState, snapshot: &HierarchySnapshot, expanded: bool) {
-    for row in ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state)) {
+    for row in ordered_hierarchy_rows(
+        snapshot,
+        true,
+        effective_manual_order(snapshot, state),
+        true,
+    ) {
         if row.child_count() > 0 {
             state.tree_expansion.insert(row.key(), expanded);
         }
@@ -10838,15 +11137,25 @@ fn hierarchy_siblings(
     state: &ViewState,
     key: &HierarchyKey,
 ) -> Vec<HierarchyKey> {
-    let parent = ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
-        .into_iter()
-        .find(|candidate| candidate.key() == *key)
-        .and_then(HierarchyRow::parent_key);
-    ordered_hierarchy_rows(snapshot, true, effective_manual_order(snapshot, state))
-        .into_iter()
-        .filter(|candidate| candidate.parent_key() == parent)
-        .map(HierarchyRow::key)
-        .collect()
+    let parent = ordered_hierarchy_rows(
+        snapshot,
+        true,
+        effective_manual_order(snapshot, state),
+        true,
+    )
+    .into_iter()
+    .find(|candidate| candidate.key() == *key)
+    .and_then(HierarchyRow::parent_key);
+    ordered_hierarchy_rows(
+        snapshot,
+        true,
+        effective_manual_order(snapshot, state),
+        true,
+    )
+    .into_iter()
+    .filter(|candidate| candidate.parent_key() == parent)
+    .map(HierarchyRow::key)
+    .collect()
 }
 
 fn move_hierarchy_key(
@@ -10910,43 +11219,13 @@ fn activate_hierarchy_row(
         HierarchyRow::Session { session, .. } => {
             vec![ViewAction::SelectSession(session.session.id.clone())]
         }
-        HierarchyRow::Process { node, .. } => {
-            state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
-                surface_id: snapshot.tree_state.surface_id.clone(),
-                session_id: node.session_id.clone(),
-                node_id: node.node_id.clone(),
-            });
+        HierarchyRow::Process { .. } => {
+            // Enter and double-click are idempotent navigation. A Node may have a Pane
+            // representation, but choosing the Node never borrows its parent's focus.
+            set_hierarchy_selection(state, snapshot, row.key());
             Vec::new()
         }
     }
-}
-
-/// Double-click is the explicit mouse equivalent of "open or focus". A background
-/// Agent with no Pane gets a temporary one; an Agent already represented in the
-/// layout keeps that stable layout and merely focuses its existing Pane.
-fn open_or_focus_hierarchy_row(
-    state: &mut ViewState,
-    snapshot: &HierarchySnapshot,
-    row: HierarchyRow<'_>,
-) -> Vec<ViewAction> {
-    let HierarchyRow::Process { node, .. } = row else {
-        return activate_hierarchy_row(state, snapshot, row);
-    };
-    let action = if node.pane_bindings.is_empty() {
-        HierarchyAction::OpenTemporaryPane {
-            surface_id: snapshot.tree_state.surface_id.clone(),
-            session_id: node.session_id.clone(),
-            node_id: node.node_id.clone(),
-        }
-    } else {
-        HierarchyAction::FocusPaneForNode {
-            surface_id: snapshot.tree_state.surface_id.clone(),
-            session_id: node.session_id.clone(),
-            node_id: node.node_id.clone(),
-        }
-    };
-    state.push_hierarchy_action(action);
-    Vec::new()
 }
 
 #[derive(Clone, Copy)]
@@ -10961,8 +11240,13 @@ enum HierarchyKeypress {
     Blur,
 }
 
-fn hierarchy_accepts_keyboard(state: &ViewState) -> bool {
-    state.tree_has_focus && !state.is_sensitive()
+fn hierarchy_accepts_keyboard(
+    state: &ViewState,
+    tree_item_has_focus: bool,
+    real_widget_has_focus: bool,
+) -> bool {
+    !state.is_sensitive()
+        && (tree_item_has_focus || (!real_widget_has_focus && state.tree_has_focus))
 }
 
 fn handle_hierarchy_keyboard(
@@ -12039,6 +12323,7 @@ mod tests {
         let row = HierarchyRow::Session {
             workspace: &snapshot.workspaces[0],
             session: &snapshot.workspaces[0].sessions[0],
+            presentation_child_count: 1,
         };
         assert!(row
             .accessible_name(false, TreeVisibilityMode::Expanded)
@@ -12080,9 +12365,19 @@ mod tests {
     }
 
     #[test]
-    fn the_unified_tree_respects_each_expansion_level() {
+    fn the_unified_tree_opens_live_agent_paths_but_respects_an_explicit_collapse() {
         let (snapshot, root_id, child_id, _) = hierarchy_fixture();
         let mut state = ViewState::default();
+        let initially_open = visible_hierarchy_rows(&snapshot, &state, false);
+        assert_eq!(
+            initially_open.len(),
+            4,
+            "a fresh live Agent path is useful without three disclosure clicks"
+        );
+
+        state
+            .tree_expansion
+            .insert(HierarchyKey::process(root_id.clone()), false);
         let collapsed = visible_hierarchy_rows(&snapshot, &state, false);
         assert_eq!(collapsed.len(), 3, "workspace, session, collapsed agent");
         assert_eq!(
@@ -12100,6 +12395,151 @@ mod tests {
         assert!(expanded
             .iter()
             .any(|row| row.key() == HierarchyKey::process(child_id.clone())));
+    }
+
+    #[test]
+    fn inferred_shell_wrappers_are_transparent_without_losing_semantic_children() {
+        let (mut snapshot, root_id, child_id, _) = hierarchy_fixture();
+        let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
+        let child_index = nodes
+            .iter()
+            .position(|node| node.node_id == child_id)
+            .unwrap();
+        let shell_id = NodeId::from_stored("proc_shell_wrapper");
+        let mut shell = nodes[child_index].clone();
+        shell.node_id = shell_id.clone();
+        shell.parent = Some(root_id.clone());
+        shell.kind = NodeKind::Shell;
+        shell.is_agentic = false;
+        shell.title = "sh".into();
+        shell.command = "sh".into();
+        shell.turn = None;
+        shell.agent = None;
+        shell.relationship_is_provisional = true;
+        shell.depth = 1;
+        shell.child_count = 1;
+        shell.pane_bindings.clear();
+        nodes[child_index].parent = Some(shell_id.clone());
+        nodes[child_index].depth = 2;
+        nodes.insert(child_index, shell);
+        snapshot.tree_state.selected = Some(HierarchyKey::process(shell_id.clone()));
+
+        let mut normal_state = ViewState::default();
+        rehome_hidden_technical_selection(&snapshot, &mut normal_state);
+        assert_eq!(
+            effective_selection(&snapshot, &normal_state),
+            Some(HierarchyKey::process(child_id.clone())),
+            "a persisted wrapper selection follows the semantic work it represented"
+        );
+        assert_eq!(
+            work_surface::resolve(
+                &snapshot,
+                effective_selection(&snapshot, &normal_state).as_ref(),
+                None,
+            )
+            .map(work_surface::ResolvedViewTarget::public),
+            Some(ViewTarget::Node(child_id.clone())),
+            "the right-hand WorkSurface resolves the promoted child, never the hidden shell"
+        );
+        assert!(matches!(
+            normal_state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::Select {
+                key: HierarchyKey::Process { node_id },
+                ..
+            }] if node_id == &child_id
+        ));
+        rehome_hidden_technical_selection(&snapshot, &mut normal_state);
+        assert!(
+            normal_state.take_hierarchy_actions().is_empty(),
+            "the optimistic replacement suppresses duplicate persistence while awaiting ack"
+        );
+
+        let normal = visible_hierarchy_rows(&snapshot, &normal_state, false);
+        assert!(!normal
+            .iter()
+            .any(|row| row.key() == HierarchyKey::process(shell_id.clone())));
+        let semantic_child = normal
+            .iter()
+            .copied()
+            .find(|row| row.key() == HierarchyKey::process(child_id.clone()))
+            .expect("the semantic descendant survives its hidden shell wrapper");
+        assert_eq!(
+            semantic_child.depth(),
+            3,
+            "it is promoted beside the wrapper"
+        );
+        assert_eq!(
+            semantic_child.parent_key(),
+            Some(HierarchyKey::process(root_id.clone()))
+        );
+
+        let mut technical_state = ViewState {
+            tree_visibility: TreeVisibilityMode::Technical,
+            ..ViewState::default()
+        };
+        technical_state
+            .tree_expansion
+            .insert(HierarchyKey::process(shell_id.clone()), true);
+        let technical = visible_hierarchy_rows(&snapshot, &technical_state, false);
+        assert!(technical
+            .iter()
+            .any(|row| row.key() == HierarchyKey::process(shell_id.clone())));
+        assert_eq!(
+            technical
+                .iter()
+                .copied()
+                .find(|row| row.key() == HierarchyKey::process(child_id.clone()))
+                .map(HierarchyRow::depth),
+            Some(4),
+            "Technical mode restores the honest full process ancestry"
+        );
+    }
+
+    #[test]
+    fn a_semantic_sibling_needing_the_operator_is_ordered_before_busy_work() {
+        let (mut snapshot, root_id, child_id, _) = hierarchy_fixture();
+        let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
+        let root = nodes
+            .iter_mut()
+            .find(|node| node.node_id == root_id)
+            .unwrap();
+        root.child_count = 0;
+        let child = nodes
+            .iter_mut()
+            .find(|node| node.node_id == child_id)
+            .unwrap();
+        child.parent = None;
+        child.depth = 0;
+        child.needs_user = true;
+
+        let process_order: Vec<_> = visible_hierarchy_rows(&snapshot, &ViewState::default(), false)
+            .into_iter()
+            .filter_map(|row| match row {
+                HierarchyRow::Process { node, .. } => Some(node.node_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            process_order,
+            [child_id, root_id],
+            "attention, not discovery order, decides what the operator sees first"
+        );
+    }
+
+    #[test]
+    fn a_persisted_collapse_wins_over_expansion_defaults_and_stale_expanded_state() {
+        let (mut snapshot, root_id, _, _) = hierarchy_fixture();
+        let key = HierarchyKey::process(root_id);
+        snapshot.tree_state.expanded.push(key.clone());
+        snapshot.tree_state.collapsed.push(key.clone());
+        let mut state = ViewState::default();
+
+        assert!(!row_is_expanded(&snapshot, &state, &key));
+
+        // The local value is the optimistic response to the operator's newest click;
+        // it remains authoritative until the daemon returns the replacement state.
+        state.tree_expansion.insert(key.clone(), true);
+        assert!(row_is_expanded(&snapshot, &state, &key));
     }
 
     #[test]
@@ -12304,11 +12744,12 @@ mod tests {
     }
 
     #[test]
-    fn selection_expansion_and_focus_are_different_typed_actions() {
+    fn selection_and_expansion_never_implicitly_focus_a_pane() {
         let (snapshot, root_id, _, _) = hierarchy_fixture();
         let mut state = ViewState::default();
         let key = HierarchyKey::process(root_id.clone());
 
+        state.tree_expansion.insert(key.clone(), false);
         set_hierarchy_expanded(&mut state, &snapshot, key.clone(), true);
         let process = visible_hierarchy_rows(&snapshot, &state, false)
             .into_iter()
@@ -12335,7 +12776,16 @@ mod tests {
         )));
         assert!(actions.iter().any(|action| matches!(
             action,
-            HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
+            HierarchyAction::Select {
+                key: HierarchyKey::Process { node_id },
+                ..
+            } if node_id == &root_id
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            HierarchyAction::FocusPaneForNode { .. }
+                | HierarchyAction::OpenTemporaryPane { .. }
+                | HierarchyAction::OpenPane { .. }
         )));
     }
 
@@ -12351,6 +12801,7 @@ mod tests {
             HierarchyRow::Session {
                 workspace: &snapshot.workspaces[0],
                 session,
+                presentation_child_count: 1,
             },
         );
 
@@ -12388,6 +12839,9 @@ mod tests {
             HierarchyRow::Process {
                 session,
                 node: process,
+                presentation_depth: process.depth,
+                presentation_parent: process.parent.as_ref(),
+                presentation_child_count: process.child_count,
             },
         );
 
@@ -12420,14 +12874,15 @@ mod tests {
         assert!(HierarchyRow::Session {
             workspace: &snapshot.workspaces[0],
             session,
+            presentation_child_count: 1,
         }
         .accessible_name(false, TreeVisibilityMode::Expanded)
         .contains("1 attention demand"));
     }
 
     #[test]
-    fn double_click_opens_a_background_subagent_without_changing_the_saved_layout() {
-        let (snapshot, root_id, child_id, session_id) = hierarchy_fixture();
+    fn repeated_activation_of_a_subagent_is_exact_idempotent_navigation() {
+        let (snapshot, root_id, child_id, _) = hierarchy_fixture();
         let session = &snapshot.workspaces[0].sessions[0];
         let child = session
             .nodes
@@ -12437,27 +12892,39 @@ mod tests {
         assert!(child.pane_bindings.is_empty());
 
         let mut state = ViewState::default();
-        open_or_focus_hierarchy_row(
-            &mut state,
-            &snapshot,
-            HierarchyRow::Process {
-                session,
-                node: child,
-            },
-        );
+        let row = HierarchyRow::Process {
+            session,
+            node: child,
+            presentation_depth: child.depth,
+            presentation_parent: child.parent.as_ref(),
+            presentation_child_count: child.child_count,
+        };
+        assert!(select_hierarchy_row(&mut state, &snapshot, row,).is_empty());
+        assert!(select_hierarchy_row(&mut state, &snapshot, row).is_empty());
         let actions = state.take_hierarchy_actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, HierarchyAction::Select { .. }))
+                .count(),
+            1,
+            "a double-click must not issue a second selection operation"
+        );
         assert!(actions.iter().any(|action| matches!(
             action,
-            HierarchyAction::OpenTemporaryPane {
-                session_id: opened_session,
-                node_id,
+            HierarchyAction::Select {
+                key: HierarchyKey::Process { node_id },
                 ..
-            } if opened_session == &session_id && node_id == &child_id
+            } if node_id == &child_id
         )));
         assert!(!actions.iter().any(|action| matches!(
             action,
-            HierarchyAction::FocusPaneForNode { node_id, .. } if node_id == &root_id
+            HierarchyAction::OpenTemporaryPane { .. }
+                | HierarchyAction::OpenPane { .. }
+                | HierarchyAction::FocusPaneForNode { .. }
         )));
+        assert_eq!(state.selected_tree, Some(HierarchyKey::process(child_id)));
+        assert_ne!(state.selected_tree, Some(HierarchyKey::process(root_id)));
     }
 
     fn process_session(row: HierarchyRow<'_>) -> SessionId {
@@ -12648,7 +13115,11 @@ mod tests {
         let session = &workspace.sessions[0];
         let rows = [
             HierarchyRow::Workspace(workspace),
-            HierarchyRow::Session { workspace, session },
+            HierarchyRow::Session {
+                workspace,
+                session,
+                presentation_child_count: 1,
+            },
         ];
 
         for row in rows {
@@ -12676,6 +13147,9 @@ mod tests {
         let process = HierarchyRow::Process {
             session,
             node: &session.nodes[0],
+            presentation_depth: session.nodes[0].depth,
+            presentation_parent: session.nodes[0].parent.as_ref(),
+            presentation_child_count: session.nodes[0].child_count,
         };
         for width in [120.0, SIDEBAR_WIDTH, 1_000.0] {
             assert_eq!(row_action_width(process, width), 0.0);
@@ -12830,10 +13304,10 @@ mod tests {
             }),
             ..ViewState::default()
         };
-        assert!(!hierarchy_accepts_keyboard(&state));
+        assert!(!hierarchy_accepts_keyboard(&state, false, false));
 
         state.lifecycle_confirmation = None;
-        assert!(hierarchy_accepts_keyboard(&state));
+        assert!(hierarchy_accepts_keyboard(&state, false, false));
     }
 
     #[test]

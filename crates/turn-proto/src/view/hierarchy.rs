@@ -47,7 +47,8 @@ impl HierarchyKey {
 ///
 /// This is deliberately separate from the snapshot's hierarchy records:
 /// selecting a Process does not focus a Pane, resolve Attention, or mutate the
-/// Process. `expanded` is a complete replacement, not a set of deltas.
+/// Process. `expanded` and `collapsed` together are the complete set of explicit
+/// expansion choices, not deltas; a key in neither collection has no saved choice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TreeSurfaceState {
@@ -56,6 +57,10 @@ pub struct TreeSurfaceState {
     pub selected: Option<HierarchyKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expanded: Vec<HierarchyKey>,
+    /// Rows the operator explicitly collapsed. Kept separate from `expanded` so an
+    /// absent key remains "use the client's default" rather than silently meaning false.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed: Vec<HierarchyKey>,
     /// Stable manual order. Keys absent from this list retain daemon order after
     /// the listed siblings, so discovering a process cannot reshuffle the row the
     /// user is currently reading.
@@ -77,6 +82,7 @@ impl TreeSurfaceState {
             surface_id: surface_id.into(),
             selected: None,
             expanded: Vec::new(),
+            collapsed: Vec::new(),
             manual_order: Vec::new(),
             filters: Vec::new(),
             visibility_mode: TreeVisibilityMode::Normal,
@@ -217,6 +223,26 @@ mod tests {
         assert_eq!(snapshot.tree_state.surface_id, "window-a");
         assert_eq!(snapshot.revision, 41);
         assert!(snapshot.workspaces.is_empty());
+    }
+
+    #[test]
+    fn collapsed_rows_round_trip_while_legacy_tree_state_defaults_to_no_collapse() {
+        let legacy: TreeSurfaceState = serde_json::from_str(
+            r#"{"surface_id":"window-a","expanded":[{"kind":"workspace","workspace_id":"ws_a"}]}"#,
+        )
+        .unwrap();
+        assert!(legacy.collapsed.is_empty());
+
+        let mut state = TreeSurfaceState::empty("window-a");
+        state
+            .collapsed
+            .push(HierarchyKey::workspace(WorkspaceId::from_stored("ws_a")));
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"collapsed\""), "got {json}");
+        assert_eq!(
+            serde_json::from_str::<TreeSurfaceState>(&json).unwrap(),
+            state
+        );
     }
 
     #[test]

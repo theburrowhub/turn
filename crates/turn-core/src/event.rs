@@ -226,6 +226,59 @@ pub enum EventKind {
     SessionAttentionResolved,
 }
 
+impl EventKind {
+    /// Repoints only typed Process-node references carried inside an Event payload.
+    ///
+    /// Event payloads also contain user and tool text. Treating their JSON as a string
+    /// and replacing an id-shaped substring would silently rewrite that evidence, so
+    /// identity repair must pass through this exhaustive typed projection instead.
+    pub fn remap_node_reference(&mut self, from: &NodeId, to: &NodeId) -> bool {
+        fn remap(slot: &mut NodeId, from: &NodeId, to: &NodeId) -> bool {
+            if slot != from {
+                return false;
+            }
+            *slot = to.clone();
+            true
+        }
+
+        fn remap_optional(slot: &mut Option<NodeId>, from: &NodeId, to: &NodeId) -> bool {
+            slot.as_mut().is_some_and(|node| remap(node, from, to))
+        }
+
+        match self {
+            Self::ProcessSpawnedChild { child, .. } => remap(child, from, to),
+            Self::AgentRelationshipCorrected {
+                previous_parent_node_id,
+                parent_node_id,
+                ..
+            } => {
+                let previous = remap_optional(previous_parent_node_id, from, to);
+                let parent = remap_optional(parent_node_id, from, to);
+                previous || parent
+            }
+            Self::ContextHandoffFinished { target_node_id, .. } => remap(target_node_id, from, to),
+            Self::ProcessStarted { .. }
+            | Self::ProcessExited { .. }
+            | Self::ProcessFailed { .. }
+            | Self::AgentStarted { .. }
+            | Self::AgentTurnStarted { .. }
+            | Self::AgentTurnCompleted { .. }
+            | Self::AgentWaitingForUser { .. }
+            | Self::AgentQuestionAsked { .. }
+            | Self::AgentPermissionRequired { .. }
+            | Self::AgentPermissionResolved { .. }
+            | Self::AgentTaskCompleted { .. }
+            | Self::AgentFailed { .. }
+            | Self::AgentIdle
+            | Self::AgentSpawned { .. }
+            | Self::AgentSubagentStopped { .. }
+            | Self::AgentRenamed { .. }
+            | Self::SessionNeedsAttention { .. }
+            | Self::SessionAttentionResolved => false,
+        }
+    }
+}
+
 /// Rough blast radius of a pending permission, used to rank and to colour the
 /// approval banner. Assessed by the adapter, never by parsing intent out of
 /// free-form agent prose.

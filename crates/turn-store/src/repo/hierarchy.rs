@@ -1133,8 +1133,8 @@ impl<'a> HierarchyRepo<'a> {
 
     pub fn tree_state(&self, surface_id: &str) -> Result<Vec<TreeUiState>> {
         let mut stmt = self.conn.prepare(
-            "SELECT surface_id, node_kind, node_id, expanded, selected, manual_order, \
-                    visibility_mode, updated_ms \
+            "SELECT surface_id, node_kind, node_id, expanded, expansion_set, selected, \
+                    manual_order, visibility_mode, updated_ms \
              FROM tree_ui_state WHERE surface_id = ?1 \
              ORDER BY COALESCE(manual_order, 2147483647), node_id",
         )?;
@@ -1147,6 +1147,7 @@ impl<'a> HierarchyRepo<'a> {
                 node_kind: kind,
                 node_id: row.get("node_id")?,
                 expanded: row.get("expanded")?,
+                expansion_set: row.get("expansion_set")?,
                 selected: row.get("selected")?,
                 manual_order: row.get("manual_order")?,
                 visibility_mode: row.get("visibility_mode")?,
@@ -1232,18 +1233,19 @@ fn save_tree_state_in(tx: &Transaction<'_>, state: &TreeUiState) -> Result<()> {
     }
     tx.execute(
         "INSERT INTO tree_ui_state \
-             (surface_id, node_kind, node_id, expanded, selected, manual_order, \
-              visibility_mode, updated_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             (surface_id, node_kind, node_id, expanded, expansion_set, selected, \
+              manual_order, visibility_mode, updated_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT(surface_id, node_kind, node_id) DO UPDATE SET \
-             expanded = excluded.expanded, selected = excluded.selected, \
-             manual_order = excluded.manual_order, \
+             expanded = excluded.expanded, expansion_set = excluded.expansion_set, \
+             selected = excluded.selected, manual_order = excluded.manual_order, \
              visibility_mode = excluded.visibility_mode, updated_ms = excluded.updated_ms",
         params![
             state.surface_id,
             tag("hierarchy node kind", &state.node_kind)?,
             state.node_id,
             state.expanded,
+            state.expansion_set,
             state.selected,
             state.manual_order,
             state.visibility_mode,
@@ -2799,6 +2801,7 @@ mod tests {
                     node_kind: HierarchyNodeKind::Workspace,
                     node_id: "ws_a".into(),
                     expanded: true,
+                    expansion_set: true,
                     selected: true,
                     manual_order: None,
                     visibility_mode: Some("normal".into()),
@@ -2834,6 +2837,7 @@ mod tests {
                         node_kind: HierarchyNodeKind::Process,
                         node_id: "proc_217".into(),
                         expanded: true,
+                        expansion_set: true,
                         selected: true,
                         manual_order: Some(0),
                         visibility_mode: None,
@@ -2844,6 +2848,7 @@ mod tests {
                         node_kind: HierarchyNodeKind::Process,
                         node_id: "proc_216".into(),
                         expanded: false,
+                        expansion_set: true,
                         selected: false,
                         manual_order: Some(1),
                         visibility_mode: None,
@@ -2868,9 +2873,18 @@ mod tests {
         assert_eq!(
             order
                 .iter()
-                .map(|row| (row.node_id.as_str(), row.manual_order, row.selected))
+                .map(|row| (
+                    row.node_id.as_str(),
+                    row.manual_order,
+                    row.selected,
+                    row.expanded,
+                    row.expansion_set,
+                ))
                 .collect::<Vec<_>>(),
-            [("proc_217", Some(0), true), ("proc_216", Some(1), false)]
+            [
+                ("proc_217", Some(0), true, true, true),
+                ("proc_216", Some(1), false, false, true),
+            ]
         );
     }
 }

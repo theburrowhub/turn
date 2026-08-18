@@ -875,10 +875,11 @@ fn historical_v8_fixture(
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         // Built with the current schema and then walked back, so what is here has to be
-        // walked back too: a real v8 database predates `setting_layers` and
-        // `tree_surface_preferences`. Leaving either table behind while claiming to be v8
-        // would make the migration under test fail on "table already exists" — a fixture
-        // bug that would read as a broken migration.
+        // walked back too: a real v8 database predates `setting_layers`,
+        // `tree_surface_preferences` and the explicit-expansion column. Leaving any of
+        // them behind while claiming to be v8 would make a later migration fail on an
+        // already-existing table or column — a fixture bug that would read as a broken
+        // migration.
         "PRAGMA journal_mode = WAL; \
          DELETE FROM settings WHERE key IN ( \
              'security.hook_raw_purge_pending', \
@@ -886,6 +887,7 @@ fn historical_v8_fixture(
          ); \
          DROP TABLE IF EXISTS setting_layers; \
          DROP TABLE IF EXISTS tree_surface_preferences; \
+         ALTER TABLE tree_ui_state DROP COLUMN expansion_set; \
          PRAGMA user_version = 8;",
     )
     .unwrap();

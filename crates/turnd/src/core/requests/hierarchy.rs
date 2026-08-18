@@ -144,6 +144,7 @@ impl Core {
                 node_kind: kind,
                 node_id,
                 expanded,
+                expansion_set: true,
                 selected: old.is_some_and(|state| state.selected),
                 manual_order: old.and_then(|state| state.manual_order),
                 visibility_mode: old.and_then(|state| state.visibility_mode.clone()),
@@ -193,6 +194,7 @@ impl Core {
                     node_kind: kind,
                     node_id,
                     expanded: old.is_some_and(|state| state.expanded),
+                    expansion_set: old.is_some_and(|state| state.expansion_set),
                     selected: true,
                     manual_order: old.and_then(|state| state.manual_order),
                     visibility_mode: old.and_then(|state| state.visibility_mode.clone()),
@@ -241,6 +243,7 @@ impl Core {
             .map(|key| {
                 tree_state_with(&surface_id, key, &previous, now_ms, |state| {
                     state.expanded = expanded;
+                    state.expansion_set = true;
                 })
             })
             .collect();
@@ -1153,6 +1156,7 @@ impl Core {
             .tree_surface_preferences(surface_id)
             .map_err(store)?;
         let mut expanded = Vec::new();
+        let mut collapsed = Vec::new();
         let mut manual_order = Vec::new();
         let mut selected = None;
         for row in rows {
@@ -1162,6 +1166,8 @@ impl Core {
             }
             if row.expanded {
                 expanded.push(key.clone());
+            } else if row.expansion_set {
+                collapsed.push(key.clone());
             }
             if row.selected {
                 selected = Some(key.clone());
@@ -1179,6 +1185,7 @@ impl Core {
             surface_id: surface_id.to_string(),
             selected,
             expanded,
+            collapsed,
             manual_order,
             filters: preferences.filters,
             visibility_mode: preferences.visibility_mode,
@@ -1384,6 +1391,7 @@ fn tree_state_with(
             node_kind: kind,
             node_id,
             expanded: false,
+            expansion_set: false,
             selected: false,
             manual_order: None,
             visibility_mode: None,
@@ -1761,6 +1769,167 @@ mod tests {
                 NOW + 9,
             )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_collapses_survive_selection_ordering_and_surface_reconnect() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_explicit_collapse");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let workspace_id = harness.core.sessions[&session_id].workspace_id.clone();
+
+        let first_id = {
+            let mut first = ProcessNode::agent(session_id.clone(), "first", "/tmp", NOW);
+            first.lifecycle = Lifecycle::Alive;
+            let id = first.id.clone();
+            harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .insert(first);
+            id
+        };
+        let second_id = {
+            let mut second = ProcessNode::agent(session_id.clone(), "second", "/tmp", NOW + 1);
+            second.lifecycle = Lifecycle::Alive;
+            let id = second.id.clone();
+            harness
+                .core
+                .sessions
+                .get_mut(&session_id)
+                .unwrap()
+                .tree
+                .insert(second);
+            id
+        };
+        harness.core.persist_session(&session_id).unwrap();
+
+        let surface = "window-explicit-collapse";
+        let first_key = HierarchyKey::process(first_id.clone());
+        let second_key = HierarchyKey::process(second_id.clone());
+        harness
+            .core
+            .select_tree_node(surface.into(), Some(first_key.clone()), NOW + 2)
+            .unwrap();
+        harness
+            .core
+            .move_tree_node(
+                surface.into(),
+                second_key.clone(),
+                Some(first_key.clone()),
+                NOW + 3,
+            )
+            .unwrap();
+
+        let incidental = harness
+            .core
+            .hierarchy_snapshot(surface, false, NOW + 4)
+            .unwrap();
+        assert!(incidental.tree_state.collapsed.is_empty());
+        assert!(incidental.tree_state.expanded.is_empty());
+
+        // Simulate a true expansion row from a pre-v12 database. It has no marker,
+        // but `expanded = true` remains authoritative for backwards compatibility.
+        let second_state = harness
+            .core
+            .store
+            .hierarchy()
+            .tree_state(surface)
+            .unwrap()
+            .into_iter()
+            .find(|state| state.node_id == second_id.as_str())
+            .unwrap();
+        harness
+            .core
+            .store
+            .hierarchy()
+            .save_tree_state(&TreeUiState {
+                expanded: true,
+                expansion_set: false,
+                updated_ms: NOW + 5,
+                ..second_state
+            })
+            .unwrap();
+        assert!(harness
+            .core
+            .hierarchy_snapshot(surface, false, NOW + 6)
+            .unwrap()
+            .tree_state
+            .expanded
+            .contains(&second_key));
+
+        harness
+            .core
+            .set_tree_expanded(surface.into(), first_key.clone(), false, NOW + 7)
+            .unwrap();
+        harness
+            .core
+            .set_tree_expanded_all(surface.into(), false, NOW + 8)
+            .unwrap();
+        harness
+            .core
+            .select_tree_node(surface.into(), Some(first_key.clone()), NOW + 9)
+            .unwrap();
+        harness
+            .core
+            .move_tree_node(
+                surface.into(),
+                second_key.clone(),
+                Some(first_key.clone()),
+                NOW + 10,
+            )
+            .unwrap();
+
+        let (first_client, _first_frames) = harness.add_client(32);
+        let first_snapshot = match harness
+            .core
+            .dispatch(
+                first_client,
+                Request::GetHierarchy {
+                    surface_id: surface.into(),
+                    include_archived: false,
+                },
+                NOW + 11,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => *snapshot,
+            other => panic!("unexpected {other:?}"),
+        };
+        harness.core.client_closed(first_client);
+        let (replacement_client, _replacement_frames) = harness.add_client(32);
+        let restored = match harness
+            .core
+            .dispatch(
+                replacement_client,
+                Request::GetHierarchy {
+                    surface_id: surface.into(),
+                    include_archived: false,
+                },
+                NOW + 12,
+            )
+            .unwrap()
+        {
+            Response::Hierarchy { snapshot } => *snapshot,
+            other => panic!("unexpected {other:?}"),
+        };
+
+        for snapshot in [&first_snapshot, &restored] {
+            assert_eq!(snapshot.tree_state.selected, Some(first_key.clone()));
+            assert!(snapshot.tree_state.collapsed.contains(&first_key));
+            assert!(snapshot
+                .tree_state
+                .collapsed
+                .contains(&HierarchyKey::workspace(workspace_id.clone())));
+            assert!(snapshot
+                .tree_state
+                .collapsed
+                .contains(&HierarchyKey::session(session_id.clone())));
+            assert!(snapshot.tree_state.expanded.contains(&second_key));
+            assert!(!snapshot.tree_state.collapsed.contains(&second_key));
+        }
     }
 
     #[tokio::test]

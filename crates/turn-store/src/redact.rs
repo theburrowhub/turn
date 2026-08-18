@@ -790,12 +790,20 @@ fn pending_permission_for_persistence(permission: &PendingPermission) -> Pending
 pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
     let external_id = operational_id_for_persistence(&agent.external_id);
     let reference = agent_ref_for_persistence(&agent.agent);
+    let identity_aliases: Vec<_> = agent
+        .identity_aliases
+        .iter()
+        .filter(|alias| operational_id_for_persistence(&Some(alias.external_id.clone())).is_some())
+        .cloned()
+        .collect();
     let lost_operational_identity = agent.external_id.is_some() && external_id.is_none()
-        || agent.agent.external_id.is_some() && reference.external_id.is_none();
+        || agent.agent.external_id.is_some() && reference.external_id.is_none()
+        || identity_aliases.len() != agent.identity_aliases.len();
     AgentInfo {
         agent: reference,
         name: agent_name_for_persistence(&agent.name),
         external_id,
+        identity_aliases,
         agent_type: redact_optional(&agent.agent_type),
         current_task: redact_optional(&agent.current_task),
         last_message: redact_optional(&agent.last_message),
@@ -1389,11 +1397,18 @@ mod tests {
             ..AgentInfo::default()
         };
         agent.agent.external_id = agent.external_id.clone();
+        agent
+            .identity_aliases
+            .push(turn_core::model::AgentIdentityAlias {
+                source: turn_core::model::AgentIdentitySource::ParentSpawn,
+                external_id: "sk-ant-api03-secret-worker-alias".into(),
+            });
         agent.resumable = true;
 
         let safe = agent_info_for_persistence(&agent);
         assert_eq!(safe.external_id, None);
         assert_eq!(safe.agent.external_id, None);
+        assert!(safe.identity_aliases.is_empty());
         assert!(!safe.resumable);
     }
 }

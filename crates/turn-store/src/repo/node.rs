@@ -85,10 +85,28 @@ impl<'a> NodeRepo<'a> {
         let sql = format!("SELECT {COLUMNS} FROM process_nodes WHERE external_id = ?1 LIMIT 1");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params![external_id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(from_row(row)?)),
-            None => Ok(None),
+        if let Some(row) = rows.next()? {
+            return Ok(Some(from_row(row)?));
         }
+
+        // The lifted column indexes the preferred id. A few runtimes also assign
+        // a parent-side alias to the same worker; those aliases live in agent_json
+        // so old schemas remain readable. This fallback is deliberately only paid
+        // after the indexed lookup misses.
+        let sql = format!("SELECT {COLUMNS} FROM process_nodes WHERE agent_json IS NOT NULL");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let node = from_row(row)?;
+            if node
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.matches_external_id(external_id))
+            {
+                return Ok(Some(node));
+            }
+        }
+        Ok(None)
     }
 
     /// Every node that has ever claimed this pid, most recent first.
@@ -402,7 +420,7 @@ mod tests {
     use crate::redact::REDACTED;
     use crate::testing;
     use turn_core::event::{AgentRef, Risk};
-    use turn_core::model::node::PendingPermission;
+    use turn_core::model::node::{AgentIdentityAlias, AgentIdentitySource, PendingPermission};
     use turn_core::state::AwaitingReason;
 
     const T0: i64 = 1_700_000_000_000;
@@ -430,6 +448,10 @@ mod tests {
             },
             name: AgentName::fallback("Claude Code"),
             external_id: Some("claude-abc123".into()),
+            identity_aliases: vec![AgentIdentityAlias {
+                source: AgentIdentitySource::Lifecycle,
+                external_id: "claude-worker-abc123".into(),
+            }],
             agent_type: None,
             current_task: Some("run the tests".into()),
             last_message: Some("May I run make verify?".into()),
@@ -453,6 +475,16 @@ mod tests {
         let back = store.nodes().get(&node.id).unwrap().expect("stored");
 
         assert_eq!(back, node);
+        assert_eq!(
+            store
+                .nodes()
+                .find_by_external_id("claude-worker-abc123")
+                .unwrap()
+                .unwrap()
+                .id,
+            node.id,
+            "the non-canonical alias is available after the indexed lookup misses"
+        );
         assert_eq!(
             back.display_state().label(),
             "PERMISSION",
