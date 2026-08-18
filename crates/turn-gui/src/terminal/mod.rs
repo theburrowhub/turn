@@ -1167,7 +1167,13 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // from the *live* geometry, without the scroll marker's strip: the pty's size must not
     // change just because the user looked at history.
     let size = size_in_cells(rect, cell);
-    if state.reported_size != Some(size) {
+    // Runtime identity can change while Pane identity and its interaction state stay
+    // put (restore/relaunch is the common case). The replacement pty starts at its
+    // initial 80x24 size, so `reported_size == size` is not proof that *this* pty has
+    // ever received the live geometry. The grid is the daemon's acknowledgement of
+    // the process size; keep asking until it matches. Desk deduplicates the request
+    // while that acknowledgement is in flight, so this does not create resize spam.
+    if should_report_size(state.reported_size, grid, size) {
         state.reported_size = Some(size);
         outcome.actions.push(PaneAction::Resize(size));
     }
@@ -1298,6 +1304,10 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         );
     }
     outcome
+}
+
+fn should_report_size(reported: Option<PtySize>, grid: &Grid, size: PtySize) -> bool {
+    reported != Some(size) || grid.rows != size.rows || grid.cols != size.cols
 }
 
 /// Whether the pointer is over the search bar rather than over the pane's cells.
@@ -2794,6 +2804,29 @@ mod tests {
             size_in_cells(rect, cell),
             PtySize::new(20, 40),
             "the size is measured from the pane, not from what is left after the marker"
+        );
+    }
+
+    /// A relaunch keeps the visual Pane and its interaction state, but the new pty
+    /// starts at 80x24. Remembering that this rectangle was reported to the old
+    /// process must not strand the replacement application in a narrow grid.
+    #[test]
+    fn a_replaced_pty_is_resized_even_when_the_visible_geometry_did_not_change() {
+        let cell = Vec2::new(8.0, 16.0);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(cell.x * 160.0, cell.y * 45.0));
+        let visible = size_in_cells(rect, cell);
+        assert_eq!(visible, PtySize::new(45, 160));
+
+        let replacement = Grid::blank(24, 80);
+        assert!(
+            should_report_size(Some(visible), &replacement, visible),
+            "the mismatched daemon grid must emit PaneAction::Resize for the replacement pty"
+        );
+
+        let acknowledged = Grid::blank(visible.rows, visible.cols);
+        assert!(
+            !should_report_size(Some(visible), &acknowledged, visible),
+            "once geometry, remembered report and daemon grid agree, the next frame is free"
         );
     }
 
