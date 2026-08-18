@@ -173,6 +173,8 @@ pub struct PaneContent<'a> {
 #[derive(Debug)]
 pub struct TemporaryPaneContent<'a> {
     pub pane: &'a NodePaneView,
+    /// Concrete PTY runtime, distinct from the semantic Agent in `pane.binding`.
+    pub runtime_id: Option<NodeId>,
     pub node: Option<&'a TreeNodeView>,
     pub previews: &'a [ActivityPreview],
     pub grid: Option<&'a Grid>,
@@ -622,7 +624,7 @@ impl ViewState {
         self.panes.entry(id.clone()).or_default()
     }
 
-    fn resize_owner_epoch(&self, runtime_id: &NodeId, pane_id: &PaneId) -> Option<u64> {
+    pub(crate) fn resize_owner_epoch(&self, runtime_id: &NodeId, pane_id: &PaneId) -> Option<u64> {
         self.resize_owners
             .get(runtime_id)
             .filter(|owner| &owner.pane_id == pane_id)
@@ -3030,12 +3032,20 @@ impl<'a> TurnView<'a> {
     /// Otherwise the focused Layout Pane wins; without either, the lexical PaneId is a
     /// deterministic fallback. This makes duplicate and floating views read-only mirrors
     /// instead of competing PTY resize authorities.
-    fn reconcile_resize_owners(&self, state: &mut ViewState) {
+    fn reconcile_resize_owners(&self, state: &mut ViewState, primary: Option<&PaneId>) -> bool {
+        let previous = state.resize_owners.clone();
         let mut desired: HashMap<NodeId, PaneId> = HashMap::new();
 
         // Start with a stable fallback. `self.panes` may arrive in Layout order, but process
         // geometry must not depend on a split-tree traversal changing after a relocation.
         for content in &self.panes {
+            if !state
+                .panes
+                .get(&content.pane_id)
+                .is_some_and(|pane| pane.geometry_available)
+            {
+                continue;
+            }
             let Some(runtime_id) = &content.runtime_id else {
                 continue;
             };
@@ -3052,7 +3062,27 @@ impl<'a> TurnView<'a> {
         // Persisted focus outranks the fallback whether the Pane is tiled or floating.
         for content in &self.panes {
             if let Some(runtime_id) = &content.runtime_id {
-                if content.focused {
+                if content.focused
+                    && state
+                        .panes
+                        .get(&content.pane_id)
+                        .is_some_and(|pane| pane.geometry_available)
+                {
+                    desired.insert(runtime_id.clone(), content.pane_id.clone());
+                }
+            }
+        }
+
+        // Switching the hierarchy to an exact Process/Agent view makes that large
+        // work surface primary. Its Pane owns geometry even when another saved split
+        // remains the persisted keyboard focus behind the view.
+        if let Some(primary) = primary {
+            if let Some(content) = self
+                .panes
+                .iter()
+                .find(|content| &content.pane_id == primary)
+            {
+                if let Some(runtime_id) = &content.runtime_id {
                     desired.insert(runtime_id.clone(), content.pane_id.clone());
                 }
             }
@@ -3065,10 +3095,9 @@ impl<'a> TurnView<'a> {
                 NodePaneCapability::Terminal { .. }
             )
         }) {
-            desired.insert(
-                temporary.pane.binding.node_id.clone(),
-                temporary.pane.binding.pane_id.clone(),
-            );
+            if let Some(runtime_id) = &temporary.runtime_id {
+                desired.insert(runtime_id.clone(), temporary.pane.binding.pane_id.clone());
+            }
         }
 
         state
@@ -3090,6 +3119,16 @@ impl<'a> TurnView<'a> {
                     epoch: state.next_resize_owner_epoch,
                 },
             );
+        }
+        state.resize_owners != previous
+    }
+
+    /// Geometry availability is observed while rendering. Ownership for this frame
+    /// consumes the previous observation, then every Pane must prove itself again; a
+    /// view that disappeared cannot retain a resize lease merely because it used to fit.
+    fn begin_geometry_frame(&self, state: &mut ViewState) {
+        for pane in state.panes.values_mut() {
+            pane.geometry_available = false;
         }
     }
 
@@ -3232,8 +3271,6 @@ impl<'a> TurnView<'a> {
             }
             state.observed_temporary_pane = temporary_pane_id;
         }
-        self.reconcile_resize_owners(state);
-
         actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref(), state));
         if let Some(permission) = &self.permission {
             actions.extend(self.permission_banner(ui, theme, permission));
@@ -3280,6 +3317,14 @@ impl<'a> TurnView<'a> {
                 self.selected.as_ref(),
             )
         });
+        let primary_pane = match work_target {
+            Some(work_surface::ResolvedViewTarget::Node { node, .. }) => self
+                .exact_terminal(node)
+                .map(|(binding, _)| binding.pane_id.clone()),
+            _ => None,
+        };
+        let _ = self.reconcile_resize_owners(state, primary_pane.as_ref());
+        self.begin_geometry_frame(state);
         state.work_surface_target = work_target.map(work_surface::ResolvedViewTarget::public);
         state.work_surface_geometry = None;
         if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), work_target) {
@@ -3439,6 +3484,14 @@ impl<'a> TurnView<'a> {
                 }
                 actions.extend(temporary_actions);
             });
+        }
+        // Geometry is learned while a Pane is painted. A newly attached ordinary
+        // Layout Pane therefore cannot own its PTY until this post-render pass sees
+        // its complete-cell body. Schedule exactly one immediate follow-up frame when
+        // that election changes; otherwise an idle/reduced-motion window could remain
+        // at the daemon's 80x24 baseline forever.
+        if self.reconcile_resize_owners(state, primary_pane.as_ref()) {
+            ui.ctx().request_repaint();
         }
         if status_height > 0.0 {
             actions.extend(self.window_status_bar(
@@ -8919,10 +8972,9 @@ impl<'a> TurnView<'a> {
                     history_complete: true,
                 };
                 let pane_id = temporary.pane.binding.pane_id.clone();
-                let resize_epoch = state.resize_owner_epoch(
-                    &temporary.pane.binding.node_id,
-                    &temporary.pane.binding.pane_id,
-                );
+                let resize_epoch = temporary.runtime_id.as_ref().and_then(|runtime_id| {
+                    state.resize_owner_epoch(runtime_id, &temporary.pane.binding.pane_id)
+                });
                 let interaction = state.pane(&pane_id);
                 let id = ui.id().with(("temporary-terminal", pane_id.as_str()));
                 for action in terminal::show_pane(
@@ -8934,9 +8986,11 @@ impl<'a> TurnView<'a> {
                         grid,
                         options,
                         id,
-                        resize_claim: resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
-                            runtime_id: &temporary.pane.binding.node_id,
-                            owner_epoch,
+                        resize_claim: temporary.runtime_id.as_ref().and_then(|runtime_id| {
+                            resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                runtime_id,
+                                owner_epoch,
+                            })
                         }),
                         chrome: None,
                     },
@@ -13883,6 +13937,41 @@ mod tests {
         assert!(
             state.pane(&second).selection.is_none(),
             "two panes must hold separate selections"
+        );
+    }
+
+    #[test]
+    fn discovering_the_first_complete_geometry_owner_requests_exactly_one_follow_up() {
+        let pane_id = PaneId::from_stored("pane_first_geometry_owner");
+        let runtime_id = NodeId::from_stored("proc_first_geometry_owner");
+        let grid = Grid::blank(24, 80);
+        let view = TurnView {
+            panes: vec![PaneContent {
+                pane_id: pane_id.clone(),
+                runtime_id: Some(runtime_id.clone()),
+                title: "first frame".into(),
+                grid: &grid,
+                focused: true,
+                scrolled: false,
+                history_complete: true,
+            }],
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+
+        assert!(
+            !view.reconcile_resize_owners(&mut state, None),
+            "before paint there is no complete-cell geometry to own"
+        );
+        state.pane(&pane_id).geometry_available = true;
+        assert!(
+            view.reconcile_resize_owners(&mut state, None),
+            "post-paint discovery must request the one follow-up frame that emits Resize"
+        );
+        assert_eq!(state.resize_owner_epoch(&runtime_id, &pane_id), Some(1));
+        assert!(
+            !view.reconcile_resize_owners(&mut state, None),
+            "stable ownership must not keep an idle reduced-motion window repainting"
         );
     }
 

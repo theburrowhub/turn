@@ -40,6 +40,7 @@ fn a_screen_update_carries_the_changed_rows_and_a_sequence_number() {
     let event = ServerEvent::PaneScreen {
         session_id: SessionId::from_stored("sess_a"),
         pane_id: PaneId::from_stored("pane_a"),
+        attachment_id: 7,
         node_id: Some(NodeId::from_stored("proc_a")),
         seq: 1_234,
         update: ScreenUpdate::between(&before, &after),
@@ -71,6 +72,7 @@ fn terminal_output_survives_as_bytes_with_a_sequence_number() {
     let event = ServerEvent::PaneOutput {
         session_id: SessionId::from_stored("sess_a"),
         pane_id: PaneId::from_stored("pane_a"),
+        attachment_id: 7,
         node_id: Some(NodeId::from_stored("proc_a")),
         seq: 1_234,
         data: TerminalBytes::new(raw.clone()),
@@ -95,6 +97,7 @@ fn a_dropped_output_burst_is_reported_instead_of_hidden() {
     let event = ServerEvent::PaneOutputGap {
         session_id: SessionId::from_stored("sess_a"),
         pane_id: PaneId::from_stored("pane_a"),
+        attachment_id: 7,
         dropped: 512,
         resume_seq: 10_000,
     };
@@ -357,6 +360,7 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
         ServerEvent::PaneScreen {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: 7,
             node_id: Some(node_id.clone()),
             seq: 7,
             update: ScreenUpdate::full(crate::cells::Grid::from_lines(&["ready"], 20)),
@@ -364,6 +368,7 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
         ServerEvent::PaneOutput {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: 7,
             node_id: Some(node_id.clone()),
             seq: 1,
             data: TerminalBytes::new(b"hello\r\n".to_vec()),
@@ -371,6 +376,7 @@ pub(crate) fn all_events() -> Vec<ServerEvent> {
         ServerEvent::PaneOutputGap {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: 7,
             dropped: 4,
             resume_seq: 100,
         },

@@ -27,10 +27,43 @@ use crate::desk::{Desk, Reaction};
 use crate::keymap::{Command, Keymap};
 use crate::repaint::{next_cursor_phase, next_elapsed_tick, Deadlines};
 use crate::theme::{AppearanceSettings, SystemAccessibility, Theme};
-use crate::transport::{Ask, DaemonLink, Inbound};
+use crate::transport::{Ask, DaemonLink, Inbound, SendOutcome};
 use crate::view::{
-    LayoutEditorOrigin, LayoutTemplateDraft, SaveTemplateDraft, ViewAction, ViewState,
+    HierarchyAction, LayoutEditorOrigin, LayoutTemplateDraft, SaveTemplateDraft, ViewAction,
+    ViewState,
 };
+
+/// Applies the renderer's optimistic hierarchy intents before returning any Pane actions from
+/// the same frame. A Node click changes geometry authority immediately; staging this ordering in
+/// one testable boundary prevents its first (and deduplicated) Resize from being rejected against
+/// the previous selection.
+pub(crate) fn stage_frame_actions(
+    desk: &mut Desk,
+    hierarchy_actions: Vec<HierarchyAction>,
+    view_actions: Vec<ViewAction>,
+) -> (Vec<Reaction>, Vec<ViewAction>) {
+    let reactions = hierarchy_actions
+        .into_iter()
+        .flat_map(|action| desk.apply_hierarchy_action(action))
+        .collect();
+    (reactions, view_actions)
+}
+
+/// Crosses the bounded GUI→daemon queue and synchronously routes a local rejection back through
+/// Desk. The injected timestamp makes retry/backoff behavior deterministic in tests and keeps a
+/// full inbound status queue from stranding a geometry write.
+pub(crate) fn submit_to_daemon(
+    link: &DaemonLink,
+    desk: &mut Desk,
+    ask: Ask,
+    request: turn_proto::Request,
+    now_ms: i64,
+) -> Vec<Reaction> {
+    match link.send(ask, request) {
+        SendOutcome::Queued => Vec::new(),
+        SendOutcome::Rejected(message) => desk.apply_inbound(message, now_ms),
+    }
+}
 
 #[derive(Debug)]
 struct FolderDialogResult {
@@ -208,10 +241,32 @@ impl TurnApp {
         &self.desk
     }
 
+    /// Releases the renderer's optimistic tree selection once Desk no longer has a matching
+    /// request in flight. This is required even when the daemon's persisted `TreeState` did
+    /// not change: a local queue rejection has no later push that could otherwise roll the
+    /// view back to the authoritative selection.
+    fn follow_navigation_settlement(&mut self) {
+        if self.state.selected_tree.is_some() && self.desk.navigation_hint().is_none() {
+            self.state.selected_tree = None;
+        }
+    }
+
     /// Carries out a reaction.
     fn perform(&mut self, ctx: &egui::Context, reaction: Reaction) {
         match reaction {
-            Reaction::Send { ask, request } => self.link.send(ask, request),
+            Reaction::Send { ask, request } => {
+                let reactions = submit_to_daemon(
+                    &self.link,
+                    &mut self.desk,
+                    ask,
+                    request,
+                    turn_core::now_ms(),
+                );
+                self.follow_navigation_settlement();
+                for reaction in reactions {
+                    self.perform(ctx, reaction);
+                }
+            }
             Reaction::Announce(announcement) => {
                 if let Announcement::Focus { .. } = &announcement {
                     // The daemon's governor cleared this one. Bringing the window
@@ -877,7 +932,9 @@ impl eframe::App for TurnApp {
                 } => Some((session_id.clone(), false)),
                 _ => None,
             };
-            for reaction in self.desk.apply_inbound(message, now_ms) {
+            let reactions = self.desk.apply_inbound(message, now_ms);
+            self.follow_navigation_settlement();
+            for reaction in reactions {
                 self.perform(&ctx, reaction);
             }
             if let Some((session_id, succeeded)) = exit_result {
@@ -897,6 +954,9 @@ impl eframe::App for TurnApp {
                     }
                 }
             }
+        }
+        for reaction in self.desk.take_due_retries(now_ms) {
+            self.perform(&ctx, reaction);
         }
         if self
             .pending_exit_stops
@@ -950,6 +1010,15 @@ impl eframe::App for TurnApp {
             let view = self.desk.view(now_ms);
             view.ui(ui, &self.theme, &self.keymap, &mut self.state)
         };
+        // Sidebar clicks update ViewState optimistically during `view.ui`. Apply those
+        // navigation intents before terminal geometry from the same frame, otherwise
+        // Desk can reject the new exact node's Resize against the previous selection
+        // and the renderer will correctly-but-fatally deduplicate it thereafter.
+        let (navigation_reactions, actions) =
+            stage_frame_actions(&mut self.desk, self.state.take_hierarchy_actions(), actions);
+        for reaction in navigation_reactions {
+            self.perform(&ctx, reaction);
+        }
         let arrangement = self.desk.arrange(ui.available_rect_before_wrap());
         self.desk.remember_arrangement(arrangement);
         for action in actions {
@@ -1019,11 +1088,6 @@ impl eframe::App for TurnApp {
                 }
             }
         }
-        for action in self.state.take_hierarchy_actions() {
-            for reaction in self.desk.apply_hierarchy_action(action) {
-                self.perform(&ctx, reaction);
-            }
-        }
         self.state.write_conflict_open = self.desk.write_conflict().is_some();
         let modal_is_open = self.state.is_sensitive()
             || self.desk.write_conflict().is_some()
@@ -1038,7 +1102,7 @@ impl eframe::App for TurnApp {
 
         // 5. The activity report, on a change and not on a timer.
         if let Some(context) = self.activity.take_update(now_ms) {
-            self.link.send(
+            let _ = self.link.send(
                 Ask::Activity,
                 turn_proto::Request::UpdateUserActivity { context },
             );
@@ -1077,6 +1141,7 @@ impl TurnApp {
             elapsed_tick_at: (!self.desk.queue().is_empty()).then(|| next_elapsed_tick(now_ms)),
             typing_expires_at: self.activity.wake_at(now_ms),
             reconnect_at: None,
+            resize_retry_at: self.desk.next_retry_at(),
         }
     }
 }
@@ -1103,6 +1168,91 @@ mod tests {
             "got {:?}",
             app.repaint_plan(now)
         );
+    }
+
+    #[test]
+    fn a_locally_rejected_tree_selection_rolls_the_renderer_back_to_authority() {
+        let ctx = egui::Context::default();
+        let mut app = TurnApp::new(
+            &ctx,
+            std::path::PathBuf::from("/tmp/turn-no-such-daemon-for-selection-rollback.sock"),
+            Keymap::build(&Overrides::new(), Platform::MAC),
+        );
+        let now = 1_700_000_000_000;
+        let workspace = turn_core::model::Workspace::new("turn", "/repo/turn", now);
+        let mut session = turn_core::model::Session::new(
+            workspace.id.clone(),
+            "Selection rollback",
+            "/repo/turn",
+            turn_core::model::Layout::single(turn_core::model::Pane::new(
+                turn_core::model::PaneKind::Agent,
+            )),
+            now,
+        );
+        let node =
+            turn_core::model::ProcessNode::agent(session.id.clone(), "claude", "/repo/turn", now);
+        let node_id = session.tree.insert(node);
+        let session_summary = turn_proto::SessionSummary::from_session(&session, 0, false, now);
+        let snapshot = turn_proto::HierarchySnapshot {
+            revision: 1,
+            tree_state: turn_proto::TreeSurfaceState {
+                surface_id: "main-window".into(),
+                selected: Some(turn_proto::HierarchyKey::session(session.id.clone())),
+                ..turn_proto::TreeSurfaceState::empty("main-window")
+            },
+            workspaces: vec![turn_proto::WorkspaceTreeView {
+                workspace: turn_proto::WorkspaceSummary::from_workspace(
+                    &workspace,
+                    std::slice::from_ref(&session_summary),
+                ),
+                checkouts: Vec::new(),
+                write_lease: None,
+                sessions: vec![turn_proto::SessionTreeView {
+                    session: session_summary,
+                    nodes: turn_proto::TreeNodeView::for_session(&session, now),
+                }],
+            }],
+        };
+        app.desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::Hierarchy,
+                response: Box::new(turn_proto::Response::Hierarchy {
+                    snapshot: Box::new(snapshot.clone()),
+                }),
+            },
+            now,
+        );
+        app.state.hierarchy = Some(snapshot);
+        let optimistic = turn_proto::HierarchyKey::process(node_id);
+        app.state.selected_tree = Some(optimistic.clone());
+        app.desk.set_navigation_hint(Some(optimistic.clone()));
+
+        app.perform(
+            &ctx,
+            Reaction::Send {
+                ask: Ask::SelectTree {
+                    surface_id: "main-window".into(),
+                    selected: Some(optimistic.clone()),
+                },
+                request: turn_proto::Request::SelectTreeNode {
+                    surface_id: "main-window".into(),
+                    selected: Some(optimistic),
+                },
+            },
+        );
+
+        assert!(app.desk.navigation_hint().is_none());
+        assert!(
+            app.state.selected_tree.is_none(),
+            "without this rollback the exact surface can deduplicate its only Resize forever"
+        );
+        assert!(matches!(
+            app.state
+                .hierarchy
+                .as_ref()
+                .and_then(|hierarchy| hierarchy.tree_state.selected.as_ref()),
+            Some(turn_proto::HierarchyKey::Session { .. })
+        ));
     }
 
     #[test]

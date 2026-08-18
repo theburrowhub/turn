@@ -79,6 +79,9 @@ pub enum PaneAction {
     Write(Vec<u8>),
     /// The pane is a different size in cells and the pty must be told.
     Resize(PtySize),
+    /// The body cannot display one complete cell. It must relinquish any remembered
+    /// geometry so a visible mirror can become the runtime's owner.
+    GeometryUnavailable,
     /// The user clicked in this pane.
     Focus,
     /// Text to put on the clipboard.
@@ -198,6 +201,10 @@ pub struct PaneInteraction {
     /// Pane becomes that process's sole geometry owner, so reacquiring ownership costs one
     /// resize even when this interaction measured the same rectangle before.
     reported_resize_claim: Option<(NodeId, u64)>,
+    /// Whether this Pane produced at least one complete cell from its actual body in
+    /// the previous frame. Geometry ownership excludes sub-cell/negative bodies so a
+    /// collapsed focused Pane cannot block a healthy visible mirror.
+    pub(crate) geometry_available: bool,
     /// The links on the grid as it was when they were last found — see [`links`].
     ///
     /// Built only while the pointer is over the pane, and reused across frames until the
@@ -1149,6 +1156,9 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // Nothing can be drawn or reported without a measured cell, and a size reported from a
     // guessed one is the bug in the report: a program laid out for a width Turn never drew.
     let Some(cell) = theme.cell_size(ui) else {
+        state.geometry_available = false;
+        state.reported_resize_claim = None;
+        outcome.actions.push(PaneAction::GeometryUnavailable);
         return outcome;
     };
     let response = ui.interact(rect, id, Sense::click_and_drag());
@@ -1157,19 +1167,37 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // `resize_pty` per frame during a window drag would be hundreds of requests. Measured
     // from the *live* geometry, without the scroll marker's strip: the pty's size must not
     // change just because the user looked at history.
-    let size = size_in_cells(rect, cell);
+    let measurable = rect.width().is_finite()
+        && rect.height().is_finite()
+        && cell.x.is_finite()
+        && cell.y.is_finite()
+        && cell.x > 0.0
+        && cell.y > 0.0
+        && rect.width() >= cell.x
+        && rect.height() >= cell.y;
+    state.geometry_available = measurable;
+    if !measurable {
+        // Re-entering a usable geometry must report again even if the same Pane/runtime
+        // wins ownership at the same dimensions it had before collapsing.
+        state.reported_resize_claim = None;
+        outcome.actions.push(PaneAction::GeometryUnavailable);
+    }
+    let size = measurable.then(|| size_in_cells(rect, cell));
     // Runtime identity can change while Pane identity and its interaction state stay
     // put (restore/relaunch is the common case). The replacement pty starts at its
     // initial 80x24 size, so `reported_size == size` is not proof that *this* pty has
     // ever received the live geometry. Runtime identity is the missing half of that
     // acknowledgement: one request per (runtime, geometry), never one per frame while
     // the daemon is still returning the old-sized grid.
-    if should_report_size(
-        state.reported_size,
-        state.reported_resize_claim.as_ref(),
-        size,
-        resize_claim,
-    ) {
+    if size.is_some_and(|size| {
+        should_report_size(
+            state.reported_size,
+            state.reported_resize_claim.as_ref(),
+            size,
+            resize_claim,
+        )
+    }) {
+        let size = size.expect("a reportable terminal body has a measured size");
         state.reported_size = Some(size);
         state.reported_resize_claim =
             resize_claim.map(|claim| (claim.runtime_id.clone(), claim.owner_epoch));
@@ -2868,6 +2896,37 @@ mod tests {
             !should_report_size(Some(visible), Some(&replacement_report), visible, None),
             "a mirror without a geometry claim can never resize"
         );
+    }
+
+    #[test]
+    fn a_subcell_pane_relinquishes_geometry_without_sending_a_one_by_one_resize() {
+        let grid = Grid::blank(24, 80);
+        let runtime = NodeId::from_stored("runtime_tiny001");
+        egui::__run_test_ui(|ui| {
+            let mut state = PaneInteraction::default();
+            let outcome = show_pane(
+                ui,
+                &mut state,
+                PaneInput {
+                    theme: &Theme::dark(),
+                    rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1.0, 1.0)),
+                    grid: &grid,
+                    options: PaneOptions::default(),
+                    id: ui.id().with("subcell-terminal"),
+                    resize_claim: Some(ResizeClaim {
+                        runtime_id: &runtime,
+                        owner_epoch: 1,
+                    }),
+                    chrome: None,
+                },
+            );
+            assert!(outcome.actions.contains(&PaneAction::GeometryUnavailable));
+            assert!(!outcome
+                .actions
+                .iter()
+                .any(|action| matches!(action, PaneAction::Resize(_))));
+            assert!(!state.geometry_available);
+        });
     }
 
     /// The user must be told when the history they are looking at does not go all the

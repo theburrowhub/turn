@@ -24,11 +24,9 @@ impl Default for PtySize {
 impl PtySize {
     /// Builds a size, clamping away the degenerate cases.
     ///
-    /// Zero is clamped rather than rejected: a UI reports a size while a pane is
-    /// still being laid out and will legitimately measure zero for a frame, and
-    /// failing that request would be worse than starting one row tall and being
-    /// corrected a moment later. A zero passed through to the kernel or to the
-    /// terminal parser is a panic.
+    /// Internal callers get a defensive non-zero value. Protocol handlers inspect the
+    /// raw fields with [`Self::was_degenerate`] and reject zero instead of silently
+    /// turning a collapsed visual body into a real 1x1 kernel PTY.
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             rows: rows.max(1),

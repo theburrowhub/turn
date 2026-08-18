@@ -365,7 +365,7 @@ impl TurnView<'_> {
         actions
     }
 
-    fn exact_terminal<'a>(
+    pub(crate) fn exact_terminal<'a>(
         &'a self,
         node: &'a TreeNodeView,
     ) -> Option<(&'a turn_core::model::PaneNodeBinding, &'a PaneContent<'a>)> {
@@ -390,10 +390,10 @@ impl TurnView<'_> {
         ui: &mut Ui,
         theme: &Theme,
         rect: Rect,
-        surface_id: &str,
+        _surface_id: &str,
         node: &TreeNodeView,
         safe_node: Option<&TreeNodeView>,
-        binding: &turn_core::model::PaneNodeBinding,
+        _binding: &turn_core::model::PaneNodeBinding,
         content: &PaneContent<'_>,
         state: &mut ViewState,
     ) -> Vec<ViewAction> {
@@ -405,7 +405,7 @@ impl TurnView<'_> {
         ui.painter().text(
             strip.left_center() + Vec2::new(10.0, 0.0),
             Align2::LEFT_CENTER,
-            "EXACT TERMINAL · READ-ONLY MIRROR",
+            "EXACT TERMINAL",
             FontId::new(10.0, egui::FontFamily::Monospace),
             theme.text_dim,
         );
@@ -415,38 +415,28 @@ impl TurnView<'_> {
         ui.ctx().accesskit_node_builder(mirror_id, |builder| {
             builder.set_role(egui::accesskit::Role::Group);
             builder.set_label(format!(
-                "Exact read-only terminal mirror for {}",
+                "Exact operational terminal for {}",
                 work_surface_title(node, safe_node)
             ));
         });
-        let focus_rect = Rect::from_min_size(
-            strip.right_top() - Vec2::new(128.0, -3.0),
-            Vec2::new(122.0, 24.0),
-        );
-        if ui
-            .put(focus_rect, egui::Button::new("Focus exact Pane"))
-            .clicked()
-        {
-            state.push_hierarchy_action(HierarchyAction::FocusPaneForNode {
-                surface_id: surface_id.to_string(),
-                session_id: binding.session_id.clone(),
-                node_id: node.node_id.clone(),
-            });
-        }
         let terminal_rect = Rect::from_min_max(strip.left_bottom(), rect.max).shrink(6.0);
-        let interaction = state
-            .node_terminal_views
-            .entry(node.node_id.clone())
-            .or_default();
+        let resize_epoch = content
+            .runtime_id
+            .as_ref()
+            .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &content.pane_id));
         let options = PaneOptions {
-            focused: false,
-            accepts_input: false,
+            focused: true,
+            accepts_input: !state.is_sensitive()
+                && self.write_conflict.is_none()
+                && self.link_confirmation.is_none(),
             now_ms: self.now_ms,
             scrolled: content.scrolled,
             history_complete: content.history_complete,
         };
-        // A separate interaction object and a filtered outcome are both intentional:
-        // measuring this larger read-only mirror must not resize or focus the saved Pane.
+        let interaction = state.pane(&content.pane_id);
+        // This exact-node view is the primary surface while selected, so its complete
+        // body owns the shared runtime geometry. The Pane identity remains the saved
+        // binding; changing views does not create a second terminal or lose selection.
         terminal::show_pane(
             ui,
             interaction,
@@ -458,18 +448,27 @@ impl TurnView<'_> {
                 id: ui
                     .id()
                     .with(("node-terminal-mirror", node.node_id.as_str())),
-                resize_claim: None,
+                resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                    resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                        runtime_id,
+                        owner_epoch,
+                    })
+                }),
                 chrome: None,
             },
         )
         .actions
         .into_iter()
-        .filter_map(|action| match action {
-            PaneAction::Copy(_) | PaneAction::Scroll(_) => Some(ViewAction::Pane {
+        .map(|action| match action {
+            PaneAction::Copy(_)
+            | PaneAction::Scroll(_)
+            | PaneAction::Resize(_)
+            | PaneAction::GeometryUnavailable
+            | PaneAction::Focus
+            | PaneAction::Write(_) => ViewAction::Pane {
                 pane_id: content.pane_id.clone(),
                 action,
-            }),
-            PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_) => None,
+            },
         })
         .collect()
     }

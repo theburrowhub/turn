@@ -822,6 +822,7 @@ mod tests {
             .insert(
                 (session.clone(), pane.clone()),
                 Attachment {
+                    attachment_id: 7,
                     node_id: Some(node.clone()),
                     stream: turn_proto::PaneStream::Cells,
                     next_seq: 0,

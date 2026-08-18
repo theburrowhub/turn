@@ -372,6 +372,7 @@ async fn panes_can_be_swapped_focused_by_name_and_detached_without_stopping_anyt
     ui.ask(Request::DetachPane {
         session_id: session.id.clone(),
         pane_id: pane_of_node.clone(),
+        attachment_id: None,
     })
     .await;
     assert!(pid_is_alive(pid), "detaching must not stop the process");

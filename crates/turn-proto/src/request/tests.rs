@@ -206,6 +206,7 @@ fn read_only_requests_are_distinguished_from_mutating_ones() {
     assert!(!Request::ResyncPane {
         session_id: session(),
         pane_id: PaneId::from_stored("pane_a"),
+        attachment_id: Some(7),
     }
     .is_mutating());
     // Reading history and searching it are reads. A search borrows the parser's
@@ -774,6 +775,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::ResyncPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: Some(7),
         },
         Request::PaneImage {
             session_id: session_id.clone(),
@@ -783,6 +785,7 @@ pub(crate) fn all_requests() -> Vec<Request> {
         Request::DetachPane {
             session_id: session_id.clone(),
             pane_id: pane_id.clone(),
+            attachment_id: Some(7),
         },
         Request::GetPaneHistory {
             session_id: session_id.clone(),

@@ -227,11 +227,13 @@ impl Core {
             return;
         };
         let seq = attachment.next_seq;
+        let attachment_id = attachment.attachment_id;
         attachment.next_seq += 1;
 
         let delivered = client.push_screen(ServerEvent::PaneScreen {
             session_id,
             pane_id,
+            attachment_id,
             node_id: Some(node.clone()),
             seq,
             update,
@@ -322,6 +324,198 @@ mod tests {
         };
         drain(&mut frames);
         (harness, screen, frames, session, pane, node, client)
+    }
+
+    /// A selected Agent is semantic identity; the shell around it owns the PTY. Attach
+    /// must return both without changing geometry, then Resize addressed to the Agent
+    /// must reach that concrete shell runtime.
+    #[tokio::test]
+    async fn a_hosted_agent_attachment_keeps_semantic_identity_and_sizes_its_shell_runtime() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_hosted001");
+        let pane = PaneId::from_stored("pane_hosted001");
+        harness.add_session(session.clone(), pane.clone(), NOW);
+        let shell = harness.spawn_process(&session, &pane, NOW).await;
+        let mut agent =
+            turn_core::model::ProcessNode::agent(session.clone(), "claude", "/tmp", NOW);
+        let agent_id = agent.id.clone();
+        agent.lifecycle = turn_core::state::Lifecycle::Alive;
+        harness
+            .core
+            .processes
+            .get_mut(&shell)
+            .expect("the hosting shell")
+            .hosted = Some(agent_id.clone());
+        let session_model = harness
+            .core
+            .sessions
+            .get_mut(&session)
+            .expect("the Session");
+        session_model.tree.insert(agent);
+        session_model
+            .layout
+            .get_mut(&pane)
+            .expect("the Pane")
+            .node_id = Some(agent_id.clone());
+
+        let (client, _frames) = harness.add_client(16);
+        let response = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id: session.clone(),
+                    pane_id: pane.clone(),
+                    size: PtySize::new(60, 200),
+                    stream: PaneStream::Cells,
+                },
+                NOW,
+            )
+            .expect("the semantic Agent must attach through its host");
+        let attachment = match response {
+            Response::Attached { attachment } => attachment,
+            other => panic!("expected an attachment, got {other:?}"),
+        };
+        assert_eq!(attachment.node_id.as_ref(), Some(&agent_id));
+        assert_eq!(attachment.runtime_id.as_ref(), Some(&shell));
+        assert_eq!(attachment.size, PtySize::new(24, 80));
+        assert_eq!(
+            harness.core.processes[&shell].size,
+            turn_pty::ScreenSize::new(24, 80),
+            "Attach is observational and cannot apply its fallback geometry"
+        );
+
+        harness
+            .core
+            .dispatch(
+                client,
+                Request::ResizePty {
+                    session_id: session,
+                    node_id: agent_id,
+                    size: PtySize::new(60, 200),
+                },
+                NOW,
+            )
+            .expect("Agent-addressed resize resolves to the shell PTY");
+        assert_eq!(
+            harness.core.processes[&shell].size,
+            turn_pty::ScreenSize::new(60, 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_a_pane_attachment_stops_its_superseded_runtime_pump() {
+        let (mut harness, _screen, _frames, session, pane, previous, client) =
+            attached_pane(16).await;
+        assert!(harness.core.pumps.contains_key(&previous));
+
+        // A process relaunch keeps the durable Pane id but binds it to a new runtime.
+        let replacement = harness.spawn_process(&session, &pane, NOW + 1).await;
+        let response = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id: session,
+                    pane_id: pane,
+                    size: PtySize::new(10, 40),
+                    stream: PaneStream::Cells,
+                },
+                NOW + 2,
+            )
+            .expect("the relaunched Pane must reattach");
+        let attachment = match response {
+            Response::Attached { attachment } => attachment,
+            other => panic!("expected an attachment, got {other:?}"),
+        };
+
+        assert_eq!(attachment.runtime_id.as_ref(), Some(&replacement));
+        assert!(harness.core.pumps.contains_key(&replacement));
+        assert!(
+            !harness.core.pumps.contains_key(&previous),
+            "the attachment replacement was the old runtime's last watcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_attachment_cleanup_cannot_detach_or_resync_a_new_generation() {
+        let (mut harness, _screen, _frames, session, pane, _node, client) = attached_pane(16).await;
+        let key = (session.clone(), pane.clone());
+        let first = harness.core.clients[&client].attachments[&key].attachment_id;
+        let response = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id: session.clone(),
+                    pane_id: pane.clone(),
+                    size: PtySize::new(24, 80),
+                    stream: PaneStream::Cells,
+                },
+                NOW,
+            )
+            .expect("reattaching replaces the subscription");
+        let second = match response {
+            Response::Attached { attachment } => attachment.attachment_id,
+            other => panic!("expected an attachment, got {other:?}"),
+        };
+        assert_ne!(first, second);
+
+        assert_eq!(
+            harness
+                .core
+                .dispatch(
+                    client,
+                    Request::DetachPane {
+                        session_id: session.clone(),
+                        pane_id: pane.clone(),
+                        attachment_id: Some(first),
+                    },
+                    NOW,
+                )
+                .expect("stale cleanup is an idempotent no-op"),
+            Response::Ack
+        );
+        assert_eq!(
+            harness.core.clients[&client].attachments[&key].attachment_id,
+            second
+        );
+        let error = harness
+            .core
+            .dispatch(
+                client,
+                Request::ResyncPane {
+                    session_id: session,
+                    pane_id: pane,
+                    attachment_id: Some(first),
+                },
+                NOW,
+            )
+            .expect_err("a stale generation cannot read the new screen");
+        assert_eq!(error.code, turn_proto::ErrorCode::Conflict);
+    }
+
+    #[tokio::test]
+    async fn raw_zero_terminal_geometry_is_rejected_instead_of_becoming_one_by_one() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_zero00001");
+        let pane = PaneId::from_stored("pane_zero00001");
+        harness.add_session(session.clone(), pane.clone(), NOW);
+        let (client, _frames) = harness.add_client(8);
+        let error = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id: session,
+                    pane_id: pane,
+                    size: PtySize { rows: 0, cols: 80 },
+                    stream: PaneStream::Cells,
+                },
+                NOW,
+            )
+            .expect_err("zero rows are a layout bug, not a 1x80 terminal");
+        assert_eq!(error.code, turn_proto::ErrorCode::InvalidArgument);
     }
 
     /// The everyday path: a process prints, and the cells that arrive say what it
@@ -497,6 +691,7 @@ mod tests {
                 Request::ResyncPane {
                     session_id: session.clone(),
                     pane_id: pane.clone(),
+                    attachment_id: Some(1),
                 },
                 NOW,
             )
@@ -555,6 +750,32 @@ mod tests {
         assert_eq!(update.size(), PtySize::new(20, 60));
         update.apply(&mut screen).expect("it applies");
         assert_eq!((screen.rows, screen.cols), (20, 60));
+    }
+
+    #[tokio::test]
+    async fn an_identical_resize_is_acknowledged_without_a_screen_broadcast() {
+        let (mut harness, _screen, mut frames, session, _pane, node, client) =
+            attached_pane(64).await;
+        drain(&mut frames);
+        assert_eq!(
+            harness
+                .core
+                .dispatch(
+                    client,
+                    Request::ResizePty {
+                        session_id: session,
+                        node_id: node,
+                        size: PtySize::new(24, 80),
+                    },
+                    NOW,
+                )
+                .expect("an idempotent resize succeeds"),
+            Response::Ack
+        );
+        assert!(
+            drain(&mut frames).is_empty(),
+            "a no-op must not send SIGWINCH-derived full-screen traffic"
+        );
     }
 
     /// A pane asked for as bytes still gets bytes, and never a grid. The escape stream

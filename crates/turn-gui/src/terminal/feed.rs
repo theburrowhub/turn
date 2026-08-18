@@ -806,7 +806,9 @@ mod tests {
         PaneAttachment {
             session_id: SessionId::from_stored("sess_feed0001"),
             pane_id: PaneId::new(),
+            attachment_id: 7,
             node_id: None,
+            runtime_id: None,
             stream: PaneStream::Cells,
             screen: screen.map(Box::new),
             scrollback: turn_proto::Scrollback::default(),

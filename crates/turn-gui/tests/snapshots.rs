@@ -137,6 +137,7 @@ impl Fixture {
             });
             TemporaryPaneContent {
                 pane,
+                runtime_id: Some(pane.binding.node_id.clone()),
                 node,
                 previews: &self.temporary_previews,
                 grid: self.grids.get(&pane.binding.pane_id),
@@ -1816,24 +1817,40 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
 }
 
 #[test]
-fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
+fn an_exact_terminal_binding_renders_as_the_operational_node_view() {
     let mut fixture = busy_desk();
     fixture.permission = None;
     fixture.queue.clear();
-    let node = fixture
-        .hierarchy
-        .as_mut()
-        .expect("hierarchy")
-        .workspaces
-        .iter_mut()
-        .flat_map(|workspace| &mut workspace.sessions)
-        .flat_map(|session| &mut session.nodes)
-        .find(|node| node.title == "Claude Code")
-        .expect("Claude Code");
-    let node_id = node.node_id.clone();
-    node.pane_capability = NodePaneCapability::Terminal {
-        streams: vec![PaneStream::Cells],
+    let (node_id, pane_id) = {
+        let node = fixture
+            .hierarchy
+            .as_mut()
+            .expect("hierarchy")
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.sessions)
+            .flat_map(|session| &mut session.nodes)
+            .find(|node| node.title == "Claude Code")
+            .expect("Claude Code");
+        node.pane_capability = NodePaneCapability::Terminal {
+            streams: vec![PaneStream::Cells],
+        };
+        (
+            node.node_id.clone(),
+            node.pane_bindings
+                .first()
+                .expect("the exact Agent has a durable Pane")
+                .pane_id
+                .clone(),
+        )
     };
+    fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .get_mut(&pane_id)
+        .expect("the bound Pane")
+        .node_id = Some(node_id.clone());
     fixture
         .hierarchy
         .as_mut()
@@ -1843,23 +1860,60 @@ fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
     fixture.inspector = Some(node_inspector(&fixture, &node_id));
     let expected_layout = serde_json::to_vec(fixture.layout.as_ref().expect("saved layout"))
         .expect("serialise Layout");
-    let mut h = harness(fixture);
-    h.run();
-    h.run();
+    let mut window = window(fixture);
+    window.theme = Theme::with_appearance(&AppearanceSettings {
+        reduced_motion: true,
+        cursor_blink: false,
+        ..AppearanceSettings::default()
+    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                window.theme.install(ui.ctx());
+                window.actions.extend(window.fixture.view().ui(
+                    ui,
+                    &window.theme,
+                    &window.keymap,
+                    &mut window.state,
+                ));
+            },
+            window,
+        );
+    let steps = h.run();
+    assert!(
+        steps <= 6,
+        "the exact terminal needed {steps} frames to settle under reduced motion"
+    );
 
     assert_eq!(
         h.state().state.work_surface_target,
-        Some(ViewTarget::Node(node_id))
+        Some(ViewTarget::Node(node_id.clone()))
+    );
+    let terminal_rect = h.get_by_label_contains("Terminal, 40 rows").rect();
+    let expected = turn_gui::panes::size_in_cells(terminal_rect, measured_cell(&h.state().theme));
+    assert_eq!(
+        pane_resizes(&h.state().actions, &pane_id),
+        vec![expected],
+        "the exact Node surface must size its runtime from the entire operational rectangle"
+    );
+    assert_eq!(
+        h.state()
+            .state
+            .panes
+            .get(&pane_id)
+            .and_then(PaneInteraction::reported_size),
+        Some(expected)
     );
     let text = all_text(&h).join("\n");
     assert!(group_labels(&h)
         .iter()
-        .any(|label| label == "Exact read-only terminal mirror for Claude Code"));
+        .any(|label| label == "Exact operational terminal for Claude Code"));
     assert!(text.contains("I'll fix the climbing bug. Running the tests first."));
     assert!(h.state().actions.iter().all(|action| !matches!(
         action,
         ViewAction::Pane {
-            action: PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_),
+            action: PaneAction::Write(_),
             ..
         } | ViewAction::ZoomPane { .. }
     )));
@@ -4773,6 +4827,233 @@ fn a_replacement_runtime_is_resized_once_through_the_floating_render_path() {
 }
 
 #[test]
+fn mixed_splits_fill_each_runtime_initially_and_during_both_divider_drags() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let pane_ids: Vec<PaneId> = fixture
+        .layout
+        .as_ref()
+        .expect("the mixed layout")
+        .panes()
+        .into_iter()
+        .map(|pane| pane.id.clone())
+        .collect();
+    assert_eq!(pane_ids.len(), 3);
+    for (index, pane_id) in pane_ids.iter().enumerate() {
+        fixture
+            .layout
+            .as_mut()
+            .expect("the mixed layout")
+            .get_mut(pane_id)
+            .expect("the Pane")
+            .node_id = Some(NodeId::from_stored(format!("proc_mixed_geometry_{index}")));
+    }
+
+    // Start settled without PaneContent, then let all three runtimes appear at once. This
+    // isolates the one post-paint wakeup that first complete-cell geometry requires; cursor
+    // animation cannot accidentally provide a second frame because reduced motion disables it.
+    let grids = std::mem::take(&mut fixture.grids);
+    let mut window = window(fixture);
+    window.theme = Theme::with_appearance(&AppearanceSettings {
+        reduced_motion: true,
+        cursor_blink: false,
+        ..AppearanceSettings::default()
+    });
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1280.0, 760.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                window.theme.install(ui.ctx());
+                window.actions.extend(window.fixture.view().ui(
+                    ui,
+                    &window.theme,
+                    &window.keymap,
+                    &mut window.state,
+                ));
+            },
+            window,
+        );
+    h.run();
+    h.state_mut().fixture.grids = grids;
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "the first paint discovers geometry; its follow-up owns the Resize"
+    );
+    let first_delay = h
+        .output()
+        .viewport_output
+        .values()
+        .map(|viewport| viewport.repaint_delay)
+        .min()
+        .unwrap_or(std::time::Duration::MAX);
+    assert_eq!(
+        first_delay,
+        std::time::Duration::ZERO,
+        "first geometry discovery must wake a reduced-motion window exactly once"
+    );
+    h.run_steps(1);
+
+    let terminal_rects = |h: &Harness<'static, Window>| {
+        let mut rects: Vec<egui::Rect> = h
+            .query_all_by_role(egui::accesskit::Role::Terminal)
+            .map(|node| node.rect())
+            .collect();
+        rects.sort_by(|left, right| {
+            left.min
+                .x
+                .total_cmp(&right.min.x)
+                .then_with(|| left.min.y.total_cmp(&right.min.y))
+        });
+        assert_eq!(rects.len(), 3, "one terminal rectangle per runtime");
+        rects
+    };
+    let rects = terminal_rects(&h);
+    for (pane_id, rect) in pane_ids.iter().zip(&rects) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(
+            pane_resizes(&h.state().actions, pane_id),
+            vec![expected],
+            "each distinct runtime receives its complete split rectangle"
+        );
+    }
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(pane_ids
+        .iter()
+        .all(|pane_id| pane_resizes(&h.state().actions, pane_id).is_empty()));
+
+    // Drag the outer horizontal divider. Apply the daemon-shaped layout answer, then
+    // verify the frame while the pointer is still held resizes all three affected runtimes.
+    let rects = terminal_rects(&h);
+    let horizontal_start = egui::pos2((rects[0].max.x + rects[1].min.x) / 2.0, rects[1].center().y);
+    let horizontal_end = horizontal_start + egui::vec2(96.0, 0.0);
+    h.hover_at(horizontal_start);
+    h.run_steps(1);
+    h.drag_at(horizontal_start);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.hover_at(horizontal_end);
+    h.run_steps(1);
+    let horizontal = h
+        .state()
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            ViewAction::ResizeDivider {
+                before,
+                after,
+                fraction,
+            } => Some((before.clone(), after.clone(), *fraction)),
+            _ => None,
+        })
+        .expect("dragging the horizontal divider emits its delta");
+    assert_eq!((&horizontal.0, &horizontal.1), (&pane_ids[0], &pane_ids[1]));
+    assert!(h
+        .state_mut()
+        .fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .resize_divider(&horizontal.0, &horizontal.1, horizontal.2));
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    let rects = terminal_rects(&h);
+    for (pane_id, rect) in pane_ids.iter().zip(&rects) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(pane_resizes(&h.state().actions, pane_id), vec![expected]);
+    }
+    h.drop_at(horizontal_end);
+    h.run_steps(1);
+
+    // The nested vertical divider changes only its two children; the tall left Pane must
+    // neither resize nor wait for release before the right-hand TUIs fill their new rows.
+    let rects = terminal_rects(&h);
+    // A terminal's accessibility rectangle excludes the Pane header. The divider is
+    // immediately below the upper terminal, not midway through the lower Pane's header.
+    let vertical_start = egui::pos2(
+        rects[1].center().x,
+        rects[1].max.y + turn_gui::panes::DIVIDER_THICKNESS / 2.0,
+    );
+    let vertical_end = vertical_start + egui::vec2(0.0, 72.0);
+    h.hover_at(vertical_start);
+    h.run_steps(1);
+    h.drag_at(vertical_start);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.hover_at(vertical_end);
+    h.run_steps(1);
+    let vertical = h
+        .state()
+        .actions
+        .iter()
+        .find_map(|action| match action {
+            ViewAction::ResizeDivider {
+                before,
+                after,
+                fraction,
+            } => Some((before.clone(), after.clone(), *fraction)),
+            _ => None,
+        })
+        .expect("dragging the nested vertical divider emits its delta");
+    assert_eq!((&vertical.0, &vertical.1), (&pane_ids[1], &pane_ids[2]));
+    assert!(h
+        .state_mut()
+        .fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .resize_divider(&vertical.0, &vertical.1, vertical.2));
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    let rects = terminal_rects(&h);
+    assert!(pane_resizes(&h.state().actions, &pane_ids[0]).is_empty());
+    for (pane_id, rect) in pane_ids[1..].iter().zip(&rects[1..]) {
+        let expected = turn_gui::panes::size_in_cells(*rect, measured_cell(&h.state().theme));
+        assert_eq!(
+            h.state()
+                .state
+                .panes
+                .get(pane_id)
+                .and_then(PaneInteraction::reported_size),
+            Some(expected)
+        );
+        assert_eq!(pane_resizes(&h.state().actions, pane_id), vec![expected]);
+    }
+    h.drop_at(vertical_end);
+    h.run_steps(1);
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(pane_ids
+        .iter()
+        .all(|pane_id| pane_resizes(&h.state().actions, pane_id).is_empty()));
+}
+
+#[test]
 fn one_runtime_has_one_geometry_owner_across_duplicates_floating_and_temporary_views() {
     let mut fixture = busy_desk();
     fixture.permission = None;
@@ -6243,7 +6524,9 @@ fn new_output_while_scrolled_back_leaves_the_view_where_it_was() {
     let mut feed = PaneFeed::attach(&PaneAttachment {
         session_id: SessionId::from_stored("sess_scroll01"),
         pane_id: PaneId::from_stored("pane_scroll01"),
+        attachment_id: 7,
         node_id: None,
+        runtime_id: None,
         stream: PaneStream::Cells,
         screen: Some(Box::new(daemon.clone())),
         scrollback: turn_proto::Scrollback::default(),

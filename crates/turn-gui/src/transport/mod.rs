@@ -69,6 +69,13 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 pub enum Ask {
     Hierarchy,
     Inspector(HierarchyKey),
+    /// One optimistic tree selection. Keeping the expected key in the intent lets a
+    /// rejection or a conflicting daemon answer release exactly that navigation hint
+    /// without disturbing a newer click already in flight.
+    SelectTree {
+        surface_id: String,
+        selected: Option<HierarchyKey>,
+    },
     Workspaces,
     Sessions,
     Details(SessionId),
@@ -124,6 +131,27 @@ pub enum Ask {
         pane_id: PaneId,
         node_id: Option<NodeId>,
         intent_id: u64,
+    },
+    /// One runtime-scoped geometry request. Unlike keystrokes, delivery and the Ack
+    /// matter: the model keeps the latest desired size dirty until this exact tuple is
+    /// acknowledged, so queue saturation cannot strand a TUI at an old geometry.
+    Resize {
+        session_id: SessionId,
+        runtime_id: NodeId,
+        pane_id: PaneId,
+        size: turn_proto::PtySize,
+        /// Window-local generation for this runtime geometry write. An external resize can
+        /// overtake an older Ack, including an ABA back to the same dimensions; tuple equality
+        /// alone cannot distinguish those two intents.
+        intent_id: u64,
+    },
+    /// A whole-screen repair is correlated to the attachment identity the window still
+    /// owns. Late answers for another Session/runtime cannot overwrite a rebound feed.
+    Resync {
+        session_id: SessionId,
+        pane_id: PaneId,
+        runtime_id: Option<NodeId>,
+        attachment_id: u64,
     },
     RelaunchNode {
         session_id: SessionId,
@@ -181,6 +209,7 @@ impl Ask {
         match self {
             Ask::Hierarchy => "loading the workspace hierarchy",
             Ask::Inspector(_) => "loading contextual details",
+            Ask::SelectTree { .. } => "selecting a node in the workspace tree",
             Ask::Workspaces => "loading workspaces",
             Ask::Sessions => "loading sessions",
             Ask::Details(_) => "loading a session",
@@ -199,6 +228,8 @@ impl Ask {
             Ask::CreateTemplate => "saving the layout preset",
             Ask::ApplyTemplate(_) => "applying the layout preset",
             Ask::Attach { .. } => "attaching to a pane",
+            Ask::Resize { .. } => "resizing a terminal pane",
+            Ask::Resync { .. } => "resynchronising a terminal pane",
             Ask::RelaunchNode { .. } => "starting the restored pane",
             Ask::RestoreLeaseAcquire { .. } => "acquiring exclusive write access",
             Ask::CloseSession { .. } => "ending the session",
@@ -211,7 +242,7 @@ impl Ask {
             Ask::ArchiveWorkspace { archived: false } => "restoring the workspace",
             Ask::Action(label) => label,
             Ask::Activity => "reporting activity",
-            Ask::Stream => "sending to the terminal",
+            Ask::Stream => "sending input to the terminal",
         }
     }
 }
@@ -232,6 +263,16 @@ pub enum Inbound {
     Notice(ProtoError),
 }
 
+/// The synchronous result of crossing the GUI-to-transport boundary. A rejected
+/// request is returned to the caller rather than squeezed through the already-full
+/// daemon-to-GUI queue, so Desk can always release its matching pending intent.
+#[derive(Debug)]
+#[must_use = "a rejected request must be returned to Desk so its pending intent can settle"]
+pub enum SendOutcome {
+    Queued,
+    Rejected(Inbound),
+}
+
 /// One request, on its way out.
 struct Outbound {
     /// The live socket generation this intent was created against. A request from an
@@ -245,16 +286,88 @@ struct Outbound {
 pub struct DaemonLink {
     socket: PathBuf,
     outbound: tokio_mpsc::Sender<Outbound>,
-    inbound_sender: sync_mpsc::SyncSender<Inbound>,
     inbound: sync_mpsc::Receiver<Inbound>,
-    wake: Waker,
     /// Zero while disconnected; otherwise the generation accepted by `serve`.
     connection_generation: Arc<AtomicU64>,
     /// Kept so the runtime thread is not detached; dropping the link ends it.
     _thread: std::thread::JoinHandle<()>,
 }
 
+#[cfg(test)]
+pub(crate) struct SaturatedTestPeer {
+    outbound: tokio_mpsc::Receiver<Outbound>,
+    inbound: sync_mpsc::SyncSender<Inbound>,
+}
+
+#[cfg(test)]
+impl SaturatedTestPeer {
+    pub(crate) fn assert_inbound_full(&self) {
+        assert!(matches!(
+            self.inbound.try_send(Inbound::Notice(ProtoError::new(
+                turn_proto::ErrorCode::Unavailable,
+                "over capacity",
+            ))),
+            Err(sync_mpsc::TrySendError::Full(_))
+        ));
+    }
+
+    pub(crate) fn release_one_outbound(&mut self) {
+        self.outbound
+            .try_recv()
+            .expect("the saturated test queue has one filler to release");
+    }
+
+    pub(crate) fn drain_sent(&mut self) -> Vec<(Ask, Request)> {
+        let mut sent = Vec::new();
+        while let Ok(outbound) = self.outbound.try_recv() {
+            sent.push((outbound.ask, outbound.request));
+        }
+        sent
+    }
+}
+
 impl DaemonLink {
+    #[cfg(test)]
+    pub(crate) fn saturated_for_test() -> (Self, SaturatedTestPeer) {
+        let (outbound, outbound_receiver) =
+            tokio_mpsc::channel::<Outbound>(OUTBOUND_INTENT_CAPACITY);
+        for _ in 0..OUTBOUND_INTENT_CAPACITY {
+            outbound
+                .try_send(Outbound {
+                    generation: 1,
+                    ask: Ask::Activity,
+                    request: Request::ListWorkspaces {
+                        include_archived: false,
+                    },
+                })
+                .expect("the test fills the bounded outbound queue exactly");
+        }
+        let (inbound_sender, inbound) =
+            sync_mpsc::sync_channel::<Inbound>(INBOUND_MESSAGE_CAPACITY);
+        for index in 0..INBOUND_MESSAGE_CAPACITY {
+            inbound_sender
+                .try_send(Inbound::Notice(ProtoError::new(
+                    turn_proto::ErrorCode::Unavailable,
+                    format!("synthetic inbound {index}"),
+                )))
+                .expect("the test fills the bounded inbound queue exactly");
+        }
+        let link = DaemonLink {
+            socket: PathBuf::from("/tmp/turn-saturated-test.sock"),
+            outbound,
+            inbound,
+            connection_generation: Arc::new(AtomicU64::new(1)),
+            _thread: std::thread::spawn(|| {}),
+        };
+        (
+            link,
+            SaturatedTestPeer {
+                outbound: outbound_receiver,
+                inbound: inbound_sender,
+            },
+        )
+    }
+
     /// Starts the connection on its own thread and returns at once.
     ///
     /// Deliberately does not wait for a connection: the window has to be able to draw
@@ -265,8 +378,6 @@ impl DaemonLink {
         let (outbound, outbound_rx) = tokio_mpsc::channel::<Outbound>(OUTBOUND_INTENT_CAPACITY);
         let (inbound_tx, inbound) = sync_mpsc::sync_channel::<Inbound>(INBOUND_MESSAGE_CAPACITY);
         let path = socket.clone();
-        let inbound_sender = inbound_tx.clone();
-        let link_wake = Arc::clone(&wake);
         let connection_generation = Arc::new(AtomicU64::new(0));
         let supervisor_generation = Arc::clone(&connection_generation);
 
@@ -314,9 +425,7 @@ impl DaemonLink {
         DaemonLink {
             socket,
             outbound,
-            inbound_sender,
             inbound,
-            wake: link_wake,
             connection_generation,
             _thread: thread,
         }
@@ -333,51 +442,46 @@ impl DaemonLink {
     /// against a layout the daemon rebuilt from disk. The window re-fetches on
     /// reconnect instead, which is the only correct recovery, so dropping a request
     /// sent while disconnected is what makes that happen.
-    pub fn send(&self, ask: Ask, request: Request) {
+    pub fn send(&self, ask: Ask, request: Request) -> SendOutcome {
         let generation = self.connection_generation.load(Ordering::Acquire);
         if generation == 0 {
-            self.reject_offline(ask);
-            return;
+            return self.reject_offline(ask);
         }
         match self.outbound.try_send(Outbound {
             generation,
             ask,
             request,
         }) {
-            Ok(()) => {}
+            Ok(()) => SendOutcome::Queued,
             Err(tokio_mpsc::error::TrySendError::Full(outbound)) => {
-                self.reject_saturated(outbound.ask);
+                self.reject_saturated(outbound.ask)
             }
             Err(tokio_mpsc::error::TrySendError::Closed(outbound)) => {
-                self.reject_offline(outbound.ask);
+                self.reject_offline(outbound.ask)
             }
         }
     }
 
-    fn reject_offline(&self, ask: Ask) {
+    fn reject_offline(&self, ask: Ask) -> SendOutcome {
         tracing::debug!(
             intent = ask.describing(),
             "a request was dropped without a live daemon connection"
         );
         if !ask.is_worth_reporting() {
-            return;
+            return SendOutcome::Queued;
         }
         let error = disconnected_request_error(&ask);
-        let _ = deliver_inbound(
-            &self.inbound_sender,
-            &self.wake,
-            Inbound::Failed { ask, error },
-        );
+        SendOutcome::Rejected(Inbound::Failed { ask, error })
     }
 
-    fn reject_saturated(&self, ask: Ask) {
+    fn reject_saturated(&self, ask: Ask) -> SendOutcome {
         tracing::warn!(
             intent = ask.describing(),
             capacity = OUTBOUND_INTENT_CAPACITY,
             "the GUI-to-daemon queue reached its fixed capacity"
         );
         if !ask.is_worth_reporting() {
-            return;
+            return SendOutcome::Queued;
         }
         let error = ProtoError::new(
             turn_proto::ErrorCode::RateLimited,
@@ -386,11 +490,7 @@ impl DaemonLink {
                 ask.describing()
             ),
         );
-        let _ = deliver_inbound(
-            &self.inbound_sender,
-            &self.wake,
-            Inbound::Failed { ask, error },
-        );
+        SendOutcome::Rejected(Inbound::Failed { ask, error })
     }
 
     /// Everything that arrived since the last call.
@@ -750,7 +850,7 @@ mod tests {
 
     #[test]
     fn both_gui_boundary_queues_have_hard_capacity() {
-        let (inbound, _inbound_receiver) =
+        let (inbound, inbound_receiver) =
             sync_mpsc::sync_channel::<Inbound>(INBOUND_MESSAGE_CAPACITY);
         for index in 0..INBOUND_MESSAGE_CAPACITY {
             inbound
@@ -790,6 +890,39 @@ mod tests {
                 },
             }),
             Err(tokio_mpsc::error::TrySendError::Full(_))
+        ));
+
+        let session_id = SessionId::from_stored("sess_saturated_resize");
+        let runtime_id = NodeId::from_stored("proc_saturated_resize");
+        let pane_id = PaneId::from_stored("pane_saturated_resize");
+        let size = turn_proto::PtySize::new(60, 200);
+        let link = DaemonLink {
+            socket: PathBuf::from("/tmp/turn-saturated-test.sock"),
+            outbound,
+            inbound: inbound_receiver,
+            connection_generation: Arc::new(AtomicU64::new(1)),
+            _thread: std::thread::spawn(|| {}),
+        };
+        let outcome = link.send(
+            Ask::Resize {
+                session_id: session_id.clone(),
+                runtime_id: runtime_id.clone(),
+                pane_id: pane_id.clone(),
+                size,
+                intent_id: 1,
+            },
+            Request::ResizePty {
+                session_id,
+                node_id: runtime_id,
+                size,
+            },
+        );
+        assert!(matches!(
+            outcome,
+            SendOutcome::Rejected(Inbound::Failed {
+                ask: Ask::Resize { pane_id: rejected, .. },
+                error,
+            }) if rejected == pane_id && error.code == turn_proto::ErrorCode::RateLimited
         ));
     }
 
@@ -1128,7 +1261,10 @@ mod tests {
         wait_for(&link, |message| {
             matches!(message, Inbound::Status(ConnectionState::Connected { .. }))
         });
-        link.send(Ask::Action("closing the pane"), Request::ListTemplates);
+        assert!(matches!(
+            link.send(Ask::Action("closing the pane"), Request::ListTemplates),
+            SendOutcome::Queued
+        ));
 
         let seen = wait_for(&link, |message| matches!(message, Inbound::Failed { .. }));
         let failure = seen.iter().find_map(|message| match message {
@@ -1163,21 +1299,21 @@ mod tests {
                 Inbound::Status(ConnectionState::Disconnected { .. })
             )
         });
-        link.send(
+        let rejected = link.send(
             Ask::Action("creating a workspace"),
             Request::CreateWorkspace {
                 name: "must-not-appear".into(),
                 root: "/tmp/must-not-appear".into(),
             },
         );
-
-        let rejected = wait_for(&link, |message| matches!(message, Inbound::Failed { .. }));
         assert!(
-            rejected.iter().any(|message| matches!(
-                message,
-                Inbound::Failed { ask: Ask::Action("creating a workspace"), error }
-                    if error.code == turn_proto::ErrorCode::Unavailable
-            )),
+            matches!(
+                rejected,
+                SendOutcome::Rejected(Inbound::Failed {
+                    ask: Ask::Action("creating a workspace"),
+                    ref error
+                }) if error.code == turn_proto::ErrorCode::Unavailable
+            ),
             "an offline user action must be rejected immediately; saw {rejected:?}"
         );
 
@@ -1238,7 +1374,10 @@ mod tests {
             "an intent created offline crossed a later connection: {stale:?}"
         );
 
-        link.send(Ask::Templates, Request::ListTemplates);
+        assert!(matches!(
+            link.send(Ask::Templates, Request::ListTemplates),
+            SendOutcome::Queued
+        ));
         let fresh = observed_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("the peer reports the request from its own generation");

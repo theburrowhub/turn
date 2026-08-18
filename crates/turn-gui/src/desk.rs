@@ -202,18 +202,35 @@ pub struct Desk {
     pane_owner: HashMap<PaneId, SessionId>,
     /// A screen per pane the window has attached to.
     feeds: BTreeMap<PaneId, PaneFeed>,
+    /// Daemon-issued identity and semantic/runtime correlation for every live feed.
+    /// PaneId is visual and reusable; this exact generation fences late ABA traffic.
+    attachments: HashMap<PaneId, ActiveAttachment>,
     /// Exact attachment generations still in flight. A PaneId may be rebound while an older
     /// answer is travelling, so membership without Session, runtime and intent is not enough.
     attaching: HashMap<PaneId, PendingAttach>,
     next_attach_intent: u64,
+    /// A transiently rejected Attach is retried by the frame deadline machinery,
+    /// never recursively from its own failure callback.
+    attach_retry_at: Option<i64>,
+    attach_retry_attempt: u32,
     /// The runtime and size each Pane last reported, so deduplication is per process rather
     /// than per durable visual Pane. The size is also reused for the next attachment, which
     /// lets a replacement start at the already-measured live geometry instead of 80x24.
     pty_sizes: HashMap<PaneId, PtySizeReport>,
     /// Last resize actually sent for one runtime and its sole visual owner. This is the
-    /// model-side fence behind the renderer: a stale/mirrored Pane cannot resize a shared
-    /// PTY even if it manages to produce a `PaneAction::Resize`.
+    /// acknowledged model-side fence behind the renderer: a stale/mirrored Pane cannot
+    /// resize a shared PTY even if it manages to produce a `PaneAction::Resize`.
     runtime_resize_reports: HashMap<(SessionId, NodeId), RuntimeResizeReport>,
+    /// At most one geometry write is in flight per runtime. Further drag frames only
+    /// update `pty_sizes`; the Ack schedules the latest desired size, so a saturated
+    /// transport cannot lose the final geometry or flood the daemon with SIGWINCH.
+    pending_resizes: HashMap<(SessionId, NodeId), PendingResize>,
+    next_resize_intent: u64,
+    /// A rejected geometry write is retried from a real deadline, never recursively in
+    /// the failure handler. The report makes a same-size renderer action wait for that
+    /// deadline while still allowing newly measured geometry to supersede it at once.
+    resize_retries: HashMap<(SessionId, NodeId), DeferredResize>,
+    resize_retry_attempts: HashMap<(SessionId, NodeId), u32>,
     queue: Vec<AttentionView>,
     /// The last arrangement drawn, for directional pane navigation — which is a question
     /// about rectangles and therefore needs the ones that were on screen.
@@ -227,9 +244,39 @@ struct PtySizeReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveAttachment {
+    session_id: SessionId,
+    node_id: Option<NodeId>,
+    runtime_id: Option<NodeId>,
+    attachment_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeResizeReport {
     owner_pane_id: PaneId,
     size: PtySize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingResize {
+    intent_id: u64,
+    report: RuntimeResizeReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeferredResize {
+    report: RuntimeResizeReport,
+    retry_at_ms: i64,
+}
+
+const FIRST_INTENT_RETRY_MS: i64 = 100;
+const MAX_INTENT_RETRY_MS: i64 = 2_000;
+
+fn intent_retry_delay_ms(attempt: u32) -> i64 {
+    let shift = attempt.saturating_sub(1).min(5);
+    FIRST_INTENT_RETRY_MS
+        .saturating_mul(1_i64 << shift)
+        .min(MAX_INTENT_RETRY_MS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,10 +338,17 @@ impl Desk {
             policies: HashMap::new(),
             pane_owner: HashMap::new(),
             feeds: BTreeMap::new(),
+            attachments: HashMap::new(),
             attaching: HashMap::new(),
             next_attach_intent: 0,
+            attach_retry_at: None,
+            attach_retry_attempt: 0,
             pty_sizes: HashMap::new(),
             runtime_resize_reports: HashMap::new(),
+            pending_resizes: HashMap::new(),
+            next_resize_intent: 0,
+            resize_retries: HashMap::new(),
+            resize_retry_attempts: HashMap::new(),
             queue: Vec::new(),
             arrangement: Arrangement::default(),
         }
@@ -369,16 +423,28 @@ impl Desk {
     /// Mirrors the tree's immediate-mode optimistic selection for the next command.
     /// The key is accepted only when it resolves inside the current hierarchy.
     pub fn set_navigation_hint(&mut self, key: Option<HierarchyKey>) {
+        if key.as_ref() != self.navigation_hint.as_ref() {
+            // Selection still invalidates a temporary-open intent during startup,
+            // before a hierarchy snapshot exists to validate the optimistic key.
+            self.follow_node_selection_for_pending_pane(key.as_ref());
+        }
         let next = key.filter(|key| {
             self.hierarchy
                 .as_ref()
                 .and_then(|hierarchy| workspace_for_key(hierarchy, key))
                 .is_some()
         });
-        if next != self.navigation_hint {
-            self.follow_node_selection_for_pending_pane(next.as_ref());
-        }
         self.navigation_hint = next;
+    }
+
+    /// The optimistic tree target still awaiting the daemon's authoritative answer.
+    ///
+    /// The renderer keeps its own immediate-mode selection so a click changes surfaces in
+    /// the same frame. The application uses this pending value to release that local choice
+    /// when the request is rejected or answered with a different selection; otherwise the
+    /// window can remain on a surface the daemon never accepted.
+    pub fn navigation_hint(&self) -> Option<&HierarchyKey> {
+        self.navigation_hint.as_ref()
     }
 
     /// Makes a command-level failure visible in the window instead of leaving it in
@@ -762,6 +828,24 @@ impl Desk {
             .and_then(|pane| pane.node_id.clone())
     }
 
+    /// The concrete PTY runtime behind a Pane.
+    ///
+    /// Before the first attachment the best available identity is the semantic binding.
+    /// The attachment then replaces it with the daemon-resolved runtime, which differs
+    /// for an Agent hosted inside a shell. Keeping this distinction is what lets the
+    /// tree remain Agent-centric while terminal geometry stays runtime-centric.
+    fn runtime_of(&self, pane: &PaneId) -> Option<NodeId> {
+        self.attachments
+            .get(pane)
+            .and_then(|attachment| attachment.runtime_id.clone())
+            .or_else(|| {
+                self.pty_sizes
+                    .get(pane)
+                    .and_then(|report| report.runtime_id.clone())
+            })
+            .or_else(|| self.node_of(pane))
+    }
+
     /// The sole Pane currently allowed to size one runtime.
     ///
     /// This deliberately repeats the renderer's policy at the model boundary. UI actions are
@@ -774,15 +858,61 @@ impl Desk {
     ) -> Option<PaneId> {
         if let Some(temporary) = self.temporary_pane.as_ref().filter(|temporary| {
             &temporary.binding.session_id == session_id
-                && &temporary.binding.node_id == node_id
+                && self.runtime_of(&temporary.binding.pane_id).as_ref() == Some(node_id)
                 && matches!(&temporary.capability, NodePaneCapability::Terminal { .. })
+                && self.pty_sizes.contains_key(&temporary.binding.pane_id)
+                && self
+                    .attachments
+                    .get(&temporary.binding.pane_id)
+                    .is_some_and(|attachment| {
+                        &attachment.session_id == session_id
+                            && attachment.runtime_id.as_ref() == Some(node_id)
+                    })
         }) {
             return Some(temporary.binding.pane_id.clone());
         }
 
         let layout = self.layouts.get(session_id)?;
-        let is_candidate =
-            |pane: &Pane| pane.kind.is_terminal() && pane.node_id.as_ref() == Some(node_id);
+        let is_candidate = |pane: &Pane| {
+            pane.kind.is_terminal()
+                && self.runtime_of(&pane.id).as_ref() == Some(node_id)
+                && self.pty_sizes.contains_key(&pane.id)
+                && self.attachments.get(&pane.id).is_some_and(|attachment| {
+                    &attachment.session_id == session_id
+                        && attachment.runtime_id.as_ref() == Some(node_id)
+                })
+        };
+        // A selected Process/Agent is rendered as the large exact work surface. Its
+        // durable binding is therefore the geometry authority even when another split
+        // remains the saved Layout focus behind that view. This mirrors the renderer's
+        // choice at the model boundary so a delayed action from a hidden split cannot
+        // shrink the application back to that split's dimensions.
+        let selected_exact = self.selected_tree_key().and_then(|key| {
+            let HierarchyKey::Process { node_id: selected } = key else {
+                return None;
+            };
+            self.hierarchy
+                .as_ref()?
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.sessions)
+                .find(|session| &session.session.id == session_id)?
+                .nodes
+                .iter()
+                .find(|node| &node.node_id == selected)?
+                .pane_bindings
+                .iter()
+                .filter(|binding| !binding.temporary)
+                .find_map(|binding| {
+                    layout
+                        .get(&binding.pane_id)
+                        .filter(|pane| is_candidate(pane))
+                        .map(|pane| pane.id.clone())
+                })
+        });
+        if selected_exact.is_some() {
+            return selected_exact;
+        }
         if let Some(active) = layout.active.as_ref().and_then(|active| {
             layout
                 .get(active)
@@ -845,6 +975,176 @@ impl Desk {
         }
     }
 
+    /// Removes the local half of an attachment and all geometry correlation owned by
+    /// that Pane. Shared-runtime state survives when another attachment owns it.
+    fn drop_attachment_state(&mut self, pane_id: &PaneId) -> Option<ActiveAttachment> {
+        self.feeds.remove(pane_id);
+        let attachment = self.attachments.remove(pane_id)?;
+        if let Some(runtime_id) = attachment.runtime_id.as_ref() {
+            let key = (attachment.session_id.clone(), runtime_id.clone());
+            // Acknowledgement is true only for the lifetime in which this window is
+            // observing the runtime. Another client may resize it while hidden; a
+            // later Attach must compare the daemon's current size and send this
+            // window's still-visible desired geometry again when they differ.
+            let runtime_still_attached = self.attachments.values().any(|other| {
+                other.session_id == attachment.session_id
+                    && other.runtime_id.as_ref() == Some(runtime_id)
+            });
+            if runtime_still_attached {
+                self.runtime_resize_reports.retain(|candidate, report| {
+                    candidate != &key || &report.owner_pane_id != pane_id
+                });
+                self.pending_resizes.retain(|candidate, pending| {
+                    candidate != &key || &pending.report.owner_pane_id != pane_id
+                });
+                let removed_retry = self
+                    .resize_retries
+                    .get(&key)
+                    .is_some_and(|retry| retry.report.owner_pane_id == *pane_id);
+                if removed_retry {
+                    self.resize_retries.remove(&key);
+                    self.resize_retry_attempts.remove(&key);
+                }
+            } else {
+                self.runtime_resize_reports.remove(&key);
+                self.pending_resizes.remove(&key);
+                self.resize_retries.remove(&key);
+                self.resize_retry_attempts.remove(&key);
+            }
+        }
+        Some(attachment)
+    }
+
+    /// Drops one local subscription and conditionally stops the exact daemon stream.
+    /// The generation fence makes this safe even when a newer Attach for the same
+    /// visual Pane has already overtaken the cleanup on the wire.
+    fn detach_subscription(&mut self, pane_id: &PaneId) -> Option<Reaction> {
+        let attachment = self.drop_attachment_state(pane_id)?;
+        Some(Reaction::Send {
+            ask: Ask::Action("detaching a hidden terminal Pane"),
+            request: Request::DetachPane {
+                session_id: attachment.session_id,
+                pane_id: pane_id.clone(),
+                attachment_id: Some(attachment.attachment_id),
+            },
+        })
+    }
+
+    fn desired_runtime_resize(
+        &self,
+        session_id: &SessionId,
+        runtime_id: &NodeId,
+    ) -> Option<RuntimeResizeReport> {
+        let owner_pane_id = self.geometry_owner_for_runtime(session_id, runtime_id)?;
+        let report = self.pty_sizes.get(&owner_pane_id)?;
+        (report.runtime_id.as_ref() == Some(runtime_id)).then_some(RuntimeResizeReport {
+            owner_pane_id,
+            size: report.size,
+        })
+    }
+
+    /// Sends at most one resize for a runtime and leaves newer desired geometry queued
+    /// in `pty_sizes` until the current request is acknowledged.
+    fn schedule_runtime_resize(
+        &mut self,
+        session_id: SessionId,
+        runtime_id: NodeId,
+    ) -> Vec<Reaction> {
+        let key = (session_id.clone(), runtime_id.clone());
+        if self.pending_resizes.contains_key(&key) {
+            return Vec::new();
+        }
+        let Some(desired) = self.desired_runtime_resize(&session_id, &runtime_id) else {
+            return Vec::new();
+        };
+        if let Some(retry) = self.resize_retries.get_mut(&key) {
+            // Keep one deadline while a drag continues. The retry resolves from the
+            // latest `pty_sizes`, so pressure coalesces sixty intermediate frames into
+            // one final geometry write instead of bypassing backoff on every change.
+            retry.report = desired;
+            return Vec::new();
+        }
+        if self.runtime_resize_reports.get(&key) == Some(&desired) {
+            return Vec::new();
+        }
+        self.next_resize_intent = self.next_resize_intent.wrapping_add(1).max(1);
+        let intent_id = self.next_resize_intent;
+        self.pending_resizes.insert(
+            key,
+            PendingResize {
+                intent_id,
+                report: desired.clone(),
+            },
+        );
+        vec![Reaction::Send {
+            ask: Ask::Resize {
+                session_id: session_id.clone(),
+                runtime_id: runtime_id.clone(),
+                pane_id: desired.owner_pane_id,
+                size: desired.size,
+                intent_id,
+            },
+            request: Request::ResizePty {
+                session_id,
+                node_id: runtime_id,
+                size: desired.size,
+            },
+        }]
+    }
+
+    /// Sends geometry retries whose deadline has elapsed. Called once by the window
+    /// at the start of a frame; a fresh rejection installs a later deadline instead
+    /// of recursively producing another send in that same frame.
+    pub fn take_due_retries(&mut self, now_ms: i64) -> Vec<Reaction> {
+        let attach_due = self
+            .attach_retry_at
+            .is_some_and(|retry_at| retry_at <= now_ms);
+        if attach_due {
+            self.attach_retry_at = None;
+        }
+        let mut due: Vec<(SessionId, NodeId)> = self
+            .resize_retries
+            .iter()
+            .filter(|(_, retry)| retry.retry_at_ms <= now_ms)
+            .map(|(key, _)| key.clone())
+            .collect();
+        due.sort_by(|left, right| {
+            left.0
+                .as_str()
+                .cmp(right.0.as_str())
+                .then_with(|| left.1.as_str().cmp(right.1.as_str()))
+        });
+        let mut reactions = Vec::new();
+        for (session_id, runtime_id) in due {
+            let key = (session_id.clone(), runtime_id.clone());
+            self.resize_retries.remove(&key);
+            let scheduled = self.schedule_runtime_resize(session_id, runtime_id);
+            if scheduled.is_empty() {
+                self.resize_retry_attempts.remove(&key);
+            }
+            reactions.extend(scheduled);
+        }
+        if attach_due {
+            let scheduled = self.attach_wanted();
+            if scheduled.is_empty() {
+                self.attach_retry_attempt = 0;
+            }
+            reactions.extend(scheduled);
+        }
+        reactions
+    }
+
+    /// The only clock deadline introduced by terminal geometry. With no deferred
+    /// failure this returns None, preserving Turn's zero-cost idle window contract.
+    pub fn next_retry_at(&self) -> Option<i64> {
+        let resize = self
+            .resize_retries
+            .values()
+            .map(|retry| retry.retry_at_ms)
+            .min();
+        resize.into_iter().chain(self.attach_retry_at).min()
+    }
+
     /// Applies a message from the daemon.
     pub fn apply_inbound(&mut self, message: Inbound, now_ms: i64) -> Vec<Reaction> {
         let mut out = self.apply_inbound_message(message, now_ms);
@@ -862,7 +1162,54 @@ impl Desk {
             Inbound::Event(event) => self.apply_event(*event, now_ms),
             Inbound::Answer { ask, response } => self.apply_answer(ask, *response),
             Inbound::Failed { ask, error } => {
+                if let Ask::Resize {
+                    session_id,
+                    runtime_id,
+                    pane_id,
+                    size,
+                    intent_id,
+                } = &ask
+                {
+                    let key = (session_id.clone(), runtime_id.clone());
+                    let failed = RuntimeResizeReport {
+                        owner_pane_id: pane_id.clone(),
+                        size: *size,
+                    };
+                    if !self.pending_resizes.get(&key).is_some_and(|pending| {
+                        pending.intent_id == *intent_id && pending.report == failed
+                    }) {
+                        return Vec::new();
+                    }
+                    self.pending_resizes.remove(&key);
+                    // Transport pressure and temporary daemon unavailability keep the
+                    // latest desired geometry dirty, but the retry happens on a named
+                    // deadline. Immediate recursion here can permanently monopolise the
+                    // UI thread while a bounded queue remains full.
+                    if error.code.is_retryable() && self.connection.is_live() {
+                        let attempt = self
+                            .resize_retry_attempts
+                            .entry(key.clone())
+                            .and_modify(|attempt| *attempt = attempt.saturating_add(1))
+                            .or_insert(1);
+                        self.resize_retries.insert(
+                            key,
+                            DeferredResize {
+                                report: failed,
+                                retry_at_ms: now_ms.saturating_add(intent_retry_delay_ms(*attempt)),
+                            },
+                        );
+                    } else {
+                        self.resize_retries.remove(&key);
+                        self.resize_retry_attempts.remove(&key);
+                    }
+                    return Vec::new();
+                }
                 match &ask {
+                    Ask::SelectTree { selected, .. } => {
+                        if self.navigation_hint.as_ref() == selected.as_ref() {
+                            self.navigation_hint = None;
+                        }
+                    }
                     Ask::PrepareContextHandoff {
                         session_id,
                         source_node_id,
@@ -916,9 +1263,18 @@ impl Desk {
                             intent_id: *intent_id,
                         };
                         if self.attaching.get(pane_id) == Some(&failed) {
-                            // Clear only this generation. A later layout/details event can
-                            // retry it; an old failure cannot cancel a newer A -> B attach.
+                            // Clear only this generation. Retry transient delivery/daemon
+                            // pressure on a deadline; an old failure cannot cancel a newer
+                            // A -> B attach or recursively fill the stack while the bounded
+                            // transport is still saturated.
                             self.attaching.remove(pane_id);
+                            if error.code.is_retryable() && self.connection.is_live() {
+                                self.attach_retry_attempt =
+                                    self.attach_retry_attempt.saturating_add(1).max(1);
+                                self.attach_retry_at = Some(now_ms.saturating_add(
+                                    intent_retry_delay_ms(self.attach_retry_attempt),
+                                ));
+                            }
                         }
                     }
                     _ => {}
@@ -1002,7 +1358,14 @@ impl Desk {
         let session_creation_interrupted = self.pending_session.is_some();
         self.companion_notice = None;
         self.feeds.clear();
+        self.attachments.clear();
         self.attaching.clear();
+        self.attach_retry_at = None;
+        self.attach_retry_attempt = 0;
+        self.pending_resizes.clear();
+        self.runtime_resize_reports.clear();
+        self.resize_retries.clear();
+        self.resize_retry_attempts.clear();
         // Pane geometry belongs to this still-open window, not to one daemon connection.
         // Retaining it lets a restored attachment start at the size already on screen;
         // `remember_layout` prunes entries for Panes that no longer exist.
@@ -1288,6 +1651,34 @@ impl Desk {
                 // what the tree contains.
                 vec![self.hierarchy_request()]
             }
+            (
+                Ask::Resize {
+                    session_id,
+                    runtime_id,
+                    pane_id,
+                    size,
+                    intent_id,
+                },
+                Response::Ack,
+            ) => {
+                let key = (session_id.clone(), runtime_id.clone());
+                let acknowledged = RuntimeResizeReport {
+                    owner_pane_id: pane_id,
+                    size,
+                };
+                if !self.pending_resizes.get(&key).is_some_and(|pending| {
+                    pending.intent_id == intent_id && pending.report == acknowledged
+                }) {
+                    return Vec::new();
+                }
+                self.pending_resizes.remove(&key);
+                self.resize_retries.remove(&key);
+                self.resize_retry_attempts.remove(&key);
+                self.runtime_resize_reports.insert(key, acknowledged);
+                // A window drag may have produced newer geometry while this request was
+                // in flight. Send only that latest value, never every intermediate one.
+                self.schedule_runtime_resize(session_id, runtime_id)
+            }
             (Ask::Inspector(expected), Response::Inspector { details }) => {
                 if details.key() != expected {
                     return vec![Reaction::Notice(
@@ -1298,7 +1689,12 @@ impl Desk {
                 Vec::new()
             }
             (_, Response::Hierarchy { snapshot }) => self.replace_hierarchy(*snapshot, true),
-            (_, Response::TreeState { state }) => {
+            (ask, Response::TreeState { state }) => {
+                if let Ask::SelectTree { selected, .. } = &ask {
+                    if self.navigation_hint.as_ref() == selected.as_ref() {
+                        self.navigation_hint = None;
+                    }
+                }
                 let selection_changed = self
                     .hierarchy
                     .as_ref()
@@ -1308,6 +1704,14 @@ impl Desk {
                 }
                 if let Some(hierarchy) = self.hierarchy.as_mut() {
                     hierarchy.tree_state = state;
+                }
+                if self.navigation_hint.as_ref()
+                    == self
+                        .hierarchy
+                        .as_ref()
+                        .and_then(|hierarchy| hierarchy.tree_state.selected.as_ref())
+                {
+                    self.navigation_hint = None;
                 }
                 Vec::new()
             }
@@ -1510,39 +1914,145 @@ impl Desk {
                 });
                 let current_owner = self.pane_owner.get(&pane_id);
                 let current_node = self.node_of(&pane_id);
+                // Protocol v4 used `node_id` for PTY ownership. A new daemon carries
+                // semantic identity there and the concrete PTY in `runtime_id`; during a
+                // rolling upgrade, absence of that new field therefore means the legacy
+                // node is the runtime and the requested binding remains the semantic node.
+                let legacy_runtime = attachment.runtime_id.is_none();
+                let attachment_semantic_node = if legacy_runtime {
+                    asked_node.clone()
+                } else {
+                    attachment.node_id.clone()
+                };
                 let stale = !exact_pending
                     || !still_wanted
                     || is_recovery_offer
                     || attachment.session_id != session_id
                     || attachment.pane_id != pane_id
-                    || attachment.node_id != asked_node
+                    || attachment_semantic_node != asked_node
                     || current_owner != Some(&session_id)
-                    || attachment.node_id != current_node;
+                    || attachment_semantic_node != current_node;
                 if exact_pending {
                     // Remove only the exact in-flight tuple. A late answer from an old
                     // Session with the same durable PaneId must not cancel a newer attach.
                     self.attaching.remove(&pane_id);
                 }
                 if stale {
+                    // A protocol-v4 daemon has no attachment generations: the omitted
+                    // field deserialises as zero and it ignores DetachPane's optional
+                    // fence. Enqueuing that unfenced cleanup behind a replacement Attach
+                    // can therefore detach the replacement (A -> B -> stale cleanup A).
+                    // Leave an idless stale subscription for the old daemon to overwrite
+                    // or release with the client instead; current daemons never issue 0.
+                    if attachment.attachment_id == 0 {
+                        return Vec::new();
+                    }
                     // Restore, close, Session switches and relaunch can all cross an
-                    // in-flight AttachPane. Discarding the answer must not remove a newer
-                    // feed already installed under the same visual PaneId.
-                    return Vec::new();
+                    // in-flight AttachPane. Always retire the exact rejected generation:
+                    // its attachment-id fence makes this harmless if a newer Attach has
+                    // already won, and prevents the old stream surviving if that newer
+                    // request later fails.
+                    return vec![Reaction::Send {
+                        ask: Ask::Action("detaching a stale terminal Pane"),
+                        request: Request::DetachPane {
+                            session_id: attachment.session_id,
+                            pane_id: attachment.pane_id,
+                            attachment_id: Some(attachment.attachment_id),
+                        },
+                    }];
                 }
-                self.feeds.insert(pane_id, PaneFeed::attach(&attachment));
-                Vec::new()
+                let runtime_id = attachment
+                    .runtime_id
+                    .clone()
+                    .or_else(|| attachment.node_id.clone());
+                let measured_size = {
+                    let report = self
+                        .pty_sizes
+                        .entry(pane_id.clone())
+                        .or_insert(PtySizeReport {
+                            runtime_id: runtime_id.clone(),
+                            size: attachment.size,
+                        });
+                    report.runtime_id = runtime_id.clone();
+                    report.size
+                };
+                self.attachments.insert(
+                    pane_id.clone(),
+                    ActiveAttachment {
+                        session_id: session_id.clone(),
+                        node_id: attachment_semantic_node,
+                        runtime_id: runtime_id.clone(),
+                        attachment_id: attachment.attachment_id,
+                    },
+                );
+                self.feeds
+                    .insert(pane_id.clone(), PaneFeed::attach(&attachment));
+                if self.attaching.is_empty() {
+                    self.attach_retry_at = None;
+                    self.attach_retry_attempt = 0;
+                }
+                if let Some(runtime_id) = runtime_id {
+                    let pane_id = attachment.pane_id.clone();
+                    let runtime_key = (session_id.clone(), runtime_id.clone());
+                    if measured_size != attachment.size {
+                        // The subscription has just proved the PTY is no longer at
+                        // the last size this window saw acknowledged. Forget that
+                        // stale fact before scheduling the current desired geometry.
+                        self.runtime_resize_reports.remove(&runtime_key);
+                        self.pending_resizes.remove(&runtime_key);
+                        self.resize_retries.remove(&runtime_key);
+                        self.resize_retry_attempts.remove(&runtime_key);
+                    }
+                    if measured_size == attachment.size
+                        && self
+                            .geometry_owner_for_runtime(&session_id, &runtime_id)
+                            .as_ref()
+                            == Some(&pane_id)
+                    {
+                        self.runtime_resize_reports.insert(
+                            (session_id, runtime_id),
+                            RuntimeResizeReport {
+                                owner_pane_id: pane_id,
+                                size: attachment.size,
+                            },
+                        );
+                        Vec::new()
+                    } else {
+                        self.schedule_runtime_resize(session_id, runtime_id)
+                    }
+                } else {
+                    Vec::new()
+                }
             }
             (
-                _,
+                Ask::Resync {
+                    session_id: asked_session,
+                    pane_id: asked_pane,
+                    runtime_id: asked_runtime,
+                    attachment_id: asked_attachment,
+                },
                 Response::Screen {
+                    session_id,
                     pane_id,
+                    attachment_id,
+                    node_id,
                     next_seq,
                     grid,
-                    ..
                 },
             ) => {
-                if let Some(feed) = self.feeds.get_mut(&pane_id) {
-                    feed.resync(*grid, next_seq);
+                let exact = pane_id == asked_pane
+                    && session_id == asked_session
+                    && attachment_id == asked_attachment
+                    && node_id == asked_runtime
+                    && self.attachments.get(&pane_id).is_some_and(|attachment| {
+                        attachment.session_id == session_id
+                            && attachment.runtime_id == node_id
+                            && attachment.attachment_id == attachment_id
+                    });
+                if exact {
+                    if let Some(feed) = self.feeds.get_mut(&pane_id) {
+                        feed.resync(*grid, next_seq);
+                    }
                 }
                 Vec::new()
             }
@@ -1621,14 +2131,14 @@ impl Desk {
                     let same_capability = previous.capability == pane.capability;
                     if !same_pane {
                         self.pane_owner.remove(&previous.binding.pane_id);
-                        self.feeds.remove(&previous.binding.pane_id);
+                        self.drop_attachment_state(&previous.binding.pane_id);
                         self.attaching.remove(&previous.binding.pane_id);
                         self.pty_sizes.remove(&previous.binding.pane_id);
                     } else if !same_runtime || !same_capability {
                         // PaneId is visual and can be reused for another runtime or view
                         // kind. Its old cells and in-flight attachment are not transferable;
                         // the measured rectangle is, so keep `pty_sizes` for the replacement.
-                        self.feeds.remove(&pane_id);
+                        self.drop_attachment_state(&pane_id);
                         self.attaching.remove(&pane_id);
                     }
                 }
@@ -1693,7 +2203,7 @@ impl Desk {
                     if let Some(preview) = preview_to_close {
                         self.temporary_pane = None;
                         self.pane_owner.remove(&preview.pane_id);
-                        self.feeds.remove(&preview.pane_id);
+                        self.drop_attachment_state(&preview.pane_id);
                         self.attaching.remove(&preview.pane_id);
                         reactions.push(Reaction::Send {
                             ask: Ask::Action("closing the semantic Attention preview"),
@@ -1829,6 +2339,16 @@ impl Desk {
                 return Vec::new();
             }
         }
+        if self
+            .navigation_hint
+            .as_ref()
+            .is_some_and(|key| !snapshot_contains_key(&snapshot, key))
+        {
+            // The selected row disappeared before the daemon could acknowledge the
+            // optimistic click. Keeping that key would grant resize authority to a
+            // surface that no longer exists.
+            self.navigation_hint = None;
+        }
         if self.navigation_hint.is_none() {
             let previous_selection = self
                 .hierarchy
@@ -1913,11 +2433,23 @@ impl Desk {
         match event {
             E::PaneScreen {
                 pane_id,
+                attachment_id,
+                node_id,
                 seq,
                 update,
                 session_id,
-                ..
             } => {
+                let Some(attachment) = self.attachments.get(&pane_id) else {
+                    return Vec::new();
+                };
+                if attachment.session_id != session_id
+                    || attachment.attachment_id != attachment_id
+                    || attachment.runtime_id != node_id
+                {
+                    // Pane ids survive rebinding. A late frame from an older generation
+                    // is expected transport traffic, never permission to repaint it.
+                    return Vec::new();
+                }
                 let Some(feed) = self.feeds.get_mut(&pane_id) else {
                     return Vec::new();
                 };
@@ -1929,14 +2461,17 @@ impl Desk {
                         // applying the update anyway would render a screen neither of
                         // them believes in.
                         tracing::debug!(?desync, pane = %pane_id, "resynchronising a pane");
-                        let owner = self
-                            .session_of_pane(&pane_id)
-                            .unwrap_or_else(|| session_id.clone());
                         vec![Reaction::Send {
-                            ask: Ask::Action("resynchronising a terminal Pane"),
+                            ask: Ask::Resync {
+                                session_id: session_id.clone(),
+                                pane_id: pane_id.clone(),
+                                runtime_id: node_id,
+                                attachment_id,
+                            },
                             request: Request::ResyncPane {
-                                session_id: owner,
+                                session_id,
                                 pane_id,
+                                attachment_id: Some(attachment_id),
                             },
                         }]
                     }
@@ -2001,7 +2536,7 @@ impl Desk {
                 if let Some(binding) = stale_temporary {
                     self.temporary_pane = None;
                     self.pane_owner.remove(&binding.pane_id);
-                    self.feeds.remove(&binding.pane_id);
+                    self.drop_attachment_state(&binding.pane_id);
                     self.attaching.remove(&binding.pane_id);
                     self.pty_sizes.remove(&binding.pane_id);
                     vec![Reaction::Send {
@@ -2056,7 +2591,7 @@ impl Desk {
                         let pane_id = temporary.binding.pane_id.clone();
                         self.temporary_pane = None;
                         self.pane_owner.remove(&pane_id);
-                        self.feeds.remove(&pane_id);
+                        self.drop_attachment_state(&pane_id);
                         self.attaching.remove(&pane_id);
                         self.pty_sizes.remove(&pane_id);
                     }
@@ -2093,6 +2628,11 @@ impl Desk {
                 node_id,
                 size,
             } => {
+                let key = (session_id.clone(), node_id.clone());
+                self.pending_resizes.remove(&key);
+                self.runtime_resize_reports.remove(&key);
+                self.resize_retries.remove(&key);
+                self.resize_retry_attempts.remove(&key);
                 // Another client resized a pty we share. The feed follows so the window
                 // draws the right shape rather than the one it asked for. One runtime may
                 // have several views, but an unrelated runtime's screen must not be erased.
@@ -2101,7 +2641,7 @@ impl Desk {
                     .keys()
                     .filter(|pane_id| {
                         self.pane_owner.get(*pane_id) == Some(&session_id)
-                            && self.node_of(pane_id).as_ref() == Some(&node_id)
+                            && self.runtime_of(pane_id).as_ref() == Some(&node_id)
                     })
                     .cloned()
                     .collect();
@@ -2115,6 +2655,11 @@ impl Desk {
                         feed.resync(Grid::blank(size.rows, size.cols), feed.next_seq());
                     }
                 }
+                // This is another client's authority, so follow it until this window's
+                // geometry changes again. Re-applying our unchanged size here would make
+                // two visible windows at different dimensions ping-pong SIGWINCH forever.
+                // Clearing the pending generation is still essential: its late Ack may
+                // not overwrite this newer external fact.
                 Vec::new()
             }
             E::RestoreResult {
@@ -2128,7 +2673,7 @@ impl Desk {
                     return Vec::new();
                 }
                 for outcome in &panes {
-                    self.feeds.remove(&outcome.pane_id);
+                    self.drop_attachment_state(&outcome.pane_id);
                     self.attaching.remove(&outcome.pane_id);
                 }
                 // Nothing is started here. The sweep in `autostart_stopped_panes` does it, over
@@ -2471,6 +3016,12 @@ impl Desk {
         }
         self.runtime_resize_reports
             .retain(|(owner, _), _| owner != session_id);
+        self.pending_resizes
+            .retain(|(owner, _), _| owner != session_id);
+        self.resize_retries
+            .retain(|(owner, _), _| owner != session_id);
+        self.resize_retry_attempts
+            .retain(|(owner, _), _| owner != session_id);
         if self
             .temporary_pane
             .as_ref()
@@ -2479,7 +3030,7 @@ impl Desk {
             if let Some(temporary) = self.temporary_pane.take() {
                 let pane_id = temporary.binding.pane_id;
                 self.pane_owner.remove(&pane_id);
-                self.feeds.remove(&pane_id);
+                self.drop_attachment_state(&pane_id);
                 self.attaching.remove(&pane_id);
                 self.pty_sizes.remove(&pane_id);
             }
@@ -2491,10 +3042,26 @@ impl Desk {
             .map(|(pane, _)| pane.clone())
             .collect();
         for pane in panes {
-            self.feeds.remove(&pane);
+            self.drop_attachment_state(&pane);
             self.attaching.remove(&pane);
             self.pty_sizes.remove(&pane);
         }
+    }
+
+    /// Stops every live daemon stream before a Session disappears from this window.
+    /// Local cache eviction alone is not a detach: a busy hidden terminal would keep
+    /// filling the bounded inbound queue until the connection was forced to recover.
+    fn detach_session_subscriptions(&mut self, session_id: &SessionId) -> Vec<Reaction> {
+        let panes: Vec<PaneId> = self
+            .attachments
+            .iter()
+            .filter(|(_, attachment)| &attachment.session_id == session_id)
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect();
+        panes
+            .iter()
+            .filter_map(|pane_id| self.detach_subscription(pane_id))
+            .collect()
     }
 
     /// Removes every window-local trace of a Session whose daemon-side lifecycle already
@@ -2552,23 +3119,23 @@ impl Desk {
             .as_ref()
             .filter(|pane| &pane.binding.session_id == session_id)
             .map(|pane| pane.binding.clone());
+        let mut reactions = self.detach_session_subscriptions(session_id);
         self.drop_session_feeds(session_id);
         self.pane_owner.retain(|_, owner| owner != session_id);
         self.layouts.remove(session_id);
         self.trees.remove(session_id);
         self.policies.remove(session_id);
-        temporary
-            .map(|binding| {
-                vec![Reaction::Send {
-                    ask: Ask::Action("closing a temporary view hidden with its Session"),
-                    request: Request::ClosePane {
-                        session_id: binding.session_id,
-                        pane_id: binding.pane_id,
-                        disposition: CloseDisposition::KeepProcesses,
-                    },
-                }]
-            })
-            .unwrap_or_default()
+        if let Some(binding) = temporary {
+            reactions.push(Reaction::Send {
+                ask: Ask::Action("closing a temporary view hidden with its Session"),
+                request: Request::ClosePane {
+                    session_id: binding.session_id,
+                    pane_id: binding.pane_id,
+                    disposition: CloseDisposition::KeepProcesses,
+                },
+            });
+        }
+        reactions
     }
 
     /// Which session a pane belongs to.
@@ -2613,7 +3180,7 @@ impl Desk {
             // process running behind the dead process's final screen. Keep the measured
             // geometry: the replacement can then attach at the full visible size before
             // its first frame, while the runtime-scoped report still permits one Resize.
-            self.feeds.remove(&pane);
+            self.drop_attachment_state(&pane);
             self.attaching.remove(&pane);
         }
         let temporary = self
@@ -2630,7 +3197,7 @@ impl Desk {
             {
                 // Protocol ids are expected to be global, but accepting a reused PaneId
                 // must still not carry another Session's feed or in-flight attach across.
-                self.feeds.remove(&pane.id);
+                self.drop_attachment_state(&pane.id);
                 self.attaching.remove(&pane.id);
                 self.pty_sizes.remove(&pane.id);
             }
@@ -2639,6 +3206,15 @@ impl Desk {
         self.layouts.insert(session_id, layout);
 
         let live: HashSet<PaneId> = self.pane_owner.keys().cloned().collect();
+        let stale_attachments: Vec<PaneId> = self
+            .attachments
+            .keys()
+            .filter(|id| !live.contains(*id))
+            .cloned()
+            .collect();
+        for pane_id in stale_attachments {
+            self.drop_attachment_state(&pane_id);
+        }
         self.feeds.retain(|id, _| live.contains(id));
         self.pty_sizes.retain(|id, _| live.contains(id));
         self.attaching.retain(|id, pending| {
@@ -2665,16 +3241,10 @@ impl Desk {
                         .iter()
                         .any(|outcome| outcome.pane_id == pane.id)
                 });
-                let runtime_cannot_attach = pane.node_id.as_ref().is_some_and(|node_id| {
-                    self.trees.get(&session_id).is_some_and(|nodes| {
-                        nodes.iter().any(|node| {
-                            &node.node_id == node_id
-                                && (node.lifecycle.is_terminal()
-                                    || node.lifecycle == Lifecycle::Orphaned)
-                        })
-                    })
-                });
-                if pane.kind.is_terminal() && !has_restore_outcome && !runtime_cannot_attach {
+                // Semantic Agent lifecycle is not terminal ownership: a hosted Agent
+                // can finish while its shell PTY remains live and readable. The daemon
+                // is the authority on attachability and resolves that runtime.
+                if pane.kind.is_terminal() && !has_restore_outcome {
                     wanted.push((session_id.clone(), pane.id.clone()));
                 }
             }
@@ -2751,8 +3321,22 @@ impl Desk {
         }
         self.selected = Some(session_id.clone());
         // Screens for panes nothing wants any more are dropped, including every Pane
-        // in the Session just left unless it is an explicit temporary Pane.
+        // in the Session just left unless it is an explicit temporary Pane. Tell the
+        // daemon too: an invisible busy PTY must not keep filling this client's bounded
+        // inbound queue.
         let wanted: HashSet<(SessionId, PaneId)> = self.wanted_panes().into_iter().collect();
+        let hidden: Vec<PaneId> = self
+            .attachments
+            .iter()
+            .filter(|(pane, attachment)| {
+                !wanted.contains(&(attachment.session_id.clone(), (*pane).clone()))
+            })
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        let mut reactions: Vec<Reaction> = hidden
+            .iter()
+            .filter_map(|pane| self.detach_subscription(pane))
+            .collect();
         self.feeds.retain(|pane, _| {
             self.pane_owner
                 .get(pane)
@@ -2761,7 +3345,7 @@ impl Desk {
         self.attaching
             .retain(|pane, pending| wanted.contains(&(pending.session_id.clone(), pane.clone())));
 
-        let mut reactions = vec![
+        reactions.extend([
             select_tree,
             Reaction::Send {
                 ask: Ask::Details(session_id.clone()),
@@ -2778,7 +3362,7 @@ impl Desk {
                     session_id: Some(session_id),
                 },
             },
-        ];
+        ]);
         reactions.extend(self.attach_wanted());
         reactions
     }
@@ -2839,9 +3423,16 @@ impl Desk {
                 request: Request::GetInspector { key },
             }],
             HierarchyAction::Select { surface_id, key } => {
-                self.follow_node_selection_for_pending_pane(Some(&key));
+                // The renderer has already moved to this exact row optimistically. Keep
+                // Desk's geometry authority on the same subject before any Pane action
+                // from the following frame is validated; waiting for the daemon echo
+                // used to discard the only full-width Resize.
+                self.set_navigation_hint(Some(key.clone()));
                 vec![Reaction::Send {
-                    ask: Ask::Action("selecting a node in the workspace tree"),
+                    ask: Ask::SelectTree {
+                        surface_id: surface_id.clone(),
+                        selected: Some(key.clone()),
+                    },
                     request: Request::SelectTreeNode {
                         surface_id,
                         selected: Some(key),
@@ -4053,7 +4644,7 @@ impl Desk {
                 }) {
                     self.temporary_pane = None;
                     self.pane_owner.remove(&pane_id);
-                    self.feeds.remove(&pane_id);
+                    self.drop_attachment_state(&pane_id);
                     self.attaching.remove(&pane_id);
                 }
                 vec![Reaction::Send {
@@ -4442,12 +5033,18 @@ impl Desk {
                 }]
             }
             PaneAction::Resize(size) => {
-                let runtime_id = self.node_of(&pane_id);
-                let Some(node_id) = runtime_id.clone() else {
+                let Some(runtime_id) = self.runtime_of(&pane_id) else {
                     return Vec::new();
                 };
+                self.pty_sizes.insert(
+                    pane_id.clone(),
+                    PtySizeReport {
+                        runtime_id: Some(runtime_id.clone()),
+                        size,
+                    },
+                );
                 if self
-                    .geometry_owner_for_runtime(&session_id, &node_id)
+                    .geometry_owner_for_runtime(&session_id, &runtime_id)
                     .as_ref()
                     != Some(&pane_id)
                 {
@@ -4456,29 +5053,38 @@ impl Desk {
                     // refuses it so stale frame actions cannot make two views resize one PTY.
                     return Vec::new();
                 }
-                let report = PtySizeReport {
-                    runtime_id: runtime_id.clone(),
-                    size,
-                };
-                self.pty_sizes.insert(pane_id.clone(), report);
-                let runtime_key = (session_id.clone(), node_id.clone());
-                let runtime_report = RuntimeResizeReport {
-                    owner_pane_id: pane_id.clone(),
-                    size,
-                };
-                if self.runtime_resize_reports.get(&runtime_key) == Some(&runtime_report) {
-                    return Vec::new();
+                self.schedule_runtime_resize(session_id, runtime_id)
+            }
+            PaneAction::GeometryUnavailable => {
+                let runtime_id = self.runtime_of(&pane_id);
+                self.pty_sizes.remove(&pane_id);
+                if let Some(runtime_id) = runtime_id {
+                    let key = (session_id.clone(), runtime_id.clone());
+                    if self
+                        .runtime_resize_reports
+                        .get(&key)
+                        .is_some_and(|report| report.owner_pane_id == pane_id)
+                    {
+                        self.runtime_resize_reports.remove(&key);
+                    }
+                    if self
+                        .pending_resizes
+                        .get(&key)
+                        .is_some_and(|pending| pending.report.owner_pane_id == pane_id)
+                    {
+                        self.pending_resizes.remove(&key);
+                    }
+                    if self
+                        .resize_retries
+                        .get(&key)
+                        .is_some_and(|retry| retry.report.owner_pane_id == pane_id)
+                    {
+                        self.resize_retries.remove(&key);
+                        self.resize_retry_attempts.remove(&key);
+                    }
+                    return self.schedule_runtime_resize(session_id, runtime_id);
                 }
-                self.runtime_resize_reports
-                    .insert(runtime_key, runtime_report);
-                vec![Reaction::Send {
-                    ask: Ask::Stream,
-                    request: Request::ResizePty {
-                        session_id,
-                        node_id,
-                        size,
-                    },
-                }]
+                Vec::new()
             }
             PaneAction::Focus => vec![Reaction::Send {
                 ask: Ask::Action("focusing the pane"),
@@ -4596,7 +5202,7 @@ impl Desk {
                     let grid = feed.peek()?;
                     Some(PaneContent {
                         pane_id: pane.id.clone(),
-                        runtime_id: pane.node_id.clone(),
+                        runtime_id: self.runtime_of(&pane.id),
                         title: pane_display_title(pane, pane_nodes),
                         grid,
                         focused: layout.active.as_ref() == Some(&pane.id),
@@ -4618,6 +5224,7 @@ impl Desk {
             });
             TemporaryPaneContent {
                 pane,
+                runtime_id: self.runtime_of(&pane.binding.pane_id),
                 node,
                 previews: self.preview_history(&pane.binding.node_id),
                 grid: self
@@ -4807,6 +5414,27 @@ fn queue_item(view: &AttentionView) -> QueueItem {
         provisional: view.provisional,
         actionable: view.actionable,
         priority_boost: view.entry.priority_boost,
+    }
+}
+
+fn snapshot_contains_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> bool {
+    match key {
+        HierarchyKey::Workspace { workspace_id } => snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| &workspace.workspace.id == workspace_id),
+        HierarchyKey::Session { session_id } => snapshot.workspaces.iter().any(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .any(|session| &session.session.id == session_id)
+        }),
+        HierarchyKey::Process { node_id } => snapshot.workspaces.iter().any(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .any(|session| session.nodes.iter().any(|node| &node.node_id == node_id))
+        }),
     }
 }
 
@@ -5030,7 +5658,9 @@ mod tests {
                 attachment: Box::new(PaneAttachment {
                     session_id: session_id.clone(),
                     pane_id: pane_id.clone(),
+                    attachment_id: 7,
                     node_id: Some(node_id.clone()),
+                    runtime_id: Some(node_id.clone()),
                     stream: PaneStream::Cells,
                     screen: Some(Box::new(grid)),
                     scrollback: turn_proto::Scrollback::default(),
@@ -5181,7 +5811,7 @@ mod tests {
     }
 
     #[test]
-    fn reselecting_an_ended_session_shows_stopped_panes_instead_of_attaching_blank_grids() {
+    fn reselecting_an_ended_agent_asks_the_daemon_for_its_possible_hosting_terminal() {
         let (mut session, pane_id, node_id) = session_with_agent("Ended work");
         session.tree.get_mut(&node_id).unwrap().lifecycle = Lifecycle::Stopped {
             signal: "Terminated".into(),
@@ -5199,11 +5829,11 @@ mod tests {
             request,
             Request::GetSession { session_id } if session_id == &session.id
         )));
-        assert!(!sent(&reactions).iter().any(|request| matches!(
+        assert!(sent(&reactions).iter().any(|request| matches!(
             request,
             Request::AttachPane { pane_id: attached, .. } if attached == &pane_id
         )));
-        assert!(!desk.attaching.contains_key(&pane_id));
+        assert!(desk.attaching.contains_key(&pane_id));
     }
 
     #[test]
@@ -5311,7 +5941,8 @@ mod tests {
             Inbound::Event(Box::new(ServerEvent::PaneScreen {
                 session_id: session.id.clone(),
                 pane_id: pane_id.clone(),
-                node_id: None,
+                attachment_id: 7,
+                node_id: Some(node_id.clone()),
                 seq: 1,
                 update: ScreenUpdate::full(Grid::from_lines(&["hello"], 80)),
             })),
@@ -5324,7 +5955,8 @@ mod tests {
             Inbound::Event(Box::new(ServerEvent::PaneScreen {
                 session_id: session.id.clone(),
                 pane_id: pane_id.clone(),
-                node_id: None,
+                attachment_id: 7,
+                node_id: Some(node_id.clone()),
                 seq: 9,
                 update: ScreenUpdate::full(Grid::from_lines(&["later"], 80)),
             })),
@@ -6059,6 +6691,67 @@ mod tests {
         assert!(!desk.pane_owner.contains_key(&pane_id));
     }
 
+    #[test]
+    fn hiding_a_session_detaches_its_exact_terminal_generation_and_clears_geometry_state() {
+        let (session, pane_id, node_id) = session_with_agent("Archived live terminal");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
+            T0,
+        );
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::Pane {
+                    pane_id: pane_id.clone(),
+                    action: PaneAction::Resize(PtySize::new(48, 160)),
+                },
+                T0,
+            ))
+            .len(),
+            1
+        );
+
+        let reactions = desk.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot::empty("main-window", 2)),
+            }),
+            T0 + 1,
+        );
+        assert!(sent(&reactions).iter().any(|request| matches!(
+            request,
+            Request::DetachPane {
+                session_id,
+                pane_id: detached,
+                attachment_id: Some(7),
+            } if session_id == &session.id && detached == &pane_id
+        )));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attachments.contains_key(&pane_id));
+        assert!(!desk.attaching.contains_key(&pane_id));
+        assert!(!desk.pty_sizes.contains_key(&pane_id));
+        assert!(desk.pending_resizes.is_empty());
+        assert!(desk.runtime_resize_reports.is_empty());
+        assert!(desk.resize_retries.is_empty());
+        assert!(desk.resize_retry_attempts.is_empty());
+    }
+
     /// Answering a pending agent interaction is human input through `WritePty`.
     #[test]
     fn typing_in_a_pane_writes_to_the_pty_and_nothing_else_does() {
@@ -6110,7 +6803,7 @@ mod tests {
 
     #[test]
     fn a_resize_is_sent_when_it_changes_and_not_on_every_frame() {
-        let (session, pane_id, _) = session_with_agent("Resizing");
+        let (session, pane_id, node_id) = session_with_agent("Resizing");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -6122,6 +6815,17 @@ mod tests {
             answer(Response::SessionDetails {
                 details: Box::new(details(&session)),
             }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
             T0,
         );
 
@@ -6148,7 +6852,414 @@ mod tests {
             },
             T0,
         );
-        assert_eq!(sent(&changed).len(), 1);
+        assert!(
+            sent(&changed).is_empty(),
+            "new drag frames coalesce behind the one in-flight resize"
+        );
+        let ask = first
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("the first resize has a correlated ask");
+        let after_ack = desk.apply_inbound(
+            Inbound::Answer {
+                ask,
+                response: Box::new(Response::Ack),
+            },
+            T0 + 1,
+        );
+        assert!(matches!(
+            sent(&after_ack).as_slice(),
+            [Request::ResizePty { size, .. }] if *size == PtySize::new(41, 120)
+        ));
+    }
+
+    #[test]
+    fn a_dropped_resize_retries_the_latest_coalesced_geometry() {
+        let (session, pane_id, node_id) = session_with_agent("Resize retry");
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
+            T0,
+        );
+        let first = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action: PaneAction::Resize(PtySize::new(40, 120)),
+            },
+            T0,
+        );
+        let ask = first
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("one resize is in flight");
+        let retry = desk.apply_inbound(
+            Inbound::Failed {
+                ask,
+                error: turn_proto::ProtoError::new(
+                    turn_proto::ErrorCode::Unavailable,
+                    "the bounded transport was full",
+                ),
+            },
+            T0 + 2,
+        );
+        assert!(
+            retry.is_empty(),
+            "a rejected send cannot recurse immediately"
+        );
+        assert_eq!(desk.next_retry_at(), Some(T0 + 102));
+        assert!(desk
+            .apply_view_action(
+                ViewAction::Pane {
+                    pane_id,
+                    action: PaneAction::Resize(PtySize::new(55, 180)),
+                },
+                T0 + 50,
+            )
+            .is_empty());
+        assert!(desk.take_due_retries(T0 + 101).is_empty());
+        let retry = desk.take_due_retries(T0 + 102);
+        assert!(matches!(
+            sent(&retry).as_slice(),
+            [Request::ResizePty { size, .. }] if *size == PtySize::new(55, 180)
+        ));
+    }
+
+    #[test]
+    fn a_saturated_app_link_retries_the_latest_geometry_once_without_an_inbound_slot() {
+        let (session, pane_id, node_id) = session_with_agent("Saturated app bridge");
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
+            T0,
+        );
+
+        let first = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action: PaneAction::Resize(PtySize::new(40, 120)),
+            },
+            T0,
+        );
+        let (ask, request) = first
+            .into_iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, request } => Some((ask, request)),
+                _ => None,
+            })
+            .expect("one initial ResizePty");
+        let (link, mut peer) = crate::transport::DaemonLink::saturated_for_test();
+        peer.assert_inbound_full();
+        assert!(crate::app::submit_to_daemon(&link, &mut desk, ask, request, T0).is_empty());
+        assert_eq!(desk.next_retry_at(), Some(T0 + 100));
+
+        let latest = PtySize::new(55, 180);
+        assert!(desk
+            .apply_view_action(
+                ViewAction::Pane {
+                    pane_id: pane_id.clone(),
+                    action: PaneAction::Resize(latest),
+                },
+                T0 + 50,
+            )
+            .is_empty());
+        assert_eq!(desk.next_retry_at(), Some(T0 + 100));
+
+        peer.release_one_outbound();
+        let retry = desk.take_due_retries(T0 + 100);
+        let (retry_ask, retry_request) = retry
+            .into_iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, request } => Some((ask, request)),
+                _ => None,
+            })
+            .expect("one due retry");
+        assert!(crate::app::submit_to_daemon(
+            &link,
+            &mut desk,
+            retry_ask.clone(),
+            retry_request,
+            T0 + 100,
+        )
+        .is_empty());
+        let delivered: Vec<(Ask, Request)> = peer
+            .drain_sent()
+            .into_iter()
+            .filter(|(_, request)| matches!(request, Request::ResizePty { .. }))
+            .collect();
+        assert!(matches!(
+            delivered.as_slice(),
+            [(Ask::Resize { size: asked, .. }, Request::ResizePty { size, .. })]
+                if *asked == latest && *size == latest
+        ));
+
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: retry_ask,
+                response: Box::new(Response::Ack),
+            },
+            T0 + 101,
+        );
+        assert!(desk.next_retry_at().is_none());
+        assert!(desk
+            .apply_view_action(
+                ViewAction::Pane {
+                    pane_id,
+                    action: PaneAction::Resize(latest),
+                },
+                T0 + 102,
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn an_external_resize_invalidates_an_old_ack_even_when_the_retry_is_an_aba_size() {
+        let (session, pane_id, node_id) = session_with_agent("Resize ABA");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
+            T0,
+        );
+
+        let desired = PtySize::new(60, 200);
+        let first = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action: PaneAction::Resize(desired),
+            },
+            T0,
+        );
+        let first_ask = first
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("the first geometry intent");
+        let first_intent = match &first_ask {
+            Ask::Resize { intent_id, .. } => *intent_id,
+            other => panic!("expected Resize, got {other:?}"),
+        };
+
+        let external = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::PtyResized {
+                session_id: session.id.clone(),
+                node_id: node_id.clone(),
+                size: PtySize::new(30, 90),
+            })),
+            T0 + 1,
+        );
+        assert!(
+            external.is_empty(),
+            "passive windows follow external geometry instead of starting a resize ping-pong"
+        );
+        assert!(desk.pending_resizes.is_empty());
+
+        // A later geometry lifecycle can legitimately produce the same dimensions
+        // again. It is a new intent even though the tuple is an ABA match.
+        assert!(desk
+            .apply_view_action(
+                ViewAction::Pane {
+                    pane_id: pane_id.clone(),
+                    action: PaneAction::GeometryUnavailable,
+                },
+                T0 + 1,
+            )
+            .is_empty());
+        let second = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id,
+                action: PaneAction::Resize(desired),
+            },
+            T0 + 1,
+        );
+        let second_ask = second
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("the newly measured geometry is applied");
+        let second_intent = match &second_ask {
+            Ask::Resize {
+                intent_id, size, ..
+            } => {
+                assert_eq!(*size, desired, "the latest measured geometry wins");
+                *intent_id
+            }
+            other => panic!("expected Resize, got {other:?}"),
+        };
+        assert_ne!(first_intent, second_intent);
+
+        assert!(desk
+            .apply_inbound(
+                Inbound::Answer {
+                    ask: first_ask,
+                    response: Box::new(Response::Ack),
+                },
+                T0 + 2,
+            )
+            .is_empty());
+        assert_eq!(
+            desk.pending_resizes
+                .get(&(session.id.clone(), node_id.clone()))
+                .map(|pending| pending.intent_id),
+            Some(second_intent),
+            "the stale Ack cannot settle the newer same-size intent"
+        );
+
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: second_ask,
+                response: Box::new(Response::Ack),
+            },
+            T0 + 3,
+        );
+        assert!(desk.pending_resizes.is_empty());
+        assert_eq!(
+            desk.runtime_resize_reports
+                .get(&(session.id, node_id))
+                .map(|report| report.size),
+            Some(desired)
+        );
+    }
+
+    #[test]
+    fn an_external_event_at_the_pending_size_cancels_it_without_a_duplicate_ioctl() {
+        let (session, pane_id, node_id) = session_with_agent("Resize event settles");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
+            T0,
+        );
+        let desired = PtySize::new(55, 180);
+        let resize = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id,
+                action: PaneAction::Resize(desired),
+            },
+            T0,
+        );
+        let ask = resize
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("one pending resize");
+
+        assert!(desk
+            .apply_inbound(
+                Inbound::Event(Box::new(ServerEvent::PtyResized {
+                    session_id: session.id.clone(),
+                    node_id: node_id.clone(),
+                    size: desired,
+                })),
+                T0 + 1,
+            )
+            .is_empty());
+        assert!(desk.pending_resizes.is_empty());
+        assert!(!desk
+            .runtime_resize_reports
+            .contains_key(&(session.id.clone(), node_id.clone())));
+        assert!(desk
+            .apply_inbound(
+                Inbound::Answer {
+                    ask,
+                    response: Box::new(Response::Ack),
+                },
+                T0 + 2,
+            )
+            .is_empty());
+        assert!(
+            !desk
+                .runtime_resize_reports
+                .contains_key(&(session.id, node_id)),
+            "the old Ack is inert after the external event superseded it"
+        );
     }
 
     #[test]
@@ -6180,6 +7291,19 @@ mod tests {
             }),
             T0,
         );
+        for pane_id in [&first_pane, &duplicate] {
+            desk.apply_inbound(
+                attached(
+                    &desk,
+                    pane_id,
+                    &session.id,
+                    &node_id,
+                    Grid::blank(24, 80),
+                    0,
+                ),
+                T0,
+            );
+        }
 
         let first_size = PtySize::new(42, 142);
         assert!(
@@ -6193,17 +7317,30 @@ mod tests {
             .is_empty(),
             "a non-owner duplicate cannot resize the runtime"
         );
-        assert_eq!(
-            sent(&desk.apply_view_action(
-                ViewAction::Pane {
-                    pane_id: first_pane.clone(),
-                    action: PaneAction::Resize(first_size),
+        let first_resize = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: first_pane.clone(),
+                action: PaneAction::Resize(first_size),
+            },
+            T0,
+        );
+        assert_eq!(sent(&first_resize).len(), 1);
+        let first_ask = first_resize
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("the owner resize has a correlated ask");
+        assert!(desk
+            .apply_inbound(
+                Inbound::Answer {
+                    ask: first_ask,
+                    response: Box::new(Response::Ack),
                 },
                 T0,
-            ))
-            .len(),
-            1
-        );
+            )
+            .is_empty());
 
         session.layout.active = Some(duplicate.clone());
         desk.apply_inbound(
@@ -6250,6 +7387,223 @@ mod tests {
     }
 
     #[test]
+    fn detaching_a_runtime_mirror_preserves_the_real_owners_pending_resize() {
+        let (mut session, owner, node_id) = session_with_agent("Mirror detach");
+        let mirror = session.layout.duplicate(&owner).expect("duplicate view");
+        session.layout.active = Some(owner.clone());
+        let mut desk = Desk::new();
+        desk.selected = Some(session.id.clone());
+        desk.remember_layout(session.id.clone(), session.layout.clone());
+        desk.attach_wanted();
+        for pane_id in [&owner, &mirror] {
+            desk.apply_inbound(
+                attached(
+                    &desk,
+                    pane_id,
+                    &session.id,
+                    &node_id,
+                    Grid::blank(24, 80),
+                    0,
+                ),
+                T0,
+            );
+        }
+        let size = PtySize::new(50, 170);
+        let resize = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: owner.clone(),
+                action: PaneAction::Resize(size),
+            },
+            T0,
+        );
+        let ask = resize
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("owner resize");
+        assert!(desk.detach_subscription(&mirror).is_some());
+        assert!(desk
+            .pending_resizes
+            .contains_key(&(session.id.clone(), node_id.clone())));
+
+        assert!(desk
+            .apply_inbound(
+                Inbound::Answer {
+                    ask,
+                    response: Box::new(Response::Ack),
+                },
+                T0 + 1,
+            )
+            .is_empty());
+        assert_eq!(
+            desk.runtime_resize_reports
+                .get(&(session.id, node_id))
+                .map(|report| report.size),
+            Some(size)
+        );
+    }
+
+    #[test]
+    fn app_stages_exact_selection_before_same_frame_geometry_actions() {
+        let (mut session, exact_pane, node_id) = session_with_agent("Full exact geometry");
+        let hidden_focused = session
+            .layout
+            .duplicate(&exact_pane)
+            .expect("duplicate view");
+        session.layout.active = Some(hidden_focused.clone());
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        for pane_id in [&exact_pane, &hidden_focused] {
+            desk.apply_inbound(
+                attached(
+                    &desk,
+                    pane_id,
+                    &session.id,
+                    &node_id,
+                    Grid::blank(24, 80),
+                    0,
+                ),
+                T0,
+            );
+        }
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0 + 1,
+        );
+        let selected_node = desk
+            .hierarchy
+            .as_mut()
+            .expect("hierarchy")
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.sessions)
+            .flat_map(|session| &mut session.nodes)
+            .find(|node| node.node_id == node_id)
+            .expect("selected node");
+        selected_node.pane_bindings = vec![PaneNodeBinding {
+            pane_id: exact_pane.clone(),
+            session_id: session.id.clone(),
+            node_id: node_id.clone(),
+            temporary: false,
+            surface_id: None,
+            opened_ms: T0,
+        }];
+        let exact_size = PtySize::new(72, 196);
+        assert!(
+            sent(&desk.apply_view_action(
+                ViewAction::Pane {
+                    pane_id: exact_pane.clone(),
+                    action: PaneAction::Resize(exact_size),
+                },
+                T0 + 1,
+            ))
+            .is_empty(),
+            "before the click, hidden Layout focus still owns this runtime"
+        );
+
+        let (selection, pane_actions) = crate::app::stage_frame_actions(
+            &mut desk,
+            vec![HierarchyAction::Select {
+                surface_id: "main-window".into(),
+                key: HierarchyKey::process(node_id.clone()),
+            }],
+            vec![
+                ViewAction::Pane {
+                    pane_id: hidden_focused,
+                    action: PaneAction::Resize(PtySize::new(18, 54)),
+                },
+                ViewAction::Pane {
+                    pane_id: exact_pane,
+                    action: PaneAction::Resize(exact_size),
+                },
+            ],
+        );
+        assert!(matches!(
+            selection.as_slice(),
+            [Reaction::Send {
+                ask: Ask::SelectTree { selected: Some(HierarchyKey::Process { node_id: selected }), .. },
+                ..
+            }] if selected == &node_id
+        ));
+        let pane_reactions: Vec<Reaction> = pane_actions
+            .into_iter()
+            .flat_map(|action| desk.apply_view_action(action, T0 + 2))
+            .collect();
+        assert!(matches!(
+            sent(&pane_reactions).as_slice(),
+            [Request::ResizePty { node_id: runtime, size, .. }]
+                if runtime == &node_id && *size == exact_size
+        ));
+    }
+
+    #[test]
+    fn rejected_or_disappeared_tree_selections_release_exact_geometry_authority() {
+        let (session, _, node_id) = session_with_agent("Selection can disappear");
+        let select = |desk: &mut Desk| {
+            desk.apply_hierarchy_action(HierarchyAction::Select {
+                surface_id: "main-window".into(),
+                key: HierarchyKey::process(node_id.clone()),
+            })
+            .into_iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask),
+                _ => None,
+            })
+            .expect("selection request")
+        };
+
+        let mut rejected = Desk::new();
+        rejected.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+        let rejected_ask = select(&mut rejected);
+        assert_eq!(
+            rejected.navigation_hint,
+            Some(HierarchyKey::process(node_id.clone()))
+        );
+        rejected.apply_inbound(
+            Inbound::Failed {
+                ask: rejected_ask,
+                error: turn_proto::ProtoError::new(
+                    turn_proto::ErrorCode::NotFound,
+                    "the selected Agent ended",
+                ),
+            },
+            T0 + 1,
+        );
+        assert!(rejected.navigation_hint.is_none());
+
+        let mut disappeared = Desk::new();
+        disappeared.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::session(session.id.clone()))),
+            T0,
+        );
+        let _ = select(&mut disappeared);
+        disappeared.apply_inbound(
+            answer(Response::Hierarchy {
+                snapshot: Box::new(HierarchySnapshot::empty("main-window", 2)),
+            }),
+            T0 + 1,
+        );
+        assert!(disappeared.navigation_hint.is_none());
+    }
+
+    #[test]
     fn a_relaunched_process_receives_the_same_visible_size_again() {
         let (mut session, pane_id, old_node) = session_with_agent("Relaunched resize");
         let mut desk = Desk::new();
@@ -6263,6 +7617,17 @@ mod tests {
             answer(Response::SessionDetails {
                 details: Box::new(details(&session)),
             }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &old_node,
+                Grid::blank(24, 80),
+                0,
+            ),
             T0,
         );
         let visible = PtySize::new(45, 160);
@@ -6299,15 +7664,18 @@ mod tests {
             "the replacement attaches at the Pane's already-measured geometry: {rebound:?}"
         );
 
-        match sent(&desk.apply_view_action(
-            ViewAction::Pane {
-                pane_id: pane_id.clone(),
-                action: PaneAction::Resize(visible),
-            },
+        let replacement_resize = desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &replacement,
+                Grid::blank(24, 80),
+                0,
+            ),
             T0 + 2,
-        ))
-        .as_slice()
-        {
+        );
+        match sent(&replacement_resize).as_slice() {
             [Request::ResizePty { node_id, size, .. }] => {
                 assert_eq!(node_id, &replacement);
                 assert_ne!(node_id, &old_node);
@@ -6327,7 +7695,7 @@ mod tests {
 
     #[test]
     fn a_reconnected_runtime_attaches_at_the_last_real_pane_geometry() {
-        let (session, pane_id, _) = session_with_agent("Restored geometry");
+        let (session, pane_id, node_id) = session_with_agent("Restored geometry");
         let mut desk = Desk::new();
         desk.apply_inbound(
             answer(Response::Sessions {
@@ -6339,6 +7707,17 @@ mod tests {
             answer(Response::SessionDetails {
                 details: Box::new(details(&session)),
             }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::blank(24, 80),
+                0,
+            ),
             T0,
         );
         let visible = PtySize::new(47, 172);
@@ -7900,6 +9279,7 @@ mod tests {
     fn an_attach_failure_or_answer_only_finishes_its_exact_generation() {
         let (session, pane_id, node_id) = session_with_agent("Attach generations");
         let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
         desk.selected = Some(session.id.clone());
         desk.remember_layout(session.id.clone(), session.layout.clone());
         let first = desk.attach_wanted();
@@ -7930,7 +9310,7 @@ mod tests {
             "an old failure cannot cancel a newer attach to the same session/node"
         );
 
-        desk.apply_inbound(
+        let retry = desk.apply_inbound(
             Inbound::Failed {
                 ask: new_ask,
                 error: turn_proto::ProtoError::new(
@@ -7941,10 +9321,164 @@ mod tests {
             T0 + 1,
         );
         assert!(
+            sent(&retry).is_empty(),
+            "Attach failure must not recursively retry"
+        );
+        assert!(
             !desk.attaching.contains_key(&pane_id),
             "the current failure clears its own pending marker so a later refresh can retry"
         );
+        assert_eq!(desk.next_retry_at(), Some(T0 + 101));
+        assert!(matches!(
+            sent(&desk.take_due_retries(T0 + 101)).as_slice(),
+            [Request::AttachPane { pane_id: retried, .. }] if retried == &pane_id
+        ));
         assert_eq!(desk.node_of(&pane_id).as_ref(), Some(&node_id));
+    }
+
+    #[test]
+    fn an_idless_v4_stale_attach_never_detaches_its_replacement() {
+        let (session, pane_id, node_id) = session_with_agent("Legacy attach generations");
+        let mut desk = Desk::new();
+        desk.selected = Some(session.id.clone());
+        desk.remember_layout(session.id.clone(), session.layout.clone());
+        assert_eq!(desk.attach_wanted().len(), 1);
+        let old_pending = desk
+            .attaching
+            .get(&pane_id)
+            .cloned()
+            .expect("first legacy Attach");
+
+        let replacement = desk.request_attach(session.id.clone(), pane_id.clone(), INITIAL_SIZE);
+        assert!(matches!(
+            replacement,
+            Reaction::Send {
+                request: Request::AttachPane { .. },
+                ..
+            }
+        ));
+        let new_pending = desk
+            .attaching
+            .get(&pane_id)
+            .cloned()
+            .expect("replacement legacy Attach");
+        assert_ne!(old_pending.intent_id, new_pending.intent_id);
+
+        let legacy_answer = |pending: &PendingAttach, text: &str| Inbound::Answer {
+            ask: Ask::Attach {
+                session_id: session.id.clone(),
+                pane_id: pane_id.clone(),
+                node_id: pending.node_id.clone(),
+                intent_id: pending.intent_id,
+            },
+            response: Box::new(Response::Attached {
+                attachment: Box::new(PaneAttachment {
+                    session_id: session.id.clone(),
+                    pane_id: pane_id.clone(),
+                    // v4 omitted both new correlation fields. Zero is the serde
+                    // sentinel and was never generated by the current daemon.
+                    attachment_id: 0,
+                    node_id: Some(node_id.clone()),
+                    runtime_id: None,
+                    stream: PaneStream::Cells,
+                    screen: Some(Box::new(Grid::from_lines(&[text], 80))),
+                    scrollback: turn_proto::Scrollback::default(),
+                    replay: TerminalBytes::default(),
+                    size: INITIAL_SIZE,
+                    scrollback_truncated: false,
+                    bytes_seen: 0,
+                    next_seq: 0,
+                }),
+            }),
+        };
+
+        let stale = desk.apply_inbound(legacy_answer(&old_pending, "old"), T0);
+        assert!(
+            sent(&stale)
+                .iter()
+                .all(|request| !matches!(request, Request::DetachPane { .. })),
+            "an old daemon would execute this cleanup after Attach B and detach B"
+        );
+        assert_eq!(desk.attaching.get(&pane_id), Some(&new_pending));
+        assert!(!desk.feeds.contains_key(&pane_id));
+
+        let accepted = desk.apply_inbound(legacy_answer(&new_pending, "replacement"), T0 + 1);
+        assert!(sent(&accepted).is_empty());
+        assert!(desk.feeds.contains_key(&pane_id));
+        let installed = desk.attachments.get(&pane_id).expect("replacement feed");
+        assert_eq!(installed.attachment_id, 0);
+        assert_eq!(installed.node_id.as_ref(), Some(&node_id));
+        assert_eq!(installed.runtime_id.as_ref(), Some(&node_id));
+    }
+
+    #[test]
+    fn a_legacy_v4_hosted_agent_attachment_keeps_semantic_selection_and_uses_its_runtime() {
+        let (session, pane_id, agent_id) = session_with_agent("Legacy hosted Agent");
+        let legacy_shell = NodeId::from_stored("proc_legacy_host_shell");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        let pending = desk
+            .attaching
+            .get(&pane_id)
+            .cloned()
+            .expect("the selected Pane is attaching");
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: Ask::Attach {
+                    session_id: session.id.clone(),
+                    pane_id: pane_id.clone(),
+                    node_id: pending.node_id,
+                    intent_id: pending.intent_id,
+                },
+                response: Box::new(Response::Attached {
+                    attachment: Box::new(PaneAttachment {
+                        session_id: session.id.clone(),
+                        pane_id: pane_id.clone(),
+                        attachment_id: 7,
+                        // v4 overloaded this field with the concrete PTY runtime.
+                        node_id: Some(legacy_shell.clone()),
+                        runtime_id: None,
+                        stream: PaneStream::Cells,
+                        screen: Some(Box::new(Grid::blank(24, 80))),
+                        scrollback: turn_proto::Scrollback::default(),
+                        replay: TerminalBytes::default(),
+                        size: PtySize::new(24, 80),
+                        scrollback_truncated: false,
+                        bytes_seen: 0,
+                        next_seq: 0,
+                    }),
+                }),
+            },
+            T0,
+        );
+
+        let installed = desk.attachments.get(&pane_id).expect("installed feed");
+        assert_eq!(installed.node_id.as_ref(), Some(&agent_id));
+        assert_eq!(installed.runtime_id.as_ref(), Some(&legacy_shell));
+        assert!(desk.feeds.contains_key(&pane_id));
+        assert!(matches!(
+            sent(&desk.apply_view_action(
+                ViewAction::Pane {
+                    pane_id,
+                    action: PaneAction::Resize(PtySize::new(50, 170)),
+                },
+                T0 + 1,
+            ))
+            .as_slice(),
+            [Request::ResizePty { node_id, size, .. }]
+                if node_id == &legacy_shell && *size == PtySize::new(50, 170)
+        ));
     }
 
     #[test]
@@ -7978,6 +9512,104 @@ mod tests {
             !desk.feeds.contains_key(&pane_id),
             "a response is accepted only while its exact (Session, Pane, Node, intent) is wanted"
         );
+    }
+
+    #[test]
+    fn switching_sessions_detaches_the_exact_hidden_subscription() {
+        let (first, pane_id, node_id) = session_with_agent("Visible first");
+        let (second, _, _) = session_with_agent("Visible second");
+        let mut desk = Desk::new();
+        desk.selected = Some(first.id.clone());
+        desk.remember_layout(first.id.clone(), first.layout.clone());
+        assert_eq!(desk.attach_wanted().len(), 1);
+        desk.apply_inbound(
+            attached(&desk, &pane_id, &first.id, &node_id, Grid::blank(24, 80), 0),
+            T0,
+        );
+
+        let reactions = desk.select(second.id);
+        assert!(matches!(
+            sent(&reactions)
+                .into_iter()
+                .find(|request| matches!(request, Request::DetachPane { .. })),
+            Some(Request::DetachPane {
+                session_id,
+                pane_id: detached,
+                attachment_id: Some(7),
+            }) if session_id == first.id && detached == pane_id
+        ));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attachments.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn reattaching_after_an_external_hidden_resize_restores_the_full_visible_geometry() {
+        let (first, pane_id, node_id) = session_with_agent("Wide first");
+        let (second, _, _) = session_with_agent("Other Session");
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&first, 0), summary(&second, 0)],
+            }),
+            T0,
+        );
+        desk.selected = Some(first.id.clone());
+        desk.remember_layout(first.id.clone(), first.layout.clone());
+        desk.remember_layout(second.id.clone(), second.layout.clone());
+        desk.attach_wanted();
+        desk.apply_inbound(
+            attached(&desk, &pane_id, &first.id, &node_id, Grid::blank(24, 80), 0),
+            T0,
+        );
+        let visible = PtySize::new(64, 210);
+        let resize = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action: PaneAction::Resize(visible),
+            },
+            T0,
+        );
+        let resize_ask = resize
+            .iter()
+            .find_map(|reaction| match reaction {
+                Reaction::Send { ask, .. } => Some(ask.clone()),
+                _ => None,
+            })
+            .expect("the visible pane resizes once");
+        desk.apply_inbound(
+            Inbound::Answer {
+                ask: resize_ask,
+                response: Box::new(Response::Ack),
+            },
+            T0 + 1,
+        );
+
+        let hidden = desk.select(second.id.clone());
+        assert!(sent(&hidden).iter().any(|request| matches!(
+            request,
+            Request::DetachPane {
+                pane_id: detached,
+                attachment_id: Some(7),
+                ..
+            } if detached == &pane_id
+        )));
+        let shown_again = desk.select(first.id.clone());
+        assert!(sent(&shown_again).iter().any(|request| matches!(
+            request,
+            Request::AttachPane { pane_id: attached, size, .. }
+                if attached == &pane_id && *size == visible
+        )));
+
+        let restore = desk.apply_inbound(
+            attached(&desk, &pane_id, &first.id, &node_id, Grid::blank(24, 80), 0),
+            T0 + 2,
+        );
+        assert!(matches!(
+            sent(&restore).as_slice(),
+            [Request::ResizePty { session_id, node_id: runtime, size }]
+                if session_id == &first.id && runtime == &node_id && *size == visible
+        ));
     }
 
     #[test]
@@ -9724,7 +11356,8 @@ mod tests {
             Inbound::Event(Box::new(ServerEvent::PaneScreen {
                 session_id: session.id.clone(),
                 pane_id: pane_id.clone(),
-                node_id: None,
+                attachment_id: 7,
+                node_id: Some(node_id.clone()),
                 seq: 1,
                 update: ScreenUpdate::full(next),
             })),
@@ -10151,10 +11784,9 @@ mod tests {
         }
     }
 
-    /// A resync must name the cached Pane's owner even when the event envelope is stale;
-    /// trusting the previous Session would make the daemon answer `not_found`.
+    /// A stale event generation cannot make a rebound Pane resync or repaint.
     #[test]
-    fn a_resync_names_the_session_the_pane_actually_belongs_to() {
+    fn a_stale_screen_event_for_another_session_is_ignored() {
         let (first, _, _) = session_with_agent("First");
         let (second, second_pane, second_node) = session_with_agent("Second");
         let mut desk = Desk::new();
@@ -10183,28 +11815,20 @@ mod tests {
             T0,
         );
 
-        // A stale event envelope names the previously selected Session, but Pane identity
-        // still owns the repair. Resync must never inherit that unrelated context.
+        // The Pane id is current but its envelope is from the previous Session. Applying
+        // or resyncing it would cross an ABA boundary and corrupt the exact view.
         let reactions = desk.apply_inbound(
             Inbound::Event(Box::new(ServerEvent::PaneScreen {
                 session_id: first.id.clone(),
                 pane_id: second_pane.clone(),
-                node_id: None,
+                attachment_id: 7,
+                node_id: Some(second_node.clone()),
                 seq: 40,
                 update: ScreenUpdate::full(Grid::blank(4, 8)),
             })),
             T0,
         );
-        match sent(&reactions).as_slice() {
-            [Request::ResyncPane {
-                session_id,
-                pane_id,
-            }] => {
-                assert_eq!(session_id, &second.id);
-                assert_eq!(pane_id, &second_pane);
-            }
-            other => panic!("got {other:?}"),
-        }
+        assert!(sent(&reactions).is_empty());
     }
 
     #[test]

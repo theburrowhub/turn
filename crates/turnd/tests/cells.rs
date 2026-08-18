@@ -312,7 +312,8 @@ async fn a_client_that_dropped_an_update_recovers_the_whole_screen_and_carries_o
     let mut ui = daemon.connect().await;
     let (session, pane) = shell_session(&daemon, &mut ui).await;
 
-    ui.attach_cells(&session.id, &pane, PtySize::new(20, 60))
+    let attachment = ui
+        .attach_cells(&session.id, &pane, PtySize::new(20, 60))
         .await;
     type_line(&mut ui, &session, &pane, "printf 'before-the-gap\\n'").await;
 
@@ -323,7 +324,10 @@ async fn a_client_that_dropped_an_update_recovers_the_whole_screen_and_carries_o
             _ => None,
         })
         .await;
-    assert_eq!(dropped, 0, "the first update starts the sequence");
+    assert_eq!(
+        dropped, attachment.next_seq,
+        "the dropped update starts exactly where the accepted attach/resize baseline ended"
+    );
     assert!(
         !ui.screen(&session.id, &pane)
             .text()
@@ -390,6 +394,7 @@ async fn a_client_that_asks_for_bytes_gets_the_escape_stream_and_a_replay() {
         .try_ask(Request::ResyncPane {
             session_id: session.id.clone(),
             pane_id: pane.clone(),
+            attachment_id: None,
         })
         .await
         .expect_err("there is no screen to resend");
@@ -514,6 +519,34 @@ async fn attaching_at_a_geometry_over_the_announced_limit_is_refused() {
         .attach_cells(&session.id, &pane, PtySize::new(24, 80))
         .await;
     assert_eq!(attachment.size, PtySize::new(24, 80));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resizing_to_a_geometry_over_the_announced_limit_is_refused_without_touching_the_pty() {
+    let daemon = TestDaemon::start_plain().await;
+    let mut ui = daemon.connect().await;
+    let (session, pane) = shell_session(&daemon, &mut ui).await;
+    let attachment = ui
+        .attach_cells(&session.id, &pane, PtySize::new(24, 80))
+        .await;
+    let runtime = attachment
+        .runtime_id
+        .expect("a shell attachment names its runtime");
+
+    let error = ui
+        .try_ask(Request::ResizePty {
+            session_id: session.id.clone(),
+            node_id: runtime,
+            size: PtySize::new(1_000, 1_000),
+        })
+        .await
+        .expect_err("a million cells must be rejected before reaching the PTY");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    type_line(&mut ui, &session, &pane, "stty size").await;
+    ui.wait_for_screen("24 80").await;
 
     daemon.shutdown().await;
 }
