@@ -4,7 +4,7 @@
 //! distinction visible in the types: resolving a [`ViewTarget`] borrows the exact
 //! Workspace, Session or Node projection and rendering it never edits `Layout`.
 
-use egui::{Align2, FontId, Rect, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
 use turn_proto::{
     HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability, SessionTreeView,
@@ -671,10 +671,17 @@ fn node_details(
                         node_id: node.node_id.clone(),
                     });
                 }
-                if node.is_agentic && ui.button("Rename Agent…").clicked() {
-                    state.node_edit = Some(super::NodeEditDraft::rename(node));
+                if node.is_agentic {
+                    let rename = ui.button("Rename Agent…");
+                    if rename.clicked() {
+                        // The same Enter that activates this button must not immediately
+                        // submit the editor that is drawn later in this frame.
+                        ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                        state.node_edit = Some(super::NodeEditDraft::rename(node));
+                    }
                 }
                 if node.is_agentic && ui.button("Correct relationship…").clicked() {
+                    ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
                     state.node_edit = Some(super::NodeEditDraft::relationship(node));
                 }
                 if node.is_agentic
@@ -683,6 +690,7 @@ fn node_details(
                     })
                     && ui.button("Pass context to Agent…").clicked()
                 {
+                    ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
                     state.context_handoff = Some(super::ContextHandoffDraft::new(session, node));
                 }
             });

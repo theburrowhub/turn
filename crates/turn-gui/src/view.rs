@@ -5400,6 +5400,7 @@ impl<'a> TurnView<'a> {
             });
         let restoring_scroll = state.scroll_tree_to.is_some();
         let mut first_visible = None;
+        let mut tree_item_has_focus = false;
         egui::ScrollArea::vertical()
             .id_salt("hierarchy-rows")
             .auto_shrink([false, false])
@@ -5938,6 +5939,7 @@ impl<'a> TurnView<'a> {
                         response.request_focus();
                         set_hierarchy_selection(state, snapshot, key);
                     }
+                    tree_item_has_focus |= response.has_focus();
                 }
             });
 
@@ -5946,7 +5948,14 @@ impl<'a> TurnView<'a> {
             push_tree_presentation(state, snapshot);
         }
 
-        if hierarchy_accepts_keyboard(state) {
+        let real_widget_has_focus = ui.memory(|memory| memory.focused().is_some());
+        if real_widget_has_focus {
+            // `tree_has_focus` is also the synthetic lease used before a real row widget
+            // exists. Once egui/AccessKit names an actual owner, that owner wins: a
+            // WorkSurface, overlay or row control must receive its own Enter key.
+            state.tree_has_focus = tree_item_has_focus;
+        }
+        if hierarchy_accepts_keyboard(state, tree_item_has_focus, real_widget_has_focus) {
             let updated_rows = visible_hierarchy_rows(snapshot, state, self.include_archived);
             actions.extend(handle_hierarchy_keyboard(
                 ui,
@@ -11231,8 +11240,13 @@ enum HierarchyKeypress {
     Blur,
 }
 
-fn hierarchy_accepts_keyboard(state: &ViewState) -> bool {
-    state.tree_has_focus && !state.is_sensitive()
+fn hierarchy_accepts_keyboard(
+    state: &ViewState,
+    tree_item_has_focus: bool,
+    real_widget_has_focus: bool,
+) -> bool {
+    !state.is_sensitive()
+        && (tree_item_has_focus || (!real_widget_has_focus && state.tree_has_focus))
 }
 
 fn handle_hierarchy_keyboard(
@@ -13290,10 +13304,10 @@ mod tests {
             }),
             ..ViewState::default()
         };
-        assert!(!hierarchy_accepts_keyboard(&state));
+        assert!(!hierarchy_accepts_keyboard(&state, false, false));
 
         state.lifecycle_confirmation = None;
-        assert!(hierarchy_accepts_keyboard(&state));
+        assert!(hierarchy_accepts_keyboard(&state, false, false));
     }
 
     #[test]

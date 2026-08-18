@@ -1177,6 +1177,119 @@ fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
 }
 
 #[test]
+fn work_surface_controls_take_enter_without_breaking_tree_item_activation() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let node_id = |title: &str| {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| node.title == title)
+            .map(|node| node.node_id.clone())
+            .unwrap_or_else(|| panic!("missing {title}"))
+    };
+    let reviewer_id = node_id("Reviewer");
+    let tests_id = node_id("Tests");
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
+    let mut h = harness(fixture);
+    h.run_steps(2);
+
+    h.query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Reviewer"))
+        })
+        .expect("Reviewer TreeItem")
+        .click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id.clone()))
+    );
+
+    h.query_by_label("Rename Agent…")
+        .expect("WorkSurface rename action")
+        .focus();
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("Rename Agent…")
+            .expect("focused rename action")
+            .accesskit_node()
+            .is_focused(),
+        "AccessKit focus must leave the tree before Enter"
+    );
+    assert!(
+        !h.state().state.tree_has_focus,
+        "real WorkSurface focus must release the synthetic tree lease"
+    );
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert!(
+        h.state().state.node_edit.is_some(),
+        "Enter on the focused WorkSurface action must open its editor"
+    );
+    h.run();
+    assert_modal(&h, egui::accesskit::Role::Dialog, "Rename Agent");
+    assert!(matches!(
+        h.state().state.node_edit,
+        Some(turn_gui::view::NodeEditDraft::Rename { ref node_id, .. })
+            if node_id == &reviewer_id
+    ));
+
+    h.state_mut().state.node_edit = None;
+    let tests_details = node_inspector(&h.state().fixture, &tests_id);
+    h.state_mut().fixture.inspector = Some(tests_details);
+    h.run_steps(2);
+    h.query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Tests"))
+        })
+        .expect("Tests TreeItem")
+        .focus();
+    h.run_steps(2);
+    assert!(h
+        .query_all_by_role(egui::accesskit::Role::TreeItem)
+        .find(|node| {
+            node.accesskit_node()
+                .label()
+                .is_some_and(|label| label.contains("SUBAGENT Tests"))
+        })
+        .expect("focused Tests TreeItem")
+        .accesskit_node()
+        .is_focused());
+    let _ = h.state_mut().state.take_hierarchy_actions();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(tests_id.clone()))
+    );
+    let actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &tests_id
+    )));
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+}
+
+#[test]
 fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
     let mut fixture = busy_desk();
     fixture.permission = None;
