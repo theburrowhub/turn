@@ -6,6 +6,7 @@
 
 use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
+use turn_core::state::{AwaitingReason, Turn};
 use turn_proto::{
     HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability, SessionTreeView,
     TreeNodeView, WorkspaceTreeView,
@@ -208,7 +209,7 @@ impl TurnView<'_> {
         ui: &mut Ui,
         theme: &Theme,
         snapshot: &HierarchySnapshot,
-        workspace: &WorkspaceTreeView,
+        _workspace: &WorkspaceTreeView,
         session: &SessionTreeView,
         node: &TreeNodeView,
         details: Option<&InspectorDetails>,
@@ -217,6 +218,11 @@ impl TurnView<'_> {
         let mut actions = Vec::new();
         let area = ui.available_rect_before_wrap();
         ui.painter().rect_filled(area, 0.0, theme.background);
+        // Hierarchy rows are the low-latency navigation projection. Any text owned by
+        // an Agent must cross the inspector redaction boundary before WorkSurface may
+        // paint it, expose it through AccessKit, or copy it into an editing draft.
+        let safe_node = inspected_node_for(details, &node.node_id);
+        let safe_details = safe_node.and(details);
 
         let attention_height: f32 = if node.needs_user { 34.0 } else { 0.0 };
         let header_height = 76.0_f32.min(area.height());
@@ -235,17 +241,25 @@ impl TurnView<'_> {
             Rect::from_min_max(header.left_bottom(), area.max).shrink2(Vec2::new(12.0, 10.0));
 
         if node.needs_user {
+            let copy = attention_copy(node, safe_node);
             ui.painter()
                 .rect_filled(attention, 0.0, theme.attention.gamma_multiply(0.14));
             ui.painter().text(
                 attention.left_center() + Vec2::new(12.0, 0.0),
                 Align2::LEFT_CENTER,
-                attention_copy(node),
+                &copy,
                 FontId::new(11.0, egui::FontFamily::Monospace),
                 theme.attention,
             );
+            let attention_id = ui
+                .id()
+                .with(("node-work-surface-attention", node.node_id.as_str()));
+            ui.ctx().accesskit_node_builder(attention_id, |builder| {
+                builder.set_role(egui::accesskit::Role::Alert);
+                builder.set_label(copy);
+            });
         }
-        paint_node_header(ui, theme, header, workspace, session, node);
+        paint_node_header(ui, theme, header, node, safe_node, safe_details);
 
         let stacked = body.width() < 760.0;
         let gap = 12.0_f32.min(body.width());
@@ -288,12 +302,22 @@ impl TurnView<'_> {
                 primary,
                 &snapshot.tree_state.surface_id,
                 node,
+                safe_node,
                 pane,
                 content,
                 state,
             ));
         } else {
-            semantic_primary(ui, theme, primary, node, details, state, self.now_ms);
+            semantic_primary(
+                ui,
+                theme,
+                primary,
+                node,
+                safe_node,
+                safe_details,
+                state,
+                self.now_ms,
+            );
         }
         node_details(
             ui,
@@ -302,7 +326,8 @@ impl TurnView<'_> {
             snapshot,
             session,
             node,
-            details,
+            safe_node,
+            safe_details,
             state,
             self.now_ms,
         );
@@ -313,7 +338,7 @@ impl TurnView<'_> {
             builder.set_label(format!(
                 "WorkSurface for exact {} {}",
                 node_kind_label(node.kind),
-                process_title(node)
+                work_surface_title(node, safe_node)
             ));
         });
         actions
@@ -346,6 +371,7 @@ impl TurnView<'_> {
         rect: Rect,
         surface_id: &str,
         node: &TreeNodeView,
+        safe_node: Option<&TreeNodeView>,
         binding: &turn_core::model::PaneNodeBinding,
         content: &PaneContent<'_>,
         state: &mut ViewState,
@@ -369,7 +395,7 @@ impl TurnView<'_> {
             builder.set_role(egui::accesskit::Role::Group);
             builder.set_label(format!(
                 "Exact read-only terminal mirror for {}",
-                process_title(node)
+                work_surface_title(node, safe_node)
             ));
         });
         let focus_rect = Rect::from_min_size(
@@ -426,9 +452,9 @@ fn paint_node_header(
     ui: &mut Ui,
     theme: &Theme,
     rect: Rect,
-    workspace: &WorkspaceTreeView,
-    session: &SessionTreeView,
     node: &TreeNodeView,
+    safe_node: Option<&TreeNodeView>,
+    details: Option<&InspectorDetails>,
 ) {
     ui.painter().rect_filled(rect, 0.0, theme.panel);
     ui.painter()
@@ -437,10 +463,10 @@ fn paint_node_header(
         region(rect.shrink2(Vec2::new(14.0, 8.0)), "node-view-header"),
         |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new(process_title(node)).color(theme.text));
+                ui.heading(RichText::new(work_surface_title(node, safe_node)).color(theme.text));
                 let (colour, glyph) = theme.state_marker(node.display_state);
                 ui.label(
-                    RichText::new(format!("{glyph} {}", node.state_label))
+                    RichText::new(format!("{glyph} {}", node.display_state.label()))
                         .monospace()
                         .color(colour),
                 );
@@ -452,14 +478,21 @@ fn paint_node_header(
                 );
             });
             ui.horizontal_wrapped(|ui| {
+                let session_name = match details {
+                    Some(InspectorDetails::Agent { session_name, .. })
+                    | Some(InspectorDetails::Process { session_name, .. }) => {
+                        Some(session_name.as_str())
+                    }
+                    _ => None,
+                };
                 ui.label(
-                    RichText::new(format!(
-                        "{}  /  {}",
-                        workspace.workspace.name, session.session.name
-                    ))
+                    RichText::new(match session_name {
+                        Some(session_name) => format!("SESSION  /  {session_name}"),
+                        None => "SESSION  /  Loading safe details…".to_string(),
+                    })
                     .color(theme.text_dim),
                 );
-                if let Some(agent) = &node.agent {
+                if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     if let Some(provider) = agent.agent.provider.as_deref() {
                         ui.label(RichText::new(provider).monospace().color(theme.text_faint));
                     }
@@ -472,20 +505,17 @@ fn paint_node_header(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn semantic_primary(
     ui: &mut Ui,
     theme: &Theme,
     rect: Rect,
     node: &TreeNodeView,
+    safe_node: Option<&TreeNodeView>,
     details: Option<&InspectorDetails>,
     state: &ViewState,
     now_ms: i64,
 ) {
-    // Hierarchy snapshots are deliberately cheap and may still contain live agent
-    // fields. The on-demand inspector projection is the only copy that has passed
-    // through `session_for_inspection`, so task/message text must never fall back to
-    // `node` while that projection is in flight.
-    let safe_node = inspected_node_for(details, &node.node_id);
     let inner = rect.shrink(14.0);
     ui.scope_builder(region(inner, "semantic-node-primary"), |ui| {
         egui::ScrollArea::vertical()
@@ -501,7 +531,7 @@ fn semantic_primary(
                     Some(task) => {
                         ui.label(RichText::new(task).size(17.0).color(theme.text));
                     }
-                    None if node.agent.is_none() || safe_node.is_some() => {
+                    None if !node.is_agentic || safe_node.is_some() => {
                         inspector_empty(ui, theme, "No task has been reported for this node")
                     }
                     None => inspector_empty(ui, theme, "Loading safe task details…"),
@@ -576,6 +606,7 @@ fn node_details(
     snapshot: &HierarchySnapshot,
     session: &SessionTreeView,
     node: &TreeNodeView,
+    safe_node: Option<&TreeNodeView>,
     details: Option<&InspectorDetails>,
     state: &mut ViewState,
     now_ms: i64,
@@ -587,17 +618,28 @@ fn node_details(
             .show(ui, |ui| {
                 inspector_section(ui, theme, "IDENTITY & RUNTIME");
                 inspector_value(ui, theme, "type", node_kind_label(node.kind));
-                inspector_value(ui, theme, "state", &node.state_label);
-                inspector_value(ui, theme, "lifecycle", lifecycle_label(&node.lifecycle));
+                inspector_value(ui, theme, "state", node.display_state.label());
+                if let Some(safe_node) = safe_node {
+                    inspector_value(
+                        ui,
+                        theme,
+                        "lifecycle",
+                        lifecycle_label(&safe_node.lifecycle),
+                    );
+                } else {
+                    inspector_value(ui, theme, "lifecycle", "Loading safe details…");
+                }
                 inspector_value(ui, theme, "runtime", &format_duration(node.runtime_ms));
                 inspector_optional_owned(ui, theme, "pid", node.pid.map(|pid| pid.to_string()));
-                if let Some(agent) = &node.agent {
+                if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     inspector_optional(ui, theme, "provider", agent.agent.provider.as_deref());
                     inspector_optional(ui, theme, "tool", agent.agent.tool.as_deref());
                     inspector_optional(ui, theme, "model", agent.agent.model.as_deref());
                     inspector_optional(ui, theme, "Agent type", agent.agent_type.as_deref());
                     inspector_optional(ui, theme, "permission mode", agent.permission_mode.as_deref());
                     inspector_optional(ui, theme, "branch", agent.git_branch.as_deref());
+                } else if node.is_agentic {
+                    inspector_value(ui, theme, "agent metadata", "Loading safe details…");
                 }
 
                 inspector_section(ui, theme, "VIEW CAPABILITY");
@@ -615,7 +657,7 @@ fn node_details(
                     }
                 }
 
-                if let Some(agent) = &node.agent {
+                if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     inspector_section(ui, theme, "USAGE");
                     inspector_optional_owned(
                         ui,
@@ -672,26 +714,50 @@ fn node_details(
                     });
                 }
                 if node.is_agentic {
-                    let rename = ui.button("Rename Agent…");
+                    let safe_agent_node = safe_node.filter(|node| node.is_agentic);
+                    let rename = ui
+                        .add_enabled(safe_agent_node.is_some(), egui::Button::new("Rename Agent…"))
+                        .on_disabled_hover_text("Loading safe Agent details…");
                     if rename.clicked() {
                         // The same Enter that activates this button must not immediately
                         // submit the editor that is drawn later in this frame.
                         ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-                        state.node_edit = Some(super::NodeEditDraft::rename(node));
+                        state.node_edit = Some(super::NodeEditDraft::rename(
+                            safe_agent_node.expect("the enabled action has safe Agent details"),
+                        ));
                     }
-                }
-                if node.is_agentic && ui.button("Correct relationship…").clicked() {
-                    ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-                    state.node_edit = Some(super::NodeEditDraft::relationship(node));
-                }
-                if node.is_agentic
-                    && session.nodes.iter().any(|candidate| {
+                    let relationship = ui
+                        .add_enabled(
+                            safe_agent_node.is_some(),
+                            egui::Button::new("Correct relationship…"),
+                        )
+                        .on_disabled_hover_text("Loading safe Agent details…");
+                    if relationship.clicked() {
+                        ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                        state.node_edit = Some(super::NodeEditDraft::relationship(
+                            safe_agent_node.expect("the enabled action has safe Agent details"),
+                        ));
+                    }
+                    let has_target = session.nodes.iter().any(|candidate| {
                         candidate.is_agentic && candidate.node_id != node.node_id
-                    })
-                    && ui.button("Pass context to Agent…").clicked()
-                {
-                    ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
-                    state.context_handoff = Some(super::ContextHandoffDraft::new(session, node));
+                    });
+                    let handoff = ui
+                        .add_enabled(
+                            safe_agent_node.is_some() && has_target,
+                            egui::Button::new("Pass context to Agent…"),
+                        )
+                        .on_disabled_hover_text(if safe_agent_node.is_none() {
+                            "Loading safe Agent details…"
+                        } else {
+                            "This Session has no other Agent to receive context."
+                        });
+                    if handoff.clicked() {
+                        ui.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+                        state.context_handoff = Some(super::ContextHandoffDraft::new(
+                            session,
+                            safe_agent_node.expect("the enabled action has safe Agent details"),
+                        ));
+                    }
                 }
             });
     });
@@ -716,8 +782,8 @@ fn activity_card(ui: &mut Ui, theme: &Theme, preview: &turn_core::model::Activit
     ui.add_space(6.0);
 }
 
-fn attention_copy(node: &TreeNodeView) -> String {
-    if let Some(agent) = &node.agent {
+fn attention_copy(node: &TreeNodeView, safe_node: Option<&TreeNodeView>) -> String {
+    if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
         if let Some(permission) = &agent.pending_permission {
             return format!("NEEDS YOU · PERMISSION · {}", permission.summary);
         }
@@ -725,7 +791,36 @@ fn attention_copy(node: &TreeNodeView) -> String {
             return format!("NEEDS YOU · QUESTION · {question}");
         }
     }
-    format!("NEEDS YOU · {}", node.state_label)
+    let kind = match node.turn.as_ref() {
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        }) => "PERMISSION",
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        }) => "QUESTION",
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Credentials,
+        }) => "CREDENTIALS",
+        Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Input,
+        }) => "INPUT",
+        _ => node.display_state.label(),
+    };
+    if safe_node.is_none() {
+        format!("NEEDS YOU · {kind} · Loading safe details…")
+    } else {
+        format!("NEEDS YOU · {kind}")
+    }
+}
+
+/// Agent names are free text. Until the exact inspector row arrives, the right-hand
+/// surface identifies the structural kind but never borrows the low-latency row title.
+fn work_surface_title<'a>(node: &'a TreeNodeView, safe_node: Option<&'a TreeNodeView>) -> &'a str {
+    safe_node.map(process_title).unwrap_or(if node.is_agentic {
+        "Agent details loading…"
+    } else {
+        "Process details loading…"
+    })
 }
 
 fn panel(ui: &Ui, theme: &Theme, rect: Rect) {

@@ -808,17 +808,32 @@ fn node_inspector(fixture: &Fixture, node_id: &NodeId) -> InspectorDetails {
         .find(|node| &node.node_id == node_id)
         .expect("inspected node")
         .clone();
-    InspectorDetails::Agent {
-        session_name: session.session.name.clone(),
-        node: Box::new(node),
-        parent: None,
-        process_group: None,
-        origin: InspectorOriginView {
-            label: "claude-code hook".into(),
-            confidence: Confidence::Explicit,
-        },
-        history: Vec::new(),
-        handoffs: Vec::new(),
+    let session_name = session.session.name.clone();
+    if node.is_agentic {
+        InspectorDetails::Agent {
+            session_name,
+            node: Box::new(node),
+            parent: None,
+            process_group: None,
+            origin: InspectorOriginView {
+                label: "claude-code hook".into(),
+                confidence: Confidence::Explicit,
+            },
+            history: Vec::new(),
+            handoffs: Vec::new(),
+        }
+    } else {
+        InspectorDetails::Process {
+            session_name,
+            node: Box::new(node),
+            parent: None,
+            process_group: None,
+            origin: InspectorOriginView {
+                label: "structured adapter".into(),
+                confidence: Confidence::Explicit,
+            },
+            history: Vec::new(),
+        }
     }
 }
 
@@ -1355,6 +1370,7 @@ fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
 #[test]
 fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load() {
     const SECRET: &str = "sk-ant-turn-regression-secret-abcdefghijklmnopqrstuvwxyz";
+    const NAME_SECRET: &str = "ghp_turnagentnamesecretabcdefghijklmnopqrstuvwxyz012345";
 
     let mut fixture = busy_desk();
     fixture.permission = None;
@@ -1374,9 +1390,39 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     let InspectorDetails::Agent { node, .. } = &mut safe_details else {
         panic!("Reviewer inspector is agent detail");
     };
+    node.title = "[redacted Agent name]".into();
+    node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    });
+    node.display_state = DisplayState::NeedsPermission;
+    node.state_label = DisplayState::NeedsPermission.label().into();
+    node.needs_user = true;
     let safe_agent = node.agent.as_mut().expect("safe agent summary");
+    safe_agent.name = AgentName::declared("[redacted declared name]");
+    safe_agent.agent = AgentRef {
+        provider: Some("[redacted provider]".into()),
+        tool: Some("[redacted tool]".into()),
+        model: Some("[redacted model]".into()),
+        external_id: None,
+    };
+    safe_agent.external_id = None;
+    safe_agent.agent_type = Some("[redacted Agent type]".into());
+    safe_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    };
     safe_agent.current_task = Some("[redacted task]".into());
     safe_agent.last_message = Some("[redacted message]".into());
+    safe_agent.pending_permission = Some(turn_core::model::PendingPermission {
+        summary: "[redacted permission]".into(),
+        command: Some("[redacted command]".into()),
+        tool_name: Some("[redacted permission tool]".into()),
+        risk: Risk::High,
+        requested_ms: T0 + 13_000,
+        cwd: Some("[redacted permission cwd]".into()),
+    });
+    safe_agent.pending_question = Some("[redacted question]".into());
+    safe_agent.permission_mode = Some("[redacted permission mode]".into());
+    safe_agent.git_branch = Some("[redacted branch]".into());
 
     let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
     snapshot.tree_state.selected = Some(HierarchyKey::process(reviewer_id.clone()));
@@ -1387,9 +1433,39 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
         .flat_map(|session| &mut session.nodes)
         .find(|node| node.node_id == reviewer_id)
         .expect("raw Reviewer row");
+    raw_node.title = format!("Reviewer {NAME_SECRET}");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    });
+    raw_node.display_state = DisplayState::NeedsPermission;
+    raw_node.state_label = DisplayState::NeedsPermission.label().into();
+    raw_node.needs_user = true;
     let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.name = AgentName::declared(format!("Reviewer {NAME_SECRET}"));
+    raw_agent.agent = AgentRef {
+        provider: Some(format!("provider {SECRET}")),
+        tool: Some(format!("tool {SECRET}")),
+        model: Some(format!("model {SECRET}")),
+        external_id: Some(format!("external {SECRET}")),
+    };
+    raw_agent.external_id = Some(format!("thread {SECRET}"));
+    raw_agent.agent_type = Some(format!("type {SECRET}"));
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Permission,
+    };
     raw_agent.current_task = Some(format!("Use credential {SECRET}"));
     raw_agent.last_message = Some(format!("Credential echoed: {SECRET}"));
+    raw_agent.pending_permission = Some(turn_core::model::PendingPermission {
+        summary: format!("Approve {SECRET}"),
+        command: Some(format!("run {SECRET}")),
+        tool_name: Some(format!("tool {SECRET}")),
+        risk: Risk::High,
+        requested_ms: T0 + 13_000,
+        cwd: Some(format!("/tmp/{SECRET}")),
+    });
+    raw_agent.pending_question = Some(format!("Question containing {SECRET}"));
+    raw_agent.permission_mode = Some(format!("mode {SECRET}"));
+    raw_agent.git_branch = Some(format!("branch/{SECRET}"));
 
     let mut h = harness(fixture);
     h.run();
@@ -1397,10 +1473,42 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
 
     let loading_text = all_text(&h).join("\n");
     assert!(loading_text.contains("Loading safe task details…"));
+    assert!(loading_text.contains("Agent details loading…"));
     assert!(
         !loading_text.contains(SECRET),
-        "raw hierarchy secrets must not enter painted or accessible text"
+        "raw AgentSummary secrets must not enter painted or accessible text"
     );
+    let tree_name_occurrences = tree_row_labels(&h).join("\n").matches(NAME_SECRET).count();
+    let unexpected_name_text: Vec<_> = all_text(&h)
+        .into_iter()
+        .filter(|text| {
+            text.contains(NAME_SECRET)
+                && !text.starts_with("SUBAGENT ")
+                && !text.starts_with("Stop agent ")
+                && !text.starts_with("Selection: ")
+        })
+        .collect();
+    assert_eq!(
+        tree_name_occurrences, 1,
+        "the poisoned hierarchy row is present"
+    );
+    assert_eq!(
+        unexpected_name_text,
+        Vec::<String>::new(),
+        "the raw hierarchy title must not escape navigation chrome into WorkSurface"
+    );
+    for action in [
+        "Rename Agent…",
+        "Correct relationship…",
+        "Pass context to Agent…",
+    ] {
+        h.query_by_label(action)
+            .unwrap_or_else(|| panic!("missing disabled {action}"))
+            .click();
+        h.run_steps(1);
+        assert!(h.state().state.node_edit.is_none());
+        assert!(h.state().state.context_handoff.is_none());
+    }
 
     h.state_mut().fixture.inspector = Some(safe_details);
     h.run();
@@ -1409,10 +1517,127 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     let safe_text = all_text(&h).join("\n");
     assert!(safe_text.contains("[redacted task]"));
     assert!(safe_text.contains("[redacted message]"));
+    assert!(safe_text.contains("[redacted Agent name]"));
+    assert!(safe_text.contains("[redacted permission]"));
+    assert!(safe_text.contains("[redacted provider]"));
+    assert!(safe_text.contains("[redacted tool]"));
+    assert!(safe_text.contains("[redacted model]"));
+    assert!(safe_text.contains("[redacted Agent type]"));
+    assert!(safe_text.contains("[redacted permission mode]"));
+    assert!(safe_text.contains("[redacted branch]"));
     assert!(
         !safe_text.contains(SECRET),
-        "only the inspector's redacted projection may supply task/message text"
+        "only the inspector's redacted projection may supply Agent text"
     );
+    let unexpected_name_text: Vec<_> = all_text(&h)
+        .into_iter()
+        .filter(|text| {
+            text.contains(NAME_SECRET)
+                && !text.starts_with("SUBAGENT ")
+                && !text.starts_with("Stop agent ")
+                && !text.starts_with("Selection: ")
+        })
+        .collect();
+    assert!(
+        unexpected_name_text.is_empty(),
+        "the safe inspector title must own WorkSurface and accessibility: {unexpected_name_text:?}"
+    );
+
+    // Exercise the question path independently: permission wins when both are present,
+    // so removing it proves a raw pending question cannot bypass the safe projection.
+    if let Some(InspectorDetails::Agent { node, .. }) = h.state_mut().fixture.inspector.as_mut() {
+        node.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        });
+        node.display_state = DisplayState::AskingQuestion;
+        node.state_label = DisplayState::AskingQuestion.label().into();
+        let agent = node.agent.as_mut().expect("safe agent summary");
+        agent.turn = Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        };
+        agent.pending_permission = None;
+        agent.pending_question = Some("[redacted question]".into());
+    }
+    let raw_node = h
+        .state_mut()
+        .fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    });
+    raw_node.display_state = DisplayState::AskingQuestion;
+    raw_node.state_label = DisplayState::AskingQuestion.label().into();
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    };
+    raw_agent.pending_permission = None;
+    let raw_node = h
+        .state_mut()
+        .state
+        .hierarchy
+        .as_mut()
+        .expect("rendered hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("rendered Reviewer row");
+    raw_node.turn = Some(Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    });
+    raw_node.display_state = DisplayState::AskingQuestion;
+    raw_node.state_label = DisplayState::AskingQuestion.label().into();
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.turn = Turn::AwaitingUser {
+        reason: AwaitingReason::Question,
+    };
+    raw_agent.pending_permission = None;
+    h.run();
+    h.run();
+    let question_text = all_text(&h).join("\n");
+    assert!(question_text.contains("[redacted question]"));
+    assert!(!question_text.contains(SECRET));
+
+    // Keep the visual artifact useful to a reviewer: the fake token remains in the
+    // low-latency hierarchy only for the assertions above, never in the snapshot.
+    let raw_node = h
+        .state_mut()
+        .fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    raw_node.title = "Reviewer".into();
+    let raw_node = h
+        .state_mut()
+        .state
+        .hierarchy
+        .as_mut()
+        .expect("rendered hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("rendered Reviewer row");
+    raw_node.title = "Reviewer".into();
+    h.run();
+    h.run();
     h.snapshot("subagent_work_surface_redacted");
 }
 
@@ -1441,6 +1666,7 @@ fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
         .expect("hierarchy")
         .tree_state
         .selected = Some(HierarchyKey::process(node_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &node_id));
     let expected_layout = serde_json::to_vec(fixture.layout.as_ref().expect("saved layout"))
         .expect("serialise Layout");
     let mut h = harness(fixture);
@@ -3978,7 +4204,9 @@ fn a_full_screen_application_fills_its_pane() {
         surface_id: None,
         opened_ms: T0 + 15_000,
     });
-    snapshot.tree_state.selected = Some(HierarchyKey::process(fang.node_id.clone()));
+    let fang_id = fang.node_id.clone();
+    snapshot.tree_state.selected = Some(HierarchyKey::process(fang_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &fang_id));
     let mut h = harness(fixture);
     h.run();
     h.snapshot("alternate_screen");
