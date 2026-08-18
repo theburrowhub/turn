@@ -5623,6 +5623,63 @@ mod tests {
         assert_eq!(sent(&changed).len(), 1);
     }
 
+    #[test]
+    fn a_relaunched_process_receives_the_same_visible_size_again() {
+        let (mut session, pane_id, old_node) = session_with_agent("Relaunched resize");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        let visible = PtySize::new(45, 160);
+        assert_eq!(
+            sent(&desk.apply_view_action(
+                ViewAction::Pane {
+                    pane_id: pane_id.clone(),
+                    action: PaneAction::Resize(visible),
+                },
+                T0,
+            ))
+            .len(),
+            1
+        );
+
+        let replacement = NodeId::from_stored("node_replacement_pty");
+        session.layout.get_mut(&pane_id).unwrap().node_id = Some(replacement.clone());
+        let _ = desk.apply_inbound(
+            answer(Response::Layout {
+                session_id: session.id.clone(),
+                layout: session.layout.clone(),
+            }),
+            T0 + 1,
+        );
+
+        match sent(&desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id,
+                action: PaneAction::Resize(visible),
+            },
+            T0 + 2,
+        ))
+        .as_slice()
+        {
+            [Request::ResizePty { node_id, size, .. }] => {
+                assert_eq!(node_id, &replacement);
+                assert_ne!(node_id, &old_node);
+                assert_eq!(*size, visible);
+            }
+            other => panic!("the replacement pty did not receive its full visible size: {other:?}"),
+        }
+    }
+
     /// A session of two side-by-side panes, drawn once so the arrangement exists.
     fn two_pane_session() -> (Desk, Session, PaneId, PaneId) {
         let left = Pane::new(PaneKind::Shell).with_title("left");
