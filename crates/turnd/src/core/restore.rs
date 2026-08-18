@@ -827,6 +827,9 @@ fn merge_legacy_claude_alias_pair(
         .activity_preview
         .clone()
         .or_else(|| lifecycle.activity_preview.clone());
+    if let Some(preview) = survivor.activity_preview.as_mut() {
+        preview.node_id = survivor.id.clone();
+    }
     survivor.preview_visibility = team.preview_visibility;
     if survivor.user_title.is_none() {
         survivor.user_title = team
@@ -926,8 +929,8 @@ mod migration_tests {
     use turn_core::event::{Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::{HandoffId, PaneId, WorkspaceId};
     use turn_core::model::{
-        AgentName, ContextHandoffMode, ContextHandoffOutcome, Direction, Layout, NameSource, Pane,
-        PendingPermission, ProcessNode, Relation,
+        ActivityPreview, AgentName, ContextHandoffMode, ContextHandoffOutcome, Direction, Layout,
+        NameSource, Pane, PendingPermission, PreviewSource, ProcessNode, Relation,
     };
     use turn_core::state::{AwaitingReason, Turn};
 
@@ -1111,6 +1114,131 @@ mod migration_tests {
             EventKind::ContextHandoffFinished { target_node_id, .. }
                 if target_node_id == &team_id
         )));
+    }
+
+    #[tokio::test]
+    async fn restore_rekeys_a_team_preview_when_the_lifecycle_identity_must_survive() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_restore_protected_lifecycle_preview");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_restore_protected_lifecycle_preview"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        let parent_id = parent.id.clone();
+        parent.lifecycle = Lifecycle::Alive;
+
+        let mut team = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 1);
+        team.kind = NodeKind::Subagent;
+        team.title = "reviewer".into();
+        team.lifecycle = Lifecycle::Alive;
+        team.link_to(parent_id.clone(), Relation::Confirmed);
+        let team_id = team.id.clone();
+        {
+            let info = team.agent.as_mut().unwrap();
+            info.external_id = Some("reviewer@session-legacy".into());
+            info.agent.external_id = info.external_id.clone();
+            info.name = AgentName::declared("reviewer");
+            info.agent_type = Some("general-purpose".into());
+        }
+        team.activity_preview = Some(ActivityPreview {
+            node_id: team_id.clone(),
+            raw_source_sequence: Some(17),
+            normalized_text: "reviewed the durable history".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: NOW + 2,
+        });
+
+        let mut lifecycle = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 2);
+        lifecycle.kind = NodeKind::Subagent;
+        lifecycle.title = "reviewer".into();
+        lifecycle.lifecycle = Lifecycle::Exited { code: 0 };
+        lifecycle.turn = Some(Turn::Done);
+        lifecycle.ended_ms = Some(NOW + 3);
+        lifecycle.link_to(parent_id, Relation::Confirmed);
+        let lifecycle_id = lifecycle.id.clone();
+        {
+            let info = lifecycle.agent.as_mut().unwrap();
+            info.external_id = Some("areviewer-deadbeef".into());
+            info.agent.external_id = info.external_id.clone();
+            info.name = AgentName {
+                declared_name: None,
+                display_name: "reviewer".into(),
+                source: NameSource::Integration,
+                confidence: Confidence::Integrated,
+                user_renamed: false,
+            };
+            info.agent_type = Some("reviewer".into());
+        }
+
+        let session = harness.core.sessions.get_mut(&session_id).unwrap();
+        session.tree.insert(parent);
+        session.tree.insert(team);
+        session.tree.insert(lifecycle);
+        harness.core.persist_session(&session_id).unwrap();
+
+        let mut restored = harness
+            .core
+            .store
+            .sessions()
+            .load_for_restore(&session_id)
+            .unwrap()
+            .unwrap();
+        let protected = HashSet::from([lifecycle_id.clone()]);
+        let repairs = repair_legacy_claude_subagent_aliases(&mut restored, &protected);
+        assert_eq!(repairs, [(team_id.clone(), lifecycle_id.clone())]);
+        assert!(restored.tree.get(&team_id).is_none());
+        assert_eq!(
+            restored
+                .tree
+                .get(&lifecycle_id)
+                .and_then(|node| node.activity_preview.as_ref())
+                .map(|preview| &preview.node_id),
+            Some(&lifecycle_id)
+        );
+
+        harness
+            .core
+            .store
+            .sessions()
+            .save_after_node_remaps(&restored, &repairs)
+            .unwrap();
+        let round_trip = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let preview = round_trip
+            .tree
+            .get(&lifecycle_id)
+            .and_then(|node| node.activity_preview.as_ref())
+            .expect("the protected lifecycle identity keeps the semantic preview");
+        assert_eq!(preview.node_id, lifecycle_id);
+        assert!(round_trip.tree.get(&team_id).is_none());
+        assert_eq!(
+            harness
+                .core
+                .store
+                .hierarchy()
+                .preview_history(&preview.node_id, 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(harness
+            .core
+            .store
+            .hierarchy()
+            .preview_history(&team_id, 20)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
