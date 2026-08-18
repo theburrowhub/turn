@@ -314,32 +314,42 @@ impl LaunchConfiguration {
     /// different subsets of the current configuration; treating either subset
     /// as a replacement would erase valid facts merely because its task
     /// completed later.
-    fn fill_missing_from(&mut self, fallback: &Self) {
-        if self.model.is_none() {
+    fn fill_missing_from(&mut self, fallback: &Self) -> bool {
+        let mut contributed = false;
+        if self.model.is_none() && fallback.model.is_some() {
             self.model.clone_from(&fallback.model);
+            contributed = true;
         }
-        if self.model_display_name.is_none() {
+        if self.model_display_name.is_none() && fallback.model_display_name.is_some() {
             self.model_display_name
                 .clone_from(&fallback.model_display_name);
+            contributed = true;
         }
-        if self.permission_mode.is_none() {
+        if self.permission_mode.is_none() && fallback.permission_mode.is_some() {
             self.permission_mode.clone_from(&fallback.permission_mode);
+            contributed = true;
         }
-        if self.approval_mode.is_none() {
+        if self.approval_mode.is_none() && fallback.approval_mode.is_some() {
             self.approval_mode.clone_from(&fallback.approval_mode);
+            contributed = true;
         }
-        if self.sandbox_mode.is_none() {
+        if self.sandbox_mode.is_none() && fallback.sandbox_mode.is_some() {
             self.sandbox_mode.clone_from(&fallback.sandbox_mode);
+            contributed = true;
         }
-        if self.effort_level.is_none() {
+        if self.effort_level.is_none() && fallback.effort_level.is_some() {
             self.effort_level.clone_from(&fallback.effort_level);
+            contributed = true;
         }
-        if self.thinking_enabled.is_none() {
+        if self.thinking_enabled.is_none() && fallback.thinking_enabled.is_some() {
             self.thinking_enabled = fallback.thinking_enabled;
+            contributed = true;
         }
-        if self.safe_flags.is_empty() {
+        if self.safe_flags.is_empty() && !fallback.safe_flags.is_empty() {
             self.safe_flags.clone_from(&fallback.safe_flags);
+            contributed = true;
         }
+        contributed
     }
 }
 
@@ -386,11 +396,127 @@ fn prefer_newer_configuration(
     } else {
         (left, right)
     };
-    if let (Some(preferred_value), Some(fallback_value)) = (preferred.value_mut(), fallback.value())
+    let fallback_contributed = if let (Some(preferred_value), Some(fallback_value)) =
+        (preferred.value_mut(), fallback.value())
     {
-        preferred_value.fill_missing_from(fallback_value);
+        preferred_value.fill_missing_from(fallback_value)
+    } else {
+        false
+    };
+    if fallback_contributed {
+        preferred = conservative_composite_configuration_receipt(preferred, &fallback);
     }
     preferred
+}
+
+/// A merged configuration is only as fresh as its oldest contributing field.
+/// Keeping the newer sample's receipt after filling fields from an older one
+/// would make those older fields look newly observed. This deliberately uses a
+/// single conservative receipt until launch facts carry provenance per field.
+fn conservative_composite_configuration_receipt(
+    preferred: Observable<LaunchConfiguration>,
+    fallback: &Observable<LaunchConfiguration>,
+) -> Observable<LaunchConfiguration> {
+    let Some((fallback_source, fallback_observed_at_ms, fallback_expires_at_ms, fallback_stale)) =
+        configuration_value_receipt(fallback)
+    else {
+        return preferred;
+    };
+
+    let combine = |value: LaunchConfiguration,
+                   source: ObservationSource,
+                   observed_at_ms: i64,
+                   expires_at_ms: Option<i64>,
+                   preferred_stale: bool| {
+        let source = composite_observation_source(&source, fallback_source);
+        let observed_at_ms = observed_at_ms.min(fallback_observed_at_ms);
+        let expires_at_ms = earliest_bounded_expiry(expires_at_ms, fallback_expires_at_ms);
+        if preferred_stale || fallback_stale {
+            Observable::Stale {
+                value,
+                source,
+                observed_at_ms,
+                expires_at_ms,
+            }
+        } else {
+            Observable::Observed {
+                value,
+                source,
+                observed_at_ms,
+                expires_at_ms,
+            }
+        }
+    };
+
+    match preferred {
+        Observable::Observed {
+            value,
+            source,
+            observed_at_ms,
+            expires_at_ms,
+        } => combine(value, source, observed_at_ms, expires_at_ms, false),
+        Observable::Stale {
+            value,
+            source,
+            observed_at_ms,
+            expires_at_ms,
+        } => combine(value, source, observed_at_ms, expires_at_ms, true),
+        observation @ (Observable::Waiting
+        | Observable::Unsupported { .. }
+        | Observable::Failed { .. }) => observation,
+    }
+}
+
+fn configuration_value_receipt(
+    observation: &Observable<LaunchConfiguration>,
+) -> Option<(&ObservationSource, i64, Option<i64>, bool)> {
+    match observation {
+        Observable::Observed {
+            source,
+            observed_at_ms,
+            expires_at_ms,
+            ..
+        } => Some((source, *observed_at_ms, *expires_at_ms, false)),
+        Observable::Stale {
+            source,
+            observed_at_ms,
+            expires_at_ms,
+            ..
+        } => Some((source, *observed_at_ms, *expires_at_ms, true)),
+        Observable::Waiting | Observable::Unsupported { .. } | Observable::Failed { .. } => None,
+    }
+}
+
+fn earliest_bounded_expiry(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(expiry), None) | (None, Some(expiry)) => Some(expiry),
+        (None, None) => None,
+    }
+}
+
+fn composite_observation_source(
+    preferred: &ObservationSource,
+    fallback: &ObservationSource,
+) -> ObservationSource {
+    if preferred == fallback {
+        return preferred.clone();
+    }
+
+    let kind = if preferred.kind == fallback.kind {
+        preferred.kind
+    } else {
+        ObservationSourceKind::Unknown
+    };
+    let label = match kind {
+        ObservationSourceKind::Provider => "combined provider observations",
+        ObservationSourceKind::LaunchRequest => "combined launch requests",
+        ObservationSourceKind::Adapter => "combined adapter observations",
+        ObservationSourceKind::Process => "combined process observations",
+        ObservationSourceKind::Cache => "combined cached observations",
+        ObservationSourceKind::Unknown => "combined observations",
+    };
+    ObservationSource::new(kind, label)
 }
 
 /// Whether a measurement is consumption, remaining capacity, or a provider's
@@ -667,7 +793,7 @@ mod tests {
             },
             provider(),
             T0,
-            None,
+            Some(T0 + 10),
         );
         let transcript = Observable::observed(
             LaunchConfiguration {
@@ -685,7 +811,18 @@ mod tests {
         assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
         assert_eq!(current.effort_level.as_deref(), Some("high"));
         assert_eq!(current.thinking_enabled, Some(true));
-        assert_eq!(merged.observed_at_ms(), Some(T0 + 1));
+        assert_eq!(merged.observed_at_ms(), Some(T0));
+        assert_eq!(
+            merged.source().and_then(|source| source.label.as_deref()),
+            Some("combined provider observations")
+        );
+        assert!(matches!(
+            merged,
+            Observable::Observed {
+                expires_at_ms: Some(expires_at_ms),
+                ..
+            } if expires_at_ms == T0 + 10
+        ));
     }
 
     #[test]
@@ -719,6 +856,75 @@ mod tests {
             current.model_display_name.as_deref(),
             Some("Useful display name")
         );
-        assert_eq!(merged.observed_at_ms(), Some(T0 + 2));
+        assert_eq!(
+            merged.observed_at_ms(),
+            Some(T0 + 1),
+            "the fallback display name must not inherit the newer model timestamp"
+        );
+    }
+
+    #[test]
+    fn fallback_that_adds_nothing_does_not_weaken_the_preferred_receipt() {
+        let preferred_source = ObservationSource::new(ObservationSourceKind::Provider, "live");
+        let preferred = Observable::observed(
+            LaunchConfiguration {
+                model: Some("new-model".into()),
+                effort_level: Some("high".into()),
+                ..LaunchConfiguration::default()
+            },
+            preferred_source.clone(),
+            T0 + 10,
+            None,
+        );
+        let fallback = Observable::stale(
+            LaunchConfiguration {
+                model: Some("old-model".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0,
+            Some(T0 + 1),
+        );
+
+        let merged = prefer_newer_configuration(fallback, preferred);
+        assert_eq!(merged.observed_at_ms(), Some(T0 + 10));
+        assert_eq!(merged.source(), Some(&preferred_source));
+        assert!(!merged.is_stale());
+    }
+
+    #[test]
+    fn stale_fallback_field_makes_the_composite_receipt_stale() {
+        let preferred = Observable::observed(
+            LaunchConfiguration {
+                model: Some("new-model".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0 + 10,
+            Some(T0 + 100),
+        );
+        let fallback = Observable::stale(
+            LaunchConfiguration {
+                effort_level: Some("high".into()),
+                ..LaunchConfiguration::default()
+            },
+            ObservationSource::new(ObservationSourceKind::Cache, "restored cache"),
+            T0,
+            Some(T0 + 1),
+        );
+
+        let merged = prefer_newer_configuration(fallback, preferred);
+        assert_eq!(merged.observed_at_ms(), Some(T0));
+        assert!(matches!(
+            merged,
+            Observable::Stale {
+                source: ObservationSource {
+                    kind: ObservationSourceKind::Unknown,
+                    label: Some(label),
+                },
+                expires_at_ms: Some(expires_at_ms),
+                ..
+            } if label == "combined observations" && expires_at_ms == T0 + 1
+        ));
     }
 }
