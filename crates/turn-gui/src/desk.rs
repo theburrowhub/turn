@@ -4284,6 +4284,7 @@ impl Desk {
                     let grid = feed.peek()?;
                     Some(PaneContent {
                         pane_id: pane.id.clone(),
+                        runtime_id: pane.node_id.clone(),
                         title: pane_display_title(pane, pane_nodes),
                         grid,
                         focused: layout.active.as_ref() == Some(&pane.id),

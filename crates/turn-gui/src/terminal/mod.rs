@@ -52,6 +52,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
+use turn_core::ids::NodeId;
 use turn_core::model::Direction;
 use turn_proto::cells::{CellAttrs, CellRun, Grid, Rgb};
 use turn_proto::PtySize;
@@ -191,6 +192,10 @@ pub struct PaneInteraction {
     /// The size in cells last reported, so a resize request is sent on a change rather
     /// than every frame.
     reported_size: Option<PtySize>,
+    /// Runtime that received [`Self::reported_size`]. A durable visual Pane can be rebound
+    /// to a replacement process while keeping the same PaneId and geometry; that process
+    /// still needs one resize of its own.
+    reported_runtime: Option<NodeId>,
     /// The links on the grid as it was when they were last found — see [`links`].
     ///
     /// Built only while the pointer is over the pane, and reused across frames until the
@@ -1106,6 +1111,9 @@ pub struct PaneInput<'a> {
     /// Distinguishes panes so `egui` tracks their interaction independently, which is what
     /// lets two panes hold separate selections.
     pub id: egui::Id,
+    /// Exact process currently behind the durable visual Pane. `None` is reserved for
+    /// standalone/read-only callers that have no runtime identity to track.
+    pub runtime_id: Option<&'a NodeId>,
     /// `None` for a caller that has not wired the pane menu: the pane then offers no menu
     /// and produces no [`PaneRequest`], which is exactly how it behaved before the menu
     /// existed.
@@ -1134,6 +1142,7 @@ pub fn show(
             grid,
             options,
             id,
+            runtime_id: None,
             chrome: None,
         },
     );
@@ -1152,6 +1161,7 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         grid,
         options,
         id,
+        runtime_id,
         chrome,
     } = input;
     let mut outcome = PaneOutcome::default();
@@ -1170,11 +1180,17 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // Runtime identity can change while Pane identity and its interaction state stay
     // put (restore/relaunch is the common case). The replacement pty starts at its
     // initial 80x24 size, so `reported_size == size` is not proof that *this* pty has
-    // ever received the live geometry. The grid is the daemon's acknowledgement of
-    // the process size; keep asking until it matches. Desk deduplicates the request
-    // while that acknowledgement is in flight, so this does not create resize spam.
-    if should_report_size(state.reported_size, grid, size) {
+    // ever received the live geometry. Runtime identity is the missing half of that
+    // acknowledgement: one request per (runtime, geometry), never one per frame while
+    // the daemon is still returning the old-sized grid.
+    if should_report_size(
+        state.reported_size,
+        state.reported_runtime.as_ref(),
+        size,
+        runtime_id,
+    ) {
         state.reported_size = Some(size);
+        state.reported_runtime = runtime_id.cloned();
         outcome.actions.push(PaneAction::Resize(size));
     }
 
@@ -1306,8 +1322,13 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     outcome
 }
 
-fn should_report_size(reported: Option<PtySize>, grid: &Grid, size: PtySize) -> bool {
-    reported != Some(size) || grid.rows != size.rows || grid.cols != size.cols
+fn should_report_size(
+    reported_size: Option<PtySize>,
+    reported_runtime: Option<&NodeId>,
+    size: PtySize,
+    runtime_id: Option<&NodeId>,
+) -> bool {
+    reported_size != Some(size) || reported_runtime != runtime_id
 }
 
 /// Whether the pointer is over the search bar rather than over the pane's cells.
@@ -2811,22 +2832,27 @@ mod tests {
     /// starts at 80x24. Remembering that this rectangle was reported to the old
     /// process must not strand the replacement application in a narrow grid.
     #[test]
-    fn a_replaced_pty_is_resized_even_when_the_visible_geometry_did_not_change() {
+    fn a_replaced_pty_is_resized_once_even_when_the_visible_geometry_did_not_change() {
         let cell = Vec2::new(8.0, 16.0);
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(cell.x * 160.0, cell.y * 45.0));
         let visible = size_in_cells(rect, cell);
         assert_eq!(visible, PtySize::new(45, 160));
 
-        let replacement = Grid::blank(24, 80);
+        let previous = NodeId::from_stored("node_previous_pty");
+        let replacement = NodeId::from_stored("node_replacement_pty");
         assert!(
-            should_report_size(Some(visible), &replacement, visible),
-            "the mismatched daemon grid must emit PaneAction::Resize for the replacement pty"
+            should_report_size(Some(visible), Some(&previous), visible, Some(&replacement)),
+            "the replacement runtime must receive the unchanged visible geometry"
         );
 
-        let acknowledged = Grid::blank(visible.rows, visible.cols);
         assert!(
-            !should_report_size(Some(visible), &acknowledged, visible),
-            "once geometry, remembered report and daemon grid agree, the next frame is free"
+            !should_report_size(
+                Some(visible),
+                Some(&replacement),
+                visible,
+                Some(&replacement)
+            ),
+            "the same runtime and geometry must not emit another resize while its grid catches up"
         );
     }
 

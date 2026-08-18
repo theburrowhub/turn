@@ -157,6 +157,9 @@ impl QueueItem {
 #[derive(Debug)]
 pub struct PaneContent<'a> {
     pub pane_id: PaneId,
+    /// Exact runtime currently bound to this durable Pane. Pane identity survives a
+    /// relaunch; runtime identity does not.
+    pub runtime_id: Option<NodeId>,
     pub title: String,
     pub grid: &'a Grid,
     pub focused: bool,
@@ -8478,6 +8481,7 @@ impl<'a> TurnView<'a> {
                             grid: content.grid,
                             options,
                             id,
+                            runtime_id: content.runtime_id.as_ref(),
                             chrome: Some(terminal::PaneChrome {
                                 shortcuts: &shortcuts,
                                 context: &pane_context,

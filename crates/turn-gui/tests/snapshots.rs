@@ -110,6 +110,7 @@ impl Fixture {
             .iter()
             .map(|(pane_id, grid)| PaneContent {
                 pane_id: pane_id.clone(),
+                runtime_id: None,
                 title: self
                     .titles
                     .get(pane_id)
@@ -5773,6 +5774,7 @@ fn interactive_pane(
                     grid: &grid,
                     options,
                     id: ui.id().with("pane-under-test"),
+                    runtime_id: None,
                     chrome: None,
                 },
             );
