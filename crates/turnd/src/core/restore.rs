@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{
-    AgentIdentitySource, NodeKind, PaneKind, ProcessNode, RestoreBehaviour, RestoreState, Session,
-    SessionMode,
+    AgentIdentitySource, NodeKind, PaneKind, PreviewVisibility, ProcessNode, RestoreBehaviour,
+    RestoreState, Session, SessionMode,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
@@ -791,7 +791,11 @@ fn legacy_claude_identity(node: &ProcessNode) -> Option<(AgentIdentitySource, St
         if !name.is_empty()
             && session.starts_with("session-")
             && agent.name.declared_name.as_deref() == Some(name)
-            && node.resolved_title().0 == name
+            // A user rename changes only the display name and deliberately keeps
+            // the parent's declaration. Treat that stronger user-authored state as
+            // compatible with this otherwise exact legacy identity shape so repair
+            // can retain it instead of leaving a known duplicate forever.
+            && (agent.name.user_renamed || node.resolved_title().0 == name)
         {
             return Some((AgentIdentitySource::ParentSpawn, name.to_string()));
         }
@@ -800,7 +804,7 @@ fn legacy_claude_identity(node: &ProcessNode) -> Option<(AgentIdentitySource, St
     let alias = agent.agent_type.as_deref()?;
     let suffix = external_id.strip_prefix('a')?.strip_prefix(alias)?;
     if agent.name.declared_name.is_none()
-        && node.resolved_title().0 == alias
+        && (agent.name.user_renamed || node.resolved_title().0 == alias)
         && suffix.starts_with('-')
         && suffix.len() > 1
     {
@@ -816,6 +820,12 @@ fn merge_legacy_claude_alias_pair(
     lifecycle_external: &str,
     team_external: &str,
 ) {
+    // Do not invent a process merge here. Both legacy rows were virtual subagents
+    // created by `insert_subagent_from`: each copied the same parent's command/cwd,
+    // carried empty args and no pid/ppid, and used the same confirmed SpawnedBy
+    // relationship. The lifecycle row is an Agent lifecycle identity, not a second
+    // OS runtime. NodeId-sensitive process history is handled by the protected-id
+    // choice above and by the store's transactional remap.
     survivor.started_ms = survivor
         .started_ms
         .min(lifecycle.started_ms.min(team.started_ms));
@@ -823,14 +833,45 @@ fn merge_legacy_claude_alias_pair(
     survivor.turn = lifecycle.turn.clone();
     survivor.ended_ms = lifecycle.ended_ms;
     survivor.exit_code = lifecycle.exit_code;
-    survivor.activity_preview = team
-        .activity_preview
-        .clone()
-        .or_else(|| lifecycle.activity_preview.clone());
+    // Both historical rows could receive semantic events. Keep the newest compact
+    // projection rather than blindly preferring the spawn declaration, then bind
+    // the nested typed identity to the surviving row as well as remapping the
+    // standalone preview-history table in the store.
+    survivor.activity_preview = match (&team.activity_preview, &lifecycle.activity_preview) {
+        (Some(team), Some(lifecycle)) if lifecycle.updated_ms > team.updated_ms => {
+            Some(lifecycle.clone())
+        }
+        (Some(team), _) => Some(team.clone()),
+        (None, Some(lifecycle)) => Some(lifecycle.clone()),
+        (None, None) => None,
+    };
     if let Some(preview) = survivor.activity_preview.as_mut() {
         preview.node_id = survivor.id.clone();
     }
-    survivor.preview_visibility = team.preview_visibility;
+    // Visibility is a user/privacy choice. Either explicit choice beats Inherit,
+    // and Hide wins an otherwise unknowable conflict so repair cannot expose text
+    // the operator had hidden on one of the duplicate rows.
+    survivor.preview_visibility = match (team.preview_visibility, lifecycle.preview_visibility) {
+        (PreviewVisibility::Hide, _) | (_, PreviewVisibility::Hide) => PreviewVisibility::Hide,
+        (PreviewVisibility::Show, _) | (_, PreviewVisibility::Show) => PreviewVisibility::Show,
+        (PreviewVisibility::Inherit, PreviewVisibility::Inherit) => PreviewVisibility::Inherit,
+    };
+    if survivor.process_title.is_none() {
+        survivor.process_title = team
+            .process_title
+            .clone()
+            .or_else(|| lifecycle.process_title.clone());
+    }
+    for (key, value) in lifecycle
+        .env_highlights
+        .iter()
+        .chain(team.env_highlights.iter())
+    {
+        survivor
+            .env_highlights
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
     if survivor.user_title.is_none() {
         survivor.user_title = team
             .user_title
@@ -841,39 +882,57 @@ fn merge_legacy_claude_alias_pair(
     let lifecycle_info = lifecycle.agent.as_ref();
     let team_info = team.agent.as_ref();
     if let Some(agent) = survivor.agent.as_mut() {
-        if let Some(team_agent) = team_info {
-            let renamed = [team_info, lifecycle_info]
-                .into_iter()
-                .flatten()
-                .find(|candidate| candidate.name.user_renamed);
-            if let Some(renamed) = renamed {
-                agent.name = renamed.name.clone();
-            } else {
-                agent.name = team_agent.name.clone();
-            }
-            agent.agent_type = team_agent
-                .agent_type
-                .clone()
-                .or_else(|| agent.agent_type.clone());
-            agent.current_task = team_agent
-                .current_task
-                .clone()
-                .or_else(|| agent.current_task.clone());
-            agent.last_message = team_agent
-                .last_message
-                .clone()
-                .or_else(|| agent.last_message.clone());
-            agent.tokens_used = team_agent.tokens_used.or(agent.tokens_used);
-            agent.cost_usd = team_agent.cost_usd.or(agent.cost_usd);
-            agent.permission_mode = team_agent
-                .permission_mode
-                .clone()
-                .or_else(|| agent.permission_mode.clone());
-            agent.git_branch = team_agent
-                .git_branch
-                .clone()
-                .or_else(|| agent.git_branch.clone());
+        // Parent-spawn owns declarations; lifecycle owns observations made while
+        // the worker ran. The old merge accidentally used `survivor` as the
+        // fallback, which meant the normal team-row survivor could never inherit
+        // lifecycle-only metadata. Refer to both source rows explicitly so the
+        // result is independent of which NodeId durable references force us to keep.
+        let renamed = [team_info, lifecycle_info]
+            .into_iter()
+            .flatten()
+            .find(|candidate| candidate.name.user_renamed);
+        if let Some(renamed) = renamed {
+            agent.name = renamed.name.clone();
+        } else if let Some(team_agent) = team_info {
+            agent.name = team_agent.name.clone();
+        } else if let Some(lifecycle_agent) = lifecycle_info {
+            agent.name = lifecycle_agent.name.clone();
         }
+
+        agent.agent_type = team_info
+            .and_then(|candidate| candidate.agent_type.clone())
+            .or_else(|| lifecycle_info.and_then(|candidate| candidate.agent_type.clone()));
+        agent.current_task = team_info
+            .and_then(|candidate| candidate.current_task.clone())
+            .or_else(|| lifecycle_info.and_then(|candidate| candidate.current_task.clone()));
+
+        agent.agent.provider = lifecycle_info
+            .and_then(|candidate| candidate.agent.provider.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.agent.provider.clone()));
+        agent.agent.tool = lifecycle_info
+            .and_then(|candidate| candidate.agent.tool.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.agent.tool.clone()));
+        agent.agent.model = lifecycle_info
+            .and_then(|candidate| candidate.agent.model.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.agent.model.clone()));
+        agent.last_message = lifecycle_info
+            .and_then(|candidate| candidate.last_message.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.last_message.clone()));
+        agent.tokens_used = lifecycle_info
+            .and_then(|candidate| candidate.tokens_used)
+            .or_else(|| team_info.and_then(|candidate| candidate.tokens_used));
+        agent.cost_usd = lifecycle_info
+            .and_then(|candidate| candidate.cost_usd)
+            .or_else(|| team_info.and_then(|candidate| candidate.cost_usd));
+        agent.permission_mode = lifecycle_info
+            .and_then(|candidate| candidate.permission_mode.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.permission_mode.clone()));
+        agent.git_branch = lifecycle_info
+            .and_then(|candidate| candidate.git_branch.clone())
+            .or_else(|| team_info.and_then(|candidate| candidate.git_branch.clone()));
+        agent.resumable = team_info.is_some_and(|candidate| candidate.resumable)
+            || lifecycle_info.is_some_and(|candidate| candidate.resumable);
+
         agent.external_id = Some(lifecycle_external.to_string());
         agent.agent.external_id = Some(lifecycle_external.to_string());
         agent.record_identity_alias(
@@ -884,6 +943,21 @@ fn merge_legacy_claude_alias_pair(
         if survivor.lifecycle.is_terminal() {
             agent.pending_permission = None;
             agent.pending_question = None;
+        } else {
+            agent.pending_permission = match (
+                lifecycle_info.and_then(|candidate| candidate.pending_permission.as_ref()),
+                team_info.and_then(|candidate| candidate.pending_permission.as_ref()),
+            ) {
+                (Some(lifecycle), Some(team)) if team.requested_ms > lifecycle.requested_ms => {
+                    Some(team.clone())
+                }
+                (Some(lifecycle), _) => Some(lifecycle.clone()),
+                (None, Some(team)) => Some(team.clone()),
+                (None, None) => None,
+            };
+            agent.pending_question = lifecycle_info
+                .and_then(|candidate| candidate.pending_question.clone())
+                .or_else(|| team_info.and_then(|candidate| candidate.pending_question.clone()));
         }
         if !agent.name.user_renamed {
             survivor.title = agent.name.display_name.clone();
@@ -1117,7 +1191,177 @@ mod migration_tests {
     }
 
     #[tokio::test]
-    async fn restore_rekeys_a_team_preview_when_the_lifecycle_identity_must_survive() {
+    async fn restore_team_survivor_keeps_lifecycle_runtime_metadata_and_user_choices() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_restore_team_survivor_metadata");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_restore_team_survivor_metadata"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+
+        let mut team = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 1);
+        team.kind = NodeKind::Subagent;
+        team.title = "reviewer".into();
+        team.lifecycle = Lifecycle::Alive;
+        team.link_to(parent_id.clone(), Relation::Confirmed);
+        let team_id = team.id.clone();
+        {
+            let info = team.agent.as_mut().unwrap();
+            info.external_id = Some("reviewer@session-legacy".into());
+            info.agent.external_id = info.external_id.clone();
+            info.name = AgentName::declared("reviewer");
+            info.agent_type = Some("code-reviewer".into());
+            info.current_task = Some("Review the durable migration".into());
+        }
+        team.activity_preview = Some(ActivityPreview {
+            node_id: team_id.clone(),
+            raw_source_sequence: Some(11),
+            normalized_text: "starting the durable migration review".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: NOW + 1,
+        });
+
+        let mut lifecycle = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 2);
+        lifecycle.kind = NodeKind::Subagent;
+        lifecycle.title = "reviewer".into();
+        lifecycle.lifecycle = Lifecycle::Alive;
+        lifecycle.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Permission,
+        });
+        lifecycle.interaction_pending = true;
+        lifecycle.preview_visibility = PreviewVisibility::Hide;
+        lifecycle.link_to(parent_id, Relation::Confirmed);
+        let lifecycle_id = lifecycle.id.clone();
+        lifecycle.activity_preview = Some(ActivityPreview {
+            node_id: lifecycle_id.clone(),
+            raw_source_sequence: Some(23),
+            normalized_text: "waiting to run cargo test".into(),
+            source: PreviewSource::SemanticEvent,
+            confidence: Confidence::Explicit,
+            stable: true,
+            contains_sensitive_data: false,
+            redacted: false,
+            updated_ms: NOW + 3,
+        });
+        {
+            let info = lifecycle.agent.as_mut().unwrap();
+            info.external_id = Some("areviewer-runtime".into());
+            info.agent.external_id = info.external_id.clone();
+            info.agent.provider = Some("anthropic".into());
+            info.agent.tool = Some("claude-code".into());
+            info.agent.model = Some("claude-opus-4-1".into());
+            info.name = AgentName {
+                declared_name: None,
+                display_name: "reviewer".into(),
+                source: NameSource::Integration,
+                confidence: Confidence::Integrated,
+                user_renamed: false,
+            };
+            info.name.rename("My reviewer");
+            info.agent_type = Some("reviewer".into());
+            info.last_message = Some("I need permission before the test".into());
+            info.pending_permission = Some(PendingPermission {
+                summary: "Run the focused test".into(),
+                command: Some("cargo test -p turnd".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::Low,
+                requested_ms: NOW + 3,
+                cwd: Some("/tmp".into()),
+            });
+            info.pending_question = Some("Should I include ignored tests?".into());
+            info.tokens_used = Some(12_345);
+            info.cost_usd = Some(0.42);
+            info.permission_mode = Some("default".into());
+            info.git_branch = Some("feature/durable-repair".into());
+            info.resumable = true;
+        }
+
+        let session = harness.core.sessions.get_mut(&session_id).unwrap();
+        session.tree.insert(parent);
+        session.tree.insert(team);
+        session.tree.insert(lifecycle);
+        harness.core.persist_session(&session_id).unwrap();
+
+        let mut restored = harness
+            .core
+            .store
+            .sessions()
+            .load_for_restore(&session_id)
+            .unwrap()
+            .unwrap();
+        let repairs = repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new());
+        assert_eq!(repairs, [(lifecycle_id.clone(), team_id.clone())]);
+        harness
+            .core
+            .store
+            .sessions()
+            .save_after_node_remaps(&restored, &repairs)
+            .unwrap();
+
+        let round_trip = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        let worker = round_trip.tree.get(&team_id).unwrap();
+        assert_eq!(worker.lifecycle, Lifecycle::Orphaned);
+        assert_eq!(
+            worker.turn,
+            Some(Turn::AwaitingUser {
+                reason: AwaitingReason::Permission
+            })
+        );
+        assert!(worker.interaction_pending);
+        assert_eq!(worker.preview_visibility, PreviewVisibility::Hide);
+        let preview = worker.activity_preview.as_ref().unwrap();
+        assert_eq!(preview.node_id, team_id);
+        assert_eq!(preview.normalized_text, "waiting to run cargo test");
+
+        let info = worker.agent.as_ref().unwrap();
+        assert!(info.name.user_renamed);
+        assert_eq!(info.name.display_name, "My reviewer");
+        assert_eq!(info.agent_type.as_deref(), Some("code-reviewer"));
+        assert_eq!(
+            info.current_task.as_deref(),
+            Some("Review the durable migration")
+        );
+        assert_eq!(info.agent.provider.as_deref(), Some("anthropic"));
+        assert_eq!(info.agent.tool.as_deref(), Some("claude-code"));
+        assert_eq!(info.agent.model.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(
+            info.last_message.as_deref(),
+            Some("I need permission before the test")
+        );
+        assert_eq!(
+            info.pending_permission
+                .as_ref()
+                .map(|pending| pending.summary.as_str()),
+            Some("Run the focused test")
+        );
+        assert_eq!(
+            info.pending_question.as_deref(),
+            Some("Should I include ignored tests?")
+        );
+        assert_eq!(info.tokens_used, Some(12_345));
+        assert_eq!(info.cost_usd, Some(0.42));
+        assert_eq!(info.permission_mode.as_deref(), Some("default"));
+        assert_eq!(info.git_branch.as_deref(), Some("feature/durable-repair"));
+        assert!(info.resumable);
+        assert!(round_trip.tree.get(&lifecycle_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_lifecycle_survivor_rekeys_team_preview_and_metadata() {
         let mut harness = Harness::new().await;
         let session_id = SessionId::from_stored("sess_restore_protected_lifecycle_preview");
         harness.add_session(
@@ -1133,14 +1377,31 @@ mod migration_tests {
         team.kind = NodeKind::Subagent;
         team.title = "reviewer".into();
         team.lifecycle = Lifecycle::Alive;
+        team.interaction_pending = true;
+        team.preview_visibility = PreviewVisibility::Hide;
         team.link_to(parent_id.clone(), Relation::Confirmed);
         let team_id = team.id.clone();
         {
             let info = team.agent.as_mut().unwrap();
             info.external_id = Some("reviewer@session-legacy".into());
             info.agent.external_id = info.external_id.clone();
+            info.agent.provider = Some("anthropic".into());
+            info.agent.tool = Some("claude-code".into());
+            info.agent.model = Some("claude-sonnet-4".into());
             info.name = AgentName::declared("reviewer");
-            info.agent_type = Some("general-purpose".into());
+            info.name.rename("Trusted reviewer");
+            info.agent_type = Some("code-reviewer".into());
+            info.current_task = Some("Inspect the persisted state".into());
+            info.pending_permission = Some(PendingPermission {
+                summary: "Read the crash artifact".into(),
+                command: Some("open crash.ips".into()),
+                tool_name: Some("Bash".into()),
+                risk: Risk::Low,
+                requested_ms: NOW + 2,
+                cwd: Some("/tmp".into()),
+            });
+            info.pending_question = Some("Keep the diagnostic artifact?".into());
+            info.resumable = true;
         }
         team.activity_preview = Some(ActivityPreview {
             node_id: team_id.clone(),
@@ -1157,9 +1418,10 @@ mod migration_tests {
         let mut lifecycle = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 2);
         lifecycle.kind = NodeKind::Subagent;
         lifecycle.title = "reviewer".into();
-        lifecycle.lifecycle = Lifecycle::Exited { code: 0 };
-        lifecycle.turn = Some(Turn::Done);
-        lifecycle.ended_ms = Some(NOW + 3);
+        lifecycle.lifecycle = Lifecycle::Alive;
+        lifecycle.turn = Some(Turn::AwaitingUser {
+            reason: AwaitingReason::Question,
+        });
         lifecycle.link_to(parent_id, Relation::Confirmed);
         let lifecycle_id = lifecycle.id.clone();
         {
@@ -1221,6 +1483,38 @@ mod migration_tests {
             .and_then(|node| node.activity_preview.as_ref())
             .expect("the protected lifecycle identity keeps the semantic preview");
         assert_eq!(preview.node_id, lifecycle_id);
+        let worker = round_trip.tree.get(&lifecycle_id).unwrap();
+        assert_eq!(worker.lifecycle, Lifecycle::Orphaned);
+        assert_eq!(
+            worker.turn,
+            Some(Turn::AwaitingUser {
+                reason: AwaitingReason::Question
+            })
+        );
+        assert!(worker.interaction_pending);
+        assert_eq!(worker.preview_visibility, PreviewVisibility::Hide);
+        let info = worker.agent.as_ref().unwrap();
+        assert!(info.name.user_renamed);
+        assert_eq!(info.name.display_name, "Trusted reviewer");
+        assert_eq!(info.agent_type.as_deref(), Some("code-reviewer"));
+        assert_eq!(
+            info.current_task.as_deref(),
+            Some("Inspect the persisted state")
+        );
+        assert_eq!(info.agent.provider.as_deref(), Some("anthropic"));
+        assert_eq!(info.agent.tool.as_deref(), Some("claude-code"));
+        assert_eq!(info.agent.model.as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(
+            info.pending_permission
+                .as_ref()
+                .map(|pending| pending.summary.as_str()),
+            Some("Read the crash artifact")
+        );
+        assert_eq!(
+            info.pending_question.as_deref(),
+            Some("Keep the diagnostic artifact?")
+        );
+        assert!(info.resumable);
         assert!(round_trip.tree.get(&team_id).is_none());
         assert_eq!(
             harness
