@@ -35,9 +35,10 @@ use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
     CloseDisposition, HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView,
-    NodePaneCapability, NodePaneView, PaneRestoreOutcome, PaneStream, ProtoErrorContext, PtySize,
-    SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
-    TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
+    InspectorOriginView, NodePaneCapability, NodePaneView, PaneRestoreOutcome, PaneStream,
+    ProtoErrorContext, PtySize, SessionConflictAlternative, SessionSummary, SessionTreeView,
+    TemplateSummary, TreeNodeView, TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView,
+    WriteLeaseOwnerView,
 };
 
 use turn_gui::keymap::{Keymap, Overrides, Platform};
@@ -793,6 +794,34 @@ fn session_inspector(fixture: &Fixture) -> InspectorDetails {
     }
 }
 
+fn node_inspector(fixture: &Fixture, node_id: &NodeId) -> InspectorDetails {
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let session = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| session.nodes.iter().any(|node| &node.node_id == node_id))
+        .expect("node's Session");
+    let node = session
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == node_id)
+        .expect("inspected node")
+        .clone();
+    InspectorDetails::Agent {
+        session_name: session.session.name.clone(),
+        node: Box::new(node),
+        parent: None,
+        process_group: None,
+        origin: InspectorOriginView {
+            label: "claude-code hook".into(),
+            confidence: Confidence::Explicit,
+        },
+        history: Vec::new(),
+        handoffs: Vec::new(),
+    }
+}
+
 fn show_inspector(fixture: &mut Fixture, details: InspectorDetails) -> HierarchyKey {
     let key = details.key();
     fixture
@@ -948,6 +977,7 @@ fn selecting_a_semantic_subagent_opens_its_exact_full_work_surface_without_touch
         .find(|node| node.title == "Reviewer")
         .map(|node| node.node_id.clone())
         .expect("Reviewer");
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
     let session_id = fixture.selected.clone().expect("active Session");
     let expected_layout = fixture.layout.clone().expect("saved layout");
     let expected_layout_bytes = serde_json::to_vec(&expected_layout).expect("serialise Layout");
@@ -1084,6 +1114,9 @@ fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
     };
     let reviewer_id = node_id("Reviewer");
     let tests_id = node_id("Tests");
+    let reviewer_details = node_inspector(&fixture, &reviewer_id);
+    let tests_details = node_inspector(&fixture, &tests_id);
+    fixture.inspector = Some(reviewer_details);
     let mut h = harness(fixture);
     h.run();
     h.run();
@@ -1112,6 +1145,7 @@ fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
 
     h.state_mut().actions.clear();
     let _ = h.state_mut().state.take_hierarchy_actions();
+    h.state_mut().fixture.inspector = Some(tests_details);
     click(&h, "SUBAGENT Tests");
     h.run();
     h.run();
@@ -1164,6 +1198,7 @@ fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
         .expect("hierarchy")
         .tree_state
         .selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    fixture.inspector = Some(node_inspector(&fixture, &reviewer_id));
 
     let mut h = Harness::builder()
         .with_size(egui::vec2(820.0, 640.0))
@@ -1202,6 +1237,70 @@ fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
         .join("\n")
         .contains("Review the climbing logic changes"));
     h.snapshot("subagent_work_surface_narrow");
+}
+
+#[test]
+fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load() {
+    const SECRET: &str = "sk-ant-turn-regression-secret-abcdefghijklmnopqrstuvwxyz";
+
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    let mut safe_details = node_inspector(&fixture, &reviewer_id);
+    let InspectorDetails::Agent { node, .. } = &mut safe_details else {
+        panic!("Reviewer inspector is agent detail");
+    };
+    let safe_agent = node.agent.as_mut().expect("safe agent summary");
+    safe_agent.current_task = Some("[redacted task]".into());
+    safe_agent.last_message = Some("[redacted message]".into());
+
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    snapshot.tree_state.selected = Some(HierarchyKey::process(reviewer_id.clone()));
+    let raw_node = snapshot
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == reviewer_id)
+        .expect("raw Reviewer row");
+    let raw_agent = raw_node.agent.as_mut().expect("raw agent summary");
+    raw_agent.current_task = Some(format!("Use credential {SECRET}"));
+    raw_agent.last_message = Some(format!("Credential echoed: {SECRET}"));
+
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let loading_text = all_text(&h).join("\n");
+    assert!(loading_text.contains("Loading safe task details…"));
+    assert!(
+        !loading_text.contains(SECRET),
+        "raw hierarchy secrets must not enter painted or accessible text"
+    );
+
+    h.state_mut().fixture.inspector = Some(safe_details);
+    h.run();
+    h.run();
+
+    let safe_text = all_text(&h).join("\n");
+    assert!(safe_text.contains("[redacted task]"));
+    assert!(safe_text.contains("[redacted message]"));
+    assert!(
+        !safe_text.contains(SECRET),
+        "only the inspector's redacted projection may supply task/message text"
+    );
+    h.snapshot("subagent_work_surface_redacted");
 }
 
 #[test]

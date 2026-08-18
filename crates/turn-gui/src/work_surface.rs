@@ -481,6 +481,11 @@ fn semantic_primary(
     state: &ViewState,
     now_ms: i64,
 ) {
+    // Hierarchy snapshots are deliberately cheap and may still contain live agent
+    // fields. The on-demand inspector projection is the only copy that has passed
+    // through `session_for_inspection`, so task/message text must never fall back to
+    // `node` while that projection is in flight.
+    let safe_node = inspected_node_for(details, &node.node_id);
     let inner = rect.shrink(14.0);
     ui.scope_builder(region(inner, "semantic-node-primary"), |ui| {
         egui::ScrollArea::vertical()
@@ -488,15 +493,18 @@ fn semantic_primary(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 inspector_section(ui, theme, "TASK");
-                match node
-                    .agent
-                    .as_ref()
-                    .and_then(|agent| agent.current_task.as_deref())
-                {
+                match safe_node.and_then(|node| {
+                    node.agent
+                        .as_ref()
+                        .and_then(|agent| agent.current_task.as_deref())
+                }) {
                     Some(task) => {
                         ui.label(RichText::new(task).size(17.0).color(theme.text));
                     }
-                    None => inspector_empty(ui, theme, "No task has been reported for this node"),
+                    None if node.agent.is_none() || safe_node.is_some() => {
+                        inspector_empty(ui, theme, "No task has been reported for this node")
+                    }
+                    None => inspector_empty(ui, theme, "Loading safe task details…"),
                 }
 
                 ui.add_space(12.0);
@@ -520,11 +528,11 @@ fn semantic_primary(
                     }
                 }
 
-                if let Some(last) = node
-                    .agent
-                    .as_ref()
-                    .and_then(|agent| agent.last_message.as_deref())
-                {
+                if let Some(last) = safe_node.and_then(|node| {
+                    node.agent
+                        .as_ref()
+                        .and_then(|agent| agent.last_message.as_deref())
+                }) {
                     ui.add_space(12.0);
                     inspector_section(ui, theme, "LATEST AGENT MESSAGE");
                     ui.label(RichText::new(last).color(theme.text));
@@ -543,6 +551,21 @@ fn semantic_primary(
                 }
             });
     });
+}
+
+fn inspected_node_for<'a>(
+    details: Option<&'a InspectorDetails>,
+    node_id: &NodeId,
+) -> Option<&'a TreeNodeView> {
+    match details {
+        Some(InspectorDetails::Agent { node, .. })
+        | Some(InspectorDetails::Process { node, .. })
+            if node.node_id == *node_id =>
+        {
+            Some(node)
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
