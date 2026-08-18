@@ -182,7 +182,9 @@ impl AgentAdapter for GeminiCliAdapter {
             permission_events: true,
             subagent_events: false,
             resumable: true,
-            usage_events: false,
+            // AfterAgent identifies the provider transcript, whose bounded tail
+            // carries exact input-context consumption for the completed turn.
+            usage_events: true,
             external_session_id: true,
         }
     }

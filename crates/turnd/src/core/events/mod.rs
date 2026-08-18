@@ -799,6 +799,29 @@ impl Core {
                     agent.agent.external_id = external_id.clone();
                 }
             }
+            EventKind::AgentRuntimeObserved { runtime } => {
+                let agent = node.agent.get_or_insert_with(Default::default);
+                if event.agent.provider.is_some() {
+                    agent.agent.provider = event.agent.provider.clone();
+                }
+                if event.agent.tool.is_some() {
+                    agent.agent.tool = event.agent.tool.clone();
+                }
+                agent.runtime =
+                    std::mem::take(&mut agent.runtime).prefer_newer(runtime.as_ref().clone());
+                // Mirror the winning current-model observation into the legacy
+                // compact AgentRef. Reading it after `prefer_newer` is important:
+                // an older detached transcript read must not roll the header back.
+                if let Some(model) = agent
+                    .runtime
+                    .launch
+                    .current
+                    .value()
+                    .and_then(|current| current.model.clone())
+                {
+                    agent.agent.model = Some(model);
+                }
+            }
             EventKind::AgentTurnStarted { prompt_excerpt } => {
                 node.turn = Some(Turn::Active);
                 node.interaction_pending = false;
@@ -1043,4 +1066,115 @@ fn turn_axis_change(kind: &EventKind) -> Option<()> {
             | EventKind::AgentIdle
     )
     .then_some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::testing::Harness;
+    use turn_core::ids::{PaneId, SessionId};
+    use turn_core::model::{
+        AgentLaunchFacts, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration,
+        Observable, ObservationSource, ObservationSourceKind, UsageMeasurement,
+        UsageMeasurementKind, UsageUnit,
+    };
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    fn observed_runtime(at_ms: i64, used: u64, model: &str) -> AgentRuntimeMetadata {
+        let source = ObservationSource::new(ObservationSourceKind::Provider, "provider transcript");
+        AgentRuntimeMetadata {
+            launch: AgentLaunchFacts {
+                current: Observable::observed(
+                    LaunchConfiguration {
+                        model: Some(model.into()),
+                        ..LaunchConfiguration::default()
+                    },
+                    source.clone(),
+                    at_ms,
+                    None,
+                ),
+                ..AgentLaunchFacts::default()
+            },
+            context: Observable::observed(
+                ContextUsageSnapshot {
+                    scope_id: Some("conversation-1".into()),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::Used,
+                        amount: used as f64,
+                        unit: UsageUnit::Tokens,
+                        total: Some(200_000.0),
+                    },
+                    effective_window: None,
+                },
+                source,
+                at_ms,
+                None,
+            ),
+            ..AgentRuntimeMetadata::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_observations_merge_per_fact_and_never_move_the_turn_axis() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_runtime_observation");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+
+        let mut node = ProcessNode::agent(session_id.clone(), "codex", "/repo", NOW);
+        node.lifecycle = Lifecycle::Alive;
+        node.turn = Some(Turn::Active);
+        let node_id = node.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(node);
+
+        let event = |runtime, at_ms| {
+            TurnEvent::new(
+                session_id.clone(),
+                EventKind::AgentRuntimeObserved {
+                    runtime: Box::new(runtime),
+                },
+                EventSource::SideChannel {
+                    tool: "codex".into(),
+                    channel: "provider transcript".into(),
+                },
+                Confidence::Explicit,
+                at_ms,
+            )
+            .with_node(node_id.clone())
+        };
+
+        let newer = event(observed_runtime(NOW + 20, 82_000, "gpt-new"), NOW + 20);
+        let late_older = event(observed_runtime(NOW + 10, 41_000, "gpt-old"), NOW + 30);
+        assert_eq!(
+            harness.core.apply(&newer, NOW + 20).node,
+            Some(node_id.clone())
+        );
+        assert_eq!(
+            harness.core.apply(&late_older, NOW + 30).node,
+            Some(node_id.clone())
+        );
+
+        let node = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap();
+        let agent = node.agent.as_ref().unwrap();
+        assert_eq!(node.turn, Some(Turn::Active));
+        assert_eq!(agent.agent.model.as_deref(), Some("gpt-new"));
+        assert_eq!(
+            agent.runtime.context.observed_at_ms(),
+            Some(NOW + 20),
+            "a detached read that finishes late must not overwrite newer evidence"
+        );
+        assert_eq!(
+            agent.runtime.context.value().unwrap().measurement.amount,
+            82_000.0
+        );
+    }
 }

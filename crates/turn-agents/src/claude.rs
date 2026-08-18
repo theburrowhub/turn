@@ -355,7 +355,9 @@ impl AgentAdapter for ClaudeCodeAdapter {
             permission_events: true,
             subagent_events: true,
             resumable: true,
-            usage_events: false,
+            // Stop identifies the provider transcript, whose bounded tail gives
+            // Turn exact input-context consumption after each completed turn.
+            usage_events: true,
             external_session_id: true,
         }
     }

@@ -330,6 +330,23 @@ fn event_summary(kind: &EventKind) -> Option<String> {
         }),
         EventKind::AgentTaskCompleted { summary } => summary.clone(),
         EventKind::AgentFailed { reason } => Some(reason.clone()),
+        EventKind::AgentRuntimeObserved { runtime } => {
+            if let Some(context) = runtime.context.value() {
+                let used = context.measurement.amount;
+                Some(context.measurement.total.map_or_else(
+                    || format!("context · {used:.0} tokens used"),
+                    |total| format!("context · {used:.0} / {total:.0} tokens"),
+                ))
+            } else if let Some(current) = runtime.launch.current.value() {
+                current
+                    .model
+                    .as_ref()
+                    .map(|model| format!("runtime model · {model}"))
+                    .or_else(|| Some("runtime metadata refreshed".into()))
+            } else {
+                Some("runtime metadata refreshed".into())
+            }
+        }
         EventKind::AgentSpawned {
             declared_name,
             task,
@@ -388,12 +405,44 @@ mod tests {
     use turn_core::event::{AgentRef, EventSource};
     use turn_core::ids::{HandoffId, PaneId};
     use turn_core::model::{
-        ContextHandoffMode, PendingPermission, Relation, Relationship, RelationshipKind,
+        AgentRuntimeMetadata, ContextHandoffMode, ContextUsageSnapshot, Observable,
+        ObservationSource, ObservationSourceKind, PendingPermission, Relation, Relationship,
+        RelationshipKind, UsageMeasurement, UsageMeasurementKind, UsageUnit,
     };
     use turn_core::state::Turn;
 
     const NOW: i64 = 1_700_000_000_000;
     const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+
+    #[test]
+    fn runtime_observation_history_summarises_typed_usage_without_ingress_data() {
+        let runtime = AgentRuntimeMetadata {
+            context: Observable::observed(
+                ContextUsageSnapshot {
+                    scope_id: Some("conversation-42".into()),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::Used,
+                        amount: 42_000.0,
+                        unit: UsageUnit::Tokens,
+                        total: Some(200_000.0),
+                    },
+                    effective_window: None,
+                },
+                ObservationSource::new(ObservationSourceKind::Provider, "codex transcript"),
+                NOW,
+                None,
+            ),
+            ..AgentRuntimeMetadata::default()
+        };
+
+        assert_eq!(
+            event_summary(&EventKind::AgentRuntimeObserved {
+                runtime: Box::new(runtime),
+            })
+            .as_deref(),
+            Some("context · 42000 / 200000 tokens")
+        );
+    }
 
     #[tokio::test]
     async fn every_inspector_kind_is_complete_redacted_and_honest() {

@@ -64,9 +64,10 @@ pub enum ObservationSourceKind {
 /// Unsupported and failed probes also say when and where that conclusion was
 /// reached. `Waiting` is the serde/default state for peers and stored rows that
 /// predate runtime telemetry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observable<T> {
+    #[default]
     Waiting,
     Observed {
         value: T,
@@ -93,12 +94,6 @@ pub enum Observable<T> {
         /// boundary before persistence or display.
         message: String,
     },
-}
-
-impl<T> Default for Observable<T> {
-    fn default() -> Self {
-        Self::Waiting
-    }
 }
 
 impl<T> Observable<T> {

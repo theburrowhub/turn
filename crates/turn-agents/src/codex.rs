@@ -287,9 +287,10 @@ impl AgentAdapter for CodexAdapter {
             permission_events: true,
             subagent_events: true,
             resumable: true,
-            // Token usage is available over `codex app-server`, not over hooks or
-            // notify, so this launch path cannot claim it.
-            usage_events: false,
+            // Stop identifies the provider transcript. Its latest token_count
+            // record gives exact turn context usage; account quota remains a
+            // separate app-server observation.
+            usage_events: true,
             external_session_id: true,
         }
     }
@@ -827,7 +828,10 @@ mod tests {
         assert!(!adapter.handles("claude"));
         assert!(!adapter.handles("codexx"));
         assert_eq!(adapter.best_level(), IntegrationLevel::Structured);
-        assert!(!adapter.capabilities().usage_events, "not over notify");
+        assert!(
+            adapter.capabilities().usage_events,
+            "the Stop transcript exposes context usage"
+        );
     }
 
     /// The shape here is the one that was seen firing. Every part of it was

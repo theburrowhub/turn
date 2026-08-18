@@ -453,6 +453,10 @@ mod tests {
     use crate::redact::REDACTED;
     use crate::testing;
     use turn_core::event::Risk;
+    use turn_core::model::{
+        AgentRuntimeMetadata, ContextUsageSnapshot, Observable, ObservationSource,
+        ObservationSourceKind, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+    };
     use turn_core::state::AwaitingReason;
 
     const T0: i64 = 1_700_000_000_000;
@@ -575,6 +579,29 @@ mod tests {
             },
             EventKind::AgentTaskCompleted {
                 summary: Some("all green".into()),
+            },
+            EventKind::AgentRuntimeObserved {
+                runtime: Box::new(AgentRuntimeMetadata {
+                    context: Observable::observed(
+                        ContextUsageSnapshot {
+                            scope_id: Some("conversation-42".into()),
+                            measurement: UsageMeasurement {
+                                kind: UsageMeasurementKind::Used,
+                                amount: 42_000.0,
+                                unit: UsageUnit::Tokens,
+                                total: Some(200_000.0),
+                            },
+                            effective_window: None,
+                        },
+                        ObservationSource::new(
+                            ObservationSourceKind::Provider,
+                            "provider transcript",
+                        ),
+                        T0 + 8,
+                        None,
+                    ),
+                    ..AgentRuntimeMetadata::default()
+                }),
             },
             EventKind::SessionAttentionResolved,
         ];
