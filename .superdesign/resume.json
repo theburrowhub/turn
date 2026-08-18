@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "agent-runtime-and-launch-profiles": {
+      "targetKind": "existing-ui",
+      "projectId": "39555fe7-e3ca-4605-85d8-8cef134c8ef7",
+      "baselineDraftId": "b981f59b-1546-4de9-8cd9-58342a536c16",
+      "activeDraftId": "210da814-7355-43c3-a8e6-095c82421154",
+      "designSystemPath": ".superdesign/design-system.md",
+      "contextFiles": [
+        ".superdesign/design-system.md",
+        "crates/turn-gui/src/theme.rs",
+        "crates/turn-gui/src/work_surface.rs"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "3833f5c7e36bfad9c0e1dc9c2fbec300d7b4fe41e764a7ff553acde9f3fe2645",
+        "crates/turn-gui/src/theme.rs": "9980939b12b79ea75976acef2a3aaca4ae8bb9a0e3d9e75f6570ad700d463a28",
+        "crates/turn-gui/src/work_surface.rs": "bc9c6c5929fe98ca0a9b5716635eca79892e78f7cc5f6cb1340cb59e0a87893a"
+      },
+      "components": [],
+      "drafts": {
+        "b981f59b-1546-4de9-8cd9-58342a536c16": {
+          "title": "Turn WorkSurface Replication",
+          "visualDirection": "faithful dense dark baseline",
+          "currentVersion": 1
+        },
+        "1f6e0fd0-cc42-4d3a-b6e8-38c1a9d4d85f": {
+          "title": "Turn AgentNodeView WorkSurface",
+          "visualDirection": "exact-node activity-first surface",
+          "parentDraftId": "b981f59b-1546-4de9-8cd9-58342a536c16",
+          "currentVersion": 1
+        },
+        "210da814-7355-43c3-a8e6-095c82421154": {
+          "title": "Turn Zero-Memory Agent WorkSurface",
+          "visualDirection": "compact always-visible runtime capacity and semantic launch profiles",
+          "parentDraftId": "1f6e0fd0-cc42-4d3a-b6e8-38c1a9d4d85f",
+          "currentVersion": 1
+        }
+      },
+      "updatedAt": "2026-08-18T14:30:03Z"
+    }
+  }
+}
