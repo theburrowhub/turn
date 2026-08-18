@@ -21,6 +21,7 @@ use turn_core::model::{
 };
 
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
+const MAX_GIT_METADATA_BYTES: usize = 64 * 1024;
 const MAX_EXACT_F64_INTEGER: u64 = 1_u64 << 53;
 const WRAPPER_NAME: &str = "claude-statusline-turn.sh";
 const ORIGINAL_NAME: &str = "claude-statusline-original.sh";
@@ -50,28 +51,189 @@ struct SettingsPaths {
     managed: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettingSources {
+    user: bool,
+    project: bool,
+    local: bool,
+}
+
 impl SettingsPaths {
-    fn for_launch(ctx: &LaunchContext) -> Self {
-        let project = PathBuf::from(&ctx.cwd).join(".claude");
-        let mut lower_precedence = vec![
-            project.join("settings.local.json"),
-            project.join("settings.json"),
-        ];
-        if let Some(config_dir) = claude_config_dir() {
+    fn for_launch(ctx: &LaunchContext) -> Result<Self, ()> {
+        let sources = setting_sources(&ctx.user_args)?;
+        let cwd = canonical_launch_directory(&ctx.cwd)?;
+        let user_config_dir = sources.user.then(|| claude_config_dir(&cwd)).transpose()?;
+        Self::from_resolved_sources(
+            &cwd,
+            sources,
+            user_config_dir.as_deref(),
+            managed_settings_paths()?,
+        )
+    }
+
+    fn from_resolved_sources(
+        cwd: &Path,
+        sources: SettingSources,
+        user_config_dir: Option<&Path>,
+        managed: Vec<PathBuf>,
+    ) -> Result<Self, ()> {
+        let mut lower_precedence = Vec::new();
+
+        if sources.local {
+            // Verified against Claude Code 2.1.234 with distinct scalar values in
+            // every candidate: from a nested cwd it loads local settings at both
+            // the canonical Git root and cwd, with the root-local value winning.
+            // Shared project settings are different: they come from cwd only.
+            let root = repository_root(cwd)?.unwrap_or_else(|| cwd.to_path_buf());
+            lower_precedence.push(root.join(".claude/settings.local.json"));
+            if root != cwd {
+                lower_precedence.push(cwd.join(".claude/settings.local.json"));
+            }
+        }
+        if sources.project {
+            lower_precedence.push(cwd.join(".claude/settings.json"));
+        }
+        if sources.user {
+            let config_dir = user_config_dir.ok_or(())?;
             lower_precedence.push(config_dir.join("settings.json"));
         }
 
-        Self {
+        Ok(Self {
             lower_precedence,
-            managed: managed_settings_paths(),
-        }
+            managed,
+        })
     }
 }
 
 /// Installs a status-line fan-out only when the user's effective command can be
 /// preserved exactly and no accessible managed source owns the feature.
 pub(crate) fn prepare(ctx: &LaunchContext) -> PreparedStatusLine {
-    prepare_with_paths(ctx, SettingsPaths::for_launch(ctx))
+    let Ok(paths) = SettingsPaths::for_launch(ctx) else {
+        return PreparedStatusLine {
+            setting: None,
+            note: "Claude status telemetry was not installed because the effective status line could not be resolved safely; it is untouched.",
+        };
+    };
+    prepare_with_paths(ctx, paths)
+}
+
+/// Resolves Claude Code's last `--setting-sources` occurrence. The CLI accepts
+/// the separate and `=` forms, trims comma-separated names, treats an exactly
+/// empty value as no filesystem sources, and lets the last repeated flag win.
+/// Those cases were probed on Claude Code 2.1.234 with a distinct model value in
+/// each source, rather than inferred from a generic argument parser.
+/// Anything else is left to Claude to reject, while Turn declines to inject a
+/// status line so an excluded or unknown source can never be executed by guess.
+fn setting_sources(args: &[String]) -> Result<SettingSources, ()> {
+    let mut sources = SettingSources {
+        user: true,
+        project: true,
+        local: true,
+    };
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        let value = if argument == "--setting-sources" {
+            index += 1;
+            args.get(index).map(String::as_str).ok_or(())?
+        } else if let Some(value) = argument.strip_prefix("--setting-sources=") {
+            value
+        } else {
+            index += 1;
+            continue;
+        };
+        sources = parse_setting_sources(value)?;
+        index += 1;
+    }
+    Ok(sources)
+}
+
+fn parse_setting_sources(value: &str) -> Result<SettingSources, ()> {
+    if value.is_empty() {
+        return Ok(SettingSources {
+            user: false,
+            project: false,
+            local: false,
+        });
+    }
+    let mut sources = SettingSources {
+        user: false,
+        project: false,
+        local: false,
+    };
+    for source in value.split(',').map(str::trim) {
+        match source {
+            "user" => sources.user = true,
+            "project" => sources.project = true,
+            "local" => sources.local = true,
+            _ => return Err(()),
+        }
+    }
+    Ok(sources)
+}
+
+fn canonical_launch_directory(cwd: &str) -> Result<PathBuf, ()> {
+    let path = std::fs::canonicalize(cwd).map_err(|_| ())?;
+    std::fs::metadata(&path)
+        .map_err(|_| ())?
+        .is_dir()
+        .then_some(path)
+        .ok_or(())
+}
+
+/// Finds the nearest ordinary Git checkout without running a PATH-controlled
+/// executable. A malformed or unreadable `.git` marker shadows outer checkouts
+/// for Git too, so it is an ambiguity rather than a reason to keep walking.
+fn repository_root(cwd: &Path) -> Result<Option<PathBuf>, ()> {
+    for candidate in cwd.ancestors() {
+        let marker = candidate.join(".git");
+        let metadata = match std::fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(()),
+        };
+        let file_type = metadata.file_type();
+        let git_dir = if file_type.is_dir() {
+            marker
+        } else if file_type.is_file() {
+            let pointer = read_bounded_regular_file(&marker, MAX_GIT_METADATA_BYTES)?;
+            let pointer = std::str::from_utf8(&pointer).map_err(|_| ())?;
+            let target = pointer
+                .lines()
+                .next()
+                .and_then(|line| line.trim().strip_prefix("gitdir:"))
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .ok_or(())?;
+            let target = Path::new(target);
+            let target = if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                candidate.join(target)
+            };
+            std::fs::canonicalize(target).map_err(|_| ())?
+        } else {
+            return Err(());
+        };
+        valid_git_directory(&git_dir)?;
+        return Ok(Some(candidate.to_path_buf()));
+    }
+    Ok(None)
+}
+
+fn valid_git_directory(git_dir: &Path) -> Result<(), ()> {
+    let head = read_bounded_regular_file(&git_dir.join("HEAD"), MAX_GIT_METADATA_BYTES)?;
+    let head = std::str::from_utf8(&head).map_err(|_| ())?.trim();
+    let symbolic = head
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .is_some_and(|reference| reference.starts_with("refs/") && reference.len() > 5);
+    let detached =
+        matches!(head.len(), 40 | 64) && head.bytes().all(|byte| byte.is_ascii_hexdigit());
+    (symbolic || detached).then_some(()).ok_or(())
 }
 
 fn prepare_with_paths(ctx: &LaunchContext, paths: SettingsPaths) -> PreparedStatusLine {
@@ -211,30 +373,43 @@ fn effective_status_line(value: &Value) -> Option<EffectiveStatusLine> {
         return None;
     }
     let command = object.get("command")?.as_str()?.to_string();
-    if command.trim().is_empty() {
+    if command.trim().is_empty() || command.contains('\0') {
         return None;
     }
     Some(EffectiveStatusLine { object, command })
 }
 
 fn read_settings(path: &Path) -> Result<Option<Value>, ()> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
-    if !metadata.is_file() || metadata.len() > MAX_SETTINGS_BYTES as u64 {
+    let contents = read_bounded_regular_file(path, MAX_SETTINGS_BYTES)?;
+    serde_json::from_slice(&contents).map(Some).map_err(|_| ())
+}
+
+fn read_bounded_regular_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !metadata.file_type().is_file() || metadata.len() > maximum as u64 {
         return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Root can open a mode-000 test file, but Claude launched as its operator
+        // ordinarily cannot. Treat the absence of every read bit as unreadable
+        // on all Unix test and production accounts.
+        if metadata.permissions().mode() & 0o444 == 0 {
+            return Err(());
+        }
     }
     let file = std::fs::File::open(path).map_err(|_| ())?;
     let mut contents = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_SETTINGS_BYTES as u64 + 1)
+    file.take(maximum as u64 + 1)
         .read_to_end(&mut contents)
         .map_err(|_| ())?;
-    if contents.len() > MAX_SETTINGS_BYTES {
-        return Err(());
-    }
-    serde_json::from_slice(&contents).map(Some).map_err(|_| ())
+    (contents.len() <= maximum).then_some(contents).ok_or(())
 }
 
 /// `Some(false)` means the accessible managed tier permits a CLI status line.
@@ -242,8 +417,8 @@ fn read_settings(path: &Path) -> Result<Option<Value>, ()> {
 /// conservative: a managed document exists but cannot be inspected safely.
 fn managed_status_line_blocked(paths: &[PathBuf]) -> Option<bool> {
     let mut status_line_defined = false;
-    let mut disable_all_hooks = None;
-    let mut managed_only = None;
+    let mut disable_all_hooks = false;
+    let mut managed_only = false;
 
     for path in paths {
         let document = match read_settings(path) {
@@ -256,30 +431,38 @@ fn managed_status_line_blocked(paths: &[PathBuf]) -> Option<bool> {
             status_line_defined = true;
         }
         if let Some(value) = object.get("disableAllHooks") {
-            disable_all_hooks = Some(value.as_bool()?);
+            disable_all_hooks |= value.as_bool()?;
         }
         if let Some(value) = object.get("allowManagedHooksOnly") {
-            managed_only = Some(value.as_bool()?);
+            managed_only |= value.as_bool()?;
         }
     }
 
-    Some(status_line_defined || disable_all_hooks == Some(true) || managed_only == Some(true))
+    Some(status_line_defined || disable_all_hooks || managed_only)
 }
 
-fn claude_config_dir() -> Option<PathBuf> {
+fn claude_config_dir(cwd: &Path) -> Result<PathBuf, ()> {
     if let Some(path) = nonempty_env("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
     }
-    nonempty_env(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .map(|home| home.join(".claude"))
+    let home =
+        PathBuf::from(nonempty_env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or(())?);
+    if !home.is_absolute() {
+        return Err(());
+    }
+    Ok(home.join(".claude"))
 }
 
 fn nonempty_env(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
-fn managed_settings_paths() -> Vec<PathBuf> {
+fn managed_settings_paths() -> Result<Vec<PathBuf>, ()> {
     #[cfg(target_os = "macos")]
     let root = PathBuf::from("/Library/Application Support/ClaudeCode");
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -292,7 +475,7 @@ fn managed_settings_paths() -> Vec<PathBuf> {
         target_os = "android",
         target_os = "windows"
     )))]
-    return Vec::new();
+    return Err(());
 
     #[cfg(any(
         target_os = "macos",
@@ -303,22 +486,28 @@ fn managed_settings_paths() -> Vec<PathBuf> {
     {
         let mut paths = vec![root.join("managed-settings.json")];
         let drop_ins = root.join("managed-settings.d");
-        if let Ok(entries) = std::fs::read_dir(drop_ins) {
-            let mut files: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                        && !path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.starts_with('.'))
-                })
-                .collect();
-            files.sort();
-            paths.extend(files);
+        match std::fs::read_dir(drop_ins) {
+            Ok(entries) => {
+                let mut files = Vec::new();
+                for entry in entries {
+                    let path = entry.map_err(|_| ())?.path();
+                    let name = path
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .ok_or(())?;
+                    if path.extension() == Some(std::ffi::OsStr::new("json"))
+                        && !name.starts_with('.')
+                    {
+                        files.push(path);
+                    }
+                }
+                files.sort();
+                paths.extend(files);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
         }
-        paths
+        Ok(paths)
     }
 }
 
@@ -576,6 +765,19 @@ mod tests {
         std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
+    fn write_git_marker(root: &Path) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        std::fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    }
+
+    fn resolved_paths(ctx: &LaunchContext, user_config_dir: &Path) -> SettingsPaths {
+        let sources = setting_sources(&ctx.user_args).unwrap();
+        let cwd = canonical_launch_directory(&ctx.cwd).unwrap();
+        SettingsPaths::from_resolved_sources(&cwd, sources, Some(user_config_dir), Vec::new())
+            .unwrap()
+    }
+
     fn launch_context(project: &Path, scratch: PathBuf) -> LaunchContext {
         LaunchContext {
             session_id: SessionId::from_stored("sess_status_line"),
@@ -591,6 +793,166 @@ mod tests {
             },
             scratch_dir: scratch,
         }
+    }
+
+    #[test]
+    fn setting_sources_match_claude_cli_forms_and_last_value_wins() {
+        let all = SettingSources {
+            user: true,
+            project: true,
+            local: true,
+        };
+        let user = SettingSources {
+            user: true,
+            project: false,
+            local: false,
+        };
+        let project_local = SettingSources {
+            user: false,
+            project: true,
+            local: true,
+        };
+        let none = SettingSources {
+            user: false,
+            project: false,
+            local: false,
+        };
+
+        assert_eq!(setting_sources(&[]).unwrap(), all);
+        assert_eq!(
+            setting_sources(&["--setting-sources".into(), "user".into()]).unwrap(),
+            user
+        );
+        assert_eq!(
+            setting_sources(&["--setting-sources= project, local ".into()]).unwrap(),
+            project_local
+        );
+        assert_eq!(
+            setting_sources(&[
+                "--setting-sources=project".into(),
+                "--setting-sources".into(),
+                "user".into(),
+            ])
+            .unwrap(),
+            user
+        );
+        assert_eq!(
+            setting_sources(&["--setting-sources=".into()]).unwrap(),
+            none
+        );
+        assert!(setting_sources(&["--setting-sources".into()]).is_err());
+        assert!(setting_sources(&["--setting-sources=user,,project".into()]).is_err());
+        assert!(setting_sources(&["--setting-sources=unknown".into()]).is_err());
+        assert_eq!(
+            setting_sources(&["--".into(), "--setting-sources=local".into()]).unwrap(),
+            all,
+            "a prompt after the option terminator is not a CLI setting source"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_setting_sources_decline_injection_before_writing_a_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut ctx = launch_context(&project, scratch.clone());
+        ctx.user_args = vec!["--setting-sources=project,unknown".into()];
+
+        let prepared = prepare(&ctx);
+        assert!(prepared.setting.is_none());
+        assert!(prepared.note.contains("resolved safely"));
+        assert!(!scratch.join(WRAPPER_NAME).exists());
+        assert!(!scratch.join(ORIGINAL_NAME).exists());
+    }
+
+    #[test]
+    fn git_root_local_wins_but_parent_shared_project_settings_are_not_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let cwd = root.join("packages/app");
+        let user = dir.path().join("user");
+        std::fs::create_dir_all(&cwd).unwrap();
+        write_git_marker(&root);
+        write_json(
+            &root.join(".claude/settings.local.json"),
+            json!({"statusLine":{"type":"command","command":"root local"}}),
+        );
+        write_json(
+            &cwd.join(".claude/settings.local.json"),
+            json!({"statusLine":{"type":"command","command":"cwd local"}}),
+        );
+        write_json(
+            &root.join(".claude/settings.json"),
+            json!({"statusLine":{"type":"command","command":"parent shared project"}}),
+        );
+
+        let mut ctx = launch_context(&cwd, dir.path().join("scratch"));
+        ctx.user_args = vec!["--setting-sources=local".into()];
+        let paths = resolved_paths(&ctx, &user);
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let canonical_cwd = std::fs::canonicalize(&cwd).unwrap();
+        assert_eq!(
+            paths.lower_precedence,
+            vec![
+                canonical_root.join(".claude/settings.local.json"),
+                canonical_cwd.join(".claude/settings.local.json"),
+            ]
+        );
+        let LowerSettings::Ready {
+            status_line: Some(line),
+            ..
+        } = resolve_lower_settings(&paths.lower_precedence)
+        else {
+            panic!("the Git-root local status line should be effective")
+        };
+        assert_eq!(line.command, "root local");
+
+        ctx.user_args = vec!["--setting-sources=project".into()];
+        let paths = resolved_paths(&ctx, &user);
+        assert_eq!(
+            paths.lower_precedence,
+            vec![canonical_cwd.join(".claude/settings.json")]
+        );
+        assert!(matches!(
+            resolve_lower_settings(&paths.lower_precedence),
+            LowerSettings::Ready {
+                status_line: None,
+                disabled: false
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excluded_project_and_user_sources_are_never_read_or_delegated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let cwd = root.join("nested");
+        let user = dir.path().join("user");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        write_git_marker(&root);
+        write_json(
+            &root.join(".claude/settings.local.json"),
+            json!({"statusLine":{"type":"command","command":"printf selected-local"}}),
+        );
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        std::fs::write(cwd.join(".claude/settings.json"), b"malformed project").unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("settings.json"), b"malformed user").unwrap();
+
+        let mut ctx = launch_context(&cwd, scratch.clone());
+        ctx.user_args = vec!["--setting-sources".into(), "local".into()];
+        let prepared = prepare_with_paths(&ctx, resolved_paths(&ctx, &user));
+        assert!(prepared.setting.is_some());
+        let original = std::fs::read_to_string(scratch.join(ORIGINAL_NAME)).unwrap();
+        assert!(original.contains("selected-local"));
+        assert!(!original.contains("malformed project"));
+        assert!(!original.contains("malformed user"));
     }
 
     #[test]
@@ -646,7 +1008,8 @@ mod tests {
                     "padding":7,
                     "refreshInterval":4,
                     "hideVimModeIndicator":true,
-                    "timeout":750
+                    "timeout":750,
+                    "futureProperty":{"nested":["exact",7]}
                 }
             }),
         );
@@ -663,7 +1026,9 @@ mod tests {
         assert_eq!(setting["refreshInterval"], 4);
         assert_eq!(setting["hideVimModeIndicator"], true);
         assert_eq!(setting["timeout"], 750);
+        assert_eq!(setting["futureProperty"], json!({"nested":["exact",7]}));
         assert!(!setting.to_string().contains(original));
+        assert!(!prepared.note.contains(original));
         assert!(setting["command"].as_str().unwrap().contains(WRAPPER_NAME));
 
         let wrapper = std::fs::read_to_string(scratch.join(WRAPPER_NAME)).unwrap();
@@ -671,9 +1036,11 @@ mod tests {
         assert!(wrapper.contains("--statusline"));
         assert!(!wrapper.contains("private-token"));
         let original_script = scratch.join(ORIGINAL_NAME);
-        assert!(std::fs::read_to_string(&original_script)
-            .unwrap()
-            .contains(original));
+        assert_eq!(
+            std::fs::read_to_string(&original_script).unwrap(),
+            format!("#!/bin/sh\n{original}\n"),
+            "the private delegate must preserve the command byte-for-byte"
+        );
         assert_eq!(
             std::fs::metadata(original_script)
                 .unwrap()
@@ -700,6 +1067,36 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn malformed_oversize_and_unreadable_selected_settings_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("lower.json");
+        write_json(
+            &lower,
+            json!({"statusLine":{"type":"command","command":"must not run"}}),
+        );
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        let oversize = dir.path().join("oversize.json");
+        let file = std::fs::File::create(&oversize).unwrap();
+        file.set_len(MAX_SETTINGS_BYTES as u64 + 1).unwrap();
+        let unreadable = dir.path().join("unreadable.json");
+        write_json(&unreadable, json!({}));
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        for selected in [&malformed, &oversize, &unreadable] {
+            assert!(matches!(
+                resolve_lower_settings(&[selected.clone(), lower.clone()]),
+                LowerSettings::Unavailable
+            ));
+        }
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     #[test]
     fn managed_status_line_and_managed_only_hooks_are_detected_without_copying_commands() {
         let dir = tempfile::tempdir().unwrap();
@@ -714,6 +1111,49 @@ mod tests {
             managed_status_line_blocked(&[base, override_file]),
             Some(true)
         );
+
+        let restrictive = dir.path().join("restrictive.json");
+        let permissive = dir.path().join("permissive.json");
+        write_json(&restrictive, json!({"disableAllHooks":true}));
+        write_json(&permissive, json!({"disableAllHooks":false}));
+        assert_eq!(
+            managed_status_line_blocked(&[restrictive, permissive]),
+            Some(true),
+            "Turn fails closed when managed merge order could change the result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_status_line_prevents_any_lower_command_or_wrapper_from_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        let managed = dir.path().join("managed.json");
+        let lower = dir.path().join("lower.json");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        write_json(
+            &managed,
+            json!({"statusLine":{"type":"command","command":"managed private"}}),
+        );
+        write_json(
+            &lower,
+            json!({"statusLine":{"type":"command","command":"lower private"}}),
+        );
+
+        let prepared = prepare_with_paths(
+            &launch_context(&project, scratch.clone()),
+            SettingsPaths {
+                lower_precedence: vec![lower],
+                managed: vec![managed],
+            },
+        );
+        assert!(prepared.setting.is_none());
+        assert!(prepared.note.contains("managed"));
+        assert!(!prepared.note.contains("private"));
+        assert!(!scratch.join(ORIGINAL_NAME).exists());
+        assert!(!scratch.join(WRAPPER_NAME).exists());
     }
 
     #[test]

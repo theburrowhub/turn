@@ -260,6 +260,9 @@ impl ClaudeCodeAdapter {
 /// Turn does not get to be the one that wins. Replacing a user's configuration to
 /// make Turn's own detection work would be Turn deciding something on their behalf,
 /// and losing Turn's hooks while still claiming `Structured` would be worse.
+/// This is deliberately conservative across separate, `=`, repeated, malformed,
+/// inline-JSON and post-`--` occurrences: a false positive only declines Turn's
+/// integration, while a false negative could replace CLI-owned settings.
 fn user_supplied_settings(args: &[String]) -> bool {
     args.iter()
         .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
@@ -1170,13 +1173,35 @@ mod tests {
     #[test]
     fn a_users_own_settings_flag_is_left_in_place_and_the_cost_is_reported() {
         let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.local.json"),
+            br#"{"statusLine":{"type":"command","command":"private command Turn must not copy"}}"#,
+        )
+        .unwrap();
         let adapter = ClaudeCodeAdapter::new();
 
         for user_flag in [
-            vec!["--settings".to_string(), "/home/me/mine.json".to_string()],
-            vec!["--settings=/home/me/mine.json".to_string()],
+            vec!["--settings".into(), "/home/me/mine.json".into()],
+            vec!["--settings=/home/me/mine.json".into()],
+            vec!["--settings".into(), r#"{"model":"sonnet"}"#.into()],
+            vec![r#"--settings={"model":"sonnet"}"#.into()],
+            vec![
+                r#"--settings={"disableAllHooks":true,"statusLine":{"type":"command","command":"printf cli-owned"}}"#
+                    .into(),
+            ],
+            vec![
+                "--settings".into(),
+                "/home/me/first.json".into(),
+                "--settings=/home/me/second.json".into(),
+            ],
+            vec!["--settings".into()],
+            vec!["--".into(), "--settings=/literal/prompt.json".into()],
         ] {
-            let mut ctx = launch_ctx(dir.path());
+            let mut ctx = launch_ctx(&scratch);
+            ctx.cwd = project.to_string_lossy().into_owned();
             ctx.user_args = user_flag.clone();
 
             let plan = adapter.prepare(&ctx).unwrap();
@@ -1189,8 +1214,11 @@ mod tests {
                     .iter()
                     .filter(|a| a.starts_with("--settings"))
                     .count(),
-                1,
-                "Turn must not add a second --settings: {:?}",
+                user_flag
+                    .iter()
+                    .filter(|a| a.starts_with("--settings"))
+                    .count(),
+                "Turn must not add or remove any --settings occurrence: {:?}",
                 plan.args
             );
             assert_eq!(
@@ -1204,7 +1232,60 @@ mod tests {
                 "the note must explain the collision and where Turn's file is: {}",
                 plan.note
             );
+            assert!(!plan.note.contains("private command"));
+            assert!(!scratch.join("claude-statusline-original.sh").exists());
+            assert!(!scratch.join("claude-statusline-turn.sh").exists());
+            assert!(!std::fs::read_to_string(scratch.join("claude-hooks.json"))
+                .unwrap()
+                .contains("private command"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_effective_status_command_stays_out_of_launch_surfaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        let private_command = "printf status-command-private-sentinel";
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "statusLine": {
+                    "type": "command",
+                    "command": private_command,
+                    "padding": 5
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut ctx = launch_ctx(&scratch);
+        ctx.cwd = project.to_string_lossy().into_owned();
+        ctx.user_args = vec!["--setting-sources=project".into()];
+
+        let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
+        assert!(!plan
+            .args
+            .iter()
+            .any(|value| value.contains(private_command)));
+        assert!(!plan.env.iter().any(|(key, value)| {
+            key.contains(private_command) || value.contains(private_command)
+        }));
+        assert!(!plan.note.contains(private_command));
+        let settings_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        let settings = std::fs::read_to_string(&plan.args[settings_index + 1]).unwrap();
+        assert!(!settings.contains(private_command));
+        assert!(settings.contains("claude-statusline-turn.sh"));
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("claude-statusline-original.sh")).unwrap(),
+            format!("#!/bin/sh\n{private_command}\n")
+        );
     }
 
     /// The fallback transport runs the helper. It must not hand it the URL as an
