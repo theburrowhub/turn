@@ -6,6 +6,7 @@ use crate::ids::{NodeId, SessionId};
 use crate::model::hierarchy::{
     ActivityPreview, AgentName, NameSource, PreviewVisibility, Relationship, RelationshipKind,
 };
+use crate::model::AgentRuntimeMetadata;
 use crate::state::{DisplayState, Lifecycle, Turn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -98,6 +99,10 @@ pub struct AgentInfo {
     pub tokens_used: Option<u64>,
     pub cost_usd: Option<f64>,
     pub permission_mode: Option<String>,
+    /// Requested/effective/current launch facts and independently scoped
+    /// context/quota observations. Older stored rows default to `Waiting`.
+    #[serde(default)]
+    pub runtime: AgentRuntimeMetadata,
     pub git_branch: Option<String>,
     /// Whether this agent can be resumed after its process ends.
     pub resumable: bool,
@@ -787,6 +792,15 @@ mod tests {
         let shell = ProcessNode::process(session, NodeKind::Shell, "zsh", "/repo", T0);
         assert!(shell.turn.is_none(), "a shell owes the user nothing");
         assert_eq!(shell.display_state(), DisplayState::Starting);
+    }
+
+    #[test]
+    fn agent_info_from_an_older_peer_defaults_runtime_observations_to_waiting() {
+        let mut json = serde_json::to_value(AgentInfo::default()).unwrap();
+        json.as_object_mut().unwrap().remove("runtime");
+
+        let info: AgentInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.runtime, AgentRuntimeMetadata::default());
     }
 
     #[test]

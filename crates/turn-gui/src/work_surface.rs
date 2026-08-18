@@ -6,10 +6,14 @@
 
 use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
+use turn_core::model::{
+    AgentRuntimeMetadata, LaunchConfiguration, Observable, ObservationSourceKind, QuotaSnapshot,
+    UsageMeasurement, UsageMeasurementKind, UsageUnit,
+};
 use turn_core::state::{AwaitingReason, Turn};
 use turn_proto::{
-    HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability, SessionTreeView,
-    TreeNodeView, WorkspaceTreeView,
+    AgentSummary, HierarchyKey, HierarchySnapshot, InspectorDetails, NodePaneCapability,
+    SessionTreeView, TreeNodeView, WorkspaceTreeView,
 };
 
 use super::{
@@ -225,7 +229,16 @@ impl TurnView<'_> {
         let safe_details = safe_node.and(details);
 
         let attention_height: f32 = if node.needs_user { 34.0 } else { 0.0 };
-        let header_height = 76.0_f32.min(area.height());
+        // Three compact rows: identity/state, Session/provider, then the four
+        // runtime facts the operator must not have to open an inspector to see.
+        // A narrow WorkSurface needs one extra wrapped line; reserving it here
+        // keeps the quota fact visible instead of painting it behind the body.
+        let header_height = (if area.width() < 760.0 {
+            118.0_f32
+        } else {
+            98.0_f32
+        })
+        .min(area.height());
         let attention = Rect::from_min_size(
             area.min,
             Vec2::new(area.width(), attention_height.min(area.height())),
@@ -496,13 +509,351 @@ fn paint_node_header(
                     if let Some(provider) = agent.agent.provider.as_deref() {
                         ui.label(RichText::new(provider).monospace().color(theme.text_faint));
                     }
-                    if let Some(model) = agent.agent.model.as_deref() {
-                        ui.label(RichText::new(model).monospace().color(theme.text_faint));
-                    }
                 }
             });
+            if node.is_agentic {
+                ui.horizontal_wrapped(|ui| {
+                    let facts = safe_node
+                        .and_then(|node| node.agent.as_ref())
+                        .map(agent_header_facts)
+                        .unwrap_or_else(CompactAgentFacts::loading);
+                    compact_fact(ui, theme, "MODEL", &facts.model);
+                    compact_fact(ui, theme, "MODE", &facts.mode);
+                    compact_fact(ui, theme, "CONTEXT", &facts.context);
+                    compact_fact(ui, theme, "QUOTA", &facts.quota);
+                });
+            }
         },
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFactState {
+    Observed,
+    Waiting,
+    Unsupported,
+    Stale,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactFact {
+    value: String,
+    state: RuntimeFactState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactAgentFacts {
+    model: CompactFact,
+    mode: CompactFact,
+    context: CompactFact,
+    quota: CompactFact,
+}
+
+impl CompactAgentFacts {
+    fn loading() -> Self {
+        let loading = || CompactFact {
+            value: "loading".into(),
+            state: RuntimeFactState::Waiting,
+        };
+        Self {
+            model: loading(),
+            mode: loading(),
+            context: loading(),
+            quota: loading(),
+        }
+    }
+}
+
+fn compact_fact(ui: &mut Ui, theme: &Theme, label: &str, fact: &CompactFact) {
+    let colour = match fact.state {
+        RuntimeFactState::Observed => theme.text_dim,
+        RuntimeFactState::Waiting | RuntimeFactState::Unsupported => theme.text_faint,
+        RuntimeFactState::Stale => theme.provisional,
+        RuntimeFactState::Failed => theme.failure,
+    };
+    ui.label(
+        RichText::new(format!("{label}  {}", fact.value))
+            .monospace()
+            .small()
+            .color(colour),
+    );
+}
+
+fn agent_header_facts(agent: &AgentSummary) -> CompactAgentFacts {
+    CompactAgentFacts {
+        model: launch_header_fact(
+            &agent.runtime,
+            LaunchField::Model,
+            agent.agent.model.as_deref(),
+        ),
+        mode: launch_header_fact(
+            &agent.runtime,
+            LaunchField::PermissionMode,
+            agent.permission_mode.as_deref(),
+        ),
+        context: observation_header_fact(&agent.runtime.context, |context| {
+            format_measurement(&context.measurement)
+        }),
+        quota: observation_header_fact(&agent.runtime.quota, format_quota_compact),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LaunchField {
+    Model,
+    PermissionMode,
+}
+
+fn launch_field<'a>(configuration: &'a LaunchConfiguration, field: LaunchField) -> Option<&'a str> {
+    match field {
+        LaunchField::Model => configuration.model.as_deref(),
+        LaunchField::PermissionMode => configuration.permission_mode.as_deref(),
+    }
+}
+
+fn launch_header_fact(
+    runtime: &AgentRuntimeMetadata,
+    field: LaunchField,
+    legacy: Option<&str>,
+) -> CompactFact {
+    let observations = [
+        &runtime.launch.requested,
+        &runtime.launch.effective,
+        &runtime.launch.current,
+    ];
+    let mut values = Vec::<String>::new();
+    for observation in observations {
+        if let Some(value) = observation
+            .value()
+            .and_then(|configuration| launch_field(configuration, field))
+            .filter(|value| !value.is_empty())
+        {
+            if values.last().is_none_or(|previous| previous != value) {
+                values.push(value.to_string());
+            }
+        }
+    }
+
+    let current_state = observable_state(&runtime.launch.current);
+    if values.is_empty() {
+        if let Some(legacy) = legacy.filter(|value| !value.is_empty()) {
+            return CompactFact {
+                value: legacy.to_string(),
+                state: RuntimeFactState::Observed,
+            };
+        }
+        let decisive = [
+            &runtime.launch.current,
+            &runtime.launch.effective,
+            &runtime.launch.requested,
+        ]
+        .into_iter()
+        .map(observable_state)
+        .find(|state| *state != RuntimeFactState::Waiting)
+        .unwrap_or(RuntimeFactState::Waiting);
+        return CompactFact {
+            value: runtime_state_label(decisive).into(),
+            state: decisive,
+        };
+    }
+
+    let mut value = values.join("→");
+    let state = match current_state {
+        RuntimeFactState::Unsupported | RuntimeFactState::Failed
+            if runtime.launch.current.value().is_none() =>
+        {
+            value.push_str(" · current ");
+            value.push_str(runtime_state_label(current_state));
+            current_state
+        }
+        RuntimeFactState::Stale => RuntimeFactState::Stale,
+        _ => RuntimeFactState::Observed,
+    };
+    CompactFact { value, state }
+}
+
+fn observation_header_fact<T>(
+    observation: &Observable<T>,
+    render: impl FnOnce(&T) -> String,
+) -> CompactFact {
+    let state = observable_state(observation);
+    let value = match observation.value() {
+        Some(value) => {
+            let mut rendered = render(value);
+            if state == RuntimeFactState::Stale {
+                rendered.push_str(" · stale");
+            }
+            rendered
+        }
+        None => runtime_state_label(state).into(),
+    };
+    CompactFact { value, state }
+}
+
+fn observable_state<T>(observation: &Observable<T>) -> RuntimeFactState {
+    match observation {
+        Observable::Waiting => RuntimeFactState::Waiting,
+        Observable::Observed { .. } => RuntimeFactState::Observed,
+        Observable::Unsupported { .. } => RuntimeFactState::Unsupported,
+        Observable::Stale { .. } => RuntimeFactState::Stale,
+        Observable::Failed { .. } => RuntimeFactState::Failed,
+    }
+}
+
+fn runtime_state_label(state: RuntimeFactState) -> &'static str {
+    match state {
+        RuntimeFactState::Observed => "observed",
+        RuntimeFactState::Waiting => "waiting",
+        RuntimeFactState::Unsupported => "unsupported",
+        RuntimeFactState::Stale => "stale",
+        RuntimeFactState::Failed => "failed",
+    }
+}
+
+fn format_quota_compact(quota: &QuotaSnapshot) -> String {
+    let scope = quota.scope_label.as_deref().or(quota.scope_id.as_deref());
+    match (scope, quota.windows.first()) {
+        (Some(scope), Some(window)) => {
+            format!(
+                "{scope} · {} {}",
+                window.label,
+                format_measurement(&window.measurement)
+            )
+        }
+        (None, Some(window)) => format!(
+            "{} {}",
+            window.label,
+            format_measurement(&window.measurement)
+        ),
+        (Some(scope), None) => format!("{scope} · no windows reported"),
+        (None, None) => "observed · no windows reported".into(),
+    }
+}
+
+fn format_measurement(measurement: &UsageMeasurement) -> String {
+    let amount = format_usage_amount(measurement.amount, &measurement.unit);
+    let amount = match measurement.total {
+        Some(total) => format!("{amount}/{}", format_usage_amount(total, &measurement.unit)),
+        None => amount,
+    };
+    let semantics = match measurement.kind {
+        UsageMeasurementKind::Used => "used",
+        UsageMeasurementKind::Remaining => "remaining",
+        UsageMeasurementKind::ProviderPercent => "provider",
+    };
+    format!("{amount} {semantics}")
+}
+
+fn format_usage_amount(amount: f64, unit: &UsageUnit) -> String {
+    let number = if amount.fract() == 0.0 {
+        format!("{amount:.0}")
+    } else {
+        format!("{amount:.1}")
+    };
+    match unit {
+        UsageUnit::Tokens => format!("{number} tok"),
+        UsageUnit::Percent => format!("{number}%"),
+        UsageUnit::Requests => format!("{number} req"),
+        UsageUnit::Credits => format!("{number} credits"),
+        UsageUnit::Other(unit) => format!("{number} {unit}"),
+    }
+}
+
+fn format_launch_configuration(configuration: &LaunchConfiguration) -> String {
+    let mut facts = Vec::new();
+    if let Some(model) = configuration.model.as_deref() {
+        facts.push(format!("model {model}"));
+    }
+    if let Some(mode) = configuration.permission_mode.as_deref() {
+        facts.push(format!("permission {mode}"));
+    }
+    if let Some(mode) = configuration.approval_mode.as_deref() {
+        facts.push(format!("approval {mode}"));
+    }
+    if let Some(mode) = configuration.sandbox_mode.as_deref() {
+        facts.push(format!("sandbox {mode}"));
+    }
+    if !configuration.safe_flags.is_empty() {
+        facts.push(format!("flags {}", configuration.safe_flags.join(" ")));
+    }
+    if facts.is_empty() {
+        "observed · no launch fields reported".into()
+    } else {
+        facts.join(" · ")
+    }
+}
+
+fn inspector_runtime_observation<T>(
+    ui: &mut Ui,
+    theme: &Theme,
+    label: &str,
+    observation: &Observable<T>,
+    now_ms: i64,
+    render: impl FnOnce(&T) -> String,
+) {
+    let state = observable_state(observation);
+    let value = match observation {
+        Observable::Observed { value, .. } | Observable::Stale { value, .. } => {
+            format!("{} · {}", runtime_state_label(state), render(value))
+        }
+        Observable::Failed { message, .. } => format!("failed · {message}"),
+        Observable::Waiting | Observable::Unsupported { .. } => {
+            runtime_state_label(state).to_string()
+        }
+    };
+    inspector_value(ui, theme, label, &value);
+
+    if let Some(source) = observation.source() {
+        let source = source
+            .label
+            .as_deref()
+            .unwrap_or_else(|| match source.kind {
+                ObservationSourceKind::Unknown => "unknown source",
+                ObservationSourceKind::LaunchRequest => "launch request",
+                ObservationSourceKind::Adapter => "adapter",
+                ObservationSourceKind::Provider => "provider",
+                ObservationSourceKind::Process => "process",
+                ObservationSourceKind::Cache => "cache",
+            });
+        inspector_value(ui, theme, &format!("{label} source"), source);
+    }
+    if let Some(observed_at_ms) = observation.observed_at_ms() {
+        inspector_value(
+            ui,
+            theme,
+            &format!("{label} observed"),
+            &format_relative_time(observed_at_ms, now_ms),
+        );
+    }
+    let expires_at_ms = match observation {
+        Observable::Observed { expires_at_ms, .. } | Observable::Stale { expires_at_ms, .. } => {
+            *expires_at_ms
+        }
+        Observable::Waiting | Observable::Unsupported { .. } | Observable::Failed { .. } => None,
+    };
+    if let Some(expires_at_ms) = expires_at_ms {
+        inspector_value(
+            ui,
+            theme,
+            &format!("{label} expires"),
+            &format_relative_time(expires_at_ms, now_ms),
+        );
+    }
+}
+
+fn format_relative_time(timestamp_ms: i64, now_ms: i64) -> String {
+    if timestamp_ms <= now_ms {
+        format!(
+            "{} ago",
+            format_duration(now_ms.saturating_sub(timestamp_ms))
+        )
+    } else {
+        format!(
+            "in {}",
+            format_duration(timestamp_ms.saturating_sub(now_ms))
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -634,9 +985,7 @@ fn node_details(
                 if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     inspector_optional(ui, theme, "provider", agent.agent.provider.as_deref());
                     inspector_optional(ui, theme, "tool", agent.agent.tool.as_deref());
-                    inspector_optional(ui, theme, "model", agent.agent.model.as_deref());
                     inspector_optional(ui, theme, "Agent type", agent.agent_type.as_deref());
-                    inspector_optional(ui, theme, "permission mode", agent.permission_mode.as_deref());
                     inspector_optional(ui, theme, "branch", agent.git_branch.as_deref());
                 } else if node.is_agentic {
                     inspector_value(ui, theme, "agent metadata", "Loading safe details…");
@@ -658,19 +1007,94 @@ fn node_details(
                 }
 
                 if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
-                    inspector_section(ui, theme, "USAGE");
-                    inspector_optional_owned(
+                    inspector_section(ui, theme, "LAUNCH RECEIPT");
+                    inspector_runtime_observation(
                         ui,
                         theme,
-                        "tokens",
-                        agent.tokens_used.map(|tokens| tokens.to_string()),
+                        "requested",
+                        &agent.runtime.launch.requested,
+                        now_ms,
+                        format_launch_configuration,
                     );
-                    inspector_optional_owned(
+                    inspector_runtime_observation(
                         ui,
                         theme,
-                        "cost",
-                        agent.cost_usd.map(|cost| format!("${cost:.4}")),
+                        "effective",
+                        &agent.runtime.launch.effective,
+                        now_ms,
+                        format_launch_configuration,
                     );
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "current",
+                        &agent.runtime.launch.current,
+                        now_ms,
+                        format_launch_configuration,
+                    );
+
+                    inspector_section(ui, theme, "CONVERSATION CONTEXT");
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "usage",
+                        &agent.runtime.context,
+                        now_ms,
+                        |context| format_measurement(&context.measurement),
+                    );
+                    if let Some(context) = agent.runtime.context.value() {
+                        inspector_optional(ui, theme, "scope", context.scope_id.as_deref());
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "effective window",
+                            context
+                                .effective_window
+                                .as_ref()
+                                .map(format_measurement),
+                        );
+                    }
+
+                    inspector_section(ui, theme, "PROVIDER QUOTA");
+                    inspector_runtime_observation(
+                        ui,
+                        theme,
+                        "quota",
+                        &agent.runtime.quota,
+                        now_ms,
+                        format_quota_compact,
+                    );
+                    if let Some(quota) = agent.runtime.quota.value() {
+                        inspector_optional(ui, theme, "scope id", quota.scope_id.as_deref());
+                        inspector_optional(ui, theme, "scope", quota.scope_label.as_deref());
+                        for window in &quota.windows {
+                            let mut value = format_measurement(&window.measurement);
+                            if let Some(reset) = window.resets_at_ms {
+                                value.push_str(" · reset ");
+                                value.push_str(&format_relative_time(reset, now_ms));
+                            }
+                            if let Some(hard) = window.hard_limit {
+                                value.push_str(if hard { " · hard" } else { " · soft" });
+                            }
+                            inspector_value(ui, theme, &window.label, &value);
+                        }
+                    }
+
+                    if agent.tokens_used.is_some() || agent.cost_usd.is_some() {
+                        inspector_section(ui, theme, "SESSION TOTALS");
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "tokens",
+                            agent.tokens_used.map(|tokens| tokens.to_string()),
+                        );
+                        inspector_optional_owned(
+                            ui,
+                            theme,
+                            "cost",
+                            agent.cost_usd.map(|cost| format!("${cost:.4}")),
+                        );
+                    }
                 }
 
                 match details {
@@ -951,5 +1375,113 @@ mod tests {
                 .map(ResolvedViewTarget::public),
             Some(ViewTarget::Node(first))
         );
+    }
+
+    fn source() -> turn_core::model::ObservationSource {
+        turn_core::model::ObservationSource::new(
+            ObservationSourceKind::Provider,
+            "provider runtime",
+        )
+    }
+
+    #[test]
+    fn compact_header_promotes_launch_mismatch_and_current_unsupported_state() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-runtime"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.launch.requested = Observable::observed(
+            LaunchConfiguration {
+                model: Some("sonnet".into()),
+                permission_mode: Some("default".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+        runtime.launch.effective = Observable::observed(
+            LaunchConfiguration {
+                model: Some("opus".into()),
+                permission_mode: Some("bypass".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        runtime.launch.current = Observable::unsupported(source(), T0 + 2);
+
+        let facts = agent_header_facts(&AgentSummary::from_node(&node).unwrap());
+        assert_eq!(facts.model.value, "sonnet→opus · current unsupported");
+        assert_eq!(facts.model.state, RuntimeFactState::Unsupported);
+        assert_eq!(facts.mode.value, "default→bypass · current unsupported");
+    }
+
+    #[test]
+    fn compact_capacity_facts_keep_observed_stale_and_unsupported_distinct() {
+        use turn_core::model::{ContextUsageSnapshot, QuotaWindow};
+
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-capacity"),
+            "codex",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::stale(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42_000.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+            },
+            source(),
+            T0,
+            Some(T0 + 1),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("account".into()),
+                scope_label: Some("team".into()),
+                windows: vec![QuotaWindow {
+                    label: "five hour".into(),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::ProviderPercent,
+                        amount: 61.0,
+                        unit: UsageUnit::Percent,
+                        total: None,
+                    },
+                    resets_at_ms: None,
+                    hard_limit: None,
+                }],
+            },
+            source(),
+            T0,
+            None,
+        );
+
+        let mut summary = AgentSummary::from_node(&node).unwrap();
+        let facts = agent_header_facts(&summary);
+        assert_eq!(facts.context.value, "42000 tok used · stale");
+        assert_eq!(facts.context.state, RuntimeFactState::Stale);
+        assert_eq!(facts.quota.value, "team · five hour 61% provider");
+        assert_eq!(facts.quota.state, RuntimeFactState::Observed);
+        assert!(
+            !facts.context.value.contains('%') && !facts.context.value.contains("remaining"),
+            "no total means no derived percentage or complement"
+        );
+
+        summary.runtime.quota = Observable::unsupported(source(), T0 + 1);
+        let facts = agent_header_facts(&summary);
+        assert_eq!(facts.quota.value, "unsupported");
+        assert_eq!(facts.quota.state, RuntimeFactState::Unsupported);
     }
 }

@@ -927,6 +927,14 @@ fn merge_legacy_claude_alias_pair(
         agent.permission_mode = lifecycle_info
             .and_then(|candidate| candidate.permission_mode.clone())
             .or_else(|| team_info.and_then(|candidate| candidate.permission_mode.clone()));
+        agent.runtime = team_info
+            .map(|candidate| candidate.runtime.clone())
+            .unwrap_or_default()
+            .prefer_newer(
+                lifecycle_info
+                    .map(|candidate| candidate.runtime.clone())
+                    .unwrap_or_default(),
+            );
         agent.git_branch = lifecycle_info
             .and_then(|candidate| candidate.git_branch.clone())
             .or_else(|| team_info.and_then(|candidate| candidate.git_branch.clone()));

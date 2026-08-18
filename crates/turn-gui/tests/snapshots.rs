@@ -26,10 +26,12 @@ use egui_kittest::Harness;
 use turn_core::event::{AgentRef, Confidence, Risk, Severity};
 use turn_core::ids::{AttentionId, CheckoutId, NodeId, PaneId, SessionId, WorkspaceId};
 use turn_core::model::{
-    ActivityPreview, AgentName, Direction, DropZone, Layout, LeaseState, NodeKind, Pane,
-    PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement, PreviewSource, ProcessNode, Relation,
-    RestoreState, Session, SessionMode, Template, Workspace, WorkspaceCheckout,
-    WorkspaceWriteLease,
+    ActivityPreview, AgentInfo, AgentName, ContextUsageSnapshot, Direction, DropZone,
+    LaunchConfiguration, Layout, LeaseState, NodeKind, Observable, ObservationSource,
+    ObservationSourceKind, Pane, PaneGeometry, PaneKind, PaneNodeBinding, PanePlacement,
+    PreviewSource, ProcessNode, QuotaSnapshot, QuotaWindow, Relation, RestoreState, Session,
+    SessionMode, Template, UsageMeasurement, UsageMeasurementKind, UsageUnit, Workspace,
+    WorkspaceCheckout, WorkspaceWriteLease,
 };
 use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
@@ -382,6 +384,65 @@ fn add_preview(
     preview
 }
 
+fn add_runtime_metadata(info: &mut AgentInfo, model: &str) {
+    let request_source = ObservationSource::new(ObservationSourceKind::LaunchRequest, "template");
+    let adapter_source = ObservationSource::new(ObservationSourceKind::Adapter, "claude adapter");
+    let provider_source =
+        ObservationSource::new(ObservationSourceKind::Provider, "claude statusline");
+    let configuration = LaunchConfiguration {
+        model: Some(model.into()),
+        permission_mode: Some("default".into()),
+        approval_mode: Some("prompt".into()),
+        sandbox_mode: Some("workspace write".into()),
+        safe_flags: vec!["--permission-mode default".into()],
+    };
+    info.runtime.launch.requested =
+        Observable::observed(configuration.clone(), request_source, T0 + 3_000, None);
+    info.runtime.launch.effective =
+        Observable::observed(configuration.clone(), adapter_source, T0 + 3_010, None);
+    info.runtime.launch.current = Observable::observed(
+        configuration,
+        provider_source.clone(),
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+    info.runtime.context = Observable::observed(
+        ContextUsageSnapshot {
+            scope_id: Some("conversation-main".into()),
+            measurement: UsageMeasurement {
+                kind: UsageMeasurementKind::Used,
+                amount: 54_000.0,
+                unit: UsageUnit::Tokens,
+                total: Some(200_000.0),
+            },
+            effective_window: None,
+        },
+        provider_source.clone(),
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+    info.runtime.quota = Observable::observed(
+        QuotaSnapshot {
+            scope_id: Some("anthropic-team".into()),
+            scope_label: Some("Team account".into()),
+            windows: vec![QuotaWindow {
+                label: "five hour".into(),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Remaining,
+                    amount: 72.0,
+                    unit: UsageUnit::Percent,
+                    total: None,
+                },
+                resets_at_ms: Some(T0 + 3_600_000),
+                hard_limit: Some(true),
+            }],
+        },
+        provider_source,
+        T0 + 12_000,
+        Some(T0 + 42_000),
+    );
+}
+
 /// A production-shaped hierarchy fixture. It is built from domain entities and projected
 /// through the same protocol views as `turnd`; no `SessionRow` or second agent tree is
 /// fabricated for the screenshot.
@@ -428,6 +489,8 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         model: Some("claude-3.5-sonnet".into()),
         external_id: Some("claude-main".into()),
     };
+    claude_info.permission_mode = Some("default".into());
+    add_runtime_metadata(claude_info, "claude-3.5-sonnet");
     claude_info.current_task = Some("Fix the climbing transition and verify it".into());
     add_preview(
         &mut claude,
@@ -456,6 +519,8 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
         model: Some("claude-3.5-sonnet".into()),
         external_id: Some("reviewer".into()),
     };
+    reviewer_info.permission_mode = Some("default".into());
+    add_runtime_metadata(reviewer_info, "claude-3.5-sonnet");
     reviewer_info.current_task = Some("Review the climbing logic changes".into());
     add_preview(
         &mut reviewer,
@@ -1422,6 +1487,10 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     });
     safe_agent.pending_question = Some("[redacted question]".into());
     safe_agent.permission_mode = Some("[redacted permission mode]".into());
+    // Force the compact runtime header through the safe legacy projection. The
+    // poisoned hierarchy below must never override it while details are loading
+    // or after they arrive.
+    safe_agent.runtime = Default::default();
     safe_agent.git_branch = Some("[redacted branch]".into());
 
     let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
@@ -1465,6 +1534,47 @@ fn semantic_work_surface_never_renders_raw_agent_fields_while_safe_details_load(
     });
     raw_agent.pending_question = Some(format!("Question containing {SECRET}"));
     raw_agent.permission_mode = Some(format!("mode {SECRET}"));
+    let poisoned_source = ObservationSource::new(
+        ObservationSourceKind::Provider,
+        format!("runtime source {SECRET}"),
+    );
+    raw_agent.runtime.launch.current = Observable::observed(
+        LaunchConfiguration {
+            model: Some(format!("runtime model {SECRET}")),
+            permission_mode: Some(format!("runtime mode {SECRET}")),
+            approval_mode: Some(format!("runtime approval {SECRET}")),
+            sandbox_mode: Some(format!("runtime sandbox {SECRET}")),
+            safe_flags: vec![format!("--profile={SECRET}")],
+        },
+        poisoned_source.clone(),
+        T0 + 13_000,
+        None,
+    );
+    raw_agent.runtime.context = Observable::failed(
+        poisoned_source.clone(),
+        T0 + 13_000,
+        format!("runtime failure {SECRET}"),
+    );
+    raw_agent.runtime.quota = Observable::observed(
+        QuotaSnapshot {
+            scope_id: Some(format!("quota scope {SECRET}")),
+            scope_label: Some(format!("quota account {SECRET}")),
+            windows: vec![QuotaWindow {
+                label: format!("quota window {SECRET}"),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Remaining,
+                    amount: 1.0,
+                    unit: UsageUnit::Percent,
+                    total: None,
+                },
+                resets_at_ms: None,
+                hard_limit: None,
+            }],
+        },
+        poisoned_source,
+        T0 + 13_000,
+        None,
+    );
     raw_agent.git_branch = Some(format!("branch/{SECRET}"));
 
     let mut h = harness(fixture);

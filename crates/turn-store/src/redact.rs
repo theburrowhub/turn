@@ -39,7 +39,9 @@ use turn_core::event::AgentRef;
 use turn_core::model::layout::{Layout, LayoutNode};
 use turn_core::model::node::{AgentInfo, PendingPermission, ProcessNode};
 use turn_core::model::{
-    ActivityPreview, AgentName, Session, SessionTree, Template, Workspace, WorkspaceCheckout,
+    ActivityPreview, AgentName, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration,
+    Observable, ObservationSource, QuotaSnapshot, QuotaWindow, Session, SessionTree, Template,
+    UsageMeasurement, UsageUnit, Workspace, WorkspaceCheckout,
 };
 use turn_core::state::{Lifecycle, Turn};
 
@@ -787,6 +789,137 @@ fn pending_permission_for_persistence(permission: &PendingPermission) -> Pending
     }
 }
 
+fn observation_source_for_persistence(source: &ObservationSource) -> ObservationSource {
+    ObservationSource {
+        kind: source.kind,
+        label: redact_optional(&source.label),
+    }
+}
+
+fn observable_for_persistence<T, U>(
+    observation: &Observable<T>,
+    redact_value: impl Fn(&T) -> U,
+) -> Observable<U> {
+    match observation {
+        Observable::Waiting => Observable::Waiting,
+        Observable::Observed {
+            value,
+            source,
+            observed_at_ms,
+            expires_at_ms,
+        } => Observable::Observed {
+            value: redact_value(value),
+            source: observation_source_for_persistence(source),
+            observed_at_ms: *observed_at_ms,
+            expires_at_ms: *expires_at_ms,
+        },
+        Observable::Unsupported {
+            source,
+            observed_at_ms,
+        } => Observable::Unsupported {
+            source: observation_source_for_persistence(source),
+            observed_at_ms: *observed_at_ms,
+        },
+        Observable::Stale {
+            value,
+            source,
+            observed_at_ms,
+            expires_at_ms,
+        } => Observable::Stale {
+            value: redact_value(value),
+            source: observation_source_for_persistence(source),
+            observed_at_ms: *observed_at_ms,
+            expires_at_ms: *expires_at_ms,
+        },
+        Observable::Failed {
+            source,
+            observed_at_ms,
+            message,
+        } => Observable::Failed {
+            source: observation_source_for_persistence(source),
+            observed_at_ms: *observed_at_ms,
+            message: redact_secrets(message),
+        },
+    }
+}
+
+fn usage_measurement_for_persistence(measurement: &UsageMeasurement) -> UsageMeasurement {
+    UsageMeasurement {
+        kind: measurement.kind,
+        amount: measurement.amount,
+        unit: match &measurement.unit {
+            UsageUnit::Other(unit) => UsageUnit::Other(redact_secrets(unit)),
+            unit => unit.clone(),
+        },
+        total: measurement.total,
+    }
+}
+
+fn launch_configuration_for_persistence(
+    configuration: &LaunchConfiguration,
+) -> LaunchConfiguration {
+    LaunchConfiguration {
+        model: redact_optional(&configuration.model),
+        permission_mode: redact_optional(&configuration.permission_mode),
+        approval_mode: redact_optional(&configuration.approval_mode),
+        sandbox_mode: redact_optional(&configuration.sandbox_mode),
+        safe_flags: configuration
+            .safe_flags
+            .iter()
+            .map(|flag| redact_secrets(flag))
+            .collect(),
+    }
+}
+
+fn context_usage_for_persistence(context: &ContextUsageSnapshot) -> ContextUsageSnapshot {
+    ContextUsageSnapshot {
+        scope_id: redact_optional(&context.scope_id),
+        measurement: usage_measurement_for_persistence(&context.measurement),
+        effective_window: context
+            .effective_window
+            .as_ref()
+            .map(usage_measurement_for_persistence),
+    }
+}
+
+fn quota_for_persistence(quota: &QuotaSnapshot) -> QuotaSnapshot {
+    QuotaSnapshot {
+        scope_id: redact_optional(&quota.scope_id),
+        scope_label: redact_optional(&quota.scope_label),
+        windows: quota
+            .windows
+            .iter()
+            .map(|window| QuotaWindow {
+                label: redact_secrets(&window.label),
+                measurement: usage_measurement_for_persistence(&window.measurement),
+                resets_at_ms: window.resets_at_ms,
+                hard_limit: window.hard_limit,
+            })
+            .collect(),
+    }
+}
+
+fn runtime_metadata_for_persistence(runtime: &AgentRuntimeMetadata) -> AgentRuntimeMetadata {
+    AgentRuntimeMetadata {
+        launch: turn_core::model::AgentLaunchFacts {
+            requested: observable_for_persistence(
+                &runtime.launch.requested,
+                launch_configuration_for_persistence,
+            ),
+            effective: observable_for_persistence(
+                &runtime.launch.effective,
+                launch_configuration_for_persistence,
+            ),
+            current: observable_for_persistence(
+                &runtime.launch.current,
+                launch_configuration_for_persistence,
+            ),
+        },
+        context: observable_for_persistence(&runtime.context, context_usage_for_persistence),
+        quota: observable_for_persistence(&runtime.quota, quota_for_persistence),
+    }
+}
+
 pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
     let external_id = operational_id_for_persistence(&agent.external_id);
     let reference = agent_ref_for_persistence(&agent.agent);
@@ -815,6 +948,7 @@ pub(crate) fn agent_info_for_persistence(agent: &AgentInfo) -> AgentInfo {
         tokens_used: agent.tokens_used,
         cost_usd: agent.cost_usd,
         permission_mode: redact_optional(&agent.permission_mode),
+        runtime: runtime_metadata_for_persistence(&agent.runtime),
         git_branch: redact_optional(&agent.git_branch),
         resumable: agent.resumable && !lost_operational_identity,
     }
@@ -1410,5 +1544,66 @@ mod tests {
         assert_eq!(safe.agent.external_id, None);
         assert!(safe.identity_aliases.is_empty());
         assert!(!safe.resumable);
+    }
+
+    #[test]
+    fn runtime_observation_receipts_keep_state_and_numbers_but_redact_every_text_leaf() {
+        use turn_core::model::{
+            LaunchConfiguration, Observable, ObservationSource, ObservationSourceKind,
+            QuotaSnapshot, QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+        };
+
+        const SECRET: &str = "ghp_0123456789abcdefghijklmnopqrstuvwxyz";
+        let source = ObservationSource::new(
+            ObservationSourceKind::Provider,
+            format!("provider {SECRET}"),
+        );
+        let mut agent = AgentInfo::default();
+        agent.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some(format!("model {SECRET}")),
+                permission_mode: Some(format!("mode {SECRET}")),
+                approval_mode: None,
+                sandbox_mode: None,
+                safe_flags: vec![format!("--profile={SECRET}")],
+            },
+            source.clone(),
+            101,
+            Some(202),
+        );
+        agent.runtime.context = Observable::failed(source.clone(), 303, format!("error {SECRET}"));
+        agent.runtime.quota = Observable::stale(
+            QuotaSnapshot {
+                scope_id: Some(format!("scope {SECRET}")),
+                scope_label: Some(format!("account {SECRET}")),
+                windows: vec![QuotaWindow {
+                    label: format!("window {SECRET}"),
+                    measurement: UsageMeasurement {
+                        kind: UsageMeasurementKind::Remaining,
+                        amount: 17.0,
+                        unit: UsageUnit::Percent,
+                        total: None,
+                    },
+                    resets_at_ms: Some(404),
+                    hard_limit: Some(true),
+                }],
+            },
+            source,
+            303,
+            Some(304),
+        );
+
+        let safe = agent_info_for_persistence(&agent);
+        let json = serde_json::to_string(&safe.runtime).unwrap();
+        assert!(!json.contains(SECRET), "runtime metadata leaked: {json}");
+        assert!(json.contains(REDACTED));
+        assert!(json.contains("\"state\":\"stale\""));
+        assert!(json.contains("\"amount\":17.0"));
+        assert!(json.contains("\"observed_at_ms\":303"));
+
+        let Observable::Failed { message, .. } = safe.runtime.context else {
+            panic!("failed state must survive redaction");
+        };
+        assert_eq!(message, format!("error {REDACTED}"));
     }
 }

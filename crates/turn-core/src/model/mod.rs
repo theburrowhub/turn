@@ -3,6 +3,7 @@
 //! The hierarchy is Workspace → Session → ProcessNode, with Layout/Pane
 //! describing what the user sees and Template describing how to make more of it.
 
+pub mod agent_runtime;
 pub mod handoff;
 pub mod hierarchy;
 pub mod layout;
@@ -11,6 +12,11 @@ pub mod session;
 pub mod template;
 pub mod workspace;
 
+pub use agent_runtime::{
+    AgentLaunchFacts, AgentRuntimeMetadata, ContextUsageSnapshot, LaunchConfiguration, Observable,
+    ObservationSource, ObservationSourceKind, QuotaSnapshot, QuotaWindow, UsageMeasurement,
+    UsageMeasurementKind, UsageUnit,
+};
 pub use handoff::{ContextHandoffMode, ContextHandoffOutcome};
 pub use hierarchy::{
     ActivityPreview, AgentName, HierarchyNodeKind, LeaseMode, LeaseState, NameSource,
