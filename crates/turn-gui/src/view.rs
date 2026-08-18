@@ -2191,6 +2191,104 @@ fn effective_selection(snapshot: &HierarchySnapshot, state: &ViewState) -> Optio
         .or_else(|| snapshot.tree_state.selected.clone())
 }
 
+fn hierarchy_projects_technical_nodes(state: &ViewState) -> bool {
+    state.tree_visibility == TreeVisibilityMode::Technical || !state.tree_query.trim().is_empty()
+}
+
+/// Moves a persisted selection off implementation plumbing when the current projection hides it.
+///
+/// A wrapper that becomes transparent must not remain the invisible subject of the WorkSurface.
+/// Prefer the first useful descendant promoted through that wrapper (using the same operational
+/// ordering as the tree), then the nearest useful ancestor, and finally the containing Session.
+/// The optimistic local selection prevents this from emitting another action on every frame while
+/// the daemon persists the replacement.
+fn rehome_hidden_technical_selection(snapshot: &HierarchySnapshot, state: &mut ViewState) {
+    if hierarchy_projects_technical_nodes(state) {
+        return;
+    }
+    let Some(HierarchyKey::Process { node_id }) = effective_selection(snapshot, state) else {
+        return;
+    };
+    let Some(session) = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|session| session.nodes.iter().any(|node| node.node_id == node_id))
+    else {
+        return;
+    };
+    let Some(hidden) = session.nodes.iter().find(|node| node.node_id == node_id) else {
+        return;
+    };
+    if !process_is_technical_wrapper(hidden) {
+        return;
+    }
+
+    let rank: HashMap<HierarchyKey, usize> = effective_manual_order(snapshot, state)
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, key)| (key, index))
+        .collect();
+    let (projected, _) = projected_process_rows(session, &rank, false);
+    let descendant = projected.iter().find_map(|row| match row {
+        HierarchyRow::Process { node, .. }
+            if process_descends_from(session, &node.node_id, &node_id) =>
+        {
+            Some(HierarchyKey::process(node.node_id.clone()))
+        }
+        _ => None,
+    });
+
+    let replacement = descendant.or_else(|| {
+        let mut cursor = hidden.parent.as_ref();
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = cursor {
+            if !visited.insert(parent_id.clone()) {
+                break;
+            }
+            let Some(parent) = session
+                .nodes
+                .iter()
+                .find(|candidate| &candidate.node_id == parent_id)
+            else {
+                break;
+            };
+            if !process_is_technical_wrapper(parent) {
+                return Some(HierarchyKey::process(parent.node_id.clone()));
+            }
+            cursor = parent.parent.as_ref();
+        }
+        None
+    });
+    let replacement =
+        replacement.unwrap_or_else(|| HierarchyKey::session(session.session.id.clone()));
+    set_hierarchy_selection(state, snapshot, replacement);
+}
+
+fn process_descends_from(session: &SessionTreeView, candidate: &NodeId, ancestor: &NodeId) -> bool {
+    let mut cursor = session
+        .nodes
+        .iter()
+        .find(|node| &node.node_id == candidate)
+        .and_then(|node| node.parent.as_ref());
+    let mut visited = HashSet::new();
+    while let Some(parent_id) = cursor {
+        if parent_id == ancestor {
+            return true;
+        }
+        if !visited.insert(parent_id.clone()) {
+            break;
+        }
+        cursor = session
+            .nodes
+            .iter()
+            .find(|node| &node.node_id == parent_id)
+            .and_then(|node| node.parent.as_ref());
+    }
+    false
+}
+
 fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option<WorkspaceId> {
     match key {
         HierarchyKey::Workspace { workspace_id } => Some(workspace_id.clone()),
@@ -2270,8 +2368,7 @@ fn visible_hierarchy_rows<'a>(
     let query = state.tree_query.trim().to_ascii_lowercase();
     // A search is an explicit request to inspect implementation details. It reveals
     // technical wrappers just like Technical mode, while ordinary browsing stays semantic.
-    let include_technical =
-        state.tree_visibility == TreeVisibilityMode::Technical || !query.is_empty();
+    let include_technical = hierarchy_projects_technical_nodes(state);
     let ordered = ordered_hierarchy_rows(
         snapshot,
         include_archived || archived_filter,
@@ -2924,6 +3021,9 @@ impl<'a> TurnView<'a> {
         let sidebar_width = SIDEBAR_WIDTH
             .min((body.width() * 0.42).max(80.0))
             .min(body.width());
+        if let Some(snapshot) = hierarchy.as_ref() {
+            rehome_hidden_technical_selection(snapshot, state);
+        }
         let current_tree_selection = hierarchy
             .as_ref()
             .and_then(|snapshot| effective_selection(snapshot, state));
@@ -12308,8 +12408,39 @@ mod tests {
         nodes[child_index].parent = Some(shell_id.clone());
         nodes[child_index].depth = 2;
         nodes.insert(child_index, shell);
+        snapshot.tree_state.selected = Some(HierarchyKey::process(shell_id.clone()));
 
-        let normal = visible_hierarchy_rows(&snapshot, &ViewState::default(), false);
+        let mut normal_state = ViewState::default();
+        rehome_hidden_technical_selection(&snapshot, &mut normal_state);
+        assert_eq!(
+            effective_selection(&snapshot, &normal_state),
+            Some(HierarchyKey::process(child_id.clone())),
+            "a persisted wrapper selection follows the semantic work it represented"
+        );
+        assert_eq!(
+            work_surface::resolve(
+                &snapshot,
+                effective_selection(&snapshot, &normal_state).as_ref(),
+                None,
+            )
+            .map(work_surface::ResolvedViewTarget::public),
+            Some(ViewTarget::Node(child_id.clone())),
+            "the right-hand WorkSurface resolves the promoted child, never the hidden shell"
+        );
+        assert!(matches!(
+            normal_state.take_hierarchy_actions().as_slice(),
+            [HierarchyAction::Select {
+                key: HierarchyKey::Process { node_id },
+                ..
+            }] if node_id == &child_id
+        ));
+        rehome_hidden_technical_selection(&snapshot, &mut normal_state);
+        assert!(
+            normal_state.take_hierarchy_actions().is_empty(),
+            "the optimistic replacement suppresses duplicate persistence while awaiting ack"
+        );
+
+        let normal = visible_hierarchy_rows(&snapshot, &normal_state, false);
         assert!(!normal
             .iter()
             .any(|row| row.key() == HierarchyKey::process(shell_id.clone())));
