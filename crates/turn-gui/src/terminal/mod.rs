@@ -3295,6 +3295,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn shift_enter_reaches_the_program_as_multiline_input() {
+        let outcome = input_event(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::default()
+            },
+        });
+        assert_eq!(
+            outcome.actions,
+            vec![PaneAction::Write(b"\x1b\r".to_vec())],
+            "the focused pane must receive one multiline chord, not a submitting carriage return"
+        );
+    }
+
     /// What is still being composed is not sent.
     ///
     /// A preedit is a candidate: it is replaced or withdrawn as the user keeps typing, so

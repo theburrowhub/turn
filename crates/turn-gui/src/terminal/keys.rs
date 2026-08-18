@@ -126,6 +126,20 @@ pub fn encode_key(key: Key, modifiers: &Modifiers, modes: &Modes) -> Option<Vec<
     let alt_prefix = modifiers.alt && !modifiers.ctrl;
 
     let bytes = match key {
+        Key::Enter
+            if modifiers.shift
+                && !modifiers.alt
+                && !modifiers.ctrl
+                && !modifiers.mac_cmd
+                && !modifiers.command =>
+        {
+            // A bare carriage return cannot carry Shift, so sending the ordinary
+            // Enter byte here makes an agent submit instead of inserting a line.
+            // Meta-Enter is the portable multiline fallback understood by agent
+            // composers and survives an ordinary pty without enhanced-key
+            // negotiation.
+            vec![0x1b, b'\r']
+        }
         Key::Enter => {
             // Carriage return, not newline. A pty in canonical mode turns CR into
             // whatever the line discipline wants; sending LF instead makes a shell
@@ -331,6 +345,26 @@ mod tests {
             encode_key(Key::Tab, &shift(), &normal()),
             Some(b"\x1b[Z".to_vec()),
             "Shift+Tab is the back-tab sequence, which every completion menu reads"
+        );
+    }
+
+    #[test]
+    fn shift_enter_uses_the_portable_multiline_sequence() {
+        assert_eq!(
+            encode_key(Key::Enter, &shift(), &normal()),
+            Some(b"\x1b\r".to_vec()),
+            "Shift+Enter must remain distinct from the carriage return that submits"
+        );
+
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            encode_key(Key::Enter, &alt_shift, &normal()),
+            Some(b"\x1b\r".to_vec()),
+            "composing Shift with Alt must not add a second escape"
         );
     }
 
