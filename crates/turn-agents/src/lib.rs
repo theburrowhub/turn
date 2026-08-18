@@ -25,6 +25,7 @@ pub mod context;
 pub mod gemini;
 pub mod heuristic;
 pub mod opencode;
+pub mod quota;
 pub mod registry;
 pub mod risk;
 pub mod server;
@@ -44,5 +45,12 @@ pub use context::{
 pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
 pub use opencode::OpenCodeAdapter;
+pub use quota::{
+    account_quota_source_for_tool, parse_codex_account_quota_response, probe_codex_account_quota,
+    AccountCredits, AccountQuotaBucket, AccountQuotaObservation, AccountQuotaParseError,
+    AccountQuotaSource, AccountQuotaWindow, AccountSpendControl, QuotaProbeError,
+    MAX_ACCOUNT_QUOTA_MESSAGE_BYTES, MAX_ACCOUNT_QUOTA_PROBE_TIMEOUT,
+    MIN_ACCOUNT_QUOTA_REFRESH_INTERVAL,
+};
 pub use registry::{AdapterLaunchCatalogue, AdapterRegistry, GenericTerminalAdapter, Selection};
 pub use server::{HookServer, HookStats, ServerError};
