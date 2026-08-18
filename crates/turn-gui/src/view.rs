@@ -849,6 +849,20 @@ impl NewPaneDraft {
             error: None,
         }
     }
+
+    fn agent(target_pane_id: PaneId, placement: PanePlacement) -> Self {
+        let mut draft = Self::new(target_pane_id, placement);
+        draft.kind = PaneKind::Agent;
+        let choice = AGENT_QUICK_CHOICES[0];
+        select_agent_program(
+            &mut draft.program,
+            &mut draft.arguments,
+            &mut draft.launch_profile,
+            choice,
+        );
+        draft.title = choice.label.to_string();
+        draft
+    }
 }
 
 impl NodeEditDraft {
@@ -1303,6 +1317,13 @@ fn agent_choice_for_program(program: &str) -> Option<AgentQuickChoice> {
 
 fn launch_profile(adapter_id: &str, profile_id: &str) -> AgentLaunchProfileRef {
     AgentLaunchProfileRef::new(adapter_id, profile_id)
+}
+
+fn quick_agent_pane(choice: AgentQuickChoice, profile_id: &str) -> NewPane {
+    let mut pane = NewPane::new(PaneKind::Agent).with_command(choice.program);
+    pane.title = Some(choice.label.to_string());
+    pane.launch_profile = Some(launch_profile(choice.adapter_id, profile_id));
+    pane
 }
 
 fn selected_launch_profile(profile: Option<&AgentLaunchProfileRef>) -> &'static str {
@@ -6594,8 +6615,41 @@ impl<'a> TurnView<'a> {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Agent · split right").clicked() {
-                            actions.push(ViewAction::Run(Command::LaunchAgent));
+                        ui.label(RichText::new("AGENTS").small().strong().color(theme.text_dim));
+                        let target = self
+                            .layout
+                            .as_ref()
+                            .and_then(|layout| layout.active.clone());
+                        for choice in AGENT_QUICK_CHOICES {
+                            ui.horizontal(|ui| {
+                                for (profile, mode) in [
+                                    (SAFE_LAUNCH_PROFILE, "Safe"),
+                                    (AUTONOMOUS_LAUNCH_PROFILE, "Autonomous"),
+                                ] {
+                                    if ui
+                                        .add_enabled(
+                                            target.is_some(),
+                                            egui::Button::new(format!("{} · {mode}", choice.label)),
+                                        )
+                                        .clicked()
+                                    {
+                                        actions.push(ViewAction::CreatePane {
+                                            target_pane_id: target.clone().expect("enabled above"),
+                                            placement: self.preferred_pane_placement(),
+                                            pane: quick_agent_pane(choice, profile),
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        if ui.button("Agent options…").clicked() {
+                            if let Some(target) = target {
+                                state.new_pane = Some(NewPaneDraft::agent(
+                                    target,
+                                    self.preferred_pane_placement(),
+                                ));
+                            }
                             ui.close();
                         }
                         ui.separator();
@@ -13829,6 +13883,37 @@ mod tests {
         assert_eq!(
             profile,
             Some(launch_profile("codex", AUTONOMOUS_LAUNCH_PROFILE))
+        );
+    }
+
+    #[test]
+    fn every_quick_agent_action_is_a_complete_zero_memory_pane_request() {
+        for choice in AGENT_QUICK_CHOICES {
+            for profile_id in [SAFE_LAUNCH_PROFILE, AUTONOMOUS_LAUNCH_PROFILE] {
+                let pane = quick_agent_pane(choice, profile_id);
+                assert_eq!(pane.kind, PaneKind::Agent);
+                assert_eq!(pane.command.as_deref(), Some(choice.program));
+                assert_eq!(pane.title.as_deref(), Some(choice.label));
+                assert!(
+                    pane.args.is_empty(),
+                    "the UI must persist intent, never provider flags"
+                );
+                assert_eq!(
+                    pane.launch_profile,
+                    Some(launch_profile(choice.adapter_id, profile_id))
+                );
+            }
+        }
+
+        let draft = NewPaneDraft::agent(
+            PaneId::from_stored("pane_agent_options"),
+            PanePlacement::SplitBelow,
+        );
+        assert_eq!(draft.kind, PaneKind::Agent);
+        assert_eq!(draft.program, "claude");
+        assert_eq!(
+            draft.launch_profile,
+            Some(launch_profile("claude-code", SAFE_LAUNCH_PROFILE))
         );
     }
 

@@ -9363,4 +9363,41 @@ mod tests {
                 && pane.args == ["-f", "file with spaces.log"]
         ));
     }
+
+    #[test]
+    fn quick_agent_creation_carries_semantic_policy_to_the_daemon_unchanged() {
+        let mut desk = Desk::new();
+        let session_id = SessionId::from_stored("sess_quick_agent");
+        let target = PaneId::from_stored("pane_quick_agent_target");
+        desk.selected = Some(session_id.clone());
+        let mut pane = NewPane::new(PaneKind::Agent).with_command("codex");
+        pane.launch_profile = Some(turn_core::model::AgentLaunchProfileRef::new(
+            "codex",
+            "autonomous",
+        ));
+
+        let requests = sent(&desk.apply_view_action(
+            ViewAction::CreatePane {
+                target_pane_id: target.clone(),
+                placement: PanePlacement::SplitRight,
+                pane,
+            },
+            T0,
+        ));
+
+        assert!(matches!(
+            requests.as_slice(),
+            [Request::CreatePane {
+                session_id: created_session,
+                target_pane_id,
+                placement: PanePlacement::SplitRight,
+                pane,
+            }] if created_session == &session_id
+                && target_pane_id == &target
+                && pane.command.as_deref() == Some("codex")
+                && pane.args.is_empty()
+                && pane.launch_profile.as_ref().is_some_and(|profile|
+                    profile.adapter_id == "codex" && profile.profile_id == "autonomous")
+        ));
+    }
 }
