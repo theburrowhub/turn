@@ -402,7 +402,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolved.args,
-            args(&["--model", "opus", "--dangerously-skip-permissions"])
+            args(&["--dangerously-skip-permissions", "--model", "opus"])
         );
         assert_eq!(resolved.posture, LaunchPermissionPosture::BypassPermissions);
 
@@ -447,9 +447,9 @@ mod tests {
         assert_eq!(
             resolved.args,
             args(&[
+                "--dangerously-bypass-approvals-and-sandbox",
                 "--model",
                 "gpt-5.6-codex",
-                "--dangerously-bypass-approvals-and-sandbox"
             ])
         );
         assert_eq!(
@@ -491,7 +491,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolved.args,
-            args(&["--model", "gemini-3", "--approval-mode", "yolo"])
+            args(&["--approval-mode", "yolo", "--model", "gemini-3"])
         );
         assert_eq!(resolved.posture, LaunchPermissionPosture::YoloApprovalMode);
         for equivalent in [
@@ -522,7 +522,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resolved.args,
-            args(&["--model", "openai/gpt-5.2", "--auto"])
+            args(&["--auto", "--model", "openai/gpt-5.2"])
         );
         assert_eq!(
             resolved.posture,
@@ -603,11 +603,11 @@ mod tests {
                 .position(|arg| arg == "--")
                 .expect("the literal prompt boundary");
 
-            assert_eq!(
-                &resolved.args[..2],
-                &requested[..2],
-                "{} moved the option prefix",
-                case.adapter
+            assert!(
+                resolved.args.ends_with(&requested),
+                "{} changed the requested argv: {:?}",
+                case.adapter,
+                resolved.args
             );
             assert_eq!(
                 &resolved.args[effective_prompt_start..],

@@ -30,13 +30,11 @@ pub fn launch_fact_configurations(
     profile: &ResolvedLaunchProfile,
 ) -> LaunchFactConfigurations {
     let requested = adapter.launch_configuration(requested_args, profile);
-    // A semantic request is intent; the effective receipt needs argv evidence.
-    // If an autonomous resolver ever reports a control that is absent from the
-    // option-bearing prefix, do not repeat its posture as fact. This protects
-    // restored/legacy rows and future adapters even though the live daemon also
-    // rejects argument-boundary violations before spawning.
+    // A semantic request is intent; the effective receipt needs provider-owned
+    // argv evidence. Flag names are display metadata only: a value-bearing mode
+    // can be present with the wrong value or lose to a repeated conflict.
     let mut ungrounded = profile.clone();
-    let effective_profile = if autonomous_profile_is_grounded(effective_args, profile) {
+    let effective_profile = if adapter.launch_profile_is_grounded(effective_args, profile) {
         profile
     } else {
         ungrounded.profile_id = "custom".into();
@@ -50,18 +48,6 @@ pub fn launch_fact_configurations(
         requested,
         effective,
     }
-}
-
-fn autonomous_profile_is_grounded(args: &[String], profile: &ResolvedLaunchProfile) -> bool {
-    if profile.role != Some(LaunchProfileRole::Autonomous) {
-        return true;
-    }
-    let observed = safe_flag_names(args);
-    !profile.effective_flag_names.is_empty()
-        && profile
-            .effective_flag_names
-            .iter()
-            .all(|flag| safe_flag_name(flag).is_some_and(|flag| observed.contains(&flag)))
 }
 
 /// Common privacy boundary used by provider-owned launch inspectors.
@@ -561,5 +547,81 @@ mod tests {
             assert!(facts.effective.sandbox_mode.is_none(), "{}", adapter.id());
             assert!(facts.effective.safe_flags.is_empty(), "{}", adapter.id());
         }
+    }
+
+    #[test]
+    fn autonomous_grounding_is_provider_semantics_not_display_flag_names() {
+        let claude = ClaudeCodeAdapter::new();
+        let mut claude_profile = claude
+            .resolve_launch_profile(AUTONOMOUS_PROFILE_ID, &[])
+            .unwrap();
+        claude_profile.effective_flag_names = strings(&["--permission-mode"]);
+        assert!(claude.launch_profile_is_grounded(
+            &strings(&["--permission-mode=bypassPermissions"]),
+            &claude_profile
+        ));
+        for wrong in [
+            strings(&["--permission-mode=plan"]),
+            strings(&["--permission-mode"]),
+            strings(&[
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "plan",
+            ]),
+            strings(&["--", "--dangerously-skip-permissions"]),
+        ] {
+            assert!(!claude.launch_profile_is_grounded(&wrong, &claude_profile));
+        }
+
+        let codex = CodexAdapter::new();
+        let codex_profile = codex
+            .resolve_launch_profile(AUTONOMOUS_PROFILE_ID, &[])
+            .unwrap();
+        assert!(codex.launch_profile_is_grounded(&codex_profile.args, &codex_profile));
+        assert!(!codex.launch_profile_is_grounded(
+            &strings(&[
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ask-for-approval=never",
+            ]),
+            &codex_profile
+        ));
+
+        let gemini = GeminiCliAdapter::new();
+        let mut gemini_profile = gemini
+            .resolve_launch_profile(AUTONOMOUS_PROFILE_ID, &[])
+            .unwrap();
+        gemini_profile.effective_flag_names = strings(&["--approval-mode"]);
+        for grounded in [
+            strings(&["--approval-mode", "yolo"]),
+            strings(&["--approval-mode=yolo"]),
+            strings(&["-y"]),
+            strings(&["--approval-mode=yolo", "--approval-mode", "yolo"]),
+        ] {
+            assert!(gemini.launch_profile_is_grounded(&grounded, &gemini_profile));
+        }
+        for wrong in [
+            strings(&["--approval-mode", "plan"]),
+            strings(&["--approval-mode=plan"]),
+            strings(&["--approval-mode"]),
+            strings(&["--yolo", "--approval-mode=plan"]),
+            strings(&["--", "--approval-mode=yolo"]),
+        ] {
+            assert!(!gemini.launch_profile_is_grounded(&wrong, &gemini_profile));
+            let facts = launch_fact_configurations(&gemini, &[], &wrong, &gemini_profile);
+            assert!(facts
+                .effective
+                .permission_mode
+                .as_deref()
+                .is_some_and(|mode| mode.starts_with("Custom")));
+        }
+
+        let opencode = OpenCodeAdapter::new();
+        let opencode_profile = opencode
+            .resolve_launch_profile(AUTONOMOUS_PROFILE_ID, &[])
+            .unwrap();
+        assert!(opencode.launch_profile_is_grounded(&strings(&["--auto"]), &opencode_profile));
+        assert!(
+            !opencode.launch_profile_is_grounded(&strings(&["--", "--auto"]), &opencode_profile)
+        );
     }
 }

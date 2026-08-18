@@ -41,6 +41,10 @@ struct CapturingBuiltinAdapter {
 
 struct LateControlAdapter;
 
+struct UngroundedGeminiAdapter {
+    inner: GeminiCliAdapter,
+}
+
 impl AgentAdapter for LateControlAdapter {
     fn id(&self) -> &'static str {
         "late-control-test"
@@ -127,6 +131,14 @@ impl AgentAdapter for CapturingBuiltinAdapter {
         self.inner.launch_configuration(args, profile)
     }
 
+    fn launch_profile_is_grounded(
+        &self,
+        args: &[String],
+        profile: &turn_agents::ResolvedLaunchProfile,
+    ) -> bool {
+        self.inner.launch_profile_is_grounded(args, profile)
+    }
+
     fn detect(&self, _executable: &str) -> Option<PathBuf> {
         turn_agents::adapter::which("true")
     }
@@ -156,6 +168,83 @@ impl AgentAdapter for CapturingBuiltinAdapter {
 
     fn resume_args(&self, external_id: &str) -> Option<Vec<String>> {
         self.inner.resume_args(external_id)
+    }
+}
+
+impl AgentAdapter for UngroundedGeminiAdapter {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn provider(&self) -> &'static str {
+        self.inner.provider()
+    }
+
+    fn executables(&self) -> &'static [&'static str] {
+        self.inner.executables()
+    }
+
+    fn best_level(&self) -> IntegrationLevel {
+        self.inner.best_level()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        self.inner.launch_profiles()
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<turn_agents::ResolvedLaunchProfile, AdapterError> {
+        self.inner.resolve_launch_profile(profile_id, user_args)
+    }
+
+    fn launch_configuration(
+        &self,
+        args: &[String],
+        profile: &turn_agents::ResolvedLaunchProfile,
+    ) -> LaunchConfiguration {
+        self.inner.launch_configuration(args, profile)
+    }
+
+    fn launch_profile_is_grounded(
+        &self,
+        args: &[String],
+        profile: &turn_agents::ResolvedLaunchProfile,
+    ) -> bool {
+        self.inner.launch_profile_is_grounded(args, profile)
+    }
+
+    fn detect(&self, _executable: &str) -> Option<PathBuf> {
+        turn_agents::adapter::which("true")
+    }
+
+    fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        Ok(LaunchPlan {
+            command: turn_agents::adapter::which("true")
+                .expect("the POSIX true executable")
+                .to_string_lossy()
+                .into_owned(),
+            // Simulates a faulty plan that replaces the resolved yolo value with
+            // plan while preserving argv structurally. Only provider semantics
+            // can catch it; the expected display flag name is still present.
+            args: turn_agents::insert_control_arguments(
+                &ctx.user_args,
+                ["--approval-mode=plan".into()],
+            ),
+            env: Vec::new(),
+            level: IntegrationLevel::Structured,
+            note: "this plan must fail semantic grounding".into(),
+        })
+    }
+
+    fn normalise(&self, payload: &serde_json::Value, ctx: &EventContext) -> Vec<TurnEvent> {
+        self.inner.normalise(payload, ctx)
     }
 }
 
@@ -472,11 +561,11 @@ async fn autonomous_controls_and_integration_args_precede_an_exact_unchanged_pro
             .iter()
             .position(|arg| arg == "--")
             .expect("the prompt boundary survives");
-        assert_eq!(
-            &launch.plan.args[..requested_boundary],
-            &requested_args[..requested_boundary],
-            "{} changed user option argv",
-            case.adapter_id
+        assert!(
+            launch.plan.args.ends_with(&requested_args),
+            "{} changed requested argv: {:?}",
+            case.adapter_id,
+            launch.plan.args
         );
         assert_eq!(
             &launch.plan.args[effective_boundary..],
@@ -691,4 +780,51 @@ async fn a_future_adapter_that_appends_a_control_into_the_prompt_is_failed_close
         live.tree.is_empty(),
         "no runtime or integration claim may survive an unsafe plan"
     );
+}
+
+#[tokio::test]
+async fn an_autonomous_plan_without_provider_grounding_never_spawns_or_creates_a_receipt() {
+    let mut harness = Harness::new().await;
+    let mut registry = AdapterRegistry::bare();
+    registry.register(Arc::new(UngroundedGeminiAdapter {
+        inner: GeminiCliAdapter::new(),
+    }));
+    harness.core.registry = registry;
+    let (session_id, target_id) = add_isolated_session(&mut harness, "ungrounded-autonomous");
+    let (client, _frames) = harness.add_client(64);
+    let requested_profile = AgentLaunchProfileRef::new("gemini-cli", "autonomous");
+    let mut pane = NewPane::new(PaneKind::Agent).with_command("gemini");
+    pane.launch_profile = Some(requested_profile.clone());
+    // The faulty adapter will add the expected display flag name with `plan`
+    // rather than `yolo`. Name-only grounding would have launched and lied.
+
+    harness
+        .core
+        .dispatch(
+            client,
+            wire_round_trip(Request::CreatePane {
+                session_id: session_id.clone(),
+                target_pane_id: target_id,
+                placement: PanePlacement::SplitRight,
+                pane,
+            }),
+            NOW + 1,
+        )
+        .expect("the correctable pane definition survives a refused spawn");
+
+    let live = harness
+        .core
+        .sessions
+        .get(&session_id)
+        .expect("live session");
+    let created = live
+        .layout
+        .panes()
+        .into_iter()
+        .find(|pane| pane.command.as_deref() == Some("gemini"))
+        .expect("the semantic request remains visible to correct");
+    assert_eq!(created.launch_profile.as_ref(), Some(&requested_profile));
+    assert!(created.node_id.is_none());
+    assert!(live.tree.is_empty(), "no false runtime receipt may exist");
+    assert!(harness.core.processes.is_empty(), "nothing reached spawn");
 }

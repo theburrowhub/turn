@@ -49,6 +49,13 @@ pub enum AdapterError {
         "adapter `{adapter_id}` could not preserve the operator's argument boundary while adding launch controls"
     )]
     ArgumentBoundaryViolation { adapter_id: String },
+    #[error(
+        "adapter `{adapter_id}` did not prove that autonomous launch profile `{profile_id}` is effective in the final argument vector"
+    )]
+    LaunchProfileNotGrounded {
+        adapter_id: String,
+        profile_id: String,
+    },
 }
 
 /// The option-bearing part of an agent argv.
@@ -67,49 +74,41 @@ pub(crate) fn control_arguments(args: &[String]) -> &[String] {
 
 /// Adds Turn-owned CLI controls without moving or reinterpreting user argv.
 ///
-/// Generated values are inserted immediately before the first `--`; without a
-/// terminator they are appended. The complete user prefix and prompt suffix stay
-/// byte-for-byte and order-for-order intact.
+/// Generated values are prepended as one self-contained group. This is stronger
+/// than inserting immediately before `--`: an incomplete or variadic user option
+/// can only consume values to its right, so it can never consume a Turn-owned
+/// control. The complete user argv stays byte-for-byte and order-for-order exact,
+/// including positional prompts that do not use an explicit terminator.
 pub fn insert_control_arguments(
     args: &[String],
     generated: impl IntoIterator<Item = String>,
 ) -> Vec<String> {
-    let boundary = control_arguments(args).len();
     let generated: Vec<String> = generated.into_iter().collect();
     let mut resolved = Vec::with_capacity(args.len() + generated.len());
-    resolved.extend_from_slice(&args[..boundary]);
     resolved.extend(generated);
-    resolved.extend_from_slice(&args[boundary..]);
+    resolved.extend_from_slice(args);
     resolved
 }
 
 /// Proves that an adapter plan only inserted controls before the user's prompt.
 ///
-/// This is the daemon's fail-closed boundary for present and future adapters. A
-/// plan may append controls when no terminator exists. When one does exist, the
-/// exact prefix must remain first, the exact terminator-plus-prompt suffix must
-/// remain last, and no generated `--` may create an earlier boundary.
+/// This is the daemon's fail-closed boundary for present and future adapters.
+/// The complete requested argv must be an exact suffix of the effective argv.
+/// Everything before it is adapter-owned, and no generated exact `--` is allowed.
+/// Besides preserving an explicit prompt suffix, this prevents a dangling user
+/// option from consuming the first generated control without requiring Turn to
+/// duplicate every provider's argument grammar.
 pub fn validate_effective_arguments(
     adapter_id: &str,
     requested: &[String],
     effective: &[String],
 ) -> Result<(), AdapterError> {
-    let boundary = control_arguments(requested).len();
-    let prefix = &requested[..boundary];
-    let suffix = &requested[boundary..];
-    let valid = effective.starts_with(prefix)
-        && if suffix.is_empty() {
-            effective[boundary..]
-                .iter()
-                .all(|argument| argument != "--")
-        } else if effective.len() < requested.len() || !effective.ends_with(suffix) {
-            false
-        } else {
-            let suffix_start = effective.len() - suffix.len();
-            effective[boundary..suffix_start]
-                .iter()
-                .all(|argument| argument != "--")
-        };
+    let generated_len = effective.len().saturating_sub(requested.len());
+    let valid = effective.len() >= requested.len()
+        && effective.ends_with(requested)
+        && effective[..generated_len]
+            .iter()
+            .all(|argument| argument != "--");
     valid
         .then_some(())
         .ok_or_else(|| AdapterError::ArgumentBoundaryViolation {
@@ -422,6 +421,19 @@ pub trait AgentAdapter: Send + Sync {
         crate::launch_facts::base_launch_configuration(args, profile, false)
     }
 
+    /// Whether the final provider argv actually establishes a semantic profile.
+    ///
+    /// `effective_flag_names` is display metadata, not evidence: value-bearing
+    /// options, repetition and precedence are provider grammar. Future adapters
+    /// therefore fail closed for Autonomous until they implement this method.
+    fn launch_profile_is_grounded(
+        &self,
+        _args: &[String],
+        profile: &ResolvedLaunchProfile,
+    ) -> bool {
+        profile.role != Some(LaunchProfileRole::Autonomous)
+    }
+
     /// Whether this adapter handles a given command line.
     fn handles(&self, command: &str) -> bool {
         let executable = command
@@ -548,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_controls_are_inserted_before_the_first_terminator_only() {
+    fn generated_controls_are_prepended_before_the_complete_requested_argv() {
         let requested = vec![
             "--model".into(),
             "opus".into(),
@@ -563,10 +575,10 @@ mod tests {
         assert_eq!(
             effective,
             vec![
-                "--model",
-                "opus",
                 "--settings",
                 "/turn/owned.json",
+                "--model",
+                "opus",
                 "--",
                 "literal prompt",
                 "--settings=/not-an-option.json",
@@ -575,6 +587,37 @@ mod tests {
             ]
         );
         validate_effective_arguments("test", &requested, &effective).unwrap();
+
+        let dangling = vec!["--model".into(), "--".into(), "prompt".into()];
+        let protected = insert_control_arguments(&dangling, ["--auto".into()]);
+        assert_eq!(protected, vec!["--auto", "--model", "--", "prompt"]);
+        validate_effective_arguments("test", &dangling, &protected).unwrap();
+
+        let positional = vec!["literal prompt without terminator".into()];
+        let protected = insert_control_arguments(&positional, ["--auto".into()]);
+        assert_eq!(
+            protected,
+            vec!["--auto", "literal prompt without terminator"]
+        );
+        validate_effective_arguments("test", &positional, &protected).unwrap();
+
+        let resumed = insert_control_arguments(&dangling, ["--resume".into(), "session-1".into()]);
+        let profiled = insert_control_arguments(&resumed, ["--auto".into()]);
+        let integrated = insert_control_arguments(&profiled, ["-c".into(), "hooks={...}".into()]);
+        assert_eq!(
+            integrated,
+            vec![
+                "-c",
+                "hooks={...}",
+                "--auto",
+                "--resume",
+                "session-1",
+                "--model",
+                "--",
+                "prompt"
+            ]
+        );
+        validate_effective_arguments("test", &dangling, &integrated).unwrap();
     }
 
     #[test]
@@ -591,6 +634,13 @@ mod tests {
             vec![
                 "--".into(),
                 "--auto".into(),
+                "prompt".into(),
+                "--flag".into(),
+            ],
+            vec![
+                "--auto".into(),
+                "--".into(),
+                "--".into(),
                 "prompt".into(),
                 "--flag".into(),
             ],

@@ -432,7 +432,7 @@ impl Core {
         env.extend(pane.env.iter().cloned());
         // Resume and other one-launch controls are Turn-owned too: they must be
         // parsed as options, never appended into the literal prompt after `--`.
-        let args = insert_control_arguments(&pane.args, extra_args.iter().cloned());
+        let args = one_launch_arguments(&pane.args, extra_args)?;
         let needs = launch_authority(&launch, pane.kind, &args);
         let request = PaneRequest {
             kind: pane.kind,
@@ -970,6 +970,18 @@ impl Core {
             .map_err(|error| self.launch_prepare_error(token, error))?;
         validate_effective_arguments(selection.adapter.id(), &launch.user_args, &plan.args)
             .map_err(|error| self.launch_prepare_error(token, error))?;
+        if !selection
+            .adapter
+            .launch_profile_is_grounded(&plan.args, &profile)
+        {
+            return Err(self.launch_prepare_error(
+                token,
+                turn_agents::AdapterError::LaunchProfileNotGrounded {
+                    adapter_id: selection.adapter.id().to_string(),
+                    profile_id: profile.profile_id.clone(),
+                },
+            ));
+        }
         Ok(PreparedLaunch { plan, profile })
     }
 
@@ -991,10 +1003,11 @@ impl Core {
         } else if matches!(
             &error,
             turn_agents::AdapterError::ArgumentBoundaryViolation { .. }
+                | turn_agents::AdapterError::LaunchProfileNotGrounded { .. }
         ) {
             ProtoError::new(
                 ErrorCode::Unavailable,
-                "Turn refused an agent launch plan that would change literal prompt arguments",
+                "Turn refused an agent launch plan that did not preserve its effective controls",
             )
             .with_detail(detail)
         } else {
@@ -1312,6 +1325,25 @@ impl Core {
         }
         info
     }
+}
+
+/// Prepends ephemeral controls while retaining the pane definition as an exact
+/// suffix. This validation happens before the resulting vector becomes the
+/// adapter's `user_args`; otherwise a generated `--` could disguise itself as a
+/// user-owned boundary and escape the later adapter-plan validation.
+fn one_launch_arguments(
+    pane_args: &[String],
+    extra_args: &[String],
+) -> std::result::Result<Vec<String>, ProtoError> {
+    let effective = insert_control_arguments(pane_args, extra_args.iter().cloned());
+    validate_effective_arguments("turn-one-launch", pane_args, &effective).map_err(|error| {
+        ProtoError::new(
+            ErrorCode::Unavailable,
+            "Turn refused malformed one-launch controls before starting a process",
+        )
+        .with_detail(error.to_string())
+    })?;
+    Ok(effective)
 }
 
 /// What the pane and its session contribute to a launch, taken once so nothing holds
@@ -1789,6 +1821,19 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_resume_controls_are_prefixed_and_generated_terminators_fail_closed() {
+        let pane = vec!["--model".into(), "--".into(), "literal prompt".into()];
+        assert_eq!(
+            one_launch_arguments(&pane, &["--resume".into(), "session-1".into()]).unwrap(),
+            vec!["--resume", "session-1", "--model", "--", "literal prompt"]
+        );
+        let error = one_launch_arguments(&pane, &["--".into(), "forged".into()])
+            .expect_err("an internal terminator must not become adapter user argv");
+        assert_eq!(error.code, ErrorCode::Unavailable);
+        assert!(error.message.contains("malformed one-launch controls"));
+    }
+
+    #[test]
     fn a_shell_pane_with_no_command_runs_the_shell_itself_and_nothing_is_hosted_in_it() {
         let registry = AdapterRegistry::bare();
         let workspace = workspace_with_shell(Some("/bin/zsh"));
@@ -2216,8 +2261,10 @@ mod tests {
             .expect("the adapter must write its settings");
         let settings = plan
             .args
-            .last()
-            .expect("the injected settings path is the last argument")
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .map(|pair| &pair[1])
+            .expect("the injected settings path follows its control")
             .clone();
         assert!(
             settings.starts_with(&scratch.to_string_lossy().into_owned()),

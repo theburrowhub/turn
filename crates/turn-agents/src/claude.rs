@@ -429,6 +429,21 @@ impl AgentAdapter for ClaudeCodeAdapter {
         configuration
     }
 
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        if profile.role != Some(crate::LaunchProfileRole::Autonomous) {
+            return true;
+        }
+        if profile.adapter_id != self.id()
+            || profile.posture != LaunchPermissionPosture::BypassPermissions
+        {
+            return false;
+        }
+        let modes = claude_permission_modes(args);
+        let modes_are_bypass = modes.iter().all(|mode| *mode == Some("bypassPermissions"));
+        modes_are_bypass
+            && (claude_skips_permissions(args) || modes.contains(&Some("bypassPermissions")))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
         let resolved_profile = self.resolve_context_launch_profile(ctx)?;
         let user_args = resolved_profile.args;
@@ -1024,9 +1039,7 @@ mod tests {
 
         assert_eq!(plan.command, "claude");
         // The user's own flags survive.
-        assert!(plan
-            .args
-            .starts_with(&["--permission-mode".to_string(), "acceptEdits".to_string()]));
+        assert!(plan.args.ends_with(&ctx.user_args));
         let settings_index = plan.args.iter().position(|a| a == "--settings").unwrap();
         let path = PathBuf::from(&plan.args[settings_index + 1]);
         assert!(path.exists(), "the settings file must actually be written");
@@ -1275,10 +1288,7 @@ mod tests {
 
         let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
         let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(
-            &plan.args[..requested_boundary],
-            &ctx.user_args[..requested_boundary]
-        );
+        assert!(plan.args.ends_with(&ctx.user_args));
         assert_eq!(
             &plan.args[effective_boundary..],
             &ctx.user_args[requested_boundary..],

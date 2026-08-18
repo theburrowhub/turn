@@ -479,7 +479,7 @@ fn no_adapter_wraps_the_users_command_in_a_shell() {
         // The user's own arguments survive untouched, as separate argv entries —
         // never spliced into one string a shell would re-split.
         assert!(
-            plan.args.starts_with(&ctx.user_args),
+            plan.args.ends_with(&ctx.user_args),
             "{} mangled the user's arguments: {:?}",
             adapter.id(),
             plan.args

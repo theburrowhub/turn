@@ -181,6 +181,15 @@ impl AgentAdapter for OpenCodeAdapter {
         configuration
     }
 
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        profile.role != Some(crate::LaunchProfileRole::Autonomous)
+            || (profile.adapter_id == self.id()
+                && profile.posture == LaunchPermissionPosture::AutoApproveUnlessDenied
+                && control_arguments(args)
+                    .iter()
+                    .any(|arg| arg == OPENCODE_AUTO))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
         let resolved_profile = self.resolve_context_launch_profile(ctx)?;
         let profile_args = resolved_profile.args;

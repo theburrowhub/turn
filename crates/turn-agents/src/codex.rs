@@ -352,6 +352,17 @@ impl AgentAdapter for CodexAdapter {
         configuration
     }
 
+    fn launch_profile_is_grounded(&self, args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+        if profile.role != Some(crate::LaunchProfileRole::Autonomous) {
+            return true;
+        }
+        let controls = control_arguments(args);
+        profile.adapter_id == self.id()
+            && profile.posture == LaunchPermissionPosture::BypassApprovalsAndSandbox
+            && controls.iter().any(|arg| arg == CODEX_BYPASS_POLICY)
+            && !controls.iter().any(|arg| is_codex_policy_option(arg))
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
         let resolved_profile = self.resolve_context_launch_profile(ctx)?;
         let profile_args = resolved_profile.args;
@@ -984,9 +995,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(plan.command, "codex");
-        assert!(plan
-            .args
-            .starts_with(&["--model".to_string(), "gpt-5".to_string()]));
+        let ctx = launch_ctx(Some("/usr/local/bin/turn-hook"));
+        assert!(plan.args.ends_with(&ctx.user_args));
         assert_eq!(
             plan.args.iter().filter(|a| *a == "-c").count(),
             2,
@@ -1044,10 +1054,7 @@ mod tests {
 
         let plan = CodexAdapter::new().prepare(&ctx).unwrap();
         let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(
-            &plan.args[..requested_boundary],
-            &ctx.user_args[..requested_boundary]
-        );
+        assert!(plan.args.ends_with(&ctx.user_args));
         assert_eq!(
             &plan.args[effective_boundary..],
             &ctx.user_args[requested_boundary..]
