@@ -12,7 +12,9 @@ use super::{
 use crate::core::Core;
 use turn_core::event::Confidence;
 use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::{AgentName, NameSource, NodeKind, ProcessNode, Relation};
+use turn_core::model::{
+    AgentIdentitySource, AgentName, NameSource, NodeKind, ProcessNode, Relation,
+};
 use turn_core::state::{Lifecycle, Turn};
 
 impl Core {
@@ -23,6 +25,7 @@ impl Core {
     /// no pty of its own — it runs inside its parent's process — so it has no pid, and
     /// pretending otherwise would put a number in the UI that matches nothing.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn insert_subagent(
         &mut self,
         session_id: &SessionId,
@@ -31,6 +34,37 @@ impl Core {
         agent_type: Option<String>,
         agent_id: Option<String>,
         task: Option<String>,
+        now_ms: i64,
+    ) -> Changed {
+        self.insert_subagent_from(
+            session_id,
+            parent,
+            declared_name,
+            agent_type,
+            agent_id,
+            task,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Adds or enriches a subagent while retaining the structured identity channel.
+    ///
+    /// Claude Agent Teams currently declares one logical worker twice: the parent-side
+    /// Agent tool result uses `name@session-*`, while `SubagentStart`/`Stop` use an
+    /// `a<name>-*` lifecycle id. Exact ids always win. Cross-channel alias correlation
+    /// is allowed only under the same parent and only when it has one unambiguous
+    /// opposite-channel candidate.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn insert_subagent_from(
+        &mut self,
+        session_id: &SessionId,
+        parent: &NodeId,
+        declared_name: Option<String>,
+        agent_type: Option<String>,
+        agent_id: Option<String>,
+        task: Option<String>,
+        identity_source: Option<AgentIdentitySource>,
         now_ms: i64,
     ) -> Changed {
         // A declared name is authored by an agent which may itself be processing
@@ -49,50 +83,76 @@ impl Core {
         if session.tree.get(parent).is_none() {
             return Changed::default();
         }
-        // A repeated SubagentStart for an id we already have is the same subagent.
-        if let Some(id) = &agent_id {
-            if let Some(existing) = session.tree.children(parent).into_iter().find(|node| {
-                node.agent.as_ref().is_some_and(|agent| {
-                    agent
-                        .external_id
-                        .as_deref()
-                        .or(agent.agent.external_id.as_deref())
-                        == Some(id.as_str())
+        // An exact id is authoritative. If it misses, a name can pair two different
+        // structured channels only when exactly one opposite-channel sibling has the
+        // same alias. Two same-named siblings remain distinct rather than guessed.
+        let exact = agent_id.as_deref().and_then(|id| {
+            session
+                .tree
+                .children(parent)
+                .into_iter()
+                .find(|node| {
+                    node.agent
+                        .as_ref()
+                        .is_some_and(|agent| agent.matches_external_id(id))
                 })
-            }) {
-                let existing = existing.id.clone();
-                let terminal = session
+                .map(|node| node.id.clone())
+        });
+        let correlated = match (
+            exact.as_ref(),
+            identity_source,
+            correlation_alias(
+                identity_source,
+                &declared_name,
+                &agent_type,
+                agent_id.as_deref(),
+            ),
+        ) {
+            (None, Some(source), Some(alias)) => {
+                let opposite = opposite_identity_source(source);
+                let candidates: Vec<_> = session
                     .tree
-                    .get(&existing)
-                    .is_some_and(|node| node.lifecycle.is_terminal());
-                if let Some(node) = session.tree.get_mut(&existing) {
-                    if let Some(agent) = node.agent.as_mut() {
-                        if let Some(name) = declared_name.filter(|name| !name.trim().is_empty()) {
-                            agent.name.declared_name = Some(name.clone());
-                            agent.name.source = NameSource::ExplicitParentEvent;
-                            agent.name.confidence = Confidence::Explicit;
-                            if !agent.name.user_renamed {
-                                agent.name.display_name = name.clone();
-                                node.title = name;
-                            }
-                        }
-                        if let Some(kind) = agent_type.filter(|kind| !kind.trim().is_empty()) {
-                            agent.agent_type = Some(kind);
-                        }
-                        if let Some(task) = task.filter(|task| !task.trim().is_empty()) {
-                            agent.current_task = Some(task);
-                        }
-                        agent.agent.external_id = Some(id.clone());
-                    }
+                    .children(parent)
+                    .into_iter()
+                    .filter(|node| node.kind == NodeKind::Subagent)
+                    .filter(|node| {
+                        node.agent.as_ref().is_some_and(|agent| {
+                            agent.has_identity_source(opposite)
+                                && !agent.has_identity_source(source)
+                        })
+                    })
+                    .filter(|node| node_correlation_alias(node, opposite) == Some(alias.as_str()))
+                    .map(|node| node.id.clone())
+                    .collect();
+                match candidates.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
                 }
-                return Changed {
-                    node: Some(existing),
-                    structure: true,
-                    // A delayed declaration may enrich a terminal tombstone, but
-                    // it cannot start a new lifecycle for the same tool identity.
-                    refused: terminal,
-                };
             }
+            _ => None,
+        };
+        if let Some(existing) = exact.or(correlated) {
+            let terminal = session
+                .tree
+                .get(&existing)
+                .is_some_and(|node| node.lifecycle.is_terminal());
+            if let Some(node) = session.tree.get_mut(&existing) {
+                enrich_subagent(
+                    node,
+                    declared_name,
+                    agent_type,
+                    agent_id.as_deref(),
+                    task,
+                    identity_source,
+                );
+            }
+            return Changed {
+                node: Some(existing),
+                structure: true,
+                // A delayed declaration may enrich a terminal tombstone, but
+                // it cannot start a new lifecycle for the same tool identity.
+                refused: terminal,
+            };
         }
 
         // A tool type is useful metadata, but it is not necessarily the name the
@@ -121,7 +181,10 @@ impl Core {
         if let Some(agent) = node.agent.as_mut() {
             agent.agent_type = agent_type;
             agent.external_id = agent_id.clone();
-            agent.agent.external_id = agent_id;
+            agent.agent.external_id = agent_id.clone();
+            if let (Some(source), Some(id)) = (identity_source, agent_id) {
+                agent.record_identity_alias(source, id);
+            }
             agent.current_task = task;
             agent.name = match declared_name {
                 Some(name) => AgentName::declared(name),
@@ -159,6 +222,7 @@ impl Core {
         session_id: &SessionId,
         parent: &NodeId,
         agent_id: String,
+        identity_source: Option<AgentIdentitySource>,
         now_ms: i64,
     ) -> Changed {
         let Some(session) = self.sessions.get_mut(session_id) else {
@@ -168,16 +232,15 @@ impl Core {
             return Changed::default();
         }
         if let Some(existing) = session.tree.children(parent).into_iter().find(|node| {
-            node.agent.as_ref().is_some_and(|agent| {
-                agent
-                    .external_id
-                    .as_deref()
-                    .or(agent.agent.external_id.as_deref())
-                    == Some(agent_id.as_str())
-            })
+            node.agent
+                .as_ref()
+                .is_some_and(|agent| agent.matches_external_id(&agent_id))
         }) {
             let existing = existing.id.clone();
             if let Some(node) = session.tree.get_mut(&existing) {
+                if let (Some(agent), Some(source)) = (node.agent.as_mut(), identity_source) {
+                    agent.record_identity_alias(source, agent_id.clone());
+                }
                 node.lifecycle = Lifecycle::Exited { code: 0 };
                 node.turn = Some(Turn::Done);
                 node.ended_ms = Some(now_ms);
@@ -209,7 +272,10 @@ impl Core {
         node.ended_ms = Some(now_ms);
         if let Some(agent) = node.agent.as_mut() {
             agent.external_id = Some(agent_id.clone());
-            agent.agent.external_id = Some(agent_id);
+            agent.agent.external_id = Some(agent_id.clone());
+            if let Some(source) = identity_source {
+                agent.record_identity_alias(source, agent_id);
+            }
             agent.name = AgentName {
                 declared_name: None,
                 display_name: title,
@@ -329,6 +395,106 @@ impl Core {
     }
 }
 
+fn opposite_identity_source(source: AgentIdentitySource) -> AgentIdentitySource {
+    match source {
+        AgentIdentitySource::Lifecycle => AgentIdentitySource::ParentSpawn,
+        AgentIdentitySource::ParentSpawn => AgentIdentitySource::Lifecycle,
+    }
+}
+
+fn parent_spawn_id_alias(external_id: &str) -> Option<&str> {
+    let (name, session) = external_id.split_once('@')?;
+    (!name.is_empty() && session.starts_with("session-")).then_some(name)
+}
+
+fn correlation_alias(
+    source: Option<AgentIdentitySource>,
+    declared_name: &Option<String>,
+    agent_type: &Option<String>,
+    external_id: Option<&str>,
+) -> Option<String> {
+    let alias = match source? {
+        AgentIdentitySource::Lifecycle => declared_name.as_deref().or(agent_type.as_deref()),
+        AgentIdentitySource::ParentSpawn => declared_name
+            .as_deref()
+            .or_else(|| external_id.and_then(parent_spawn_id_alias)),
+    }?;
+    (!alias.trim().is_empty()).then(|| alias.to_string())
+}
+
+fn node_correlation_alias(node: &ProcessNode, source: AgentIdentitySource) -> Option<&str> {
+    let agent = node.agent.as_ref()?;
+    match source {
+        AgentIdentitySource::Lifecycle => agent
+            .name
+            .declared_name
+            .as_deref()
+            .or(agent.agent_type.as_deref()),
+        AgentIdentitySource::ParentSpawn => agent.name.declared_name.as_deref().or_else(|| {
+            agent
+                .identity_aliases
+                .iter()
+                .find(|alias| alias.source == AgentIdentitySource::ParentSpawn)
+                .and_then(|alias| parent_spawn_id_alias(&alias.external_id))
+        }),
+    }
+}
+
+fn enrich_subagent(
+    node: &mut ProcessNode,
+    declared_name: Option<String>,
+    agent_type: Option<String>,
+    agent_id: Option<&str>,
+    task: Option<String>,
+    identity_source: Option<AgentIdentitySource>,
+) {
+    let Some(agent) = node.agent.as_mut() else {
+        return;
+    };
+    if let Some(name) = declared_name.filter(|name| !name.trim().is_empty()) {
+        agent.name.declared_name = Some(name.clone());
+        agent.name.source = NameSource::ExplicitParentEvent;
+        agent.name.confidence = Confidence::Explicit;
+        if !agent.name.user_renamed {
+            agent.name.display_name = name.clone();
+            node.title = name;
+        }
+    }
+    if let Some(kind) = agent_type.filter(|kind| !kind.trim().is_empty()) {
+        // The parent's structured spawn result knows both the human name and the
+        // reusable agent type. A lifecycle hook may put the name in `agent_type`,
+        // so it only fills a missing type and never downgrades the richer result.
+        if identity_source == Some(AgentIdentitySource::ParentSpawn)
+            || identity_source.is_none()
+            || agent.agent_type.is_none()
+        {
+            agent.agent_type = Some(kind);
+        }
+    }
+    if let Some(task) = task.filter(|task| !task.trim().is_empty()) {
+        agent.current_task = Some(task);
+    }
+    if let Some(id) = agent_id {
+        let had_lifecycle = agent.has_identity_source(AgentIdentitySource::Lifecycle);
+        if let Some(source) = identity_source {
+            agent.record_identity_alias(source, id.to_string());
+        }
+        match identity_source {
+            // The lifecycle id is the worker's own runtime identity and therefore
+            // the preferred indexed/resume identity once it is available.
+            Some(AgentIdentitySource::Lifecycle) => {
+                agent.external_id = Some(id.to_string());
+                agent.agent.external_id = Some(id.to_string());
+            }
+            Some(AgentIdentitySource::ParentSpawn) if had_lifecycle => {}
+            _ => {
+                agent.external_id = Some(id.to_string());
+                agent.agent.external_id = Some(id.to_string());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{MAX_DISCOVERED_ARGS, MAX_DISCOVERED_ARGV_CHARS, MAX_DISCOVERED_ARG_CHARS};
@@ -349,6 +515,275 @@ mod tests {
             value.chars().count() <= max_chars,
             "{} characters exceeded the {max_chars}-character bound",
             value.chars().count()
+        );
+    }
+
+    fn add_parent(harness: &mut Harness, session_id: &SessionId, suffix: &str) -> NodeId {
+        let mut parent =
+            ProcessNode::agent(session_id.clone(), format!("claude-{suffix}"), "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(session_id)
+            .unwrap()
+            .tree
+            .insert(parent);
+        parent_id
+    }
+
+    fn team_spawn(
+        session_id: &SessionId,
+        parent: &NodeId,
+        name: &str,
+        external_id: &str,
+        at: i64,
+    ) -> TurnEvent {
+        TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSpawned {
+                declared_name: Some(name.into()),
+                agent_type: Some("general-purpose".into()),
+                agent_id: Some(external_id.into()),
+                task: Some(format!("Task for {name}")),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "PostToolUse".into(),
+            },
+            Confidence::Explicit,
+            at,
+        )
+        .with_node(parent.clone())
+    }
+
+    fn lifecycle_start(
+        session_id: &SessionId,
+        parent: &NodeId,
+        name: &str,
+        external_id: &str,
+        at: i64,
+    ) -> TurnEvent {
+        TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSpawned {
+                declared_name: None,
+                agent_type: Some(name.into()),
+                agent_id: Some(external_id.into()),
+                task: None,
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStart".into(),
+            },
+            Confidence::Explicit,
+            at,
+        )
+        .with_node(parent.clone())
+    }
+
+    fn lifecycle_stop(
+        session_id: &SessionId,
+        parent: &NodeId,
+        external_id: &str,
+        at: i64,
+    ) -> TurnEvent {
+        TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentSubagentStopped {
+                agent_id: Some(external_id.into()),
+            },
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "SubagentStop".into(),
+            },
+            Confidence::Explicit,
+            at,
+        )
+        .with_parent(parent.clone())
+    }
+
+    #[tokio::test]
+    async fn claude_team_and_lifecycle_declarations_merge_in_both_orders_and_round_trip() {
+        for (suffix, lifecycle_first) in [("team-first", false), ("lifecycle-first", true)] {
+            let mut harness = Harness::new().await;
+            let session_id = SessionId::from_stored(format!("sess_alias_{suffix}"));
+            harness.add_session(
+                session_id.clone(),
+                PaneId::from_stored(format!("pane_alias_{suffix}")),
+                NOW,
+            );
+            let parent = add_parent(&mut harness, &session_id, suffix);
+            let team_id = format!("frase-1@session-{suffix}");
+            let lifecycle_id = format!("afrase-1-{suffix}");
+            let team = team_spawn(&session_id, &parent, "frase-1", &team_id, NOW + 1);
+            let lifecycle =
+                lifecycle_start(&session_id, &parent, "frase-1", &lifecycle_id, NOW + 2);
+            if lifecycle_first {
+                harness.core.ingest(lifecycle, NOW + 1);
+                harness.core.ingest(team, NOW + 2);
+            } else {
+                harness.core.ingest(team, NOW + 1);
+                harness.core.ingest(lifecycle, NOW + 2);
+            }
+
+            let tree = &harness.core.sessions[&session_id].tree;
+            assert_eq!(tree.children(&parent).len(), 1, "{suffix}");
+            let by_team = tree.find_by_external_id(&team_id).unwrap().id.clone();
+            let by_lifecycle = tree.find_by_external_id(&lifecycle_id).unwrap().id.clone();
+            assert_eq!(by_team, by_lifecycle, "both ids address one AgentNode");
+            let worker = tree.get(&by_team).unwrap().agent.as_ref().unwrap();
+            assert_eq!(worker.name.display_name, "frase-1");
+            assert_eq!(worker.agent_type.as_deref(), Some("general-purpose"));
+            assert_eq!(worker.identity_aliases.len(), 2);
+
+            let restored = harness
+                .core
+                .store
+                .sessions()
+                .get(&session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored.tree.find_by_external_id(&team_id).unwrap().id,
+                restored.tree.find_by_external_id(&lifecycle_id).unwrap().id,
+                "aliases survive the SQLite/serde round trip"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn either_claude_alias_stops_the_same_merged_subagent() {
+        for (suffix, stop_with_team_id) in [("team-stop", true), ("lifecycle-stop", false)] {
+            let mut harness = Harness::new().await;
+            let session_id = SessionId::from_stored(format!("sess_{suffix}"));
+            harness.add_session(
+                session_id.clone(),
+                PaneId::from_stored(format!("pane_{suffix}")),
+                NOW,
+            );
+            let parent = add_parent(&mut harness, &session_id, suffix);
+            let team_id = format!("worker@session-{suffix}");
+            let lifecycle_id = format!("aworker-{suffix}");
+            harness.core.ingest(
+                team_spawn(&session_id, &parent, "worker", &team_id, NOW + 1),
+                NOW + 1,
+            );
+            harness.core.ingest(
+                lifecycle_start(&session_id, &parent, "worker", &lifecycle_id, NOW + 2),
+                NOW + 2,
+            );
+            let stop_id = if stop_with_team_id {
+                &team_id
+            } else {
+                &lifecycle_id
+            };
+            harness.core.ingest(
+                lifecycle_stop(&session_id, &parent, stop_id, NOW + 3),
+                NOW + 3,
+            );
+
+            let tree = &harness.core.sessions[&session_id].tree;
+            assert_eq!(tree.children(&parent).len(), 1);
+            let worker = tree.find_by_external_id(&team_id).unwrap();
+            assert!(worker.lifecycle.is_terminal(), "stop through {stop_id}");
+            assert_eq!(
+                worker.id,
+                tree.find_by_external_id(&lifecycle_id).unwrap().id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn simultaneous_same_named_siblings_are_never_paired_by_guess() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_ambiguous_aliases");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_ambiguous_aliases"),
+            NOW,
+        );
+        let parent = add_parent(&mut harness, &session_id, "ambiguous");
+        for (id, at) in [
+            ("worker@session-one", NOW + 1),
+            ("worker@session-two", NOW + 2),
+        ] {
+            harness
+                .core
+                .ingest(team_spawn(&session_id, &parent, "worker", id, at), at);
+        }
+        harness.core.ingest(
+            lifecycle_start(&session_id, &parent, "worker", "aworker-one", NOW + 3),
+            NOW + 3,
+        );
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert_eq!(tree.children(&parent).len(), 3);
+        let lifecycle = tree.find_by_external_id("aworker-one").unwrap();
+        assert_ne!(
+            lifecycle.id,
+            tree.find_by_external_id("worker@session-one").unwrap().id
+        );
+        assert_ne!(
+            lifecycle.id,
+            tree.find_by_external_id("worker@session-two").unwrap().id
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_aliases_under_different_parents_never_cross_parent_boundaries() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_parent_scoped_aliases");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_parent_scoped_aliases"),
+            NOW,
+        );
+        let first_parent = add_parent(&mut harness, &session_id, "first");
+        let second_parent = add_parent(&mut harness, &session_id, "second");
+        harness.core.ingest(
+            team_spawn(
+                &session_id,
+                &first_parent,
+                "worker",
+                "worker@session-first",
+                NOW + 1,
+            ),
+            NOW + 1,
+        );
+        harness.core.ingest(
+            team_spawn(
+                &session_id,
+                &second_parent,
+                "worker",
+                "worker@session-second",
+                NOW + 2,
+            ),
+            NOW + 2,
+        );
+        harness.core.ingest(
+            lifecycle_start(
+                &session_id,
+                &first_parent,
+                "worker",
+                "aworker-first",
+                NOW + 3,
+            ),
+            NOW + 3,
+        );
+
+        let tree = &harness.core.sessions[&session_id].tree;
+        assert_eq!(tree.children(&first_parent).len(), 1);
+        assert_eq!(tree.children(&second_parent).len(), 1);
+        let first = tree.find_by_external_id("aworker-first").unwrap();
+        assert_eq!(first.parent.as_ref(), Some(&first_parent));
+        assert_eq!(
+            tree.find_by_external_id("worker@session-second")
+                .unwrap()
+                .parent
+                .as_ref(),
+            Some(&second_parent)
         );
     }
 

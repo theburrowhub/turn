@@ -25,7 +25,7 @@ use super::{Core, DeferredRuntimeInput, FailedIngestCheckpoint};
 use turn_agents::IntegrationLevel;
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::NodeId;
-use turn_core::model::{NodeKind, PendingPermission, ProcessNode};
+use turn_core::model::{AgentIdentitySource, NodeKind, PendingPermission, ProcessNode};
 use turn_core::state::{AwaitingReason, Lifecycle, Turn};
 use turn_proto::ServerEvent;
 
@@ -180,11 +180,9 @@ impl Core {
                         node.kind == NodeKind::Subagent
                             && agent_id.as_deref().is_some()
                             && node.agent.as_ref().is_some_and(|agent| {
-                                agent
-                                    .external_id
+                                agent_id
                                     .as_deref()
-                                    .or(agent.agent.external_id.as_deref())
-                                    == agent_id.as_deref()
+                                    .is_some_and(|id| agent.matches_external_id(id))
                             })
                     });
                 if !node_is_exact_subject {
@@ -583,13 +581,9 @@ impl Core {
                 .and_then(|node| session.tree.get(node))
                 .is_some_and(|node| {
                     let external_matches = agent_id.as_deref().is_none_or(|external_id| {
-                        node.agent.as_ref().is_some_and(|agent| {
-                            agent
-                                .external_id
-                                .as_deref()
-                                .or(agent.agent.external_id.as_deref())
-                                == Some(external_id)
-                        })
+                        node.agent
+                            .as_ref()
+                            .is_some_and(|agent| agent.matches_external_id(external_id))
                     });
                     node.kind == NodeKind::Subagent
                         && belongs_to_hook_parent(&node.id)
@@ -665,9 +659,13 @@ impl Core {
             return match event.node_id.as_ref() {
                 Some(target) => self.stop_subagent(&session_id, target, now_ms),
                 None => match (event.parent_node_id.as_ref(), agent_id.as_ref()) {
-                    (Some(parent), Some(agent_id)) => {
-                        self.insert_stopped_subagent(&session_id, parent, agent_id.clone(), now_ms)
-                    }
+                    (Some(parent), Some(agent_id)) => self.insert_stopped_subagent(
+                        &session_id,
+                        parent,
+                        agent_id.clone(),
+                        subagent_identity_source(&event.source),
+                        now_ms,
+                    ),
                     _ => Changed::default(),
                 },
             };
@@ -684,13 +682,14 @@ impl Core {
             task,
         } = &event.kind
         {
-            return self.insert_subagent(
+            return self.insert_subagent_from(
                 &session_id,
                 &node_id,
                 declared_name.clone(),
                 agent_type.clone(),
                 agent_id.clone(),
                 task.clone(),
+                subagent_identity_source(&event.source),
                 now_ms,
             );
         }
@@ -1009,6 +1008,19 @@ fn preserve_unresolved_external_subject(event: &mut TurnEvent, parent: &NodeId, 
         "{}|subject:external:{external_id}-unresolved-under:{parent}",
         event.dedup_key
     );
+}
+
+fn subagent_identity_source(source: &EventSource) -> Option<AgentIdentitySource> {
+    match source {
+        EventSource::Hook { tool, event_name } if tool == "claude-code" => {
+            match event_name.as_str() {
+                "SubagentStart" | "SubagentStop" => Some(AgentIdentitySource::Lifecycle),
+                "PostToolUse" => Some(AgentIdentitySource::ParentSpawn),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether an event kind moves the agent turn axis, and to what.

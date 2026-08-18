@@ -28,7 +28,10 @@ use crate::paths;
 use std::collections::{HashMap, HashSet};
 use turn_core::attention::AttentionManager;
 use turn_core::ids::{NodeId, PaneId, SessionId};
-use turn_core::model::{PaneKind, RestoreBehaviour, RestoreState, Session, SessionMode};
+use turn_core::model::{
+    AgentIdentitySource, NodeKind, PaneKind, ProcessNode, RestoreBehaviour, RestoreState, Session,
+    SessionMode,
+};
 use turn_core::state::Lifecycle;
 use turn_proto::{PaneRestoreOutcome, ServerEvent};
 
@@ -62,10 +65,21 @@ impl Core {
             .into_iter()
             .map(|session| session.id)
             .collect();
+        let protected_attention_nodes: HashSet<NodeId> = self
+            .store
+            .attention()
+            .load_queue()?
+            .iter()
+            .filter_map(|entry| entry.node_id.clone())
+            .collect();
+        let mut subagent_alias_repairs = 0usize;
         for id in &stored {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
             if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
+                let repaired =
+                    repair_legacy_claude_subagent_aliases(&mut session, &protected_attention_nodes);
+                subagent_alias_repairs += repaired;
                 let navigation_migrated = migrate_obsolete_navigation_panes(&mut session);
                 let guard_downgraded =
                     if session.mode == SessionMode::ReadOnly && session.read_only_enforced {
@@ -88,7 +102,7 @@ impl Core {
                     } else {
                         false
                     };
-                if navigation_migrated || guard_downgraded {
+                if navigation_migrated || guard_downgraded || repaired > 0 {
                     // The old central AgentTree cannot coexist with the unified
                     // sidebar. Persist structural/guard truth immediately, but never
                     // materialise the replacement Shell during restore. False is not
@@ -145,6 +159,7 @@ impl Core {
             scratch_pruned = pruned,
             terminal_histories_restored,
             terminal_histories_pruned,
+            subagent_alias_repairs,
             "restored"
         );
         Ok(())
@@ -612,6 +627,255 @@ impl Core {
     }
 }
 
+#[derive(Default)]
+struct LegacyAliasPair {
+    lifecycle: Vec<NodeId>,
+    parent_spawn: Vec<NodeId>,
+}
+
+/// Repairs the exact duplicate shape written before structured Agent aliases existed.
+///
+/// The projection is intentionally narrow: both rows must be leaf siblings under a
+/// Claude parent, one must have the live lifecycle id shape (`a<name>-*`), the other
+/// the parent declaration shape (`<name>@session-*`), and each side must be unique for
+/// that name. If two homonymous workers exist, or two durable references require both
+/// node ids to survive, restoration leaves the rows untouched rather than guessing.
+fn repair_legacy_claude_subagent_aliases(
+    session: &mut Session,
+    attention_nodes: &HashSet<NodeId>,
+) -> usize {
+    let mut protected = attention_nodes.clone();
+    protected.extend(
+        session
+            .layout
+            .panes()
+            .iter()
+            .filter_map(|pane| pane.node_id.clone()),
+    );
+
+    let mut pairs: HashMap<(NodeId, String), LegacyAliasPair> = HashMap::new();
+    for node in session.tree.iter() {
+        let Some(parent) = node.parent.clone() else {
+            continue;
+        };
+        if node.kind != NodeKind::Subagent
+            || !session.tree.children(&node.id).is_empty()
+            || !is_claude_parent(&session.tree, &parent)
+        {
+            continue;
+        }
+        let Some((source, alias)) = legacy_claude_identity(node) else {
+            continue;
+        };
+        let pair = pairs.entry((parent, alias)).or_default();
+        match source {
+            AgentIdentitySource::Lifecycle => pair.lifecycle.push(node.id.clone()),
+            AgentIdentitySource::ParentSpawn => pair.parent_spawn.push(node.id.clone()),
+        }
+    }
+
+    let mut repaired = 0usize;
+    for ((_parent, alias), pair) in pairs {
+        let ([lifecycle_id], [team_id]) = (pair.lifecycle.as_slice(), pair.parent_spawn.as_slice())
+        else {
+            continue;
+        };
+        let lifecycle_id = lifecycle_id.clone();
+        let team_id = team_id.clone();
+        if protected.contains(&lifecycle_id) && protected.contains(&team_id) {
+            continue;
+        }
+        let Some(lifecycle) = session.tree.get(&lifecycle_id).cloned() else {
+            continue;
+        };
+        let Some(team) = session.tree.get(&team_id).cloned() else {
+            continue;
+        };
+        let Some(lifecycle_external) = single_legacy_external_id(&lifecycle).map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(team_external) = single_legacy_external_id(&team).map(str::to_string) else {
+            continue;
+        };
+
+        // Preserve whichever id is referenced durably. With no such constraint,
+        // keep the parent-spawn row because it owns the semantic task preview/history.
+        let survivor_id = if protected.contains(&lifecycle_id) {
+            lifecycle_id.clone()
+        } else {
+            team_id.clone()
+        };
+        let removed_id = if survivor_id == lifecycle_id {
+            team_id
+        } else {
+            lifecycle_id
+        };
+        let Some(survivor) = session.tree.get_mut(&survivor_id) else {
+            continue;
+        };
+        merge_legacy_claude_alias_pair(
+            survivor,
+            &lifecycle,
+            &team,
+            &lifecycle_external,
+            &team_external,
+        );
+        session.tree.remove(&removed_id);
+        tracing::info!(
+            session = %session.id,
+            survivor = %survivor_id,
+            removed = %removed_id,
+            alias,
+            "repaired duplicate Claude subagent identities"
+        );
+        repaired += 1;
+    }
+    repaired
+}
+
+fn is_claude_parent(tree: &turn_core::model::SessionTree, parent: &NodeId) -> bool {
+    let Some(parent) = tree.get(parent) else {
+        return false;
+    };
+    if parent.agent.as_ref().is_some_and(|agent| {
+        agent.agent.tool.as_deref() == Some("claude-code")
+            || agent.agent.provider.as_deref() == Some("anthropic")
+    }) {
+        return true;
+    }
+    parent
+        .command
+        .split_whitespace()
+        .next()
+        .and_then(|command| command.rsplit('/').next())
+        == Some("claude")
+}
+
+fn single_legacy_external_id(node: &ProcessNode) -> Option<&str> {
+    let agent = node.agent.as_ref()?;
+    if !agent.identity_aliases.is_empty() {
+        return None;
+    }
+    match (
+        agent.external_id.as_deref(),
+        agent.agent.external_id.as_deref(),
+    ) {
+        (Some(left), Some(right)) if left != right => None,
+        (Some(id), _) | (_, Some(id)) => Some(id),
+        (None, None) => None,
+    }
+}
+
+fn legacy_claude_identity(node: &ProcessNode) -> Option<(AgentIdentitySource, String)> {
+    let agent = node.agent.as_ref()?;
+    let external_id = single_legacy_external_id(node)?;
+    if let Some((name, session)) = external_id.split_once('@') {
+        if !name.is_empty()
+            && session.starts_with("session-")
+            && agent.name.declared_name.as_deref() == Some(name)
+            && node.resolved_title().0 == name
+        {
+            return Some((AgentIdentitySource::ParentSpawn, name.to_string()));
+        }
+    }
+
+    let alias = agent.agent_type.as_deref()?;
+    let suffix = external_id.strip_prefix('a')?.strip_prefix(alias)?;
+    if agent.name.declared_name.is_none()
+        && node.resolved_title().0 == alias
+        && suffix.starts_with('-')
+        && suffix.len() > 1
+    {
+        return Some((AgentIdentitySource::Lifecycle, alias.to_string()));
+    }
+    None
+}
+
+fn merge_legacy_claude_alias_pair(
+    survivor: &mut ProcessNode,
+    lifecycle: &ProcessNode,
+    team: &ProcessNode,
+    lifecycle_external: &str,
+    team_external: &str,
+) {
+    survivor.started_ms = survivor
+        .started_ms
+        .min(lifecycle.started_ms.min(team.started_ms));
+    survivor.lifecycle = lifecycle.lifecycle.clone();
+    survivor.turn = lifecycle.turn.clone();
+    survivor.ended_ms = lifecycle.ended_ms;
+    survivor.exit_code = lifecycle.exit_code;
+    survivor.activity_preview = team
+        .activity_preview
+        .clone()
+        .or_else(|| lifecycle.activity_preview.clone());
+    survivor.preview_visibility = team.preview_visibility;
+    if survivor.user_title.is_none() {
+        survivor.user_title = team
+            .user_title
+            .clone()
+            .or_else(|| lifecycle.user_title.clone());
+    }
+
+    let lifecycle_info = lifecycle.agent.as_ref();
+    let team_info = team.agent.as_ref();
+    if let Some(agent) = survivor.agent.as_mut() {
+        if let Some(team_agent) = team_info {
+            let renamed = [team_info, lifecycle_info]
+                .into_iter()
+                .flatten()
+                .find(|candidate| candidate.name.user_renamed);
+            if let Some(renamed) = renamed {
+                agent.name = renamed.name.clone();
+            } else {
+                agent.name = team_agent.name.clone();
+            }
+            agent.agent_type = team_agent
+                .agent_type
+                .clone()
+                .or_else(|| agent.agent_type.clone());
+            agent.current_task = team_agent
+                .current_task
+                .clone()
+                .or_else(|| agent.current_task.clone());
+            agent.last_message = team_agent
+                .last_message
+                .clone()
+                .or_else(|| agent.last_message.clone());
+            agent.tokens_used = team_agent.tokens_used.or(agent.tokens_used);
+            agent.cost_usd = team_agent.cost_usd.or(agent.cost_usd);
+            agent.permission_mode = team_agent
+                .permission_mode
+                .clone()
+                .or_else(|| agent.permission_mode.clone());
+            agent.git_branch = team_agent
+                .git_branch
+                .clone()
+                .or_else(|| agent.git_branch.clone());
+        }
+        agent.external_id = Some(lifecycle_external.to_string());
+        agent.agent.external_id = Some(lifecycle_external.to_string());
+        agent.record_identity_alias(
+            AgentIdentitySource::Lifecycle,
+            lifecycle_external.to_string(),
+        );
+        agent.record_identity_alias(AgentIdentitySource::ParentSpawn, team_external.to_string());
+        if survivor.lifecycle.is_terminal() {
+            agent.pending_permission = None;
+            agent.pending_question = None;
+        }
+        if !agent.name.user_renamed {
+            survivor.title = agent.name.display_name.clone();
+        }
+    }
+    if survivor.lifecycle.is_terminal() {
+        survivor.interaction_pending = false;
+    } else {
+        survivor.interaction_pending = lifecycle.interaction_pending || team.interaction_pending;
+    }
+}
+
 fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
     let obsolete: Vec<_> = session
         .layout
@@ -644,10 +908,133 @@ mod migration_tests {
     use crate::core::FailedIngestCheckpoint;
     use turn_core::event::{Confidence, EventKind, EventSource, Risk, TurnEvent};
     use turn_core::ids::{PaneId, WorkspaceId};
-    use turn_core::model::{Direction, Layout, Pane, PendingPermission, ProcessNode};
+    use turn_core::model::{
+        AgentName, Direction, Layout, NameSource, Pane, PendingPermission, ProcessNode, Relation,
+    };
     use turn_core::state::{AwaitingReason, Turn};
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn restore_repairs_one_unambiguous_legacy_claude_alias_pair_and_persists_it() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_restore_alias_pair");
+        harness.add_session(
+            session_id.clone(),
+            PaneId::from_stored("pane_restore_alias_pair"),
+            NOW,
+        );
+        let mut parent = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        parent.lifecycle = Lifecycle::Alive;
+        let parent_id = parent.id.clone();
+
+        let mut team = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 1);
+        team.kind = NodeKind::Subagent;
+        team.title = "frase-1".into();
+        team.lifecycle = Lifecycle::Alive;
+        team.link_to(parent_id.clone(), Relation::Confirmed);
+        let team_id = team.id.clone();
+        {
+            let info = team.agent.as_mut().unwrap();
+            info.external_id = Some("frase-1@session-legacy".into());
+            info.agent.external_id = info.external_id.clone();
+            info.name = AgentName::declared("frase-1");
+            info.agent_type = Some("general-purpose".into());
+            info.current_task = Some("Combine three phrases".into());
+        }
+
+        let mut lifecycle = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW + 2);
+        lifecycle.kind = NodeKind::Subagent;
+        lifecycle.title = "frase-1".into();
+        lifecycle.lifecycle = Lifecycle::Exited { code: 0 };
+        lifecycle.turn = Some(Turn::Done);
+        lifecycle.ended_ms = Some(NOW + 3);
+        lifecycle.link_to(parent_id.clone(), Relation::Confirmed);
+        let lifecycle_id = lifecycle.id.clone();
+        {
+            let info = lifecycle.agent.as_mut().unwrap();
+            info.external_id = Some("afrase-1-ea36227f2c953321".into());
+            info.agent.external_id = info.external_id.clone();
+            info.name = AgentName {
+                declared_name: None,
+                display_name: "frase-1".into(),
+                source: NameSource::Integration,
+                confidence: Confidence::Integrated,
+                user_renamed: false,
+            };
+            info.agent_type = Some("frase-1".into());
+        }
+
+        let session = harness.core.sessions.get_mut(&session_id).unwrap();
+        session.tree.insert(parent);
+        session.tree.insert(team);
+        session.tree.insert(lifecycle);
+        harness.core.persist_session(&session_id).unwrap();
+
+        let mut restored = harness
+            .core
+            .store
+            .sessions()
+            .load_for_restore(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored.tree.subagent_count(),
+            2,
+            "legacy duplicate fixture"
+        );
+        assert_eq!(
+            repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new()),
+            1
+        );
+        assert_eq!(restored.tree.subagent_count(), 1);
+        assert!(restored.tree.get(&lifecycle_id).is_none());
+        let worker = restored.tree.get(&team_id).unwrap();
+        assert!(worker.lifecycle.is_terminal());
+        assert_eq!(worker.resolved_title().0, "frase-1");
+        assert_eq!(
+            worker.agent.as_ref().unwrap().current_task.as_deref(),
+            Some("Combine three phrases")
+        );
+        assert_eq!(
+            restored
+                .tree
+                .find_by_external_id("frase-1@session-legacy")
+                .unwrap()
+                .id,
+            team_id
+        );
+        assert_eq!(
+            restored
+                .tree
+                .find_by_external_id("afrase-1-ea36227f2c953321")
+                .unwrap()
+                .id,
+            team_id
+        );
+
+        harness.core.store.sessions().save(&restored).unwrap();
+        let round_trip = harness
+            .core
+            .store
+            .sessions()
+            .get(&session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(round_trip.tree.subagent_count(), 1);
+        assert_eq!(
+            round_trip
+                .tree
+                .find_by_external_id("frase-1@session-legacy")
+                .unwrap()
+                .id,
+            round_trip
+                .tree
+                .find_by_external_id("afrase-1-ea36227f2c953321")
+                .unwrap()
+                .id
+        );
+    }
 
     #[test]
     fn a_legacy_session_keeps_its_geometry_but_not_a_second_navigator() {
