@@ -142,7 +142,7 @@ impl TreeNodeView {
             ended_ms: node.ended_ms,
             runtime_ms: node.runtime_ms(now_ms),
             exit_code: node.exit_code,
-            agent: AgentSummary::from_node(node),
+            agent: AgentSummary::from_node(node, now_ms),
         }
     }
 

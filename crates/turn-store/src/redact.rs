@@ -900,6 +900,7 @@ fn quota_for_persistence(quota: &QuotaSnapshot) -> QuotaSnapshot {
                 label: redact_secrets(&window.label),
                 measurement: usage_measurement_for_persistence(&window.measurement),
                 resets_at_ms: window.resets_at_ms,
+                exhausted: window.exhausted,
                 hard_limit: window.hard_limit,
             })
             .collect(),
@@ -1595,6 +1596,7 @@ mod tests {
                         total: None,
                     },
                     resets_at_ms: Some(404),
+                    exhausted: Some(true),
                     hard_limit: Some(true),
                 }],
             },
@@ -1609,6 +1611,7 @@ mod tests {
         assert!(json.contains(REDACTED));
         assert!(json.contains("\"state\":\"stale\""));
         assert!(json.contains("\"amount\":17.0"));
+        assert!(json.contains("\"exhausted\":true"));
         assert!(json.contains("\"observed_at_ms\":303"));
 
         let Observable::Failed { message, .. } = safe.runtime.context else {

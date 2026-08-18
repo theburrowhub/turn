@@ -177,6 +177,42 @@ impl<T> Observable<T> {
         matches!(self, Self::Stale { .. })
     }
 
+    /// Whether this value must be presented as stale at `now_ms`.
+    ///
+    /// A live projection can remain in a client past its provider deadline, so
+    /// callers must not rely on a coordinator having rewritten `Observed` to
+    /// `Stale` first. The deadline is inclusive: at the instant it expires the
+    /// observation is no longer current.
+    pub fn is_stale_at(&self, now_ms: i64) -> bool {
+        matches!(self, Self::Stale { .. })
+            || matches!(
+                self,
+                Self::Observed {
+                    expires_at_ms: Some(expires_at_ms),
+                    ..
+                } if now_ms >= *expires_at_ms
+            )
+    }
+
+    /// Materialises an elapsed provider deadline without losing its last-known
+    /// value, provenance, sample time, or original expiry receipt.
+    pub fn stale_if_expired(self, now_ms: i64) -> Self {
+        match self {
+            Self::Observed {
+                value,
+                source,
+                observed_at_ms,
+                expires_at_ms: Some(expires_at_ms),
+            } if now_ms >= expires_at_ms => Self::Stale {
+                value,
+                source,
+                observed_at_ms,
+                expires_at_ms: Some(expires_at_ms),
+            },
+            observation => observation,
+        }
+    }
+
     /// Maps the contained value while preserving its observation receipt.
     /// Useful at privacy boundaries that must redact every text leaf without
     /// weakening availability/freshness semantics.
@@ -236,6 +272,13 @@ impl<T> Observable<T> {
             (Some(_), Some(_)) => other,
         }
     }
+
+    fn value_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Observed { value, .. } | Self::Stale { value, .. } => Some(value),
+            Self::Waiting | Self::Unsupported { .. } | Self::Failed { .. } => None,
+        }
+    }
 }
 
 /// Requested/effective/current launch facts safe to expose to the operator.
@@ -265,6 +308,41 @@ pub struct LaunchConfiguration {
     pub safe_flags: Vec<String>,
 }
 
+impl LaunchConfiguration {
+    /// Retains independently observed fields that a newer partial provider
+    /// sample did not carry. Provider status lines and transcript tails expose
+    /// different subsets of the current configuration; treating either subset
+    /// as a replacement would erase valid facts merely because its task
+    /// completed later.
+    fn fill_missing_from(&mut self, fallback: &Self) {
+        if self.model.is_none() {
+            self.model.clone_from(&fallback.model);
+        }
+        if self.model_display_name.is_none() {
+            self.model_display_name
+                .clone_from(&fallback.model_display_name);
+        }
+        if self.permission_mode.is_none() {
+            self.permission_mode.clone_from(&fallback.permission_mode);
+        }
+        if self.approval_mode.is_none() {
+            self.approval_mode.clone_from(&fallback.approval_mode);
+        }
+        if self.sandbox_mode.is_none() {
+            self.sandbox_mode.clone_from(&fallback.sandbox_mode);
+        }
+        if self.effort_level.is_none() {
+            self.effort_level.clone_from(&fallback.effort_level);
+        }
+        if self.thinking_enabled.is_none() {
+            self.thinking_enabled = fallback.thinking_enabled;
+        }
+        if self.safe_flags.is_empty() {
+            self.safe_flags.clone_from(&fallback.safe_flags);
+        }
+    }
+}
+
 /// The launch request, adapter receipt, and currently observed configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentLaunchFacts {
@@ -279,11 +357,40 @@ pub struct AgentLaunchFacts {
 impl AgentLaunchFacts {
     pub fn prefer_newer(self, other: Self) -> Self {
         Self {
-            requested: self.requested.prefer_newer(other.requested),
-            effective: self.effective.prefer_newer(other.effective),
-            current: self.current.prefer_newer(other.current),
+            requested: prefer_newer_configuration(self.requested, other.requested),
+            effective: prefer_newer_configuration(self.effective, other.effective),
+            current: prefer_newer_configuration(self.current, other.current),
         }
     }
+
+    fn stale_if_expired(self, now_ms: i64) -> Self {
+        Self {
+            requested: self.requested.stale_if_expired(now_ms),
+            effective: self.effective.stale_if_expired(now_ms),
+            current: self.current.stale_if_expired(now_ms),
+        }
+    }
+}
+
+fn prefer_newer_configuration(
+    left: Observable<LaunchConfiguration>,
+    right: Observable<LaunchConfiguration>,
+) -> Observable<LaunchConfiguration> {
+    let right_is_preferred = match (left.observed_at_ms(), right.observed_at_ms()) {
+        (Some(left), Some(right)) => right >= left,
+        (None, Some(_)) | (None, None) => true,
+        (Some(_), None) => false,
+    };
+    let (mut preferred, fallback) = if right_is_preferred {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    if let (Some(preferred_value), Some(fallback_value)) = (preferred.value_mut(), fallback.value())
+    {
+        preferred_value.fill_missing_from(fallback_value);
+    }
+    preferred
 }
 
 /// Whether a measurement is consumption, remaining capacity, or a provider's
@@ -366,6 +473,13 @@ pub struct QuotaWindow {
     pub measurement: UsageMeasurement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_ms: Option<i64>,
+    /// Whether the provider explicitly reports this allowance exhausted.
+    /// This is independent of enforcement hardness: "limit reached" proves
+    /// exhaustion, but does not prove whether the boundary is hard or soft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted: Option<bool>,
+    /// Whether the provider schema explicitly classifies the boundary as hard
+    /// (`true`) or soft (`false`). `None` means hardness is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_limit: Option<bool>,
 }
@@ -401,6 +515,17 @@ impl AgentRuntimeMetadata {
             launch: self.launch.prefer_newer(other.launch),
             context: self.context.prefer_newer(other.context),
             quota: self.quota.prefer_newer(other.quota),
+        }
+    }
+
+    /// Materialises every elapsed observation deadline for restoration and
+    /// point-in-time projections. Live views must additionally consult
+    /// [`Observable::is_stale_at`] because a received projection can itself age.
+    pub fn stale_if_expired(self, now_ms: i64) -> Self {
+        Self {
+            launch: self.launch.stale_if_expired(now_ms),
+            context: self.context.stale_if_expired(now_ms),
+            quota: self.quota.stale_if_expired(now_ms),
         }
     }
 }
@@ -477,6 +602,7 @@ mod tests {
                     total: None,
                 },
                 resets_at_ms: Some(T0 + 3_600_000),
+                exhausted: None,
                 hard_limit: Some(true),
             }],
         };
@@ -502,5 +628,97 @@ mod tests {
             cached.prefer_newer(unsupported),
             Observable::Unsupported { .. }
         ));
+    }
+
+    #[test]
+    fn elapsed_deadlines_are_stale_at_the_boundary_and_keep_their_receipt() {
+        let before = Observable::observed("value", provider(), T0, Some(T0 + 10));
+        assert!(!before.is_stale_at(T0 + 9));
+
+        let expired = before.stale_if_expired(T0 + 10);
+        assert!(expired.is_stale_at(T0 + 10));
+        assert_eq!(expired.value(), Some(&"value"));
+        assert!(matches!(
+            expired,
+            Observable::Stale {
+                observed_at_ms: T0,
+                expires_at_ms: Some(expires_at_ms),
+                ..
+            } if expires_at_ms == T0 + 10
+        ));
+
+        let unbounded = Observable::observed("current", provider(), T0, None);
+        assert!(!unbounded.is_stale_at(i64::MAX));
+        assert!(matches!(
+            unbounded.stale_if_expired(i64::MAX),
+            Observable::Observed { .. }
+        ));
+    }
+
+    #[test]
+    fn newer_partial_current_configuration_keeps_independent_richer_facts() {
+        let status_line = Observable::observed(
+            LaunchConfiguration {
+                model: Some("opus".into()),
+                model_display_name: Some("Opus".into()),
+                effort_level: Some("high".into()),
+                thinking_enabled: Some(true),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0,
+            None,
+        );
+        let transcript = Observable::observed(
+            LaunchConfiguration {
+                model: Some("opus-latest-id".into()),
+                ..LaunchConfiguration::default()
+            },
+            ObservationSource::new(ObservationSourceKind::Provider, "provider transcript"),
+            T0 + 1,
+            None,
+        );
+
+        let merged = prefer_newer_configuration(status_line, transcript);
+        let current = merged.value().unwrap();
+        assert_eq!(current.model.as_deref(), Some("opus-latest-id"));
+        assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(current.effort_level.as_deref(), Some("high"));
+        assert_eq!(current.thinking_enabled, Some(true));
+        assert_eq!(merged.observed_at_ms(), Some(T0 + 1));
+    }
+
+    #[test]
+    fn late_older_partial_configuration_cannot_replace_newer_fields() {
+        let newer = Observable::observed(
+            LaunchConfiguration {
+                model: Some("new-model".into()),
+                effort_level: Some("xhigh".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0 + 2,
+            None,
+        );
+        let older_completed_late = Observable::observed(
+            LaunchConfiguration {
+                model: Some("old-model".into()),
+                model_display_name: Some("Useful display name".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0 + 1,
+            None,
+        );
+
+        let merged = prefer_newer_configuration(newer, older_completed_late);
+        let current = merged.value().unwrap();
+        assert_eq!(current.model.as_deref(), Some("new-model"));
+        assert_eq!(current.effort_level.as_deref(), Some("xhigh"));
+        assert_eq!(
+            current.model_display_name.as_deref(),
+            Some("Useful display name")
+        );
+        assert_eq!(merged.observed_at_ms(), Some(T0 + 2));
     }
 }

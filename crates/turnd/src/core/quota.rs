@@ -393,7 +393,8 @@ fn quota_snapshot(
                 label: format!("{label} · spend"),
                 measurement: remaining_percent(spend.remaining_percent),
                 resets_at_ms: unix_seconds_to_ms(Some(spend.resets_at_unix)),
-                hard_limit: bucket.spend_control_reached,
+                exhausted: bucket.spend_control_reached,
+                hard_limit: None,
             });
         }
     }
@@ -407,7 +408,8 @@ fn quota_snapshot(
                 total: None,
             },
             resets_at_ms: None,
-            hard_limit: Some(credits == 0),
+            exhausted: Some(credits == 0),
+            hard_limit: None,
         });
     }
     if windows.is_empty() {
@@ -443,7 +445,8 @@ fn rolling_window(
         label: format!("{bucket_label} · {window_label}"),
         measurement: remaining_percent(window.remaining_percent()),
         resets_at_ms: unix_seconds_to_ms(window.resets_at_unix),
-        hard_limit: Some(bucket.reached.is_some()),
+        exhausted: bucket.reached.as_ref().map(|_| true),
+        hard_limit: None,
     }
 }
 
@@ -583,6 +586,8 @@ mod tests {
         assert_eq!(snapshot.windows[0].measurement.amount, 63.0);
         assert_eq!(snapshot.windows[0].measurement.total, Some(100.0));
         assert_eq!(snapshot.windows[0].resets_at_ms, Some(1_800_000_000_000));
+        assert_eq!(snapshot.windows[0].exhausted, None);
+        assert_eq!(snapshot.windows[0].hard_limit, None);
         assert_eq!(snapshot.windows[1].label, "Codex · 1w");
         assert_eq!(snapshot.windows[1].measurement.amount, 88.0);
         assert_eq!(snapshot.windows[1].resets_at_ms, Some(1_800_600_000_000));
@@ -590,6 +595,21 @@ mod tests {
         assert_eq!(snapshot.windows[2].resets_at_ms, Some(1_801_000_000_000));
         assert_eq!(snapshot.windows[3].measurement.unit, UsageUnit::Requests);
         assert_eq!(snapshot.windows[3].measurement.amount, 2.0);
+    }
+
+    #[test]
+    fn provider_limit_reached_means_exhausted_with_unknown_hardness() {
+        let mut observation = observation();
+        observation.buckets[0].reached = Some("primary".into());
+        let snapshot = quota_snapshot(observation).expect("usable provider limits");
+
+        assert_eq!(snapshot.windows[0].exhausted, Some(true));
+        assert_eq!(snapshot.windows[0].hard_limit, None);
+        assert_eq!(snapshot.windows[1].hard_limit, None);
+        assert!(snapshot
+            .windows
+            .iter()
+            .all(|window| window.hard_limit.is_none()));
     }
 
     #[test]

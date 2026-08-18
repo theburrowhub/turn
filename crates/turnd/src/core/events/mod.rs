@@ -1177,6 +1177,7 @@ mod tests {
                             total: Some(100.0),
                         },
                         resets_at_ms: Some(at_ms + 60_000),
+                        exhausted: None,
                         hard_limit: None,
                     }],
                 },
@@ -1271,6 +1272,193 @@ mod tests {
                 .amount,
             76.5,
             "late older provider capacity must not roll back the current quota"
+        );
+
+        let partial_source =
+            ObservationSource::new(ObservationSourceKind::Provider, "provider transcript");
+        let newer_partial = event(
+            AgentRuntimeMetadata {
+                launch: AgentLaunchFacts {
+                    current: Observable::observed(
+                        LaunchConfiguration {
+                            model: Some("gpt-newest".into()),
+                            ..LaunchConfiguration::default()
+                        },
+                        partial_source.clone(),
+                        NOW + 40,
+                        None,
+                    ),
+                    ..AgentLaunchFacts::default()
+                },
+                ..AgentRuntimeMetadata::default()
+            },
+            NOW + 50,
+        );
+        harness.core.apply(&newer_partial, NOW + 50);
+
+        let older_failure_completed_last = event(
+            AgentRuntimeMetadata {
+                context: Observable::failed(
+                    partial_source,
+                    NOW + 15,
+                    "provider transcript is unavailable",
+                ),
+                ..AgentRuntimeMetadata::default()
+            },
+            NOW + 60,
+        );
+        harness.core.apply(&older_failure_completed_last, NOW + 60);
+
+        let agent = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap()
+            .agent
+            .as_ref()
+            .unwrap();
+        let current = agent.runtime.launch.current.value().unwrap();
+        assert_eq!(current.model.as_deref(), Some("gpt-newest"));
+        assert_eq!(
+            current.effort_level.as_deref(),
+            Some("xhigh"),
+            "a newer model-only transcript sample must retain richer status-line fields"
+        );
+        assert_eq!(
+            agent.runtime.context.value().unwrap().measurement.amount,
+            82_000.0,
+            "an older failure completed last must not erase newer usable context"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_transcript_callback_cannot_roll_back_a_newer_status_line_sample() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_adversarial_runtime_order");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+        let mut node = ProcessNode::agent(session_id.clone(), "claude", "/repo", NOW);
+        node.lifecycle = Lifecycle::Alive;
+        node.turn = Some(Turn::Active);
+        let node_id = node.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(node);
+
+        let status_source =
+            ObservationSource::new(ObservationSourceKind::Provider, "claude status line");
+        let status_line = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentRuntimeObserved {
+                runtime: Box::new(AgentRuntimeMetadata {
+                    launch: AgentLaunchFacts {
+                        current: Observable::observed(
+                            LaunchConfiguration {
+                                model: Some("claude-current".into()),
+                                model_display_name: Some("Claude Current".into()),
+                                effort_level: Some("high".into()),
+                                thinking_enabled: Some(true),
+                                ..LaunchConfiguration::default()
+                            },
+                            status_source,
+                            NOW + 20,
+                            None,
+                        ),
+                        ..AgentLaunchFacts::default()
+                    },
+                    ..AgentRuntimeMetadata::default()
+                }),
+            },
+            EventSource::SideChannel {
+                tool: "claude-code".into(),
+                channel: "provider status line".into(),
+            },
+            Confidence::Explicit,
+            NOW + 20,
+        )
+        .with_node(node_id.clone());
+
+        // This callback sampled the transcript first, at T0+10, but its detached
+        // read finishes after the synchronous status-line callback at T0+20.
+        let transcript_source =
+            ObservationSource::new(ObservationSourceKind::Provider, "claude transcript");
+        let delayed_transcript = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentRuntimeObserved {
+                runtime: Box::new(AgentRuntimeMetadata {
+                    launch: AgentLaunchFacts {
+                        current: Observable::observed(
+                            LaunchConfiguration {
+                                model: Some("claude-older".into()),
+                                ..LaunchConfiguration::default()
+                            },
+                            transcript_source.clone(),
+                            NOW + 10,
+                            None,
+                        ),
+                        ..AgentLaunchFacts::default()
+                    },
+                    context: Observable::observed(
+                        ContextUsageSnapshot {
+                            scope_id: Some("conversation".into()),
+                            measurement: UsageMeasurement {
+                                kind: UsageMeasurementKind::Used,
+                                amount: 41_000.0,
+                                unit: UsageUnit::Tokens,
+                                total: None,
+                            },
+                            effective_window: None,
+                            window_size_tokens: None,
+                            used_percentage: None,
+                            remaining_percentage: None,
+                            current_usage: None,
+                        },
+                        transcript_source,
+                        NOW + 10,
+                        None,
+                    ),
+                    ..AgentRuntimeMetadata::default()
+                }),
+            },
+            EventSource::SideChannel {
+                tool: "claude-code".into(),
+                channel: "provider transcript".into(),
+            },
+            Confidence::Explicit,
+            // Delivery/completion time is intentionally later than the status
+            // callback; field receipts retain the earlier trigger sample.
+            NOW + 30,
+        )
+        .with_node(node_id.clone());
+
+        harness.core.apply(&status_line, NOW + 20);
+        harness.core.apply(&delayed_transcript, NOW + 30);
+
+        let agent = harness.core.sessions[&session_id]
+            .tree
+            .get(&node_id)
+            .unwrap()
+            .agent
+            .as_ref()
+            .unwrap();
+        let current = &agent.runtime.launch.current;
+        assert_eq!(current.observed_at_ms(), Some(NOW + 20));
+        let current = current.value().unwrap();
+        assert_eq!(current.model.as_deref(), Some("claude-current"));
+        assert_eq!(
+            current.model_display_name.as_deref(),
+            Some("Claude Current")
+        );
+        assert_eq!(current.effort_level.as_deref(), Some("high"));
+        assert_eq!(current.thinking_enabled, Some(true));
+        assert_eq!(agent.agent.model.as_deref(), Some("claude-current"));
+        assert_eq!(agent.runtime.context.observed_at_ms(), Some(NOW + 10));
+        assert_eq!(
+            agent.runtime.context.value().unwrap().measurement.amount,
+            41_000.0,
+            "the delayed callback still contributes its independent context fact"
         );
     }
 

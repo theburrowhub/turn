@@ -77,7 +77,7 @@ impl Core {
         for id in &stored {
             // `load_for_restore` downgrades anything stored as running to `Orphaned`,
             // because a stored "alive" only ever meant "alive when we last wrote".
-            if let Some(mut session) = self.store.sessions().load_for_restore(id)? {
+            if let Some(mut session) = self.store.sessions().load_for_restore(id, now_ms)? {
                 let mut protected_nodes = protected_attention_nodes.clone();
                 protected_nodes.extend(session.tree.iter().filter_map(|node| {
                     std::fs::symlink_metadata(paths::node_terminal_history(
@@ -1112,7 +1112,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1303,7 +1303,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         let repairs = repair_legacy_claude_subagent_aliases(&mut restored, &HashSet::new());
@@ -1457,7 +1457,7 @@ mod migration_tests {
             .core
             .store
             .sessions()
-            .load_for_restore(&session_id)
+            .load_for_restore(&session_id, NOW)
             .unwrap()
             .unwrap();
         let protected = HashSet::from([lifecycle_id.clone()]);

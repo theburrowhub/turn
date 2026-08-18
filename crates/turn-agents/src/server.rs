@@ -600,7 +600,14 @@ async fn receive(
     // Scheduling is deliberately the final operation and never awaited. A slow
     // disk, a locked file, or a saturated observation cap must not hold open the
     // provider hook that declared the turn complete.
-    schedule_context_observation(&state, adapter.as_ref(), &payload, session_id, node_id);
+    schedule_context_observation(
+        &state,
+        adapter.as_ref(),
+        &payload,
+        session_id,
+        node_id,
+        ctx.timestamp_ms,
+    );
 
     StatusCode::OK.into_response()
 }
@@ -715,7 +722,10 @@ fn schedule_context_observation(
     payload: &serde_json::Value,
     session_id: SessionId,
     node_id: NodeId,
+    sampled_at_ms: i64,
 ) {
+    // `sampled_at_ms` is captured on the authenticated callback path, before
+    // detaching. Completion order is filesystem scheduling, not evidence order.
     let Some(probe) = context_probe(adapter, payload) else {
         return;
     };
@@ -740,7 +750,6 @@ fn schedule_context_observation(
 
         let (probe, observation) = match read {
             Ok((probe, Ok(read))) if read.parse_failed => {
-                let observed_at_ms = turn_core::now_ms();
                 try_emit(
                     &state,
                     context_failure_event(
@@ -748,7 +757,7 @@ fn schedule_context_observation(
                         node_id,
                         probe,
                         "provider transcript contained an unreadable context record",
-                        observed_at_ms,
+                        sampled_at_ms,
                     ),
                 );
                 return;
@@ -760,7 +769,6 @@ fn schedule_context_observation(
                     error_kind = ?error.kind(),
                     "could not read an agent transcript context tail"
                 );
-                let observed_at_ms = turn_core::now_ms();
                 try_emit(
                     &state,
                     context_failure_event(
@@ -768,14 +776,13 @@ fn schedule_context_observation(
                         node_id,
                         probe,
                         context_read_failure_message(error.kind()),
-                        observed_at_ms,
+                        sampled_at_ms,
                     ),
                 );
                 return;
             }
             Err(_) => {
                 tracing::warn!("agent transcript observation task failed");
-                let observed_at_ms = turn_core::now_ms();
                 try_emit(
                     &state,
                     context_failure_event(
@@ -783,7 +790,7 @@ fn schedule_context_observation(
                         node_id,
                         failed_probe,
                         "provider transcript observation failed",
-                        observed_at_ms,
+                        sampled_at_ms,
                     ),
                 );
                 return;
@@ -792,9 +799,8 @@ fn schedule_context_observation(
         let Some(observation) = observation else {
             return;
         };
-        let observed_at_ms = turn_core::now_ms();
         let Some(event) =
-            runtime_observation_event(session_id, node_id, probe, observation, observed_at_ms)
+            runtime_observation_event(session_id, node_id, probe, observation, sampled_at_ms)
         else {
             return;
         };
@@ -1316,6 +1322,46 @@ mod tests {
             assert_eq!(failed.raw, None);
         }
         assert_eq!(server.stats().emitted, 4);
+    }
+
+    #[tokio::test]
+    async fn detached_transcript_results_keep_their_trigger_sample_time() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let valid = transcript_dir.path().join("valid.jsonl");
+        let missing = transcript_dir.path().join("missing.jsonl");
+        std::fs::write(
+            &valid,
+            b"{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus\",\"usage\":{\"input_tokens\":42}}}\n",
+        )
+        .unwrap();
+        let (server, mut rx, _endpoint) = server_with_node().await;
+        let adapter = ClaudeCodeAdapter::new();
+
+        for (path, sampled_at_ms, expected_failure) in
+            [(valid, 101_i64, false), (missing, 202_i64, true)]
+        {
+            schedule_context_observation(
+                &server.state,
+                &adapter,
+                &json!({"hook_event_name":"Stop", "transcript_path":path}),
+                SessionId::from_stored("sess_server01"),
+                NodeId::from_stored("proc_server01"),
+                sampled_at_ms,
+            );
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let EventKind::AgentRuntimeObserved { runtime } = event.kind else {
+                panic!("unexpected detached event")
+            };
+            assert_eq!(event.timestamp_ms, sampled_at_ms);
+            assert_eq!(runtime.context.observed_at_ms(), Some(sampled_at_ms));
+            assert_eq!(
+                matches!(runtime.context, Observable::Failed { .. }),
+                expected_failure
+            );
+        }
     }
 
     #[tokio::test]

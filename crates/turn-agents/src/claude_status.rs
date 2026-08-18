@@ -723,6 +723,7 @@ fn quota_window(value: Option<&Value>, label: &str) -> Option<QuotaWindow> {
             .and_then(Value::as_i64)
             .filter(|seconds| *seconds >= 0)
             .and_then(|seconds| seconds.checked_mul(1_000)),
+        exhausted: None,
         hard_limit: None,
     })
 }

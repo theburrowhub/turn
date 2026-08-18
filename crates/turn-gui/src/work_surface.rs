@@ -8,7 +8,7 @@ use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Ve
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
 use turn_core::model::{
     AgentRuntimeMetadata, LaunchConfiguration, Observable, ObservationSourceKind, QuotaSnapshot,
-    UsageMeasurement, UsageMeasurementKind, UsageUnit,
+    QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
 };
 use turn_core::state::{AwaitingReason, Turn};
 use turn_proto::{
@@ -272,7 +272,15 @@ impl TurnView<'_> {
                 builder.set_label(copy);
             });
         }
-        paint_node_header(ui, theme, header, node, safe_node, safe_details);
+        paint_node_header(
+            ui,
+            theme,
+            header,
+            node,
+            safe_node,
+            safe_details,
+            self.now_ms,
+        );
 
         let stacked = body.width() < 760.0;
         let gap = 12.0_f32.min(body.width());
@@ -474,6 +482,7 @@ fn paint_node_header(
     node: &TreeNodeView,
     safe_node: Option<&TreeNodeView>,
     details: Option<&InspectorDetails>,
+    now_ms: i64,
 ) {
     ui.painter().rect_filled(rect, 0.0, theme.panel);
     ui.painter()
@@ -521,7 +530,7 @@ fn paint_node_header(
                 ui.horizontal_wrapped(|ui| {
                     let facts = safe_node
                         .and_then(|node| node.agent.as_ref())
-                        .map(agent_header_facts)
+                        .map(|agent| agent_header_facts(agent, now_ms))
                         .unwrap_or_else(CompactAgentFacts::loading);
                     compact_fact(ui, theme, "MODEL", &facts.model);
                     compact_fact(ui, theme, "MODE", &facts.mode);
@@ -586,22 +595,24 @@ fn compact_fact(ui: &mut Ui, theme: &Theme, label: &str, fact: &CompactFact) {
     );
 }
 
-fn agent_header_facts(agent: &AgentSummary) -> CompactAgentFacts {
+fn agent_header_facts(agent: &AgentSummary, now_ms: i64) -> CompactAgentFacts {
     CompactAgentFacts {
         model: launch_header_fact(
             &agent.runtime,
             LaunchField::Model,
             agent.agent.model.as_deref(),
+            now_ms,
         ),
         mode: launch_header_fact(
             &agent.runtime,
             LaunchField::PermissionMode,
             agent.permission_mode.as_deref(),
+            now_ms,
         ),
-        context: observation_header_fact(&agent.runtime.context, |context| {
+        context: observation_header_fact(&agent.runtime.context, now_ms, |context| {
             format_measurement(&context.measurement)
         }),
-        quota: observation_header_fact(&agent.runtime.quota, format_quota_compact),
+        quota: observation_header_fact(&agent.runtime.quota, now_ms, format_quota_compact),
     }
 }
 
@@ -622,6 +633,7 @@ fn launch_header_fact(
     runtime: &AgentRuntimeMetadata,
     field: LaunchField,
     legacy: Option<&str>,
+    now_ms: i64,
 ) -> CompactFact {
     let observations = [
         &runtime.launch.requested,
@@ -641,7 +653,7 @@ fn launch_header_fact(
         }
     }
 
-    let current_state = observable_state(&runtime.launch.current);
+    let current_state = observable_state_at(&runtime.launch.current, now_ms);
     if values.is_empty() {
         if let Some(legacy) = legacy.filter(|value| !value.is_empty()) {
             return CompactFact {
@@ -655,7 +667,7 @@ fn launch_header_fact(
             &runtime.launch.requested,
         ]
         .into_iter()
-        .map(observable_state)
+        .map(|observation| observable_state_at(observation, now_ms))
         .find(|state| *state != RuntimeFactState::Waiting)
         .unwrap_or(RuntimeFactState::Waiting);
         return CompactFact {
@@ -681,9 +693,10 @@ fn launch_header_fact(
 
 fn observation_header_fact<T>(
     observation: &Observable<T>,
+    now_ms: i64,
     render: impl FnOnce(&T) -> String,
 ) -> CompactFact {
-    let state = observable_state(observation);
+    let state = observable_state_at(observation, now_ms);
     let value = match observation.value() {
         Some(value) => {
             let mut rendered = render(value);
@@ -697,7 +710,10 @@ fn observation_header_fact<T>(
     CompactFact { value, state }
 }
 
-fn observable_state<T>(observation: &Observable<T>) -> RuntimeFactState {
+fn observable_state_at<T>(observation: &Observable<T>, now_ms: i64) -> RuntimeFactState {
+    if observation.is_stale_at(now_ms) {
+        return RuntimeFactState::Stale;
+    }
     match observation {
         Observable::Waiting => RuntimeFactState::Waiting,
         Observable::Observed { .. } => RuntimeFactState::Observed,
@@ -798,7 +814,7 @@ fn inspector_runtime_observation<T>(
     now_ms: i64,
     render: impl FnOnce(&T) -> String,
 ) {
-    let state = observable_state(observation);
+    let state = observable_state_at(observation, now_ms);
     let value = match observation {
         Observable::Observed { value, .. } | Observable::Stale { value, .. } => {
             format!("{} · {}", runtime_state_label(state), render(value))
@@ -1071,14 +1087,7 @@ fn node_details(
                         inspector_optional(ui, theme, "scope id", quota.scope_id.as_deref());
                         inspector_optional(ui, theme, "scope", quota.scope_label.as_deref());
                         for window in &quota.windows {
-                            let mut value = format_measurement(&window.measurement);
-                            if let Some(reset) = window.resets_at_ms {
-                                value.push_str(" · reset ");
-                                value.push_str(&format_relative_time(reset, now_ms));
-                            }
-                            if let Some(hard) = window.hard_limit {
-                                value.push_str(if hard { " · hard" } else { " · soft" });
-                            }
+                            let value = format_quota_window(window, now_ms);
                             inspector_value(ui, theme, &window.label, &value);
                         }
                     }
@@ -1188,6 +1197,24 @@ fn node_details(
                 }
             });
     });
+}
+
+fn format_quota_window(window: &QuotaWindow, now_ms: i64) -> String {
+    let mut value = format_measurement(&window.measurement);
+    if let Some(reset) = window.resets_at_ms {
+        value.push_str(" · reset ");
+        value.push_str(&format_relative_time(reset, now_ms));
+    }
+    if window.exhausted == Some(true) {
+        value.push_str(" · exhausted");
+    }
+    match window.hard_limit {
+        Some(true) => value.push_str(" · hard limit"),
+        Some(false) => value.push_str(" · soft limit"),
+        None if window.exhausted == Some(true) => value.push_str(" · hardness unknown"),
+        None => {}
+    }
+    value
 }
 
 fn activity_card(ui: &mut Ui, theme: &Theme, preview: &turn_core::model::ActivityPreview) {
@@ -1418,7 +1445,7 @@ mod tests {
         );
         runtime.launch.current = Observable::unsupported(source(), T0 + 2);
 
-        let facts = agent_header_facts(&AgentSummary::from_node(&node).unwrap());
+        let facts = agent_header_facts(&AgentSummary::from_node(&node, T0).unwrap(), T0);
         assert_eq!(facts.model.value, "sonnet→opus · current unsupported");
         assert_eq!(facts.model.state, RuntimeFactState::Unsupported);
         assert_eq!(facts.mode.value, "default→bypass · current unsupported");
@@ -1467,6 +1494,7 @@ mod tests {
                         total: None,
                     },
                     resets_at_ms: None,
+                    exhausted: None,
                     hard_limit: None,
                 }],
             },
@@ -1475,8 +1503,8 @@ mod tests {
             None,
         );
 
-        let mut summary = AgentSummary::from_node(&node).unwrap();
-        let facts = agent_header_facts(&summary);
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let facts = agent_header_facts(&summary, T0);
         assert_eq!(facts.context.value, "42000 tok used · stale");
         assert_eq!(facts.context.state, RuntimeFactState::Stale);
         assert_eq!(facts.quota.value, "team · five hour 61% provider");
@@ -1487,8 +1515,87 @@ mod tests {
         );
 
         summary.runtime.quota = Observable::unsupported(source(), T0 + 1);
-        let facts = agent_header_facts(&summary);
+        let facts = agent_header_facts(&summary, T0);
         assert_eq!(facts.quota.value, "unsupported");
         assert_eq!(facts.quota.state, RuntimeFactState::Unsupported);
+    }
+
+    #[test]
+    fn compact_capacity_facts_age_after_a_received_projection_expires() {
+        use turn_core::model::ContextUsageSnapshot;
+
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-live-expiry"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.context = Observable::observed(
+            ContextUsageSnapshot {
+                scope_id: Some("conversation".into()),
+                measurement: UsageMeasurement {
+                    kind: UsageMeasurementKind::Used,
+                    amount: 42.0,
+                    unit: UsageUnit::Tokens,
+                    total: None,
+                },
+                effective_window: None,
+                window_size_tokens: None,
+                used_percentage: None,
+                remaining_percentage: None,
+                current_usage: None,
+            },
+            source(),
+            T0,
+            Some(T0 + 10),
+        );
+        runtime.quota = Observable::observed(
+            QuotaSnapshot {
+                scope_id: Some("account".into()),
+                scope_label: None,
+                windows: Vec::new(),
+            },
+            source(),
+            T0,
+            Some(T0 + 10),
+        );
+        let summary = AgentSummary::from_node(&node, T0).unwrap();
+        assert!(matches!(
+            summary.runtime.context,
+            Observable::Observed { .. }
+        ));
+
+        let facts = agent_header_facts(&summary, T0 + 10);
+        assert_eq!(facts.context.state, RuntimeFactState::Stale);
+        assert_eq!(facts.context.value, "42 tok used · stale");
+        assert_eq!(facts.quota.state, RuntimeFactState::Stale);
+        assert_eq!(facts.quota.value, "account · no windows reported · stale");
+    }
+
+    #[test]
+    fn exhausted_provider_limit_does_not_claim_unknown_hardness() {
+        let mut window = QuotaWindow {
+            label: "5h".into(),
+            measurement: UsageMeasurement {
+                kind: UsageMeasurementKind::Remaining,
+                amount: 0.0,
+                unit: UsageUnit::Percent,
+                total: Some(100.0),
+            },
+            resets_at_ms: None,
+            exhausted: Some(true),
+            hard_limit: None,
+        };
+
+        assert_eq!(
+            format_quota_window(&window, T0),
+            "0%/100% remaining · exhausted · hardness unknown"
+        );
+        window.hard_limit = Some(true);
+        assert_eq!(
+            format_quota_window(&window, T0),
+            "0%/100% remaining · exhausted · hard limit"
+        );
     }
 }
