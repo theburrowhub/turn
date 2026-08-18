@@ -35,7 +35,7 @@ use turn_core::state::{AwaitingReason, DisplayState, Lifecycle, Turn};
 use turn_proto::cells::{Cell, CellAttrs, Grid, Rgb};
 use turn_proto::{
     CloseDisposition, HierarchyKey, HierarchySnapshot, InspectorDetails, InspectorEventView,
-    NodePaneCapability, NodePaneView, PaneRestoreOutcome, ProtoErrorContext, PtySize,
+    NodePaneCapability, NodePaneView, PaneRestoreOutcome, PaneStream, ProtoErrorContext, PtySize,
     SessionConflictAlternative, SessionSummary, SessionTreeView, TemplateSummary, TreeNodeView,
     TreeSurfaceState, Welcome, WorkspaceSummary, WorkspaceTreeView, WriteLeaseOwnerView,
 };
@@ -47,10 +47,10 @@ use turn_gui::terminal::{PaneAction, PaneInteraction, PaneOptions};
 use turn_gui::theme::{AppearanceSettings, Theme};
 use turn_gui::transport::{ConnectionState, DaemonIdentity};
 use turn_gui::view::{
-    CloseTurnChoice, CloseTurnDraft, CloseTurnSession, LayoutEditorOrigin, LayoutTemplateDraft,
-    LifecycleConfirmation, NewPaneDraft, PaneContent, PanePlacementDraft, PanePlacementSource,
-    PendingPermission, QueueItem, SessionDraft, SessionRestoreView, SessionRow,
-    TemporaryPaneContent, TurnView, ViewAction, ViewState, WorkspaceDraft,
+    CloseTurnChoice, CloseTurnDraft, CloseTurnSession, HierarchyAction, LayoutEditorOrigin,
+    LayoutTemplateDraft, LifecycleConfirmation, NewPaneDraft, PaneContent, PanePlacementDraft,
+    PanePlacementSource, PendingPermission, QueueItem, SessionDraft, SessionRestoreView,
+    SessionRow, TemporaryPaneContent, TurnView, ViewAction, ViewState, ViewTarget, WorkspaceDraft,
 };
 
 const T0: i64 = 1_700_000_000_000;
@@ -655,7 +655,10 @@ fn unified_hierarchy(layout: &Layout, panes: &[PaneId]) -> UnifiedHierarchy {
             revision: 23,
             tree_state: TreeSurfaceState {
                 surface_id: "window-snapshot".into(),
-                selected: Some(HierarchyKey::process(claude_id.clone())),
+                // The general-purpose fixture starts on the Session Layout. Tests for
+                // exact Node WorkSurfaces select their Node explicitly, just as the
+                // operator does, so pane/layout tests do not accidentally test a Node view.
+                selected: Some(HierarchyKey::session(session_id.clone())),
                 expanded: vec![
                     HierarchyKey::workspace(workspace_id.clone()),
                     HierarchyKey::session(session_id.clone()),
@@ -929,22 +932,31 @@ fn coming_back_to_a_session_has_no_manual_start_actions() {
     );
 }
 
-/// Pointing at one worker among many, and getting the layout back.
-///
-/// An agent managing four subagents runs all of them inside one pane, so the tree could list them
-/// and not show them: finding the one you cared about meant reading output from four. Clicking a
-/// subagent now maximises the pane it runs in, and clicking what owns it — its agent, its Session
-/// — puts the layout back.
 #[test]
-fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout() {
-    let fixture = busy_desk();
+fn selecting_a_semantic_subagent_opens_its_exact_full_work_surface_without_touching_layout() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    let session_id = fixture.selected.clone().expect("active Session");
+    let expected_layout = fixture.layout.clone().expect("saved layout");
+    let expected_layout_bytes = serde_json::to_vec(&expected_layout).expect("serialise Layout");
     let mut h = harness(fixture);
     h.run();
     h.run();
 
-    // A subagent, which has no pane of its own.
     let rows = tree_row_labels(&h);
-    let subagent = rows
+    let reviewer = rows
         .iter()
         .find(|label| label.contains("Reviewer"))
         .unwrap_or_else(|| panic!("the fixture has a subagent row: {rows:?}"))
@@ -957,73 +969,292 @@ fn clicking_a_subagent_shows_its_pane_and_clicking_its_owner_restores_the_layout
     };
 
     h.state_mut().actions.clear();
-    click_tree_row(&h, &subagent);
-    h.run_steps(1);
-    let zoomed: Vec<&ViewAction> = h
-        .state()
-        .actions
-        .iter()
-        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
-        .collect();
+    click_tree_row(&h, &reviewer);
+    h.run();
+    h.run();
+
     assert_eq!(
-        zoomed.len(),
-        1,
-        "clicking a subagent asks for exactly one pane to be shown: {:?}",
-        h.state().actions
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id.clone()))
     );
-
-    // The layout the daemon answers with, so the window's next decision is made against the
-    // state the daemon reports rather than against a guess.
-    let pane = match zoomed[0] {
-        ViewAction::ZoomPane { pane_id, .. } => pane_id.clone(),
-        _ => unreachable!(),
-    };
-    let mut layout = h.state().fixture.layout.clone().expect("a layout");
-    assert!(layout.toggle_zoom(&pane), "the pane the click named exists");
-    assert_eq!(layout.zoomed.as_ref(), Some(&pane));
-    h.state_mut().fixture.layout = Some(layout);
-    h.run();
-    h.run();
-
-    // Clicking the same subagent again does *not* toggle it back off. `zoom_pane` toggles, so a
-    // second click on a row already being shown would un-maximise the pane and the tree would
-    // flicker instead of holding still.
-    h.state_mut().actions.clear();
-    click_tree_row(&h, &subagent);
-    h.run_steps(1);
     assert!(
-        !h.state()
-            .actions
-            .iter()
-            .any(|action| matches!(action, ViewAction::ZoomPane { .. })),
-        "a pane already being shown must not be un-maximised by pointing at it again: {:?}",
-        h.state().actions
+        h.query_all_by_role(egui::accesskit::Role::Group)
+            .filter_map(|group| group.accesskit_node().label())
+            .any(|label| label == "WorkSurface for exact SUBAGENT Reviewer"),
+        "the accessible surface names the semantic child, not its runtime owner"
+    );
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::ZoomPane { .. } | ViewAction::SelectSession(_)
+    )));
+    let hierarchy_actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &reviewer_id
+    )));
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Inspect {
+            key: HierarchyKey::Process { node_id },
+        } if node_id == &reviewer_id
+    )));
+    assert!(hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::QuickPreview { node_id, .. } if node_id == &reviewer_id
+    )));
+    assert!(!hierarchy_actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+    assert_eq!(
+        serde_json::to_vec(h.state().fixture.layout.as_ref().expect("saved layout"))
+            .expect("serialise Layout"),
+        expected_layout_bytes,
+        "node navigation leaves active Pane, zoom and every Layout byte untouched"
     );
 
-    // And clicking the agent that owns it puts the layout back.
-    let owner = rows
+    let text = all_text(&h).join("\n");
+    assert!(text.contains("Review the climbing logic changes"));
+    assert!(text.contains("Reviewing climb_system.gd"));
+    assert!(text.contains("Checking state transitions and edge cases"));
+    assert!(!text.contains("I'll fix the climbing bug. Running the tests first."));
+    assert!(!text.contains("Do you want to allow this?"));
+    let buttons = button_labels(&h);
+    assert!(buttons.iter().all(|label| {
+        !label.starts_with("Start")
+            && !label.contains("Focus exact Pane")
+            && !label.contains("Open temporary pane")
+    }));
+
+    let geometry = h
+        .state()
+        .state
+        .work_surface_geometry
+        .expect("Node WorkSurface geometry");
+    assert!(!geometry.stacked);
+    assert!((240.0..=320.0).contains(&geometry.details_width));
+    assert!(geometry.width > 850.0 && geometry.height > 620.0);
+    assert!(geometry.primary_height > geometry.height * 0.72);
+    assert!(geometry.primary_width > geometry.details_width);
+    h.snapshot("subagent_work_surface");
+
+    // Returning to the Session is the exact saved Layout. It does not unzoom, focus,
+    // or otherwise compensate for the Node view because navigation changed none of it.
+    let session = rows
         .iter()
-        .find(|label| label.contains("Claude Code"))
-        .expect("the fixture has the owning agent")
+        .find(|label| label.contains("Session Fix climbing bugs"))
+        .expect("the fixture has the Session row")
         .clone();
     h.state_mut().actions.clear();
-    click_tree_row(&h, &owner);
-    h.run_steps(1);
-    let restored: Vec<&ViewAction> = h
+    click_tree_row(&h, &session);
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Session(session_id))
+    );
+    assert_eq!(h.state().fixture.layout.as_ref(), Some(&expected_layout));
+    assert!(!h
         .state()
         .actions
         .iter()
-        .filter(|action| matches!(action, ViewAction::ZoomPane { .. }))
-        .collect();
+        .any(|action| matches!(action, ViewAction::ZoomPane { .. })));
+}
+
+#[test]
+fn sibling_subagents_switch_between_distinct_exact_work_surfaces() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let snapshot = fixture.hierarchy.as_ref().expect("hierarchy");
+    let node_id = |title: &str| {
+        snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.nodes)
+            .find(|node| node.title == title)
+            .map(|node| node.node_id.clone())
+            .unwrap_or_else(|| panic!("missing {title}"))
+    };
+    let reviewer_id = node_id("Reviewer");
+    let tests_id = node_id("Tests");
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    let click = |h: &Harness<'static, Window>, fragment: &str| {
+        h.query_all_by_role(egui::accesskit::Role::TreeItem)
+            .find(|node| {
+                node.accesskit_node()
+                    .label()
+                    .is_some_and(|label| label.contains(fragment))
+            })
+            .unwrap_or_else(|| panic!("missing tree row containing {fragment:?}"))
+            .click();
+    };
+
+    click(&h, "SUBAGENT Reviewer");
+    h.run();
+    h.run();
     assert_eq!(
-        restored.len(),
-        1,
-        "clicking the owner asks for the maximised pane to be released: {:?}",
-        h.state().actions
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id))
     );
-    assert!(
-        matches!(restored[0], ViewAction::ZoomPane { pane_id, .. } if *pane_id == pane),
-        "and it names the pane that is maximised, which is what un-toggles it"
+    assert!(all_text(&h)
+        .join("\n")
+        .contains("Review the climbing logic changes"));
+
+    h.state_mut().actions.clear();
+    let _ = h.state_mut().state.take_hierarchy_actions();
+    click(&h, "SUBAGENT Tests");
+    h.run();
+    h.run();
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(tests_id.clone()))
+    );
+    let text = all_text(&h).join("\n");
+    assert!(text.contains("Running integration tests — 12/18"));
+    assert!(!text.contains("Review the climbing logic changes"));
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::ZoomPane { .. } | ViewAction::SelectSession(_)
+    )));
+    let actions = h.state_mut().state.take_hierarchy_actions();
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::Select {
+            key: HierarchyKey::Process { node_id },
+            ..
+        } if node_id == &tests_id
+    )));
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        HierarchyAction::OpenTemporaryPane { .. }
+            | HierarchyAction::OpenPane { .. }
+            | HierarchyAction::FocusPaneForNode { .. }
+    )));
+}
+
+#[test]
+fn a_narrow_subagent_work_surface_stacks_details_inside_the_available_height() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let reviewer_id = fixture
+        .hierarchy
+        .as_ref()
+        .expect("hierarchy")
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|session| &session.nodes)
+        .find(|node| node.title == "Reviewer")
+        .map(|node| node.node_id.clone())
+        .expect("Reviewer");
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(reviewer_id.clone()));
+
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(820.0, 640.0))
+        .build_ui_state(
+            |ui, window: &mut Window| {
+                let Window {
+                    fixture,
+                    state,
+                    theme,
+                    keymap,
+                    actions,
+                } = window;
+                theme.install(ui.ctx());
+                actions.extend(fixture.view().ui(ui, theme, keymap, state));
+            },
+            window(fixture),
+        );
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(reviewer_id))
+    );
+    let geometry = h
+        .state()
+        .state
+        .work_surface_geometry
+        .expect("Node WorkSurface geometry");
+    assert!(geometry.stacked);
+    assert!(geometry.primary_height > 200.0);
+    assert!(geometry.details_width > 400.0);
+    assert!((geometry.primary_width - geometry.details_width).abs() < 1.0);
+    assert!(geometry.header_height + geometry.primary_height < geometry.height);
+    assert!(all_text(&h)
+        .join("\n")
+        .contains("Review the climbing logic changes"));
+    h.snapshot("subagent_work_surface_narrow");
+}
+
+#[test]
+fn an_exact_terminal_binding_renders_as_a_read_only_node_mirror() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let node = fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.title == "Claude Code")
+        .expect("Claude Code");
+    let node_id = node.node_id.clone();
+    node.pane_capability = NodePaneCapability::Terminal {
+        streams: vec![PaneStream::Cells],
+    };
+    fixture
+        .hierarchy
+        .as_mut()
+        .expect("hierarchy")
+        .tree_state
+        .selected = Some(HierarchyKey::process(node_id.clone()));
+    let expected_layout = serde_json::to_vec(fixture.layout.as_ref().expect("saved layout"))
+        .expect("serialise Layout");
+    let mut h = harness(fixture);
+    h.run();
+    h.run();
+
+    assert_eq!(
+        h.state().state.work_surface_target,
+        Some(ViewTarget::Node(node_id))
+    );
+    let text = all_text(&h).join("\n");
+    assert!(group_labels(&h)
+        .iter()
+        .any(|label| label == "Exact read-only terminal mirror for Claude Code"));
+    assert!(text.contains("I'll fix the climbing bug. Running the tests first."));
+    assert!(h.state().actions.iter().all(|action| !matches!(
+        action,
+        ViewAction::Pane {
+            action: PaneAction::Resize(_) | PaneAction::Focus | PaneAction::Write(_),
+            ..
+        } | ViewAction::ZoomPane { .. }
+    )));
+    assert_eq!(
+        serde_json::to_vec(h.state().fixture.layout.as_ref().expect("saved layout"))
+            .expect("serialise Layout"),
+        expected_layout
     );
 }
 
@@ -4155,8 +4386,10 @@ fn every_hierarchy_level_is_a_reachable_tree_item() {
         .filter_map(|node| node.accesskit_node().label())
         .collect();
     assert!(
-        selected.iter().any(|label| label.contains("Claude Code")),
-        "selection is independent and belongs to the selected AgentNode; found {selected:?}"
+        selected
+            .iter()
+            .any(|label| label.contains("Fix climbing bugs")),
+        "selection belongs to the exact Session target; found {selected:?}"
     );
 }
 
