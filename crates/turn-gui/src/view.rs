@@ -12765,6 +12765,107 @@ mod tests {
     }
 
     #[test]
+    fn a_coordinator_with_shell_plumbing_projects_only_its_three_real_workers() {
+        let (mut snapshot, root_id, first_worker_id, _) = hierarchy_fixture();
+        let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
+        let first_index = nodes
+            .iter()
+            .position(|node| node.node_id == first_worker_id)
+            .unwrap();
+        nodes[first_index].title = "phrase-1".into();
+        nodes[first_index].command = "claude worker phrase-1".into();
+
+        let first_wrapper_id = NodeId::from_stored("proc_phrase_1_shell");
+        let mut first_wrapper = nodes[first_index].clone();
+        first_wrapper.node_id = first_wrapper_id.clone();
+        first_wrapper.parent = Some(root_id.clone());
+        first_wrapper.kind = NodeKind::Shell;
+        first_wrapper.is_agentic = false;
+        first_wrapper.title = "sh".into();
+        first_wrapper.command = "sh".into();
+        first_wrapper.turn = None;
+        first_wrapper.agent = None;
+        first_wrapper.relationship_is_provisional = true;
+        first_wrapper.child_count = 1;
+        first_wrapper.pane_bindings.clear();
+        nodes[first_index].parent = Some(first_wrapper_id.clone());
+
+        let mut second_wrapper = first_wrapper.clone();
+        second_wrapper.node_id = NodeId::from_stored("proc_phrase_2_bash");
+        second_wrapper.title = "bash".into();
+        second_wrapper.command = "bash".into();
+        let mut second_worker = nodes[first_index].clone();
+        second_worker.node_id = NodeId::from_stored("agent_phrase_2");
+        second_worker.parent = Some(second_wrapper.node_id.clone());
+        second_worker.title = "phrase-2".into();
+        second_worker.command = "claude worker phrase-2".into();
+
+        let mut third_wrapper = first_wrapper.clone();
+        third_wrapper.node_id = NodeId::from_stored("proc_phrase_3_shell");
+        let mut third_worker = nodes[first_index].clone();
+        third_worker.node_id = NodeId::from_stored("agent_phrase_3");
+        third_worker.parent = Some(third_wrapper.node_id.clone());
+        third_worker.title = "phrase-3".into();
+        third_worker.command = "claude worker phrase-3".into();
+        third_worker.lifecycle = Lifecycle::Exited { code: 0 };
+
+        // Extra inferred leaf processes are the `sh`/`bash` noise visible in the
+        // original failure: they are implementation details, not operator work.
+        let mut leaf_shell = first_wrapper.clone();
+        leaf_shell.node_id = NodeId::from_stored("proc_leaf_shell");
+        leaf_shell.child_count = 0;
+        let mut leaf_bash = second_wrapper.clone();
+        leaf_bash.node_id = NodeId::from_stored("proc_leaf_bash");
+        leaf_bash.child_count = 0;
+
+        nodes.extend([
+            first_wrapper,
+            second_wrapper,
+            second_worker.clone(),
+            third_wrapper,
+            third_worker,
+            leaf_shell,
+            leaf_bash,
+        ]);
+        nodes
+            .iter_mut()
+            .find(|node| node.node_id == root_id)
+            .unwrap()
+            .child_count = 5;
+
+        let mut state = ViewState::default();
+        let visible_processes: Vec<_> = visible_hierarchy_rows(&snapshot, &state, false)
+            .into_iter()
+            .filter_map(|row| match row {
+                HierarchyRow::Process { node, .. } => {
+                    Some((node.title.as_str(), node.node_id.clone()))
+                }
+                HierarchyRow::Workspace(_) | HierarchyRow::Session { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            visible_processes
+                .iter()
+                .map(|(title, _)| *title)
+                .collect::<Vec<_>>(),
+            ["claude", "phrase-1", "phrase-2", "phrase-3"],
+            "normal operation must expose semantic work, not sh/bash plumbing"
+        );
+
+        state.selected_tree = Some(HierarchyKey::process(second_worker.node_id.clone()));
+        assert_eq!(
+            work_surface::resolve(
+                &snapshot,
+                effective_selection(&snapshot, &state).as_ref(),
+                None,
+            )
+            .map(work_surface::ResolvedViewTarget::public),
+            Some(ViewTarget::Node(second_worker.node_id)),
+            "selecting phrase-2 must never substitute the coordinator or its shell wrapper"
+        );
+    }
+
+    #[test]
     fn a_semantic_sibling_needing_the_operator_is_ordered_before_busy_work() {
         let (mut snapshot, root_id, child_id, _) = hierarchy_fixture();
         let nodes = &mut snapshot.workspaces[0].sessions[0].nodes;
