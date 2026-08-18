@@ -13918,6 +13918,39 @@ mod tests {
     }
 
     #[test]
+    fn quick_agent_choices_cannot_drift_from_the_provider_owned_catalogue() {
+        let catalogue = turn_agents::AdapterRegistry::with_builtin().launch_catalogue();
+        assert_eq!(catalogue.len(), AGENT_QUICK_CHOICES.len());
+        for choice in AGENT_QUICK_CHOICES {
+            let provider = catalogue
+                .iter()
+                .find(|provider| provider.adapter_id == choice.adapter_id)
+                .unwrap_or_else(|| panic!("{} disappeared from the registry", choice.adapter_id));
+            assert!(
+                provider
+                    .executables
+                    .iter()
+                    .any(|name| name == choice.program),
+                "{} is no longer an executable owned by {}",
+                choice.program,
+                choice.adapter_id
+            );
+            assert!(
+                provider
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == SAFE_LAUNCH_PROFILE)
+                    && provider
+                        .profiles
+                        .iter()
+                        .any(|profile| profile.id == AUTONOMOUS_LAUNCH_PROFILE),
+                "{} no longer offers both semantic modes",
+                choice.adapter_id
+            );
+        }
+    }
+
+    #[test]
     fn a_layout_cell_persists_autonomous_intent_instead_of_provider_flags() {
         let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
         let selected = draft.selected.clone();
