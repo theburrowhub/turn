@@ -406,6 +406,19 @@ fn a_new_pane_omits_everything_it_was_not_given() {
 }
 
 #[test]
+fn a_new_pane_round_trips_its_semantic_launch_profile() {
+    let mut pane = NewPane::new(PaneKind::Agent).with_command("gemini");
+    pane.launch_profile = Some(turn_core::model::AgentLaunchProfileRef::new(
+        "gemini-cli",
+        "autonomous",
+    ));
+    let json = serde_json::to_string(&pane).unwrap();
+    assert!(json.contains("\"adapter_id\":\"gemini-cli\""));
+    assert!(!json.contains("--approval-mode"));
+    assert_eq!(serde_json::from_str::<NewPane>(&json).unwrap(), pane);
+}
+
+#[test]
 fn a_legacy_handoff_request_defaults_to_continue_with() {
     let request: Request = serde_json::from_value(serde_json::json!({
         "op": "prepare_context_handoff",

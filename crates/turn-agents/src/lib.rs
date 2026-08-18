@@ -32,7 +32,8 @@ pub mod text;
 
 pub use adapter::{
     AdapterError, AgentAdapter, Capabilities, EventContext, HookEndpoint, IntegrationLevel,
-    LaunchContext, LaunchPlan,
+    LaunchContext, LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, LaunchProfileRole,
+    ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 pub use claude::{ClaudeCodeAdapter, HookTransport};
 pub use codex::{CodexAdapter, CodexTransport};
@@ -43,5 +44,5 @@ pub use context::{
 pub use gemini::GeminiCliAdapter;
 pub use heuristic::{HeuristicAdapter, HeuristicConfig, Inference, OutputHeuristic};
 pub use opencode::OpenCodeAdapter;
-pub use registry::{AdapterRegistry, GenericTerminalAdapter, Selection};
+pub use registry::{AdapterLaunchCatalogue, AdapterRegistry, GenericTerminalAdapter, Selection};
 pub use server::{HookServer, HookStats, ServerError};

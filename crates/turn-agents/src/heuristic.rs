@@ -461,9 +461,10 @@ impl AgentAdapter for HeuristicAdapter {
     }
 
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let args = self.resolve_context_launch_profile(ctx)?.args;
         Ok(LaunchPlan {
             command: ctx.command.clone(),
-            args: ctx.user_args.clone(),
+            args,
             env: vec![
                 ("TURN_SESSION_ID".into(), ctx.session_id.to_string()),
                 ("TURN_NODE_ID".into(), ctx.node_id.to_string()),
@@ -596,6 +597,7 @@ jamuriano@studio ~/personal-workspace/turn %
             cwd: "/repo".into(),
             command: "aider".into(),
             user_args: vec!["--model".into(), "sonnet".into()],
+            launch_profile: None,
             endpoint: crate::adapter::HookEndpoint {
                 base_url: "http://127.0.0.1:1".into(),
                 token: "t".into(),

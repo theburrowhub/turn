@@ -104,6 +104,7 @@ fn merged_plugin_config_is_fire_and_forget_and_pure_mode_degrades_safely() {
         cwd: "/repo".into(),
         command: "opencode".into(),
         user_args: vec!["--model".into(), "openai/gpt-5.2".into()],
+        launch_profile: None,
         endpoint: HookEndpoint {
             base_url: "http://127.0.0.1:51234".into(),
             token: "tok_opencode".into(),

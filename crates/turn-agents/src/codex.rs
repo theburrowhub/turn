@@ -79,7 +79,8 @@
 
 use crate::adapter::{
     AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
+    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
@@ -211,6 +212,58 @@ impl CodexAdapter {
     }
 }
 
+fn is_codex_policy_option(arg: &str) -> bool {
+    matches!(arg, "--ask-for-approval" | "-a" | "--sandbox" | "-s")
+        || arg.starts_with("--ask-for-approval=")
+        || arg.starts_with("-a=")
+        || arg.starts_with("--sandbox=")
+        || arg.starts_with("-s=")
+}
+
+fn resolve_codex_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+    let bypass = args.iter().any(|arg| arg == BYPASS);
+
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if bypass || args.iter().any(|arg| is_codex_policy_option(arg)) {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "codex".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "an explicit approval or sandbox policy argument".to_string(),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("codex", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            if let Some(conflict) = args.iter().find(|arg| is_codex_policy_option(arg)) {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "codex".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: format!("the explicit `{conflict}` policy argument"),
+                });
+            }
+            let mut resolved = args.to_vec();
+            if !bypass {
+                resolved.push(BYPASS.to_string());
+            }
+            Ok(ResolvedLaunchProfile::autonomous(
+                "codex",
+                LaunchPermissionPosture::BypassApprovalsAndSandbox,
+                resolved,
+                vec![BYPASS.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "codex".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
+    }
+}
+
 impl AgentAdapter for CodexAdapter {
     fn id(&self) -> &'static str {
         "codex"
@@ -241,7 +294,29 @@ impl AgentAdapter for CodexAdapter {
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe(
+                "Codex keeps its configured approval policy and sandbox in force.",
+            ),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::BypassApprovalsAndSandbox,
+                "Codex bypasses approvals and runs without its sandbox for this launch.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_codex_profile(profile_id, user_args)
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let profile_args = resolved_profile.args;
         let url = ctx.endpoint.url();
 
         // Both mechanisms are command-based: Codex has no HTTP handler type, so
@@ -252,7 +327,7 @@ impl AgentAdapter for CodexAdapter {
         let Some(helper) = ctx.endpoint.helper_path.as_ref() else {
             return Ok(LaunchPlan {
                 command: ctx.command.clone(),
-                args: ctx.user_args.clone(),
+                args: profile_args,
                 env: base_env(ctx, &url),
                 level: IntegrationLevel::GenericTerminal,
                 note: "The turn-hook helper was not found, so Codex has no way to \
@@ -263,7 +338,7 @@ impl AgentAdapter for CodexAdapter {
         };
         let helper = helper.to_string_lossy().to_string();
 
-        let mut args = ctx.user_args.clone();
+        let mut args = profile_args;
         // Hooks are configured in both hook transports. The difference between them
         // is only what Turn is entitled to claim, never what Codex is told.
         if self.transport != CodexTransport::NotifyOnly {
@@ -708,6 +783,7 @@ mod tests {
             cwd: "/repo".into(),
             command: "codex".into(),
             user_args: vec!["--model".into(), "gpt-5".into()],
+            launch_profile: None,
             endpoint: HookEndpoint {
                 base_url: "http://127.0.0.1:51234".into(),
                 token: "tok_codex".into(),

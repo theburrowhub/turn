@@ -26,8 +26,8 @@ use turn_core::ids::{
     AttentionId, CheckoutId, HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 use turn_core::model::{
-    Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind, PanePlacement,
-    PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
+    AgentLaunchProfileRef, Direction, DropZone, Layout, LayoutPreset, PaneGeometry, PaneKind,
+    PanePlacement, PreviewVisibility, RelationshipKind, RestoreBehaviour, Template, TreeFilter,
     TreeVisibilityMode,
 };
 use turn_core::privacy::PrivacyScope;
@@ -112,6 +112,10 @@ pub struct NewPane {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Provider-owned launch policy. Omitted by old clients and for custom/raw
+    /// command lines, which keeps their arguments untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -127,6 +131,7 @@ impl NewPane {
             title: None,
             command: None,
             args: Vec::new(),
+            launch_profile: None,
             cwd: None,
             env: Vec::new(),
             restore: RestoreBehaviour::default(),

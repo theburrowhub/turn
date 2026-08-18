@@ -46,7 +46,8 @@ use turn_agents::{
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_core::model::{
-    NodeKind, PaneKind, ProcessNode, Relation, Session, SessionMode, WorkspaceCheckout,
+    AgentLaunchProfileRef, NodeKind, PaneKind, ProcessNode, Relation, Session, SessionMode,
+    WorkspaceCheckout,
 };
 use turn_core::state::Lifecycle;
 use turn_proto::{ErrorCode, ProtoError};
@@ -438,6 +439,7 @@ impl Core {
             kind: pane.kind,
             title: pane.title.clone(),
             args,
+            launch_profile: pane.launch_profile.clone(),
             env,
             // Resolved at the last boundary before a pty, which is where it has to
             // happen whatever shape the launch takes: a shell is a more general thing to
@@ -932,16 +934,29 @@ impl Core {
             cwd: request.cwd.clone(),
             command: command.to_string(),
             user_args: request.args.clone(),
+            launch_profile: request.launch_profile.clone(),
             endpoint,
             scratch_dir: paths::node_scratch(&self.data_dir, session_id, node_id),
         };
         selection.adapter.prepare(&launch).map_err(|error| {
             self.revoke(token);
-            ProtoError::new(
-                ErrorCode::Unavailable,
-                "Turn could not write the configuration this agent needs",
-            )
-            .with_detail(error.to_string())
+            let detail = error.to_string();
+            if matches!(
+                error,
+                turn_agents::AdapterError::UnknownLaunchAdapter { .. }
+                    | turn_agents::AdapterError::UnknownLaunchProfile { .. }
+                    | turn_agents::AdapterError::LaunchProfileAdapterMismatch { .. }
+                    | turn_agents::AdapterError::LaunchProfileConflict { .. }
+            ) {
+                ProtoError::invalid("This agent launch profile cannot be applied")
+                    .with_detail(detail)
+            } else {
+                ProtoError::new(
+                    ErrorCode::Unavailable,
+                    "Turn could not write the configuration this agent needs",
+                )
+                .with_detail(detail)
+            }
         })
     }
 
@@ -1261,6 +1276,7 @@ pub(crate) struct PaneRequest {
     /// so on a hosted launch it names the agent rather than the shell around it.
     pub title: Option<String>,
     pub args: Vec<String>,
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     pub env: Vec<(String, String)>,
     /// Already resolved and proved to be inside the Session's checkout.
     pub cwd: String,
@@ -1969,6 +1985,7 @@ mod tests {
                 cwd: temp.path().to_string_lossy().into_owned(),
                 command: "claude".to_string(),
                 user_args: vec!["--model".to_string(), "opus".to_string()],
+                launch_profile: None,
                 endpoint: turn_agents::HookEndpoint {
                     base_url: "http://127.0.0.1:51234".to_string(),
                     token: "to'ken$(id)".to_string(),

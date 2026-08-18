@@ -98,6 +98,7 @@ fn launch_is_non_blocking_and_waits_for_live_evidence_before_claiming_structured
         cwd: "/repo".into(),
         command: "gemini".into(),
         user_args: vec!["--model".into(), "gemini-2.5-pro".into()],
+        launch_profile: None,
         endpoint: HookEndpoint {
             base_url: "http://127.0.0.1:51234".into(),
             token: "tok_gemini".into(),

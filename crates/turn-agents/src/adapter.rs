@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use turn_core::event::TurnEvent;
 use turn_core::ids::{NodeId, SessionId};
+use turn_core::model::AgentLaunchProfileRef;
+
+/// Stable ids understood by every provider catalogue. The adapter owns what each
+/// id means for its CLI; callers never need to know a vendor flag.
+pub const SAFE_PROFILE_ID: &str = "safe";
+pub const AUTONOMOUS_PROFILE_ID: &str = "autonomous";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -18,6 +24,142 @@ pub enum AdapterError {
     Serialise(#[from] serde_json::Error),
     #[error("{tool} is not installed or not on PATH")]
     NotInstalled { tool: String },
+    #[error("unknown agent adapter `{adapter_id}`")]
+    UnknownLaunchAdapter { adapter_id: String },
+    #[error("adapter `{adapter_id}` has no launch profile `{profile_id}`")]
+    UnknownLaunchProfile {
+        adapter_id: String,
+        profile_id: String,
+    },
+    #[error(
+        "launch profile `{profile_id}` belongs to `{requested_adapter}`, but `{selected_adapter}` would run this command"
+    )]
+    LaunchProfileAdapterMismatch {
+        requested_adapter: String,
+        selected_adapter: String,
+        profile_id: String,
+    },
+    #[error("launch profile `{profile_id}` for `{adapter_id}` conflicts with {detail}")]
+    LaunchProfileConflict {
+        adapter_id: String,
+        profile_id: String,
+        detail: String,
+    },
+}
+
+/// The product-level choice presented to an operator.
+///
+/// This is an enum, not a `yolo: bool`: providers have materially different
+/// autonomous policies, recorded separately in [`LaunchPermissionPosture`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchProfileRole {
+    Safe,
+    Autonomous,
+}
+
+/// What a provider profile actually changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPermissionPosture {
+    /// No Turn-selected policy; arguments came from a legacy or advanced launch.
+    Custom,
+    /// The provider's normal permission and sandbox policy remains in force.
+    StandardSafeguards,
+    /// Claude Code skips its permission checks.
+    BypassPermissions,
+    /// Codex bypasses both approvals and its sandbox.
+    BypassApprovalsAndSandbox,
+    /// Gemini runs in its `yolo` approval mode.
+    YoloApprovalMode,
+    /// OpenCode auto-approves requests except those explicitly denied by policy.
+    AutoApproveUnlessDenied,
+}
+
+/// One provider-owned choice suitable for a UI or template editor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchProfileDefinition {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub role: LaunchProfileRole,
+    pub posture: LaunchPermissionPosture,
+}
+
+impl LaunchProfileDefinition {
+    pub fn safe(description: impl Into<String>) -> Self {
+        Self {
+            id: SAFE_PROFILE_ID.to_string(),
+            label: "Safe".to_string(),
+            description: description.into(),
+            role: LaunchProfileRole::Safe,
+            posture: LaunchPermissionPosture::StandardSafeguards,
+        }
+    }
+
+    pub fn autonomous(posture: LaunchPermissionPosture, description: impl Into<String>) -> Self {
+        Self {
+            id: AUTONOMOUS_PROFILE_ID.to_string(),
+            label: "Autonomous".to_string(),
+            description: description.into(),
+            role: LaunchProfileRole::Autonomous,
+            posture,
+        }
+    }
+}
+
+/// A semantic profile resolved against a concrete argument vector.
+///
+/// `effective_flag_names` contains flag names only, never values, so callers can
+/// explain the launch without turning a model name, path or token into metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLaunchProfile {
+    pub adapter_id: String,
+    pub profile_id: String,
+    pub role: Option<LaunchProfileRole>,
+    pub posture: LaunchPermissionPosture,
+    pub args: Vec<String>,
+    pub effective_flag_names: Vec<String>,
+}
+
+impl ResolvedLaunchProfile {
+    fn custom(adapter_id: &str, args: &[String]) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: "custom".to_string(),
+            role: None,
+            posture: LaunchPermissionPosture::Custom,
+            args: args.to_vec(),
+            effective_flag_names: Vec::new(),
+        }
+    }
+
+    pub fn safe(adapter_id: &str, args: &[String]) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: SAFE_PROFILE_ID.to_string(),
+            role: Some(LaunchProfileRole::Safe),
+            posture: LaunchPermissionPosture::StandardSafeguards,
+            args: args.to_vec(),
+            effective_flag_names: Vec::new(),
+        }
+    }
+
+    pub fn autonomous(
+        adapter_id: &str,
+        posture: LaunchPermissionPosture,
+        args: Vec<String>,
+        effective_flag_names: Vec<String>,
+    ) -> Self {
+        Self {
+            adapter_id: adapter_id.to_string(),
+            profile_id: AUTONOMOUS_PROFILE_ID.to_string(),
+            role: Some(LaunchProfileRole::Autonomous),
+            posture,
+            args,
+            effective_flag_names,
+        }
+    }
 }
 
 /// How well Turn understands a given tool. The brief's four levels.
@@ -96,6 +238,9 @@ pub struct LaunchContext {
     /// The command the user asked for, e.g. `claude` plus their own flags.
     pub command: String,
     pub user_args: Vec<String>,
+    /// A persisted semantic choice. `None` is deliberately distinct from Safe:
+    /// it represents a legacy/custom command line that must remain untouched.
+    pub launch_profile: Option<AgentLaunchProfileRef>,
     pub endpoint: HookEndpoint,
     /// Directory the adapter may write throwaway configuration into. Turn owns
     /// it and deletes it with the session, so the user's own config is never
@@ -140,6 +285,48 @@ pub trait AgentAdapter: Send + Sync {
     fn best_level(&self) -> IntegrationLevel;
 
     fn capabilities(&self) -> Capabilities;
+
+    /// Provider-owned launch choices. Generic integrations expose only Safe;
+    /// concrete agent adapters add the exact Autonomous policy they support.
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![LaunchProfileDefinition::safe(
+            "Use the command line without changing its permission policy.",
+        )]
+    }
+
+    /// Applies one semantic profile to user arguments.
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        match profile_id {
+            SAFE_PROFILE_ID => Ok(ResolvedLaunchProfile::safe(self.id(), user_args)),
+            _ => Err(AdapterError::UnknownLaunchProfile {
+                adapter_id: self.id().to_string(),
+                profile_id: profile_id.to_string(),
+            }),
+        }
+    }
+
+    /// Resolves the persisted reference only after adapter selection, preventing a
+    /// Template saved for one provider from silently applying to another command.
+    fn resolve_context_launch_profile(
+        &self,
+        ctx: &LaunchContext,
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        let Some(requested) = &ctx.launch_profile else {
+            return Ok(ResolvedLaunchProfile::custom(self.id(), &ctx.user_args));
+        };
+        if requested.adapter_id != self.id() {
+            return Err(AdapterError::LaunchProfileAdapterMismatch {
+                requested_adapter: requested.adapter_id.clone(),
+                selected_adapter: self.id().to_string(),
+                profile_id: requested.profile_id.clone(),
+            });
+        }
+        self.resolve_launch_profile(&requested.profile_id, &ctx.user_args)
+    }
 
     /// Whether this adapter handles a given command line.
     fn handles(&self, command: &str) -> bool {

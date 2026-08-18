@@ -995,6 +995,7 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
         pane.title = Some("shell".into());
         pane.command = None;
         pane.args.clear();
+        pane.launch_profile = None;
         pane.cwd = None;
         pane.env.clear();
         pane.node_id = None;

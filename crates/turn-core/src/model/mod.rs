@@ -25,8 +25,8 @@ pub use hierarchy::{
     WorkspaceWriteLease,
 };
 pub use layout::{
-    Child, Direction, DropZone, FloatingPane, Layout, LayoutNode, LayoutPreset, Pane, PaneGeometry,
-    PaneKind, PanePlacement, RestoreBehaviour, Split,
+    AgentLaunchProfileRef, Child, Direction, DropZone, FloatingPane, Layout, LayoutNode,
+    LayoutPreset, Pane, PaneGeometry, PaneKind, PanePlacement, RestoreBehaviour, Split,
 };
 pub use node::{
     AgentIdentityAlias, AgentIdentitySource, AgentInfo, NodeKind, PendingPermission, ProcessNode,

@@ -1751,6 +1751,7 @@ pub(super) fn pane_from_spec(spec: &NewPane) -> Pane {
     pane.title_is_user_set = spec.title.is_some();
     pane.command = spec.command.clone();
     pane.args = spec.args.clone();
+    pane.launch_profile = spec.launch_profile.clone();
     pane.cwd = spec.cwd.clone();
     pane.env = spec.env.clone();
     pane.restore = spec.restore;
@@ -2887,6 +2888,10 @@ mod tests {
             title: Some("api".into()),
             command: Some("cargo run".into()),
             args: vec!["--release".into()],
+            launch_profile: Some(turn_core::model::AgentLaunchProfileRef::new(
+                "codex",
+                "autonomous",
+            )),
             cwd: Some("api".into()),
             env: vec![("PORT".into(), "8080".into())],
             restore: turn_core::model::RestoreBehaviour::Relaunch,
@@ -2898,6 +2903,7 @@ mod tests {
         );
         assert_eq!(pane.command.as_deref(), Some("cargo run"));
         assert_eq!(pane.args, vec!["--release".to_string()]);
+        assert_eq!(pane.launch_profile, spec.launch_profile);
         assert_eq!(pane.cwd.as_deref(), Some("api"));
         assert_eq!(pane.env.len(), 1);
         assert_eq!(pane.restore, turn_core::model::RestoreBehaviour::Relaunch);
@@ -3307,6 +3313,7 @@ mod tests {
                         title: Some("escape".into()),
                         command: Some("/bin/sh".into()),
                         args: Vec::new(),
+                        launch_profile: None,
                         cwd: Some(cwd.into()),
                         env: Vec::new(),
                         restore: turn_core::model::RestoreBehaviour::ReattachOnly,
@@ -3432,6 +3439,7 @@ mod tests {
                     title: Some("write attempt".into()),
                     command: Some("sh".into()),
                     args: vec!["-c".into(), format!("touch {}", marker.display())],
+                    launch_profile: None,
                     cwd: None,
                     env: Vec::new(),
                     restore: turn_core::model::RestoreBehaviour::ReattachOnly,
@@ -3506,6 +3514,7 @@ mod tests {
                 ran.to_string_lossy().into_owned(),
                 blocked.to_string_lossy().into_owned(),
             ],
+            launch_profile: None,
             cwd: Some(".".into()),
             env: Vec::new(),
             restore: turn_core::model::RestoreBehaviour::ReattachOnly,
@@ -3672,6 +3681,7 @@ mod tests {
                     title: Some("primary escape".into()),
                     command: Some("/bin/sh".into()),
                     args: Vec::new(),
+                    launch_profile: None,
                     cwd: Some(repository.to_string_lossy().into_owned()),
                     env: Vec::new(),
                     restore: turn_core::model::RestoreBehaviour::ReattachOnly,

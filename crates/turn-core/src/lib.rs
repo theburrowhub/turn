@@ -26,8 +26,8 @@ pub use ids::{
     AttentionId, EventId, HandoffId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId,
 };
 pub use model::{
-    AgentInfo, Layout, LayoutNode, Pane, PaneKind, ProcessNode, Session, SessionTree, Split,
-    Template, Workspace,
+    AgentInfo, AgentLaunchProfileRef, Layout, LayoutNode, Pane, PaneKind, ProcessNode, Session,
+    SessionTree, Split, Template, Workspace,
 };
 pub use privacy::{
     InstallationPurgeReport, PrivacyCategory, PrivacyDatum, PrivacyDeletionReport,

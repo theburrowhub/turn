@@ -31,7 +31,8 @@
 
 use crate::adapter::{
     AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPlan,
+    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
+    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
@@ -263,6 +264,74 @@ fn user_supplied_settings(args: &[String]) -> bool {
         .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
 }
 
+fn claude_permission_modes(args: &[String]) -> Vec<Option<&str>> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(index, arg)| {
+            if arg == "--permission-mode" {
+                Some(args.get(index + 1).map(String::as_str))
+            } else {
+                arg.strip_prefix("--permission-mode=").map(Some)
+            }
+        })
+        .collect()
+}
+
+fn resolve_claude_profile(
+    profile_id: &str,
+    args: &[String],
+) -> Result<ResolvedLaunchProfile, AdapterError> {
+    let skip_flag = args
+        .iter()
+        .any(|arg| arg == "--dangerously-skip-permissions");
+    let permission_modes = claude_permission_modes(args);
+    let bypass_mode = permission_modes.contains(&Some("bypassPermissions"));
+
+    match profile_id {
+        SAFE_PROFILE_ID => {
+            if skip_flag || !permission_modes.is_empty() {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "claude-code".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "an explicit Claude Code permission policy argument".to_string(),
+                });
+            }
+            Ok(ResolvedLaunchProfile::safe("claude-code", args))
+        }
+        AUTONOMOUS_PROFILE_ID => {
+            if permission_modes
+                .iter()
+                .any(|mode| *mode != Some("bypassPermissions"))
+            {
+                return Err(AdapterError::LaunchProfileConflict {
+                    adapter_id: "claude-code".to_string(),
+                    profile_id: profile_id.to_string(),
+                    detail: "the explicit --permission-mode argument".to_string(),
+                });
+            }
+            let mut resolved = args.to_vec();
+            let effective_flag = if skip_flag {
+                "--dangerously-skip-permissions"
+            } else if bypass_mode {
+                "--permission-mode"
+            } else {
+                resolved.push("--dangerously-skip-permissions".to_string());
+                "--dangerously-skip-permissions"
+            };
+            Ok(ResolvedLaunchProfile::autonomous(
+                "claude-code",
+                LaunchPermissionPosture::BypassPermissions,
+                resolved,
+                vec![effective_flag.to_string()],
+            ))
+        }
+        _ => Err(AdapterError::UnknownLaunchProfile {
+            adapter_id: "claude-code".to_string(),
+            profile_id: profile_id.to_string(),
+        }),
+    }
+}
+
 impl AgentAdapter for ClaudeCodeAdapter {
     fn id(&self) -> &'static str {
         "claude-code"
@@ -291,7 +360,29 @@ impl AgentAdapter for ClaudeCodeAdapter {
         }
     }
 
+    fn launch_profiles(&self) -> Vec<LaunchProfileDefinition> {
+        vec![
+            LaunchProfileDefinition::safe(
+                "Claude Code keeps its normal permission checks in force.",
+            ),
+            LaunchProfileDefinition::autonomous(
+                LaunchPermissionPosture::BypassPermissions,
+                "Claude Code skips permission checks for this launch.",
+            ),
+        ]
+    }
+
+    fn resolve_launch_profile(
+        &self,
+        profile_id: &str,
+        user_args: &[String],
+    ) -> Result<ResolvedLaunchProfile, AdapterError> {
+        resolve_claude_profile(profile_id, user_args)
+    }
+
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
+        let resolved_profile = self.resolve_context_launch_profile(ctx)?;
+        let user_args = resolved_profile.args;
         std::fs::create_dir_all(&ctx.scratch_dir)?;
         let settings_path = ctx.scratch_dir.join("claude-hooks.json");
         let (document, undeliverable) = self.subscriptions(ctx);
@@ -312,10 +403,10 @@ impl AgentAdapter for ClaudeCodeAdapter {
 
         // The user's own `--settings` stands, and the file Turn wrote is named so
         // they can merge it if they want Turn's detection as well.
-        if user_supplied_settings(&ctx.user_args) {
+        if user_supplied_settings(&user_args) {
             return Ok(LaunchPlan {
                 command: ctx.command.clone(),
-                args: ctx.user_args.clone(),
+                args: user_args,
                 env,
                 level: IntegrationLevel::GenericTerminal,
                 note: format!(
@@ -328,7 +419,7 @@ impl AgentAdapter for ClaudeCodeAdapter {
             });
         }
 
-        let mut args = ctx.user_args.clone();
+        let mut args = user_args;
         // Appended, which is where an argument Turn adds belongs: the user's own
         // arguments keep the order and the meaning they were written with. The one
         // case where appending would decide something on their behalf — a second
@@ -787,6 +878,7 @@ mod tests {
             cwd: "/repo".into(),
             command: "claude".into(),
             user_args: vec!["--permission-mode".into(), "acceptEdits".into()],
+            launch_profile: None,
             endpoint: crate::adapter::HookEndpoint {
                 base_url: "http://127.0.0.1:51234".into(),
                 token: "tok_abc".into(),
