@@ -643,16 +643,25 @@ enum LaunchField {
     ThinkingEnabled,
 }
 
-fn launch_field(configuration: &LaunchConfiguration, field: LaunchField) -> Option<&str> {
+fn launch_field(configuration: &LaunchConfiguration, field: LaunchField) -> Option<String> {
     match field {
-        LaunchField::Model => configuration.model.as_deref(),
-        LaunchField::PermissionMode => configuration.permission_mode.as_deref(),
-        LaunchField::EffortLevel => configuration.effort_level.as_deref(),
-        LaunchField::ThinkingEnabled => {
-            configuration
-                .thinking_enabled
-                .map(|enabled| if enabled { "enabled" } else { "disabled" })
-        }
+        LaunchField::Model => compact_model(configuration),
+        LaunchField::PermissionMode => configuration.permission_mode.clone(),
+        LaunchField::EffortLevel => configuration.effort_level.clone(),
+        LaunchField::ThinkingEnabled => configuration
+            .thinking_enabled
+            .map(|enabled| if enabled { "enabled" } else { "disabled" }.to_string()),
+    }
+}
+
+fn compact_model(configuration: &LaunchConfiguration) -> Option<String> {
+    match (
+        configuration.model.as_deref(),
+        configuration.model_display_name.as_deref(),
+    ) {
+        (Some(model), _) => Some(model.to_string()),
+        (None, Some(display_name)) => Some(display_name.to_string()),
+        (None, None) => None,
     }
 }
 
@@ -674,8 +683,8 @@ fn launch_header_fact(
             .and_then(|configuration| launch_field(configuration, field))
             .filter(|value| !value.is_empty())
         {
-            if values.last().is_none_or(|previous| previous != value) {
-                values.push(value.to_string());
+            if values.last() != Some(&value) {
+                values.push(value);
             }
         }
     }
@@ -1597,6 +1606,95 @@ mod tests {
         assert_eq!(absent_stale.effort.state, RuntimeFactState::Stale);
         assert_eq!(absent_stale.thinking.value, "stale · unreported");
         assert_eq!(absent_stale.thinking.state, RuntimeFactState::Stale);
+    }
+
+    #[test]
+    fn compact_model_uses_display_only_and_keeps_id_and_label_unambiguous() {
+        let mut node = ProcessNode::agent(
+            SessionId::from_stored("session-model-display"),
+            "claude",
+            "/repo",
+            T0,
+        );
+        let runtime = &mut node.agent.as_mut().unwrap().runtime;
+        runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model_display_name: Some("Opus".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+
+        let mut summary = AgentSummary::from_node(&node, T0).unwrap();
+        let display_only = agent_header_facts(&summary, T0);
+        assert_eq!(display_only.model.value, "Opus");
+        assert_eq!(display_only.model.state, RuntimeFactState::Observed);
+
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                model_display_name: Some("Opus 5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        let identified = agent_header_facts(&summary, T0 + 1);
+        assert_eq!(identified.model.value, "claude-opus-5");
+        assert_eq!(identified.model.state, RuntimeFactState::Observed);
+
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("same-name".into()),
+                model_display_name: Some("same-name".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            None,
+        );
+        assert_eq!(
+            agent_header_facts(&summary, T0 + 2).model.value,
+            "same-name",
+            "an identical provider label must not be repeated"
+        );
+
+        summary.runtime.launch.requested = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0,
+            None,
+        );
+        summary.runtime.launch.effective = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 1,
+            None,
+        );
+        summary.runtime.launch.current = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus-5".into()),
+                model_display_name: Some("Opus 5".into()),
+                ..LaunchConfiguration::default()
+            },
+            source(),
+            T0 + 2,
+            None,
+        );
+        assert_eq!(
+            agent_header_facts(&summary, T0 + 2).model.value,
+            "claude-opus-5",
+            "adding a display label to the same id is enrichment, not a model transition"
+        );
     }
 
     #[test]

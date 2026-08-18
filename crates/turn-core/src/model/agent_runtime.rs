@@ -316,11 +316,40 @@ impl LaunchConfiguration {
     /// completed later.
     fn fill_missing_from(&mut self, fallback: &Self) -> bool {
         let mut contributed = false;
-        if self.model.is_none() && fallback.model.is_some() {
+        let preferred_model = self.model.clone();
+        let preferred_display_name = self.model_display_name.clone();
+
+        // A model id and its provider display name are a correlated pair. A
+        // display-only preferred sample cannot safely borrow an unrelated id;
+        // require the fallback to repeat that display name before enriching it.
+        let model_can_be_inherited = self.model.is_none()
+            && fallback.model.is_some()
+            && match (
+                preferred_display_name.as_deref(),
+                fallback.model_display_name.as_deref(),
+            ) {
+                (None, _) => true,
+                (Some(preferred), Some(fallback)) => preferred == fallback,
+                (Some(_), None) => false,
+            };
+        if model_can_be_inherited {
             self.model.clone_from(&fallback.model);
             contributed = true;
         }
-        if self.model_display_name.is_none() && fallback.model_display_name.is_some() {
+
+        // Only fill a display name when its correlation is established by the
+        // same fallback, equal ids, or two genuinely display-only samples.
+        // In particular, an id-bearing preferred sample must never acquire a
+        // display name from an id-less or differently identified fallback.
+        let display_can_be_inherited = self.model_display_name.is_none()
+            && fallback.model_display_name.is_some()
+            && match (preferred_model.as_deref(), fallback.model.as_deref()) {
+                (None, Some(_)) => model_can_be_inherited,
+                (Some(preferred), Some(fallback)) => preferred == fallback,
+                (None, None) => true,
+                (Some(_), None) => false,
+            };
+        if display_can_be_inherited {
             self.model_display_name
                 .clone_from(&fallback.model_display_name);
             contributed = true;
@@ -808,7 +837,10 @@ mod tests {
         let merged = prefer_newer_configuration(status_line, transcript);
         let current = merged.value().unwrap();
         assert_eq!(current.model.as_deref(), Some("opus-latest-id"));
-        assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(
+            current.model_display_name, None,
+            "a label observed beside a different model id is not portable"
+        );
         assert_eq!(current.effort_level.as_deref(), Some("high"));
         assert_eq!(current.thinking_enabled, Some(true));
         assert_eq!(merged.observed_at_ms(), Some(T0));
@@ -839,7 +871,7 @@ mod tests {
         );
         let older_completed_late = Observable::observed(
             LaunchConfiguration {
-                model: Some("old-model".into()),
+                model: Some("new-model".into()),
                 model_display_name: Some("Useful display name".into()),
                 ..LaunchConfiguration::default()
             },
@@ -861,6 +893,126 @@ mod tests {
             Some(T0 + 1),
             "the fallback display name must not inherit the newer model timestamp"
         );
+    }
+
+    #[test]
+    fn a_display_name_is_not_borrowed_from_a_different_or_unidentified_model() {
+        let preferred_source = ObservationSource::new(ObservationSourceKind::Provider, "live");
+        let preferred = Observable::observed(
+            LaunchConfiguration {
+                model: Some("new-model".into()),
+                ..LaunchConfiguration::default()
+            },
+            preferred_source.clone(),
+            T0 + 10,
+            None,
+        );
+
+        for fallback in [
+            LaunchConfiguration {
+                model: Some("old-model".into()),
+                model_display_name: Some("Old Model".into()),
+                ..LaunchConfiguration::default()
+            },
+            LaunchConfiguration {
+                model_display_name: Some("Uncorrelated label".into()),
+                ..LaunchConfiguration::default()
+            },
+        ] {
+            let merged = prefer_newer_configuration(
+                Observable::observed(fallback, provider(), T0, Some(T0 + 1)),
+                preferred.clone(),
+            );
+            let current = merged.value().expect("preferred configuration");
+            assert_eq!(current.model.as_deref(), Some("new-model"));
+            assert_eq!(current.model_display_name, None);
+            assert_eq!(merged.observed_at_ms(), Some(T0 + 10));
+            assert_eq!(merged.source(), Some(&preferred_source));
+            assert!(matches!(
+                merged,
+                Observable::Observed {
+                    expires_at_ms: None,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn model_and_display_enrichment_requires_a_coherent_pair() {
+        let preferred_source = ObservationSource::new(ObservationSourceKind::Provider, "live");
+        let display_only = Observable::observed(
+            LaunchConfiguration {
+                model_display_name: Some("Opus".into()),
+                ..LaunchConfiguration::default()
+            },
+            preferred_source.clone(),
+            T0 + 10,
+            None,
+        );
+        let matching_pair = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus".into()),
+                model_display_name: Some("Opus".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0,
+            Some(T0 + 1),
+        );
+
+        let merged = prefer_newer_configuration(matching_pair, display_only.clone());
+        let current = merged.value().expect("combined configuration");
+        assert_eq!(current.model.as_deref(), Some("claude-opus"));
+        assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(merged.observed_at_ms(), Some(T0));
+        assert!(matches!(
+            merged,
+            Observable::Observed {
+                expires_at_ms: Some(expires_at_ms),
+                ..
+            } if expires_at_ms == T0 + 1
+        ));
+
+        let unrelated_model = Observable::observed(
+            LaunchConfiguration {
+                model: Some("other-model".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0,
+            Some(T0 + 1),
+        );
+        let merged = prefer_newer_configuration(unrelated_model, display_only);
+        let current = merged
+            .value()
+            .expect("preferred display-only configuration");
+        assert_eq!(current.model, None);
+        assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(merged.observed_at_ms(), Some(T0 + 10));
+        assert_eq!(merged.source(), Some(&preferred_source));
+    }
+
+    #[test]
+    fn an_empty_preferred_configuration_inherits_one_fallback_model_pair() {
+        let preferred =
+            Observable::observed(LaunchConfiguration::default(), provider(), T0 + 10, None);
+        let fallback = Observable::observed(
+            LaunchConfiguration {
+                model: Some("claude-opus".into()),
+                model_display_name: Some("Opus".into()),
+                ..LaunchConfiguration::default()
+            },
+            provider(),
+            T0,
+            Some(T0 + 1),
+        );
+
+        let merged = prefer_newer_configuration(fallback, preferred);
+        let current = merged.value().expect("combined configuration");
+        assert_eq!(current.model.as_deref(), Some("claude-opus"));
+        assert_eq!(current.model_display_name.as_deref(), Some("Opus"));
+        assert_eq!(merged.observed_at_ms(), Some(T0));
     }
 
     #[test]
