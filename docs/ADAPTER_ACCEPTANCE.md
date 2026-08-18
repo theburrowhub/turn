@@ -1,4 +1,4 @@
-# Gemini CLI, OpenCode, and external-app acceptance
+# Agent adapter, quota connector and external-app acceptance
 
 Run the complete reproducible check without opening Turn:
 
@@ -49,9 +49,340 @@ Capture callback JSON from the disposable hook endpoint, remove user content and
 secrets without changing field names or types, save it under the exact observed
 tool version, and rerun `make adapter-acceptance`.
 
+## Accepted provider-parity target
+
+The checks above prove the current Gemini/OpenCode adapter surface; they do not prove ADR-062/065's complete
+provider-neutral topology. Before Turn advertises that target, Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok run the same capability-driven fixture/degradation suite, the generic fallback and
+user-declared custom adapter run the honesty suite, and every advertised live-dependent cell carries a dated
+authenticated record. Kimi and MiniMax run the AccountProfile-scoped quota/activity connector suite without
+being mislabelled as launch adapters.
+
+### One complete capability vocabulary
+
+The shared manifest has exactly one row for each canonical capability below. A provider may report
+`supported`, `unsupported`, `degraded` or `unknown`; it may not omit a row or invent a provider-only synonym.
+
+| Capability | Common contract exercised |
+| --- | --- |
+| `launch` | New instance/attempt, requested-versus-effective launch receipt and failure before partial registration. |
+| `resume` | Exact provider conversation plus profile/target binding, fresh attempt lineage and stale-id refusal. |
+| `branch` | Exact source conversation/revision, distinct destination identity and unsupported-with-zero-effect path. |
+| `stop` | Idempotent exact-attempt stop, uncertain-effect receipt and no process-name fan-out. |
+| `structured_status` | Total native map into independent Lifecycle and TurnState axes, with source/revision/freshness. |
+| `questions` | Exact pending interaction, correlated answer/cancel and no free-text fallback for a typed permission. |
+| `permissions` | Fact revision plus closed typed/verified-local-PTY/none response transport, exact option/attempt/turn/input-route correlation, supported/fresh gating and durable resolution evidence; degraded/unknown/stale and opaque-TUI inference fail closed. |
+| `subagents` | Versioned snapshot/delta/gap topology, stable semantic identity and attempt-fenced parentage. |
+| `transcript` | Per-conversation ordered cursor, bounded content, provenance and explicit unavailable/gap state. |
+| `context_usage` | Scoped used/limit/unit/window facts with observation time, expiry and honest unavailable state. |
+| `provider_quota` | Account/profile-scoped remaining/reset/unit facts, rate-limit/error degradation and no fabricated zero. |
+| `model_switch` | Requested/effective model receipt, exact current attempt and unsupported-before-effect behavior. |
+| `mode_switch` | Closed requested/effective permission/approval/reasoning mode patch, exact current attempt/configuration revision and unsupported-before-effect behavior. |
+| `messaging` | Structured destination, delivery/evidence state and refusal rather than generic PTY injection. |
+| `context_transfer` | Budgeted packet capability, exact source/destination attempt and reviewed delivery receipt. |
+| `shared_identity` | Proved provider conversation identity without merging Turn AgentInstances. |
+| `durable_attach` | Exact endpoint/runtime generation reattachment and stale/mismatched identity refusal. |
+| `delegated_control` | Closed operation vocabulary, bounded grant and correlated accepted/refused/uncertain receipt. |
+| `native_jobs` | Provider-owned scheduled, recurring or background job plus iteration identities, lifecycle, schedule and exact control receipts; never inferred from a Turn Flow. |
+| `conversation_inventory` | Profile/target-scoped history enumeration, bounded pagination/search, freshness, exact identity matching and adopt/resume eligibility. |
+| `title_read` | Bounded provider-title observation with source revision/freshness and an explicit unavailable state, independent of rename support. |
+| `conversation_rename` | Revision-fenced provider rename with requested/effective receipt and zero-effect refusal, independent of title-read support or Turn's local display alias. |
+| `model_gateway` | Target-bound endpoint/route/model mapping and secret-reference preflight with effective receipt, bounded discovery and zero silent fallback. |
+
+The fixture manifest is bijective with these rows and the production capability manifest. Shared fixtures,
+provider fixtures, degraded/unsupported/unknown fixtures and live evidence all use the same identifiers.
+Unknown native values, missing fields and illegal state transitions fail the adapter contract rather than
+falling through to an inferred provider behavior.
+
+Capability state is scoped to `(adapter version, ProviderAccountScope, ExecutionTarget, RuntimeEndpoint/mechanism)`
+and carries observation time, expiry, reason and remediation. It is never a provider-global boolean. Expired
+authentication, profile isolation loss, target outage, mechanism failure or stale evidence degrades only the
+affected cell to `degraded|unsupported|unknown`; it cannot borrow a sibling profile/target's proof or silently
+fall back to another credential, endpoint, generic PTY or local implementation. Restart begins live-dependent
+cells as unknown until current evidence arrives, while independently proved capabilities remain usable.
+
+### Generic and custom honesty suite
+
+An unrecognised command always selects the generic terminal adapter. A user-declared custom adapter always
+selects deterministically from its declaration. Each is run through all 23 vocabulary rows and must:
+
+1. advertise only evidence it can prove, with an explicit state, mechanism, limits, reason and remediation;
+2. leave Lifecycle and raw terminal/process observation available without fabricating TurnState, questions,
+   permissions, subagents, quota, transcript, resume, native jobs, conversation inventory, provider titles,
+   provider rename, model-gateway routing or structured identity;
+3. reject an undeclared operation before launch/input/network/file effects and without falling through to a
+   dedicated provider implementation; and
+4. degrade one capability independently, preserving terminal input, selection and all unrelated capabilities.
+
+Fixtures cover an unknown binary, a shell, a renamed wrapper, a valid minimal custom declaration, every
+invalid/undeclared custom field, an unavailable executable and a declaration whose evidence mechanism fails
+at runtime. UI and protocol snapshots distinguish unsupported, degraded, unknown and stale from exact zero.
+
+### Topology and count matrix
+
+The child-topology smoke requires authenticated child and nested-child topology for all six dedicated
+adapters. Claude Code creates exactly three children, Codex exactly five, and Gemini, OpenCode, GitHub
+Copilot and Grok each use a declared bounded count. Failure to prove `subagents` fails dedicated-adapter
+acceptance; generic process inference remains additional degraded evidence and never substitutes for the
+dedicated contract. It verifies parent/child ids, UI reconnect, daemon recovery,
+duplicate/out-of-order/stop-without-start evidence and degraded mechanisms.
+Count assertions cover the full Cartesian product below at one graph revision:
+
+- metric: `semantic_children`, `live_children`, `completed_children`;
+- scope: `direct`, `descendants`; and
+- parent lifetime: `current_attempt`, `instance_lifetime`.
+
+That is 12 independently expected cells for each fixture revision. Fixtures include a nested child, a
+completed child with no active attempt, a completed-but-still-live child, spawning/orphaned/conflicted/lost
+children and an old parent attempt. A separate valid empty authoritative snapshot proves `exact(0)` for every
+applicable cell; an empty best-effort source remains unknown. Event 1,025 forces bounded overflow/gap and
+immediately degrades exact coverage. A matching asynchronous snapshot restores it without blocking input.
+Partial `N+ observed`, unknown, unsupported and stale are separate protocol/UI values. The expected event and
+snapshot manifest is generated independently and never invokes the production aggregate query.
+
+### Capability dispatch
+
+`launch`, `resume`, `branch`, `model_switch`, `mode_switch` and `stop` dispatch only through the capability-selected adapter
+method. The matrix exercises supported success, adapter-declared degraded behavior, unsupported/unknown,
+timeout, cancellation, stale capability, wrong version/profile/host/endpoint/attempt/epoch and duplicate
+operation id. Unsupported or mismatched calls fail before side effects. The daemon, store, protocol, UI and
+Attention reducers contain no provider-name re-check after registry selection. Question/permission answers,
+messaging, context transfer, durable attach, delegated control, native-job control, conversation adoption/
+resume and rename likewise select their typed method from the current capability intersection plus authority;
+no operation silently falls back to PTY text. `title_read` and `conversation_rename` are dispatched and degraded
+independently: a locally edited display alias never counts as a provider rename, and a provider rename receipt
+never fabricates the ability to read the effective provider title.
+
+### Six-adapter roster and quota-only connectors
+
+The dedicated-roster manifest contains exactly six entries: Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok. Each entry fixes adapter id, supported CLI/service version range, detection evidence and all
+23 capability cells. A versioned fixture exercises every cell in `supported|unsupported|degraded|unknown`
+states, and each supported live-dependent cell has the authenticated evidence below. Registry selection by
+renamed executable, wrapper text or process title is insufficient; an unavailable dedicated adapter may fall
+back only to an honestly labelled generic terminal after showing the lost capabilities. Core, protocol and UI
+contain no roster-specific behavior branch after registry selection.
+
+Kimi and MiniMax use a separate `QuotaConnector` manifest. Each reads only the exact provider,
+AccountProfile, ExecutionTarget and credential-reference scope and returns bounded context/quota windows plus
+activity with source, coverage, freshness, rate-limit/error and reset semantics. Shared subscription limits
+stay account facts and never become per-Agent usage. The connector advertises no `launch`, `resume`,
+`transcript`, `questions`, `permissions`, `subagents`, `messaging` or control method; calls to those paths are
+structurally absent or refused before any effect. Cross-profile cache/cursor, missing-page, zero-versus-error,
+expired auth and one-provider timeout fixtures prove isolation and failure independence.
+
+### ModelEndpointProfile and gateway matrix
+
+`ACP-ADP-013` creates two endpoint profiles under the same AccountProfile and target, then exercises create,
+validate, bounded model discovery, set-default, launch, model switch, retire and delete. The route key includes
+profile id/revision, canonical origin, wire dialect and model namespace; discovery results from an older
+revision or target generation are discarded. Responses with more than the declared model/byte/time bound are
+truncated/degraded without claiming completeness. A selected model is never inserted into flags, argv or
+environment without adapter-owned typed mapping.
+
+Credential variants are `environment variable name`, OS keystore, target host-agent or external broker
+references. The suite places unique canaries in every raw secret and proves they are absent from protocol,
+store, argv/process listing, PTY, diagnostics, logs and export. Missing, locked, expired, revoked or wrong-target
+references produce zero provider request and zero launch; a remote attempt resolves only its remote reference
+and cannot receive a locally resolved secret. Migration first commits the secret to the broker, then swaps the
+durable reference and scrubs the old literal; failure preserves the only recoverable copy and blocks use.
+
+Network fixtures reject non-HTTPS origins except an explicitly reviewed exact loopback policy, URL userinfo,
+query/fragment ambiguity, redirect outside the adopted origin, private/metadata targets, DNS rebinding, TLS/pin
+change and oversized/malformed discovery. A valid launch receipt freezes requested/effective endpoint revision,
+wire route/model, AccountProfile and credential generation. A failed switch makes no new attempt and leaves the
+old one usable; a successful capability-declared switch records exact continuity or a new RuntimeAttempt.
+Editing a default affects only future preflights, and no error silently chooses native provider, another route,
+model, profile, target or generic PTY.
+
+### Foreground Session activation
+
+`ACP-LIF-009` removes the generic secondary “start pane” interaction without making selection a broad launch
+capability. Exactly one foreground selection of a canonical Session row resolves its bounded eligible saved-
+runtime descriptor set, or a declared default Shell when the Session has none, and automatically performs
+the preflighted attach/start plan. Tree expansion, hover/preview, search results, references, restore, reconnect,
+Attention routing and background sync are not foreground selections and perform zero launch/attach effects.
+
+Before any process effect, one revision-fenced preflight resolves and freezes the Session, bounded
+descriptor/default set, WorkSurface, every ExecutionTarget, cwd/worktree containment, write lease and
+AccountProfile where applicable,
+adapter/version/capability generation, effective argv/environment policy and current operator authority. A
+missing or stale fact refuses before spawn and leaves selection usable; the exact reason and recovery appear
+in the WorkSurface and bottom status history, not behind a generic start button. The preflight operation id
+and reserved attempt identities make rapid reselection/reconnect idempotent. An ambiguous spawn is reconciled
+against its identity and is never repeated automatically. Existing pending permission, credential,
+destructive or host-trust work is surfaced through Attention and cannot be bypassed by autoactivation.
+
+The acceptance fixture selects Sessions containing an already-running child, several eligible saved/stopped
+descriptors, an empty default-Shell plan, a missing executable, a stale profile/capability, a checkout
+conflict and an uncertain launch. Every eligible
+case needs one selection and zero follow-up actions; every refusal creates zero process effects, never changes
+the requested target, and never offers a provider-generic PTY fallback.
+
+### External WorkItemSource contract
+
+`ACP-VIE-012` is a separate integration-adapter contract; it does not extend an agent's authority. A
+`WorkItemSource` manifest declares source/version, credential-reference kind, supported filters, cursor and
+page limits, rate-limit semantics, writable fields and an exhaustive native-to-`WorkItemState` mapping.
+Each imported item is keyed by `(source_id, source_profile_id, project_namespace, external_item_id)`, never
+title, URL or ordinal. Per-field
+authority is explicit (`external|turn|reviewed_merge`), and unknown native state, assignee or field is
+preserved as unmapped/degraded rather than coerced into a known value.
+
+The source suite exercises source CRUD, local create, correlated external create, explicit import/bind/rebind/
+detach and initial/incremental sync across every page, duplicate/out-of-order webhook/poll, filter/mapping/
+credential generation change, missing page, cursor expiry, cache restart and exact deletion evidence. Coverage,
+freshness, backoff and presence are independent; filtered/partial/stale/offline/rate-limited is never deletion.
+Every write freezes binding/source/mapping/item revisions; create uses CreationId correlation because no item
+ETag exists. Mutation and conflict state machines cover crash/possible-effect lookup without redispatch, newer
+remote revisions and two resolver races. Local transition edges and externally observed mapped jumps remain
+distinct. Stable external comment/assignee identities deduplicate sync echoes.
+
+Rate limiting publishes retry time and keeps the last cache visibly stale; it never clears the board or
+reports an empty authoritative result. Credentials remain a broker/keychain reference scoped to the source
+and ExecutionTarget, never appear in a manifest, cursor, cache, log or diagnostic. External assignees map by
+stable source identity to an exact local identity or remain visibly unmapped; an assignee never grants runtime,
+Flow, Attention or repository authority. Source create/edit/comment/assign/transition/close/reopen and sync remain inert with respect
+to Lifecycle, TurnState and the canonical runtime hierarchy.
+
+### Native jobs and conversation continuity
+
+`ACP-ADP-011` treats provider-native work as incarnation-aware identity with separately stable creation,
+mutation, invocation and iteration ids. The nine adapter keys
+`list|get|create|update|pause|resume|run_now|cancel_iteration|delete_job` map one-to-one and independently
+degrade; local adopt/cancel/projection/privacy operations are never aliases. List pages carry one fenced scan/
+cursor/watermark chain and closed coverage. Schedule, iteration and presence reducers reject stale regressions;
+provider id reuse requires another incarnation. Unversioned events trigger a read and cannot mutate truth.
+
+Create reserves its destination Node/CreationIntent, while every other mutation reserves a durable
+MutationIntent before effect. Every advertised mutation proves side-effect-free exact idempotency-key or receipt
+lookup; a write-only idempotency key is insufficient. Recovery from dispatching/uncertainty performs only that
+lookup and never redispatches or infers success from matching label/definition/schedule/state/time. Requested
+configuration and provider-proved effective configuration stay separate. Exact external deletion tombstones
+are distinct from complete absence. Adoption globally owns one discovered key without provider effect;
+creation/adoption, cross-Workspace, multiple run-now, privacy/compaction and container-delete races follow
+ACP-ADP-011. Turn Flow recurrence remains a different authority.
+
+`ACP-CTX-013` requires `conversation_inventory` to enumerate active and historical conversations inside the
+exact provider, AccountProfile, ExecutionTarget and provider namespace. Pages are bounded and cursor-stable;
+search declares whether it is provider-side or over a complete, fresh local cache. Each result carries the
+global conversation key, safe timestamps/state, source revision, coverage/freshness and match evidence.
+Missing pages, rate limits and unsupported search are visible and can never produce an authoritative zero.
+Titles are optional `title_read` observations, not identity.
+
+Adopt binds one proved live conversation/runtime without spawning; resume creates a new fenced attempt from
+one exact resumable conversation. Both revalidate inventory generation, profile/target, global conversation
+ownership and current capability immediately before effect. Ambiguous matches, duplicate ownership, stale
+rows and display-title-only matches are refused. Inventory access does not imply transcript access, and
+search results never carry body content unless the independent bounded `transcript` capability authorises it.
+
+### Remote permission and Companion observation
+
+`ACP-ATT-011` first proves that LocalDesktopForegroundAuthority can submit an exact provider-offered option via
+`submit_local_permission_response` without a remote grant. A remote/Companion client may use only
+`submit_remote_permission_response` when its role registry and one immutable delivered/acknowledged grant bind
+client/surface/connection, Workspace/Session, route/owner/attempt/binding, interaction, capability/transport,
+allowed options and expiry. Only LocalDesktopForegroundAuthority may issue or revoke it; widening revokes and
+creates a new id. The
+encrypted authenticated request contains the exact typed option, operation id, expected interaction revision,
+binding/connection generation and anti-replay nonce. The daemon revalidates all of them plus the adapter's
+current `permissions` capability immediately before dispatch and returns a durable accepted/refused/uncertain
+receipt. Credentials, free-form secret entry, host trust, grant administration and destructive administration
+remain local-only and cannot be added by a client-advertised capability.
+
+While Turn has a typed sensitive interaction pending, remote/Companion raw PTY input to that binding is
+blocked; when typed permission response is available, local raw PTY input is blocked too and the local
+foreground typed authorization must be used. Only the exact typed answer method can resolve it remotely. No
+remote or Companion permission path
+falls back to terminal bytes; the verified local-foreground PTY fallback remains a separate local path when
+the adapter lacks typed response capability. For an opaque generic TUI Turn cannot prove that arbitrary terminal text is or is not an approval: the
+surface states that limitation, never labels raw input as a permission decision, and may disable remote raw
+input by policy. Tests therefore claim prevention only for Turn-recognised typed interactions.
+
+`ACP-SCL-010` gives the Companion a per-AccountProfile usage/context/activity inbox, not installation-wide
+facts. Every usage cell names profile, provider scope, unit/window, used/remaining/limit when supplied,
+`observed_at`, expiry and source; an unavailable, stale or rate-limited collector never becomes numeric zero.
+Activity rows keep provider event identity, bounded safe summary, time, freshness and read/handled state.
+They become Attention only through the normal typed reducer, never because the inbox is unread. AccountProfile
+isolation, paging, reconnect and cache tests prove that no sibling profile's samples, conversation identity or
+activity enters the selected profile, and degradation of any one collector leaves the other capabilities
+honest and usable.
+
+### Shared live endpoint isolation
+
+The mandatory source-compatible live fixture binds exactly five simultaneous AgentInstances and five distinct
+conversation ids to one `RuntimeEndpoint` generation with `ProviderAccountScope=endpoint_unscoped`; its input
+contains no account field and the test must create no AccountProfile, quota, activity or inventory authority.
+A second fixture, when the provider advertises cross-profile multiplexing, binds three instances to
+`AccountProfile A` and two to `AccountProfile B` on that same endpoint. Lack of that optional provider feature
+does not invalidate unscoped shared identity and is never approximated with multiple endpoints. The fixtures
+interleave unique canary prompts, transcript pages, authorised context, questions and Attention demands; only
+the profiled fixture may supply profile quota observations. They prove:
+
+- exactly one current owner per conversation and at most one current binding per instance;
+- no input, transcript cursor, context grant, profiled quota attribution, Attention subject or writer lease
+  crosses a binding or account scope;
+- a duplicate conversation claim, cross-scope handle, sibling operation and late old-generation event is
+  refused with zero effect on the current bindings;
+- saturation/backpressure on instance 2 leaves instances 1, 3, 4 and 5 within their latency budget; and
+- endpoint disconnect/crash/restart makes each binding stale independently, then exact reattach or explicit
+  per-instance fallback creates correct lineage without merged identity, duplicate launch or cross-talk.
+
+The mandatory run is not accepted with `N`, fewer than five unscoped bindings, a synthetic AccountProfile, a
+mocked service or one endpoint per instance. The profiled extension is not accepted with one profile when it
+is claimed supported. Transcript and Attention assertions use per-binding canaries that are removed from
+published artifacts after their absence outside the intended binding has been proved.
+
+### Authenticated live-evidence manifest
+
+Every live-dependent advertised capability cell links one immutable record with all of these fields:
+
+- evidence schema/id, capability id and claimed `supported|degraded` state plus mechanism and limits;
+- adapter id/version, provider and exact CLI/service version, executable or artifact digest and Turn commit;
+- closed profiled AccountProfile id or endpoint-unscoped scope id, ExecutionTarget/host id, RuntimeEndpoint
+  id/generation, attempt/epoch and fixture id, omitting credentials and user content;
+- authenticated test identity/environment class, invocation id, start/end time, observed-at, expires-at and
+  freshness policy;
+- expected oracle, actual typed result, per-step result, timeout/resource/quota consequences and final pass;
+- raw-record digest/signature or trusted CI attestation, fixture/manifest digest, redaction version/result,
+  cleanup receipt and links to bounded encrypted artifacts; and
+- failure/downgrade reason, remediation and superseded-record id when the cell is no longer current.
+
+CI rejects an advertised live-dependent cell whose record is absent, failed, expired, for another capability
+scope/version/profile/host/endpoint, unauthenticated, digest-invalid, unredacted or missing cleanup proof. A
+record proves only its exact cell; one provider/profile cannot approve another.
+
+Every run also captures the integration diagnostic: detected CLI version, configured/effective mechanism,
+last successful invocation, last valid/rejected event, achieved level, freshness, downgrade reason/remediation
+and redacted export. The frozen obligations are `ACP-TOP-001` through `ACP-TOP-009`, `ACP-ADP-001`
+through `ACP-ADP-013`, plus `ACP-LIF-009`, `ACP-VIE-012`, `ACP-ATT-011`, `ACP-ATT-012`,
+`ACP-CTX-013`, `ACP-RUN-011`, `ACP-OBS-009` through `ACP-OBS-011` and `ACP-SCL-010` in
+`docs/CONTROL_PLANE_ACCEPTANCE.md`.
+
 Primary contract references:
 
 - Gemini CLI: <https://geminicli.com/docs/hooks/reference/>
 - OpenCode plugins: <https://opencode.ai/docs/plugins/>
 - OpenCode configuration merging: <https://opencode.ai/docs/config/>
 - OpenCode CLI session flag: <https://opencode.ai/docs/cli/>
+
+## ADR-067 adapter-controlled Browser and Eco capabilities
+
+`ACP-ADP-014` and the adapter portion of `ACP-LIF-011` are separate matrix cells for each of the six dedicated
+adapters; one passing provider cannot approve another.
+
+1. `agent_browser_control` is unsupported until live authenticated evidence proves the exact adapter can bind
+   an AgentInstance/RuntimeAttempt/attempt/binding generation to Turn's typed action channel. A repository flag,
+   command name, model claim or raw tool text is not evidence.
+2. A local reviewed Workspace grant creates one logged-out isolated Browser Node with immutable agent ownership.
+   Current-revision navigate/read/click/type fixtures pass; wrong agent/attempt/Node/page, raw selector/script,
+   upload/path, secret field, localhost/private/file/daemon origin, clipboard, credential, popup/download
+   acceptance and human/other-agent Browser access refuse before effect. Badge/Stop/revoke/expiry/adapter restart
+   fence queued and late actions, and crash recovery looks up receipts without repeating interaction.
+3. `hibernate_resume` is independently advertised only when the adapter has a typed graceful exit plus exact
+   same-conversation/session resume correlation. Injecting `/exit`, terminal text or process kill cannot satisfy
+   it. A live fixture proves Idle exit retains Session/multiplexer/scrollback and wake returns one new exact
+   RuntimeAttempt; ambiguous correlation becomes unsupported/reconcile-required, not guessed continuity.
+4. Kimi/MiniMax quota-only connectors and generic terminal tools advertise neither capability. A provider
+   downgrade removes new admission immediately while preserving current Browser/lifecycle evidence and routes
+   no false Attention.

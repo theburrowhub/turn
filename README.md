@@ -22,8 +22,9 @@ actually needs attention.
 Traditional terminals organise windows and tabs. Turn organises work.
 
 A **Workspace** represents a persistent project. Each **Session** represents one task inside it. Agents,
-subagents, shells, test runners, servers, and TUIs live in a single hierarchy, while the centre of the
-window contains only the panes you chose to open.
+subagents, shells, test runners, servers, resources and TUIs live in a single hierarchy. Selecting an Agent,
+child or resource shows its one canonical view in the right-hand **WorkSurface**; selecting the Session shows
+its saved terminal Layout, including only the Panes intentionally opened there.
 
 When several agents work in parallel, Turn distinguishes activity from intervention. Finishing a tool
 call is not the same as asking a question; completing an agent turn is not the same as exiting a process.
@@ -35,19 +36,27 @@ Actionable demands enter one ordered **Attention Queue**, so multiple agents nev
 | --- | --- |
 | Unified navigation | One searchable `Workspace → Session → Agent/Tool → Child` tree with durable filters, density, ordering and viewport |
 | Background subagents | Discovered under their parent without opening panes, changing layout, or stealing focus |
-| Agent handoffs | Review a bounded, redacted context packet and explicitly pass it to another Agent in the same Session |
+| Agent handoffs | Review a bounded, redacted packet for another Agent in the same Session or another Session/worktree; cross-Workspace transfer exists only through inert portable export/import with reminted ids and fresh destination review |
 | Attention management | Per-session policies, badges, notifications, and one ordered Next Attention action |
 | Real terminal workloads | PTYs with ANSI colour, alternate screen, mouse input, resize, bounded durable scrollback, shells, and TUIs |
 | Stable layouts | Nested splits, reusable presets, drag-to-reorder, resize, balance, zoom, and per-session persistence |
-| Checkout safety | One host-global write owner per checkout across data dirs; extra sessions are read-only or isolated in worktrees |
+| Checkout safety | Accepted target: the primary `main` checkout is never a Turn writer; writable work always uses a unique isolated worktree and every checkout has one host-global owner. The current v4 `main_checkout` migration path remains an explicit release conflict below |
 | Honest recovery | Restore layout and metadata without silently rerunning saved commands or destructive work |
 | Integration without forks | Structured hooks where available, wrappers and heuristics where useful, generic terminal otherwise |
 
 ## Agent and tool support
 
+This is the accepted post-v0.1 support target, not a claim that every integration below is implemented in the
+current build. The following **Current status** section is the implementation inventory.
+
 - **Claude Code** — structured hooks plus terminal/process observation.
 - **OpenAI Codex CLI** — structured hooks and notifications, with graceful fallback.
-- **Other agent CLIs** — run through the generic terminal adapter even without a dedicated integration.
+- **Gemini CLI** — dedicated hook adapter with explicit capability/degradation reporting.
+- **OpenCode** — dedicated plugin/session adapter with explicit capability/degradation reporting.
+- **GitHub Copilot CLI** — dedicated adapter with the same capability/evidence contract.
+- **Grok CLI** — dedicated adapter with the same capability/evidence contract.
+- **Kimi and MiniMax** — quota/activity connectors only; they expose no launch/input/control capability.
+- **Other agent CLIs** — run through the generic terminal adapter without pretending to have a dedicated integration.
 - **Shells and TUIs** — ordinary interactive processes remain first-class: shells, test runners, servers,
   logs, file explorers, `lazygit`, `btop`, and similar tools.
 
@@ -69,7 +78,7 @@ Implemented today:
 - Optional contextual inspectors for Workspace, Session, Agent, and Process rows, with safe bounded
   history, readable parent links, confidence labels, runtime facts, and contextual actions.
 - Review-before-send context handoffs between controllable Agents in one Session.
-- Claude Code and Codex adapter infrastructure.
+- Claude Code, Codex, Gemini and OpenCode adapter infrastructure.
 - Attention policies, permission context, queue ordering, and typing-aware focus protection.
 - Live font/zoom controls, a measured high-contrast palette, reduced-motion support,
   modal AccessKit semantics, separate state/selection/focus/attention announcements, and
@@ -81,6 +90,49 @@ Implemented today:
 - Automated macOS and Linux builds plus native UI snapshot coverage.
 - A version-checked macOS app bundle, hardened-runtime signing/notarization workflow,
   arm64 and Intel release channels, and an updater that leaves compatible live daemons and PTYs alone.
+
+## Accepted post-v0.1 target — not implemented yet
+
+The frozen operator-control-plane specification additionally requires:
+
+- recursive, cycle-safe Groups whose rows may project a separately owned CheckoutScope for agent-per-branch
+  work without making presentation a runtime/repository authority;
+- automatic compact, non-overlapping hierarchy layout in stable logical/accessibility order, with no cleanup
+  action, persisted coordinates or side effect on selection, runtime, input or Attention;
+- one resumable New/Open/Clone/SSH Workspace onboarding path with exact partial-effect recovery and publish
+  kept as a distinct foreground operation;
+- six dedicated adapters—Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok—under the same
+  capability/evidence matrix, plus quota-only Kimi and MiniMax connectors;
+- target-bound ModelEndpointProfiles for BYO endpoint/model routing, bounded discovery and secret references
+  with no silent provider/model/account/local fallback;
+- shared provider RuntimeEndpoints with independently owned, isolated instance/conversation bindings;
+- target-wide recovery inventory for known, unmatched and surviving runtimes with exact reconciliation, host
+  RAM/swap/pressure and reuse-safe process-tree attribution that never turns collection failure into zero;
+- revisioned board/work-item metadata projected from canonical Node ids;
+- bounded delegated Resource Node revisions and typed ProgressUpdates with receipts;
+- pinned or explicitly reviewed live Note briefs as ContextLink sources;
+- isolated AccountProfile creation, external authentication, defaults, retirement and deletion;
+- revision-fenced atomic FileBackend editing with truthful conflict recovery;
+- a full authenticated remote/headless operator surface, distinct from the reduced companion API;
+- one-action foreground Session activation that safely materialises its saved runtimes or default Shell,
+  while every ambiguous or unsafe case fails closed without a generic start gate;
+- external work-item projections with stable source identity, bounded synchronisation and explicit conflict;
+- separately capable provider-native background jobs, private conversation inventory, title reading and
+  provider rename, each with truthful receipts and degradation;
+- distinct inert WebPreview and isolated interactive Browser Nodes, including reviewed local-content access;
+- revision-fenced encrypted permission responses from an explicitly granted remote/companion client, while
+  credentials and administration remain local; and
+- revocable encrypted background Attention delivery plus monotonic live status, with failure never resolving
+  work and notification-only hosts opening no public listener;
+- bounded local display-name proposals with source/revision/redaction and manual pinning, never provider rename
+  or terminal input; and
+- bounded per-profile companion projections for usage, context and the canonical activity inbox, with
+  source, coverage and freshness that never render unknown as zero.
+
+These are accepted requirements and proof obligations, not claims about the current executable. See
+[docs/PRODUCT_REQUIREMENTS.md](docs/PRODUCT_REQUIREMENTS.md). The audited denominator is frozen separately in
+[docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv](docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv), so an omitted capability
+cannot be hidden by deleting both a requirement and its test.
 
 The functional v0.1.0 baseline is complete and reproducible with `make mvp-acceptance`;
 see [docs/MVP_ACCEPTANCE.md](docs/MVP_ACCEPTANCE.md) for the evidence map and explicit scope.
@@ -127,6 +179,9 @@ cargo run -p turn-gui
 4. Use **+ Pane** to add a shell or agent, and **Layout** to redistribute or save the current arrangement.
 5. Use **Next Attention** to jump to the next agent that actually needs you.
 
+The advanced handoff and lifecycle walkthrough below is the accepted post-v0.1 interaction target; the
+current build may expose only the subset listed in **Current status**.
+
 To pass useful context without copying a terminal transcript, right-click an Agent in the hierarchy and
 choose **Pass context to Agent…**, or search for it in the Command Palette. Choose **Continue with**,
 **Review handoff**, **Ask for second opinion** or **Promote to main**, then select an idle destination Agent
@@ -135,16 +190,21 @@ subagent and event evidence; review that exact redacted payload, then send it. P
 sending submits it once. The source remains in history, and the destination inherits no permissions or
 claims of authority.
 
-To finish work, choose **Session → End session…** or press **⌘⇧K**. This stops Turn-owned processes while
-keeping the Session's layout and history. **Detach all views · keep running** only closes the views.
+To finish work, choose **Session → End session…** or press **⌘⇧K**. One action revokes the Session, removes its
+tree row and requests cleanup without letting an unkillable process block closure. Only bounded tombstone,
+history and recovery evidence survives under its owning Workspace; reopening work creates a new Session.
+**Detach all views · keep running** only closes the views and keeps the original Session active.
 
 ## Restart and recovery
 
-Turn never silently reruns saved commands after a daemon restart.
+This section describes the accepted post-v0.1 recovery target.
 
-For a main-checkout Session, choose **Confirm write access**, then **Start pane** or **Start all**. If a
-process survived but the new daemon cannot control it, stop that process outside Turn and choose
-**Check & confirm access**. The daemon revalidates ownership at that moment.
+Boot recovery restores layout/metadata and attaches only proved-live attempts; it never launches in the
+background. The next foreground click on a Session is the single activation intent: after one atomic preflight
+it attaches survivors and starts every safe eligible saved descriptor—or one configured default Shell when
+the Session is empty—without a generic **Start pane** step. A stale, ambiguous or unsafe descriptor keeps the
+whole materialisation stopped and exposes one consolidated recovery action in the bottom status bar. Writable
+work is reprovisioned in an isolated worktree; Turn never acquires the primary `main` checkout.
 
 Archiving Sessions or Workspaces never deletes the project directory.
 
@@ -165,7 +225,7 @@ Turn is one Rust workspace with a daemon-owned runtime and a thin native client.
 | `turn-gui` | Native `eframe`/`egui` desktop interface rendered through `wgpu` |
 | `turnd` | Authoritative owner of PTYs, Sessions, hierarchy, write leases, and Attention |
 | `turn-pty` | PTY processes, private bounded journals/checkpoints, replay, resize, signals, and supervision |
-| `turn-agents` | Claude Code, Codex, heuristic, and generic terminal adapters |
+| `turn-agents` | Claude Code, Codex, Gemini, OpenCode, heuristic, and generic terminal adapters |
 | `turn-store` | SQLite persistence, migrations, hierarchy records, and secret redaction |
 | `turn-proto` | Versioned daemon/client protocol, requests, events, terminal cells, and view models |
 | `turn-core` | Domain model, process/turn state machines, layouts, events, and Attention policy |
@@ -179,9 +239,14 @@ relationships, permissions, or write authority.
 - A heuristic can badge a Session, but it can never move focus.
 - Agent output is never interpreted as a command for Turn to execute.
 - Closing a pane never terminates the process behind it.
-- A checkout has at most one active writing Session across every cooperating Turn daemon for the same host user, even when daemons use different data directories or path aliases.
+- Accepted post-v0.1 target: the canonical primary `main` checkout has zero Turn writers. The current v4
+  `main_checkout` migration path remains an explicit release conflict; once removed, every write-capable Session uses its own
+  dedicated worktree, and every non-primary checkout still has at most one active writing Session across
+  cooperating Turn daemons for the same host user, data directories and path aliases.
 - Permission prompts show the exact Session, process, command, and working directory available to Turn.
-- Restore never relaunches a process until the user explicitly asks.
+- Background restore and non-Session selection never launch from metadata. Only the foreground Session
+  activation gesture, another explicit operator action or a still-valid operator-reviewed persisted Flow
+  policy may advance declared work.
 
 See [SECURITY.md](docs/SECURITY.md) for the complete threat model.
 
@@ -207,6 +272,17 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
 - [ARCHITECTURE.md](ARCHITECTURE.md) — module boundaries, integration levels, security, and performance.
 - [DECISIONS.md](DECISIONS.md) — architectural decision records and their trade-offs.
 - [ROADMAP.md](ROADMAP.md) — milestones, open risks, technical debt, and release work.
+- [Operator control plane](docs/OPERATOR_CONTROL_PLANE.md) — the complete accepted post-v0.1 contract for
+  Flows, provider-neutral topology, views, lifecycle, context, telemetry, Attention, remote runtime and voice.
+- [Product requirement inventory](docs/PRODUCT_REQUIREMENTS.md) — frozen requirements with an honest audited
+  baseline/partial/target/conflict/implemented status for each capability; its versioned semantic-hash
+  manifest makes paired deletion or weakening fail CI.
+- [Control-plane acceptance](docs/CONTROL_PLANE_ACCEPTANCE.md) — one proof obligation per requirement plus
+  cross-feature end-to-end journeys and the completion report contract.
+- [Product implementation evidence](docs/PRODUCT_IMPLEMENTATION_EVIDENCE.md) — deliberately empty until
+  implementation commits supply one reproducible ACP command and immutable artifact record per requirement.
+- [Current control-plane gap audit](docs/CONTROL_PLANE_GAP_AUDIT.md) — evidence-backed baseline/partial/
+  target/conflict findings that keep specification completion separate from product implementation.
 - [Unified hierarchy upgrade](docs/UNIFIED_HIERARCHY_UPGRADE.md) — tree, Agent/Pane separation,
   write leases, previews, and persistence contracts.
 - [Agent node views and context routing](docs/AGENT_NODE_VIEWS_AND_CONTEXT.md) — the accepted post-v0.1

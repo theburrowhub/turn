@@ -3,7 +3,8 @@
 **Status:** normative, accepted, implemented and audited for the first vertical.
 **Precedence:** this document supersedes earlier navigation, simultaneous-session and automatic-subagent-pane decisions wherever they conflict. See ADR-040.
 
-**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059 and
+**Post-v0.1 successor:** this remains the implemented hierarchy and safety baseline. ADR-059, ADR-064,
+ADR-065 and
 `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md` supersede its click/selection presentation for the accepted next
 architecture: the whole area to the right of the tree becomes one `WorkSurface`, and selecting a node
 chooses its unique view without mutating the saved Layout, process state, terminal focus or Attention.
@@ -15,23 +16,37 @@ Turn has one persistent navigation surface and one hierarchy projection:
 ```text
 Workspace
 └── Session
+    ├── Flow / Team / Group
+    │                 └── nested Group / presented members
     ├── Agent
     │   ├── Subagent
-    │   └── Process
-    ├── Shell
-    ├── TUI
-    └── Background Process
+    │   └── Process / Log
+    ├── Shell / Command / TUI / Service
+    ├── Job (projects NativeJob; iteration references stay in its Node View)
+    ├── WorkItem
+    └── Resource: Note / File / Diff / WebPreview / Browser / Media
 ```
 
 The left tree is the source of truth for navigation, state and supervision. Workspace, Session, Agent and Process are not duplicated as persistent tabs, thumbnail strips or a second tree. In the implemented v0.1
 baseline the optional right inspector shows details for the selected node and the centre contains only panes
 chosen by the user, a template, restoration, or an explicit automation. The accepted successor composes
 those regions as one WorkSurface with mutually exclusive Session and Node views; it does not add navigation.
+ADR-065 lets Groups form a bounded same-Session acyclic presentation forest and optionally project a
+separately owned CheckoutScope. Neither nesting nor the projection changes spawn/process ancestry, runtime or
+repository authority, and moving a row never silently changes a live cwd.
+
+Visible rows are derived automatically from that logical order. Expansion, filtering, restore, resize, zoom,
+variable row metrics and topology deltas keep a compact non-overlapping tree and identical accessibility
+order without a Tidy/Arrange operation, persisted coordinates or any hierarchy/runtime/input/Attention
+mutation caused by layout.
 
 Normalised ownership remains in the existing Workspace/Session/process records; the tree does not replace
 those foreign keys. The UI keeps three independent values: `selected_tree_node`, `focused_pane` and pending
 `AttentionEntry` values. Selecting an item does not focus a pane or resolve attention. Opening or closing a
-pane does not start or stop its AgentNode.
+pane does not start or stop its AgentNode. Selecting a child, resource, WorkItem, Job iteration or historical
+conversation never starts work. ADR-064 has one narrow exception for the Session row itself: a foreground
+selection may issue one typed idempotent Session activation when a current daemon-owned plan has already
+proved every consequence safe; otherwise it starts nothing and shows one exact recovery action.
 
 ## Domain model
 
@@ -52,11 +67,63 @@ Workspace 1 ── * Checkout
 
 Normalised ownership stays explicit: `Session.workspace_id`, `ProcessNode.session_id`, and `ProcessNode.parent` remain foreign keys/pointers. The unified tree is a projection of these records, not a polymorphic table that hides ownership.
 
+### Accepted ADR-064 hierarchy extensions
+
+The additional rows in the product-invariant tree are post-v0.1 targets, not claims about the implemented
+first vertical. They extend the same canonical projection and single WorkSurface under these rules:
+
+- an externally bound WorkItem remains one canonical Node keyed by source profile/project/external id. Its
+  `WorkItemSource` adapter owns source identity, field/state and assignee mapping, per-field authority,
+  pagination/cache coverage, rate budget, revision/ETag and receipts. A partial page or cache miss cannot
+  delete a row; conflicts remain visible on that Node until revision-fenced reconciliation. Close/reopen and
+  provider deletion are source operations, never consequences of hiding, dismissing or deleting the Turn
+  projection;
+- a provider-native Job is one stable Job Node with a pre-dispatch creation reservation, ordered stable
+  iteration records, bounded private definition observation and references to proved Agent/RuntimeAttempts.
+  It is distinct from Flow recurrence. All nine exact adapter keys map one-to-one to wire operations; create/
+  run-now reconcile only by proved creation/invocation correlation. Schedule, iteration, presence, projection
+  and mutation states are independent; prepared-create cancel and local activity-hide/forget/restore emit
+  zero provider request, while provider iteration cancel and provider job delete stay separately fenced;
+- `ConversationInventory` is a bounded, private provider/AccountProfile/ExecutionTarget/namespace query,
+  not another tree or a collection of live Nodes. Search/match results report coverage and freshness and
+  launch nothing. Foreground adoption creates one stopped canonical Agent Node after installation-wide exact
+  ConversationKey ownership checks. Resume is a separate preflight and new RuntimeAttempt; similarity never
+  owns or binds a conversation;
+- an inert WebPreview Resource and an interactive Browser are different Node kinds. WebPreview executes no script,
+  form, navigation, popup or download and has no ambient credentials, daemon/file access or control channel.
+  Browser owns an isolated storage partition and typed navigation/history/popup/download operations; local
+  HTML and localhost require a reviewed confined-origin binding, and restore never reloads automatically;
+- provider title read and conversation rename are independent capabilities. The display model keeps
+  requested, provider-observed and effective titles separate; rename requires the exact provider revision,
+  idempotent operation id and correlated receipt, while read-only support exposes no write control;
+- profile telemetry is an `AccountActivityProjection` keyed by exact provider, AccountProfile and execution
+  target. Context windows, quota windows and bounded conversation/job/Attention inbox entries preserve their
+  own source, coverage and freshness. Unknown, unsupported, stale, partial, rate-limited and failed reads are
+  never rendered as zero or an authoritative empty inbox;
+- a full remote GUI is another authenticated revisioned Surface over this tree and WorkSurface, with explicit
+  invitation, scope and input leases. A headless status client and a companion are bounded projections with
+  separate closed allowlists; they are not hidden full GUIs. A remote typed provider-offered permission option requires one exact
+  single-use foreground-desktop-issued encrypted permission grant and provider evidence. While that known
+  sensitive interaction is pending, raw remote PTY input is blocked; credentials, grant changes,
+  administration and host trust stay local. Generic unclassifiable TUI input is never promoted to a typed
+  permission claim.
+
+These additions preserve the cardinal rule: an operational object has one primary tree row and one selected
+view. Job iterations, Flow/Team membership and activity-inbox items may link to that row but never duplicate
+it as a second authoritative navigation object.
+
 ### Session modes and checkout safety
 
 - `main_checkout`: read/write access to the workspace primary checkout and ownership of its exclusive write lease.
 - `read_only`: review/research against the primary checkout. Turn must use a technical guard when viable and must require explicit escalation before a write-capable relaunch.
 - `isolated_worktree`: independent path and branch. It may write concurrently, but Turn warns about declared shared ports, containers, databases, caches, credentials and services.
+
+These are the implemented v4 modes. The accepted operator-control-plane target retires new
+`main_checkout` creation entirely: the enum becomes migration-only, every write-capable path provisions a
+dedicated worktree and enforced read-only is the only primary-checkout runtime mode. Live legacy main workers
+are quarantined and block target release compliance until stopped or explicitly recreated in isolation; see
+`docs/OPERATOR_CONTROL_PLANE.md` §7. This target supersedes any v4 text below that treats the primary write
+lease as an allowed steady state.
 
 An active second main-checkout session is a conflict, never a silent success. Creation must return the
 current owner and the alternatives: focus it, create read-only, create an isolated worktree, or cancel. If
@@ -191,7 +258,8 @@ Agent runtime state remains the existing two-dimensional model:
 
 ```text
 Lifecycle: Spawning → Alive
-                 ├──────→ Orphaned → Lost
+                 ├──────→ Reconnected → Alive
+                 ├──────→ Orphaned → Reconnected | Lost
                  └──────→ Exited(code) | Signaled(signal) | Stopped(signal)
 Turn:      Idle → Active ↔ AwaitingUser(reason)
                   ├────→ Done → Active
@@ -200,18 +268,21 @@ Turn:      Idle → Active ↔ AwaitingUser(reason)
             any state may degrade to Unknown when no adapter can vouch for it
 ```
 
-`Reconnected` remains a reserved lifecycle value for a backend that can prove PTY reattachment; the current
-daemon-restart path deliberately emits only `Orphaned` or `Lost`. Reconnecting a UI to the same live daemon
-reattaches a view and does not change the runtime lifecycle.
+`Reconnected` is emitted only when a backend proves exact durable PTY/runtime reattachment; the current v4
+daemon-restart path may still emit only `Orphaned` or `Lost` until that proof ships. The canonical closed
+transition/evidence/tie-break table and TurnId rules are `OPERATOR_CONTROL_PLANE.md` §6 and supersede any
+shorthand in this diagram. Reconnecting a UI to the same live daemon reattaches a view and does not change
+the runtime lifecycle.
 
 Node state is a daemon-derived projection whose actual labels include `starting`, `RUNNING`, `WAITING`,
 `PERMISSION`, `QUESTION`, `turn done`, `DONE`, `FAILED`, `STOPPED`, `IDLE` and `UNKNOWN`. `YOUR TURN` is the
 Session/Attention label, not a replacement for an Agent's exact
 `WAITING` or `PERMISSION` state. A Session may therefore say `YOUR TURN` while its exact child still says
 `WAITING`, and a scoped unresolved demand may badge the Session while the parent Agent remains `RUNNING`.
-Completing a turn does not imply process exit. Process exit clears pending permissions/questions, the exact
-node's Attention and unresolved child scopes owned by that runtime; it does not clear exact live siblings or
-children.
+Completing a turn does not imply process exit. Process exit closes only exact runtime-bound
+permission/question interactions whose owning attempt can no longer answer and retires unresolved discovery
+scopes owned solely by that runtime. It preserves TurnComplete/unread-result, failure and review Attention
+whose typed policy says `survives_owner_exit`, and never clears exact live siblings or children.
 
 Session aggregate state is derived from every node plus pending attention. Session lifecycle/mode is independent:
 
@@ -321,6 +392,19 @@ moved, or retroactively made read-only by the migration.
 Migration 011 adds `tree_surface_preferences` for durable filters, visibility mode and scroll anchor;
 manual sibling ranks remain in `tree_ui_state` so presentation restoration stays surface-scoped.
 
+Planned migration 012 is the vNext semantic-recovery boundary. Under the exclusive canonical data-directory
+lock, one SQLite `BEGIN IMMEDIATE` transaction adds `WorkspaceSemanticReservation` and
+`InstallationMigrationReservation`, performs a closed side-effect-free census of schema11 legacy rows,
+validates every owner/key/enum/JSON/UTF-8/count/encoded-byte invariant, inserts each same-id reservation pair,
+writes the census-complete marker plus frozen 26-kind registry digest and sets `user_version=12`. Only live/
+orphaned/reconnected/spawning process Nodes and Agent/Subagent Nodes with stable external-conversation identity
+are eligible; inert terminal Nodes, Attention, presentation, relations and checkout handles are excluded.
+No missing generation is guessed and migration performs no probe, restore, launch, signal, file or network
+effect. Any failure or crash rolls back DDL, rows, marker and version to a schema11 database reopenable by the
+previous binary. A committed schema12 opens for writers only after exact Workspace↔Installation pair
+bijection, subject uniqueness and registry digest verify; a different digest fails closed. The atomicity claim
+is specifically schema11→12 and does not pretend an older multi-migration chain rolls back below11.
+
 ## Updated wireframe
 
 ```text
@@ -371,8 +455,10 @@ the list remains so a future refactor does not reintroduce them:
 
 ## Implementation and migration sequence
 
-Steps 1–8 and the deterministic half of step 9 are implemented. The authenticated live Claude Code smoke
-test in step 9 remains pending.
+Steps 1–9 are implemented for the v0.1 vertical. The authenticated packaged Claude Code 2.1.226 run passed
+on 2026-08-10; its environment, observations and reproducible harness are recorded in
+`docs/REVIEWER_ACCEPTANCE.md`. This proof does not imply ADR-062 provider-parity or durable nested-topology
+acceptance, which remain post-v0.1 targets.
 
 1. Land this normative document and ADR-040; update product/architecture/protocol claims.
 2. Add domain types, event variants and deterministic migration 003 with upgrade tests.
@@ -442,3 +528,57 @@ the supported explicit `agent_name: Reviewer` and task fields. Claude Code 2.1.2
 this repository supplied an external worker id and role (`Explore`) but not that parent-declared display
 name. Until a live installed version emits an explicit name, Turn must display the role/fallback honestly
 and enrich the same node later if a declaration arrives; it must never invent `Reviewer` from `Explore`.
+
+## Reproducible ADR-064/065 successor acceptance
+
+The product-spec completion gate must add a deterministic multi-adapter vertical plus authenticated live
+smokes where a capability depends on an external provider. The deterministic vertical executes this
+sequence against the real daemon/protocol/store and native WorkSurface:
+
+```text
+create Workspace and an inactive Session with a current safe activation plan
+→ select the Session once
+→ assert one idempotent activation, restored Layout and its exact bounded eligible saved descriptor set (or
+  one configured default Shell when empty), with no second action
+→ mutate target/account/authority generation and assert the same selection launches nothing with one recovery
+→ connect a paged external WorkItemSource and project one canonical card
+→ inject a partial page, an ETag conflict and a timeout-after-possible-close
+→ assert no disappearance/false close, visible field conflict and reconcile_required before any retry
+→ enumerate one provider-native Job with two stable iterations and a linked Agent result
+→ restart daemon and assert provider evidence, not app lifetime, determines survival
+→ reserve one Job/CreationId, lose create and run-now receipts, and reconcile only by exact correlation
+→ cancel one still-prepared creation; race dispatch and prove the loser emits no duplicate/provider effect
+→ hide activity, forget and restore the local projection; assert the same NodeId/fence and zero provider request
+→ query two profiles' bounded ConversationInventory pages with overlap, truncation and similar titles
+→ assert exact-key deduplication, private profile/target caches and no Node/runtime from search
+→ adopt one result and assert one stopped Node and zero launch/input
+→ resume it after full preflight and assert one new attempt plus installation-wide current ownership
+→ expose title_read without rename, then rename without fresh read, and assert independent degradation
+→ render profile context/quota/activity projections with stale, partial, rate-limited and failed sources
+→ assert no false zero, no cross-profile entries and no queue reordering from informational telemetry
+→ select an inert WebPreview Resource and assert zero network/script/navigation
+→ create a Browser with isolated storage; exercise reviewed localhost/local-HTML and reject origin rebinding
+→ restore Browser metadata and assert zero reload; reject page/script content as control or Attention evidence
+→ issue one exact remote permission-response grant from the foreground desktop
+→ accept one exact provider-offered typed option from a full remote GUI or companion and wait for provider evidence
+→ replay/cross-profile/widen/stale/offline attempts and raw remote PTY writes all fail server-side
+→ assert credential, grant, administration, host-trust and destructive actions remain local-only
+→ create a depth-128 same-Session Group branch projected from a separate CheckoutScope
+→ reject a concurrent cycle and cross-Session parent atomically; unbind without changing cwd, runtime or worktree
+→ crash and resume one New/Open/Clone/SSH onboarding operation without duplicate effects or implicit publish
+→ run the 23-cell matrix for all six dedicated adapters and prove quota-only connectors have no launch/control
+→ freeze one target-bound ModelEndpointProfile in a launch receipt and reject late discovery/secret/target drift
+→ reconcile host memory and reuse-safe process trees across current, closed and unmatched runtime owners
+→ apply one current safe generated alias, then prove manual pinning and sibling isolation across reconnect
+→ deliver two same-titled child demands while the GUI is absent through separate exact notification revisions
+→ revoke during retry, resolve one demand, reject the late live tick and find zero inbound listener
+→ replace the local/full GUI and independently reconnect headless status and companion clients
+→ assert one canonical tree/WorkSurface revision while each client retains only its declared allowlist
+```
+
+The fixtures include delayed/out-of-order pushes, operation retries and Surface/connection/attempt generation
+changes. Native snapshots cover ordinary and dense trees with nested Groups, CheckoutScopes, WorkItem,
+Job/iteration, adopted conversation, WebPreview, Browser, resource pressure and delivery rows. They are evidence
+only when the corresponding semantic assertions and protocol
+captures pass; a screenshot, provider label or headless render by itself cannot prove lifecycle, external
+authority, remote input or absence-of-side-effect claims.

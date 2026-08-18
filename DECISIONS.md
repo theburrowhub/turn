@@ -53,27 +53,33 @@ Status values:
 | [037](#adr-037) | Codex does not validate keys inside the hooks struct; a contract test is the only guard | Accepted, implemented |
 | [038](#adr-038) | Codex's turn boundary comes from `notify`, not its `Stop` hook, because `notify` is not gated on trust | Accepted, implemented |
 | [039](#adr-039) | The frontend is native Rust drawn on the GPU, not a webview | Accepted, implemented for the first vertical; supersedes the UI half of ADR-001 |
-| [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Accepted, implemented for the first vertical; narrowly amends ADR-036 |
+| [040](#adr-040) | One hierarchy projection, one main-checkout writer, background subagents | Implemented v0.1 history; Layout-only centre superseded by ADR-059 and primary writer target superseded by ADR-065 |
 | [041](#adr-041) | Runtime events checkpoint Session, event log and Attention in one transaction | Accepted, implemented |
 | [042](#adr-042) | The desktop bootstraps a detached sibling daemon and serialises creation until operations have IDs | Accepted, implemented |
 | [043](#adr-043) | Agent context handoffs are reviewed, bounded daemon capabilities | Accepted, implemented |
 | [044](#adr-044) | A terminal pane hosts the user's shell, and an agent runs inside it | Accepted, implemented |
 | [045](#adr-045) | Turn never writes its own words into a program's screen | Accepted, implemented |
-| [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Accepted, implemented |
-| [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Accepted, implemented; narrows ADR-046 |
+| [046](#adr-046) | Archive, close and delete are three verbs, and delete forgets only Turn's record | Implemented v0.1 history; target survivor semantics superseded by ADR-047/050/057/066 |
+| [047](#adr-047) | Ending a Session takes its row out of the tree; a Workspace is a project and stays | Implemented v0.1 history; navigation rule retained, survivor/primary-writer clauses extended by ADR-066/065 |
 | [048](#adr-048) | The tree points at one worker: click a managed node to show its pane, its owner to restore | Superseded by ADR-059; retained as the v0.1 implementation record |
 | [049](#adr-049) | Coming back to a Session starts it; the daemon still starts nothing on its own | Accepted, implemented; overturns the restore half of the never-relaunch rule |
-| [050](#adr-050) | Ending is authoritative: a process Turn cannot stop is reported, never a veto | Accepted, implemented |
+| [050](#adr-050) | Ending is authoritative: a process Turn cannot stop is reported, never a veto | Implemented process-cleanup rule; semantic preflight and recovery inventory extended by ADR-066 |
 | [051](#adr-051) | Settings resolve in the daemon through one explicit hierarchy | Accepted, implemented |
 | [052](#adr-052) | Terminal history is a private bounded journal, never proof of liveness | Accepted, implemented; persistence retained and relaunch replacement narrowly superseded by ADR-059 |
 | [053](#adr-053) | The control socket admits only the owner with a per-generation capability and bounded load | Accepted, implemented |
-| [054](#adr-054) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Accepted, implemented macOS-first |
-| [055](#adr-055) | Checkout write authority is a host-global inode lock inherited by every writer | Accepted, implemented on Unix |
+| [054](#adr-054) | Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere | Implemented macOS-first; promotion to writable primary is superseded by ADR-065 |
+| [055](#adr-055) | Checkout write authority is a host-global inode lock inherited by every writer | Implemented legacy exclusion; steady-state primary writers are superseded by ADR-065 |
 | [056](#adr-056) | A compatible app update replaces files, never the live daemon | Accepted, implemented for macOS |
-| [057](#adr-057) | Local-data control is complete, inspectable and daemon-authoritative | Accepted, implemented |
+| [057](#adr-057) | Local-data control is complete, inspectable and daemon-authoritative | Implemented base; unconditional cascade semantics extended by ADR-063/064/066 |
 | [058](#adr-058) | Functional v0.1.0 has one evidence-backed release gate | Accepted, implemented |
 | [059](#adr-059) | Agent nodes select one WorkSurface view and keep instance, context and attention identity separate | Accepted, not yet implemented |
 | [060](#adr-060) | Local dictation is a reviewed exact-target input path, never an attention or approval authority | Accepted, not yet implemented |
+| [061](#adr-061) | Turn is an operator control plane with reusable Flows and bounded delegated control | Accepted, not yet implemented |
+| [062](#adr-062) | All agent providers normalize into one durable topology and capability contract | Accepted, not yet implemented |
+| [063](#adr-063) | Operational scale features remain first-class control-plane objects | Accepted, not yet implemented |
+| [064](#adr-064) | Close the remaining operator-loop capabilities as typed first-class contracts | Accepted, not yet implemented |
+| [065](#adr-065) | Make source-capability coverage explicit and close the final operational gaps | Accepted, not yet implemented |
+| [066](#adr-066) | Bound the remaining operator utilities without creating parallel authority | Accepted, not yet implemented |
 
 ---
 
@@ -1572,8 +1578,9 @@ yields an error for that line and the decoder carries on with the next.
 <a id="adr-031"></a>
 ## ADR-031 — One flat `Request` enum, and product rules enforced by protocol shape
 
-**Status:** Accepted, implemented. `turn-proto::request`, `turn-proto::response`, `turn-proto::error`, plus
-`turn-proto::envelope` for the versioned handshake.
+**Status:** Accepted, implemented for the flat-enum/envelope rule. The v4 omission-based permission and
+single-relaunch clauses below are historical and amended by ADR-049/064: target protocol has typed
+operator-response and Session-activation operations while still forbidding inferred answers/commands.
 
 ### Context
 
@@ -1604,12 +1611,14 @@ client processes them in arrival order and treats each as the current truth abou
 And three product rules are enforced by the *shape* of the protocol rather than by the daemon remembering to
 check them:
 
-- **There is no request that approves an agent's permission.** Answering a permission prompt is typing into
-  the agent's terminal, which is `Request::WritePty` — an explicit act by the human. Turn cannot approve on
-  the user's behalf because the protocol gives it no way to say so.
+- **Historical protocol-v4 shape:** there was no semantic permission-response request; the human used
+  `Request::WritePty`. Target vNext instead has exact revision-fenced local or grant-bound remote typed
+  response requests, but Turn still never chooses an option or infers approval from output.
 - **There is no request that runs a command Turn inferred from output.** A process starts from a Template, a
   Pane definition, or an explicit relaunch — all of which the user chose.
-- **`Request::RelaunchNode` exists and nothing else restarts anything.** Restore offers; the user decides.
+- **Historical protocol-v4 shape:** `Request::RelaunchNode` was the only restart path. Target vNext adds
+  `activate_session` and distinct create/resume/restart/recycle/Flow operations, each explicit or covered by
+  persisted reviewed policy; metadata, child selection and inferred output still start nothing.
 
 ### Consequences
 
@@ -2252,9 +2261,11 @@ is in the retirement report; the load-bearing items are:
 <a id="adr-040"></a>
 ## ADR-040 — One unified hierarchy, one main-checkout writer, background subagents
 
-**Status:** Accepted, implemented for the first vertical. Extends ADR-017's flat parent-pointer model, ADR-032's
-daemon-derived views, ADR-033's append-only migration discipline and ADR-039's native egui/wgpu client.
-It does not supersede any of them. It narrowly amends ADR-036 as described there.
+**Status:** Implemented v0.1 history with two target clauses superseded. The canonical hierarchy remains.
+ADR-059 supersedes the Layout-only centre with one selected WorkSurface, and ADR-065 supersedes every
+primary-checkout writer with operator-only primary `main` plus dedicated worktrees. The decision otherwise
+extends ADR-017's flat parent-pointer model, ADR-032's daemon-derived views, ADR-033's append-only migration
+discipline and ADR-039's native egui/wgpu client, and narrowly amends ADR-036 as described there.
 
 ### Context
 
@@ -2274,12 +2285,14 @@ child. It is derived from normalised ownership — `Session.workspace_id`, `Proc
 runtime parent relationship are different facts and remain different fields.
 
 Sessions are not duplicated in top tabs, bottom strips or a permanent overview, and Agents are not
-duplicated in a second persistent tree. The right side is an optional contextual inspector. The centre is
-only the user/template-chosen Layout. Tree selection, active Session, focused Pane and pending Attention are
+duplicated in a second persistent tree. **Historical v0.1 clause, superseded by ADR-059:** the right side was
+an optional contextual inspector and the centre only the user/template-chosen Layout. The target instead
+uses the selected Node's one WorkSurface. Tree selection, active Session, focused Pane and pending Attention are
 independent. Tree expansion and selection persist per stable UI `surface_id`; they are not `TurnEvent`s and
 are never broadcast as another window's selection.
 
-`SessionMode` is a closed enum with wire values `main_checkout`, `read_only` and `isolated_worktree`.
+**Historical v0.1 writer clause, superseded by ADR-065:** `SessionMode` was a closed enum with wire values
+`main_checkout`, `read_only` and `isolated_worktree`.
 Inside one canonical Turn data directory, every primary checkout has at most one unreleased blocking
 `exclusive_write` claim, owned and arbitrated by the daemon.
 Its semantic record is `workspace_id`, `session_id`, `checkout_id`, `mode`, `state`, `acquired_at` and
@@ -2330,9 +2343,11 @@ unknown id never falls through to the one different child currently visible, and
 resolves the provisional flow under the same parent. Migration 007 persists this scope so restart does not
 broaden it to the Session.
 
-The same subject boundary governs lifecycle and focus. A runtime exit clears its exact demand and unresolved
-child scopes owned by that runtime, but not exact children that may still be alive; a declared child stop also
-retires its earlier parent/external-id scope. Every such mutation reaches SQLite and the queue projection.
+The same subject boundary governs lifecycle and focus. A runtime exit closes only its exact runtime-bound
+permission/question interaction and unresolved discovery scopes owned solely by that runtime; it preserves
+TurnComplete/unread-result, failure and review demands marked `survives_owner_exit`, and never clears exact
+children that may still be alive. A declared child stop also retires its earlier parent/external-id scope.
+Every such mutation reaches SQLite and the queue projection.
 Deferred focus is valid only while that exact subject remains actionable, and mute/snooze/dismiss cancel the
 matching jump. Permission UI may show command, cwd and risk only after an exact node join; it never substitutes
 the primary Agent for a modern unresolved or stale worker identity. A node-less but Session-scoped demand
@@ -2976,7 +2991,9 @@ statistics. No IPC capability is placed in a hook URL or agent configuration.
 <a id="adr-046"></a>
 ## ADR-046 — Archive, close and delete are three verbs, and delete forgets only Turn's record
 
-**Status:** Accepted, implemented for Sessions and Workspaces.
+**Status:** Implemented v0.1 history. The three distinct user intents remain, but ADR-047/050/057/066
+supersede the generic table and unconditional erasure below: target archive/detach/End/Stop-all/delete have
+separate rows, and End/delete uses a total daemon-derived semantic-survivor reduction before authoritative cleanup.
 
 ### Context
 
@@ -3014,7 +3031,7 @@ Turn's record and nothing else.**
 | Close | yes | no | yes | the work is not |
 | Delete | yes | yes | **no** | **no** |
 
-What is deleted: the row, the layout, the process tree, the event log, the attention entries,
+**Historical v0.1 deletion list, superseded for the target:** what was deleted was the row, the layout, the process tree, the event log, the attention entries,
 the activity previews, the pane bindings, the write lease, the scratch directory, and the
 per-window tree state. A Workspace takes its Sessions with it, deleted one at a time rather
 than by database cascade, because each has processes to stop and clients to detach and neither
@@ -3028,7 +3045,10 @@ about "your files" is not checkable by the person reading it and a path is.
 with nothing left that names them: not in the tree, not in the store, not in a pane. That is a
 leak the user cannot see, let alone fix.
 
-Deleting something already gone answers `Ack`, so a client that lost a reply can retry.
+**Target vNext supersession:** replaying the same close/delete operation returns the identical durable
+`Closed`; a new operation against the exact tombstone returns `Closed(already_closed)` with its original
+disposition reference. Generic `Ack` is only the historical v0.1 answer and is forbidden for these four target
+operations because it would lose the typed survivor result.
 
 It is offered on the row's context menu and in the command palette, not as a fourth button on
 the row. A row that carries four controls, one of them irreversible and one click from the
@@ -3057,8 +3077,8 @@ hidden.
 <a id="adr-054"></a>
 ## ADR-054 — Read-only Sessions use an inherited macOS checkout write guard and fail closed elsewhere
 
-**Status:** Accepted, implemented macOS-first. `turn-pty::ReadOnlySandbox`, guarded Session creation and
-explicit lease promotion.
+**Status:** Accepted, implemented macOS-first for guarded read-only inspection. Explicit promotion to a
+writable `main_checkout` is decode-only history superseded by ADR-065.
 
 ### Context
 
@@ -3100,9 +3120,9 @@ unresolvable protected metadata rejects creation rather than persisting an ambig
 the primary write lease. The hierarchy, Session header, status bar and accessibility label state whether the
 guard is enforced or unavailable, and Seatbelt denials remain visible in the terminal.
 
-Write escalation reuses the durable lease arbiter but is a separate explicit action. It is refused while any
-read-only runtime node remains alive. Once they have all ended and no other writer exists, acquisition
-atomically changes the Session to `main_checkout`; a failed write never changes mode.
+**Historical v0.1 clause, superseded by ADR-065:** write escalation reused the durable lease arbiter and
+could promote a stopped reviewer to `main_checkout`. The target never promotes to primary; write escalation
+provisions a dedicated worktree and changes authority only after that exact worktree is proved and fenced.
 
 ### Consequences
 
@@ -3122,7 +3142,9 @@ atomically changes the Session to `main_checkout`; a failed write never changes 
 <a id="adr-047"></a>
 ## ADR-047 — Ending a Session takes its row out of the tree; a Workspace is a project and stays
 
-**Status:** Accepted, implemented. Narrows ADR-046's middle verb.
+**Status:** Implemented v0.1 navigation history. The rule that End removes the Session row while Stop-all
+keeps the Workspace is retained. ADR-066 extends it with a total precommit semantic rehome/tombstone/recovery reduction and
+recovery inventory; ADR-065 makes every primary-writer/free-for-next-writer clause decode-only history.
 
 ### Context
 
@@ -3151,9 +3173,13 @@ wanted back — the branch is still there, the task may not be finished.
 
 ### Decision
 
-**Ending a Session archives it.** The processes stop, the write lease it held is released, and the
-row leaves the tree. Reversible in the way archiving always was: it comes back, stopped, when
-archived rows are shown or when it is restored. `DeleteSession` is still the one that forgets.
+**Historical v0.1 mechanics:** Ending a Session archived it, stopped processes and released its write lease;
+that old archived row could be restored. **Target contract:** ADR-066 retains only the navigation outcome.
+End serially derives and commits every semantic-survivor disposition without another user action, permanently
+revokes Session authority and removes the active Session row behind a minimal tombstone/recovery record.
+Process and legacy lease cleanup occur afterwards and cannot erase survivor evidence or veto removal. End is
+not Direct Archive and does not expose that Session row for restoration; Direct Archive remains the distinct
+reversible hide-only verb, while starting again from retained artifacts creates an explicitly new Session.
 
 Releasing the lease is part of it. A Session whose processes have stopped is not writing to the
 checkout, and leaving the lease held meant the user had to find "Release write lease" in a menu
@@ -3176,13 +3202,13 @@ invisible until it was used.
 ### Consequences
 
 - Ending a Session does what the word says. The tree holds what is being worked on.
-- A Session can be brought back from the archived list, stopped, with its layout and history.
-- The write lease follows the work rather than the record, so finishing a Session in the primary
-  checkout leaves the checkout free for the next one without a second step.
-- **Downside:** a Session ended by mistake is in the archived list, which is off by default. It is
-  one preference away, and this is the reason ending archives rather than deletes.
-- **Downside:** `close_session` now has two jobs — stopping and filing — where before it had one.
-  They are one act from the user's side, which is the side that decides.
+- **Historical v0.1 consequence:** an Ended Session could be brought back from the archived list. The target
+  reserves that reversible behavior for explicit Direct Archive; End itself is terminal for the Session row.
+- **Historical v0.1 consequence, superseded by ADR-065:** the write lease followed work in the primary
+  checkout. Target Turn writers never acquire primary `main`; ending only cleans legacy/quarantined state.
+- **Historical v0.1 downside:** an Ended Session was in the archived list. The target replaces that hybrid
+  with two honest verbs: reversible Archive and authoritative End.
+- `close_session(terminate|kill)` has one user-visible job—End—and commits it in one action.
 - **Downside:** the asymmetry between a Session and a Workspace has to be learnt. It is carried by
   the control's name rather than by documentation, which is the only place it can be learnt from.
 
@@ -3267,8 +3293,10 @@ menu, because that is a decision about the pane.
 <a id="adr-049"></a>
 ## ADR-049 — Coming back to a Session starts it; the daemon still starts nothing on its own
 
-**Status:** Accepted, implemented. Overturns the restore half of "Turn never relaunches", which was
-a product rule of this project from its brief onwards.
+**Status:** Accepted, implemented; its blanket “daemon never sends itself a start request” clause is
+superseded by ADR-061 for a persisted, still-valid reviewed Flow policy, and its v0.1 client fan-out is
+refined by ADR-064 into one foreground, revision-fenced Session activation operation. Overturns the restore half of
+"Turn never relaunches", which was a product rule of this project from its brief onwards.
 
 ### Context
 
@@ -3308,6 +3336,18 @@ started at all. It does not act on it: `RelaunchNode` remains the only request t
 anything, and the daemon does not send itself requests. The executable form of that is unchanged
 and still passing.
 
+ADR-061 adds one narrow post-v0.1 exception: the daemon scheduler may issue the next typed step operation
+when an immutable restored FlowRun policy, current result, budgets, authority generation and prior receipts
+all prove it was authorised up front. It does not generalise Session activation or metadata restore, and an
+ambiguous effect is never replayed.
+
+ADR-064 preserves the human-foreground boundary and the per-pane `Relaunch` decision while replacing the
+window's v0.1 loop of `RelaunchNode` requests. One explicit Session selection submits one idempotent activation
+plan for the exact current bounded eligible descriptor set—or one commandless default Shell when empty.
+The daemon preflights every descriptor and authority fence before the first effect; a stale, unsafe or
+ambiguous member launches nothing and produces one exact recovery action. Background restore, child selection
+and reconnect still submit no activation.
+
 The **window** acts on it, when it receives the restore report — which is the moment a person has
 opened Turn and asked for that Session. It starts every `auto_start` pane, once, without asking,
 and holds back exactly two cases: a pane that would use the checkout while a write confirmation is
@@ -3330,9 +3370,9 @@ row's contextual `Start again` action without turning every recovered layout int
 - **Downside:** a command-bearing pane left on the default `ReattachOnly` does not start
   automatically, so a hand-built job behaves differently from a template's. The default is the
   cautious one; commandless terminal panes are exempt because their fallback is only a shell.
-- **Downside:** two windows attached to the same Session both act on the report. The second
-  request arrives after the first has started the node and is refused, so the outcome is right and
-  the log carries a refusal nobody asked about.
+- **Historical v0.1 downside, superseded by ADR-064:** two windows attached to the same Session could both act
+  on the report; the second request was refused and produced noise. The vNext operation id plus Session/
+  surface revision makes duplicate activation return the same receipt.
 - **Downside:** this is a product rule reversed under pressure from its owner, on the third
   report. The rule was defensible and the way it was applied was not, and the record should say
   that the owner was right and I was slow.
@@ -3340,7 +3380,9 @@ row's contextual `Start again` action without turning every recovered layout int
 <a id="adr-050"></a>
 ## ADR-050 — Ending is authoritative: a process Turn cannot stop is reported, never a veto
 
-**Status:** Accepted, implemented. Reverses the refusal added with `ensure_session_processes_stoppable`.
+**Status:** Implemented for post-commit process cleanup. ADR-066 requires a total daemon-derived semantic-
+survivor reduction in that commit and preserves unmatched processes in target-wide recovery inventory; only later
+process/worktree/artifact cleanup is authoritative best-effort.
 
 ### Context
 
@@ -3384,9 +3426,12 @@ one more sentence.
 
 ### Decision
 
-Ending is authoritative. Past the point where the disposition is known, `close_session` treats
+Ending is authoritative. **The point of no return is one serial daemon transaction, not a second form.** It
+derives a closed disposition for every current semantic subject, discards uncommitted Session-owned drafts,
+revokes Session authority, uses valid predeclared rehomes and otherwise tombstones/retains independently live
+or uncertain evidence in the exact semantic recovery inventory. Missing/stale client input cannot refuse End. Past it, `close_session` treats
 everything as best-effort: a process it cannot signal, a lease row that will not update, a write
-that will not land. Each is logged; none of them abandons the act. The Session is archived, its row
+that will not land. Each is logged; none of them abandons the act. The Session is terminally tombstoned, its row
 leaves the tree, and the two errors that remain are asking about a Session that does not exist and
 `KeepProcesses`, which is not destructive and can afford to be strict.
 
@@ -3405,12 +3450,10 @@ original reasoning that was never in question.
 - The destructive verb works when the daemon has had a bad day, which is when it is needed most.
 - A user who ends such a Session is told, in the dialog and again afterwards, that a process may
   still be running and how to find it.
-- **Downside:** the Session's row is gone while one of its processes may not be. Turn has no place
-  left to show that process, and the honest sentence at the end of the act is the whole of what the
-  user gets. A "processes Turn has lost track of" view would be better and does not exist.
-- **Downside:** the lease is released for a Session that may still have a writer in it. This is a
-  real narrowing of the guarantee, taken deliberately: the alternative was a Workspace permanently
-  locked out of its own checkout by a process nobody can stop.
+- **Historical downside, superseded by ADR-063/066:** the v0.1 tree had no place for the survivor. Target
+  RuntimeInventory retains it as an unmatched/recovery subject with its exact last evidence.
+- **Historical downside, superseded by ADR-065:** v0.1 could release a primary lease while a writer
+  survived. Target has zero Turn-owned primary writers; non-primary survivors retain recovery/lock evidence.
 - **Downside:** `Response::Ack` no longer answers the close and delete requests, so any client
   matching on it for those four sees an unhandled shape rather than a compile error.
 
@@ -3419,8 +3462,9 @@ original reasoning that was never in question.
 <a id="adr-055"></a>
 ## ADR-055 — Checkout write authority is a host-global inode lock inherited by every writer
 
-**Status:** Accepted, implemented on Unix. `turnd::checkout_lock`, joined SQLite/lock acquisition and
-recovery, explicit PTY descriptor preservation, and cross-daemon integration coverage.
+**Status:** Accepted, implemented on Unix as legacy exclusion and still normative for non-primary checkout
+ownership. ADR-065 supersedes steady-state primary writers: primary lock/lease rows are decode,
+quarantine and cleanup evidence only; every target writer owns a dedicated worktree.
 
 ### Context
 
@@ -3458,7 +3502,7 @@ existing focus/read-only/worktree/cancel choices. An owner from another daemon r
 without `focus_owner`, because the current socket cannot focus it. Heartbeat, init, Pane launch, split and
 relaunch require both the active SQLite generation and the matching host lock.
 
-For each main-checkout spawn the daemon duplicates only that lock descriptor with `FD_CLOEXEC` still set.
+**Historical v0.1 primary-writer mechanism, unreachable for target launches:** for each main-checkout spawn the daemon duplicated only that lock descriptor with `FD_CLOEXEC` still set.
 portable-pty normally closes every descriptor above stderr in `pre_exec`; Turn carries a small vendored
 extension that preserves an explicit descriptor allowlist, clears `FD_CLOEXEC` only in the already-forked
 child, and retains cleanup for all others. This avoids a cross-thread inheritance window in the daemon. The
@@ -3555,7 +3599,12 @@ rolls back a failed rename. The new on-disk daemon is used only after the old da
 <a id="adr-057"></a>
 ## ADR-057 — Local-data control is complete, inspectable and daemon-authoritative
 
-**Status:** Accepted and implemented.
+**Status:** Accepted and implemented for the base inventory. ADR-063/064/066/067 extend its closed scopes and
+supersede unconditional cascade. Turn-container Session/Workspace End/delete is total: independently live or
+uncertain semantic records are rehomed, tombstoned or moved to bounded recovery and can never veto active-row
+removal. Refusal remains valid only for a separately scoped provider/user-data or privacy deletion whose own
+live-reference/consequence contract requires it. Exact links/grants/Attention and in-flight effects are fenced
+before either kind of removal.
 
 ### Context
 
@@ -3582,10 +3631,12 @@ ADR-059 extends this closed-catalogue obligation before its schema migration may
 RuntimeAttempts, safe launch/resume and configuration-transition receipts, ContextLinks and broker-read audit, lineage, ContextPacket
 metadata, ContextScope/QuotaScope samples, AgentMessage hash/delivery metadata, DependencyEdge/results,
 Team roles/policy, safe RuntimeEndpoint fingerprints and resource-node records must all be classified. Account
-references, provider conversation ids, host/cwd/worktree, link/message endpoints and Web URLs are sensitive
+references, provider conversation ids, host/cwd/worktree, link/message endpoints and WebPreview URLs are sensitive
 metadata with policy-aware redacted export. Agent/Session/Workspace deletion first revokes live link/broker
-capabilities, then cascades scoped samples, audit, delivery, dependency, Team, runtime-endpoint and lineage
-records. Their exact live-versus-history limits are configurable and the privacy report/export/delete/
+capabilities, then applies a closed per-subject rehome/tombstone/retain-or-refuse plan. Only records proved
+exclusively owned and terminal may cascade; independently live jobs, intents, deliveries, dependency/Team/
+Attention evidence and runtime survivors retain exact receipts and routes. Their exact live-versus-history
+limits are configurable and the privacy report/export/delete/
 compact tests must fail if any new table or file category is omitted.
 
 Installation purge is a separate `turnd --delete-installation-data` mode. It acquires the canonical
@@ -3647,6 +3698,10 @@ and a checked functional row cannot be used to imply that those distribution cla
 **Status:** Accepted, not yet implemented. Supersedes ADR-048's click-to-zoom interaction; extends ADR-040's
 hierarchy/view split and ADR-043's context boundary; preserves ADR-044's Shell ownership; narrows ADR-049
 auto-start to Session activation; and supersedes only ADR-052's relaunch-replaces-node target.
+
+**Requirement scope:** `PRD-HIE-001..008`, `PRD-VIE-001..010`, `PRD-LIF-001..007`,
+`PRD-RUN-001..009`, `PRD-CTX-001..011`, `PRD-OBS-001..007`, `PRD-ATT-001..010` and
+`PRD-SAF-001..013`. The authority file expands and verifies every id individually.
 
 ### Context
 
@@ -3754,15 +3809,16 @@ journal; review names that downstream retention and revocation cannot recall it.
 provenance, hash, redaction/truncation facts and evidence-backed delivery state. `submitted`, `received`,
 `read` and `acted` are never inferred from one another.
 
-Short direct messages, observational dependency results and Teams are accepted, sequenced after context,
-and build on the same stable instance ids. They are non-tree coordination edges, have no independent focus/
-attention authority and cannot create hidden context access. A dependency result uses a bounded closed schema
-of state, producer/revision ids, hashes/verified references, provenance and at most stripped/redacted summary;
-raw runtime, transcript, diff/file, environment and provider payloads are invalid. It may project ready/
-blocked/failure evidence but never starts, advances or retries an Agent. User-directed coordination is in scope; autonomous
-workflow scheduling, approval and checkout authority remain out of scope. Session-owned Group, Note, File,
-Diff and Web resource nodes are accepted as M14 with explicit privacy/content-security acceptance; they own
-no runtime or checkout authority and deletion never removes referenced user data. Initial Web URLs forbid
+Short direct messages, dependency results and Teams are accepted, sequenced after context, and build on the
+same stable instance ids. They are non-tree coordination edges, have no independent focus/attention authority
+and cannot create hidden context access. A dependency result uses a bounded closed schema of state,
+producer/revision ids, hashes/verified references, provenance and at most stripped/redacted summary; raw
+runtime, transcript, diff/file, environment and provider payloads are invalid. ADR-061 supersedes this ADR's
+original passive-only limit: outside a FlowRun it only projects ready/blocked/failure evidence, while an
+immutable operator-reviewed Flow policy may advance it within an exact DelegationGrant. Permission approval,
+unbounded scheduling and checkout-authority expansion remain out of scope. Session-owned Group, Note, File,
+Diff and WebPreview resource nodes are accepted as M14 with explicit privacy/content-security acceptance; they own
+no runtime or checkout authority and deletion never removes referenced user data. Initial WebPreview URLs forbid
 userinfo/query/fragment, remain private content and connect only by pinning an approved public address after
 validating every DNS answer for each request/redirect.
 
@@ -3804,6 +3860,8 @@ boundaries are normative in `docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`.
 **Status:** Accepted, not yet implemented. Depends on ADR-059's WorkSurface and stable instance/input identity;
 preserves ADR-016/018's single Attention authority, ADR-045's program-owned screen boundary, ADR-051's
 Settings hierarchy and ADR-057's closed local-data catalogue.
+
+**Requirement scope:** `PRD-VOI-001..005`; expanded individually in the authority file.
 
 ### Context
 
@@ -3882,3 +3940,636 @@ The normative settings, protocol fields, failure behavior and adversarial/packag
   packaged-helper and cross-platform acceptance work.
 - **Downside:** Turn deliberately keeps one review/send action and refuses dictation on inputs it cannot
   authenticate, so it will expose fewer voice affordances than a general OS dictation feature.
+
+---
+
+<a id="adr-061"></a>
+## ADR-061 — Turn is an operator control plane with reusable Flows and bounded delegated control
+
+**Status:** Accepted, not yet implemented. Extends ADR-040/059 and narrowly supersedes ADR-049's blanket
+daemon-self-start prohibition plus their statements that dependencies can never advance work and
+agent/conductor changes must always remain foreground proposals. It preserves the single Attention authority,
+explicit permission decisions and checkout safety.
+
+**Requirement scope:** `PRD-OUT-001..004`, `PRD-CRE-001..007`, `PRD-FLW-001..011` and
+`PRD-SCL-001..008`; expanded individually in the authority file.
+
+### Context
+
+Supervising isolated terminals is not enough for the intended scale. The operator must be able to create a
+repeatable multi-agent/tool run, fan independent work out, transfer selected context, sequence typed results
+and gather a synthesis without approving the same safe operation one node at a time. A passive-only product
+forces the operator to become the scheduler and defeats the reduction in interaction Turn is meant to buy.
+
+The opposite extreme is also wrong. Treating agent prose as commands, allowing a conductor to mint its own
+authority or advancing on guessed idle state would turn observation into an unsafe autopilot. The boundary
+must be an explicit product object that is reviewable before work starts and enforceable afterwards.
+
+### Alternatives considered
+
+**Keep Turn purely observational.** Rejected. It cannot deliver fast reusable flows or manage a useful volume
+of coordinated work; it preserves the exact manual polling/dispatch burden the product exists to remove.
+
+**Let an agent control the daemon through terminal output.** Rejected. Output is untrusted content, has no
+stable operation identity and is vulnerable to prompt injection, replay and stale-attempt races.
+
+**Confirm every child, link and dependency separately.** Rejected. It is safe but needlessly interactive.
+One up-front scoped grant provides the same authority boundary with far less operator interruption.
+
+**Adopt a spatial canvas as the orchestration model.** Rejected. The persistent hierarchy and WorkSurface
+remain Turn's canonical navigation. A Flow/Team view may project a graph or board, but geometry never owns
+runtime identity or attention.
+
+### Decision
+
+Turn adds a versioned `FlowDefinition` and immutable `FlowRun` inside a normal Session. A definition declares
+node specs, roles, prompts/commands, typed dependencies/start policies, context sources/budgets, execution
+targets, worktree isolation, Attention policy, resource/concurrency bounds, optional bounded recurrence and
+the exact `DelegationGrant`. One reviewed launch preflights and provisions the graph idempotently; every
+external effect has a durable receipt and partial failures remain visible.
+
+Closed `FlowRunTrigger`s are foreground `manual` and one-id-per-occurrence `bounded_recurrence`; the latter
+creates a new run from an exact durable occurrence receipt and never directly advances a step. Closed
+`StepStartPolicy` variants are `manual`, `with_run`, `after_success`, `after_result`, `all_of` and `any_of`.
+Only the four dependency variants of the immutable policy may consume matching current typed
+`DependencyResult`s; manual uses a foreground operation and with-run consumes the owning run's transition to
+running. Process idleness, output text and agent proposals are not results. Outside a FlowRun a dependency
+remains observational.
+
+A `DelegationGrant` binds issuer, FlowRun, exact AgentInstance/RuntimeAttempt/generation, expiry, maximum
+nodes/concurrency, provider/tool allowlist, cwd roots, worktree strategy, context scopes, message/dependency
+verbs and resource budgets. Within it a conductor may create declared nodes, organise Teams, open declared
+context, deliver bounded messages and request fan-out/synthesis without another prompt. It cannot approve a
+permission, expand itself, use the primary checkout, delete user data, merge/publish, act after generation
+change or turn text into control. An out-of-grant request becomes one exact Attention item.
+
+Creation surfaces use the `category=creation` filter of the one declarative `CommandCatalogue`. Turn-managed fan-out and dependency operations are
+asynchronous and return after durable receipts; they inject no synchronous child join, and daemon/UI, input,
+navigation and later control remain responsive. A provider may independently wait for its own child, which
+Turn reports as provider state rather than claiming to control it. Every writer, whether single/parallel or
+foreground/background, receives a dedicated worktree; no Turn path uses the operator's primary `main`
+checkout.
+
+The complete normative contract is `docs/OPERATOR_CONTROL_PLANE.md`; frozen requirements and proof
+obligations are in `docs/PRODUCT_REQUIREMENTS.md` and `docs/CONTROL_PLANE_ACCEPTANCE.md`.
+
+### Consequences
+
+- Turn can create repeatable mixed-agent/tool workflows with one safe interaction and keep the operator on
+  exceptions, decisions and results.
+- Teams, messages, dependencies, context and worktrees become typed control-plane objects rather than UI
+  conventions.
+- Attention remains the only focus/interruption authority, and permissions remain human decisions.
+- **Downside:** recovery, idempotency, grant revocation and partial provisioning make Flows a cross-layer
+  domain feature, not a command-palette shortcut.
+- **Downside:** bounded automation must be tested adversarially; a missing limit or stale generation is an
+  authority bug, not merely an orchestration bug.
+
+---
+
+<a id="adr-062"></a>
+## ADR-062 — All agent providers normalize into one durable topology and capability contract
+
+**Status:** Accepted, not yet implemented. Extends ADR-003/029/040/059. Existing per-provider adapters and
+v0.1 hierarchy are a partial foundation; current false-zero counting and provider-specific resume dispatch
+contradict this target.
+
+**Requirement scope:** `PRD-TOP-001..009` and `PRD-ADP-001..009`; expanded individually in the authority
+file.
+
+### Context
+
+An operator cannot manage many agents if child agents exist in the real runtime but disappear from Turn, or
+if absence of integration is rendered as zero. Provider CLIs expose different hook, notification, transcript,
+usage and control dialects. Copying one provider's ephemeral child cards or branching in the UI for every
+tool would produce inconsistent lifecycles, counts and attention routes—the exact failure the unified tree is
+supposed to eliminate.
+
+### Alternatives considered
+
+**Use OS child processes as the universal hierarchy.** Rejected. Provider-side children may have no process,
+one process may host several conversations and executable-name inference cannot prove semantic delegation.
+
+**Model only the richest provider and degrade every other provider to terminal.** Rejected. It hides useful
+evidence and makes provider choice change Turn's core behavior instead of only its capability coverage.
+
+**Let each provider own custom UI/state.** Rejected. Counts, Attention, restore and WorkSurface behavior would
+diverge and provider state could bypass global safety rules.
+
+### Decision
+
+Every dedicated adapter translates native evidence into the same versioned `AgentTopologyObservation`:
+source/observation epoch and covered domain, snapshot/delta/gap kind plus sequence/watermark, parent
+instance/attempt/generation, stable native child/tool and child attempt identity, causal invocation, child
+task/role, canonical lifecycle and turn transitions, transcript/activity/result handles, optional usage/model
+data, native revision, confidence, observation time and explicit capability/unknown states. Provider labels
+reduce through the existing two-dimensional Lifecycle/TurnState machine; turn completion is not process exit.
+Ingestion is idempotent, order-independent and attempt-fenced. Structured and process evidence reconcile
+into one node; only stronger evidence may reparent it.
+
+The open capability vocabulary includes launch/resume/branch/stop, structured status, questions,
+permissions, subagents, transcripts, context usage, provider quota, model switching, messaging, context
+transfer, shared identity, durable attach and delegated control. The registry is the sole provider-specific
+seam. Core, store, protocol projections, Attention and UI may not branch on provider names. Generic/custom
+adapters always answer but advertise only proved behavior.
+
+ADR-064 extends that same vocabulary, rather than adding provider branches, with `native_jobs`,
+`conversation_inventory`, `title_read` and `conversation_rename`; the complete closed versioned list is in
+`docs/ADAPTER_ACCEPTANCE.md`.
+
+Subagents are durable semantic nodes with their own identity, lifecycle and result, not renderer-local cards.
+Aggregates declare direct versus descendant scope, graph revision and observation coverage. Exact `0` needs
+a matching complete authoritative snapshot or gap-free sequenced coverage for the exact scope/attempt/
+generation. Drop, overflow, gap, disconnect/restart or stale heartbeat invalidates exactness until
+asynchronous resync; best-effort evidence can only add a lower bound. Partial coverage renders `N+ observed`;
+unavailable, unsupported and stale remain distinct. Each Agent View exposes integration version/mechanism/
+freshness/downgrade diagnostics and an explicit disposable, bounded, redacted self-test record.
+
+Every advertised capability maps bijectively to shared contract fixtures, provider fixtures and degradation
+tests. Capabilities dependent on real provider behavior also require versioned authenticated live evidence.
+One provider's timeout cannot block another provider, terminal input or the selected view.
+
+### Consequences
+
+- Claude Code, Codex, Gemini, OpenCode and future/custom agents can differ in evidence without differing in
+  core identity, tree, Attention or lifecycle semantics.
+- False-zero subagent summaries become impossible by type and acceptance contract.
+- Provider-specific richer features remain possible behind explicit capabilities.
+- **Downside:** some adapters will truthfully show unsupported/partial for a long time; parity cannot be
+  achieved by presentation alone.
+- **Downside:** live contract evidence must be maintained across CLI releases in addition to offline fixtures.
+
+---
+
+<a id="adr-063"></a>
+## ADR-063 — Operational scale features remain first-class control-plane objects
+
+**Status:** Accepted, not yet implemented. Extends ADR-059/061/062 and closes the operational capabilities
+that would otherwise leave a multi-agent control plane unable to discover, isolate or manage all of the work
+it claims to supervise.
+
+**Requirement scope:** `PRD-VIE-011`, `PRD-FLW-012`, `PRD-ADP-010`, `PRD-LIF-008`, `PRD-RUN-010`,
+`PRD-CTX-012`, `PRD-OBS-008`, `PRD-SCL-009`. The machine-checked one-to-one origin map lives in
+`docs/PRODUCT_SPEC_V1.authority`; moving any requirement to another decision changes the frozen authority
+root.
+
+### Context
+
+Independent agent identities are not enough when a provider multiplexes many conversations through one
+service, a host retains runtimes no Workspace currently knows, teams coordinate through a changing brief,
+or several provider accounts must stay isolated. At scale, agents also need a safe way to publish bounded
+artifacts/progress, operators need revisioned file and work-item views, and a remote/headless client must see
+the same truth rather than a second reduced model.
+
+Treating these as UI conveniences would recreate the failures Turn exists to prevent: invisible surviving
+work, cross-account or cross-conversation leakage, unreviewed writes, duplicate board/runtime identity and
+remote state that disagrees with the desktop.
+
+### Alternatives considered
+
+**Leave runtime inventory and multiplexing to provider UIs.** Rejected. Turn could display zero while live
+work survives, and a shared service could cross-wire instance identity without a daemon-owned binding.
+
+**Represent live briefs, progress and board cards as untyped text.** Rejected. Text is hostile content, has
+no revision or authority boundary and cannot safely drive work or Attention.
+
+**Use one ambient provider account/config directory.** Rejected. Parallel sessions could leak credentials,
+transcripts, conversations and quota attribution across accounts.
+
+**Make remote operation a separate product/state store.** Rejected. It would split navigation, Attention,
+input ownership and recovery truth. A remote surface must consume the same protocol and server-side policy.
+
+### Decision
+
+Turn adds the following provider-neutral control-plane objects and operations:
+
+- one-to-many `RuntimeEndpointBinding`s with installation-wide current ConversationKey ownership while
+  endpoint generations fence transport, plus isolated input/transcript/context/Attention. The key's closed
+  account scope is either an independently authorised AccountProfile or an endpoint-bound opaque unscoped id
+  for sources that deliberately expose no account field; the latter grants no profile/quota/credential power;
+- authenticated target-wide `RuntimeInventoryObservation`s plus exact adopt/ignore/terminate reconciliation;
+- Note-backed ContextLinks with pinned or explicitly reviewed live-revision policies;
+- isolated non-secret `AccountProfile`s with external authentication, launch/default precedence and a
+  retire/delete lifecycle;
+- bounded delegated Resource/progress operations with typed schemas, compare-and-swap, limits and receipts;
+- canonical work-item metadata projected as board/list/search without another topology or Attention queue;
+- revisioned atomic FileBackend editing with conflict and confinement semantics; and
+- a capability-negotiated remote/headless operator surface over the same hierarchy, WorkSurface, streams,
+  Attention routes and mutation journal, while the server enforces its closed remote allowlist.
+
+All of these preserve the same invariant: an observation or piece of content is not authority. Every
+external effect names an exact target, identity, generation, revision and operation id, and every unavailable
+capability is shown honestly rather than silently approximated.
+
+### Consequences
+
+- Provider services can be shared efficiently without collapsing AgentInstance identity.
+- Processes that outlive or escape Workspace bookkeeping stay discoverable and individually reconcilable.
+- Teams can share reviewed living briefs and publish progress without granting arbitrary filesystem/control
+  access.
+- Account, file, work-item and remote workflows become testable domain behavior instead of renderer state.
+- **Downside:** host inventory, remote clients and account isolation enlarge the security/acceptance matrix.
+- **Downside:** live-note and delegated-resource policies need strict cumulative bounds and revision audits.
+
+---
+
+<a id="adr-064"></a>
+## ADR-064 — Close the remaining operator-loop capabilities as typed first-class contracts
+
+**Status:** Accepted, not yet implemented. Extends ADR-059/061/062/063 after an independent final-reference
+coverage audit rejected the previous specification candidate.
+
+**Requirement scope:** `PRD-VIE-012`, `PRD-ADP-011`, `PRD-LIF-009`, `PRD-RUN-011`, `PRD-CTX-013`,
+`PRD-OBS-009`, `PRD-ATT-011`, `PRD-SCL-010`. The machine-checked one-to-one origin map lives in
+`docs/PRODUCT_SPEC_V1.authority`; moving any requirement to another decision changes the frozen authority
+root.
+
+### Context
+
+The earlier candidate covered the hierarchy, WorkSurface, Attention, Flows, topology, context handoff and
+telemetry, but it still forced avoidable operator actions and left real work outside the model. In
+particular it did not fully specify external work-item sources, provider conversation history, provider-native
+jobs, an interactive Browser, independent title operations, profile-scoped companion activity or a narrowly
+delegated remote permission response. It also said both that selection never starts work and that returning
+to a Session should be immediately useful.
+
+Those are not optional visual extras. An operator supervising many processes needs the default foreground
+Session to become usable in one action, must see provider work that exists outside current runtime handles,
+and must distinguish a local projection from an externally authoritative object. Remote assistance is
+incomplete if every routine typed permission requires returning to the desktop, but unsafe if raw terminal
+input or a broad invitation can answer it.
+
+### Alternatives considered
+
+**Leave these as implementation details beneath existing broad rows.** Rejected. A broad row could pass
+without testing pagination, ambiguous source writes, global conversation ownership, job survival, browser
+origin isolation or permission-grant fencing; the missing behavior would remain invisible to the gate.
+
+**Treat provider-native jobs as recurring Flows and history as RuntimeInventory.** Rejected. Provider jobs
+have provider-owned schedules and iterations that may survive Turn, while historical conversations need no
+live runtime. Combining them would invent identity, lifecycle and cancellation authority.
+
+**Use one generic WebPreview view and raw remote PTY input.** Rejected. Inert reference content and interactive
+browsing have different network/storage/origin consequences, and raw input can bypass a typed sensitive
+interaction contract.
+
+**Keep every permission desktop-only.** Rejected. It creates unnecessary operator polling and movement even
+when the desktop can pre-authorise one exact closed response. Credentials, host trust, administration and
+authority changes still cannot be delegated this way.
+
+### Decision
+
+Turn adds eight separately testable capabilities:
+
+- a WorkItemSource adapter with stable external identity, per-field authority, bounded sync/cache coverage,
+  revision-fenced writes and explicit conflict/reconciliation;
+- provider-native Job/Iteration identity and controls, explicitly distinct from Flow recurrence and from
+  dismissing Turn projections;
+- foreground Session activation that restores/attaches and may materialise only its bounded fully preflighted
+  eligible saved descriptors—or one safe default Shell when empty—in the same selection, otherwise failing
+  closed with one precise recovery action;
+- separate inert WebPreview and isolated interactive Browser semantics, including reviewed local HTML and
+  loopback origins, navigation/history, popup/download and storage policy;
+- a private bounded ConversationInventory with search/pagination, global ConversationKey ownership and
+  separate adopt/resume operations;
+- independent `title_read` and `conversation_rename` capabilities with revisioned receipts and degradation;
+- one exact typed permission-response operation with closed authorization variants: direct authenticated
+  local-foreground submission, or a single-use foreground-issued end-to-end encrypted remote grant. Raw PTY
+  input is blocked on every surface when typed response exists; only verified local foreground retains a PTY
+  fallback when it does not, and all secret/admin/trust/grant authority remains local; and
+- AccountProfile-scoped context, quota and activity projections shared by desktop/companion, preserving
+  freshness/coverage and never converting missing or partial evidence into zero.
+
+Every object remains in the canonical tree or a projection of it, every selection routes to the one
+WorkSurface, and every actionable event enters the same Attention Queue. No new canvas, runtime identity or
+independent notification queue is introduced.
+
+### Consequences
+
+- External and provider-retained work can be discovered and controlled without identity or authority lies.
+- Common safe foreground activation and narrowly delegated permissions reduce operator interactions while
+  preserving explicit failure and review boundaries.
+- WebPreview/browser, Flow/job, runtime/history and read/rename pairs can degrade independently and be tested
+  independently.
+- **Downside:** adapters now need more granular capabilities, live evidence and conflict fixtures.
+- **Downside:** browser origins, external-source reconciliation and remote response grants substantially
+  enlarge security, privacy, performance and packaged accessibility acceptance.
+
+---
+
+<a id="adr-065"></a>
+## ADR-065 — Make source-capability coverage explicit and close the final operational gaps
+
+**Status:** Accepted, not yet implemented. Extends ADR-049/059/061/062/063/064 after successive blind audits
+rejected prior candidates and corrected both over-broad and missing claims.
+
+**Requirement scope:** `PRD-HIE-009`, `PRD-HIE-010`, `PRD-CRE-008`, `PRD-ADP-012`, `PRD-ADP-013`, `PRD-OBS-010`,
+`PRD-OBS-011`, `PRD-ATT-012`, `PRD-SAF-014`. The machine-checked one-to-one origin map lives in
+`docs/PRODUCT_SPEC_V1.authority`; moving any requirement to another decision changes the frozen authority
+root.
+
+### Context
+
+The first independent audit found capabilities that a requirements-only comparison could miss: recursive
+organisation, branch-isolated group workflows, notification delivery while the UI is absent, target memory
+pressure, two additional dedicated agent adapters, quota-only providers, configurable inference endpoints,
+complete Workspace onboarding and safe generated names. A later audit also corrected an imprecise claim:
+target-wide runtime/survivor inventory already existed, but it lacked host capacity and process-tree resource
+accounting. A final exact-SHA blind audit then caught a visual-management capability omitted from both the
+ledger and requirements: one-action active-work-surface top-level non-overlapping arrangement. Turn adapts that behavior to its canonical
+tree instead of importing a spatial authority or requiring an operator cleanup action. Corrections must
+narrow the gap rather than inflate the amount of purported missing work.
+
+The deeper failure was methodological. A selective gap narrative has no frozen denominator, so an omitted
+feature is indistinguishable from a deliberately rejected one. Turn therefore needs an independently auditable
+coverage ledger as well as PRD and ACP rows. The ledger may cite an opaque frozen source snapshot and evidence
+digests, but product/code/docs must remain source-neutral and must not inherit another product's names,
+architecture or canvas authority.
+
+### Alternatives considered
+
+**Declare broad hierarchy, telemetry and adapter rows sufficient.** Rejected. They do not force cycle-safe
+Group mutation, complete-versus-failed memory accounting, a six-adapter live matrix, quota-only isolation or
+BYO model-route secret handling.
+
+**Give Group runtime/repository authority because it presents a branch.** Rejected. Group remains a
+presentation relationship. A Session-owned CheckoutScope owns repository/worktree identity and lifecycle;
+the Group only projects it and supplies reviewed defaults. This preserves one hierarchy without creating a
+second execution owner.
+
+**Treat notification gateway acceptance as delivery or Attention resolution.** Rejected. Push is an encrypted,
+revocable, collapse-aware projection. It can be accepted, fail or expire without saying anything about device
+delivery, reading or the underlying interaction.
+
+**Reuse AccountProfile or RuntimeEndpoint as a model gateway.** Rejected. Account identity, a multiplexed
+provider service and a configurable inference route have different identities, secrets, network trust and
+launch-freeze semantics.
+
+**Copy every remote mutation exposed by the audited source.** Rejected as a deliberate safety adaptation.
+The full remote surface may create ordinary work, type under a visible lease and perform revision-fenced
+non-destructive mutations, including the explicitly registry-allowed scoped repository stage/unstage/commit/
+fetch/branch operations. Credential entry, grant/authority issue, host trust, destructive process lifecycle,
+repository push/pull/commit-and-push/merge/conflict-resolution/discard/cleanup and publish stay desktop-
+foreground-only under `PRD-SAF-012` and `PRD-SCL-009`. This is
+recorded as an adapted capability, not an omission.
+
+### Decision
+
+Turn adds nine independently testable obligations:
+
+- same-Session recursive Groups with one parent, atomic CAS subtree operations, cycle/depth/corruption bounds
+  and closed non-cascading removal dispositions;
+- automatic compact non-overlapping layout of the canonical tree in stable logical/accessibility order, with
+  no persisted coordinates, tidy command or mutation of hierarchy, selection, runtime, input or Attention;
+- Session-owned CheckoutScope identity/lifecycle, optionally projected by a Group, with one-step agent-per-
+  branch creation/adoption, truthful inventory/reconciliation and no implicit cwd/runtime/worktree deletion;
+- one resumable WorkspaceOnboarding path for new/open/clone/SSH adoption, with crash-safe partial receipts and
+  repository publication as a separate foreground operation;
+- six dedicated agent adapters—Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok—under the same
+  capability/live-evidence matrix, plus isolated Kimi and MiniMax quota/activity connectors;
+- a distinct ModelEndpointProfile for target-bound BYO endpoint/model routing, bounded discovery, secret
+  references, network trust and launch/switch receipts with no silent fallback;
+- ResourceInventory fields over the existing target RuntimeInventory for host RAM/swap/pressure and
+  reuse-safe process-tree accounting across current owners, closed owners and unmatched survivors;
+- local DisplayNameFacts and bounded generated proposals whose manual pinning, redaction and revision rules
+  never imply identity, provider rename or terminal input; and
+- revocable device delivery grants, minimal encrypted outbox, subject/revision collapse, monotonic live status
+  and a notification-only host that opens no public listener.
+
+`docs/PRODUCT_CAPABILITY_COVERAGE_V1.tsv` freezes the audited denominator. Every stable feature id has one
+`adopted|adapted|rejected|irrelevant` disposition, evidence digest, rationale and PRD/ACP/ADR trace. Unknown,
+duplicate, missing, malformed, broken-link or weakened entries fail the specification gate and its mutation
+suite. The file is authority-hashed with every other normative source.
+
+### Consequences
+
+- Nested agent-per-branch workflows remain visible in the canonical tree without making presentation equal
+  ownership or blocking the primary `main` checkout.
+- Dense or changing hierarchies remain readable without an operator arranging them or creating a second
+  canvas/layout authority.
+- Operator Attention can arrive when the full UI is backgrounded or absent without inventing a second queue
+  or falsely acknowledging work.
+- Capacity, adapter, quota, route and naming claims become scoped evidence rather than labels or guesses.
+- A future audit can prove what was considered and why, instead of trusting a prose assertion of completeness.
+- **Downside:** the protocol/store/security/privacy/performance/accessibility matrices gain new identities,
+  lifecycle machines and destructive-boundary cases.
+- **Downside:** any source-snapshot refresh now requires an explicit ledger review, ADR and external authority
+  pin rotation rather than a quiet documentation edit.
+
+---
+
+<a id="adr-066"></a>
+## ADR-066 — Bound the remaining operator utilities without creating parallel authority
+
+**Status:** Accepted, not yet implemented. Extends ADR-056/059/061/063/064/065 after exact capability,
+cross-document, security and performance audits showed that the previous candidate could pass while common
+operator workflows remained untyped or trusted by assertion.
+
+**Requirement scope:** `PRD-VIE-013`, `PRD-VIE-014`, `PRD-CRE-009`, `PRD-CRE-010`, `PRD-RUN-012`,
+`PRD-RUN-013`, `PRD-RUN-014`, `PRD-RUN-015`, `PRD-RUN-016`, `PRD-SAF-015`. The machine-checked origin map
+assigns each id only to this decision; every source-ledger row mapped to one of these requirements uses the
+same origin.
+
+### Context
+
+The operator control plane already had one hierarchy, one WorkSurface, one Attention Queue and typed
+runtime/context authority. It still lacked closed contracts for routine work around those pillars: command
+discovery, bounded media, safe content rendering, repository-host identity, generated commit drafts, file
+transfer, announcements, app updates, work-item history and narrowly reversible presentation changes.
+
+Leaving those as renderer helpers would create exactly the hidden side channels this architecture rejects.
+A toolbar callback could execute something the catalogue could not name; an update or announcement could be
+called “signed” without canonical bytes or independent trust roots; a proposal helper could read the
+repository it was meant only to summarise; and generic undo could replay an external or destructive effect.
+Likewise, unqualified end/delete rules could erase Attention or Session-scoped authority while claiming the
+operator had safely finished work.
+
+### Alternatives considered
+
+**Treat the utilities as implementation details of existing broad requirements.** Rejected. Broad rows could
+pass without paging, replay fencing, sandbox enforcement, manifest/package binding, exact transfer recovery
+or the closed undo allowlist.
+
+**Reuse one trust root and one generic signed JSON envelope.** Rejected. Cross-domain key acceptance and
+ambiguous serialization allow a valid object from one channel to authorise another. Command extensions,
+announcements, update manifests, update packages and voice-model manifests need separate stores, domains and
+replay watermarks.
+
+**Let a local proposal command run with the Session environment.** Rejected. “Local” does not make a process
+least-privilege; inherited cwd, descriptors, environment, credentials or sockets would expose far more than
+the reviewed staged snapshot.
+
+**Make all mutations undoable.** Rejected. Runtime input, provider/source/repository effects, Attention,
+credentials, grants and destructive lifecycle cannot be reversed by restoring presentation state.
+
+### Decision
+
+Turn adds ten independently testable obligations without adding another navigation, runtime or authority
+model:
+
+- one contextual revisioned `CommandCatalogue` supplies toolbar, palette, context menus and shortcuts with
+  stable ids, bounded search, typed schemas and identical current authority checks;
+- signed product announcements remain inert and separate from operational StatusEvent and Attention;
+- app update discovery/download/verify/stage/apply/rollback is an explicit crash-reconcilable lifecycle that
+  preserves live terminal work and never silently installs;
+- WorkItem activity is an ordered, paged, provenance-bearing evidence stream over the canonical WorkItem;
+- Media is a distinct inert Node capability with descriptor/stream import, sealed hash publication,
+  lookup-only recovery and sandboxed non-autoplay playback;
+- repository-host profiles and independently scoped RepositoryBackend/WorkItemSource grants separate safe
+  identity from external credentials and bind every request;
+- a commit-proposal provider receives only one exact bounded redacted staged snapshot inside a fail-closed
+  sandbox and can only return an editable draft;
+- transfer tickets bind two separately fenced endpoints, immutable size/hash/chunk/expiry policy and
+  create-new atomic publication with no same-name fallback;
+- plain/Markdown is an inert exact-revision content projection; a link opens only through a separate reviewed
+  Browser-Node operation; and
+- undo/redo represents exactly eight presentation requests, including constant-size expand-all, partitioned by operator/surface/Session and
+  structurally unable to contain runtime, input, provider, source, SCM, Attention, context, grant, credential
+  or destructive effects.
+
+All five signed artifact domains use a versioned canonical signing envelope, installation-owned independent
+trust stores, monotonic key epochs/sequences, revocation and replay/high-water fences. Update packages are
+separately signed and bind the exact parent-manifest hash. The commit-proposal profile freezes an executable
+descriptor/hash or exact broker route, sandbox policy and numeric resource limits before spawn. New paths
+have explicit performance workloads and may never consume the terminal-input or Attention latency budget.
+
+This decision also closes cross-cutting survivor semantics found during the same audit. End/delete serially
+derives every semantic, relationship and Attention disposition without blocking on user input. Cross-Session rehome terminates or
+historicises Session-scoped Team/Flow/dependency relationships and revokes their authority; immutable grants
+and ContextLinks are never retargeted. Once that semantic commit succeeds, unreachable process/worktree/
+artifact cleanup is reported and cannot resurrect navigation. The primary `main` checkout remains
+operator-only for both runtime and repository mutation paths.
+
+### Consequences
+
+- Common operator actions remain discoverable and low-interaction while using the same typed authority as
+  their direct forms.
+- Signatures, helper isolation, transfer recovery, updates and undo have mutation-resistant acceptance
+  surfaces instead of security adjectives.
+- Media, announcements, activity and rendered content enrich the WorkSurface without adding a canvas or
+  another Attention queue.
+- Lifecycle cleanup preserves the evidence the operator still needs and cannot silently retarget authority.
+- **Downside:** five trust stores, helper sandboxing and crash-reconcilable staged artifacts enlarge platform,
+  privacy, release and performance test matrices.
+- **Downside:** presentation undo is intentionally narrow; an operator must use the domain's explicit repair
+  or compensating operation for every external effect.
+
+---
+
+<a id="adr-067"></a>
+## ADR-067 — Close the audited operator-surface and lifecycle denominator
+
+**Status:** Accepted, not yet implemented. Extends ADR-059/061/064/065/066 after a file-and-registry source
+census, adversarial trace audit and cross-document state audit proved that ledger presence alone could still
+hide unowned state, an undisposed source behavior or an acceptance row that passed on a shallow UI.
+
+**Requirement scope:** `PRD-CRE-011`, `PRD-ADP-014`, `PRD-LIF-010`, `PRD-LIF-011`,
+`PRD-VIE-015`, `PRD-RUN-017`, `PRD-RUN-018`, `PRD-RUN-019`, `PRD-RUN-020`, `PRD-RUN-021`, `PRD-RUN-022`,
+`PRD-OBS-012`, `PRD-ATT-013`,
+`PRD-SAF-016`, `PRD-SAF-017`, `PRD-SAF-018`, `PRD-SAF-019`, `PRD-SAF-020`, `PRD-SCL-011`, `PRD-SCL-012`,
+`PRD-SAF-021`, `PRD-SCL-013`. `PRD-CRE-007` remains owned by ADR-061 and `PRD-ADP-010` remains owned by ADR-063 even though
+the refreshed source census maps new capability origins to those existing obligations. Only the new or
+explicit-disposition rows whose requirements are listed above map to this decision. The census, its one-to-many
+mapping table, capability ledger, PRD, ACP and state-
+family manifest are one authority-hashed proof set; changing any denominator or origin changes that root.
+
+### Context
+
+The prior candidate described Turn's central purpose correctly but had not proved an exhaustive source
+disposition. A second audit found common operator utilities and later lifecycle/safety behaviors that were
+present in the audited source yet absent, over-generalised or attached to old decisions: diagnostics and bug
+report preparation, hierarchical settings, short-lived collaborator chat, document viewing and terminal
+clipboard gestures, Attention sound cues, bounded bulk recovery, conservative idle hibernation, agent-owned
+isolated browser work, mobile companion launch, corrupt-store preservation, commercial entitlement surfaces
+and anonymous telemetry. An acceptance row for each name was still insufficient: without exact state owners,
+bounds, reducers, recovery and negative authority, a renderer mock could pass while the product remained
+unsafe or incomplete.
+
+The audit also exposed a methodological trap. A single source file can support several capabilities and one
+capability can require several files; a one-file/one-row heuristic or generic catch-all mapping can report
+100 percent while hiding semantics. Source coverage therefore needs a normalized candidate census plus a
+one-to-many mapping whose basis is independently checked, not a count copied from the ledger.
+
+### Alternatives considered
+
+**Fold every new row into ADR-059 because it concerns the control plane.** Rejected. That makes origin
+verification tautological and fails to record the new security, data-lifetime and source-denominator decision.
+
+**Adopt source behavior literally.** Rejected. Turn has no commercial entitlement gate or product telemetry;
+terminal-originated clipboard control is denied; agent browsing and Companion launch gain narrow reviewed
+grants; idle hibernation is opt-in and evidence-conservative; document content is inert and printing is a
+separate effect.
+
+**Treat diagnostics, settings, sounds, clipboard and corrupt-file handling as renderer details.** Rejected.
+Each can retain sensitive bytes, create an external effect, hide a gap, alter lifecycle or destroy the only
+copy of operator data. They require typed ownership and falsifiable limits.
+
+### Decision
+
+Turn adds or explicitly disposes twenty-two obligations:
+
+- one generated 23-section settings hierarchy with an independently frozen scope matrix, exact resolver
+  provenance, canonical search/deep links and revision-pinned section reset;
+- a redacted bounded current-daemon diagnostic ring and a separate local bug-report draft/review path whose
+  clear/export/open effects cannot erase or leak operational evidence;
+- short-lived collaborator chat fenced to one exact shared ViewTarget with no durable, input, context,
+  Attention or control authority;
+- exact-revision image/PDF views with isolated bounded decode/search and a distinct reviewed, reconcilable
+  print intent;
+- gesture-bound terminal copy/paste/path drop with memory-only bodies, existing input receipts and unconditional
+  denial of terminal-controlled clipboard read/write;
+- a closed advanced repository-operation set for init, detached checkout, branch rename/delete, stash push/pop,
+  merge, rebase, revert and force-push, each revision-planned, non-primary, consequence-reviewed where
+  destructive and reconciled by typed intent rather than an arbitrary Git command;
+- optional rate-limited `done|needs_you` local sounds derived only from canonical state edges and supplementary
+  to accessible visual/structured Attention;
+- a reviewed≤256-candidate sequential bulk idle restart with per-instance canonical receipts and complete
+  final accounting;
+- opt-in Eco hibernation that admits only exact idle, off-screen, local, resumable work, preserves Session and
+  scrollback, wakes automatically and never hides Attention;
+- a locally adopted Workspace grant for one agent to create and operate only its own logged-out isolated
+  Browser Nodes through bounded typed actions and a permanently visible Stop control;
+- opt-in Browser Memory Saver that discards only an exact safely idle hidden page after five minutes, reports
+  resource truth, retains no page/form/credential state and automatically rehydrates on same-daemon selection
+  through one new idempotent reviewed navigation intent or a precise bottom-status refusal;
+- a closed fail-visible set of optional menu/header controls whose setting cannot hide Attention, recovery,
+  destructive, Delete/End, Restart, Search or Close routes and cannot remove palette/keyboard access;
+- target-scoped PTY used/ceiling/headroom observations with exact freshness, early and critical Attention and
+  a separately reviewed, durably reconciled privileged remediation only where before/after/rollback proof is
+  available;
+- off-screen viewer/xterm/PTY-client parking that proves durable work survives, caps safe parks by LRU, keeps
+  zero-PTY tmux observation/input fenced and reattaches automatically without another user action;
+- explicit rejection of age/count/memory/PTY-pressure killing of detached durable Sessions; those signals may
+  raise Attention or trim proved reconstructible clients, never end user work;
+- opt-in AccountProfile-scoped private cross-conversation body search with bounded redacted index/query, honest
+  freshness/coverage/deletion and canonical view routing without implicit resume or input;
+- a separate narrow expiring Companion launch grant over immutable safe templates, preassigned canonical ids
+  and lookup-only recovery, with no arbitrary command/flags/cwd/account/target authority;
+- byte-preserving corrupt-store quarantine before any default save, with no time-based evidence deletion and
+  explicit recover/start-fresh/export/discard dispositions;
+- daemon-authoritative additive convergence for changes from another authenticated client, with operation echo
+  deduplication, revision conflicts and fieldwise presentation merge; internal store files are never a second
+  watched mutation authority and external packages remain reviewed PortableImports;
+- an explicit `irrelevant` disposition for commercial licence, subscription, seat and entitlement behavior;
+- an explicit `rejected` disposition for product telemetry, analytics and install-count behavior, while
+  purpose-bound signed update discovery remains identifier-free; and
+- a normalized exhaustive source census/mapping gate plus closed machine-readable state-family ownership
+  manifest, both mutation-tested against deletion, duplicate, stale digest, false mapping and undeclared state.
+
+All positive paths reuse the canonical hierarchy, WorkSurface, Attention Queue, typed mutation envelope,
+runtime identities and existing isolated Browser/terminal authority. None introduces a canvas, hidden mobile
+registry, second settings resolver, second clipboard/input path or generic plugin authority. Every body,
+intent, receipt, worker and queue has an exact owner, independent count/byte boundary and cleanup edge in
+`docs/PROTOCOL.md`, `docs/PRIVACY.md` and `docs/PERFORMANCE.md`.
+
+### Consequences
+
+- A complete specification claim now depends on a reproducible denominator rather than confidence or document
+  volume; an unmapped source candidate or undeclared state family is a hard NO-GO.
+- Operator utilities remain low-interaction without allowing page content, remote clients, terminal escape
+  sequences, stale lifecycle evidence or settings search to acquire authority.
+- Data-loss and privacy-negative behaviors are dispositions with executable oracles, not undocumented absence.
+- **Downside:** document decoding/printing, Browser automation, bulk/Eco lifecycle and corrupt-store recovery
+  add platform-specific failure and resource-pressure matrices.
+- **Downside:** any source refresh requires semantic remapping and independent audit; line-count parity or a
+  generic capability fallback is intentionally unable to satisfy the gate.

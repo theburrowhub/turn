@@ -10,7 +10,8 @@
 #   * `--all-targets` on lint. Without it, clippy never looks at test code, and
 #     the snapshot tests stop compiling without anyone noticing.
 #
-# `make verify` is what CI runs. If it passes here it passes there.
+# `make verify` is the local umbrella. CI runs the same gates with platform-specific
+# test selection for macOS GPU snapshots and Linux headless coverage.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -27,6 +28,7 @@ TURN_SOCKET ?= /tmp/turn.sock
 TURN_DATA_DIR ?= $(HOME)/.local/share/turn-dev
 LINUX_IMAGE ?= rust:1-bookworm
 LINUX_TARGET_DIR ?= /tmp/turn-linux-target
+CAPABILITY_SOURCE_REPOSITORY ?=
 
 .PHONY: help
 help: ## Show this help
@@ -41,8 +43,41 @@ help: ## Show this help
 # --- the loop you actually run -----------------------------------------------
 
 .PHONY: verify
-verify: fmt-check lint test ## Everything CI checks, in CI's order
+verify: product-spec-acceptance fmt-check lint test ## Everything CI checks, in CI's order
 	@echo "verify: ok"
+
+.PHONY: semantic-recovery-acceptance
+semantic-recovery-acceptance: ## Verify the closed semantic recovery registry and its mutation resistance
+	bash -n scripts/verify-semantic-recovery-registry.sh scripts/test-semantic-recovery-registry-gate.sh
+	bash scripts/verify-semantic-recovery-registry.sh
+	bash scripts/test-semantic-recovery-registry-gate.sh
+
+.PHONY: product-spec-acceptance
+product-spec-acceptance: semantic-recovery-acceptance ## Verify the frozen semantic inventory, proof mapping and mutation resistance
+	bash -n scripts/verify-product-capability-source.sh
+	bash -n scripts/verify-operation-registry.sh scripts/test-operation-registry-gate.sh
+	bash scripts/verify-operation-registry.sh
+	bash scripts/test-operation-registry-gate.sh
+	bash -n scripts/verify-state-family-manifest.sh scripts/test-state-family-manifest-gate.sh
+	bash scripts/verify-state-family-manifest.sh
+	bash scripts/test-state-family-manifest-gate.sh
+	@if [ -n "$${TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256:-}" ] || [ "$${CI:-}" = true ]; then \
+	  ./scripts/verify-product-spec.sh verify; \
+	else \
+	  ./scripts/verify-product-spec.sh --verify-local; \
+	fi
+	./scripts/test-product-spec-gate.sh
+
+.PHONY: product-capability-source-acceptance
+product-capability-source-acceptance: ## Verify every frozen capability locator/hash against an audited source clone
+	@test -n "$(CAPABILITY_SOURCE_REPOSITORY)" || { \
+		echo "set CAPABILITY_SOURCE_REPOSITORY=/path/to/audited-source-repository" >&2; exit 2; \
+	}
+	./scripts/verify-product-capability-source.sh "$(CAPABILITY_SOURCE_REPOSITORY)"
+
+.PHONY: product-completion-acceptance
+product-completion-acceptance: verify ## Require every product requirement to be implemented with evidence
+	./scripts/verify-product-completion.sh
 
 .PHONY: test
 test: ## Run the whole test suite

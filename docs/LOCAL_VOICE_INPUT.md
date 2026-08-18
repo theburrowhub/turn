@@ -37,6 +37,13 @@ is off by default, downloads nothing until the operator explicitly installs a mo
 permission only on the first capture attempt. Hold-to-talk is the default; an accessible toggle mode exposes
 the same start/stop/cancel states without requiring a held key.
 
+Foreground Session selection may independently auto-attach/start its safe current/default Shell under
+`ACP-LIF-009`, but dictation never invokes or authorises that operation. Until activation has produced one
+current input-ready attempt, the microphone control is disabled with the exact preflight/starting reason and
+the shortcut opens no microphone. A shortcut pressed during activation is not queued or replayed. Browser,
+WebPreview, NativeJob, ConversationInventory, WorkItem and Activity Inbox views have no dictation target merely
+because they are selected.
+
 At capture start, Turn freezes a client-local `DictationTarget`: one exact protocol `InputTarget` plus the
 capture generation and draft bound. It contains:
 
@@ -45,6 +52,12 @@ capture generation and draft bound. It contains:
 - current RuntimeAttempt/generation and verified input-owner Node/Pane or structured composer;
 - exact pending-interaction id/revision when the input belongs to a question;
 - expected input revision and the 32 KiB UTF-8 draft bound.
+
+The frozen target belongs only to capture/commit validation. A completed draft instead has stable
+`VoiceDraftOwner=(LocalClientInstanceId,SurfaceId,VoiceDraftId)` and stores the prior target as stale-or-current
+review metadata, not as its owner. Thus daemon/connection loss can preserve the one visible editable draft in
+that still-open client window; reconnect obtains a new InputTarget and explicit retarget/reinsert review. It
+never silently rekeys to current selection.
 
 No eligible target means no microphone open. A pending permission has no editable voice target. Selection,
 manual navigation, window blur, device loss, Escape or closing the surface stops capture immediately and
@@ -80,6 +93,8 @@ Voice is an input method, not an attention authority:
 - it may populate a verified question composer, but that question remains pending until the operator submits
   and adapter evidence confirms the exact interaction ended;
 - it cannot target a permission control, synthesize allow/deny or interpret words such as “yes” as a decision;
+- an explicitly granted remote/Companion typed permission response does not add a microphone, audio or
+  free-text answer path; dictation remains physical-foreground-client only;
 - transcription errors use operational status and do not masquerade as Agent failures or Attention demands.
 
 Capture, transcription and a visible voice draft set `UserContext.sensitive_operation` on that exact surface.
@@ -101,16 +116,33 @@ foreground surface ── mic PCM in memory ──► sandboxed SpeechWorker
 inline review ── explicit Insert/Send ──► daemon validates target ──► one safe text commit
 ```
 
+PCM is closed to mono signed 16-bit little-endian 16-kHz samples. One 300-second maximum capture is exactly
+≤9,600,000 bytes and reserves a 10-MiB buffer. The installation admits one SpeechWorker≤512 MiB, one active
+microphone capture plus one pending inference buffer (two buffers/20 MiB total), one≤32-KiB hypothesis and
+one≤32-KiB completed LocalInputDraft per Surface/eight per LocalClientInstanceId/64 drafts/2 MiB installation-
+wide. VoiceTranscriptDraft adds only≤4-KiB provenance/review metadata per body,≤64/256 KiB global, rather than
+copying the text. Worker+PCM+hypothesis bytes charge
+their family caps and `runtime.turn_variable_rss_mib` before microphone open/spawn. A Surface with an existing
+nonempty draft cannot start another capture until Send/Insert/Copy+Discard/Discard resolves it; no result
+silently replaces text. Inference has a 300-second post-capture wall deadline; shutdown requests stop, waits at
+most two seconds, then kills the worker.
+
 The client gives the worker only a read-only verified model descriptor and one bounded audio buffer through
 an inherited descriptor/shared-memory handle. The worker has no network, daemon socket, repository,
 credential, clipboard, accessibility or arbitrary filesystem access. CPU/GPU/RAM and wall-clock limits keep
-transcription below terminal/UI responsiveness; only one inference job runs per worker and queued work is
-bounded to one pending capture per surface. One device-scoped microphone lease prevents two Turn windows
-from recording concurrently without an explicit handoff.
+transcription below terminal/UI responsiveness; only one inference job runs and the entire installation has
+at most one pending capture, one frozen DictationTarget and one physical-device MicrophoneLease. The lease is
+owned by the device and names the exact LocalClientInstanceId+Surface+capture generation holder; another Turn
+window records only after an explicit atomic handoff. Lease/target/buffer/worker capacity reserves before OS
+microphone open, and owner/window/process loss releases the lease after capture stop without redirecting audio.
 
-A hang, native abort, segmentation fault, corrupt model or OOM kills/restarts only the worker. Sessions,
+A hang, native abort, segmentation fault, corrupt model or OOM kills/restarts only the worker. Logical cancel,
+Surface/window loss or shutdown fences its generation; worker/PCM/shared charges release only after descriptor/
+process/thread/shared-memory quiescence or OS-reclamation proof. If the worker ignores termination, the
+pre-reserved ProcessCleanupCharge inherits its exact family/shared reservations while the Surface/window closes
+normally; a new worker cannot exceed the one-worker cap. Sessions,
 Attention and terminal processes remain live. The job becomes a recoverable local status; it is not replayed
-and does not insert partial text. Shutdown cancels work and then terminates the worker within a fixed budget;
+and does not insert partial text. Shutdown cancels work and then enforces the two-second termination budget;
 Turn never waits indefinitely for a native inference library.
 
 The sandbox and separate process reduce consequences of a malicious/corrupt model but do not make model
@@ -133,7 +165,10 @@ manifest allowlists each engine/model artifact with stable id, engine compatibil
 byte size, cryptographic digest, display size, language capability, provenance and licence/notice. The
 installer:
 
-- validates the manifest through the normal signed-update trust root or an equivalently pinned signature;
+- validates an exact `SignedEnvelopeV1(domain=voice_model_manifest)` only through the independent
+  installation-owned `SigningTrustStore(voice_model_manifest)` at its expected revision; update,
+  command-extension and announcement roots are never consulted, and rotation/revocation/high-water follows
+  the canonical signed-artifact contract;
 - checks declared size and free space before download, enforces a hard streaming byte cap and verifies the
   digest before any native parser sees the artifact;
 - permits no redirect outside the exact manifest origin and uses a direct connection whose complete A/AAAA
@@ -184,10 +219,10 @@ management plus one generic reviewed-text commit that typed/pasted input may als
 | Operation | Required request | Result |
 | --- | --- | --- |
 | `list_local_speech_models` | none | `local_speech_models` |
-| `install_local_speech_model` | foreground surface, `operation_id`, closed `model_id` | `local_speech_model_state` |
+| `install_local_speech_model` | foreground surface, `operation_id`, closed `model_id`, exact accepted `SignedEnvelopeV1(voice_model_manifest)` identity, expected voice-model SigningTrustStore+catalogue revisions and declared artifact size/hash/origin; the caller cannot select key/root | `local_speech_model_state` |
 | `cancel_local_speech_model_install` | foreground surface, `operation_id`, `model_id`, expected generation | `local_speech_model_state` |
 | `remove_local_speech_model` | foreground surface, `operation_id`, `model_id`, expected generation | `local_speech_model_state` |
-| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, `insert|submit`, bounded UTF-8 text | `operator_text_delivery` |
+| `commit_operator_text` | foreground surface/connection/daemon generation, `operation_id`, exact `InputTarget`, expected input revision, either `insert` or `submit`, bounded UTF-8 text | `operator_text_delivery` |
 
 Model state/progress may be pushed, but carries no audio. `InputTarget` repeats the semantic subject, verified
 input owner, attempt/prompt generations and bound. `commit_operator_text` revalidates every identity,
@@ -218,6 +253,10 @@ PCM lives only in bounded client/worker memory, is zeroed/released on stop, canc
 and never enters SQLite, files, event payloads, logs, terminal journals, analytics, diagnostics or Turn crash
 reports. This is an application guarantee, not a claim that a general-purpose OS can prevent swap, physical
 memory inspection or a privileged debugger.
+
+“Released” above means after descriptor/process/thread/shared-memory quiescence or OS-reclamation proof; until
+then the original worker/PCM slot and bytes remain charged through ProcessCleanupCharge. Zeroing is attempted
+before release when the process is cooperative and is never claimed as proof against an unkillable process.
 
 Before insertion, transcript text exists only in the foreground client's memory. Cancel/discard/window close
 removes it. Once inserted, it becomes ordinary target input and may remain in the Agent/provider transcript,
@@ -263,11 +302,18 @@ M15 is not complete until native, daemon and adversarial tests prove:
 - zero target bytes before explicit **Insert**/**Send**; afterward only the verified editable owner receives
   one bounded fenced operation, with CR/LF/control/invisible input unable to escape bracketed paste or answer
   a permission;
+- Session autoactivation, Browser/WebPreview selection, native-job controls, conversation adoption/resume and remote
+  permission response cannot be triggered by the dictate shortcut; capture attempted before input readiness
+  opens no device and is never queued/replayed;
 - attempt/prompt/surface/daemon generation changes fail closed, and an uncertain insertion is never replayed;
 - queue order, badge, unread and resolution state remain byte-for-byte equivalent apart from the operator's
   later explicit send; automatic Focus defers only on the exact sensitive surface and retains its route;
 - corrupt/truncated/oversized/wrong-digest models, full disk, symlink races, concurrent install/delete,
   worker SIGABRT/SIGSEGV/OOM/hang and shutdown during inference leave Sessions and Attention healthy;
+- exact one-worker/512-MiB, two-PCM-buffer/10-MiB-item/20-MiB aggregate, one 32-KiB hypothesis, one draft/
+  Surface/64 drafts/2-MiB aggregate and 300-second inference limits plus every N+1 reserve before mic/spawn;
+  a worker that ignores the two-second shutdown remains ProcessCleanupCharge-owned and charged until OS proof,
+  so close/reopen cannot admit a second worker;
 - worker sandbox denies network, daemon socket, repository, credentials and arbitrary filesystem access;
 - requested/installed/effective model and placement are honest, and no cloud/Session-host fallback exists;
 - privacy inventory/export/delete handles models/partials/settings, while fixture markers in PCM/transcript

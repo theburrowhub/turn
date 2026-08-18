@@ -45,6 +45,61 @@ by `mvp-acceptance` because `make verify` already runs their test binaries; the 
 gate adds only the specialised performance, privacy and package-level proofs that the
 ordinary workspace suite does not fully reproduce.
 
+## Successor product-spec gate is separate
+
+Passing this historical v0.1.0 gate is not completion evidence for ADR-059–ADR-066 or the operator
+control-plane goal. The successor completion gate must additionally dispatch independent production-path
+oracles for all of these later obligations:
+
+- one safe foreground Session selection performs at most one idempotent preflighted activation without a
+  second start action, while every stale/unsafe case and every child/resource/history selection launches
+  nothing;
+- external WorkItemSource identity, mapping, bounded pagination/cache coverage, compare-and-swap writes,
+  conflict/reconciliation, close/reopen, assignee/rate/credential isolation and source receipts;
+- provider-native scheduled/background Job identity, private-definition observation, independent schedule/
+  iteration/presence/projection/reconciliation axes, ordered iteration history and survival evidence; all nine
+  adapter operations, correlated create/run-now, prepared-create cancel and local hide-activity/forget/restore
+  are distinct from Flow recurrence and provider deletion;
+- private bounded ConversationInventory search/history with installation-wide exact ownership, advisory
+  matching, stopped adoption and separately preflighted resume;
+- inert WebPreview versus an isolated interactive Browser with reviewed local HTML/localhost, typed
+  navigation/history/popup/download/storage operations and no automatic restore load;
+- independent provider `title_read` and `conversation_rename` capability/receipt/degradation paths;
+- an exact single-use foreground-desktop-issued encrypted remote permission-response grant, provider-evidence
+  closure and server-side blocking of raw remote PTY input during that known sensitive interaction, without
+  extending the claim to an unclassifiable generic TUI; and
+- per-provider/AccountProfile/ExecutionTarget context, quota and bounded activity inbox projections whose
+  independent source, coverage and freshness prevent false zero or cross-profile leakage.
+- recursive same-Session Groups and separately owned CheckoutScopes, including cycle-safe atomic subtree
+  mutation, complete worktree lifecycle and a primary `main` checkout that remains free;
+- automatic compact non-overlapping hierarchy projection in stable logical/accessibility order, requiring no
+  cleanup action and producing no domain revision;
+- resumable new/open/clone/SSH Workspace onboarding with exact partial-effect reconciliation and publication
+  kept as a separate reviewed foreground operation;
+- all six dedicated adapters under one complete capability/evidence matrix, with Kimi/MiniMax confined to
+  quota/activity connectors and no inherited launch or control authority;
+- target-bound ModelEndpointProfiles with bounded untrusted discovery, secret references, network trust,
+  launch/switch receipts and no silent endpoint/model/account/target fallback;
+- host memory/swap/pressure and reuse-safe process-tree attribution over the existing RuntimeInventory,
+  preserving complete-empty, partial, failed, stale and measured-zero distinctions;
+- revisioned generated local display names whose manual pinning and redaction rules cannot rename a provider,
+  change identity or send terminal input;
+- background/headless Attention delivery through revocable grants, a minimal encrypted outbox, exact
+  collapse/retry/live-status semantics and a notification-only host with zero public listener; and
+- the frozen 112-capability disposition/evidence ledger, selector-v1 source census and their one-to-one trace to the complete PRD/ACP/ADR
+  inventory, including adversarial deletion, weakening and coordinated-rewrite rejection;
+- bounded Directory/DAG/TextSearch, inert Media import/playback, repository-host grants, sandboxed commit
+  proposals, cross-target TransferTickets and inert content projection with exact recovery and performance;
+- one typed CommandCatalogue across every action surface, five domain-disjoint canonical signing stores,
+  inert product announcements and separately signed/bound update manifest+package lifecycle; and
+- ordered WorkItem activity plus owner/surface-partitioned presentation-only undo/redo that cannot replay a
+  runtime, provider, repository, input, context, Attention, credential or destructive effect.
+
+Those proofs must use the same canonical tree, one selected WorkSurface and one logical Attention Queue.
+Full remote GUI, headless status and companion clients have distinct authenticated sync/input/action
+contracts and must be exercised independently. A PR may report this document's v0.1 gate green while the
+successor product completion report remains correctly rejected; the two results must never be collapsed.
+
 ## Explicitly outside this functional gate
 
 - Surviving a **daemon** crash with a live PTY. v0.1.0 preserves live processes across
@@ -61,4 +116,6 @@ ordinary workspace suite does not fully reproduce.
 
 Those exclusions match issue #21's scope clarification. They remain visible work, but
 none is silently promoted into the functional MVP or used to weaken its completed
-acceptance criteria.
+acceptance criteria. They describe only the frozen v0.1.0 release gate; later accepted control-plane
+requirements for remote ExecutionTargets, full remote GUI and companions supersede the relevant product
+scope without retroactively changing what this historical gate proved.

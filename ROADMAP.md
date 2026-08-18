@@ -46,12 +46,14 @@ restart instead of being attributed or resolved session-wide.
 | M7 — The window | Native Rust on the GPU: one hierarchy, user-chosen panes, inspector, effects | **Done for v0.1.0**; tree management, terminal UX and accessibility contract landed |
 | M8 — First vertical | One Session and background Reviewer, end to end | **Done**; packaged Claude Code 2.1.226 run and UI reconnect passed |
 | M9 — Hardening | Measurement, restore semantics, packaging and release gates | **Functional baseline done**; public distribution and broad platform sign-off continue post-MVP |
-| M10 — Agent Node WorkSurface | Unique selection-driven node views and one-interaction Attention routing | **Accepted, not started**; ADR-059 |
-| M11 — Durable Agent instances | Stable instance/attempt identity, runtime receipts and lifecycle continuity | **Accepted, not started**; ADR-059 |
-| M12 — Context and observability | Context links/packets, lineage, model/account/runtime/context/quota truth | **Accepted, not started**; ADR-059 |
-| M13 — Coordination and durable runtime | Messages, observational dependencies, Teams and PTY/provider-runtime continuity | **Accepted, sequenced after M12; not started**; ADR-059 |
-| M14 — Resource nodes | Session-owned Group, Note, File, Diff and Web views | **Accepted, sequenced after M10–M12; not started**; ADR-059 |
+| M10 — Agent Node WorkSurface | Unique node views, safe one-action Session activation, canonical board/external work-item projections and exact Attention routing | **Accepted, not started**; ADR-059/063/064/065/066 |
+| M11 — Durable instances and provider topology | Stable instance/attempt identity, normalized children/native jobs, six-adapter parity, quota-only connectors, model endpoint routing, private conversation inventory, shared-runtime isolation and receipted title capabilities | **Accepted, not started**; ADR-059/062/063/064/065 |
+| M12 — Context and observability | Context links/packets and Note briefs, lineage, account-profile lifecycle, model/runtime/context/quota/resource/name truth and per-profile companion projections | **Accepted, not started**; ADR-059/063/064/065 |
+| M13 — Flows and delegated control | CommandCatalogue creation filter plus Workspace onboarding, FlowRuns, bounded conductor grants, messages, dependencies, Teams, Resource/progress publishing and worktree-safe fan-out | **Accepted, sequenced after M11–M12; not started**; ADR-061/063/065/066 |
+| M14 — Resource nodes | Recursive Session-owned Group projections, separate CheckoutScopes, Note, File, Diff, inert WebPreview, isolated Browser and Media views | **Accepted, sequenced after M10–M12; not started**; ADR-059/064/065/066 |
 | M15 — Local dictation | On-device speech worker, reviewed exact-target input and trusted model lifecycle | **Accepted, sequenced after M10–M11; not started**; ADR-060 |
+| M16 — Durable and remote runtime | RuntimeBackend, target-wide recovery/resource inventory, revisioned file editing, remote targets, full remote/headless surfaces, background notification delivery, scoped remote permission response and companion projections | **Accepted, not started**; ADR-061/062/063/064/065/066 |
+| M17 — Control-plane closeout | Full-scale, live-provider, recovery, security, accessibility and packaged proof for the frozen requirement and source-capability ledgers | **Accepted, not started**; ADR-061/062/063/064/065/066 |
 
 M6 blocks incompatible M7/M8 UI work. Its exit proof is the reproducible
 `Workspace → main Session+lease → Claude fixture → Reviewer background node → normalised preview → Quick
@@ -448,13 +450,30 @@ A current node-less parent/external or unassigned demand opens its exact provisi
 borrows a Node/input owner. Automatic Focus is bound to one connected surface generation and degrades to
 queue/badge if that surface retires; no route activates a Session runtime.
 
+List, search and board are projections of the same Node ids/routes. Board state, priority, due, tags,
+comments and assignee use closed revision-fenced metadata; moves cannot change Lifecycle/TurnState, satisfy a
+dependency, start work or create a second Attention queue.
+
+The same foreground gesture that selects a Session is its revision-fenced activation intent: it restores the
+Layout and materialises all complete safe saved runtimes, or one policy-resolved default Shell for an empty
+Session, without a second start button. Restore/background/child selection cannot activate. Changed or
+missing worktrees, unresolved commands or profiles, remote/offline targets, unsafe flags and uncertain prior
+effects fail closed before spawn and route their exact remediation through status or Attention.
+
+External WorkItemSources retain stable source/profile/item identity, declarative field mappings and bounded
+paged snapshot/delta sync with opaque cursors, cache limits, trust/freshness and source backoff. Explicit
+writes compare against the observed remote revision; divergence preserves both field values for review.
+Their board/list rows remain projections of canonical Node ids and remote content remains inert.
+
 **Exit proof.** Native snapshots and daemon/GUI integration tests cover two PTY-less children sharing one
 ancestor, exact Layout restoration, cross-Session manual/automatic attention navigation, question-versus-
-approval controls, zero auto-ack, foreground revision-gated unread clearing, pending delivery confirmation
-and accessibility/keyboard parity. Selection launches/resumes nothing, no generic “Start pane” gate exists,
-and the old ADR-048 click-to-zoom path is absent.
+approval controls, zero auto-ack, foreground revision-gated unread clearing, pending delivery confirmation,
+zero-extra-click safe/default-Shell activation and fail-closed activation preflights
+and accessibility/keyboard parity. Node selection launches/resumes nothing, no generic “Start pane” gate exists,
+and the old ADR-048 click-to-zoom path is absent. Work-item fixtures cover full/incremental pagination,
+restart cache expiry, mapping changes, rate-limit recovery, CAS success and preserved conflicts.
 
-## M11 — Durable Agent instances · **Accepted, not started**
+## M11 — Durable instances and provider topology · **Accepted, not started**
 
 **Delivers.** `AgentInstanceId` survives warm view attach; it survives cold resume, runtime restart and model
 switch only with verified continuity of the same provider conversation. `RuntimeAttemptId` is one launch/
@@ -472,13 +491,52 @@ configuration receipt and transfers the binding without claiming another launch.
 nothing; connected auto-start applies only to fully resolved safe runtimes. Remote/offline/missing-worktree
 paths fail closed without local or fresh-conversation substitution.
 
+All dedicated adapters also emit ADR-062's common `AgentTopologyObservation`. Nested children receive their
+own durable semantic identity, attempt/generation and causal spawn/result rather than renderer-local cards.
+Structured and process discoveries reconcile into one graph. Counts declare direct/descendant scope,
+coverage and revision: exact zero needs fresh positive evidence, partial coverage is `N+ observed`, and
+unknown/unsupported/stale never become a number. Provider names do not appear in core/UI behavior branches.
+
+A shared RuntimeEndpoint may host many current bindings, but each fixes endpoint generation, account/host,
+instance, attempt and conversation with unique conversation ownership. Sibling input, transcript cursors,
+context and Attention stay isolated; restart/reconnect and fallback reconcile each binding independently.
+
+Each adapter may expose a private, bounded ConversationInventory for one provider/profile/target. Search is
+paged and cache-expiring, returns only identity/match metadata with provenance, and requires explicit review
+plus an exact fresh identity probe before adopt or resume. Ambiguous, stale or cross-profile matches fail
+closed; raw transcript bodies are not indexed.
+
+Provider-native scheduled, recurring and background jobs have reserved creation and invocation correlation,
+stable job/iteration identity, bounded private definition observation and independent schedule, iteration,
+presence, local-projection and reconciliation axes. The nine exact adapter keys `list|get|create|update|pause|
+resume|run_now|cancel_iteration|delete_job` map one-to-one to fenced wire operations. Create reserves its
+Session/optional-Group Job Node before provider dispatch; create/run-now reconcile only by proved correlation.
+Prepared-create cancel and local activity-hide/forget/restore emit zero provider request. Dismissing an
+Attention/unread item never cancels or deletes the underlying job. Provider title
+read and provider conversation rename are likewise separate capabilities: rename needs a current-revision
+acknowledgement receipt, and degradation creates only a labelled local alias.
+
+The dedicated roster is exactly Claude Code, Codex, Gemini, OpenCode, GitHub Copilot and Grok; all six run
+the same 23-cell capability/evidence matrix. Kimi and MiniMax use quota/activity connectors scoped by exact
+AccountProfile/target and expose no launch or control methods. `ModelEndpointProfile` is separate from account
+and RuntimeEndpoint identity: it validates a target-bound HTTPS route, resolves only a secret reference,
+bounds model discovery and freezes effective route/model/credential generations into launch/switch receipts
+without fallback.
+
 **Exit proof.** Append-only migrations, protocol catalogue tests and restart/restore adversarial tests prove
 stable identity, one-current-attempt fencing, attempt-scoped capability cleanup, exact Attention retention,
 no silent downgrade, no resurrection after an authoritative delete and multi-surface attachment. UI close/
 reopen, daemon restart and machine restart cover live attach, honest loss and explicit auto-start/resume;
 recovered scrollback never claims liveness and a failed resume never becomes a fresh conversation. A shared
 provider runtime with isolated per-node conversations and a dedicated-process adapter both pass the same
-instance contract.
+instance contract. Shared fixtures plus authenticated versioned Claude Code, Codex, Gemini, OpenCode, GitHub
+Copilot and Grok
+evidence cover every advertised topology/lifecycle capability, including exact child counts and degradation.
+Inventory fixtures prove paging/cache bounds, stale and ambiguous match refusal and exact adopt/resume;
+native-job fixtures prove all independent axes, exact correlation/reconcile, Node reservation, stable
+iteration identity, projection fences and dismiss-not-delete; title fixtures prove
+independent read/rename capability negotiation, receipts and local-alias fallback. Quota-only and model-route
+fixtures prove cross-profile/target isolation, secret absence, bounded discovery and failed-switch continuity.
 
 ## M12 — Context and observability · **Accepted, not started**
 
@@ -491,13 +549,33 @@ states. New-target delivery is an idempotent provisioning/launch/grant-install/d
 is only probed/adopted, uncertain bearer installation is revoked and uncertain context writes are never
 retried. Branching uses native provider identity only when verifiable and otherwise reports a normal handoff.
 
+ContextLink sources include an AgentInstance or exact Note. Note links are pinned by default; an explicitly
+reviewed live policy fixes authors, schema, revision/byte/token budgets and expiry and audits each revision
+disclosed without resetting authority on edit.
+
 The Node View header shows requested/effective/current model and runtime settings, account/host/worktree,
 conversation context consumption and separately scoped provider quota windows. Every value includes source,
 observation time and freshness; unavailable is not zero, and shared quota is not attributed to a node.
+AccountProfile create/adopt/external-auth/validate/default/retire/delete keeps provider+target config/auth
+roots isolated. Launch preflight resolves fixed precedence and the receipt freezes the effective profile;
+default changes affect only later launches and never fall back across accounts.
+
+Companion projections expose bounded usage, context and activity-inbox facts per AccountProfile. Each fact
+keeps source, scope, coverage and freshness, and unknown/partial/stale/unavailable/unsupported never become a
+zero. The inbox is a view of the canonical Attention Queue and unread revisions, not a second activity or
+resolution authority.
+
+The same target RuntimeInventory supplies host RAM/swap/pressure plus reuse-safe process trees and attributes
+own/descendant RSS to current or closed Session owners and unmatched survivors with explicit coverage.
+Measured empty, unmeasured, partial/gapped, unavailable, stale and true numeric zero remain distinct. Local
+DisplayNameFacts and bounded generated proposals preserve source/confidence/revision and operator pinning;
+they never alter identity, invoke provider rename or type into a terminal.
 
 **Exit proof.** Foreground-operator supported-flow authority plus the explicit unsandboxed same-uid
 impersonation limit, destination/attempt binding, capability rotation, revocation/delete/archive races,
-lost-response idempotency and active-link bounds, cross-Workspace refusal, local/remote path jail, offline
+lost-response idempotency and active-link bounds, direct/live-Link cross-Workspace refusal plus successful
+portable ContextPacket export/import only with reminted ids, stripped authority and fresh destination review,
+local/remote path jail, offline
 `remote_residual`/authenticated purge behavior,
 sanitisation/best-effort-redaction and budget bounds, canonical-body/encoder hash identity with honest PTY
 submission-only semantics, pending-prompt refusal, uncertain-write fencing,
@@ -508,45 +586,74 @@ necessarily the same provider); negative fixtures prove honest unsupported state
 cannot focus or reorder Attention without a typed event. ADR-057 privacy report/export/delete/compact tests
 cover every new table and filesystem category.
 
-## M13 — Coordination and durable runtime · **Accepted, sequenced after M12; not started**
+## M13 — Flows and delegated control · **Accepted, sequenced after M11–M12; not started**
 
-**Delivers.** Bounded direct Agent messages, durable closed-schema dependency results and user-authorised Teams reuse the
-stable identities, context capabilities and single Attention authority from M10–M12. Dependencies are an
-observational cycle-free graph satisfied by typed results, not process idleness; they may mark work ready or
-blocked but never start, advance, interrupt or retry it. Member agents retain independent tree positions and
-prompts. Final synthesis/reconciliation is an operator-visible result with repository evidence.
+**Delivers.** The creation filter of one declarative CommandCatalogue drives Workspace `+`, toolbar, palette and context actions.
+Its resumable WorkspaceOnboarding operation provides new/open/clone/SSH adoption with preassigned identity,
+closed phases, cancellation and exact reconciliation; repository publication remains a separate reviewed
+foreground operation and no path occupies primary `main`.
+Versioned `FlowDefinition`s create immutable `FlowRun`s containing mixed Agent/Tool nodes, roles,
+prompts/commands, typed dependencies/start policies, context, execution/worktree strategy, Attention and
+resource bounds. Foreground-manual and bounded-recurrence FlowRun triggers stay distinct from manual,
+with-run and typed-result-gated StepStartPolicies; each consumes only its exact current receipt/evidence under
+the immutable policy reviewed up front.
 
-External multiplexing or provider-runtime services then close the daemon-death gap with explicit warm
-attach versus cold resume semantics. A missing remote host, account or conversation never becomes a local
-fresh launch. M13 covers reconnect to an already configured provider-runtime/multiplexer endpoint; general
-Remote/SSH Session creation remains later scope. Update compatibility continues to preserve live runtimes
-under ADR-056.
+FlowRun ships with the closed preflight/provision/run/pause/cancel/reconcile/terminal state machine and
+versioned wire operations before any scheduler is enabled. Pause, resume, cancel, abort and bounded retry
+preserve receipts and apply declared runtime dispositions. Recurrence fixes IANA timezone, DST fold/gap,
+clock rollback, sleep/reboot catch-up, overlap and finite occurrence/backlog limits.
 
-**Exit proof.** FIFO/idempotent message delivery, expiry and uncertain receipt; dependency cycle/failure/
-cancel projections with zero automatic execution/retry and rejection of raw output/transcript/diff/file/
-environment/provider payloads; Team checkout/context/approval boundaries; daemon
-crash with live PTY; and controlled provider-runtime reconnect all pass adversarial integration tests.
-Agents cannot grant context, approve, take write authority or invoke focus directly; they emit typed
-evidence and only AttentionManager/governor may focus under operator policy.
+A current `DelegationGrant` lets an exact conductor create declared children, organise Teams, open declared
+context, send bounded messages, create/update typed Resource Nodes, publish ProgressUpdates and fan
+reviewers/synthesis out without repeated confirmation. Resource/progress operations are compare-and-swap and
+provenance-bound with kind/owner/schema/author/byte/revision/rate/expiry limits. The grant cannot self-expand,
+approve permissions, use the primary checkout, delete/reparent resources or user data, mutate a referenced
+file, merge/publish, invoke focus or turn output/content into control. Outside the grant, an agent can only
+propose an operation through Attention.
+
+Turn-managed fan-out and dependency calls return after durable receipts and inject no synchronous join;
+terminal input, daemon/GUI, navigation and later control stay responsive. Provider-internal waits are shown
+truthfully. Every writer receives a dedicated worktree. Messages retain
+FIFO/TTL/capacity/input gates and independent receipts; a dependency is satisfied only by a closed-schema
+result, never process idleness; every member keeps its own tree identity and Attention subject.
+
+**Exit proof.** Idempotent preflight/provision/partial-failure recovery; every FlowRun trigger and StepStartPolicy; grant expiry,
+budget, wrong-attempt and escalation cases; typed-control output fuzzing; mixed-provider Team and independent
+review/synthesiser live runs; universal primary-`main` checkout availability across every creation/lifecycle
+path; message uncertain delivery and dependency
+cycle/result tests all pass. A large fan-out leaves the parent and Turn responsive, and only
+AttentionManager/governor can move focus.
 
 ## M14 — Resource nodes · **Accepted, sequenced after M10–M12; not started**
 
-**Delivers.** Session-owned Group, Note, File, Diff and Web nodes use the same hierarchy and one WorkSurface.
-A Group is presentation only. A Note stores private Turn-owned text. File and Diff store canonical,
-checkout-confined references rather than owning user data. Web stores a validated URL and performs no load
-on restore or background selection. Removing a resource forgets Turn's record and never deletes the file,
-branch or site it references.
+**Delivers.** Session-owned Group, Note, File, Diff, WebPreview, Browser and Media nodes use the same
+hierarchy and one WorkSurface. The visible hierarchy continuously compacts into non-overlapping rows in
+stable logical/accessibility order without a Tidy action, stored coordinates or domain mutation.
+A Group is presentation only but may recursively contain Groups/nodes inside one bounded acyclic forest.
+Atomic subtree operations and non-cascading removal preserve runtimes/Attention. An optional Group row may
+project a separately identified Session-owned CheckoutScope with complete create/adopt/missing/reconcile/
+unbind/remove lifecycle; presentation move alone changes no cwd and adopted worktrees are never deleted by
+default. A Note stores private Turn-owned text. File and Diff store canonical,
+checkout-confined references rather than owning user data. WebPreview is inert: no scripts, cookies, ambient
+credentials, interactive navigation or restore/background load. Browser is a separately created,
+process-isolated Node with an isolated storage partition, bounded per-node history and revision-fenced
+navigation. Popups are blocked unless reviewed into a separate Browser child. Exact localhost origins and
+descriptor-fenced local HTML require explicit reviewed capabilities that do not widen across redirects,
+subresources or navigation. Removing a resource forgets Turn's record and never deletes the file, branch or
+site it references.
 
 **Exit proof.** The incompatible vNext `HierarchyKey.node` migration covers every resource kind. Creation,
-restore, selection, one-level Group membership/safe child reparent, reorder, archive/delete, late-response
+restore, selection, 128-level Group membership/safe subtree reparent, concurrent-cycle refusal, promote/
+reorder/archive/delete, CheckoutScope inventory/lifecycle, late-response
 and subscription tests preserve runtime parentage, Session ownership and Layout. Descriptor-root/TOCTOU/
-symlink/hardlink/mount checks, inert File/Diff/Note rendering, query/userinfo/fragment refusal, all-answer DNS
-validation and approved-IP pinning per HTTPS connection/redirect, private URL/origin/credential isolation,
-no-load-on-restore, bounded Note storage and ADR-057 inventory/export/delete/retention tests pass before any
-resource kind is advertised.
+symlink/hardlink/mount checks, inert File/Diff/Note/WebPreview rendering, query/userinfo/fragment refusal,
+all-answer DNS validation and approved-IP pinning per HTTPS connection/redirect, Browser process/storage
+isolation, history bounds, popup refusal/promotion, exact reviewed localhost/local-HTML grants, private URL/
+origin/credential isolation, no-load-on-restore, bounded Note storage and ADR-057 inventory/export/delete/
+retention tests pass before any resource kind is advertised.
 
-The normative requirements and complete acceptance matrix for M10–M14 are in
-`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`.
+The detailed Agent/resource/context requirements for M10–M14 are in
+`docs/AGENT_NODE_VIEWS_AND_CONTEXT.md`; the cross-milestone inventory and proof matrix remain authoritative.
 
 ## M15 — Local dictation · **Accepted, sequenced after M10–M11; not started**
 
@@ -571,6 +678,80 @@ zero cloud fallback and absence of PCM/drafts from protocol, database, files, lo
 diagnostics and crash artifacts. ADR-057 inventory/export/delete covers model files, receipts, partials and
 settings. The normative contract is `docs/LOCAL_VOICE_INPUT.md`.
 
+## M16 — Durable and remote runtime · **Accepted, not started**
+
+**Delivers.** One `RuntimeBackend` contract covers local, durable and remote `ExecutionTarget`s with typed
+create/attach/resize/input/signal/observe/close. Warm reattach preserves the same process; cold
+reconstruction/provider resume states its weaker guarantee. Host identity, generation, namespace and
+capabilities are pinned and remote outage never falls back to a local process or same-named path.
+
+Each backend also exposes bounded complete/partial/gapped target-wide inventory. Known attempts reconcile;
+unmatched live handles stay in a Recovery View without invented Nodes and adopt/ignore/terminate revalidates
+one exact target+handle+generation before any effect. ResourceInventory extends that same snapshot with host
+capacity/pressure and deduplicated reuse-safe process attribution; failed/partial remote collection never
+becomes local data or zero, and exact termination re-probes the handle/process-start identity.
+
+Separate `FileBackend` and `RepositoryBackend` contracts cover confined exploration and full status/diff/
+stage/unstage/commit/history/fetch/pull/push/branch/conflict/worktree operations. Remote channels provide
+pinned/mutual authentication, confidentiality, integrity, replay rejection, explicit key rotation/revocation
+and OS-keystore credential references.
+
+FileBackend open returns a bounded content/hash/revision snapshot; save is atomic compare-and-swap with a
+three-way conflict and zero overwrite on external change. Root/descriptor/symlink/hardlink/mount/TOCTOU and
+remote host/generation checks apply equally to editing, which never falls back to terminal input.
+
+Authoritative generation/revision/watermark/ack snapshot+journal recovery and object-specific conflict rules
+support several desktop/companion clients. A runtime has one 15-second generation-fenced visible input/
+resize writer lease, bounded catch-up and permanent deletion fences. Optional operator sharing
+uses a separate short-lived end-to-end encrypted, Workspace/Session-scoped capability; presence grants
+nothing. Local/remote explorer, source control and worktree views operate through the selected target.
+
+A full authenticated remote GUI and a read-only headless operator surface consume their authorised portions
+of the same hierarchy, WorkSurface, snapshot/journal, terminal subscription and Attention routes as desktop.
+They are distinct from the reduced companion API. A foreground local operator may issue one short-lived
+response grant only to a full-GUI remote or Companion client, bound to client/surface generation,
+Workspace/Session, permission request class and expiry. Only that granted full-GUI/Companion surface may send
+an end-to-end encrypted typed response bound to grant, pending-request revision, nonce and operation id;
+headless status can never receive or submit such a grant. The
+daemon CAS produces one terminal receipt and refuses stale, replayed or widened responses. Credential entry,
+AccountProfile/auth mutation, grant administration, host trust, destructive control, repository push/pull/
+commit-and-push/merge/conflict-resolution/discard/cleanup and publish remain local and fail at the daemon;
+registry-allowed scoped stage/unstage/commit/fetch/branch operations remain available to full GUI. Companion usage, context and activity-inbox projections are
+bounded per profile, carry source/coverage/freshness and preserve unknown/partial/stale/unavailable rather
+than displaying false zero; the inbox remains a projection of canonical Attention/unread state.
+
+Revocable NotificationEndpoints and DeliveryGrants project canonical Attention while GUI/companion is
+backgrounded or absent. The encrypted minimal outbox uses subject/revision collapse, bounded retry and
+monotonic live end fences; gateway acceptance/failure never reads, acknowledges or resolves work. Deep links
+resnapshot before routing. NotificationHostMode receives authenticated owner-local/loopback observations,
+makes outbound HTTPS requests only and binds no public listener.
+
+**Exit proof.** Local and remote runtime/file/repository backends pass their separate contracts. UI/daemon/
+shell restart, host reboot, reconnect, two writers, stale/compacted clients, delete resurrection, uncertain
+external effects, MITM/replay/key rotation and wrong-host/root/repository cases pass adversarially. Packaged
+remote/headless/companion runs prove their distinct capability sets, server-side separation and zero silent
+local fallback. Response-grant tests cover expiry, wrong client/surface/request/revision, replay, uncertain
+receipt and forbidden credential/admin operations; companion projection tests cover profile isolation,
+freshness expiry, partial coverage and absence of false zero or a second Attention queue.
+
+## M17 — Control-plane closeout · **Accepted, not started**
+
+**Delivers.** The complete accepted target is evaluated as one product rather than a collection of merged
+milestones. The frozen source-capability ledger, requirement inventory and proof matrix cover mixed providers/tools, safe one-action activation,
+external work items, native jobs and conversations, title capabilities, all Node Views including isolated
+Browser, exact Attention, Flows, lifecycle, context, telemetry, resources, voice, granted remote permission
+response, per-profile companion projections, privacy, security, accessibility and recovery.
+
+**Exit proof.** Every row in `docs/PRODUCT_REQUIREMENTS.md` has evidence from its matching
+`docs/CONTROL_PLANE_ACCEPTANCE.md` oracle on the same commit. All named end-to-end journeys pass, including
+the 50-Session/100-live-runtime/1,000-node fixed-profile sustained envelope with p50/p95/p99 measurements.
+Every one of the 112 frozen capability rows retains a valid disposition/evidence/PRD/ACP/ADR trace; an
+independent clone reproduces the opaque snapshot tree plus all evidence-blob hashes, and every deletion,
+unknown, weakening or broken link mutation fails. At least two non-authors perform adversarial
+cross-document and implementation audits with zero unresolved
+P0/P1/P2. CI is green on the exact
+commit merged to `main`. A documentation contract alone cannot close M17.
+
 ---
 
 ## Post-MVP
@@ -578,31 +759,36 @@ settings. The normative contract is `docs/LOCAL_VOICE_INPUT.md`.
 In rough order of how much they are wanted, not of how hard they are. `PRODUCT.md` §6 records why each waits
 and what must not be foreclosed.
 
-1. **M10 Agent Node WorkSurface and attention route.** Unique content per selected child, no Layout
-   mutation, and one interaction from every demand to its safe action.
-2. **M11 durable Agent instances and runtime receipts.** Stable identity across concrete attempts, with
-   requested/effective runtime truth and idempotent branch/handoff provisioning.
-3. **M12 context and observability.** Pull links, ContextPacket v2/lineage, separate context versus shared
-   quota telemetry and honest provider capability gaps.
-4. **Codex `app-server`** (`--listen unix://PATH`, JSON-RPC) — `turn/started`, `turn/completed`,
-   `thread/status/changed`, `ProcessExited`, approval requests and token usage. Richer than hooks, and
-   `EventSource::SideChannel` already accommodates it.
-5. **M13 coordination and durable runtime.** Messages, dependency results and Teams, followed by tmux or
-   another proved runtime substrate so work survives daemon exit.
-6. **M14 resource nodes.** Session-owned Group, Note, File, Diff and Web views with explicit privacy and
-   content-security boundaries.
-7. **M15 local dictation.** Reviewed on-device speech input bound to one exact Agent/runtime input without
+1. **M10 Agent Node WorkSurface and exact Attention route.** Unique content per selected child, safe
+   zero-extra-click Session activation, external work-item projections and one interaction from every demand
+   to its safe action.
+2. **M11 durable instances and provider topology.** Stable identities, truthful nested children/counts,
+   native-job and private-conversation discovery, runtime receipts, six dedicated adapters, quota-only
+   connectors, model endpoint routing and separate title capabilities under common evidence.
+3. **M12 context and observability.** Pull links, budgeted ContextPacket/lineage, launch truth, integration
+   diagnostics, host/process resource accounting, safe local names, separate context/provider-quota telemetry
+   and fresh per-profile companion projections.
+4. **M13 Flows and delegated control.** One creation/onboarding catalog, FlowRuns, conductor grants, messages,
+   dependency advancement, Teams/review synthesis and primary-`main`-safe worktrees.
+5. **M14 resource nodes.** Recursive Groups with separately owned CheckoutScopes, Note, File, Diff, inert
+   WebPreview, isolated Browser and Media views plus
+   target-bound explorer/source control with explicit privacy and content-security boundaries; automatic
+   pure-projection hierarchy arrangement keeps dense work readable without operator cleanup.
+6. **M15 local dictation.** Reviewed on-device speech input bound to one exact Agent/runtime input without
    weakening or becoming another source of Attention.
-8. **Binary output channel** — `OutputEncoding` is already negotiated in the handshake, so a length-prefixed
-   side channel is additive rather than a protocol break.
-9. **Heuristic correction UI** — "this state is wrong". `EventSource::UserCorrection` already exists at
-   `Explicit` confidence, and `Inference` already carries the rule name so the UI can say why it guessed.
-10. **Remote and SSH Sessions.** M11/M12 define the fail-closed identity and context seams first.
-11. **More adapters** — Gemini CLI at better than `Heuristic`, Aider, and whatever ships next.
-12. **Plugin API for third-party adapters** — once `AgentAdapter` has stopped moving.
+7. **M16 durable and remote runtime.** Warm runtime survival, SSH/remote targets, multi-client revisions,
+   input leases, resource inventory, outbound-only background Attention delivery, scoped encrypted companion/
+   operator sharing and explicitly granted permission response.
+8. **M17 control-plane closeout.** Full frozen capability/inventory evidence at scale across live providers, recovery,
+   security, privacy, accessibility and packaged platforms.
+9. **Richer provider side channels** such as Codex `app-server`, integrated only through ADR-062 capability
+   adapters and never as a core/UI special case.
+10. **Binary output channel** — `OutputEncoding` is already negotiated in the handshake, so a length-prefixed
+    side channel is additive rather than a protocol break.
+11. **Heuristic correction UI** — "this state is wrong". `EventSource::UserCorrection` already exists at
+    `Explicit` confidence, and `Inference` carries the rule name so the UI can explain its guess.
+12. **Additional adapters and a plugin API** after the common capability contract is stable.
 13. **Windows support.**
-14. **Session sharing / multi-user** — contradicts the 127.0.0.1-only posture; needs an auth model Turn does
-    not have.
 
 ---
 
@@ -884,9 +1070,12 @@ been decided on.
   failed opening a PTY and another starved a quiet process behind a concurrent output flood, while immediate
   reruns passed. Local `make verify`, macOS CI and Linux CI now all use one test thread; concurrency inside
   each production-shaped test remains intact without introducing unrelated cross-test contention.
-- **Automatic relaunch remains forbidden and is now test-proven.** Restart may offer recovery metadata but
-  never launches by itself; only the explicit `RelaunchNode` request crosses the launch boundary. Keep the
-  daemon restart and protocol conversation regressions because this is a safety invariant, not a UI choice.
+- **Automatic relaunch remains forbidden and is now test-proven for the shipped v0.1 contract.** Restart may
+  offer recovery metadata but never launches by itself; in that historical protocol only explicit
+  `RelaunchNode` crossed the launch boundary. The accepted target additionally permits revision-fenced typed
+  Flow/creation operations and ADR-064 `activate_session`, whose one-interaction plan is bounded, preflighted
+  and foreground-only. Keep the daemon restart and protocol conversation regressions because background
+  metadata restore still has zero launch authority.
 
 ---
 

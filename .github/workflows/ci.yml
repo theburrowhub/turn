@@ -26,6 +26,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Repository-level Actions variable: a PR cannot update it. The specification gate
+  # fails closed when it is absent or differs from the frozen authority root.
+  TURN_EXPECTED_PRODUCT_SPEC_AUTHORITY_SHA256: ${{ vars.PRODUCT_SPEC_V1_AUTHORITY_SHA256 }}
 
 jobs:
   rust:
@@ -52,6 +55,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Product specification contract
+        run: make product-spec-acceptance
 
       - name: Format
         run: cargo fmt --all -- --check
