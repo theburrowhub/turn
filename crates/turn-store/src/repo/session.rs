@@ -505,6 +505,7 @@ mod tests {
                 node_kind: turn_core::model::hierarchy::HierarchyNodeKind::Session,
                 node_id: session.id.to_string(),
                 expanded: true,
+                expansion_set: true,
                 selected: true,
                 manual_order: None,
                 visibility_mode: None,

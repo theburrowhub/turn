@@ -467,6 +467,12 @@ pub struct TreeUiState {
     pub node_kind: HierarchyNodeKind,
     pub node_id: String,
     pub expanded: bool,
+    /// Whether `expanded` records an explicit operator choice.
+    ///
+    /// Rows also exist to carry selection and manual order. Without this marker their
+    /// default `expanded = false` is indistinguishable from a deliberate collapse.
+    #[serde(default)]
+    pub expansion_set: bool,
     pub selected: bool,
     pub manual_order: Option<i32>,
     pub visibility_mode: Option<String>,

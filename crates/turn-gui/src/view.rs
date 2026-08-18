@@ -2213,8 +2213,9 @@ fn workspace_for_key(snapshot: &HierarchySnapshot, key: &HierarchyKey) -> Option
 
 fn row_is_expanded(snapshot: &HierarchySnapshot, state: &ViewState, key: &HierarchyKey) -> bool {
     state.tree_expansion.get(key).copied().unwrap_or_else(|| {
-        snapshot.tree_state.expanded.contains(key)
-            || hierarchy_row_defaults_to_expanded(snapshot, key)
+        !snapshot.tree_state.collapsed.contains(key)
+            && (snapshot.tree_state.expanded.contains(key)
+                || hierarchy_row_defaults_to_expanded(snapshot, key))
     })
 }
 
@@ -12378,6 +12379,22 @@ mod tests {
             [child_id, root_id],
             "attention, not discovery order, decides what the operator sees first"
         );
+    }
+
+    #[test]
+    fn a_persisted_collapse_wins_over_expansion_defaults_and_stale_expanded_state() {
+        let (mut snapshot, root_id, _, _) = hierarchy_fixture();
+        let key = HierarchyKey::process(root_id);
+        snapshot.tree_state.expanded.push(key.clone());
+        snapshot.tree_state.collapsed.push(key.clone());
+        let mut state = ViewState::default();
+
+        assert!(!row_is_expanded(&snapshot, &state, &key));
+
+        // The local value is the optimistic response to the operator's newest click;
+        // it remains authoritative until the daemon returns the replacement state.
+        state.tree_expansion.insert(key.clone(), true);
+        assert!(row_is_expanded(&snapshot, &state, &key));
     }
 
     #[test]
