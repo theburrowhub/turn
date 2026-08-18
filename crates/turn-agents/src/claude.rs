@@ -30,9 +30,9 @@
 //! it, so Turn adds nothing and says what that costs.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
-    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
@@ -260,20 +260,24 @@ impl ClaudeCodeAdapter {
 /// Turn does not get to be the one that wins. Replacing a user's configuration to
 /// make Turn's own detection work would be Turn deciding something on their behalf,
 /// and losing Turn's hooks while still claiming `Structured` would be worse.
-/// This is deliberately conservative across separate, `=`, repeated, malformed,
-/// inline-JSON and post-`--` occurrences: a false positive only declines Turn's
-/// integration, while a false negative could replace CLI-owned settings.
+/// This is deliberately conservative across separate, `=`, repeated, malformed
+/// and inline-JSON occurrences in the option-bearing prefix. A `--settings` after
+/// the first exact `--` is prompt text and must never disable integration or be
+/// reinterpreted as a control.
 fn user_supplied_settings(args: &[String]) -> bool {
-    args.iter()
+    control_arguments(args)
+        .iter()
         .any(|arg| arg == "--settings" || arg.starts_with("--settings="))
 }
 
 fn claude_permission_modes(args: &[String]) -> Vec<Option<&str>> {
-    args.iter()
+    let controls = control_arguments(args);
+    controls
+        .iter()
         .enumerate()
         .filter_map(|(index, arg)| {
             if arg == "--permission-mode" {
-                Some(args.get(index + 1).map(String::as_str))
+                Some(controls.get(index + 1).map(String::as_str))
             } else {
                 arg.strip_prefix("--permission-mode=").map(Some)
             }
@@ -282,7 +286,8 @@ fn claude_permission_modes(args: &[String]) -> Vec<Option<&str>> {
 }
 
 fn claude_skips_permissions(args: &[String]) -> bool {
-    args.iter()
+    control_arguments(args)
+        .iter()
         .any(|arg| arg == "--dangerously-skip-permissions")
 }
 
@@ -330,14 +335,17 @@ fn resolve_claude_profile(
                     detail: "the explicit --permission-mode argument".to_string(),
                 });
             }
-            let mut resolved = args.to_vec();
             let effective_flag = if skip_flag {
                 "--dangerously-skip-permissions"
             } else if bypass_mode {
                 "--permission-mode"
             } else {
-                resolved.push("--dangerously-skip-permissions".to_string());
                 "--dangerously-skip-permissions"
+            };
+            let resolved = if skip_flag || bypass_mode {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, ["--dangerously-skip-permissions".to_string()])
             };
             Ok(ResolvedLaunchProfile::autonomous(
                 "claude-code",
@@ -475,14 +483,17 @@ impl AgentAdapter for ClaudeCodeAdapter {
         }
         write_private(&settings_path, &serde_json::to_vec_pretty(&document)?)?;
 
-        let mut args = user_args;
-        // Appended, which is where an argument Turn adds belongs: the user's own
-        // arguments keep the order and the meaning they were written with. The one
-        // case where appending would decide something on their behalf — a second
-        // `--settings`, which Claude Code cannot honour alongside this one — is
-        // refused above rather than quietly won.
-        args.push("--settings".to_string());
-        args.push(settings_path.to_string_lossy().to_string());
+        // Provider controls belong before the first option terminator. Everything
+        // from `--` onward is the operator's literal prompt and remains untouched.
+        // A real CLI-owned settings occurrence in the option prefix was refused
+        // above rather than quietly shadowed.
+        let args = insert_control_arguments(
+            &user_args,
+            [
+                "--settings".to_string(),
+                settings_path.to_string_lossy().to_string(),
+            ],
+        );
 
         let (level, mut note) = self.achieved(&undeliverable);
         note.push(' ');
@@ -1198,7 +1209,6 @@ mod tests {
                 "--settings=/home/me/second.json".into(),
             ],
             vec!["--settings".into()],
-            vec!["--".into(), "--settings=/literal/prompt.json".into()],
         ] {
             let mut ctx = launch_ctx(&scratch);
             ctx.cwd = project.to_string_lossy().into_owned();
@@ -1239,6 +1249,50 @@ mod tests {
                 .unwrap()
                 .contains("private command"));
         }
+    }
+
+    #[test]
+    fn settings_that_only_look_like_flags_inside_the_prompt_do_not_block_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut ctx = launch_ctx(&scratch);
+        ctx.cwd = project.to_string_lossy().into_owned();
+        ctx.user_args = vec![
+            "--setting-sources=".into(),
+            "--model".into(),
+            "opus".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "--settings=/literal/prompt.json".into(),
+            "--settings".into(),
+            "still literal".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let requested_boundary = ctx.user_args.iter().position(|arg| arg == "--").unwrap();
+
+        let plan = ClaudeCodeAdapter::new().prepare(&ctx).unwrap();
+        let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &plan.args[..requested_boundary],
+            &ctx.user_args[..requested_boundary]
+        );
+        assert_eq!(
+            &plan.args[effective_boundary..],
+            &ctx.user_args[requested_boundary..],
+            "the complete prompt suffix must remain literal and exact"
+        );
+        let settings_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "--settings")
+            .unwrap();
+        assert!(settings_index < effective_boundary, "{:?}", plan.args);
+        assert!(std::path::Path::new(&plan.args[settings_index + 1]).starts_with(&scratch));
+        assert_eq!(plan.level, IntegrationLevel::Structured, "{}", plan.note);
+        assert!(plan.note.contains("Hooks injected via --settings"));
     }
 
     #[cfg(unix)]

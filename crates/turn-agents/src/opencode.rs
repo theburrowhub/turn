@@ -6,9 +6,9 @@
 //! changed plugin contract can cost an event, never an OpenCode interaction.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
-    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::{risk, text};
 use serde_json::Value;
@@ -81,7 +81,9 @@ fn resolve_opencode_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    let auto = args.iter().any(|arg| arg == OPENCODE_AUTO);
+    let auto = control_arguments(args)
+        .iter()
+        .any(|arg| arg == OPENCODE_AUTO);
     match profile_id {
         SAFE_PROFILE_ID => {
             if auto {
@@ -94,10 +96,11 @@ fn resolve_opencode_profile(
             Ok(ResolvedLaunchProfile::safe("opencode", args))
         }
         AUTONOMOUS_PROFILE_ID => {
-            let mut resolved = args.to_vec();
-            if !auto {
-                resolved.push(OPENCODE_AUTO.to_string());
-            }
+            let resolved = if auto {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, [OPENCODE_AUTO.to_string()])
+            };
             Ok(ResolvedLaunchProfile::autonomous(
                 "opencode",
                 LaunchPermissionPosture::AutoApproveUnlessDenied,
@@ -166,7 +169,10 @@ impl AgentAdapter for OpenCodeAdapter {
         profile: &ResolvedLaunchProfile,
     ) -> LaunchConfiguration {
         let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
-        if args.iter().any(|arg| arg == OPENCODE_AUTO) {
+        if control_arguments(args)
+            .iter()
+            .any(|arg| arg == OPENCODE_AUTO)
+        {
             configuration.approval_mode = Some("auto unless denied".into());
             if profile.role.is_none() {
                 configuration.permission_mode = Some("Custom · auto-approve unless denied".into());
@@ -178,7 +184,10 @@ impl AgentAdapter for OpenCodeAdapter {
     fn prepare(&self, ctx: &LaunchContext) -> Result<LaunchPlan, AdapterError> {
         let resolved_profile = self.resolve_context_launch_profile(ctx)?;
         let profile_args = resolved_profile.args;
-        if profile_args.iter().any(|arg| arg == "--pure") {
+        if control_arguments(&profile_args)
+            .iter()
+            .any(|arg| arg == "--pure")
+        {
             return Ok(Self::fallback(
                 ctx,
                 profile_args,

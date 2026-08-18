@@ -78,9 +78,9 @@
 //! means it.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
-    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::risk;
 use crate::text::{self, excerpt};
@@ -227,11 +227,12 @@ fn resolve_codex_profile(
     profile_id: &str,
     args: &[String],
 ) -> Result<ResolvedLaunchProfile, AdapterError> {
-    let bypass = args.iter().any(|arg| arg == CODEX_BYPASS_POLICY);
+    let controls = control_arguments(args);
+    let bypass = controls.iter().any(|arg| arg == CODEX_BYPASS_POLICY);
 
     match profile_id {
         SAFE_PROFILE_ID => {
-            if bypass || args.iter().any(|arg| is_codex_policy_option(arg)) {
+            if bypass || controls.iter().any(|arg| is_codex_policy_option(arg)) {
                 return Err(AdapterError::LaunchProfileConflict {
                     adapter_id: "codex".to_string(),
                     profile_id: profile_id.to_string(),
@@ -241,17 +242,18 @@ fn resolve_codex_profile(
             Ok(ResolvedLaunchProfile::safe("codex", args))
         }
         AUTONOMOUS_PROFILE_ID => {
-            if let Some(conflict) = args.iter().find(|arg| is_codex_policy_option(arg)) {
+            if let Some(conflict) = controls.iter().find(|arg| is_codex_policy_option(arg)) {
                 return Err(AdapterError::LaunchProfileConflict {
                     adapter_id: "codex".to_string(),
                     profile_id: profile_id.to_string(),
                     detail: format!("the explicit `{conflict}` policy argument"),
                 });
             }
-            let mut resolved = args.to_vec();
-            if !bypass {
-                resolved.push(CODEX_BYPASS_POLICY.to_string());
-            }
+            let resolved = if bypass {
+                args.to_vec()
+            } else {
+                insert_control_arguments(args, [CODEX_BYPASS_POLICY.to_string()])
+            };
             Ok(ResolvedLaunchProfile::autonomous(
                 "codex",
                 LaunchPermissionPosture::BypassApprovalsAndSandbox,
@@ -323,7 +325,10 @@ impl AgentAdapter for CodexAdapter {
         profile: &ResolvedLaunchProfile,
     ) -> LaunchConfiguration {
         let mut configuration = crate::launch_facts::base_launch_configuration(args, profile, true);
-        if args.iter().any(|arg| arg == CODEX_BYPASS_POLICY) {
+        if control_arguments(args)
+            .iter()
+            .any(|arg| arg == CODEX_BYPASS_POLICY)
+        {
             configuration.approval_mode = Some("bypassed".into());
             configuration.sandbox_mode = Some("disabled".into());
             if profile.role.is_none() {
@@ -371,15 +376,16 @@ impl AgentAdapter for CodexAdapter {
         };
         let helper = helper.to_string_lossy().to_string();
 
-        let mut args = profile_args;
+        let mut generated = Vec::new();
         // Hooks are configured in both hook transports. The difference between them
         // is only what Turn is entitled to claim, never what Codex is told.
         if self.transport != CodexTransport::NotifyOnly {
-            args.push("-c".to_string());
-            args.push(self.hooks_config(&helper));
+            generated.push("-c".to_string());
+            generated.push(self.hooks_config(&helper));
         }
-        args.push("-c".to_string());
-        args.push(self.notify_config(&helper));
+        generated.push("-c".to_string());
+        generated.push(self.notify_config(&helper));
+        let args = insert_control_arguments(&profile_args, generated);
 
         // `--dangerously-bypass-hook-trust` would make the hooks run on the first
         // launch. It is deliberately never added: hooks run outside Codex's sandbox,
@@ -1014,6 +1020,54 @@ mod tests {
             .find(|(k, _)| k == "TURN_HOOK_URL")
             .map(|(_, v)| v.as_str());
         assert_eq!(url, Some("http://127.0.0.1:51234/hook/tok_codex"));
+    }
+
+    #[test]
+    fn profile_hooks_and_notify_all_stay_before_literal_prompt_argv() {
+        let mut ctx = launch_ctx(Some("/usr/local/bin/turn-hook"));
+        ctx.launch_profile = Some(turn_core::model::AgentLaunchProfileRef::new(
+            "codex",
+            AUTONOMOUS_PROFILE_ID,
+        ));
+        ctx.user_args = vec![
+            "--model".into(),
+            "gpt-5".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "-c".into(),
+            "notify=[\"prompt-only\"]".into(),
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let requested_boundary = ctx.user_args.iter().position(|arg| arg == "--").unwrap();
+
+        let plan = CodexAdapter::new().prepare(&ctx).unwrap();
+        let effective_boundary = plan.args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            &plan.args[..requested_boundary],
+            &ctx.user_args[..requested_boundary]
+        );
+        assert_eq!(
+            &plan.args[effective_boundary..],
+            &ctx.user_args[requested_boundary..]
+        );
+        assert_eq!(
+            plan.args[..effective_boundary]
+                .iter()
+                .filter(|arg| *arg == "-c")
+                .count(),
+            2
+        );
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg == CODEX_BYPASS_POLICY));
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg.starts_with("hooks={")));
+        assert!(plan.args[..effective_boundary]
+            .iter()
+            .any(|arg| arg.starts_with("notify=[")));
     }
 
     /// Structured is reachable, but only once a hook has been seen firing.

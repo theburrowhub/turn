@@ -45,6 +45,76 @@ pub enum AdapterError {
         profile_id: String,
         detail: String,
     },
+    #[error(
+        "adapter `{adapter_id}` could not preserve the operator's argument boundary while adding launch controls"
+    )]
+    ArgumentBoundaryViolation { adapter_id: String },
+}
+
+/// The option-bearing part of an agent argv.
+///
+/// The first exact `--` is a semantic boundary owned by the provider CLI: every
+/// subsequent value is positional prompt input, even when it looks like a flag.
+/// Adapter policy, conflict detection and launch receipts must therefore inspect
+/// this prefix only.
+pub(crate) fn control_arguments(args: &[String]) -> &[String] {
+    let end = args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(args.len());
+    &args[..end]
+}
+
+/// Adds Turn-owned CLI controls without moving or reinterpreting user argv.
+///
+/// Generated values are inserted immediately before the first `--`; without a
+/// terminator they are appended. The complete user prefix and prompt suffix stay
+/// byte-for-byte and order-for-order intact.
+pub fn insert_control_arguments(
+    args: &[String],
+    generated: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let boundary = control_arguments(args).len();
+    let generated: Vec<String> = generated.into_iter().collect();
+    let mut resolved = Vec::with_capacity(args.len() + generated.len());
+    resolved.extend_from_slice(&args[..boundary]);
+    resolved.extend(generated);
+    resolved.extend_from_slice(&args[boundary..]);
+    resolved
+}
+
+/// Proves that an adapter plan only inserted controls before the user's prompt.
+///
+/// This is the daemon's fail-closed boundary for present and future adapters. A
+/// plan may append controls when no terminator exists. When one does exist, the
+/// exact prefix must remain first, the exact terminator-plus-prompt suffix must
+/// remain last, and no generated `--` may create an earlier boundary.
+pub fn validate_effective_arguments(
+    adapter_id: &str,
+    requested: &[String],
+    effective: &[String],
+) -> Result<(), AdapterError> {
+    let boundary = control_arguments(requested).len();
+    let prefix = &requested[..boundary];
+    let suffix = &requested[boundary..];
+    let valid = effective.starts_with(prefix)
+        && if suffix.is_empty() {
+            effective[boundary..]
+                .iter()
+                .all(|argument| argument != "--")
+        } else if effective.len() < requested.len() || !effective.ends_with(suffix) {
+            false
+        } else {
+            let suffix_start = effective.len() - suffix.len();
+            effective[boundary..suffix_start]
+                .iter()
+                .all(|argument| argument != "--")
+        };
+    valid
+        .then_some(())
+        .ok_or_else(|| AdapterError::ArgumentBoundaryViolation {
+            adapter_id: adapter_id.to_string(),
+        })
 }
 
 /// The product-level choice presented to an operator.
@@ -322,17 +392,20 @@ pub trait AgentAdapter: Send + Sync {
         &self,
         ctx: &LaunchContext,
     ) -> Result<ResolvedLaunchProfile, AdapterError> {
-        let Some(requested) = &ctx.launch_profile else {
-            return Ok(ResolvedLaunchProfile::custom(self.id(), &ctx.user_args));
+        let resolved = if let Some(requested) = &ctx.launch_profile {
+            if requested.adapter_id != self.id() {
+                return Err(AdapterError::LaunchProfileAdapterMismatch {
+                    requested_adapter: requested.adapter_id.clone(),
+                    selected_adapter: self.id().to_string(),
+                    profile_id: requested.profile_id.clone(),
+                });
+            }
+            self.resolve_launch_profile(&requested.profile_id, &ctx.user_args)?
+        } else {
+            ResolvedLaunchProfile::custom(self.id(), &ctx.user_args)
         };
-        if requested.adapter_id != self.id() {
-            return Err(AdapterError::LaunchProfileAdapterMismatch {
-                requested_adapter: requested.adapter_id.clone(),
-                selected_adapter: self.id().to_string(),
-                profile_id: requested.profile_id.clone(),
-            });
-        }
-        self.resolve_launch_profile(&requested.profile_id, &ctx.user_args)
+        validate_effective_arguments(self.id(), &ctx.user_args, &resolved.args)?;
+        Ok(resolved)
     }
 
     /// Privacy-safe launch facts for this provider's argv.
@@ -472,5 +545,69 @@ mod tests {
     fn which_rejects_a_directory_that_shares_a_binarys_name() {
         // `/tmp` is a directory, not an executable, and must not be returned.
         assert!(!is_executable(std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn generated_controls_are_inserted_before_the_first_terminator_only() {
+        let requested = vec![
+            "--model".into(),
+            "opus".into(),
+            "--".into(),
+            "literal prompt".into(),
+            "--settings=/not-an-option.json".into(),
+            "--".into(),
+            "tail".into(),
+        ];
+        let effective =
+            insert_control_arguments(&requested, ["--settings".into(), "/turn/owned.json".into()]);
+        assert_eq!(
+            effective,
+            vec![
+                "--model",
+                "opus",
+                "--settings",
+                "/turn/owned.json",
+                "--",
+                "literal prompt",
+                "--settings=/not-an-option.json",
+                "--",
+                "tail",
+            ]
+        );
+        validate_effective_arguments("test", &requested, &effective).unwrap();
+    }
+
+    #[test]
+    fn argument_boundary_validation_refuses_prompt_rewrites_and_late_controls() {
+        let requested = vec!["--".into(), "prompt".into(), "--flag".into()];
+        for unsafe_plan in [
+            vec![
+                "--".into(),
+                "prompt".into(),
+                "--flag".into(),
+                "--auto".into(),
+            ],
+            vec!["--".into(), "changed".into(), "--flag".into()],
+            vec![
+                "--".into(),
+                "--auto".into(),
+                "prompt".into(),
+                "--flag".into(),
+            ],
+        ] {
+            assert!(matches!(
+                validate_effective_arguments("future-adapter", &requested, &unsafe_plan),
+                Err(AdapterError::ArgumentBoundaryViolation { adapter_id })
+                    if adapter_id == "future-adapter"
+            ));
+        }
+
+        let no_boundary = vec!["prompt".into()];
+        assert!(validate_effective_arguments(
+            "future-adapter",
+            &no_boundary,
+            &["prompt".into(), "--".into(), "late".into()]
+        )
+        .is_err());
     }
 }

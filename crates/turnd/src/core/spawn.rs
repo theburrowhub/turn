@@ -41,8 +41,9 @@ use super::{hosting, Core, Process};
 use crate::paths;
 use std::path::{Path, PathBuf};
 use turn_agents::{
-    launch_fact_configurations, AdapterRegistry, IntegrationLevel, LaunchContext, LaunchPlan,
-    OutputHeuristic, ResolvedLaunchProfile, Selection,
+    insert_control_arguments, launch_fact_configurations, validate_effective_arguments,
+    AdapterRegistry, IntegrationLevel, LaunchContext, LaunchPlan, OutputHeuristic,
+    ResolvedLaunchProfile, Selection,
 };
 use turn_core::event::{AgentRef, Confidence, EventKind, EventSource, TurnEvent};
 use turn_core::ids::{NodeId, PaneId, SessionId};
@@ -429,12 +430,9 @@ impl Core {
         }
         env.extend(session.env.iter().cloned());
         env.extend(pane.env.iter().cloned());
-        let args: Vec<String> = pane
-            .args
-            .iter()
-            .cloned()
-            .chain(extra_args.iter().cloned())
-            .collect();
+        // Resume and other one-launch controls are Turn-owned too: they must be
+        // parsed as options, never appended into the literal prompt after `--`.
+        let args = insert_control_arguments(&pane.args, extra_args.iter().cloned());
         let needs = launch_authority(&launch, pane.kind, &args);
         let request = PaneRequest {
             kind: pane.kind,
@@ -964,9 +962,13 @@ impl Core {
             .adapter
             .resolve_context_launch_profile(&launch)
             .map_err(|error| self.launch_prepare_error(token, error))?;
+        validate_effective_arguments(selection.adapter.id(), &launch.user_args, &profile.args)
+            .map_err(|error| self.launch_prepare_error(token, error))?;
         let plan = selection
             .adapter
             .prepare(&launch)
+            .map_err(|error| self.launch_prepare_error(token, error))?;
+        validate_effective_arguments(selection.adapter.id(), &launch.user_args, &plan.args)
             .map_err(|error| self.launch_prepare_error(token, error))?;
         Ok(PreparedLaunch { plan, profile })
     }
@@ -979,13 +981,22 @@ impl Core {
         self.revoke(token);
         let detail = error.to_string();
         if matches!(
-            error,
+            &error,
             turn_agents::AdapterError::UnknownLaunchAdapter { .. }
                 | turn_agents::AdapterError::UnknownLaunchProfile { .. }
                 | turn_agents::AdapterError::LaunchProfileAdapterMismatch { .. }
                 | turn_agents::AdapterError::LaunchProfileConflict { .. }
         ) {
             ProtoError::invalid("This agent launch profile cannot be applied").with_detail(detail)
+        } else if matches!(
+            &error,
+            turn_agents::AdapterError::ArgumentBoundaryViolation { .. }
+        ) {
+            ProtoError::new(
+                ErrorCode::Unavailable,
+                "Turn refused an agent launch plan that would change literal prompt arguments",
+            )
+            .with_detail(detail)
         } else {
             ProtoError::new(
                 ErrorCode::Unavailable,

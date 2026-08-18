@@ -7,9 +7,9 @@
 //! structured integration only after an authenticated callback is observed.
 
 use crate::adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, IntegrationLevel, LaunchContext,
-    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, ResolvedLaunchProfile,
-    AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
+    control_arguments, insert_control_arguments, AdapterError, AgentAdapter, Capabilities,
+    EventContext, IntegrationLevel, LaunchContext, LaunchPermissionPosture, LaunchPlan,
+    LaunchProfileDefinition, ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 use crate::{risk, text};
 use serde_json::{json, Value};
@@ -95,11 +95,13 @@ impl GeminiCliAdapter {
 }
 
 fn gemini_approval_modes(args: &[String]) -> Vec<Option<&str>> {
-    args.iter()
+    let controls = control_arguments(args);
+    controls
+        .iter()
         .enumerate()
         .filter_map(|(index, arg)| {
             if arg == "--approval-mode" {
-                Some(args.get(index + 1).map(String::as_str))
+                Some(controls.get(index + 1).map(String::as_str))
             } else {
                 arg.strip_prefix("--approval-mode=").map(Some)
             }
@@ -108,7 +110,8 @@ fn gemini_approval_modes(args: &[String]) -> Vec<Option<&str>> {
 }
 
 fn gemini_yolo_flag(args: &[String]) -> Option<&str> {
-    args.iter()
+    control_arguments(args)
+        .iter()
         .find(|arg| matches!(arg.as_str(), "--yolo" | "-y"))
         .map(String::as_str)
 }
@@ -148,14 +151,11 @@ fn resolve_gemini_profile(
                     detail: "the explicit non-yolo --approval-mode argument".to_string(),
                 });
             }
-            let mut resolved = args.to_vec();
-            let effective_flag = if let Some(flag) = yolo_flag {
-                flag
-            } else if yolo_mode {
-                "--approval-mode"
+            let effective_flag = yolo_flag.unwrap_or("--approval-mode");
+            let resolved = if yolo_flag.is_some() || yolo_mode {
+                args.to_vec()
             } else {
-                resolved.extend(["--approval-mode".to_string(), "yolo".to_string()]);
-                "--approval-mode"
+                insert_control_arguments(args, ["--approval-mode".to_string(), "yolo".to_string()])
             };
             Ok(ResolvedLaunchProfile::autonomous(
                 "gemini-cli",

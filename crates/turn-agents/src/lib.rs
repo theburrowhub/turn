@@ -34,8 +34,9 @@ pub mod server;
 pub mod text;
 
 pub use adapter::{
-    AdapterError, AgentAdapter, Capabilities, EventContext, HookEndpoint, IntegrationLevel,
-    LaunchContext, LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, LaunchProfileRole,
+    insert_control_arguments, validate_effective_arguments, AdapterError, AgentAdapter,
+    Capabilities, EventContext, HookEndpoint, IntegrationLevel, LaunchContext,
+    LaunchPermissionPosture, LaunchPlan, LaunchProfileDefinition, LaunchProfileRole,
     ResolvedLaunchProfile, AUTONOMOUS_PROFILE_ID, SAFE_PROFILE_ID,
 };
 pub use claude::{ClaudeCodeAdapter, HookTransport};

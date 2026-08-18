@@ -638,8 +638,10 @@ product decision about relevance, not a confidence decision.
 
 Hooks are injected with `--settings <path>`, which adds a settings layer and leaves
 `~/.claude/settings.json` and `.claude/settings.json` read normally and unmodified. The file is written
-into `LaunchContext::scratch_dir`, and `--settings` is **appended** after the user's own args so their
-flags keep precedence wherever Claude Code's parser gives later flags the final say.
+into `LaunchContext::scratch_dir`. Turn inserts `--settings` immediately before the first exact `--`
+(or appends it when there is no terminator), so provider controls remain options while the operator's
+complete terminator-plus-prompt suffix stays byte-for-byte unchanged. A CLI-owned `--settings` in the
+option prefix disables injection rather than being shadowed.
 
 Subscribed events, deliberately not all of them — each subscription costs the Agent a callback, and Turn
 only wants the ones that change a state it renders: `SessionStart`, `UserPromptSubmit`,

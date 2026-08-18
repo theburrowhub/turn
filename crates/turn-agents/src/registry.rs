@@ -546,6 +546,141 @@ mod tests {
     }
 
     #[test]
+    fn every_autonomous_profile_keeps_prompt_like_flags_literal_after_the_terminator() {
+        struct Case {
+            adapter: &'static str,
+            generated_flag: &'static str,
+            generated_value: Option<&'static str>,
+            literal_policy: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                adapter: "claude-code",
+                generated_flag: "--dangerously-skip-permissions",
+                generated_value: None,
+                literal_policy: &["--permission-mode", "plan"],
+            },
+            Case {
+                adapter: "codex",
+                generated_flag: "--dangerously-bypass-approvals-and-sandbox",
+                generated_value: None,
+                literal_policy: &["--ask-for-approval", "never"],
+            },
+            Case {
+                adapter: "gemini-cli",
+                generated_flag: "--approval-mode",
+                generated_value: Some("yolo"),
+                literal_policy: &["--approval-mode", "plan"],
+            },
+            Case {
+                adapter: "opencode",
+                generated_flag: "--auto",
+                generated_value: None,
+                literal_policy: &["--auto", "--pure"],
+            },
+        ];
+        let registry = registry();
+
+        for case in cases {
+            let mut requested = args(&["--model", "provider/model", "--", "literal prompt"]);
+            requested.extend(case.literal_policy.iter().map(|value| (*value).to_string()));
+            requested.extend(args(&[
+                "--",
+                "second literal terminator",
+                "--model",
+                "not-the-launch-model",
+            ]));
+            let prompt_start = requested.iter().position(|arg| arg == "--").unwrap();
+            let resolved = registry
+                .resolve_launch_profile(
+                    &AgentLaunchProfileRef::new(case.adapter, AUTONOMOUS_PROFILE_ID),
+                    &requested,
+                )
+                .unwrap_or_else(|error| panic!("{}: {error}", case.adapter));
+            let effective_prompt_start = resolved
+                .args
+                .iter()
+                .position(|arg| arg == "--")
+                .expect("the literal prompt boundary");
+
+            assert_eq!(
+                &resolved.args[..2],
+                &requested[..2],
+                "{} moved the option prefix",
+                case.adapter
+            );
+            assert_eq!(
+                &resolved.args[effective_prompt_start..],
+                &requested[prompt_start..],
+                "{} reinterpreted or changed literal prompt argv",
+                case.adapter
+            );
+            let flag_index = resolved
+                .args
+                .iter()
+                .position(|arg| arg == case.generated_flag)
+                .expect("the autonomous control");
+            assert!(
+                flag_index < effective_prompt_start,
+                "{} placed its control in the prompt: {:?}",
+                case.adapter,
+                resolved.args
+            );
+            if let Some(value) = case.generated_value {
+                assert_eq!(
+                    resolved.args.get(flag_index + 1).map(String::as_str),
+                    Some(value)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_existing_autonomous_controls_are_preserved_without_new_copies() {
+        let cases = [
+            (
+                "claude-code",
+                args(&[
+                    "--dangerously-skip-permissions",
+                    "--dangerously-skip-permissions",
+                    "--",
+                    "prompt",
+                ]),
+            ),
+            (
+                "codex",
+                args(&[
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "--",
+                    "prompt",
+                ]),
+            ),
+            (
+                "gemini-cli",
+                args(&[
+                    "--approval-mode=yolo",
+                    "--approval-mode",
+                    "yolo",
+                    "--",
+                    "prompt",
+                ]),
+            ),
+            ("opencode", args(&["--auto", "--auto", "--", "prompt"])),
+        ];
+        let registry = registry();
+        for (adapter, requested) in cases {
+            let resolved = registry
+                .resolve_launch_profile(
+                    &AgentLaunchProfileRef::new(adapter, AUTONOMOUS_PROFILE_ID),
+                    &requested,
+                )
+                .unwrap_or_else(|error| panic!("{adapter}: {error}"));
+            assert_eq!(resolved.args, requested, "{adapter} rewrote repeated argv");
+        }
+    }
+
+    #[test]
     fn unknown_adapters_and_profiles_are_refused() {
         assert!(matches!(
             registry().resolve_launch_profile(

@@ -7,6 +7,7 @@
 //! posture; this code consumes their resolved receipt instead of reimplementing
 //! which flags make a provider autonomous.
 
+use crate::adapter::control_arguments;
 use crate::{AgentAdapter, LaunchPermissionPosture, LaunchProfileRole, ResolvedLaunchProfile};
 use turn_core::model::LaunchConfiguration;
 
@@ -29,16 +30,38 @@ pub fn launch_fact_configurations(
     profile: &ResolvedLaunchProfile,
 ) -> LaunchFactConfigurations {
     let requested = adapter.launch_configuration(requested_args, profile);
-    let mut effective = adapter.launch_configuration(effective_args, profile);
-    for flag in &profile.effective_flag_names {
-        if let Some(flag) = safe_flag_name(flag) {
-            push_unique(&mut effective.safe_flags, flag);
-        }
-    }
+    // A semantic request is intent; the effective receipt needs argv evidence.
+    // If an autonomous resolver ever reports a control that is absent from the
+    // option-bearing prefix, do not repeat its posture as fact. This protects
+    // restored/legacy rows and future adapters even though the live daemon also
+    // rejects argument-boundary violations before spawning.
+    let mut ungrounded = profile.clone();
+    let effective_profile = if autonomous_profile_is_grounded(effective_args, profile) {
+        profile
+    } else {
+        ungrounded.profile_id = "custom".into();
+        ungrounded.role = None;
+        ungrounded.posture = LaunchPermissionPosture::Custom;
+        ungrounded.effective_flag_names.clear();
+        &ungrounded
+    };
+    let effective = adapter.launch_configuration(effective_args, effective_profile);
     LaunchFactConfigurations {
         requested,
         effective,
     }
+}
+
+fn autonomous_profile_is_grounded(args: &[String], profile: &ResolvedLaunchProfile) -> bool {
+    if profile.role != Some(LaunchProfileRole::Autonomous) {
+        return true;
+    }
+    let observed = safe_flag_names(args);
+    !profile.effective_flag_names.is_empty()
+        && profile
+            .effective_flag_names
+            .iter()
+            .all(|flag| safe_flag_name(flag).is_some_and(|flag| observed.contains(&flag)))
 }
 
 /// Common privacy boundary used by provider-owned launch inspectors.
@@ -126,9 +149,10 @@ fn model_argument(args: &[String], short_model: bool) -> Option<String> {
 
 fn option_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
     let mut found = None;
-    for (index, arg) in args.iter().enumerate() {
+    let controls = control_arguments(args);
+    for (index, arg) in controls.iter().enumerate() {
         if names.contains(&arg.as_str()) {
-            found = args.get(index + 1).map(String::as_str);
+            found = controls.get(index + 1).map(String::as_str);
             continue;
         }
         for name in names {
@@ -180,7 +204,7 @@ pub fn safe_model_name(value: &str) -> Option<String> {
 
 fn safe_flag_names(args: &[String]) -> Vec<String> {
     let mut flags = Vec::new();
-    for arg in args {
+    for arg in control_arguments(args) {
         if let Some(flag) = safe_flag_name(arg) {
             push_unique(&mut flags, flag);
         }
@@ -462,5 +486,80 @@ mod tests {
             OpenCodeAdapter::new().resolve_launch_profile(SAFE_PROFILE_ID, &strings(&["--auto"])),
             Err(AdapterError::LaunchProfileConflict { .. })
         ));
+    }
+
+    #[test]
+    fn prompt_text_that_looks_like_flags_never_becomes_a_launch_fact() {
+        let args = strings(&[
+            "--model",
+            "provider/real-model",
+            "--",
+            "literal prompt",
+            "--model",
+            "provider/fake-model",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--ask-for-approval=never",
+            "--sandbox=danger-full-access",
+            "--auto",
+        ]);
+        let profile = ResolvedLaunchProfile {
+            adapter_id: "codex".into(),
+            profile_id: "custom".into(),
+            role: None,
+            posture: LaunchPermissionPosture::Custom,
+            args: args.clone(),
+            effective_flag_names: Vec::new(),
+        };
+        let facts = launch_fact_configurations(&CodexAdapter::new(), &args, &args, &profile);
+        assert_eq!(
+            facts.effective.model.as_deref(),
+            Some("provider/real-model")
+        );
+        assert_eq!(facts.effective.safe_flags, strings(&["--model"]));
+        assert_eq!(facts.effective.permission_mode.as_deref(), Some("Custom"));
+        assert_eq!(facts.effective.approval_mode, None);
+        assert_eq!(facts.effective.sandbox_mode, None);
+    }
+
+    #[test]
+    fn an_ungrounded_autonomous_receipt_is_not_reported_as_effective() {
+        let cases: Vec<Box<dyn AgentAdapter>> = vec![
+            Box::new(ClaudeCodeAdapter::new()),
+            Box::new(CodexAdapter::new()),
+            Box::new(GeminiCliAdapter::new()),
+            Box::new(OpenCodeAdapter::new()),
+        ];
+        let requested = strings(&["--", "literal prompt"]);
+        for adapter in cases {
+            let profile = adapter
+                .resolve_launch_profile(AUTONOMOUS_PROFILE_ID, &requested)
+                .unwrap();
+            let facts = launch_fact_configurations(
+                adapter.as_ref(),
+                &requested,
+                // Simulate an unsafe/future adapter plan that lost the generated
+                // control. The daemon rejects it; projection must not lie either.
+                &requested,
+                &profile,
+            );
+            assert!(
+                facts
+                    .requested
+                    .permission_mode
+                    .as_deref()
+                    .is_some_and(|mode| mode.starts_with("Autonomous")),
+                "{} lost the semantic request",
+                adapter.id()
+            );
+            assert_eq!(
+                facts.effective.permission_mode.as_deref(),
+                Some("Custom"),
+                "{} claimed a control absent before `--`",
+                adapter.id()
+            );
+            assert!(facts.effective.approval_mode.is_none(), "{}", adapter.id());
+            assert!(facts.effective.sandbox_mode.is_none(), "{}", adapter.id());
+            assert!(facts.effective.safe_flags.is_empty(), "{}", adapter.id());
+        }
     }
 }
