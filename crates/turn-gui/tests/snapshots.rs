@@ -4773,6 +4773,152 @@ fn a_replacement_runtime_is_resized_once_through_the_floating_render_path() {
 }
 
 #[test]
+fn one_runtime_has_one_geometry_owner_across_duplicates_floating_and_temporary_views() {
+    let mut fixture = busy_desk();
+    fixture.permission = None;
+    fixture.queue.clear();
+    let layout = fixture.layout.as_mut().expect("layout");
+    let first = layout.active.clone().expect("active Pane");
+    let runtime = NodeId::from_stored("node_shared_geometry_runtime");
+    layout.get_mut(&first).expect("first Pane").node_id = Some(runtime.clone());
+    let duplicate = layout.duplicate(&first).expect("duplicate Pane");
+    assert_eq!(
+        layout
+            .get(&duplicate)
+            .and_then(|pane| pane.node_id.as_ref()),
+        Some(&runtime)
+    );
+    assert!(layout.float(
+        &duplicate,
+        PaneGeometry {
+            x: 710.0,
+            y: 120.0,
+            width: 310.0,
+            height: 210.0,
+        },
+    ));
+    layout.active = Some(first.clone());
+    fixture.focused = Some(first.clone());
+    fixture.grids.insert(duplicate.clone(), agent_screen());
+    fixture
+        .titles
+        .insert(duplicate.clone(), "shared mirror".into());
+
+    let mut h = harness(fixture);
+    h.run_steps(1);
+    let first_size = h
+        .state()
+        .state
+        .panes
+        .get(&first)
+        .and_then(PaneInteraction::reported_size)
+        .expect("focused owner measured its geometry");
+    assert_eq!(pane_resizes(&h.state().actions, &first), vec![first_size]);
+    assert!(
+        pane_resizes(&h.state().actions, &duplicate).is_empty(),
+        "the unequal floating duplicate must be a read-only geometry mirror"
+    );
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window.fixture.layout.as_mut().expect("layout").active = Some(duplicate.clone());
+        window.fixture.focused = Some(duplicate.clone());
+    }
+    h.run_steps(1);
+    let duplicate_size = h
+        .state()
+        .state
+        .panes
+        .get(&duplicate)
+        .and_then(PaneInteraction::reported_size)
+        .expect("new focused owner measured its floating geometry");
+    assert_eq!(
+        pane_resizes(&h.state().actions, &duplicate),
+        vec![duplicate_size],
+        "focus transfers geometry ownership exactly once"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "stationary duplicates must not ping-pong the shared PTY"
+    );
+
+    let temporary_id = PaneId::from_stored("pane_shared_runtime_temporary");
+    let selected = h
+        .state()
+        .fixture
+        .selected
+        .clone()
+        .expect("selected Session");
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window
+            .fixture
+            .grids
+            .insert(temporary_id.clone(), agent_screen());
+        window.fixture.temporary_pane = Some(NodePaneView {
+            binding: PaneNodeBinding {
+                pane_id: temporary_id.clone(),
+                session_id: selected,
+                node_id: runtime.clone(),
+                temporary: true,
+                surface_id: Some("window-snapshot".into()),
+                opened_ms: T0,
+            },
+            capability: NodePaneCapability::Terminal {
+                streams: vec![PaneStream::Cells],
+            },
+        });
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &temporary_id).len(),
+        1,
+        "the explicit temporary terminal takes ownership once"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+    assert!(pane_resizes(&h.state().actions, &duplicate).is_empty());
+
+    {
+        let window = h.state_mut();
+        window.actions.clear();
+        window.fixture.temporary_pane = None;
+        window.fixture.grids.remove(&temporary_id);
+    }
+    h.run_steps(1);
+    assert_eq!(
+        pane_resizes(&h.state().actions, &duplicate),
+        vec![duplicate_size],
+        "closing the temporary view returns ownership to the focused Pane even at its old size"
+    );
+    assert!(pane_resizes(&h.state().actions, &first).is_empty());
+
+    h.state_mut().actions.clear();
+    h.run_steps(1);
+    assert!(
+        h.state().actions.iter().all(|action| !matches!(
+            action,
+            ViewAction::Pane {
+                action: PaneAction::Resize(_),
+                ..
+            }
+        )),
+        "the owner returned by temporary close must settle after one report"
+    );
+}
+
+#[test]
 fn a_write_lease_conflict_offers_only_explicit_safe_alternatives() {
     let mut fixture = busy_desk();
     let hierarchy = unified_hierarchy(
@@ -5943,7 +6089,7 @@ fn interactive_pane(
                     grid: &grid,
                     options,
                     id: ui.id().with("pane-under-test"),
-                    runtime_id: None,
+                    resize_claim: None,
                     chrome: None,
                 },
             );

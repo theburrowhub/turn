@@ -192,10 +192,12 @@ pub struct PaneInteraction {
     /// The size in cells last reported, so a resize request is sent on a change rather
     /// than every frame.
     reported_size: Option<PtySize>,
-    /// Runtime that received [`Self::reported_size`]. A durable visual Pane can be rebound
-    /// to a replacement process while keeping the same PaneId and geometry; that process
-    /// still needs one resize of its own.
-    reported_runtime: Option<NodeId>,
+    /// Runtime ownership claim that received [`Self::reported_size`]. A durable visual Pane
+    /// can be rebound to a replacement process while keeping the same PaneId and geometry;
+    /// and two visual Panes can mirror one process. The claim epoch changes whenever this
+    /// Pane becomes that process's sole geometry owner, so reacquiring ownership costs one
+    /// resize even when this interaction measured the same rectangle before.
+    reported_resize_claim: Option<(NodeId, u64)>,
     /// The links on the grid as it was when they were last found — see [`links`].
     ///
     /// Built only while the pointer is over the pane, and reused across frames until the
@@ -1111,13 +1113,25 @@ pub struct PaneInput<'a> {
     /// Distinguishes panes so `egui` tracks their interaction independently, which is what
     /// lets two panes hold separate selections.
     pub id: egui::Id,
-    /// Exact process currently behind the durable visual Pane. `None` is reserved for
-    /// standalone/read-only callers that have no runtime identity to track.
-    pub runtime_id: Option<&'a NodeId>,
+    /// The exact process and renderer-owned epoch when this Pane is the sole authority for
+    /// its PTY geometry. `None` makes the surface a mirror: it may paint and scroll, but it
+    /// can never emit [`PaneAction::Resize`].
+    pub resize_claim: Option<ResizeClaim<'a>>,
     /// `None` for a caller that has not wired the pane menu: the pane then offers no menu
     /// and produces no [`PaneRequest`], which is exactly how it behaved before the menu
     /// existed.
     pub chrome: Option<PaneChrome<'a>>,
+}
+
+/// One render surface's temporary lease to size exactly one runtime.
+///
+/// The epoch is window-local and deliberately opaque to the daemon. It exists so changing
+/// owner A -> B -> A produces one report at each hand-off even if both panes have already
+/// measured the same number of rows and columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeClaim<'a> {
+    pub runtime_id: &'a NodeId,
+    pub owner_epoch: u64,
 }
 
 /// Draws a pane, with its context menu, and collects everything the user did to it.
@@ -1128,7 +1142,7 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         grid,
         options,
         id,
-        runtime_id,
+        resize_claim,
         chrome,
     } = input;
     let mut outcome = PaneOutcome::default();
@@ -1152,12 +1166,13 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     // the daemon is still returning the old-sized grid.
     if should_report_size(
         state.reported_size,
-        state.reported_runtime.as_ref(),
+        state.reported_resize_claim.as_ref(),
         size,
-        runtime_id,
+        resize_claim,
     ) {
         state.reported_size = Some(size);
-        state.reported_runtime = runtime_id.cloned();
+        state.reported_resize_claim =
+            resize_claim.map(|claim| (claim.runtime_id.clone(), claim.owner_epoch));
         outcome.actions.push(PaneAction::Resize(size));
     }
 
@@ -1291,11 +1306,17 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
 
 fn should_report_size(
     reported_size: Option<PtySize>,
-    reported_runtime: Option<&NodeId>,
+    reported_claim: Option<&(NodeId, u64)>,
     size: PtySize,
-    runtime_id: Option<&NodeId>,
+    claim: Option<ResizeClaim<'_>>,
 ) -> bool {
-    reported_size != Some(size) || reported_runtime != runtime_id
+    let Some(claim) = claim else {
+        return false;
+    };
+    reported_size != Some(size)
+        || reported_claim.is_none_or(|(runtime_id, owner_epoch)| {
+            runtime_id != claim.runtime_id || *owner_epoch != claim.owner_epoch
+        })
 }
 
 /// Whether the pointer is over the search bar rather than over the pane's cells.
@@ -2807,19 +2828,45 @@ mod tests {
 
         let previous = NodeId::from_stored("node_previous_pty");
         let replacement = NodeId::from_stored("node_replacement_pty");
+        let previous_report = (previous, 4);
         assert!(
-            should_report_size(Some(visible), Some(&previous), visible, Some(&replacement)),
+            should_report_size(
+                Some(visible),
+                Some(&previous_report),
+                visible,
+                Some(ResizeClaim {
+                    runtime_id: &replacement,
+                    owner_epoch: 5,
+                }),
+            ),
             "the replacement runtime must receive the unchanged visible geometry"
         );
 
+        let replacement_report = (replacement.clone(), 5);
         assert!(
             !should_report_size(
                 Some(visible),
-                Some(&replacement),
+                Some(&replacement_report),
                 visible,
-                Some(&replacement)
+                Some(ResizeClaim {
+                    runtime_id: &replacement,
+                    owner_epoch: 5,
+                }),
             ),
             "the same runtime and geometry must not emit another resize while its grid catches up"
+        );
+        assert!(should_report_size(
+            Some(visible),
+            Some(&replacement_report),
+            visible,
+            Some(ResizeClaim {
+                runtime_id: &replacement,
+                owner_epoch: 6,
+            }),
+        ));
+        assert!(
+            !should_report_size(Some(visible), Some(&replacement_report), visible, None),
+            "a mirror without a geometry claim can never resize"
         );
     }
 

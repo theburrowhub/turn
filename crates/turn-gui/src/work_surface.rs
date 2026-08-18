@@ -458,7 +458,7 @@ impl TurnView<'_> {
                 id: ui
                     .id()
                     .with(("node-terminal-mirror", node.node_id.as_str())),
-                runtime_id: None,
+                resize_claim: None,
                 chrome: None,
             },
         )

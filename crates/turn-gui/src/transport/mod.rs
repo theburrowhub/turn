@@ -104,7 +104,11 @@ pub enum Ask {
         session_id: SessionId,
         subject_node_id: NodeId,
     },
-    NodePane,
+    NodePane {
+        session_id: SessionId,
+        node_id: NodeId,
+        intent_id: u64,
+    },
     /// A creation response must close or preserve the correct sheet; a generic label
     /// cannot safely correlate that lifecycle.
     CreateWorkspace {
@@ -118,6 +122,8 @@ pub enum Ask {
     Attach {
         session_id: SessionId,
         pane_id: PaneId,
+        node_id: Option<NodeId>,
+        intent_id: u64,
     },
     RelaunchNode {
         session_id: SessionId,
@@ -187,7 +193,7 @@ impl Ask {
             Ask::PrepareContextHandoff { .. } => "preparing an Agent context handoff",
             Ask::DeliverContextHandoff { .. } => "delivering an Agent context handoff",
             Ask::AttentionFocus { .. } => "focusing the pane that can answer attention",
-            Ask::NodePane => "opening a node as a pane",
+            Ask::NodePane { .. } => "opening a node as a pane",
             Ask::CreateWorkspace { .. } => "creating a workspace",
             Ask::CreateSession { .. } => "creating a session",
             Ask::CreateTemplate => "saving the layout preset",

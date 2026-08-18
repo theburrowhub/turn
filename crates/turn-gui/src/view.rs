@@ -471,6 +471,12 @@ impl std::fmt::Debug for LogoTexture {
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
+    /// Exactly one visible operational Pane owns each runtime's PTY geometry. Duplicate
+    /// Panes are mirrors until focus (or an explicit temporary Pane) transfers this lease.
+    resize_owners: HashMap<NodeId, ResizeOwner>,
+    /// Monotonic window-local epoch used to make every ownership transfer observable by the
+    /// PaneInteraction that wins it, including A -> B -> A at an unchanged geometry.
+    next_resize_owner_epoch: u64,
     /// The checked-in product mark, decoded and uploaded once for the lifetime of the window.
     /// Keeping the handle here avoids allocating a GPU texture on every immediate-mode frame.
     logo_texture: LogoTexture,
@@ -592,6 +598,12 @@ pub struct ViewState {
     observed_temporary_pane: Option<PaneId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResizeOwner {
+    pane_id: PaneId,
+    epoch: u64,
+}
+
 #[derive(Default)]
 struct SecretSettingsDrafts(std::collections::BTreeMap<String, String>);
 
@@ -608,6 +620,13 @@ impl ViewState {
     /// The interaction state for a pane, created on first sight.
     pub fn pane(&mut self, id: &PaneId) -> &mut PaneInteraction {
         self.panes.entry(id.clone()).or_default()
+    }
+
+    fn resize_owner_epoch(&self, runtime_id: &NodeId, pane_id: &PaneId) -> Option<u64> {
+        self.resize_owners
+            .get(runtime_id)
+            .filter(|owner| &owner.pane_id == pane_id)
+            .map(|owner| owner.epoch)
     }
 
     /// Whether anything is on screen that must not be interrupted.
@@ -3005,6 +3024,75 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    /// Chooses one geometry writer per live runtime before any Pane is rendered.
+    ///
+    /// An explicit temporary terminal is the operator's current view and therefore wins.
+    /// Otherwise the focused Layout Pane wins; without either, the lexical PaneId is a
+    /// deterministic fallback. This makes duplicate and floating views read-only mirrors
+    /// instead of competing PTY resize authorities.
+    fn reconcile_resize_owners(&self, state: &mut ViewState) {
+        let mut desired: HashMap<NodeId, PaneId> = HashMap::new();
+
+        // Start with a stable fallback. `self.panes` may arrive in Layout order, but process
+        // geometry must not depend on a split-tree traversal changing after a relocation.
+        for content in &self.panes {
+            let Some(runtime_id) = &content.runtime_id else {
+                continue;
+            };
+            desired
+                .entry(runtime_id.clone())
+                .and_modify(|candidate| {
+                    if content.pane_id.as_str() < candidate.as_str() {
+                        *candidate = content.pane_id.clone();
+                    }
+                })
+                .or_insert_with(|| content.pane_id.clone());
+        }
+
+        // Persisted focus outranks the fallback whether the Pane is tiled or floating.
+        for content in &self.panes {
+            if let Some(runtime_id) = &content.runtime_id {
+                if content.focused {
+                    desired.insert(runtime_id.clone(), content.pane_id.clone());
+                }
+            }
+        }
+
+        // A temporary terminal is an explicit operator choice and sits above the Layout.
+        if let Some(temporary) = self.temporary_pane.as_ref().filter(|temporary| {
+            matches!(
+                temporary.pane.capability,
+                NodePaneCapability::Terminal { .. }
+            )
+        }) {
+            desired.insert(
+                temporary.pane.binding.node_id.clone(),
+                temporary.pane.binding.pane_id.clone(),
+            );
+        }
+
+        state
+            .resize_owners
+            .retain(|runtime_id, _| desired.contains_key(runtime_id));
+        for (runtime_id, pane_id) in desired {
+            let unchanged = state
+                .resize_owners
+                .get(&runtime_id)
+                .is_some_and(|owner| owner.pane_id == pane_id);
+            if unchanged {
+                continue;
+            }
+            state.next_resize_owner_epoch = state.next_resize_owner_epoch.wrapping_add(1).max(1);
+            state.resize_owners.insert(
+                runtime_id,
+                ResizeOwner {
+                    pane_id,
+                    epoch: state.next_resize_owner_epoch,
+                },
+            );
+        }
+    }
+
     fn preferred_pane_placement(&self) -> PanePlacement {
         match self
             .settings
@@ -3144,6 +3232,7 @@ impl<'a> TurnView<'a> {
             }
             state.observed_temporary_pane = temporary_pane_id;
         }
+        self.reconcile_resize_owners(state);
 
         actions.extend(self.status_bar(ui, theme, keymap, hierarchy.as_ref(), state));
         if let Some(permission) = &self.permission {
@@ -8459,6 +8548,9 @@ impl<'a> TurnView<'a> {
                     });
                 }
                 (None, Some(content)) => {
+                    let resize_epoch = content.runtime_id.as_ref().and_then(|runtime_id| {
+                        state.resize_owner_epoch(runtime_id, &placed.pane_id)
+                    });
                     let options = PaneOptions {
                         focused,
                         accepts_input: focused && accepts_terminal_input,
@@ -8481,7 +8573,12 @@ impl<'a> TurnView<'a> {
                             grid: content.grid,
                             options,
                             id,
-                            runtime_id: content.runtime_id.as_ref(),
+                            resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                                resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                    runtime_id,
+                                    owner_epoch,
+                                })
+                            }),
                             chrome: Some(terminal::PaneChrome {
                                 shortcuts: &shortcuts,
                                 context: &pane_context,
@@ -8656,6 +8753,10 @@ impl<'a> TurnView<'a> {
                     ui.separator();
                     let body = ui.available_rect_before_wrap();
                     if let Some(content) = content {
+                        let resize_epoch = content
+                            .runtime_id
+                            .as_ref()
+                            .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &pane_id));
                         let options = PaneOptions {
                             focused: layout.active.as_ref() == Some(&pane_id),
                             accepts_input: !state.is_sensitive()
@@ -8674,7 +8775,12 @@ impl<'a> TurnView<'a> {
                                 grid: content.grid,
                                 options,
                                 id: ui.id().with(("floating-terminal", pane_id.as_str())),
-                                runtime_id: content.runtime_id.as_ref(),
+                                resize_claim: content.runtime_id.as_ref().and_then(|runtime_id| {
+                                    resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                                        runtime_id,
+                                        owner_epoch,
+                                    })
+                                }),
                                 chrome: None,
                             },
                         )
@@ -8813,6 +8919,10 @@ impl<'a> TurnView<'a> {
                     history_complete: true,
                 };
                 let pane_id = temporary.pane.binding.pane_id.clone();
+                let resize_epoch = state.resize_owner_epoch(
+                    &temporary.pane.binding.node_id,
+                    &temporary.pane.binding.pane_id,
+                );
                 let interaction = state.pane(&pane_id);
                 let id = ui.id().with(("temporary-terminal", pane_id.as_str()));
                 for action in terminal::show_pane(
@@ -8824,7 +8934,10 @@ impl<'a> TurnView<'a> {
                         grid,
                         options,
                         id,
-                        runtime_id: Some(&temporary.pane.binding.node_id),
+                        resize_claim: resize_epoch.map(|owner_epoch| terminal::ResizeClaim {
+                            runtime_id: &temporary.pane.binding.node_id,
+                            owner_epoch,
+                        }),
                         chrome: None,
                     },
                 )
