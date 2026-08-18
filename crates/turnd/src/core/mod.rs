@@ -28,6 +28,8 @@ pub mod events;
 pub mod hosting;
 pub mod output;
 pub mod preview;
+#[cfg(test)]
+mod profile_acceptance;
 mod quota;
 pub mod requests;
 pub mod restore;
