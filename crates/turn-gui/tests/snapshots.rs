@@ -2192,6 +2192,45 @@ fn an_agent_pane_exposes_provider_and_mode_without_requiring_flags() {
 }
 
 #[test]
+fn the_pane_menu_launches_any_provider_mode_without_opening_advanced_settings() {
+    let mut h = harness(busy_desk());
+    h.run();
+    h.run();
+    h.query_by_label("+ Pane")
+        .expect("the Session toolbar has a Pane menu")
+        .click();
+    h.run();
+
+    for label in [
+        "Claude · Safe",
+        "Claude · Autonomous",
+        "Codex · Safe",
+        "Codex · Autonomous",
+        "Gemini · Safe",
+        "Gemini · Autonomous",
+        "OpenCode · Safe",
+        "OpenCode · Autonomous",
+    ] {
+        assert!(
+            h.query_by_label(label).is_some(),
+            "the zero-memory Pane menu is missing {label:?}"
+        );
+    }
+
+    h.state_mut().actions.clear();
+    h.query_by_label("Codex · Autonomous").unwrap().click();
+    h.run();
+    assert!(h.state().actions.iter().any(|action| matches!(
+        action,
+        ViewAction::CreatePane { pane, .. }
+            if pane.command.as_deref() == Some("codex")
+                && pane.args.is_empty()
+                && pane.launch_profile.as_ref().is_some_and(|profile|
+                    profile.adapter_id == "codex" && profile.profile_id == "autonomous")
+    )));
+}
+
+#[test]
 fn operational_messages_use_the_existing_bottom_status_bar() {
     let mut fixture = busy_desk();
     fixture.permission = None;
