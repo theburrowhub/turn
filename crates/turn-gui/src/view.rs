@@ -473,6 +473,13 @@ impl std::fmt::Debug for LogoTexture {
 pub struct ViewState {
     pub palette: Palette,
     pub panes: HashMap<PaneId, PaneInteraction>,
+    /// The live binding for every terminal interaction above.
+    ///
+    /// PaneIds are durable view identities, so a daemon update may legitimately keep one
+    /// while replacing the process it shows. Remembering the binding separately lets the
+    /// next frame discard selections, links and GPU-backed image textures from the previous
+    /// process instead of lending them to its replacement.
+    pane_interaction_bindings: HashMap<PaneId, PaneInteractionBinding>,
     /// Exactly one visible operational Pane owns each runtime's PTY geometry. Duplicate
     /// Panes are mirrors until focus (or an explicit temporary Pane) transfers this lease.
     resize_owners: HashMap<NodeId, ResizeOwner>,
@@ -588,9 +595,6 @@ pub struct ViewState {
     /// Exact Node whose bounded activity projection was last requested for the
     /// WorkSurface. The response cache is keyed by NodeId as a second stale fence.
     pub node_preview_key: Option<NodeId>,
-    /// Read-only terminal mirrors have interaction state separate from saved Panes.
-    /// In particular, measuring a full-surface mirror can never resize the Layout Pane.
-    pub node_terminal_views: HashMap<NodeId, PaneInteraction>,
     /// Current closed navigation target and measured Node surface, for diagnostics and
     /// deterministic geometry acceptance. Neither value is persisted in the Layout.
     pub work_surface_target: Option<ViewTarget>,
@@ -604,6 +608,24 @@ pub struct ViewState {
 struct ResizeOwner {
     pane_id: PaneId,
     epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneInteractionBinding {
+    session_id: SessionId,
+    semantic_node_id: Option<NodeId>,
+    runtime_id: Option<NodeId>,
+}
+
+impl PaneInteractionBinding {
+    fn is_replaced_by(&self, next: &Self) -> bool {
+        self.session_id != next.session_id
+            || self.semantic_node_id != next.semantic_node_id
+            || matches!(
+                (&self.runtime_id, &next.runtime_id),
+                (Some(previous), Some(current)) if previous != current
+            )
+    }
 }
 
 #[derive(Default)]
@@ -3026,6 +3048,116 @@ fn active_session_context<'a>(
 }
 
 impl<'a> TurnView<'a> {
+    /// Reconciles window-local terminal resources with the surfaces this frame can draw.
+    ///
+    /// `PaneInteraction` owns more than small input state: its image cache may hold several
+    /// megabytes of CPU pixels and GPU textures. Immediate-mode rendering does not destroy
+    /// that state when a Pane closes, so the window must make those lifetimes explicit here.
+    fn reconcile_terminal_view_state(
+        &self,
+        state: &mut ViewState,
+        hierarchy: Option<&HierarchySnapshot>,
+    ) {
+        let session_is_live = |session_id: &SessionId| {
+            hierarchy.is_none_or(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .flat_map(|workspace| &workspace.sessions)
+                    .any(|session| &session.session.id == session_id)
+            })
+        };
+        let layout_is_live = self.selected.as_ref().is_some_and(&session_is_live);
+        let mut live_bindings = HashMap::new();
+        if let Some(layout) = self.layout.as_ref().filter(|_| layout_is_live) {
+            let session_id = self
+                .selected
+                .as_ref()
+                .expect("a live Layout has a selected Session");
+            for pane in layout
+                .panes()
+                .into_iter()
+                .filter(|pane| pane.kind.is_terminal())
+            {
+                let observed_runtime_id = self
+                    .panes
+                    .iter()
+                    .find(|content| content.pane_id == pane.id)
+                    .and_then(|content| content.runtime_id.clone());
+                let previous_runtime_id = state
+                    .pane_interaction_bindings
+                    .get(&pane.id)
+                    .filter(|previous| {
+                        previous.session_id == *session_id
+                            && previous.semantic_node_id == pane.node_id
+                    })
+                    .and_then(|previous| previous.runtime_id.clone());
+                live_bindings.insert(
+                    pane.id.clone(),
+                    PaneInteractionBinding {
+                        session_id: session_id.clone(),
+                        semantic_node_id: pane.node_id.clone(),
+                        // A missing feed is an attach/relaunch gap, not evidence that the
+                        // runtime changed. Preserve the last observed owner until a new
+                        // PaneContent can identify its replacement.
+                        runtime_id: observed_runtime_id.or(previous_runtime_id),
+                    },
+                );
+            }
+        }
+        if let Some(temporary) = self.temporary_pane.as_ref().filter(|temporary| {
+            matches!(
+                temporary.pane.capability,
+                NodePaneCapability::Terminal { .. }
+            ) && session_is_live(&temporary.pane.binding.session_id)
+        }) {
+            let previous_runtime_id = state
+                .pane_interaction_bindings
+                .get(&temporary.pane.binding.pane_id)
+                .filter(|previous| {
+                    previous.session_id == temporary.pane.binding.session_id
+                        && previous.semantic_node_id.as_ref()
+                            == Some(&temporary.pane.binding.node_id)
+                })
+                .and_then(|previous| previous.runtime_id.clone());
+            live_bindings.insert(
+                temporary.pane.binding.pane_id.clone(),
+                PaneInteractionBinding {
+                    session_id: temporary.pane.binding.session_id.clone(),
+                    semantic_node_id: Some(temporary.pane.binding.node_id.clone()),
+                    runtime_id: temporary.runtime_id.clone().or(previous_runtime_id),
+                },
+            );
+        }
+
+        // A stable PaneId with a different binding is a replacement, not a continuation.
+        // Drop the old interaction before recording the new owner so TextureHandles are
+        // released in this frame and no stale selection/search/link state crosses runtimes.
+        for (pane_id, binding) in &live_bindings {
+            if state
+                .pane_interaction_bindings
+                .get(pane_id)
+                .is_some_and(|previous| previous.is_replaced_by(binding))
+            {
+                state.panes.remove(pane_id);
+            }
+        }
+        state
+            .panes
+            .retain(|pane_id, _| live_bindings.contains_key(pane_id));
+        state.pane_interaction_bindings = live_bindings;
+
+        // Geometry is useful only while the corresponding Pane is still floating in the
+        // selected Layout. This also runs while a Workspace or Node surface is selected,
+        // where `floating_panes` itself is intentionally not rendered.
+        state.floating_geometry.retain(|pane_id, _| {
+            layout_is_live
+                && self.layout.as_ref().is_some_and(|layout| {
+                    layout.is_floating(pane_id) && layout.get(pane_id).is_some()
+                })
+        });
+    }
+
     /// Chooses one geometry writer per live runtime before any Pane is rendered.
     ///
     /// An explicit temporary terminal is the operator's current view and therefore wins.
@@ -3317,6 +3449,7 @@ impl<'a> TurnView<'a> {
                 self.selected.as_ref(),
             )
         });
+        self.reconcile_terminal_view_state(state, hierarchy.as_ref());
         let primary_pane = match work_target {
             Some(work_surface::ResolvedViewTarget::Node { node, .. }) => self
                 .exact_terminal(node)
@@ -8739,15 +8872,6 @@ impl<'a> TurnView<'a> {
             return Vec::new();
         };
         let mut actions = Vec::new();
-        let live_ids: HashSet<PaneId> = layout
-            .floating
-            .iter()
-            .map(|floating| floating.pane_id.clone())
-            .collect();
-        state
-            .floating_geometry
-            .retain(|pane_id, _| live_ids.contains(pane_id));
-
         for floating in &layout.floating {
             let Some(pane) = layout.get(&floating.pane_id) else {
                 continue;
@@ -12712,7 +12836,7 @@ mod tests {
         SessionMode, Workspace,
     };
     use turn_core::state::{Lifecycle, Turn};
-    use turn_proto::{SessionSummary, TreeSurfaceState, WorkspaceSummary};
+    use turn_proto::{ImagePayload, SessionSummary, TreeSurfaceState, WorkspaceSummary};
 
     const T0: i64 = 1_700_000_000_000;
 
@@ -12797,6 +12921,122 @@ mod tests {
             }],
         };
         (snapshot, root_id, child_id, session_id)
+    }
+
+    fn cache_test_image(interaction: &mut PaneInteraction, value: u8) {
+        let payload = ImagePayload::new(1, 1, vec![value; 4]).expect("a one-pixel image");
+        interaction
+            .images
+            .insert(&egui::Context::default(), &payload);
+        assert_eq!(interaction.images.len(), 1);
+        assert_eq!(interaction.images.bytes(), 4);
+    }
+
+    #[test]
+    fn closing_a_terminal_pane_releases_its_interaction_and_floating_geometry() {
+        let session_id = SessionId::from_stored("sess_cache_close");
+        let mut terminal = Pane::new(PaneKind::Agent);
+        terminal.node_id = Some(NodeId::from_stored("proc_cache_close"));
+        let terminal_id = terminal.id.clone();
+        let mut layout = Layout::single(terminal);
+        assert!(layout.split(
+            &terminal_id,
+            Direction::Horizontal,
+            Pane::new(PaneKind::EventLog)
+        ));
+        assert!(layout.float(&terminal_id, PaneGeometry::default()));
+
+        let mut view = TurnView {
+            selected: Some(session_id),
+            layout: Some(layout),
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+        view.reconcile_terminal_view_state(&mut state, None);
+        cache_test_image(state.pane(&terminal_id), 7);
+        state
+            .floating_geometry
+            .insert(terminal_id.clone(), PaneGeometry::default());
+        view.reconcile_terminal_view_state(&mut state, None);
+        assert_eq!(state.panes.len(), 1);
+        assert_eq!(state.floating_geometry.len(), 1);
+
+        assert!(view
+            .layout
+            .as_mut()
+            .expect("the active layout")
+            .close(&terminal_id));
+        view.reconcile_terminal_view_state(&mut state, None);
+
+        assert!(state.panes.is_empty());
+        assert!(state.pane_interaction_bindings.is_empty());
+        assert!(state.floating_geometry.is_empty());
+    }
+
+    #[test]
+    fn a_pane_rebind_or_removed_session_cannot_inherit_terminal_resources() {
+        let session_id = SessionId::from_stored("sess_cache_rebind");
+        let semantic_node = NodeId::from_stored("proc_cache_agent");
+        let old_runtime = NodeId::from_stored("proc_cache_shell_old");
+        let new_runtime = NodeId::from_stored("proc_cache_shell_new");
+        let mut pane = Pane::new(PaneKind::Agent);
+        pane.node_id = Some(semantic_node);
+        let pane_id = pane.id.clone();
+        let grid = Grid::blank(1, 1);
+        let mut view = TurnView {
+            selected: Some(session_id),
+            layout: Some(Layout::single(pane)),
+            panes: vec![PaneContent {
+                pane_id: pane_id.clone(),
+                runtime_id: Some(old_runtime),
+                title: "hosted agent".into(),
+                grid: &grid,
+                focused: true,
+                scrolled: false,
+                history_complete: true,
+            }],
+            ..TurnView::default()
+        };
+        let mut state = ViewState::default();
+        view.reconcile_terminal_view_state(&mut state, None);
+        cache_test_image(state.pane(&pane_id), 11);
+
+        view.panes.clear();
+        view.reconcile_terminal_view_state(&mut state, None);
+        assert_eq!(
+            state.panes[&pane_id].images.bytes(),
+            4,
+            "an attach gap is not a runtime replacement"
+        );
+
+        view.panes.push(PaneContent {
+            pane_id: pane_id.clone(),
+            runtime_id: Some(new_runtime.clone()),
+            title: "hosted agent".into(),
+            grid: &grid,
+            focused: true,
+            scrolled: false,
+            history_complete: true,
+        });
+        view.reconcile_terminal_view_state(&mut state, None);
+
+        assert!(state.panes.is_empty(), "the former binding owns the cache");
+        assert_eq!(
+            state
+                .pane_interaction_bindings
+                .get(&pane_id)
+                .and_then(|binding| binding.runtime_id.as_ref()),
+            Some(&new_runtime)
+        );
+        assert!(state.pane(&pane_id).images.is_empty());
+        cache_test_image(state.pane(&pane_id), 13);
+
+        let removed = HierarchySnapshot::empty("cache-test", 2);
+        view.reconcile_terminal_view_state(&mut state, Some(&removed));
+
+        assert!(state.panes.is_empty());
+        assert!(state.pane_interaction_bindings.is_empty());
+        assert!(state.floating_geometry.is_empty());
     }
 
     #[test]
