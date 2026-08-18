@@ -255,8 +255,13 @@ impl Core {
         changed.structure |= !terminal_dependents.is_empty();
         let preview_changed = !changed.refused
             && self.update_preview_from_event(&event, changed.node.as_ref(), now_ms);
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.touch(now_ms);
+        // Capacity/status refreshes are telemetry, not operator or agent
+        // activity. Letting a periodic quota probe touch the Session would move
+        // otherwise idle work to the top of the attention-oriented navigator.
+        if !matches!(&event.kind, EventKind::AgentRuntimeObserved { .. }) {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                session.touch(now_ms);
+            }
         }
 
         // An event too weak to change the state is also too weak to demand attention.
@@ -1213,5 +1218,41 @@ mod tests {
             agent.runtime.context.value().unwrap().measurement.amount,
             82_000.0
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_telemetry_does_not_make_an_idle_session_look_recent() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_runtime_recency");
+        harness.add_session(session_id.clone(), PaneId::new(), NOW);
+
+        let mut node = ProcessNode::agent(session_id.clone(), "codex", "/repo", NOW);
+        node.lifecycle = Lifecycle::Alive;
+        node.turn = Some(Turn::Idle);
+        let node_id = node.id.clone();
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .tree
+            .insert(node);
+
+        let event = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentRuntimeObserved {
+                runtime: Box::new(observed_runtime(NOW + 60_000, 42_000, "gpt-current")),
+            },
+            EventSource::SideChannel {
+                tool: "codex".into(),
+                channel: "account quota".into(),
+            },
+            Confidence::Explicit,
+            NOW + 60_000,
+        )
+        .with_node(node_id);
+
+        harness.core.ingest(event, NOW + 60_000);
+        assert_eq!(harness.core.sessions[&session_id].last_activity_ms, NOW);
     }
 }

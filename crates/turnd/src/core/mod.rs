@@ -28,6 +28,7 @@ pub mod events;
 pub mod hosting;
 pub mod output;
 pub mod preview;
+mod quota;
 pub mod requests;
 pub mod restore;
 pub mod screens;
@@ -261,6 +262,16 @@ pub struct Core {
     /// bytes never live here; only a candidate row and scheduling metadata do.
     pub(crate) preview_probes: HashMap<NodeId, preview::PreviewProbe>,
 
+    /// One provider/account quota cache shared by every Codex node.
+    ///
+    /// Account limits belong to the authenticated local CLI account, not to a
+    /// conversation. Keeping the coordinator here prevents a large Session tree
+    /// from starting one provider process per node.
+    pub(crate) account_quota: quota::AccountQuotaCoordinator,
+    /// The sole detached account-quota probe, retained so shutdown can cancel it
+    /// and the child process's kill-on-drop guard can run immediately.
+    pub(crate) account_quota_probe: Option<JoinHandle<()>>,
+
     /// Review-before-send drafts and a bounded replay fence. Bodies exist only in
     /// `pending_context_handoffs`; delivered entries retain metadata, never text.
     pub(crate) pending_context_handoffs: HashMap<HandoffId, PendingContextHandoff>,
@@ -341,6 +352,8 @@ impl Core {
             turn_authority: HashMap::new(),
             background_tasks: HashMap::new(),
             preview_probes: HashMap::new(),
+            account_quota: quota::AccountQuotaCoordinator::default(),
+            account_quota_probe: None,
             pending_context_handoffs: HashMap::new(),
             finished_context_handoffs: HashMap::new(),
             hierarchy_revision: 1,
@@ -438,6 +451,9 @@ impl Core {
                 dropped,
             } => self.deliver_output(&node, data, dropped, now),
             Command::Exited { node, info } => self.node_exited(&node, info, now),
+            Command::AccountQuotaProbeFinished { result } => {
+                self.account_quota_probe_finished(result, now)
+            }
             Command::Shutdown { .. } => unreachable!("shutdown is handled by the run loop"),
         }
         false
@@ -458,6 +474,7 @@ impl Core {
         self.observe_heuristics(now_ms);
         self.observe_process_titles(now_ms);
         self.observe_activity_previews(now_ms);
+        self.observe_account_quotas(now_ms);
         self.heartbeat_workspace_leases(now_ms);
         if now_ms.saturating_sub(self.last_privacy_maintenance_ms)
             >= PRIVACY_MAINTENANCE_INTERVAL_MS
@@ -514,6 +531,9 @@ impl Core {
             pump.abort();
         }
         self.pumps.clear();
+        if let Some(probe) = self.account_quota_probe.take() {
+            probe.abort();
+        }
         self.flush();
         self.release_write_authority(now_ms);
     }

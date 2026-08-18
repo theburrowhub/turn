@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use turn_core::ids::NodeId;
 use turn_proto::{ProtoError, Request, RequestId, Response, ServerFrame};
 
+use super::quota::QuotaProbeResult;
+
 /// A connected client, numbered in accept order.
 ///
 /// A counter rather than a random id: it appears in log lines, and "client 3" is
@@ -56,6 +58,8 @@ pub enum Command {
         node: NodeId,
         info: turn_pty::ExitInfo,
     },
+    /// The single shared provider/account quota probe finished.
+    AccountQuotaProbeFinished { result: QuotaProbeResult },
     /// Stop: flush state to the store and end the loop.
     Shutdown { done: oneshot::Sender<()> },
 }
@@ -82,6 +86,11 @@ impl std::fmt::Debug for Command {
                 write!(f, "Output({node}, {} bytes, {dropped} dropped)", data.len())
             }
             Command::Exited { node, info } => write!(f, "Exited({node}, {info:?})"),
+            // The result can contain provider-account capacity. Its values do not
+            // belong in daemon diagnostics.
+            Command::AccountQuotaProbeFinished { .. } => {
+                f.write_str("AccountQuotaProbeFinished(codex)")
+            }
             Command::Shutdown { .. } => f.write_str("Shutdown"),
         }
     }
