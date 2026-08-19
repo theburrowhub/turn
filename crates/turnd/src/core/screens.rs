@@ -254,6 +254,8 @@ impl Core {
 mod tests {
     use crate::core::testing::Harness;
     use turn_core::ids::{PaneId, SessionId};
+    use turn_core::model::ProcessNode;
+    use turn_core::state::Lifecycle;
     use turn_proto::{Grid, PaneStream, PtySize, Request, Response, ServerEvent, ServerMessage};
 
     const NOW: i64 = 1_775_000_000_000;
@@ -346,6 +348,12 @@ mod tests {
             .get_mut(&shell)
             .expect("the hosting shell")
             .hosted = Some(agent_id.clone());
+        harness
+            .core
+            .processes
+            .get_mut(&shell)
+            .expect("the hosting shell")
+            .observed_subject = Some(agent_id.clone());
         let session_model = harness
             .core
             .sessions
@@ -516,6 +524,69 @@ mod tests {
             )
             .expect_err("zero rows are a layout bug, not a 1x80 terminal");
         assert_eq!(error.code, turn_proto::ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn only_a_truly_empty_pane_may_attach_to_a_blank_terminal() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_blank_guard");
+        let pane_id = PaneId::from_stored("pane_blank_guard");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let mut subject = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        subject.lifecycle = Lifecycle::Alive;
+        let subject_id = subject.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.insert(subject);
+            session.layout.get_mut(&pane_id).unwrap().node_id = Some(subject_id);
+        }
+        let (client, _frames) = harness.add_client(8);
+
+        let error = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id: session_id.clone(),
+                    pane_id: pane_id.clone(),
+                    size: PtySize::new(12, 34),
+                    stream: PaneStream::Cells,
+                },
+                NOW,
+            )
+            .expect_err("a bound semantic Process cannot invent an empty terminal");
+        assert_eq!(error.code, turn_proto::ErrorCode::Conflict);
+
+        harness
+            .core
+            .sessions
+            .get_mut(&session_id)
+            .unwrap()
+            .layout
+            .get_mut(&pane_id)
+            .unwrap()
+            .node_id = None;
+        let response = harness
+            .core
+            .dispatch(
+                client,
+                Request::AttachPane {
+                    session_id,
+                    pane_id,
+                    size: PtySize::new(12, 34),
+                    stream: PaneStream::Cells,
+                },
+                NOW,
+            )
+            .expect("an intentionally empty slot has an honest blank surface");
+        let Response::Attached { attachment } = response else {
+            panic!("expected an attachment, got {response:?}")
+        };
+        assert!(attachment.node_id.is_none());
+        assert!(attachment.runtime_id.is_none());
+        let screen = attachment.screen.expect("cells always carry a screen");
+        assert_eq!(screen.rows, 12);
+        assert_eq!(screen.cols, 34);
     }
 
     /// The everyday path: a process prints, and the cells that arrive say what it

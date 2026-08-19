@@ -21,6 +21,10 @@ pub struct ObservedProcess {
     pub ppid: Option<u32>,
     /// Executable name, e.g. `node`.
     pub name: String,
+    /// Kernel-reported executable path, falling back to [`Self::name`] only when
+    /// the platform does not expose it. Unlike argv[0], this is not controlled by
+    /// `exec -a` or a runtime changing its process title.
+    pub executable: String,
     /// Full command line, when the OS lets us read it.
     pub command_line: String,
     /// Argument boundaries as reported by the OS. This remains raw supervisor
@@ -135,22 +139,29 @@ impl ProcessSupervisor {
     pub fn observe(&self, pid: u32) -> Option<ObservedProcess> {
         let process = self.system.process(Pid::from_u32(pid))?;
         let name = process.name().to_string_lossy().to_string();
+        let executable = process
+            .exe()
+            .map(|path| path.to_string_lossy().to_string())
+            .filter(|path| !path.is_empty())
+            .unwrap_or_else(|| name.clone());
         let args = process
             .cmd()
             .iter()
             .map(|part| part.to_string_lossy().to_string())
             .collect::<Vec<_>>();
         let command_line = args.join(" ");
-        let effective = if command_line.is_empty() {
-            name.clone()
-        } else {
-            command_line.clone()
-        };
+        let (program, program_args) = args
+            .split_first()
+            .map_or((name.as_str(), &[][..]), |(program, args)| {
+                (program.as_str(), args)
+            });
+        let kind = classify_argv(program, program_args);
 
         Some(ObservedProcess {
             pid,
             ppid: process.parent().map(|p| p.as_u32()),
             name,
+            executable,
             command_line,
             args,
             cwd: process.cwd().map(|path| path.to_string_lossy().to_string()),
@@ -160,7 +171,7 @@ impl ProcessSupervisor {
                 0 => None,
                 seconds => i64::try_from(seconds).ok().map(|seconds| seconds * 1_000),
             },
-            kind: classify(&effective),
+            kind,
         })
     }
 
@@ -181,16 +192,37 @@ impl ProcessSupervisor {
 /// which still appears in the tree. Turn showing an honest "unknown process" is
 /// better than confidently mislabelling it.
 pub fn classify(command_line: &str) -> NodeKind {
-    let lower = command_line.to_ascii_lowercase();
-    // Match on the executable rather than the whole line, so a shell command
-    // that merely *mentions* claude is not classified as an agent.
+    let mut words = command_line.split_whitespace();
+    let Some(program) = words.next() else {
+        return NodeKind::Unknown;
+    };
+    let args = words.map(str::to_string).collect::<Vec<_>>();
+    classify_argv(program, &args)
+}
+
+/// Classifies one process without throwing away argument boundaries.
+///
+/// Process-table observations and Pane launches both already have an argv. Keeping
+/// it structured prevents prose such as `echo test` or JavaScript passed to
+/// `node --eval` from turning into a Test or Server node merely because it contains
+/// a familiar word.
+pub fn classify_argv(program: &str, args: &[String]) -> NodeKind {
+    let lower = program.to_ascii_lowercase();
+    // Match on the executable rather than the whole argv, so a command that merely
+    // *mentions* an integrated tool is not classified as that tool. Accept both path
+    // separators because restored Windows launch definitions are valid input on every
+    // platform even when the current daemon cannot execute them.
     let executable = lower
-        .split_whitespace()
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
+        .strip_suffix(".exe")
+        .unwrap_or_else(|| lower.rsplit(['/', '\\']).next().unwrap_or(""));
+    let arguments = args
+        .iter()
+        .map(|argument| argument.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let arg = |index: usize| arguments.get(index).map(String::as_str);
 
     let is_word = |needle: &str| executable == needle;
 
@@ -246,21 +278,75 @@ pub fn classify(command_line: &str) -> NodeKind {
         return NodeKind::TmuxSession;
     }
 
-    // Beyond the executable name, the arguments carry the intent.
-    if lower.contains(" test") || is_word("pytest") || is_word("jest") || is_word("vitest") {
+    if is_word("pytest") || is_word("jest") || is_word("vitest") {
         return NodeKind::TestRunner;
     }
-    if lower.contains(" build") || is_word("make") || is_word("ninja") {
+    if is_word("make") || is_word("ninja") {
         return NodeKind::Build;
     }
-    if lower.contains(" serve")
-        || lower.contains(" dev")
-        || lower.contains("runserver")
-        || lower.contains("http.server")
-    {
-        return NodeKind::Server;
+
+    // Multi-purpose launchers need an exact first subcommand. Arbitrary later
+    // arguments are data, not evidence: `cargo metadata test` is metadata and
+    // `npm exec echo run dev` is neither a Server nor a build.
+    let script_kind = |script: Option<&str>| match script {
+        Some("test") => Some(NodeKind::TestRunner),
+        Some("build") => Some(NodeKind::Build),
+        Some("dev" | "serve" | "start") => Some(NodeKind::Server),
+        Some("watch") => Some(NodeKind::Watcher),
+        _ => None,
+    };
+    match executable {
+        "cargo" => match arg(0) {
+            Some("test") => return NodeKind::TestRunner,
+            Some("build") => return NodeKind::Build,
+            Some("watch") => return NodeKind::Watcher,
+            _ => {}
+        },
+        "go" => match arg(0) {
+            Some("test") => return NodeKind::TestRunner,
+            Some("build") => return NodeKind::Build,
+            _ => {}
+        },
+        "dotnet" => match arg(0) {
+            Some("test") => return NodeKind::TestRunner,
+            Some("build") => return NodeKind::Build,
+            Some("watch") => return NodeKind::Watcher,
+            _ => {}
+        },
+        "npm" => {
+            let kind = match arg(0) {
+                Some("test") => Some(NodeKind::TestRunner),
+                Some("start") => Some(NodeKind::Server),
+                Some("run" | "run-script") => script_kind(arg(1)),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                return kind;
+            }
+        }
+        "pnpm" | "yarn" | "bun" => {
+            let kind = match arg(0) {
+                Some("run" | "run-script") => script_kind(arg(1)),
+                direct => script_kind(direct),
+            };
+            if let Some(kind) = kind {
+                return kind;
+            }
+        }
+        "python" | "python3"
+            if matches!((arg(0), arg(1)), (Some("-m"), Some("http.server")))
+                || (arg(0).is_some_and(|value| {
+                    value
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .is_some_and(|name| name == "manage.py")
+                }) && arg(1) == Some("runserver")) =>
+        {
+            return NodeKind::Server;
+        }
+        _ => {}
     }
-    if is_word("watchman") || lower.contains(" watch") {
+    if is_word("watchman") {
         return NodeKind::Watcher;
     }
 
@@ -310,6 +396,70 @@ mod tests {
         assert_eq!(classify("make build"), NodeKind::Build);
         assert_eq!(classify("npm run dev"), NodeKind::Server);
         assert_eq!(classify("tmux new-session"), NodeKind::TmuxSession);
+    }
+
+    #[test]
+    fn structured_arguments_classify_only_exact_launcher_subcommands() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            classify_argv("cargo", &args(&["test"])),
+            NodeKind::TestRunner
+        );
+        assert_eq!(
+            classify_argv("npm", &args(&["run", "dev"])),
+            NodeKind::Server
+        );
+        for (program, arguments, expected) in [
+            ("cargo", args(&["watch", "-x", "test"]), NodeKind::Watcher),
+            ("go", args(&["test", "./..."]), NodeKind::TestRunner),
+            ("go", args(&["build", "./cmd/x"]), NodeKind::Build),
+            ("dotnet", args(&["test", "app.sln"]), NodeKind::TestRunner),
+            ("dotnet", args(&["watch", "run"]), NodeKind::Watcher),
+            ("yarn", args(&["dev"]), NodeKind::Server),
+            ("pnpm", args(&["build"]), NodeKind::Build),
+            ("bun", args(&["test"]), NodeKind::TestRunner),
+            ("bun", args(&["run", "watch"]), NodeKind::Watcher),
+        ] {
+            assert_eq!(classify_argv(program, &arguments), expected);
+        }
+        assert_eq!(
+            classify_argv("python3", &args(&["-m", "http.server", "8000"])),
+            NodeKind::Server
+        );
+
+        for (program, arguments) in [
+            ("echo", args(&["test"])),
+            ("node", args(&["--eval", "npm run dev"])),
+            ("cargo", args(&["metadata", "test"])),
+            ("cargo", args(&["run", "build"])),
+            ("go", args(&["env", "test"])),
+            ("go", args(&["run", "./cmd/test"])),
+            ("dotnet", args(&["tool", "run", "test"])),
+            ("dotnet", args(&["run", "--", "test"])),
+            ("npm", args(&["exec", "echo", "run", "dev"])),
+            ("npm", args(&["config", "get", "test"])),
+            ("npm", args(&["run", "developer"])),
+            ("npm", args(&["run dev"])),
+            ("yarn", args(&["dlx", "echo", "build"])),
+            ("yarn", args(&["workspaces", "foreach", "run", "test"])),
+            ("pnpm", args(&["exec", "echo", "dev"])),
+            ("bun", args(&["x", "echo", "test"])),
+            ("bun", args(&["--eval", "npm run dev"])),
+            ("python", args(&["-c", "code", "manage.py", "runserver"])),
+            ("python", args(&["app.py", "manage.py", "runserver"])),
+        ] {
+            assert_eq!(
+                classify_argv(program, &arguments),
+                NodeKind::Unknown,
+                "{program} {arguments:?} must fail closed"
+            );
+        }
     }
 
     #[test]

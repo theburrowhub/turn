@@ -179,7 +179,10 @@ fn replace_obsolete_navigation_panes(template: &mut Template) -> bool {
         .layout
         .panes()
         .iter()
-        .filter(|pane| pane.kind == PaneKind::AgentTree)
+        .filter(|pane| {
+            pane.presentation_kind() == PaneKind::AgentTree
+                || pane.launch_kind() == PaneKind::AgentTree
+        })
         .map(|pane| pane.id.clone())
         .collect();
     for pane_id in &obsolete {
@@ -188,9 +191,12 @@ fn replace_obsolete_navigation_panes(template: &mut Template) -> bool {
             .get_mut(pane_id)
             .expect("the Pane id came from this Layout");
         pane.kind = PaneKind::Shell;
+        pane.launch_kind = None;
+        pane.kind_is_user_set = false;
         pane.title = Some("shell".into());
         pane.command = None;
         pane.args.clear();
+        pane.launch_profile = None;
         pane.cwd = None;
         pane.env.clear();
         pane.node_id = None;
@@ -338,7 +344,12 @@ mod tests {
         layout.split(
             &agent_id,
             Direction::Horizontal,
-            Pane::new(PaneKind::AgentTree).with_title("agents"),
+            Pane::new(PaneKind::AgentTree)
+                .with_launch_profile(turn_core::model::AgentLaunchProfileRef::new(
+                    "claude",
+                    "autonomous",
+                ))
+                .with_title("agents"),
         );
         let tree_id = layout.active.clone().unwrap();
         layout.split(
@@ -364,15 +375,34 @@ mod tests {
             .panes()
             .iter()
             .all(|pane| pane.kind != PaneKind::AgentTree));
-        assert!(restored
-            .layout
-            .panes()
-            .iter()
-            .any(|pane| pane.kind == PaneKind::Shell && pane.command.is_none()));
+        assert!(restored.layout.panes().iter().any(|pane| {
+            pane.kind == PaneKind::Shell
+                && pane.launch_kind() == PaneKind::Shell
+                && pane.command.is_none()
+                && pane.launch_profile.is_none()
+        }));
         assert!(restored.layout.panes().iter().any(|pane| {
             pane.kind == PaneKind::Server && pane.command.as_deref() == Some("cargo run")
         }));
         assert_eq!(store.templates().install_built_ins(T0 + 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_obsolete_navigation_launch_intent_is_migrated_even_after_a_view_override() {
+        let mut pane = turn_core::model::Pane::new(PaneKind::AgentTree).with_launch_profile(
+            turn_core::model::AgentLaunchProfileRef::new("codex", "autonomous"),
+        );
+        pane.override_kind(PaneKind::Shell);
+        let pane_id = pane.id.clone();
+        let mut template = Template::from_layout("Legacy navigator", &Layout::single(pane), T0);
+
+        assert!(replace_obsolete_navigation_panes(&mut template));
+        let migrated = template.layout.get(&pane_id).unwrap();
+        assert_eq!(migrated.presentation_kind(), PaneKind::Shell);
+        assert_eq!(migrated.launch_kind(), PaneKind::Shell);
+        assert!(!migrated.kind_is_user_set);
+        assert!(migrated.launch_profile.is_none());
+        assert!(!replace_obsolete_navigation_panes(&mut template));
     }
 
     #[test]

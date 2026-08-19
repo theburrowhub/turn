@@ -70,6 +70,12 @@ pub const DROP_EDGE_MAX: f32 = 96.0;
 pub struct PaneRect {
     pub pane_id: PaneId,
     pub kind: PaneKind,
+    /// True only when the operator pinned this renderer. False means `kind` is
+    /// daemon-detected and can follow a new semantic subject automatically.
+    pub kind_is_user_set: bool,
+    /// Runtime truth underneath the selected renderer. A manual terminal override
+    /// cannot make a semantic-only Process attachable.
+    pub terminal_capability: bool,
     /// The process behind it, when there is one. Absent for an empty slot after a
     /// partial restore, or for one of Turn's own views.
     pub node_id: Option<NodeId>,
@@ -80,7 +86,7 @@ pub struct PaneRect {
 impl PaneRect {
     /// Whether this pane is backed by a pty and therefore paints a grid.
     pub fn is_terminal(&self) -> bool {
-        self.kind.is_terminal()
+        self.terminal_capability
     }
 }
 
@@ -326,7 +332,9 @@ pub fn arrange(layout: &Layout, area: Rect) -> Arrangement {
 fn placed(pane: &turn_core::model::Pane, rect: Rect) -> PaneRect {
     PaneRect {
         pane_id: pane.id.clone(),
-        kind: pane.kind,
+        kind: pane.presentation_kind(),
+        kind_is_user_set: pane.kind_is_user_set,
+        terminal_capability: pane.has_terminal_capability(),
         node_id: pane.node_id.clone(),
         title: pane.title.clone(),
         rect,

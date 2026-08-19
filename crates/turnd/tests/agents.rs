@@ -10,7 +10,7 @@ use common::agent::*;
 use common::*;
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, EventKind, EventSource};
-use turn_core::model::{NodeKind, PaneKind};
+use turn_core::model::{NodeKind, PaneKind, PanePlacement};
 use turn_core::state::{AwaitingReason, DisplayState, Turn};
 use turn_proto::{CloseDisposition, HierarchyKey, NewPane, Request, Response, ServerEvent};
 
@@ -312,15 +312,18 @@ async fn an_idless_worker_permission_round_trips_through_hooks_to_the_reviewer()
             subject_node_id: reviewer.clone(),
         })
         .await;
-    assert!(matches!(
-        routed,
-        Response::PaneFocus {
-            focus: Some(ref focus)
-        } if focus.attention_subject_node_id.as_ref() == Some(&reviewer)
-            // The pane's shell, not the agent: the agent reads from that tty, so it is
-            // where a person answering the worker would type.
-            && focus.node_id == agent.shell
-    ));
+    assert!(
+        matches!(
+            routed,
+            Response::PaneFocus {
+                focus: Some(ref focus)
+            } if focus.attention_subject_node_id.as_ref() == Some(&reviewer)
+                // The Pane represents the parent Agent while its terminal resolver sends
+                // input to the Shell-owned PTY. Reviewer remains the exact demand subject.
+                && focus.node_id == agent.node
+        ),
+        "unexpected Attention focus route: {routed:?}"
+    );
 
     let prompt = fixtures()["UserPromptSubmit"].clone();
     assert!(prompt.get("agent_id").is_none());
@@ -1370,6 +1373,932 @@ async fn own_workspace(
 
 // ------------------------------------- an agent runs inside the pane's shell
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_hosted_agent_keeps_lifecycle_authority_while_another_agent_uses_its_terminal() {
+    let daemon = TestDaemon::start_with(inferring_registry).await;
+    let mut ui = daemon.connect().await;
+    let hosted = agent_session(&daemon, &mut ui, "hosted foreground handoff").await;
+    wait_for_agent_pid(&mut ui, &hosted.session, &hosted.node).await;
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: hosted.session.clone(),
+        })
+        .await,
+    );
+    let pane_id = before.layout.panes()[0].id.clone();
+
+    ui.ask(Request::WritePty {
+        session_id: hosted.session.clone(),
+        node_id: hosted.node.clone(),
+        data: turn_proto::TerminalBytes::new(vec![0x1a]),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: hosted.session.clone(),
+            })
+            .await,
+        );
+        if details.layout.get(&pane_id).unwrap().node_id.as_ref() == Some(&hosted.shell) {
+            assert!(row(&details, &hosted.node).lifecycle.is_running());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the hosted Agent did not yield terminal presentation after Ctrl-Z"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    ui.ask(Request::WritePty {
+        session_id: hosted.session.clone(),
+        node_id: hosted.shell.clone(),
+        data: turn_proto::TerminalBytes::new(b"sh -c 'sleep 30; :'\r".to_vec()),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let replacement = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: hosted.session.clone(),
+            })
+            .await,
+        );
+        if let Some(subject) = details
+            .layout
+            .get(&pane_id)
+            .unwrap()
+            .node_id
+            .as_ref()
+            .filter(|subject| *subject != &hosted.shell && *subject != &hosted.node)
+        {
+            assert_eq!(row(&details, subject).kind, NodeKind::Agent);
+            break subject.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement Agent never took foreground presentation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
+    // A's authenticated lifecycle channel remains A's while B owns only the screen.
+    post_hook(&hosted.hook, &fixtures()["Stop"]).await;
+    let turn = ui
+        .wait_for("the background hosted Agent's hook", |event| match event {
+            ServerEvent::NodeStateChanged { node_id, turn, .. }
+                if node_id == &hosted.node && turn.as_ref() == Some(&Turn::Done) =>
+            {
+                turn.clone()
+            }
+            _ => None,
+        })
+        .await;
+    assert_eq!(turn, Turn::Done);
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: hosted.session.clone(),
+        })
+        .await,
+    );
+    assert_eq!(
+        details.layout.get(&pane_id).unwrap().node_id,
+        Some(replacement.clone())
+    );
+    assert!(row(&details, &hosted.node).lifecycle.is_running());
+
+    ui.ask(Request::WritePty {
+        session_id: hosted.session.clone(),
+        node_id: replacement,
+        data: turn_proto::TerminalBytes::new(vec![0x03]),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: hosted.session.clone(),
+            })
+            .await,
+        );
+        if details.layout.get(&pane_id).unwrap().node_id.as_ref() == Some(&hosted.shell) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement Agent did not return control to the Shell"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    ui.attach_cells(&hosted.session, &pane_id, turn_proto::PtySize::new(20, 80))
+        .await;
+    ui.ask(Request::WritePty {
+        session_id: hosted.session.clone(),
+        node_id: hosted.shell.clone(),
+        data: turn_proto::TerminalBytes::new(
+            b"printf 'JOBS-BEGIN\\n'; jobs -l; printf 'JOBS-END\\n'\r".to_vec(),
+        ),
+    })
+    .await;
+    ui.wait_for_screen("JOBS-END").await;
+    ui.poll_screens().await;
+    let jobs = ui.screen(&hosted.session, &pane_id).text();
+    assert!(
+        jobs.contains("suspended") || jobs.contains("Stopped"),
+        "the original hosted job vanished while backgrounded:\n{jobs}"
+    );
+    let details = details_of(
+        ui.ask(Request::GetSession {
+            session_id: hosted.session.clone(),
+        })
+        .await,
+    );
+    assert!(row(&details, &hosted.node).lifecycle.is_running());
+    assert_eq!(row(&details, &hosted.node).turn, Some(Turn::Done));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_background_agent_does_not_steal_the_shell_pane() {
+    let daemon = TestDaemon::start_with(inferring_registry).await;
+    let mut ui = daemon.connect().await;
+    let root = daemon.data_dir().join("background-agent");
+    std::fs::create_dir_all(&root).unwrap();
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "background agent workspace".into(),
+            root: root.display().to_string(),
+        })
+        .await,
+    );
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "background agent".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Shell)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pane_id = before.layout.panes()[0].id.clone();
+    let shell_id = before.layout.panes()[0]
+        .node_id
+        .clone()
+        .expect("the automatic shell runtime");
+
+    // An interactive shell puts the job in its own background process group. The
+    // fixture's `sh` executable is a heuristic Agent and waits on `sleep` without
+    // reading the terminal, so it remains alive for both sides of the job-control
+    // transition without ever owning the foreground here.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"sh -c 'sleep 30; :' &\r".to_vec()),
+    })
+    .await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (background_id, detected) =
+        loop {
+            let details = details_of(
+                ui.ask(Request::GetSession {
+                    session_id: session.id.clone(),
+                })
+                .await,
+            );
+            let pane = details.layout.get(&pane_id).unwrap();
+            assert_eq!(
+                pane.node_id.as_ref(),
+                Some(&shell_id),
+                "a background Agent must never become the Pane subject"
+            );
+            assert_eq!(pane.presentation_kind(), PaneKind::Shell);
+            if let Some(agent) = details.tree.iter().find(|node| {
+                node.kind == NodeKind::Agent && node.parent.as_ref() == Some(&shell_id)
+            }) {
+                break (agent.node_id.clone(), details);
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the background Agent was not discovered within the debounced sweep"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+    assert_eq!(row(&detected, &background_id).kind, NodeKind::Agent);
+    assert_eq!(
+        detected.layout.get(&pane_id).unwrap().node_id.as_ref(),
+        Some(&shell_id)
+    );
+
+    // Job control changes foreground ownership without creating another PID. The
+    // already-known Agent must take the Pane when `fg` resumes it rather than being
+    // skipped forever merely because the discovery sweep saw it once in background.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"fg\r".to_vec()),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if pane.node_id.as_ref() == Some(&background_id) {
+            assert_eq!(pane.presentation_kind(), PaneKind::Agent);
+            assert!(row(&details, &background_id)
+                .pane_bindings
+                .iter()
+                .any(|binding| binding.pane_id == pane_id));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an Agent moved to foreground never became the Pane subject"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let duplicated = layout_of(
+        ui.ask(Request::DuplicatePane {
+            session_id: session.id.clone(),
+            pane_id: pane_id.clone(),
+        })
+        .await,
+    );
+    let exact_background_pane = duplicated
+        .panes()
+        .into_iter()
+        .find(|pane| pane.id != pane_id && pane.node_id.as_ref() == Some(&background_id))
+        .expect("the duplicate is an exact view of Agent A")
+        .id
+        .clone();
+    let pinned = layout_of(
+        ui.ask(Request::ChangePaneKind {
+            session_id: session.id.clone(),
+            pane_id: exact_background_pane.clone(),
+            kind: PaneKind::Terminal,
+        })
+        .await,
+    );
+    let pinned = pinned.get(&exact_background_pane).unwrap();
+    assert_eq!(pinned.presentation_kind(), PaneKind::Terminal);
+    assert!(pinned.kind_is_user_set);
+    assert_eq!(pinned.detected_kind, Some(PaneKind::Agent));
+    assert!(pinned.has_terminal_capability());
+    ui.attach_cells(&session.id, &pane_id, turn_proto::PtySize::new(20, 80))
+        .await;
+    ui.attach_cells(
+        &session.id,
+        &exact_background_pane,
+        turn_proto::PtySize::new(20, 80),
+    )
+    .await;
+
+    // Ctrl-Z is the inverse transition and carries no newline. Turn schedules a sweep
+    // for the unchanged control byte, sees the Shell's process group regain the PTY and
+    // returns presentation without pretending the stopped Agent exited.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: background_id.clone(),
+        data: turn_proto::TerminalBytes::new(vec![0x1a]),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let after_background = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if pane.node_id.as_ref() == Some(&shell_id) {
+            assert_eq!(pane.presentation_kind(), PaneKind::Shell);
+            assert!(row(&details, &shell_id)
+                .pane_bindings
+                .iter()
+                .any(|binding| binding.pane_id == pane_id));
+            assert!(
+                row(&details, &background_id).lifecycle.is_running(),
+                "backgrounding changes foreground ownership, not lifecycle"
+            );
+            break details;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Shell did not regain its Pane after Ctrl-Z"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let exact = after_background.layout.get(&exact_background_pane).unwrap();
+    assert_eq!(exact.node_id.as_ref(), Some(&background_id));
+    assert_eq!(exact.presentation_kind(), PaneKind::Terminal);
+    assert!(exact.kind_is_user_set);
+    assert_eq!(exact.detected_kind, Some(PaneKind::ProcessDetails));
+    assert!(!exact.has_terminal_capability());
+
+    // Agent B now owns the same Shell PTY. Neither resetting nor explicitly opening
+    // the still-live Agent A may infer that shared runtime from its old relationship.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"sh -c 'sleep 30; :'\r".to_vec()),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (replacement_id, with_replacement) = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let subject = details.layout.get(&pane_id).unwrap().node_id.as_ref();
+        if let Some(subject) = subject.filter(|node| *node != &shell_id && *node != &background_id)
+        {
+            break (subject.clone(), details);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Agent B never became the Shell's foreground subject"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        with_replacement
+            .layout
+            .get(&pane_id)
+            .unwrap()
+            .presentation_kind(),
+        PaneKind::Agent
+    );
+
+    let reset = layout_of(
+        ui.ask(Request::ResetPaneKind {
+            session_id: session.id.clone(),
+            pane_id: exact_background_pane.clone(),
+        })
+        .await,
+    );
+    let reset_exact = reset.get(&exact_background_pane).unwrap();
+    assert_eq!(reset_exact.node_id.as_ref(), Some(&background_id));
+    assert_eq!(reset_exact.presentation_kind(), PaneKind::ProcessDetails);
+    assert!(!reset_exact.kind_is_user_set);
+    assert!(!reset_exact.has_terminal_capability());
+
+    let surface_id = "background-binding-guard".to_string();
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: surface_id.clone(),
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected hierarchy, got {other:?}"),
+    };
+    let branch = hierarchy
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|branch| branch.session.id == session.id)
+        .unwrap();
+    assert_eq!(
+        branch
+            .nodes
+            .iter()
+            .find(|node| node.node_id == background_id)
+            .unwrap()
+            .pane_capability,
+        turn_proto::NodePaneCapability::PreviewDetails
+    );
+    assert!(matches!(
+        branch
+            .nodes
+            .iter()
+            .find(|node| node.node_id == replacement_id)
+            .unwrap()
+            .pane_capability,
+        turn_proto::NodePaneCapability::Terminal { .. }
+    ));
+
+    let opened = layout_of(
+        ui.ask(Request::OpenNodeAsPane {
+            surface_id,
+            session_id: session.id.clone(),
+            node_id: background_id.clone(),
+            target_pane_id: pane_id.clone(),
+            placement: PanePlacement::SplitBelow,
+        })
+        .await,
+    );
+    let opened_background_pane = opened
+        .panes()
+        .into_iter()
+        .find(|pane| {
+            pane.id != exact_background_pane
+                && pane.node_id.as_ref() == Some(&background_id)
+                && pane.presentation_kind() == PaneKind::ProcessDetails
+        })
+        .expect("opening suspended Agent A creates a ProcessDetails view")
+        .id
+        .clone();
+    for guarded in [&exact_background_pane, &opened_background_pane] {
+        let error = ui
+            .try_ask(Request::AttachPane {
+                session_id: session.id.clone(),
+                pane_id: guarded.clone(),
+                size: turn_proto::PtySize::new(20, 80),
+                stream: turn_proto::PaneStream::Cells,
+            })
+            .await
+            .expect_err("Agent A must not borrow Agent B's Shell terminal");
+        assert_eq!(error.code, turn_proto::ErrorCode::Conflict);
+    }
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_typed_into_a_shell_is_detected_and_becomes_the_pane_subject() {
+    let daemon = TestDaemon::start().await;
+    let mut ui = daemon.connect().await;
+    let root = daemon.data_dir().join("manually-started-agent");
+    std::fs::create_dir_all(&root).unwrap();
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "manual agent workspace".into(),
+            root: root.display().to_string(),
+        })
+        .await,
+    );
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "manual agent".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Shell)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pane_id = before.layout.panes()[0].id.clone();
+    let shell_id = before.layout.panes()[0]
+        .node_id
+        .clone()
+        .expect("the automatic shell runtime");
+
+    // `cat` is the fixture registry's structured agent. It is started exactly as a
+    // person starts Claude/Codex/Gemini/OpenCode in an existing terminal.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"cat\r".to_vec()),
+    })
+    .await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (agent_id, detected) = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if pane.node_id.as_ref().is_some_and(|node| node != &shell_id) {
+            break (pane.node_id.clone().unwrap(), details);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the submitted command was not classified within the debounced sweep"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let pane = detected.layout.get(&pane_id).unwrap();
+    assert_eq!(pane.kind, PaneKind::Agent);
+    assert_eq!(
+        pane.launch_kind(),
+        PaneKind::Shell,
+        "launch intent stays a Shell"
+    );
+    assert_eq!(pane.presentation_kind(), PaneKind::Agent);
+    assert!(!pane.kind_is_user_set);
+    let agent = row(&detected, &agent_id);
+    assert_eq!(agent.kind, NodeKind::Agent);
+    assert_eq!(agent.parent.as_ref(), Some(&shell_id));
+    let info = agent.agent.as_ref().expect("detected agent metadata");
+    assert_eq!(info.agent.tool.as_deref(), Some("claude-code"));
+    assert_eq!(info.agent.provider.as_deref(), Some("anthropic"));
+
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id: "agent-runtime-host".into(),
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected hierarchy, got {other:?}"),
+    };
+    let branch = hierarchy
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .find(|branch| branch.session.id == session.id)
+        .unwrap();
+    assert!(
+        branch
+            .nodes
+            .iter()
+            .find(|node| node.node_id == shell_id)
+            .unwrap()
+            .terminal_runtime_host,
+        "GetHierarchy must expose the Shell that owns the detected Agent's PTY"
+    );
+
+    // Input addressed to semantic identity still reaches the Shell-owned PTY.
+    ui.attach_cells(&session.id, &pane_id, turn_proto::PtySize::new(20, 80))
+        .await;
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: agent_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"semantic-agent-input\n".to_vec()),
+    })
+    .await;
+    ui.wait_for_screen("semantic-agent-input").await;
+
+    // Leaving the manually started agent returns automatic presentation to the same
+    // live Shell, ready to detect the next foreground agent.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: agent_id,
+        data: turn_proto::TerminalBytes::new(vec![0x04]),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if pane.node_id.as_ref() == Some(&shell_id) {
+            assert_eq!(pane.kind, PaneKind::Shell);
+            assert_eq!(pane.presentation_kind(), PaneKind::Shell);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Pane stayed on an exited inferred Agent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    daemon.shutdown().await;
+}
+
+/// A fast command replacement is a single supervisor observation: the old Agent has
+/// vanished and the new one already exists before retirement runs. The Pane must move
+/// directly A -> B rather than returning to Shell and then permanently skipping B as an
+/// already-known PID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replacement_agent_becomes_the_subject_in_the_same_sweep() {
+    let daemon = TestDaemon::start_with(inferring_registry).await;
+    let mut ui = daemon.connect().await;
+    let root = daemon.data_dir().join("replacement-agent");
+    std::fs::create_dir_all(&root).unwrap();
+    let workspace = workspace_of(
+        ui.ask(Request::CreateWorkspace {
+            name: "replacement agent workspace".into(),
+            root: root.display().to_string(),
+        })
+        .await,
+    );
+    let session = session_of(
+        ui.ask(Request::CreateSession {
+            workspace_id: workspace.id,
+            name: "replacement agent".into(),
+            cwd: None,
+            panes: Some(vec![NewPane::new(PaneKind::Shell)]),
+            note: None,
+            tags: Vec::new(),
+        })
+        .await,
+    );
+    let before = details_of(
+        ui.ask(Request::GetSession {
+            session_id: session.id.clone(),
+        })
+        .await,
+    );
+    let pane_id = before.layout.panes()[0].id.clone();
+    let shell_id = before.layout.panes()[0]
+        .node_id
+        .clone()
+        .expect("the automatic shell runtime");
+    let shell_pid = row(&before, &shell_id).pid.expect("the Shell pid");
+
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(b"sh -c 'sleep 30; :'\r".to_vec()),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let first_agent = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if let Some(subject) = pane
+            .node_id
+            .as_ref()
+            .filter(|subject| *subject != &shell_id)
+        {
+            break subject.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first manual Agent was not detected"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let first_pid = wait_for_agent_pid(&mut ui, &session.id, &first_agent).await;
+    let duplicated = layout_of(
+        ui.ask(Request::DuplicatePane {
+            session_id: session.id.clone(),
+            pane_id: pane_id.clone(),
+        })
+        .await,
+    );
+    let exact_first_agent_pane = duplicated
+        .panes()
+        .into_iter()
+        .find(|pane| pane.id != pane_id && pane.node_id.as_ref() == Some(&first_agent))
+        .expect("the explicit duplicate is an exact view of Agent A")
+        .id
+        .clone();
+    let surface_id = "replacement-first-byte-guard".to_string();
+    assert!(matches!(
+        ui.ask(Request::GetHierarchy {
+            surface_id: surface_id.clone(),
+            include_archived: false,
+        })
+        .await,
+        Response::Hierarchy { .. }
+    ));
+    let temporary = match ui
+        .ask(Request::OpenNodeAsTemporaryPane {
+            surface_id: surface_id.clone(),
+            session_id: session.id.clone(),
+            node_id: first_agent.clone(),
+        })
+        .await
+    {
+        Response::NodePane { pane } => pane,
+        other => panic!("expected Agent A's temporary exact pane, got {other:?}"),
+    };
+    assert!(temporary.binding.temporary);
+    assert_eq!(temporary.binding.node_id, first_agent);
+    assert!(matches!(
+        temporary.capability,
+        turn_proto::NodePaneCapability::Terminal { .. }
+    ));
+    let temporary_first_agent_pane = temporary.binding.pane_id;
+    ui.attach_cells(&session.id, &pane_id, turn_proto::PtySize::new(20, 80))
+        .await;
+    ui.attach_cells(
+        &session.id,
+        &exact_first_agent_pane,
+        turn_proto::PtySize::new(20, 80),
+    )
+    .await;
+    ui.attach_cells(
+        &session.id,
+        &temporary_first_agent_pane,
+        turn_proto::PtySize::new(20, 80),
+    )
+    .await;
+
+    // Schedule one debounced sweep, then make A disappear and B appear before it runs.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: first_agent.clone(),
+        data: turn_proto::TerminalBytes::new(vec![0x03]),
+    })
+    .await;
+    let exit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while pid_is_alive(first_pid) {
+        assert!(
+            tokio::time::Instant::now() < exit_deadline,
+            "the first Agent fixture did not consume Ctrl-C"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        // The echoed command does not contain the contiguous marker. Seeing
+        // `B-FIRST` therefore proves the first output batch from Agent B arrived.
+        data: turn_proto::TerminalBytes::new(
+            b"sh -c \"printf 'B%s\\n' '-FIRST'; sleep 30; :\"\r".to_vec(),
+        ),
+    })
+    .await;
+    ui.wait_for_screen("B-FIRST").await;
+    ui.poll_screens().await;
+    assert!(ui.screen(&session.id, &pane_id).text().contains("B-FIRST"));
+    assert!(
+        !ui.screen(&session.id, &exact_first_agent_pane)
+            .text()
+            .contains("B-FIRST"),
+        "Agent A's durable exact feed consumed Agent B's first output"
+    );
+    assert!(
+        !ui.screen(&session.id, &temporary_first_agent_pane)
+            .text()
+            .contains("B-FIRST"),
+        "Agent A's temporary exact feed consumed Agent B's first output"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (replacement, after) = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane_id).unwrap();
+        if let Some(subject) = pane
+            .node_id
+            .as_ref()
+            .filter(|subject| *subject != &shell_id && *subject != &first_agent)
+        {
+            break (subject.clone(), details);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement was discovered but never became the Pane subject: {:#?}",
+            details.layout
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        after.layout.get(&pane_id).unwrap().presentation_kind(),
+        PaneKind::Agent
+    );
+    assert_eq!(row(&after, &replacement).kind, NodeKind::Agent);
+    assert!(row(&after, &replacement).lifecycle.is_running());
+    assert!(!row(&after, &first_agent).lifecycle.is_running());
+    assert_eq!(
+        after
+            .layout
+            .get(&exact_first_agent_pane)
+            .and_then(|pane| pane.node_id.as_ref()),
+        Some(&first_agent),
+        "an exact duplicate of A must not follow the Shell foreground to B"
+    );
+    let exact = after.layout.get(&exact_first_agent_pane).unwrap();
+    assert_eq!(exact.presentation_kind(), PaneKind::ProcessDetails);
+    assert!(!exact.kind_is_user_set);
+    assert!(!exact.has_terminal_capability());
+    assert_eq!(exact.launch_kind(), PaneKind::Shell);
+    let attach_error = ui
+        .try_ask(Request::AttachPane {
+            session_id: session.id.clone(),
+            pane_id: exact_first_agent_pane.clone(),
+            size: turn_proto::PtySize::new(20, 80),
+            stream: turn_proto::PaneStream::Cells,
+        })
+        .await
+        .expect_err("semantic ProcessDetails must not borrow Agent B's Shell");
+    assert_eq!(attach_error.code, turn_proto::ErrorCode::Conflict);
+    let temporary_attach_error = ui
+        .try_ask(Request::AttachPane {
+            session_id: session.id.clone(),
+            pane_id: temporary_first_agent_pane.clone(),
+            size: turn_proto::PtySize::new(20, 80),
+            stream: turn_proto::PaneStream::Cells,
+        })
+        .await
+        .expect_err("Agent A's temporary exact view must not borrow Agent B's Shell");
+    assert_eq!(temporary_attach_error.code, turn_proto::ErrorCode::Conflict);
+    let hierarchy = match ui
+        .ask(Request::GetHierarchy {
+            surface_id,
+            include_archived: false,
+        })
+        .await
+    {
+        Response::Hierarchy { snapshot } => *snapshot,
+        other => panic!("expected hierarchy, got {other:?}"),
+    };
+    let first_row = hierarchy
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.sessions)
+        .flat_map(|branch| &branch.nodes)
+        .find(|node| node.node_id == first_agent)
+        .expect("Agent A remains a semantic row");
+    assert_eq!(
+        first_row.pane_capability,
+        turn_proto::NodePaneCapability::PreviewDetails
+    );
+    assert!(first_row
+        .pane_bindings
+        .iter()
+        .any(|binding| binding.pane_id == temporary_first_agent_pane && binding.temporary));
+
+    let mut reconnected = daemon.connect().await;
+    let restored = details_of(
+        reconnected
+            .ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+    );
+    let exact = restored.layout.get(&exact_first_agent_pane).unwrap();
+    assert_eq!(exact.node_id.as_ref(), Some(&first_agent));
+    assert_eq!(exact.presentation_kind(), PaneKind::ProcessDetails);
+    assert!(!exact.has_terminal_capability());
+
+    // Once B releases the Shell, output from that same PTY may update the foreground
+    // Pane but can never repaint the exact view still labelled A.
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: replacement.clone(),
+        data: turn_proto::TerminalBytes::new(vec![0x03]),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: session.id.clone(),
+            })
+            .await,
+        );
+        if details.layout.get(&pane_id).unwrap().node_id.as_ref() == Some(&shell_id) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the replacement Agent did not release the Shell"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let marker = "exact-feed-guard-53";
+    ui.ask(Request::WritePty {
+        session_id: session.id.clone(),
+        node_id: shell_id.clone(),
+        data: turn_proto::TerminalBytes::new(format!("printf '{marker}\\n'\r").into_bytes()),
+    })
+    .await;
+    ui.wait_for_screen(marker).await;
+    ui.poll_screens().await;
+    assert!(ui.screen(&session.id, &pane_id).text().contains(marker));
+    assert!(
+        !ui.screen(&session.id, &exact_first_agent_pane)
+            .text()
+            .contains(marker),
+        "Agent A's exact view consumed later output from the shared Shell"
+    );
+    assert_eq!(row(&after, &shell_id).pid, Some(shell_pid));
+    assert!(pid_is_alive(shell_pid));
+
+    daemon.shutdown().await;
+}
+
 /// The report: leaving Claude with `/exit` left the pane flickering, because the pane's
 /// process *was* Claude. It is not any more. The pane runs the user's shell, the agent
 /// runs in it, and quitting the agent gives the prompt back — which is what quitting an
@@ -1380,7 +2309,7 @@ async fn own_workspace(
 /// is something only a shell can print, where a program still holding the terminal would
 /// merely echo the characters back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn quitting_the_agent_leaves_a_working_shell_in_the_pane() {
+async fn quitting_an_agent_returns_the_live_shell_and_allows_the_next_agent() {
     let daemon = TestDaemon::start().await;
     let mut ui = daemon.connect().await;
     let agent = agent_session(&daemon, &mut ui, "quits cleanly").await;
@@ -1421,13 +2350,32 @@ async fn quitting_the_agent_leaves_a_working_shell_in_the_pane() {
         "an agent that quit is not waiting for anybody: {ended:?}"
     );
 
+    // The Pane's semantic subject returns to its runtime Shell automatically. The
+    // lifecycle event and layout push are separate frames, so observe the durable
+    // session state rather than relying on their delivery order.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let after = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: agent.session.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane).unwrap();
+        if pane.node_id.as_ref() == Some(&agent.shell)
+            && pane.presentation_kind() == PaneKind::Shell
+        {
+            break details;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Pane stayed bound to the hosted Agent after it exited: {:#?}",
+            details.layout
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+
     // The pane never blinked: same process, same pid, still running.
-    let after = details_of(
-        ui.ask(Request::GetSession {
-            session_id: agent.session.clone(),
-        })
-        .await,
-    );
     let shell = row(&after, &agent.shell);
     assert!(
         shell.lifecycle.is_running(),
@@ -1457,6 +2405,47 @@ async fn quitting_the_agent_leaves_a_working_shell_in_the_pane() {
     let screen = ui.wait_for_screen("turn-42").await;
     assert!(screen.contains("turn-42"), "the screen reads {screen:?}");
 
+    // The returned prompt is not a terminal state. Starting another recognised
+    // executable manually must create a fresh Agent and hand the Pane to it, without
+    // replacing the long-lived Shell process underneath.
+    ui.ask(Request::WritePty {
+        session_id: agent.session.clone(),
+        node_id: agent.shell.clone(),
+        data: turn_proto::TerminalBytes::new(b"cat\r".to_vec()),
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (next_agent, detected) = loop {
+        let details = details_of(
+            ui.ask(Request::GetSession {
+                session_id: agent.session.clone(),
+            })
+            .await,
+        );
+        let pane = details.layout.get(&pane).unwrap();
+        if let Some(subject) = pane
+            .node_id
+            .as_ref()
+            .filter(|subject| *subject != &agent.shell && *subject != &agent.node)
+        {
+            break (subject.clone(), details);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Shell did not detect the next foreground Agent"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let next = row(&detected, &next_agent);
+    assert_eq!(next.kind, NodeKind::Agent);
+    assert_eq!(next.parent.as_ref(), Some(&agent.shell));
+    assert_eq!(
+        row(&detected, &agent.shell).pid,
+        Some(shell_pid),
+        "detecting the next Agent must retain the Pane's Shell runtime"
+    );
+    assert!(pid_is_alive(shell_pid));
+
     daemon.shutdown().await;
 }
 
@@ -1483,8 +2472,13 @@ async fn an_agent_started_in_a_pane_shell_is_still_an_agent_in_the_tree() {
     assert_eq!(shell.depth, 0);
     assert_eq!(
         details.layout.panes()[0].node_id.as_ref(),
-        Some(&agent.shell),
-        "the pane shows the shell, because that is the process it runs"
+        Some(&agent.node),
+        "the Pane represents the Agent while its terminal runtime remains the shell"
+    );
+    assert_eq!(details.layout.panes()[0].kind, PaneKind::Agent);
+    assert!(
+        !details.layout.panes()[0].kind_is_user_set,
+        "the Agent view is detected, not a manual renderer label"
     );
 
     let row = row(&details, &agent.node);
@@ -1694,7 +2688,12 @@ async fn adding_an_agent_pane_with_no_configured_default_still_launches_one() {
         .find(|pane| pane.id != first)
         .cloned()
         .expect("the new pane");
-    let shell = added.node_id.clone().expect("the pane runs a shell");
+    let subject = added
+        .node_id
+        .clone()
+        .expect("the pane represents the launched agent");
+    assert_eq!(added.kind, PaneKind::Agent);
+    assert!(!added.kind_is_user_set);
 
     let details = details_of(
         ui.ask(Request::GetSession {
@@ -1705,9 +2704,11 @@ async fn adding_an_agent_pane_with_no_configured_default_still_launches_one() {
     let started = details
         .tree
         .iter()
-        .find(|view| view.is_agentic)
+        .find(|view| view.node_id == subject)
         .expect("an agent was started without one being configured");
-    assert_eq!(started.parent.as_ref(), Some(&shell));
+    assert!(started.is_agentic);
+    let shell = started.parent.as_ref().expect("the agent's PTY host");
+    assert_eq!(row(&details, shell).kind, NodeKind::Shell);
     assert_eq!(started.relationship.confidence, Confidence::Explicit);
     assert_eq!(
         started

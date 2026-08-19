@@ -563,6 +563,7 @@ mod tests {
                 pid: 4243,
                 ppid: Some(4242),
                 command: "cargo test".into(),
+                executable: "cargo".into(),
                 args: vec!["cargo".into(), "test".into()],
                 cwd: Some("/repo".into()),
                 confirmed_parent: false,

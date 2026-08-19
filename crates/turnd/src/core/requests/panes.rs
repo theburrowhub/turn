@@ -294,10 +294,59 @@ impl Core {
         pane_id: &PaneId,
         kind: PaneKind,
     ) -> Answer {
+        if !kind.is_display_override() {
+            return Err(ProtoError::invalid(
+                "That Pane type is internal or has no operational renderer",
+            ));
+        }
         if !self
             .session_mut(session_id)?
             .layout
             .change_kind(pane_id, kind)
+        {
+            return Err(ProtoError::not_found("pane", pane_id.as_str()));
+        }
+        self.save_layout(session_id)?;
+        self.push_layout(session_id, Some(client));
+        self.answer_layout(session_id)
+    }
+
+    pub(super) fn reset_pane_kind(
+        &mut self,
+        client: ClientId,
+        session_id: &SessionId,
+        pane_id: &PaneId,
+    ) -> Answer {
+        let (node_id, launch_kind) = {
+            let pane = self
+                .session(session_id)?
+                .layout
+                .get(pane_id)
+                .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
+            (pane.node_id.clone(), pane.launch_kind())
+        };
+        let detected = node_id
+            .as_ref()
+            .and_then(|node_id| {
+                self.session(session_id)
+                    .ok()?
+                    .tree
+                    .get(node_id)
+                    .map(|node| {
+                        PaneKind::detected_for_node(
+                            node.kind,
+                            self.terminal_node(node_id).is_some(),
+                        )
+                    })
+            })
+            // An unbound Pane has no live subject to classify. Returning to its
+            // immutable launch intent is the only automatic answer that does not
+            // accidentally preserve the override we are being asked to remove.
+            .unwrap_or(launch_kind);
+        if !self
+            .session_mut(session_id)?
+            .layout
+            .reset_kind(pane_id, detected)
         {
             return Err(ProtoError::not_found("pane", pane_id.as_str()));
         }
@@ -732,6 +781,16 @@ impl Core {
         let requested = validate_terminal_size(size)?;
 
         let session = self.session(session_id)?;
+        if session
+            .layout
+            .get(pane_id)
+            .is_some_and(|pane| !pane.has_terminal_capability())
+        {
+            return Err(ProtoError::new(
+                ErrorCode::Conflict,
+                "This Pane is a semantic details view and has no terminal to attach",
+            ));
+        }
         let binding_node_id = match session.layout.get(pane_id) {
             // A permanent Agent Pane stays bound to the semantic Agent identity even
             // when its screen belongs to the hosting shell. PTY ownership is resolved
@@ -760,11 +819,16 @@ impl Core {
         let runtime_id = match binding_node_id.as_ref() {
             Some(node) => match self.terminal_node(node) {
                 Some(runtime) => Some(runtime),
-                None if session.layout.get(pane_id).is_some() => Some(node.clone()),
+                // An ended/replaced semantic subject can keep a durable exact Pane,
+                // but it cannot keep borrowing the Shell after that Shell moves on to
+                // another Agent. Recovered output is still a real retained terminal;
+                // every other bound no-runtime view fails closed. A blank attachment
+                // is reserved for a genuinely empty Pane (`node_id: None`).
+                None if self.recovered_terminals.contains_key(node) => Some(node.clone()),
                 None => {
                     return Err(ProtoError::new(
                         ErrorCode::Conflict,
-                        "This Agent has semantic preview details but no attachable terminal",
+                        "This Process has semantic details but no attachable terminal",
                     ));
                 }
             },
@@ -1028,21 +1092,7 @@ fn validate_resize_delta(delta: f32) -> Result<(), ProtoError> {
 }
 
 fn pane_kind_for_node(kind: NodeKind, has_terminal: bool) -> PaneKind {
-    if !has_terminal {
-        return PaneKind::ProcessDetails;
-    }
-    match kind {
-        NodeKind::Agent | NodeKind::Subagent => PaneKind::Agent,
-        NodeKind::Shell => PaneKind::Shell,
-        NodeKind::Tui => PaneKind::Tui,
-        NodeKind::Server => PaneKind::Server,
-        NodeKind::TestRunner | NodeKind::Build => PaneKind::TestOutput,
-        NodeKind::TmuxSession | NodeKind::TmuxPane => PaneKind::TmuxTerminal,
-        NodeKind::ExternalApp => PaneKind::ProcessDetails,
-        NodeKind::Terminal | NodeKind::Watcher | NodeKind::Background | NodeKind::Unknown => {
-            PaneKind::Terminal
-        }
-    }
+    PaneKind::detected_for_node(kind, has_terminal)
 }
 
 #[cfg(test)]
@@ -1259,6 +1309,11 @@ mod tests {
         assert_eq!(
             layout.get(&opened_id).unwrap().node_id.as_ref(),
             Some(&node_id)
+        );
+        assert_eq!(
+            layout.get(&opened_id).unwrap().presentation_kind(),
+            PaneKind::ProcessDetails,
+            "a semantic-only Agent receives a real details view, never its parent's PTY"
         );
         let binding = harness
             .core

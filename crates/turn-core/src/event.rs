@@ -132,6 +132,11 @@ pub enum EventKind {
         #[serde(default)]
         ppid: Option<u32>,
         command: String,
+        /// OS-reported executable identity. This is kept separate from argv because
+        /// argv[0] is mutable (`exec -a`, process titles) and may contain a different
+        /// display name. Empty only on legacy events written before this field existed.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        executable: String,
         /// OS-reported argv, retained separately from the compact command-line
         /// projection so the inspector need not guess argument boundaries.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -658,7 +663,11 @@ mod tests {
 
         assert!(matches!(
             kind,
-            EventKind::ProcessSpawnedChild { args, .. } if args.is_empty()
+            EventKind::ProcessSpawnedChild {
+                executable,
+                args,
+                ..
+            } if executable.is_empty() && args.is_empty()
         ));
     }
 

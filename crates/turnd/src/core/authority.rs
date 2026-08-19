@@ -483,6 +483,7 @@ mod tests {
             pid: 4_242,
             ppid: Some(1),
             name: command.split_whitespace().next().unwrap_or("").to_string(),
+            executable: command.split_whitespace().next().unwrap_or("").to_string(),
             command_line: command.to_string(),
             args: command.split_whitespace().map(str::to_string).collect(),
             cwd: Some("/repo".to_string()),

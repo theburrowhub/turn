@@ -20,7 +20,7 @@ use turn_core::model::{
 use turn_proto::{
     ErrorCode, HierarchyKey, HierarchySnapshot, NodePaneCapability, NodePaneView, PaneFocusView,
     PaneStream, ProtoError, ProtoErrorContext, Response, ServerEvent, SessionConflictAlternative,
-    SessionTreeView, TreeNodeView, TreeSurfaceState, WorkspaceTreeView, WriteLeaseOwnerView,
+    SessionTreeView, TreeSurfaceState, WorkspaceTreeView, WriteLeaseOwnerView,
 };
 
 const MAX_SURFACE_ID_CHARS: usize = 128;
@@ -915,9 +915,18 @@ impl Core {
             .bindings_for_session(session_id)
             .map_err(store)?;
 
-        let focus_binding = if node_has_distinct_runtime(self, subject) {
-            // A node with its own runtime is its own input boundary. Its exact Pane
-            // may be focused, but a missing Pane never licenses routing to its parent.
+        let focus_binding = if let Some(runtime) = self.terminal_node(subject_node_id) {
+            // Prefer the semantic Pane. A hosted Agent is what the Pane represents even
+            // though the terminal resolver writes to its Shell-owned PTY. The runtime
+            // binding remains a compatibility fallback for layouts saved by older Turn
+            // builds, and a missing Pane never licenses walking past this input boundary.
+            visible_binding_for_node(&bindings, &surface_id, subject_node_id)
+                .or_else(|| visible_binding_for_node(&bindings, &surface_id, &runtime))
+        } else if subject.pid.is_some() {
+            // A live process with no terminal handle in this daemon is still a
+            // distinct boundary. Its own existing Pane is the only honest target:
+            // focus it when one survived a restart, but never walk through it and
+            // type into a different Agent.
             visible_binding_for_node(&bindings, &surface_id, subject_node_id)
         } else {
             // A PreviewDetails binding is an honest view of a semantic Agent, not an
@@ -935,10 +944,19 @@ impl Core {
                         return None;
                     }
                     let parent = session.tree.get(parent_id)?;
-                    if node_has_distinct_runtime(self, parent) {
-                        // This is the authentic input boundary. With no Pane on this
-                        // surface there is nowhere safe to focus, and walking past it
-                        // would type into a different Agent.
+                    if let Some(runtime) = self.terminal_node(parent_id) {
+                        // This is the authentic input boundary. Focus its semantic Pane
+                        // when available, or a legacy runtime-bound Pane. With neither on
+                        // this surface there is nowhere safe to focus.
+                        return visible_binding_for_node(&bindings, &surface_id, parent_id)
+                            .or_else(|| {
+                                visible_binding_for_node(&bindings, &surface_id, &runtime)
+                            });
+                    }
+                    if parent.pid.is_some() {
+                        // A restored semantic runtime can outlive the daemon that held
+                        // its PTY. Its Pane remains the right place to take the
+                        // operator, while the PID boundary forbids walking any higher.
                         return visible_binding_for_node(&bindings, &surface_id, parent_id);
                     }
                     cursor = parent;
@@ -1015,11 +1033,6 @@ impl Core {
                         !binding.temporary || binding.surface_id.as_deref() == Some(surface_id)
                     })
                     .collect();
-                let capabilities: HashMap<NodeId, NodePaneCapability> = session
-                    .tree
-                    .iter()
-                    .map(|node| (node.id.clone(), self.node_pane_capability(&node.id)))
-                    .collect();
                 let summary = summaries
                     .iter()
                     .find(|summary| summary.id == session.id)
@@ -1029,12 +1042,7 @@ impl Core {
                     });
                 session_views.push(SessionTreeView {
                     session: summary,
-                    nodes: TreeNodeView::for_session_with_panes(
-                        session,
-                        &bindings,
-                        &capabilities,
-                        now_ms,
-                    ),
+                    nodes: self.tree_views_with_bindings(session, &bindings, now_ms),
                 });
             }
             let checkouts = self
@@ -1102,10 +1110,20 @@ impl Core {
         if self.processes.contains_key(node_id) {
             return Some(node_id.clone());
         }
-        self.processes
+        if let Some(host) = self
+            .processes
             .iter()
-            .find(|(_, process)| process.hosted.as_ref() == Some(node_id))
+            .find(|(_, process)| process.observed_subject.as_ref() == Some(node_id))
             .map(|(shell, _)| shell.clone())
+        {
+            return Some(host);
+        }
+        // A saved binding or inferred parent edge is not terminal authority. Restored
+        // legacy layouts wait for foreground reconciliation to establish
+        // `observed_subject`; `hosted` is lifecycle authority only. Otherwise a
+        // background/exited Agent A could borrow the
+        // Shell while Agent B is actually drawing on it.
+        None
     }
 
     pub(crate) fn heartbeat_workspace_leases(&mut self, now_ms: i64) {
@@ -1315,20 +1333,6 @@ fn visible_binding_for_node(
                 && (!binding.temporary || binding.surface_id.as_deref() == Some(surface_id))
         })
         .cloned()
-}
-
-/// Whether this node is its own input boundary.
-///
-/// Owning a pty makes it one. An agent Turn started inside a pane's shell does not: it
-/// has a pid of its own but reads from the shell's tty, so the shell is where typing
-/// goes and routing has to continue to it. Answering "yes" for a shared runtime would
-/// look for a Pane the agent does not have and give up, leaving a demand nothing can
-/// take the user to.
-fn node_has_distinct_runtime(core: &Core, node: &ProcessNode) -> bool {
-    match core.terminal_node(&node.id) {
-        Some(terminal) => terminal == node.id,
-        None => node.pid.is_some(),
-    }
 }
 
 fn relationship_routes_to_runtime_owner(node: &ProcessNode) -> bool {

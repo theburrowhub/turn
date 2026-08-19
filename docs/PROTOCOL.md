@@ -5581,7 +5581,10 @@ remain the explicit blank/shell path.
 Both creation paths strip process bindings: a template describes what to start, never which
 instance it was captured from. `create_layout_template` is the visual editor path. Its bounded
 Layout is validated and normalised by the daemon before persistence; the client-side Pane ids are
-draft identity only, and every Session instantiation mints a fresh set.
+draft identity only, and every Session instantiation mints a fresh set. Capturing a live Layout with
+`save_layout_as_template` resets transient Automatic presentation `kind` to `launch_kind()` and preserves a
+valid manual operational display pin. Create/update drafts containing a manual pin to an internal or
+renderer-less kind are rejected with `invalid_argument`; they are never persisted as operational Panes.
 
 Built-in Templates are immutable but may be duplicated. Rich create/update drafts preserve Layout
 geometry, Pane command/argv/cwd/environment/restore behaviour, Template environment and init actions,
@@ -5610,7 +5613,8 @@ references to that Template, but Sessions retain their independently persisted l
 | `swap_panes` | `session_id`, `a`, `b` — superseded by `relocate_pane` | `layout` |
 | `zoom_pane` | `session_id`, `pane_id` — **toggles** | `layout` |
 | `duplicate_pane` | `session_id`, `pane_id` | `layout` |
-| `change_pane_kind` | `session_id`, `pane_id`, `kind` | `layout` |
+| `change_pane_kind` | `session_id`, `pane_id`, operational display `kind` | `layout` |
+| `reset_pane_kind` | `session_id`, `pane_id` | `layout` |
 | `float_pane` | `session_id`, `pane_id`, `geometry` | `layout` |
 | `dock_pane` | `session_id`, `pane_id` | `layout` |
 | `set_floating_pane_geometry` | `session_id`, `pane_id`, `geometry` | `layout` |
@@ -5632,12 +5636,104 @@ subagent with no independent PTY yields a Preview/Process Details pane capabilit
 cannot work. Detach or `ClosePane(KeepProcesses)` never terminates the node; explicit `Terminate`/`Kill`
 dispositions apply only where process-control rules allow them, and an Agent requires a separate node action.
 
+#### Pane kind wire contract
+
+`PaneKind` is a closed snake-case JSON enum. Its documentation slug is not a wire value:
+
+| Wire value | Documentation slug | Operator label | Allowed by `change_pane_kind` |
+| --- | --- | --- | --- |
+| `terminal` | `terminal` | Terminal | yes |
+| `agent` | `agent-terminal` | Agent terminal | yes |
+| `shell` | `shell` | Shell | yes |
+| `tui` | `terminal-app` | Terminal app | yes |
+| `logs` | `logs` | Logs | yes |
+| `test_output` | `test-output` | Test output | yes |
+| `server` | `server` | Server | yes |
+| `event_log` | `event-log` | Event log | no |
+| `agent_tree` | `agent-tree` | Agent tree | no |
+| `process_details` | `process-details` | Process details | no |
+| `preview` | `preview` | Preview | no |
+| `tmux_terminal` | `tmux-terminal` | tmux terminal | yes |
+| `placeholder` | `placeholder` | Placeholder | no |
+
+The [Pane and view type catalog](VIEW_TYPES.md) gives the renderer, input, detection, restore and fallback
+contract for every row.
+
+The five `no` values remain readable for migration, reserved and daemon-selected semantic views; they are
+not operator-selectable saved-Pane overrides. `change_pane_kind` returns `invalid_argument` for them.
+Automatic detection may still use `process_details` for a semantic Node without its own terminal, and a
+durable tiled or floating Pane with that exact Node binding renders the bounded Node WorkSurface rather than
+an empty terminal placeholder.
+
+A persisted `Pane` separates launch from presentation while keeping the meaning an existing v4 client
+assigns to `kind`:
+
+- required `kind: PaneKind` is the current presentation and historical v4 renderer field.
+  `Pane::presentation_kind()` returns it directly;
+- optional `launch_kind?: PaneKind` is immutable launch intent when it differs from `kind`. When absent,
+  `Pane::launch_kind()` falls back to `kind`; Template materialisation, restore and relaunch use this accessor;
+- `kind_is_user_set: bool` is presentation provenance. It defaults to false when absent. False means
+  Automatic and allows daemon detection to update `kind` while preserving launch intent; true means an
+  operator pin that detection cannot overwrite;
+- `detected_kind?: PaneKind` is the latest daemon-detected capability while a manual pin owns `kind`.
+  It is absent for Automatic Panes and defaults to visible `kind` for legacy payloads. A terminal-shaped pin
+  is attachable only when both its selected presentation and `detected_kind` are terminal-backed; the pin
+  cannot borrow another semantic Node's PTY;
+- provenance is authoritative independently of optional-field presence. A manual pin to the same value as
+  launch intent has `launch_kind` absent and `kind_is_user_set: true`;
+- `title`, `title_is_user_set`, `command`, `args`, `launch_profile`, `cwd`, `env`, `node_id` and `restore`
+  retain their existing meanings. Presentation and provenance are not process, PTY, binding or lifecycle
+  authority; `launch_kind` affects only a later authorised materialisation/restore.
+
+For example, a Shell launch currently presenting a shell-hosted Agent is
+`{"kind":"agent","launch_kind":"shell","kind_is_user_set":false,...}`. `NewPane.kind` is launch intent
+on the creation request; the returned Pane begins Automatic with that same value in presentation `kind` and
+no `launch_kind`. `change_pane_kind` changes presentation `kind` and provenance while preserving the effective
+launch intent. `reset_pane_kind` clears manual provenance and derives `kind` from the bound semantic Node plus
+terminal capability, or from `Pane::launch_kind()` when unbound.
+
+`launch_kind`, `kind_is_user_set` and `detected_kind` are additive within protocol v4. A new client receiving an old Pane
+defaults to Automatic and interprets historical `kind` as both presentation and launch. An old client
+receiving a new Pane ignores the additive fields but continues to render the correct presentation from
+`kind`. It cannot represent the split axes: if it rewrites a complete Layout, the rewritten Pane loses manual
+provenance and collapses launch intent to its visible `kind`. That lossy old-writer round trip may therefore
+change what a later restore launches, although merely reading the payload changes no command, current runtime
+or lifecycle. Clients that edit complete Layouts must understand the additive fields to preserve the split.
+
 `placement` is `replace_current`, `split_right`, `split_below` or `temporary`. Opening an existing node and
 promoting its temporary view reuse the same vocabulary; only the temporary choice leaves the saved Layout
 untouched. `create_pane` accepts the complete `NewPane`, including an arbitrary executable and argv without
 shell evaluation. `duplicate_pane` creates another view of the same node rather than another process.
-`change_pane_kind`, floating, docking and geometry updates are likewise view-only operations. A floating Pane
-retains its split-tree position and exact point geometry, so docking restores it without reparenting its node.
+`change_pane_kind`, `reset_pane_kind`, floating, docking and geometry updates are likewise view-only
+operations. `change_pane_kind` pins one of the eight operational presentations without changing the semantic
+node, PTY or saved launch intent; daemon detection leaves that pin intact. `reset_pane_kind` removes the pin
+and immediately derives the presentation from the bound semantic node and its terminal capability; an
+unbound Pane returns to its immutable launch intent.
+
+For Shell-hosted Agents, `hosted` is the daemon's lifecycle/relaunch and authenticated-hook receipt while
+`observed_subject` is independent foreground terminal authority. Ctrl+Z can therefore remove A's terminal
+capability without ending A; a detected B may own the same Shell PTY; and `fg` restores A's adapter and
+integration tier without relaunching it. Before publishing output for a changed foreground process group,
+the daemon reconciles and generation-fences durable and surface-scoped temporary exact views. The eager
+barrier runs at most once per distinct job during a deferred sweep request. `attach_pane` fails with
+`conflict` for every bound Node without a proved live/recovered terminal; only `node_id:null` may return a
+blank terminal attachment.
+
+Supervisor-originated `process.spawned_child` events keep `executable` and `args` as separate fields.
+`executable` is the OS executable path (falling back to the OS process name only when the platform exposes no
+path); `args` preserves argument boundaries and `command` remains the bounded display projection. Legacy
+events omit `executable` and replay through the conservative command fallback. Live identity never tokenises
+an executable path, never promotes mutable `argv[0]` over it and never searches arbitrary argv text. An
+adapter-declared observation alias additionally requires argv[0] to name one of that same adapter's launch
+executables; a filesystem alias must canonicalise to the kernel executable. Observation aliases never enter
+the launch catalogue. Existing
+wrapper paths are canonicalised before adapter suffix matching. Hosted PID corroboration binds the observed
+adapter to the adapter recorded in the Node's launch metadata, rather than accepting a provider word in a
+prompt. A same-provider interpreter child is coalesced only when its canonical wrapper subject equals its
+parent's; this covers Gemini's intentional same-bundle Node relaunch without hiding a distinct Agent instance.
+
+A floating Pane retains its split-tree position and exact point geometry, so docking restores it without
+reparenting its node.
 The wire-level `detach_pane` remains v4-only and is unrepresentable after vNext negotiation; vNext clients use
 only `detach_runtime_view`, so they cannot bypass its exact generations or `RuntimeViewReplayFence`.
 Likewise the v4 `close_pane` shape cannot carry Terminate/Kill into vNext: presentation close routes to
@@ -5674,10 +5770,12 @@ remains the distinct saved-Layout operation.
 - `zoom_pane` leaves the layout tree untouched, so un-zooming restores the exact
   previous geometry. Zoom and focus both survive a relocation: moving a pane must not
   change what the user is looking at or typing into.
-- `pane` (a `NewPane`): `kind` plus optional `title`, `command`, `args`, `cwd`,
-  `env`, `restore`. The daemon mints the `PaneId` — it is the only writer of state,
-  and a client minting its own would collide with a second client on the same
-  daemon.
+- `pane` (a `NewPane`): required launch `kind`; optional `title`, `command`, `args`, `launch_profile`, `cwd`
+  and `env`; and `restore` defaulting to `reattach_only`. `launch_profile`, when present, is
+  `{adapter_id,profile_id}` semantic launch policy; it never substitutes provider-specific flags into
+  `args`. A `NewPane` has no `launch_kind`, `kind_is_user_set` or `detected_kind`: presentation starts Automatic and is
+  changed only through the separate view operation. The daemon mints the `PaneId` — it is the only writer of
+  state, and a client minting its own would collide with a second client on the same daemon.
 - `stream`: `"cells"` (absent means cells) \| `"bytes"`. See §2. `size` is applied to
   the pty before the screen or replay is taken, so what comes back matches the geometry
   the client is about to render at. `rows * cols` over `max_screen_cells` is
@@ -6744,8 +6842,11 @@ Placement: `node_id`, `session_id`, `parent`, `relationship { kind, confidence }
 `relationship_is_provisional`, `depth`, `child_count`.
 Event confidence does not substitute for `relationship.confidence`.
 
-Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`, `ephemeral`. Ephemeral
-process-table plumbing remains searchable but is hidden outside Technical mode unless a search reveals it.
+Identity: `kind`, `is_agentic`, `title`, `command`, `args`, `cwd`, `pid`, `ppid`, `ephemeral`,
+`terminal_runtime_host`. Ephemeral process-table plumbing remains searchable but is hidden outside Technical
+mode unless a search reveals it. `terminal_runtime_host: true` marks the Shell that owns the PTY used by a
+semantic Agent child; it is routing metadata, not a second Agent or an instruction to display the Shell in
+Normal navigation.
 
 State: `lifecycle`, `turn` (absent for a non-agent), `display_state`,
 `state_label`, `severity`, `needs_user`, `interaction_pending`.

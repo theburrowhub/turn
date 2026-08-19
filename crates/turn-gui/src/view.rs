@@ -563,6 +563,17 @@ pub struct ViewState {
     pub tree_expansion: HashMap<HierarchyKey, bool>,
     /// Whether navigation keys belong to the hierarchy rather than the terminal.
     pub tree_has_focus: bool,
+    /// Pane holding the window-local logical terminal keyboard lease. Terminal grids
+    /// are not egui text fields: this explicit owner lets pane cycling and tree →
+    /// WorkSurface transitions move input without another click, while a real focused
+    /// control in the inspector/header can suspend PTY input safely.
+    terminal_keyboard_owner: Option<PaneId>,
+    /// Set by the one logical terminal owner rendered in this frame. Cleared at frame
+    /// start so a semantic-only WorkSurface cannot leave a stale terminal lease behind.
+    terminal_keyboard_rendered: bool,
+    /// A modal temporarily covered the logical owner. Its first unobscured frame must
+    /// reclaim the lease instead of inheriting focus from the sheet that just closed.
+    terminal_keyboard_blocked: bool,
     /// One-shot AccessKit/egui focus restoration after a modal sheet disappears.
     pub request_tree_focus: bool,
     /// One-shot focus request used by the palette's Search command.
@@ -1053,6 +1064,13 @@ pub struct CellCommandDraft {
     /// `None` preserves a legacy/custom argv exactly. A semantic profile lets the
     /// provider adapter own its current permission flags.
     pub launch_profile: Option<AgentLaunchProfileRef>,
+    /// Launch intent read from the source Pane. This is editor provenance rather
+    /// than a second persisted field: it prevents an open/save round trip from
+    /// collapsing Logs, TUI, Test, Server or tmux launch semantics to Terminal.
+    pub source_launch_kind: Option<PaneKind>,
+    /// Program read with `source_launch_kind`; used only to tell an unchanged cell
+    /// from a new/custom draft whose launch kind should be derived.
+    pub source_program: Option<String>,
     /// Optional working directory, relative to the Workspace unless absolute.
     pub cwd: String,
     /// One `NAME=value` pair per line. Parsed as data, never evaluated by a shell.
@@ -1066,6 +1084,8 @@ impl CellCommandDraft {
             program: pane.command.clone().unwrap_or_default(),
             arguments: shell_words::join(&pane.args),
             launch_profile: pane.launch_profile.clone(),
+            source_launch_kind: Some(pane.launch_kind()),
+            source_program: Some(pane.command.clone().unwrap_or_default()),
             cwd: pane.cwd.clone().unwrap_or_default(),
             environment: format_environment(&pane.env),
             restore: pane.restore,
@@ -1218,8 +1238,14 @@ impl LayoutTemplateDraft {
                 .get_mut(&id)
                 .ok_or_else(|| "A layout cell disappeared while saving.".to_string())?;
             let program = command.program.trim();
+            let source_unchanged = command.source_launch_kind.is_some()
+                && command.source_program.as_deref().unwrap_or_default() == program;
             if program.is_empty() {
-                pane.kind = PaneKind::Shell;
+                pane.replace_launch_kind(if source_unchanged {
+                    command.source_launch_kind.unwrap_or(PaneKind::Shell)
+                } else {
+                    PaneKind::Shell
+                });
                 pane.command = None;
                 pane.args.clear();
                 pane.launch_profile = None;
@@ -1227,11 +1253,22 @@ impl LayoutTemplateDraft {
             } else {
                 let args = shell_words::split(command.arguments.trim())
                     .map_err(|error| format!("Invalid arguments for {program}: {error}"))?;
-                pane.kind = if matches!(program, "claude" | "codex" | "gemini" | "opencode") {
+                let source_launch_kind = command.source_launch_kind.unwrap_or(pane.launch_kind());
+                let launch_kind = if source_unchanged {
+                    source_launch_kind
+                } else if agent_choice_for_program(program).is_some() {
                     PaneKind::Agent
+                } else if source_launch_kind.is_terminal()
+                    && !matches!(
+                        source_launch_kind,
+                        PaneKind::Shell | PaneKind::Agent | PaneKind::Terminal
+                    )
+                {
+                    source_launch_kind
                 } else {
                     PaneKind::Terminal
                 };
+                pane.replace_launch_kind(launch_kind);
                 pane.command = Some(program.to_string());
                 pane.args = args;
                 pane.launch_profile = agent_choice_for_program(program)
@@ -1348,17 +1385,23 @@ const AGENT_QUICK_CHOICES: [AgentQuickChoice; 4] = [
 ];
 
 fn agent_choice_for_program(program: &str) -> Option<AgentQuickChoice> {
-    let executable = program
-        .split_whitespace()
-        .next()
-        .unwrap_or(program)
-        .rsplit('/')
-        .next()
-        .unwrap_or(program);
+    let executable = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let executable = executable
+        .len()
+        .checked_sub(4)
+        .filter(|stem| *stem > 0)
+        .and_then(|stem| {
+            executable
+                .get(stem..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                .then_some(stem)
+        })
+        .and_then(|stem| executable.get(..stem))
+        .unwrap_or(executable);
     AGENT_QUICK_CHOICES
         .iter()
         .copied()
-        .find(|choice| choice.program == executable)
+        .find(|choice| choice.program.eq_ignore_ascii_case(executable))
 }
 
 fn launch_profile(adapter_id: &str, profile_id: &str) -> AgentLaunchProfileRef {
@@ -1751,6 +1794,9 @@ pub enum ViewAction {
     ChangePaneKind {
         pane_id: PaneId,
         kind: PaneKind,
+    },
+    ResetPaneKind {
+        pane_id: PaneId,
     },
     FloatPane {
         pane_id: PaneId,
@@ -2726,7 +2772,8 @@ fn process_is_technical_wrapper(node: &TreeNodeView) -> bool {
     {
         return false;
     }
-    node.ephemeral
+    node.terminal_runtime_host
+        || node.ephemeral
         || (node.relationship_is_provisional
             && matches!(
                 node.kind,
@@ -3077,7 +3124,7 @@ impl<'a> TurnView<'a> {
             for pane in layout
                 .panes()
                 .into_iter()
-                .filter(|pane| pane.kind.is_terminal())
+                .filter(|pane| pane.has_terminal_capability())
             {
                 let observed_runtime_id = self
                     .panes
@@ -3346,6 +3393,20 @@ impl<'a> TurnView<'a> {
         // draw a toolbar of missing-glyph boxes.
         icons::install(ui.ctx());
 
+        // egui treats Tab, arrows and Escape as focus navigation before widgets render.
+        // When no egui control owns the keyboard, Turn's logical terminal owner must get
+        // those bytes instead. Cancel only the pending navigation direction: a focused
+        // inspector/header control remains fully navigable and suspends PTY input below.
+        let terminal_owned_last_frame = state.terminal_keyboard_owner.is_some();
+        state.terminal_keyboard_rendered = false;
+        if terminal_owned_last_frame
+            && !state.tree_has_focus
+            && !state.is_sensitive()
+            && ui.memory(|memory| memory.focused().is_none())
+        {
+            ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+        }
+
         // Escape abandons a pane drag — `egui` has already dropped the gesture by the time
         // this runs — and the press is spent here rather than left to fall through to the
         // handlers below. Cancelling a rearrangement must not have the side effect of
@@ -3462,6 +3523,27 @@ impl<'a> TurnView<'a> {
                 self.selected.as_ref(),
             )
         });
+        // A durable Process-details Pane is still part of the Session Layout rather
+        // than a second selection model. Its active Node owns the bounded inspector
+        // projection while the Session is selected, so the Pane can render real
+        // semantic content instead of an empty slot.
+        let layout_semantic_target = hierarchy.as_ref().and_then(|snapshot| {
+            if !matches!(
+                work_target,
+                Some(work_surface::ResolvedViewTarget::Session { .. })
+            ) {
+                return None;
+            }
+            let layout = self.layout.as_ref()?;
+            let active = layout.active.as_ref()?;
+            let pane = layout.get(active)?;
+            work_surface::resolve_process_details_pane(
+                snapshot,
+                pane.presentation_kind(),
+                pane.node_id.as_ref(),
+                self.selected.as_ref(),
+            )
+        });
         self.reconcile_terminal_view_state(state, hierarchy.as_ref());
         let primary_pane = match work_target {
             Some(work_surface::ResolvedViewTarget::Node { node, .. }) => self
@@ -3473,13 +3555,22 @@ impl<'a> TurnView<'a> {
         self.begin_geometry_frame(state);
         state.work_surface_target = work_target.map(work_surface::ResolvedViewTarget::public);
         state.work_surface_geometry = None;
-        if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), work_target) {
+        let projection_target = layout_semantic_target.or(work_target);
+        if let (Some(snapshot), Some(target)) = (hierarchy.as_ref(), projection_target) {
             work_surface::request_node_projection(state, snapshot, target);
         }
-        let inspector_target = hierarchy.as_ref().and_then(|snapshot| {
-            current_tree_selection
-                .clone()
-                .filter(|key| hierarchy_contains_key(snapshot, key))
+        let layout_semantic_key = layout_semantic_target.and_then(|target| match target {
+            work_surface::ResolvedViewTarget::Node { node, .. } => {
+                Some(HierarchyKey::process(node.node_id.clone()))
+            }
+            _ => None,
+        });
+        let inspector_target = layout_semantic_key.or_else(|| {
+            hierarchy.as_ref().and_then(|snapshot| {
+                current_tree_selection
+                    .clone()
+                    .filter(|key| hierarchy_contains_key(snapshot, key))
+            })
         });
         if state.inspector_open
             && !work_target.is_some_and(work_surface::ResolvedViewTarget::is_node)
@@ -3605,7 +3696,7 @@ impl<'a> TurnView<'a> {
                     }
                     actions.extend(pane_actions);
                 });
-                actions.extend(self.floating_panes(ui, theme, keymap, state));
+                actions.extend(self.floating_panes(ui, theme, keymap, state, hierarchy.as_ref()));
             }
         }
         if let Some(temporary) = &self.temporary_pane {
@@ -3783,6 +3874,10 @@ impl<'a> TurnView<'a> {
                 })
                 .inner;
             actions.extend(modal_actions);
+        }
+        if !state.terminal_keyboard_rendered {
+            state.terminal_keyboard_owner = None;
+            state.terminal_keyboard_blocked = false;
         }
         state.hierarchy = hierarchy;
         actions
@@ -4002,8 +4097,10 @@ impl<'a> TurnView<'a> {
                     egui::ComboBox::from_label("View type")
                         .selected_text(format!("{:?}", draft.kind))
                         .show_ui(ui, |ui| {
-                            for (label, kind) in pane_kind_choices() {
-                                if ui.selectable_value(&mut draft.kind, kind, label).clicked()
+                            for kind in pane_kind_choices() {
+                                if ui
+                                    .selectable_value(&mut draft.kind, kind, kind.label())
+                                    .clicked()
                                     && kind != PaneKind::Agent
                                 {
                                     draft.launch_profile = None;
@@ -8582,11 +8679,12 @@ impl<'a> TurnView<'a> {
 
         let arrangement = panes::arrange(layout, area);
         // Persisted pane focus and the window's keyboard lease are different things.
-        // Keep the visual focus in place behind a sheet, but never let that sheet's
-        // Text/Paste/Key events reach a PTY.
+        // Keep visual focus in place behind a sheet or Temporary Pane, but never let
+        // the shared Text/Paste/Key events reach both the underlay and its overlay.
         // A modal question holds the keyboard, and the link dialog is one: a keystroke aimed at
         // "Cancel" must not also be typed into whatever is running underneath it.
-        let accepts_terminal_input = !state.is_sensitive()
+        let accepts_terminal_input = self.temporary_pane.is_none()
+            && !state.is_sensitive()
             && self.write_conflict.is_none()
             && self.link_confirmation.is_none();
 
@@ -8750,9 +8848,19 @@ impl<'a> TurnView<'a> {
                     let resize_epoch = content.runtime_id.as_ref().and_then(|runtime_id| {
                         state.resize_owner_epoch(runtime_id, &placed.pane_id)
                     });
+                    let accepts_input = if focused && self.temporary_pane.is_none() {
+                        terminal_accepts_keyboard(
+                            ui,
+                            state,
+                            &placed.pane_id,
+                            accepts_terminal_input,
+                        )
+                    } else {
+                        false
+                    };
                     let options = PaneOptions {
                         focused,
-                        accepts_input: focused && accepts_terminal_input,
+                        accepts_input,
                         now_ms: self.now_ms,
                         scrolled: content.scrolled,
                         history_complete: content.history_complete,
@@ -8794,7 +8902,42 @@ impl<'a> TurnView<'a> {
                 }
                 (None, None) => {
                     ui.painter().rect_filled(body, 0.0, theme.background);
-                    let stopped = placed.node_id.as_ref().and_then(|node_id| {
+                    let semantic_target = hierarchy.and_then(|snapshot| {
+                        work_surface::resolve_process_details_pane(
+                            snapshot,
+                            placed.kind,
+                            placed.node_id.as_ref(),
+                            self.selected.as_ref(),
+                        )
+                    });
+                    if let Some(work_surface::ResolvedViewTarget::Node {
+                        workspace,
+                        session,
+                        node,
+                    }) = semantic_target
+                    {
+                        let details = self.inspector.filter(|details| {
+                            details.key() == HierarchyKey::process(node.node_id.clone())
+                        });
+                        actions.extend(
+                            ui.scope_builder(
+                                region(body.shrink(1.0), "persisted-process-details"),
+                                |ui| {
+                                    self.node_work_surface(
+                                        ui,
+                                        theme,
+                                        hierarchy.expect("a resolved Node has a hierarchy"),
+                                        workspace,
+                                        session,
+                                        node,
+                                        details,
+                                        state,
+                                    )
+                                },
+                            )
+                            .inner,
+                        );
+                    } else if let Some(node) = placed.node_id.as_ref().and_then(|node_id| {
                         hierarchy.and_then(|snapshot| {
                             snapshot
                                 .workspaces
@@ -8805,8 +8948,7 @@ impl<'a> TurnView<'a> {
                                     &node.node_id == node_id && node.lifecycle.is_terminal()
                                 })
                         })
-                    });
-                    if let Some(node) = stopped {
+                    }) {
                         let content_rect = Rect::from_center_size(
                             body.center(),
                             Vec2::new(body.width().min(320.0), body.height().min(108.0)),
@@ -8880,6 +9022,7 @@ impl<'a> TurnView<'a> {
         theme: &Theme,
         _keymap: &Keymap,
         state: &mut ViewState,
+        hierarchy: Option<&HierarchySnapshot>,
     ) -> Vec<ViewAction> {
         let Some(layout) = &self.layout else {
             return Vec::new();
@@ -8896,7 +9039,7 @@ impl<'a> TurnView<'a> {
                 .find(|content| content.pane_id == pane_id)
                 .map(|content| content.title.clone())
                 .or_else(|| pane.title.clone())
-                .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase());
+                .unwrap_or_else(|| format!("{:?}", pane.presentation_kind()).to_lowercase());
             let geometry = state
                 .floating_geometry
                 .get(&pane_id)
@@ -8924,8 +9067,31 @@ impl<'a> TurnView<'a> {
                             });
                         }
                         ui.menu_button("View type", |ui| {
-                            for (label, kind) in pane_kind_choices() {
-                                if ui.selectable_label(pane.kind == kind, label).clicked() {
+                            if ui
+                                .selectable_label(
+                                    !pane.kind_is_user_set,
+                                    format!("Automatic — {}", pane.presentation_kind().label()),
+                                )
+                                .on_hover_text(
+                                    "Follow the semantic process Turn detects in this Pane.",
+                                )
+                                .clicked()
+                            {
+                                window_actions.push(ViewAction::ResetPaneKind {
+                                    pane_id: pane_id.clone(),
+                                });
+                                ui.close();
+                            }
+                            ui.separator();
+                            ui.label("Display as…");
+                            for kind in pane_kind_choices() {
+                                if ui
+                                    .selectable_label(
+                                        pane.kind_is_user_set && pane.presentation_kind() == kind,
+                                        kind.label(),
+                                    )
+                                    .clicked()
+                                {
                                     window_actions.push(ViewAction::ChangePaneKind {
                                         pane_id: pane_id.clone(),
                                         kind,
@@ -8942,16 +9108,59 @@ impl<'a> TurnView<'a> {
                     });
                     ui.separator();
                     let body = ui.available_rect_before_wrap();
-                    if let Some(content) = content {
+                    let semantic_target = hierarchy.and_then(|snapshot| {
+                        work_surface::resolve_process_details_pane(
+                            snapshot,
+                            pane.presentation_kind(),
+                            pane.node_id.as_ref(),
+                            self.selected.as_ref(),
+                        )
+                    });
+                    if let Some(work_surface::ResolvedViewTarget::Node {
+                        workspace,
+                        session,
+                        node,
+                    }) = semantic_target
+                    {
+                        let details = self.inspector.filter(|details| {
+                            details.key() == HierarchyKey::process(node.node_id.clone())
+                        });
+                        window_actions.extend(
+                            ui.scope_builder(region(body, "floating-process-details"), |ui| {
+                                self.node_work_surface(
+                                    ui,
+                                    theme,
+                                    hierarchy.expect("a resolved Node has a hierarchy"),
+                                    workspace,
+                                    session,
+                                    node,
+                                    details,
+                                    state,
+                                )
+                            })
+                            .inner,
+                        );
+                    } else if let Some(content) = content {
                         let resize_epoch = content
                             .runtime_id
                             .as_ref()
                             .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &pane_id));
+                        let focused = layout.active.as_ref() == Some(&pane_id);
+                        let eligible = self.temporary_pane.is_none()
+                            && !state.is_sensitive()
+                            && self.write_conflict.is_none()
+                            && self.link_confirmation.is_none();
+                        let accepts_input = if focused && self.temporary_pane.is_none() {
+                            terminal_accepts_keyboard(ui, state, &pane_id, eligible)
+                        } else {
+                            false
+                        };
                         let options = PaneOptions {
-                            focused: layout.active.as_ref() == Some(&pane_id),
-                            accepts_input: !state.is_sensitive()
-                                && self.write_conflict.is_none()
-                                && self.link_confirmation.is_none(),
+                            focused,
+                            // A Temporary Pane is drawn after every saved/floating Pane in
+                            // this frame. Raw egui events are shared, so the underlay must
+                            // release its keyboard lease before the overlay reads them.
+                            accepts_input,
                             now_ms: self.now_ms,
                             scrolled: content.scrolled,
                             history_complete: content.history_complete,
@@ -8984,7 +9193,7 @@ impl<'a> TurnView<'a> {
                     } else {
                         ui.centered_and_justified(|ui| {
                             ui.label(
-                                RichText::new(format!("{:?} view", pane.kind))
+                                RichText::new(format!("{:?} view", pane.presentation_kind()))
                                     .color(theme.text_dim),
                             );
                         });
@@ -9099,16 +9308,18 @@ impl<'a> TurnView<'a> {
         let body = Rect::from_min_max(header.left_bottom(), panel.max).shrink(10.0);
         match (&temporary.pane.capability, temporary.grid) {
             (NodePaneCapability::Terminal { .. }, Some(grid)) => {
+                let pane_id = temporary.pane.binding.pane_id.clone();
+                let eligible = !state.is_sensitive()
+                    && self.write_conflict.is_none()
+                    && self.link_confirmation.is_none();
+                let accepts_input = terminal_accepts_keyboard(ui, state, &pane_id, eligible);
                 let options = PaneOptions {
                     focused: true,
-                    accepts_input: !state.is_sensitive()
-                        && self.write_conflict.is_none()
-                        && self.link_confirmation.is_none(),
+                    accepts_input,
                     now_ms: self.now_ms,
                     scrolled: false,
                     history_complete: true,
                 };
-                let pane_id = temporary.pane.binding.pane_id.clone();
                 let resize_epoch = temporary.runtime_id.as_ref().and_then(|runtime_id| {
                     state.resize_owner_epoch(runtime_id, &temporary.pane.binding.pane_id)
                 });
@@ -11906,7 +12117,12 @@ fn handle_hierarchy_keyboard(
     rows: &[HierarchyRow<'_>],
 ) -> Vec<ViewAction> {
     let keypress = ui.input_mut(|input| {
-        if input.consume_key(Modifiers::COMMAND, Key::Enter) {
+        // `InputState::consume_key` uses logical modifier matching: Shift and Alt
+        // are deliberately ignored. That is useful for application shortcuts, but
+        // wrong at the terminal boundary — a focused tree row used to consume
+        // Shift+Enter before the Pane could turn it into multiline input. Match the
+        // modifier state carried by the key event exactly, for both Enter bindings.
+        if consume_exact_key(input, Modifiers::COMMAND, Key::Enter) {
             Some(HierarchyKeypress::TemporaryPane)
         } else if input.consume_key(Modifiers::NONE, Key::Escape) {
             Some(HierarchyKeypress::Blur)
@@ -11920,7 +12136,7 @@ fn handle_hierarchy_keyboard(
             Some(HierarchyKeypress::Right)
         } else if input.consume_key(Modifiers::NONE, Key::Space) {
             Some(HierarchyKeypress::Preview)
-        } else if input.consume_key(Modifiers::NONE, Key::Enter) {
+        } else if consume_exact_key(input, Modifiers::NONE, Key::Enter) {
             Some(HierarchyKeypress::Activate)
         } else {
             None
@@ -11930,6 +12146,76 @@ fn handle_hierarchy_keyboard(
         return Vec::new();
     };
     apply_hierarchy_keypress(snapshot, state, rows, keypress)
+}
+
+/// Consumes a key-down event only when its complete logical modifier set matches.
+///
+/// `Modifiers::matches_exact` still treats platform Command correctly (Cmd on macOS,
+/// Ctrl elsewhere) while refusing extra Shift/Alt. Inspecting the event rather than
+/// `InputState::modifiers` is important when the modifier was released later in the
+/// same frame.
+fn consume_exact_key(input: &mut egui::InputState, modifiers: Modifiers, key: Key) -> bool {
+    let mut consumed = false;
+    input.events.retain(|event| {
+        let matches = matches!(
+            event,
+            egui::Event::Key {
+                key: event_key,
+                pressed: true,
+                modifiers: event_modifiers,
+                ..
+            } if *event_key == key && event_modifiers.matches_exact(modifiers)
+        );
+        consumed |= matches;
+        !matches
+    });
+    consumed
+}
+
+/// Grants this frame's keyboard lease to one logically focused terminal.
+///
+/// A terminal is intentionally not an egui text field: its complete key vocabulary
+/// includes Tab, arrows and Escape. Pane focus therefore lives in Turn's Layout while
+/// egui focus is reserved for actual controls. An explicit logical transition (tree →
+/// terminal, temporary Pane, pane cycling, or returning from a modal) releases the old
+/// control immediately. With no transition, a focused inspector/header control wins and
+/// the terminal receives nothing until the operator clicks the grid again.
+fn terminal_accepts_keyboard(
+    ui: &mut Ui,
+    state: &mut ViewState,
+    pane_id: &PaneId,
+    eligible: bool,
+) -> bool {
+    state.terminal_keyboard_rendered = true;
+    if !eligible {
+        state.terminal_keyboard_blocked = true;
+        return false;
+    }
+
+    // A modal marks the previous terminal lease as blocked. If its caller
+    // explicitly returns accessibility/keyboard focus to the hierarchy, that request
+    // wins until the operator clicks or cycles back to a Pane. Without this ordering,
+    // the terminal cleared the freshly focused TreeItem later in the same frame.
+    if state.tree_has_focus && state.terminal_keyboard_blocked {
+        return false;
+    }
+
+    let transferred = state.terminal_keyboard_owner.as_ref() != Some(pane_id)
+        || state.tree_has_focus
+        || state.terminal_keyboard_blocked;
+    if transferred {
+        if let Some(focused) = ui.memory(|memory| memory.focused()) {
+            ui.memory_mut(|memory| memory.surrender_focus(focused));
+        }
+        state.terminal_keyboard_owner = Some(pane_id.clone());
+        state.tree_has_focus = false;
+        state.terminal_keyboard_blocked = false;
+    }
+
+    // A control focused after the last transfer is the current keyboard owner. The
+    // terminal grid clears that focus when clicked, so the next frame returns here with
+    // no egui owner and resumes PTY input without a second click.
+    ui.memory(|memory| memory.focused().is_none())
 }
 
 fn apply_hierarchy_keypress(
@@ -12713,8 +12999,29 @@ fn pane_header_controls(
                     ui.close();
                 }
                 ui.menu_button("View type", |ui| {
-                    for (label, kind) in pane_kind_choices() {
-                        if ui.selectable_label(placed.kind == kind, label).clicked() {
+                    if ui
+                        .selectable_label(
+                            !placed.kind_is_user_set,
+                            format!("Automatic — {}", placed.kind.label()),
+                        )
+                        .on_hover_text("Follow the semantic process Turn detects in this Pane.")
+                        .clicked()
+                    {
+                        actions.push(ViewAction::ResetPaneKind {
+                            pane_id: placed.pane_id.clone(),
+                        });
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label("Display as…");
+                    for kind in pane_kind_choices() {
+                        if ui
+                            .selectable_label(
+                                placed.kind_is_user_set && placed.kind == kind,
+                                kind.label(),
+                            )
+                            .clicked()
+                        {
                             actions.push(ViewAction::ChangePaneKind {
                                 pane_id: placed.pane_id.clone(),
                                 kind,
@@ -12782,22 +13089,10 @@ fn pane_header_controls(
     actions
 }
 
-fn pane_kind_choices() -> [(&'static str, PaneKind); 13] {
-    [
-        ("Terminal", PaneKind::Terminal),
-        ("Agent terminal", PaneKind::Agent),
-        ("Shell", PaneKind::Shell),
-        ("Terminal app", PaneKind::Tui),
-        ("Logs", PaneKind::Logs),
-        ("Test output", PaneKind::TestOutput),
-        ("Server", PaneKind::Server),
-        ("Event log", PaneKind::EventLog),
-        ("Agent tree", PaneKind::AgentTree),
-        ("Process details", PaneKind::ProcessDetails),
-        ("Preview", PaneKind::Preview),
-        ("tmux terminal", PaneKind::TmuxTerminal),
-        ("Placeholder", PaneKind::Placeholder),
-    ]
+fn pane_kind_choices() -> impl Iterator<Item = PaneKind> {
+    PaneKind::ALL
+        .into_iter()
+        .filter(|kind| kind.is_display_override())
 }
 
 /// What a pane calls itself, for a sentence about it.
@@ -12845,8 +13140,8 @@ mod tests {
     use super::*;
     use turn_core::event::Confidence;
     use turn_core::model::{
-        ActivityPreview, Pane, PaneKind, PreviewSource, ProcessNode, Relation, Session,
-        SessionMode, Workspace,
+        ActivityPreview, Pane, PaneKind, PaneNodeBinding, PreviewSource, ProcessNode, Relation,
+        Session, SessionMode, Workspace,
     };
     use turn_core::state::{Lifecycle, Turn};
     use turn_proto::{ImagePayload, SessionSummary, TreeSurfaceState, WorkspaceSummary};
@@ -13445,6 +13740,147 @@ mod tests {
         apply_hierarchy_keypress(&snapshot, &mut state, &rows, HierarchyKeypress::Down);
         assert_eq!(state.selected_tree, Some(HierarchyKey::process(root_id)));
         assert_ne!(state.selected_tree, Some(HierarchyKey::process(child_id)));
+    }
+
+    #[test]
+    fn a_focused_hierarchy_leaves_modified_enter_chords_for_the_terminal() {
+        let (snapshot, root_id, _, _) = hierarchy_fixture();
+        let theme = Theme::dark();
+        let grid = Grid::from_lines(&["agent prompt"], 80);
+
+        for (modifiers, expected) in [
+            (Modifiers::SHIFT, b"\n".to_vec()),
+            (Modifiers::ALT | Modifiers::SHIFT, b"\x1b\r".to_vec()),
+            (
+                Modifiers {
+                    shift: true,
+                    mac_cmd: true,
+                    command: true,
+                    ..Modifiers::default()
+                },
+                b"\r".to_vec(),
+            ),
+        ] {
+            let mut state = ViewState {
+                selected_tree: Some(HierarchyKey::process(root_id.clone())),
+                tree_has_focus: true,
+                ..ViewState::default()
+            };
+            let rows = visible_hierarchy_rows(&snapshot, &state, false);
+            let mut raw = egui::RawInput::default();
+            raw.events.extend([
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: Some(Key::Enter),
+                    pressed: false,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::ModifiersChanged(Modifiers::default()),
+            ]);
+
+            let context = egui::Context::default();
+            let mut interaction = PaneInteraction::default();
+            let mut hierarchy_actions = Vec::new();
+            let mut terminal_actions = Vec::new();
+            let pane_id = PaneId::from_stored("pane-hierarchy-terminal-enter");
+            let _ = crate::frames::measure_with(&context, raw, |ui| {
+                // Reproduce the real failure: clicking a focusable TreeItem leaves an
+                // actual egui focus id behind, not only ViewState::tree_has_focus.
+                let tree_row = ui.interact(
+                    Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(320.0, 32.0)),
+                    ui.id().with("focused-hierarchy-row"),
+                    Sense::click(),
+                );
+                tree_row.request_focus();
+                hierarchy_actions = handle_hierarchy_keyboard(ui, &snapshot, &mut state, &rows);
+                let accepts_input = terminal_accepts_keyboard(ui, &mut state, &pane_id, true);
+                terminal_actions = terminal::show_pane(
+                    ui,
+                    &mut interaction,
+                    terminal::PaneInput {
+                        theme: &theme,
+                        rect: Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(640.0, 320.0)),
+                        grid: &grid,
+                        options: PaneOptions {
+                            focused: true,
+                            accepts_input,
+                            now_ms: T0,
+                            ..PaneOptions::default()
+                        },
+                        id: ui.id().with(("hierarchy-terminal-enter", modifiers)),
+                        resize_claim: None,
+                        chrome: None,
+                    },
+                )
+                .actions;
+            });
+
+            assert!(
+                hierarchy_actions.is_empty(),
+                "the hierarchy must not reinterpret modified Enter {modifiers:?}"
+            );
+            assert!(
+                context.memory(|memory| memory.focused().is_none()),
+                "the explicit tree → terminal transfer must release the TreeItem focus"
+            );
+            let writes: Vec<_> = terminal_actions
+                .iter()
+                .filter_map(|action| match action {
+                    PaneAction::Write(bytes) => Some(bytes.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                writes,
+                [expected],
+                "the terminal must remain the sole recipient for {modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_keyboard_lease_moves_with_the_pane_but_yields_to_real_controls() {
+        let context = egui::Context::default();
+        let mut state = ViewState {
+            terminal_keyboard_owner: Some(PaneId::from_stored("pane-old")),
+            ..ViewState::default()
+        };
+        let next = PaneId::from_stored("pane-next");
+        let control = egui::Id::new("focused-inspector-control");
+        let mut assertions_ran = false;
+        let _ = crate::frames::measure_with(&context, egui::RawInput::default(), |ui| {
+            ui.memory_mut(|memory| memory.request_focus(control));
+            assert!(
+                terminal_accepts_keyboard(ui, &mut state, &next, true),
+                "pane cycling is an explicit logical transfer"
+            );
+            assert!(ui.memory(|memory| memory.focused().is_none()));
+
+            ui.memory_mut(|memory| memory.request_focus(control));
+            assert!(
+                !terminal_accepts_keyboard(ui, &mut state, &next, true),
+                "a control focused after the transfer must suspend PTY input"
+            );
+            assert_eq!(ui.memory(|memory| memory.focused()), Some(control));
+
+            state.terminal_keyboard_blocked = true;
+            assert!(
+                terminal_accepts_keyboard(ui, &mut state, &next, true),
+                "closing a modal explicitly returns its keyboard lease"
+            );
+            assert!(ui.memory(|memory| memory.focused().is_none()));
+            assertions_ran = true;
+        });
+        assert!(assertions_ran);
     }
 
     #[test]
@@ -14295,6 +14731,81 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_template_replaces_launch_intent_without_forging_a_view_override() {
+        let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
+        let selected = draft.selected.clone();
+        draft
+            .layout
+            .get_mut(&selected)
+            .unwrap()
+            .override_kind(PaneKind::Logs);
+        draft.cells.insert(
+            selected.clone(),
+            CellCommandDraft {
+                program: "/usr/local/bin/codex".into(),
+                ..CellCommandDraft::default()
+            },
+        );
+
+        let layout = draft.materialized_layout().unwrap();
+        let pinned = layout.get(&selected).unwrap();
+        assert_eq!(pinned.presentation_kind(), PaneKind::Logs);
+        assert_eq!(pinned.launch_kind(), PaneKind::Agent);
+        assert!(pinned.kind_is_user_set);
+
+        let automatic_id = layout
+            .panes()
+            .into_iter()
+            .find(|pane| pane.id != selected)
+            .unwrap()
+            .id
+            .clone();
+        draft.cells.insert(
+            automatic_id.clone(),
+            CellCommandDraft {
+                program: "codex".into(),
+                ..CellCommandDraft::default()
+            },
+        );
+        let layout = draft.materialized_layout().unwrap();
+        let automatic = layout.get(&automatic_id).unwrap();
+        assert_eq!(automatic.presentation_kind(), PaneKind::Agent);
+        assert_eq!(automatic.launch_kind(), PaneKind::Agent);
+        assert!(automatic.launch_kind.is_none());
+        assert!(!automatic.kind_is_user_set);
+    }
+
+    #[test]
+    fn opening_and_saving_a_template_preserves_every_specialised_launch_kind() {
+        for kind in [
+            PaneKind::Logs,
+            PaneKind::Tui,
+            PaneKind::TestOutput,
+            PaneKind::Server,
+            PaneKind::TmuxTerminal,
+        ] {
+            let pane = Pane::new(kind).with_command("tool");
+            let pane_id = pane.id.clone();
+            let template = Template::from_layout(
+                format!("{} template", kind.label()),
+                &Layout::single(pane),
+                T0,
+            );
+            let draft = LayoutTemplateDraft::from_template(template, LayoutEditorOrigin::Settings);
+            let saved = draft.materialized_layout().unwrap();
+            let pane = saved.get(&pane_id).unwrap();
+            assert_eq!(
+                pane.launch_kind(),
+                kind,
+                "an unchanged {} cell lost launch semantics",
+                kind.label()
+            );
+            assert_eq!(pane.presentation_kind(), kind);
+            assert!(!pane.kind_is_user_set);
+        }
+    }
+
+    #[test]
     fn the_template_editor_round_trips_every_startup_field_without_json() {
         let mut draft = LayoutTemplateDraft::two_shells(LayoutEditorOrigin::Settings);
         draft.name = "Product work".into();
@@ -14314,6 +14825,8 @@ mod tests {
                 program: "npm".into(),
                 arguments: "run dev -- --port 3000".into(),
                 launch_profile: None,
+                source_launch_kind: None,
+                source_program: None,
                 cwd: "frontend".into(),
                 environment: "CELL=left".into(),
                 restore: RestoreBehaviour::Skip,
@@ -14470,5 +14983,47 @@ mod tests {
         assert!(parse_environment("9INVALID=value")
             .unwrap_err()
             .contains("invalid variable name"));
+    }
+
+    #[test]
+    fn the_view_override_menu_exposes_only_renderers_that_work() {
+        let choices: Vec<_> = pane_kind_choices().collect();
+        assert_eq!(choices.len(), 8);
+        assert!(choices.iter().all(|kind| kind.is_display_override()));
+        for unavailable in [
+            PaneKind::EventLog,
+            PaneKind::AgentTree,
+            PaneKind::ProcessDetails,
+            PaneKind::Preview,
+            PaneKind::Placeholder,
+        ] {
+            assert!(
+                !choices.contains(&unavailable),
+                "{} must not be offered before it has a Pane renderer",
+                unavailable.label()
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_runtime_shell_is_transparent_until_explicitly_opened() {
+        let session_id = SessionId::from_stored("sess_runtime_host");
+        let shell = ProcessNode::process(session_id.clone(), NodeKind::Shell, "zsh", "/repo", T0);
+        let mut view = TreeNodeView::from_node(&shell, 0, 1, T0 + 1);
+        view.terminal_runtime_host = true;
+        assert!(process_is_technical_wrapper(&view));
+
+        view.pane_bindings.push(PaneNodeBinding {
+            pane_id: PaneId::from_stored("pane_explicit_shell"),
+            session_id,
+            node_id: shell.id,
+            temporary: false,
+            surface_id: None,
+            opened_ms: T0,
+        });
+        assert!(
+            !process_is_technical_wrapper(&view),
+            "an explicitly opened Shell is operator-visible, not hidden plumbing"
+        );
     }
 }

@@ -21,6 +21,8 @@
 mod exit;
 mod tree;
 
+pub(crate) use tree::same_provider_bootstrap_child;
+
 use super::{Core, DeferredRuntimeInput, FailedIngestCheckpoint};
 use turn_agents::IntegrationLevel;
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
@@ -101,10 +103,16 @@ fn normalise_untrusted_tree_fields(event: &mut TurnEvent) {
                 .and_then(|task| safe_untrusted_label(&task, MAX_AGENT_TASK_CHARS));
         }
         EventKind::ProcessSpawnedChild {
-            command, args, cwd, ..
+            command,
+            executable,
+            args,
+            cwd,
+            ..
         } => {
             *command = safe_untrusted_label(command, MAX_DISCOVERED_COMMAND_CHARS)
                 .unwrap_or_else(|| "process".into());
+            *executable =
+                safe_untrusted_label(executable, MAX_DISCOVERED_COMMAND_CHARS).unwrap_or_default();
             *args = safe_untrusted_args(std::mem::take(args));
             *cwd = cwd.take().map(|cwd| {
                 safe_untrusted_label(&cwd, MAX_DISCOVERED_CWD_CHARS)
@@ -232,6 +240,24 @@ impl Core {
         let policy = self.attention_policy_for_session(&session_id);
 
         let mut changed = self.apply(&event, now_ms);
+        // `insert_child` may have promoted a manually started agent from a Shell's
+        // technical child to the Pane's semantic subject. Remember those exact Panes
+        // now, but publish and update the binding index only after the atomic Session
+        // checkpoint below succeeds.
+        let rebound_panes: Vec<_> = if matches!(&event.kind, EventKind::ProcessSpawnedChild { .. })
+        {
+            changed.node.as_ref().map_or_else(Vec::new, |node_id| {
+                self.sessions
+                    .get(&session_id)
+                    .into_iter()
+                    .flat_map(|session| session.layout.panes())
+                    .filter(|pane| pane.node_id.as_ref() == Some(node_id))
+                    .map(|pane| pane.id.clone())
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
         if matches!(&event.kind, EventKind::AgentSubagentStopped { .. }) && event.node_id.is_none()
         {
             if let Some(node) = changed.node.as_ref() {
@@ -315,6 +341,34 @@ impl Core {
             return;
         }
 
+        if let Some(node_id) = changed.node.as_ref().filter(|_| !rebound_panes.is_empty()) {
+            let mut binding_changed = false;
+            for pane_id in &rebound_panes {
+                let binding = turn_core::model::PaneNodeBinding {
+                    pane_id: pane_id.clone(),
+                    session_id: session_id.clone(),
+                    node_id: node_id.clone(),
+                    temporary: false,
+                    surface_id: None,
+                    opened_ms: now_ms,
+                };
+                match self.store.hierarchy().bind_pane(&binding) {
+                    Ok(()) => binding_changed = true,
+                    Err(error) => tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        pane = %pane_id,
+                        node = %node_id,
+                        "could not index an automatically detected Pane subject"
+                    ),
+                }
+            }
+            if binding_changed {
+                self.bump_hierarchy();
+            }
+            self.push_layout(&session_id, None);
+        }
+
         self.push_all(ServerEvent::TurnEventEmitted {
             turn_event: event.clone(),
         });
@@ -353,27 +407,37 @@ impl Core {
             _ => return,
         };
         let candidates = [event.node_id.as_ref(), event.parent_node_id.as_ref()];
-        let runtime_id = candidates.into_iter().flatten().find_map(|candidate| {
+        let matched = candidates.into_iter().flatten().find_map(|candidate| {
             self.processes
                 .iter()
                 .find(|(runtime_id, process)| {
-                    *runtime_id == candidate || process.hosted.as_ref() == Some(candidate)
+                    *runtime_id == candidate
+                        || process.hosted.as_ref() == Some(candidate)
+                        || process.observed_subject.as_ref() == Some(candidate)
                 })
-                .map(|(runtime_id, _)| runtime_id.clone())
+                .map(|(runtime_id, _)| (runtime_id.clone(), candidate.clone()))
         });
-        let Some(runtime_id) = runtime_id else {
+        let Some((runtime_id, semantic_id)) = matched else {
             return;
         };
         let Some(process) = self.processes.get_mut(&runtime_id) else {
             return;
         };
-        if process.level >= promoted {
-            return;
+        // A hook from hosted A remains valid while A is in the background, but it
+        // cannot disable the heuristic currently watching foreground B. Integration
+        // promotion follows the exact event subject, independently of lifecycle
+        // authority retained by `hosted`.
+        let owns_foreground =
+            runtime_id == semantic_id || process.observed_subject.as_ref() == Some(&semantic_id);
+        if process.hosted.as_ref() == Some(&semantic_id)
+            && process.hosted_level.is_none_or(|level| level < promoted)
+        {
+            process.hosted_level = Some(promoted);
         }
-        process.level = promoted;
-        process.heuristic = None;
-
-        let semantic_id = process.hosted.as_ref().unwrap_or(&runtime_id).clone();
+        if owns_foreground && process.level < promoted {
+            process.level = promoted;
+            process.heuristic = None;
+        }
         if let Some(session) = self.sessions.get_mut(&process.session_id) {
             if let Some(node) = session.tree.get_mut(&semantic_id) {
                 node.env_highlights
@@ -713,6 +777,7 @@ impl Core {
             pid,
             ppid,
             command,
+            executable,
             args,
             cwd,
             confirmed_parent,
@@ -725,6 +790,7 @@ impl Core {
                 *pid,
                 *ppid,
                 command.clone(),
+                executable.clone(),
                 args.clone(),
                 cwd.clone(),
                 *confirmed_parent,

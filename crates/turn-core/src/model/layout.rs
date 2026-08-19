@@ -6,6 +6,7 @@
 //! "resize" behave the way a user expects.
 
 use crate::ids::{NodeId, PaneId};
+use crate::model::NodeKind;
 use serde::{Deserialize, Serialize};
 
 /// What a pane shows.
@@ -32,6 +33,102 @@ pub enum PaneKind {
 }
 
 impl PaneKind {
+    /// Every persisted kind, in the stable order used by documentation and tests.
+    pub const ALL: [Self; 13] = [
+        Self::Terminal,
+        Self::Agent,
+        Self::Shell,
+        Self::Tui,
+        Self::Logs,
+        Self::TestOutput,
+        Self::Server,
+        Self::EventLog,
+        Self::AgentTree,
+        Self::ProcessDetails,
+        Self::Preview,
+        Self::TmuxTerminal,
+        Self::Placeholder,
+    ];
+
+    /// Stable documentation and telemetry name.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Agent => "agent-terminal",
+            Self::Shell => "shell",
+            Self::Tui => "terminal-app",
+            Self::Logs => "logs",
+            Self::TestOutput => "test-output",
+            Self::Server => "server",
+            Self::EventLog => "event-log",
+            Self::AgentTree => "agent-tree",
+            Self::ProcessDetails => "process-details",
+            Self::Preview => "preview",
+            Self::TmuxTerminal => "tmux-terminal",
+            Self::Placeholder => "placeholder",
+        }
+    }
+
+    /// Operator-facing name. Keeping it beside the enum prevents menus and docs
+    /// from inventing different vocabularies for the same renderer.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Terminal => "Terminal",
+            Self::Agent => "Agent terminal",
+            Self::Shell => "Shell",
+            Self::Tui => "Terminal app",
+            Self::Logs => "Logs",
+            Self::TestOutput => "Test output",
+            Self::Server => "Server",
+            Self::EventLog => "Event log",
+            Self::AgentTree => "Agent tree",
+            Self::ProcessDetails => "Process details",
+            Self::Preview => "Preview",
+            Self::TmuxTerminal => "tmux terminal",
+            Self::Placeholder => "Placeholder",
+        }
+    }
+
+    /// Kinds that have a working Pane renderer and are meaningful display
+    /// overrides. Internal, migrated and reserved values remain readable from old
+    /// Layouts but are not offered as if they were operational choices.
+    pub const fn is_display_override(self) -> bool {
+        matches!(
+            self,
+            Self::Terminal
+                | Self::Agent
+                | Self::Shell
+                | Self::Tui
+                | Self::Logs
+                | Self::TestOutput
+                | Self::Server
+                | Self::TmuxTerminal
+        )
+    }
+
+    /// Automatic presentation for one semantic subject.
+    ///
+    /// `has_terminal` is deliberately independent of identity: an Agent can use a
+    /// Shell-owned PTY, while a semantic-only subagent must open details instead of
+    /// borrowing its parent's terminal.
+    pub const fn detected_for_node(kind: NodeKind, has_terminal: bool) -> Self {
+        if !has_terminal {
+            return Self::ProcessDetails;
+        }
+        match kind {
+            NodeKind::Agent | NodeKind::Subagent => Self::Agent,
+            NodeKind::Shell => Self::Shell,
+            NodeKind::Tui => Self::Tui,
+            NodeKind::Server => Self::Server,
+            NodeKind::TestRunner | NodeKind::Build => Self::TestOutput,
+            NodeKind::TmuxSession | NodeKind::TmuxPane => Self::TmuxTerminal,
+            NodeKind::ExternalApp => Self::ProcessDetails,
+            NodeKind::Terminal | NodeKind::Watcher | NodeKind::Background | NodeKind::Unknown => {
+                Self::Terminal
+            }
+        }
+    }
+
     /// Whether this pane type is backed by a pty.
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -198,7 +295,35 @@ impl AgentLaunchProfileRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: PaneId,
+    /// Current presentation and the historical v4 wire field.
+    ///
+    /// Older clients know this as the renderer that owns the view. Keeping that meaning
+    /// lets them continue to display automatic detection and explicit overrides even
+    /// though they cannot preserve a distinct launch intent when rewriting a Layout.
     pub kind: PaneKind,
+    /// Immutable launch intent when it differs from the current presentation.
+    ///
+    /// `None` is both the compact and historical wire form: launch falls back to `kind`.
+    /// This additive field prevents a new client's display choice from changing a later
+    /// restore, but an old client that rewrites the whole Layout necessarily collapses
+    /// the two axes back to its one historical `kind` value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_kind: Option<PaneKind>,
+    /// Whether the effective presentation is an override chosen from the Pane menu.
+    ///
+    /// False means the daemon may update `kind` from the semantic node
+    /// currently represented by this Pane. This provenance bit is separate from launch intent:
+    /// choosing an Agent when creating a Pane asks what to launch; it does not freeze
+    /// a label after the runtime proves what actually started.
+    #[serde(default)]
+    pub kind_is_user_set: bool,
+    /// Latest daemon-detected presentation while `kind` is manually pinned.
+    ///
+    /// This keeps renderer preference separate from runtime capability. A Pane may
+    /// stay pinned to Terminal while its exact Agent is in the background, but it
+    /// must detach from the Shell until that Agent owns the foreground again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_kind: Option<PaneKind>,
     pub title: Option<String>,
     /// Whether `title` was explicitly chosen by the user.
     ///
@@ -228,9 +353,10 @@ pub struct Pane {
 #[serde(rename_all = "snake_case")]
 pub enum RestoreBehaviour {
     /// Re-attach if the process survived; otherwise leave a consequential command stopped.
-    /// Commandless terminal panes are the exception: they are always restored as the user's
+    /// Bare commandless terminal panes are the exception: they are restored as the user's
     /// shell, because an empty terminal is not useful and opening a shell has no automated
-    /// side effect against the checkout.
+    /// side effect against the checkout. Agent launch intent, arguments and provider profiles
+    /// are consequential and therefore never qualify for this exception.
     #[default]
     ReattachOnly,
     /// Start the pane again when a window returns to the Session (a shell, an agent pane, a
@@ -246,6 +372,9 @@ impl Pane {
         Self {
             id: PaneId::new(),
             kind,
+            launch_kind: None,
+            kind_is_user_set: false,
+            detected_kind: None,
             title: None,
             title_is_user_set: false,
             command: None,
@@ -288,6 +417,94 @@ impl Pane {
     pub fn with_restore(mut self, restore: RestoreBehaviour) -> Self {
         self.restore = restore;
         self
+    }
+
+    /// Applies daemon-authoritative detection without trampling a manual display
+    /// override.
+    pub fn detect_kind(&mut self, kind: PaneKind) {
+        if self.kind_is_user_set {
+            self.detected_kind = Some(kind);
+        } else {
+            let launch_kind = self.launch_kind();
+            self.kind = kind;
+            self.launch_kind = (launch_kind != kind).then_some(launch_kind);
+            self.detected_kind = None;
+        }
+    }
+
+    /// Presentation after applying automatic detection or an explicit override.
+    pub fn presentation_kind(&self) -> PaneKind {
+        self.kind
+    }
+
+    /// Whether the selected renderer has a real terminal subject behind it.
+    ///
+    /// A manual terminal-shaped renderer is preference, not permission to borrow a
+    /// different Process's PTY. Automatic Panes carry this in `kind`; pinned Panes
+    /// retain the latest automatic result in `detected_kind`.
+    pub fn has_terminal_capability(&self) -> bool {
+        self.presentation_kind().is_terminal()
+            && self
+                .detected_kind
+                .unwrap_or_else(|| self.presentation_kind())
+                .is_terminal()
+    }
+
+    /// Immutable launch intent, falling back to the historical single-axis value.
+    pub fn launch_kind(&self) -> PaneKind {
+        self.launch_kind.unwrap_or(self.kind)
+    }
+
+    /// Replaces launch intent while editing a launch definition.
+    ///
+    /// A manual presentation remains a manual presentation; Automatic follows the
+    /// new launch kind until runtime evidence detects something more specific. View
+    /// operations never call this method, so they cannot mutate launch authority.
+    pub fn replace_launch_kind(&mut self, launch_kind: PaneKind) {
+        if self.kind_is_user_set {
+            self.launch_kind = (self.kind != launch_kind).then_some(launch_kind);
+        } else {
+            self.kind = launch_kind;
+            self.launch_kind = None;
+            self.detected_kind = None;
+        }
+    }
+
+    /// Whether an otherwise stopped Pane can be restored as a plain interactive shell
+    /// without opting into consequential relaunch.
+    ///
+    /// Every commandless terminal presentation except Agent resolves to the configured
+    /// shell. Agent is deliberately excluded: the same shape resolves a Workspace
+    /// default/installed agent when one exists. Arguments and a provider profile also
+    /// make the launch consequential rather than a bare shell fallback.
+    pub fn is_commandless_shell_fallback(&self) -> bool {
+        self.launch_kind().is_terminal()
+            && self.launch_kind() != PaneKind::Agent
+            && self
+                .command
+                .as_deref()
+                .is_none_or(|command| command.trim().is_empty())
+            && self.args.is_empty()
+            && self.launch_profile.is_none()
+    }
+
+    /// Pins the presentation while leaving process identity and lifetime untouched.
+    pub fn override_kind(&mut self, kind: PaneKind) {
+        let launch_kind = self.launch_kind();
+        let detected_kind = self.detected_kind.unwrap_or(self.kind);
+        self.kind = kind;
+        self.launch_kind = (launch_kind != kind).then_some(launch_kind);
+        self.kind_is_user_set = true;
+        self.detected_kind = Some(detected_kind);
+    }
+
+    /// Returns presentation control to automatic detection.
+    pub fn reset_kind(&mut self, detected: PaneKind) {
+        let launch_kind = self.launch_kind();
+        self.kind = detected;
+        self.launch_kind = (launch_kind != detected).then_some(launch_kind);
+        self.kind_is_user_set = false;
+        self.detected_kind = None;
     }
 }
 
@@ -441,12 +658,21 @@ impl Layout {
             .then_some(id)
     }
 
-    /// Changes what renderer owns the view, without touching its process binding.
+    /// Pins what renderer owns the view, without touching its process binding.
     pub fn change_kind(&mut self, target: &PaneId, kind: PaneKind) -> bool {
         let Some(pane) = self.get_mut(target) else {
             return false;
         };
-        pane.kind = kind;
+        pane.override_kind(kind);
+        true
+    }
+
+    /// Returns a Pane to daemon-authoritative presentation detection.
+    pub fn reset_kind(&mut self, target: &PaneId, detected: PaneKind) -> bool {
+        let Some(pane) = self.get_mut(target) else {
+            return false;
+        };
+        pane.reset_kind(detected);
         true
     }
 
@@ -2072,6 +2298,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_bare_commandless_non_agent_terminal_is_a_safe_shell_fallback() {
+        assert!(Pane::new(PaneKind::Shell).is_commandless_shell_fallback());
+        assert!(Pane::new(PaneKind::Terminal).is_commandless_shell_fallback());
+        assert!(Pane::new(PaneKind::Tui).is_commandless_shell_fallback());
+
+        assert!(
+            !Pane::new(PaneKind::Agent).is_commandless_shell_fallback(),
+            "Agent intent may resolve a configured or installed agent"
+        );
+        assert!(!Pane::new(PaneKind::Shell)
+            .with_command("zsh")
+            .is_commandless_shell_fallback());
+        let mut scripted = Pane::new(PaneKind::Shell);
+        scripted.args = vec!["-c".into(), "make deploy".into()];
+        assert!(!scripted.is_commandless_shell_fallback());
+        assert!(!Pane::new(PaneKind::Shell)
+            .with_launch_profile(AgentLaunchProfileRef::new("codex", "autonomous"))
+            .is_commandless_shell_fallback());
+
+        let mut detected = Pane::new(PaneKind::Shell);
+        detected.detect_kind(PaneKind::Agent);
+        assert!(
+            detected.is_commandless_shell_fallback(),
+            "automatic presentation cannot change the immutable Shell launch intent"
+        );
+    }
+
+    #[test]
     fn floating_and_docking_preserve_the_pane_binding_and_exact_geometry() {
         let mut layout = layout();
         let first = layout.panes()[0].id.clone();
@@ -2117,12 +2371,168 @@ mod tests {
         );
         assert!(layout.change_kind(&duplicate, PaneKind::ProcessDetails));
         assert_eq!(
-            layout.get(&duplicate).unwrap().kind,
+            layout.get(&duplicate).unwrap().presentation_kind(),
             PaneKind::ProcessDetails
+        );
+        assert!(layout.get(&duplicate).unwrap().kind_is_user_set);
+        assert_eq!(
+            layout.get(&duplicate).unwrap().launch_kind(),
+            PaneKind::Agent,
+            "a display override cannot rewrite relaunch intent"
         );
         assert_eq!(
             layout.get(&duplicate).unwrap().node_id.as_ref(),
             Some(&node)
         );
+        assert!(layout.reset_kind(&duplicate, PaneKind::Agent));
+        assert!(!layout.get(&duplicate).unwrap().kind_is_user_set);
+        assert_eq!(
+            layout.get(&duplicate).unwrap().presentation_kind(),
+            PaneKind::Agent
+        );
+    }
+
+    #[test]
+    fn a_historical_retyped_pane_keeps_kind_as_presentation_and_launch() {
+        // This is the exact pre-split Pane shape. In that implementation
+        // `change_pane_kind` overwrote `kind`, so `logs` may be a renderer chosen
+        // after the Pane was created rather than its original launch category.
+        let json = r#"{
+            "id": "pane_legacy_retyped",
+            "kind": "logs",
+            "title": "old logs view",
+            "command": "tail",
+            "args": ["-f", "turn.log"],
+            "cwd": null,
+            "env": [],
+            "node_id": null,
+            "restore": "reattach_only"
+        }"#;
+        let pane: Pane = serde_json::from_str(json).unwrap();
+
+        assert_eq!(pane.kind, PaneKind::Logs);
+        assert_eq!(pane.presentation_kind(), PaneKind::Logs);
+        assert_eq!(pane.launch_kind(), PaneKind::Logs);
+        assert!(pane.launch_kind.is_none());
+        assert!(!pane.kind_is_user_set);
+    }
+
+    #[test]
+    fn detection_override_and_reset_preserve_a_distinct_launch_intent() {
+        let mut pane = Pane::new(PaneKind::Shell).with_command("zsh");
+
+        pane.detect_kind(PaneKind::Agent);
+        assert_eq!(pane.kind, PaneKind::Agent);
+        assert_eq!(pane.launch_kind(), PaneKind::Shell);
+        assert_eq!(pane.presentation_kind(), PaneKind::Agent);
+        assert_eq!(pane.launch_kind, Some(PaneKind::Shell));
+
+        pane.override_kind(PaneKind::Logs);
+        assert_eq!(pane.kind, PaneKind::Logs);
+        assert_eq!(pane.launch_kind(), PaneKind::Shell);
+        assert_eq!(pane.presentation_kind(), PaneKind::Logs);
+        assert_eq!(pane.launch_kind, Some(PaneKind::Shell));
+
+        pane.reset_kind(PaneKind::Agent);
+        assert_eq!(pane.kind, PaneKind::Agent);
+        assert_eq!(pane.launch_kind(), PaneKind::Shell);
+        assert_eq!(pane.presentation_kind(), PaneKind::Agent);
+
+        let round_trip: Pane =
+            serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(round_trip.kind, PaneKind::Agent);
+        assert_eq!(round_trip.launch_kind(), PaneKind::Shell);
+        assert_eq!(round_trip.presentation_kind(), PaneKind::Agent);
+    }
+
+    #[test]
+    fn a_terminal_override_never_invents_runtime_capability() {
+        let mut pane = Pane::new(PaneKind::Agent);
+        pane.override_kind(PaneKind::Terminal);
+        assert!(pane.has_terminal_capability());
+        assert_eq!(pane.detected_kind, Some(PaneKind::Agent));
+
+        pane.detect_kind(PaneKind::ProcessDetails);
+        assert_eq!(pane.presentation_kind(), PaneKind::Terminal);
+        assert!(pane.kind_is_user_set);
+        assert_eq!(pane.detected_kind, Some(PaneKind::ProcessDetails));
+        assert!(
+            !pane.has_terminal_capability(),
+            "a renderer pin cannot borrow another Process's PTY"
+        );
+
+        pane.detect_kind(PaneKind::Agent);
+        assert_eq!(pane.presentation_kind(), PaneKind::Terminal);
+        assert!(pane.has_terminal_capability());
+
+        pane.reset_kind(PaneKind::Agent);
+        assert_eq!(pane.detected_kind, None);
+        assert_eq!(pane.presentation_kind(), PaneKind::Agent);
+        assert!(pane.has_terminal_capability());
+    }
+
+    #[test]
+    fn replacing_launch_intent_preserves_only_an_explicit_presentation_pin() {
+        let mut automatic = Pane::new(PaneKind::Shell);
+        automatic.detect_kind(PaneKind::Agent);
+        automatic.replace_launch_kind(PaneKind::Terminal);
+        assert_eq!(automatic.presentation_kind(), PaneKind::Terminal);
+        assert_eq!(automatic.launch_kind(), PaneKind::Terminal);
+        assert!(automatic.launch_kind.is_none());
+        assert!(!automatic.kind_is_user_set);
+
+        let mut pinned = Pane::new(PaneKind::Shell);
+        pinned.override_kind(PaneKind::Logs);
+        pinned.replace_launch_kind(PaneKind::Agent);
+        assert_eq!(pinned.presentation_kind(), PaneKind::Logs);
+        assert_eq!(pinned.launch_kind(), PaneKind::Agent);
+        assert_eq!(pinned.launch_kind, Some(PaneKind::Agent));
+        assert!(pinned.kind_is_user_set);
+    }
+
+    #[test]
+    fn a_historical_writer_collapses_split_axes_to_the_visible_kind() {
+        let mut pane = Pane::new(PaneKind::Shell).with_command("zsh");
+        pane.detect_kind(PaneKind::Agent);
+        let mut rewritten = serde_json::to_value(&pane).unwrap();
+        let object = rewritten.as_object_mut().unwrap();
+        object.remove("launch_kind");
+        object.remove("kind_is_user_set");
+
+        let rewritten: Pane = serde_json::from_value(rewritten).unwrap();
+        assert_eq!(rewritten.presentation_kind(), PaneKind::Agent);
+        assert_eq!(rewritten.launch_kind(), PaneKind::Agent);
+        assert!(!rewritten.kind_is_user_set);
+    }
+
+    #[test]
+    fn every_persisted_view_kind_has_unique_catalogue_metadata() {
+        let mut slugs = std::collections::HashSet::new();
+        for kind in PaneKind::ALL {
+            assert!(!kind.slug().is_empty());
+            assert!(!kind.label().is_empty());
+            assert!(slugs.insert(kind.slug()), "duplicate slug: {}", kind.slug());
+        }
+        assert_eq!(slugs.len(), 13);
+    }
+
+    #[test]
+    fn every_view_kind_has_an_exact_documentation_anchor_and_section() {
+        let docs = include_str!("../../../../docs/VIEW_TYPES.md");
+        for kind in PaneKind::ALL {
+            let anchor = format!("<a id=\"{}\"></a>", kind.slug());
+            assert_eq!(
+                docs.matches(&anchor).count(),
+                1,
+                "{} needs one stable documentation anchor",
+                kind.slug()
+            );
+            let heading = format!("## {}", kind.label());
+            assert!(
+                docs.contains(&heading),
+                "{} needs a detailed documentation section",
+                kind.slug()
+            );
+        }
     }
 }

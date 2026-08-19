@@ -22,7 +22,7 @@ use crate::gemini::GeminiCliAdapter;
 use crate::heuristic::HeuristicAdapter;
 use crate::opencode::OpenCodeAdapter;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turn_core::event::TurnEvent;
 use turn_core::model::AgentLaunchProfileRef;
@@ -249,12 +249,23 @@ impl AdapterRegistry {
     pub fn select(&self, command_line: &str) -> Selection {
         let executable = executable_of(command_line);
 
+        self.select_executable(&executable)
+    }
+
+    /// Picks an adapter from one already-structured executable identity.
+    ///
+    /// Unlike [`Self::select`], this never tokenises the value. Process-table
+    /// executable paths may legally contain spaces, and treating such a path as a
+    /// shell command both loses its basename and makes mutable argv text authoritative.
+    fn select_executable(&self, executable_path: &str) -> Selection {
+        let executable = structured_executable_of(executable_path);
+
         for adapter in &self.adapters {
-            if !adapter.handles(executable) {
+            if !adapter.handles(&executable) {
                 continue;
             }
-            let found = adapter.detect(executable);
-            let note = describe(adapter.as_ref(), executable, found.is_some());
+            let found = adapter.detect(&executable);
+            let note = describe(adapter.as_ref(), &executable, found.is_some());
             return Selection {
                 level: adapter.best_level(),
                 capabilities: adapter.capabilities(),
@@ -267,7 +278,7 @@ impl AdapterRegistry {
         Selection {
             level: self.fallback.best_level(),
             capabilities: self.fallback.capabilities(),
-            executable: crate::adapter::which(executable),
+            executable: crate::adapter::which(&executable),
             note: if executable.is_empty() {
                 "No command given.".to_string()
             } else {
@@ -279,6 +290,361 @@ impl AdapterRegistry {
             adapter: Arc::clone(&self.fallback),
         }
     }
+
+    /// Picks an adapter from structured process-table identity.
+    ///
+    /// Agent CLIs installed from npm/pip are often visible to the OS as `node` or
+    /// `python`, even though the shell invoked `claude`, `codex`, `gemini` or another
+    /// registered executable. Only the wrapper's first script/module operand is
+    /// inspected, and only exact path components owned by an adapter are accepted.
+    /// Arbitrary prompt arguments are deliberately ignored, so `node app.js --prompt
+    /// codex` cannot become a Codex Agent.
+    pub fn select_observed(
+        &self,
+        process_name: &str,
+        argv: &[String],
+        command_line: &str,
+        cwd: Option<&str>,
+    ) -> Selection {
+        let named = self.select_executable(process_name);
+        if named.level >= IntegrationLevel::Heuristic {
+            return named;
+        }
+
+        let actual_executable = structured_executable_of(process_name);
+        let invoked_executable = argv
+            .first()
+            .map(|argument| structured_executable_of(argument))
+            .unwrap_or_default();
+        for adapter in &self.adapters {
+            if adapter.handles(&invoked_executable)
+                && adapter
+                    .observed_executable_aliases()
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&actual_executable))
+            {
+                return self.select(adapter.executables().first().copied().unwrap_or(""));
+            }
+        }
+
+        // Some kernels report the canonical interpreter (`/bin/bash`) even when
+        // the launched executable was a registered symlink (`/bin/sh`). argv[0]
+        // may recover that launch name only when the adapter's detected executable
+        // and the kernel executable resolve to the same filesystem target. This
+        // preserves legitimate aliases without allowing `exec -a codex node app.js`
+        // to turn arbitrary Node code into Codex.
+        if let Some(alias) = argv.first() {
+            let aliased = self.select_executable(alias);
+            if aliased.level >= IntegrationLevel::Heuristic
+                && aliased.executable.as_deref().is_some_and(|candidate| {
+                    same_executable_target(Path::new(process_name), candidate)
+                })
+            {
+                return aliased;
+            }
+        }
+
+        // Old stored process events did not carry the executable separately. Keep
+        // their replay compatible, but never let argv/command-line spelling overrule
+        // a real OS executable identity (for example `exec -a codex node app.js`).
+        if process_name.is_empty() {
+            return self.select(command_line);
+        }
+
+        let wrapper = structured_executable_of(process_name);
+        if !matches!(
+            wrapper.as_str(),
+            "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "ruby"
+        ) {
+            return named;
+        }
+        let Some(subject) = wrapper_subject(&wrapper, argv) else {
+            return named;
+        };
+        for adapter in &self.adapters {
+            if adapter_owns_wrapper_subject(adapter.as_ref(), subject, cwd) {
+                return self.select(adapter.executables().first().copied().unwrap_or(""));
+            }
+        }
+        named
+    }
+
+    /// Whether two interpreter processes execute the exact same wrapper subject.
+    ///
+    /// Gemini deliberately relaunches its JavaScript bundle in a child Node process.
+    /// That child is runtime scaffolding, not a second Agent. Equality is based on the
+    /// canonical script/module identity rather than merely the provider name, so a
+    /// genuine second Gemini invocation is never swallowed.
+    pub fn same_observed_wrapper_subject(
+        &self,
+        left_executable: &str,
+        left_argv: &[String],
+        left_cwd: Option<&str>,
+        right_executable: &str,
+        right_argv: &[String],
+        right_cwd: Option<&str>,
+    ) -> bool {
+        observed_wrapper_identity(left_executable, left_argv, left_cwd)
+            .zip(observed_wrapper_identity(
+                right_executable,
+                right_argv,
+                right_cwd,
+            ))
+            .is_some_and(|(left, right)| left == right)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WrapperSubject<'a> {
+    Path(&'a str),
+    Module(&'a str),
+}
+
+fn adapter_owns_wrapper_subject(
+    adapter: &dyn AgentAdapter,
+    subject: WrapperSubject<'_>,
+    cwd: Option<&str>,
+) -> bool {
+    match subject {
+        WrapperSubject::Path(path) => {
+            let Some(identity) = normalised_wrapper_path(path, cwd) else {
+                return false;
+            };
+            adapter
+                .observed_wrapper_path_suffixes()
+                .iter()
+                .any(|suffix| path_ends_at_component(&identity, suffix))
+        }
+        WrapperSubject::Module(module) => adapter.observed_wrapper_modules().contains(&module),
+    }
+}
+
+fn path_ends_at_component(path: &str, suffix: &str) -> bool {
+    if path.len() < suffix.len() {
+        return false;
+    }
+    let (prefix, tail) = path.split_at(path.len() - suffix.len());
+    tail.eq_ignore_ascii_case(suffix) && (prefix.is_empty() || prefix.ends_with('/'))
+}
+
+fn path_is_absolute_like(path: &str) -> bool {
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+}
+
+fn same_executable_target(observed: &Path, candidate: &Path) -> bool {
+    let (Ok(observed), Ok(candidate)) = (
+        std::fs::canonicalize(observed),
+        std::fs::canonicalize(candidate),
+    ) else {
+        return false;
+    };
+    observed == candidate
+}
+
+fn normalised_wrapper_path(path: &str, cwd: Option<&str>) -> Option<String> {
+    if path.contains("://") {
+        return None;
+    }
+    let candidate = Path::new(path);
+    let candidate = if path_is_absolute_like(path) {
+        candidate.to_path_buf()
+    } else {
+        Path::new(cwd?).join(candidate)
+    };
+    match std::fs::canonicalize(&candidate) {
+        Ok(canonical) => Some(canonical.to_string_lossy().replace('\\', "/")),
+        // Synthetic/restored absolute paths can describe another platform or a
+        // process that has already exited. Relative paths require an existing target.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path_is_absolute_like(path) =>
+        {
+            // A broken symlink is still an existing, untrusted filesystem object;
+            // never fall back to its package-shaped spelling.
+            match std::fs::symlink_metadata(&candidate) {
+                Err(metadata_error) if metadata_error.kind() == std::io::ErrorKind::NotFound => {
+                    Some(path.replace('\\', "/"))
+                }
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn observed_wrapper_identity(
+    executable: &str,
+    argv: &[String],
+    cwd: Option<&str>,
+) -> Option<String> {
+    let wrapper = structured_executable_of(executable);
+    if !matches!(
+        wrapper.as_str(),
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "ruby"
+    ) {
+        return None;
+    }
+    let subject = wrapper_subject(&wrapper, argv)?;
+    let subject = match subject {
+        WrapperSubject::Path(path) => normalised_wrapper_path(path, cwd)?,
+        WrapperSubject::Module(module) => format!("module:{module}"),
+    };
+    Some(format!("{wrapper}\0{}", subject.to_ascii_lowercase()))
+}
+
+/// Returns only an operand the wrapper itself will execute.
+///
+/// Unknown option grammar fails closed. Treating an option value or `-c` source as a
+/// script would let arbitrary prompt/config text become Agent identity.
+fn wrapper_subject<'a>(wrapper: &str, argv: &'a [String]) -> Option<WrapperSubject<'a>> {
+    let mut args = argv;
+    if args
+        .first()
+        .is_some_and(|argument| structured_executable_of(argument) == wrapper)
+    {
+        args = &args[1..];
+    }
+    match wrapper {
+        "node" | "nodejs" => script_after_options(
+            args,
+            &[
+                "-r",
+                "--require",
+                "--import",
+                "--loader",
+                "--experimental-loader",
+            ],
+            &["-e", "--eval", "-p", "--print", "-c", "--check"],
+        )
+        .filter(|candidate| path_like_script(candidate))
+        .map(WrapperSubject::Path),
+        "bun" => {
+            if matches!(args.first().map(String::as_str), Some("run" | "x" | "exec")) {
+                None
+            } else {
+                script_after_options(args, &["--cwd", "--config"], &["-e", "--eval"])
+                    .filter(|candidate| path_like_script(candidate))
+                    .map(WrapperSubject::Path)
+            }
+        }
+        "deno" => {
+            let rest = args.strip_prefix(&["run".to_string()])?;
+            script_after_options(
+                rest,
+                &[
+                    "--config",
+                    "--import-map",
+                    "--cert",
+                    "--location",
+                    "--v8-flags",
+                ],
+                &[],
+            )
+            .filter(|candidate| path_like_script(candidate))
+            .map(WrapperSubject::Path)
+        }
+        "python" | "python3" => python_subject(args),
+        "ruby" => script_after_options(args, &["-I", "-r"], &["-e"])
+            .filter(|candidate| path_like_script(candidate))
+            .map(WrapperSubject::Path),
+        _ => None,
+    }
+}
+
+fn script_after_options<'a>(
+    args: &'a [String],
+    options_with_value: &[&str],
+    code_options: &[&str],
+) -> Option<&'a str> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "--" {
+            return args.get(index + 1).map(String::as_str);
+        }
+        if code_options
+            .iter()
+            .any(|option| is_inline_or_separate_code_option(argument, option))
+        {
+            return None;
+        }
+        if options_with_value.contains(&argument) {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            // Long `--flag=value` and common boolean runtime flags are self-contained.
+            // Any other unknown option could consume the following token, so stop.
+            if argument.contains('=')
+                || matches!(
+                    argument,
+                    "--quiet" | "--no-check" | "--unstable" | "--watch" | "-B" | "-E" | "-s"
+                )
+            {
+                index += 1;
+                continue;
+            }
+            return None;
+        }
+        return Some(argument);
+    }
+    None
+}
+
+fn is_inline_or_separate_code_option(argument: &str, option: &str) -> bool {
+    if argument == option {
+        return true;
+    }
+    let Some(rest) = argument.strip_prefix(option) else {
+        return false;
+    };
+    if option.starts_with("--") {
+        rest.starts_with('=')
+    } else {
+        !rest.is_empty()
+    }
+}
+
+fn python_subject(args: &[String]) -> Option<WrapperSubject<'_>> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--" => {
+                return args
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .map(WrapperSubject::Path)
+            }
+            "-c" => return None,
+            "-m" => {
+                return args
+                    .get(index + 1)
+                    .map(String::as_str)
+                    .map(WrapperSubject::Module)
+            }
+            "-W" | "-X" => index += 2,
+            "-B" | "-E" | "-I" | "-O" | "-OO" | "-P" | "-q" | "-s" | "-S" | "-u" | "-v" => {
+                index += 1
+            }
+            argument if argument.starts_with('-') => return None,
+            argument => {
+                return path_like_script(argument).then_some(WrapperSubject::Path(argument))
+            }
+        }
+    }
+    None
+}
+
+fn path_like_script(candidate: &str) -> bool {
+    candidate.contains(['/', '\\'])
+        || [".js", ".mjs", ".cjs", ".ts", ".py", ".rb"]
+            .iter()
+            .any(|extension| candidate.ends_with(extension))
 }
 
 /// A sentence about what the user is getting, for the session details panel.
@@ -318,14 +684,45 @@ fn describe(adapter: &dyn AgentAdapter, executable: &str, installed: bool) -> St
 /// shell one-liner, a pipeline) is deliberately not unpicked: guessing which
 /// program inside `sh -c '…'` matters would produce confident mistakes, and the
 /// generic terminal is the right answer for a shell invocation.
-pub fn executable_of(command_line: &str) -> &str {
-    command_line
+pub fn executable_of(command_line: &str) -> String {
+    let executable = command_line
         .split_whitespace()
         .find(|token| !is_env_assignment(token))
         .unwrap_or("")
-        .rsplit('/')
+        .rsplit(['/', '\\'])
         .next()
-        .unwrap_or("")
+        .unwrap_or("");
+    let executable = executable
+        .len()
+        .checked_sub(4)
+        .filter(|stem| *stem > 0)
+        .and_then(|stem| {
+            executable
+                .get(stem..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                .then_some(stem)
+        })
+        .and_then(|stem| executable.get(..stem))
+        .unwrap_or(executable);
+    executable.to_ascii_lowercase()
+}
+
+/// Basename of an OS-provided executable path, preserving spaces inside the path.
+fn structured_executable_of(path: &str) -> String {
+    let executable = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let executable = executable
+        .len()
+        .checked_sub(4)
+        .filter(|stem| *stem > 0)
+        .and_then(|stem| {
+            executable
+                .get(stem..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                .then_some(stem)
+        })
+        .and_then(|stem| executable.get(..stem))
+        .unwrap_or(executable);
+    executable.to_ascii_lowercase()
 }
 
 fn is_env_assignment(token: &str) -> bool {
@@ -824,6 +1221,10 @@ mod tests {
     #[test]
     fn an_absolute_path_and_leading_environment_variables_do_not_hide_the_tool() {
         assert_eq!(executable_of("/opt/homebrew/bin/claude"), "claude");
+        assert_eq!(executable_of(r"C:\Tools\CLAUDE.EXE"), "claude");
+        assert_eq!(executable_of("node.exe"), "node");
+        assert_eq!(executable_of("ééa"), "ééa");
+        assert_eq!(executable_of("工具.EXE"), "工具");
         assert_eq!(executable_of("RUST_LOG=debug claude --resume"), "claude");
         assert_eq!(
             executable_of("ANTHROPIC_API_KEY=sk-x FOO=1 /usr/local/bin/claude"),
@@ -834,6 +1235,285 @@ mod tests {
 
         let selection = registry().select("RUST_LOG=debug /opt/homebrew/bin/codex");
         assert_eq!(selection.adapter.id(), "codex");
+    }
+
+    #[test]
+    fn observed_script_wrappers_resolve_only_exact_adapter_owned_paths() {
+        let registry = AdapterRegistry::with_builtin();
+        for (path, adapter) in [
+            (
+                "/opt/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs",
+                "claude-code",
+            ),
+            (
+                "/opt/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "claude-code",
+            ),
+            ("/opt/lib/node_modules/@openai/codex/bin/codex.js", "codex"),
+            (
+                "/opt/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+                "gemini-cli",
+            ),
+            ("/opt/lib/node_modules/opencode-ai/bin/opencode", "opencode"),
+        ] {
+            let argv = vec!["node".to_string(), path.to_string(), "--flag".to_string()];
+            assert_eq!(
+                registry
+                    .select_observed("node", &argv, &argv.join(" "), None)
+                    .adapter
+                    .id(),
+                adapter,
+                "wrapper path {path}"
+            );
+        }
+
+        for (process, adapter) in [
+            (
+                r"C:\npm\node_modules\@anthropic-ai\claude-code\bin\CLAUDE.EXE",
+                "claude-code",
+            ),
+            (
+                r"C:\npm\node_modules\@openai\codex\vendor\x86_64-pc-windows-msvc\bin\CODEX.EXE",
+                "codex",
+            ),
+            (
+                r"C:\npm\node_modules\opencode-ai\bin\OPENCODE.EXE",
+                "opencode",
+            ),
+        ] {
+            assert_eq!(
+                registry
+                    .select_observed(process, &[], process, None)
+                    .adapter
+                    .id(),
+                adapter,
+                "native Windows executable {process}"
+            );
+        }
+
+        let unrelated = vec![
+            "node".to_string(),
+            "/repo/app.js".to_string(),
+            "--prompt".to_string(),
+            "codex".to_string(),
+        ];
+        assert_eq!(
+            registry
+                .select_observed("node", &unrelated, &unrelated.join(" "), None)
+                .level,
+            IntegrationLevel::GenericTerminal,
+            "an argument that merely mentions an Agent is not executable identity"
+        );
+
+        for argv in [
+            vec!["node", "--require", "codex", "/repo/app.js"],
+            vec![
+                "node",
+                "--eval='0'",
+                "/opt/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+            vec![
+                "node",
+                "--print=process.version",
+                "/opt/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+            vec![
+                "node.exe",
+                "-e0",
+                r"C:\npm\node_modules\@openai\codex\bin\codex.js",
+            ],
+            vec!["python", "-c", "claude"],
+            vec!["bun", "run", "opencode"],
+            vec!["node", "/repo/codex/app.js"],
+            vec!["node", "/repo/claude/index.js"],
+            vec!["node", "/repo/gemini-cli/tool.js"],
+            vec!["node", "/tmp/opencode/bin.js"],
+            vec!["node", "/tmp/evilnode_modules/@openai/codex/bin/codex.js"],
+            vec!["python3", "-m", "codex"],
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                registry
+                    .select_observed(&argv[0], &argv, &argv.join(" "), None)
+                    .level,
+                IntegrationLevel::GenericTerminal,
+                "an option value or package-script name is not executable identity: {argv:?}"
+            );
+        }
+
+        let deno = vec![
+            "deno".to_string(),
+            "run".to_string(),
+            "/opt/lib/node_modules/@google/gemini-cli/dist/index.js".to_string(),
+        ];
+        assert_eq!(
+            registry
+                .select_observed("deno", &deno, &deno.join(" "), None)
+                .adapter
+                .id(),
+            "gemini-cli"
+        );
+
+        let spoofed_argv = vec![
+            "codex".to_string(),
+            "/repo/app.js".to_string(),
+            "--prompt".to_string(),
+            "codex".to_string(),
+        ];
+        assert_eq!(
+            registry
+                .select_observed(
+                    "/usr/local/bin/node",
+                    &spoofed_argv,
+                    &spoofed_argv.join(" "),
+                    None,
+                )
+                .level,
+            IntegrationLevel::GenericTerminal,
+            "argv[0] cannot overrule the kernel executable identity"
+        );
+
+        assert_eq!(
+            registry
+                .select_observed(
+                    "/Applications/Agent Tools/codex",
+                    &["codex".into()],
+                    "codex",
+                    None,
+                )
+                .adapter
+                .id(),
+            "codex",
+            "spaces inside an OS executable path are not shell token boundaries"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_node_shims_are_identified_from_their_canonical_package_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let registry = AdapterRegistry::with_builtin();
+
+        for (shim_name, package_path, expected) in [
+            (
+                "codex",
+                "lib/node_modules/@openai/codex/bin/codex.js",
+                "codex",
+            ),
+            (
+                "gemini",
+                "lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+                "gemini-cli",
+            ),
+        ] {
+            let target = root.path().join(package_path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "// package-owned fixture").unwrap();
+            let shim = bin.join(shim_name);
+            symlink(&target, &shim).unwrap();
+            let argv = vec![
+                "node".to_string(),
+                shim.display().to_string(),
+                "--yolo".to_string(),
+            ];
+            assert_eq!(
+                registry
+                    .select_observed("node", &argv, &argv.join(" "), None)
+                    .adapter
+                    .id(),
+                expected,
+                "the package-manager shim must resolve to {package_path}"
+            );
+        }
+
+        let unrelated = root.path().join("evil.js");
+        std::fs::write(&unrelated, "// unrelated fixture").unwrap();
+        let misleading = bin.join("codex-unrelated");
+        symlink(&unrelated, &misleading).unwrap();
+        let argv = vec!["node".to_string(), misleading.display().to_string()];
+        assert_eq!(
+            registry
+                .select_observed("node", &argv, &argv.join(" "), None)
+                .level,
+            IntegrationLevel::GenericTerminal,
+            "a shim name is not evidence when its canonical target is unrelated"
+        );
+
+        let package_spelling = root.path().join("node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(package_spelling.parent().unwrap()).unwrap();
+        symlink(&unrelated, &package_spelling).unwrap();
+        let argv = vec!["node".to_string(), package_spelling.display().to_string()];
+        assert_eq!(
+            registry
+                .select_observed("node", &argv, &argv.join(" "), None)
+                .level,
+            IntegrationLevel::GenericTerminal,
+            "an exact package-shaped symlink must be judged by its canonical target"
+        );
+    }
+
+    #[test]
+    fn wrapper_relaunch_identity_requires_the_same_canonical_subject() {
+        let registry = AdapterRegistry::with_builtin();
+        let outer = vec![
+            "node".to_string(),
+            "/opt/lib/node_modules/@google/gemini-cli/bundle/gemini.js".to_string(),
+            "--yolo".to_string(),
+        ];
+        let child = vec![
+            "/usr/local/bin/node".to_string(),
+            "/opt/lib/node_modules/@google/gemini-cli/bundle/gemini.js".to_string(),
+            "--yolo".to_string(),
+        ];
+        assert!(registry.same_observed_wrapper_subject(
+            "/usr/local/bin/node",
+            &outer,
+            None,
+            "/usr/local/bin/node",
+            &child,
+            None,
+        ));
+
+        let other = vec![
+            "node".to_string(),
+            "/another/lib/node_modules/@google/gemini-cli/bundle/gemini.js".to_string(),
+        ];
+        assert!(
+            !registry.same_observed_wrapper_subject("node", &outer, None, "node", &other, None,)
+        );
+    }
+
+    #[test]
+    fn relative_wrapper_scripts_are_resolved_against_the_observed_process_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("node_modules/@google/gemini-cli");
+        let script = package.join("dist/index.js");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(&script, "// package-owned fixture").unwrap();
+        let argv = vec!["node".to_string(), "dist/index.js".to_string()];
+        let registry = AdapterRegistry::with_builtin();
+        assert_eq!(
+            registry
+                .select_observed("node", &argv, &argv.join(" "), package.to_str(),)
+                .adapter
+                .id(),
+            "gemini-cli"
+        );
+
+        let application = root.path().join("repo/app");
+        let unrelated = application.join("dist/index.js");
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        std::fs::write(unrelated, "// unrelated fixture").unwrap();
+        assert_eq!(
+            registry
+                .select_observed("node", &argv, &argv.join(" "), application.to_str(),)
+                .level,
+            IntegrationLevel::GenericTerminal
+        );
     }
 
     #[test]

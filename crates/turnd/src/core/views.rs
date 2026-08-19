@@ -9,13 +9,46 @@ use super::command::ClientId;
 use super::Core;
 use std::collections::HashMap;
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
-use turn_core::model::SessionStatus;
+use turn_core::model::{PaneNodeBinding, Session, SessionStatus};
 use turn_proto::{
     AttentionView, NodePaneCapability, ServerEvent, SessionDetails, SessionSummary,
     TemplateSummary, TreeNodeView, WorkspaceSummary,
 };
 
 impl Core {
+    /// Builds one Session tree with identical capability and PTY-host facts for
+    /// detail responses, pushes and the unified hierarchy snapshot.
+    pub(crate) fn tree_views_with_bindings(
+        &self,
+        session: &Session,
+        bindings: &[PaneNodeBinding],
+        now_ms: i64,
+    ) -> Vec<TreeNodeView> {
+        let capabilities: HashMap<NodeId, NodePaneCapability> = session
+            .tree
+            .iter()
+            .map(|node| (node.id.clone(), self.node_pane_capability(&node.id)))
+            .collect();
+        let terminal_hosts: std::collections::HashSet<_> = session
+            .tree
+            .iter()
+            .filter(|node| node.kind.is_agentic())
+            .filter_map(|node| self.terminal_node(&node.id))
+            .filter(|runtime| {
+                session
+                    .tree
+                    .get(runtime)
+                    .is_some_and(|node| node.kind == turn_core::model::NodeKind::Shell)
+            })
+            .collect();
+        let mut views =
+            TreeNodeView::for_session_with_panes(session, bindings, &capabilities, now_ms);
+        for view in &mut views {
+            view.terminal_runtime_host = terminal_hosts.contains(&view.node_id);
+        }
+        views
+    }
+
     /// One session row, with the attention manager's numbers folded in.
     pub(crate) fn session_summary(&self, id: &SessionId, now_ms: i64) -> Option<SessionSummary> {
         let session = self.sessions.get(id)?;
@@ -130,15 +163,7 @@ impl Core {
                         tracing::warn!(%error, session = %id, "could not load Pane bindings");
                         Vec::new()
                     });
-                // One answer for what an explicit open action may render, shared with
-                // every other route that reports it: an agent running in a pane's shell
-                // has a terminal, and it is that shell's.
-                let capabilities: HashMap<NodeId, NodePaneCapability> = session
-                    .tree
-                    .iter()
-                    .map(|node| (node.id.clone(), self.node_pane_capability(&node.id)))
-                    .collect();
-                TreeNodeView::for_session_with_panes(session, &bindings, &capabilities, now_ms)
+                self.tree_views_with_bindings(session, &bindings, now_ms)
             }
             None => Vec::new(),
         }

@@ -374,6 +374,13 @@ impl AgentAdapter for ClaudeCodeAdapter {
         &["claude"]
     }
 
+    fn observed_wrapper_path_suffixes(&self) -> &'static [&'static str] {
+        &[
+            "node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs",
+            "node_modules/@anthropic-ai/claude-code/cli.js",
+        ]
+    }
+
     fn best_level(&self) -> IntegrationLevel {
         IntegrationLevel::Structured
     }

@@ -7,8 +7,8 @@
 use egui::{Align2, FontId, Key, Modifiers, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use turn_core::ids::{NodeId, SessionId, WorkspaceId};
 use turn_core::model::{
-    AgentRuntimeMetadata, LaunchConfiguration, Observable, ObservationSourceKind, QuotaSnapshot,
-    QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
+    AgentRuntimeMetadata, LaunchConfiguration, Observable, ObservationSourceKind, PaneKind,
+    QuotaSnapshot, QuotaWindow, UsageMeasurement, UsageMeasurementKind, UsageUnit,
 };
 use turn_core::state::{AwaitingReason, Turn};
 use turn_proto::{
@@ -115,6 +115,24 @@ pub(super) fn resolve<'a>(
             })
         }),
     }
+}
+
+/// Resolves the semantic subject a durable Process-details Pane is allowed to draw.
+///
+/// Keeping the kind and binding checks beside the navigation resolver prevents a
+/// renderer from falling back to a similarly named or parent Node when a saved binding
+/// is stale. Other Pane kinds deliberately return `None` here.
+pub(super) fn resolve_process_details_pane<'a>(
+    snapshot: &'a HierarchySnapshot,
+    kind: PaneKind,
+    node_id: Option<&NodeId>,
+    active_session: Option<&SessionId>,
+) -> Option<ResolvedViewTarget<'a>> {
+    if kind != PaneKind::ProcessDetails {
+        return None;
+    }
+    let key = HierarchyKey::process(node_id?.clone());
+    resolve(snapshot, Some(&key), active_session)
 }
 
 /// Starts the two bounded read-only projections used by a Node view.
@@ -316,6 +334,21 @@ impl TurnView<'_> {
 
         panel(ui, theme, primary);
         panel(ui, theme, detail_rect);
+        // Controls claim egui focus before the terminal decides whether it owns this
+        // frame's raw keyboard events. Drawing the inspector second let Shift+Enter
+        // write to the PTY and activate a focused button in the same frame.
+        node_details(
+            ui,
+            theme,
+            detail_rect,
+            snapshot,
+            session,
+            node,
+            safe_node,
+            safe_details,
+            state,
+            self.now_ms,
+        );
         if let Some((pane, content)) = self.exact_terminal(node) {
             actions.extend(self.terminal_primary(
                 ui,
@@ -340,18 +373,6 @@ impl TurnView<'_> {
                 self.now_ms,
             );
         }
-        node_details(
-            ui,
-            theme,
-            detail_rect,
-            snapshot,
-            session,
-            node,
-            safe_node,
-            safe_details,
-            state,
-            self.now_ms,
-        );
 
         let id = ui.id().with(("node-work-surface", node.node_id.as_str()));
         ui.ctx().accesskit_node_builder(id, |builder| {
@@ -424,11 +445,21 @@ impl TurnView<'_> {
             .runtime_id
             .as_ref()
             .and_then(|runtime_id| state.resize_owner_epoch(runtime_id, &content.pane_id));
+        let eligible = self.temporary_pane.is_none()
+            && !state.is_sensitive()
+            && self.write_conflict.is_none()
+            && self.link_confirmation.is_none();
+        let accepts_input = if self.temporary_pane.is_none() {
+            super::terminal_accepts_keyboard(ui, state, &content.pane_id, eligible)
+        } else {
+            false
+        };
         let options = PaneOptions {
             focused: true,
-            accepts_input: !state.is_sensitive()
-                && self.write_conflict.is_none()
-                && self.link_confirmation.is_none(),
+            // The exact Node WorkSurface remains painted beneath a Temporary Pane, but
+            // there is only one keyboard lease. Otherwise both terminals clone the same
+            // raw egui event and a single keystroke is written to two runtimes.
+            accepts_input,
             now_ms: self.now_ms,
             scrolled: content.scrolled,
             history_complete: content.history_complete,
@@ -1041,6 +1072,29 @@ fn inspected_node_for<'a>(
     }
 }
 
+fn terminal_runtime_host<'a>(
+    session: &'a SessionTreeView,
+    node: &TreeNodeView,
+    has_terminal: bool,
+) -> Option<&'a TreeNodeView> {
+    if !has_terminal {
+        return None;
+    }
+    let mut ancestor_id = node.parent.clone();
+    for _ in 0..session.nodes.len() {
+        let id = ancestor_id?;
+        let ancestor = session
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node_id == id)?;
+        if ancestor.terminal_runtime_host {
+            return Some(ancestor);
+        }
+        ancestor_id = ancestor.parent.clone();
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn node_details(
     ui: &mut Ui,
@@ -1060,7 +1114,17 @@ fn node_details(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 inspector_section(ui, theme, "IDENTITY & RUNTIME");
-                inspector_value(ui, theme, "type", node_kind_label(node.kind));
+                inspector_value(ui, theme, "subject type", node_kind_label(node.kind));
+                let has_terminal = matches!(
+                    node.pane_capability,
+                    NodePaneCapability::Terminal { .. }
+                );
+                inspector_value(
+                    ui,
+                    theme,
+                    "detected view",
+                    PaneKind::detected_for_node(node.kind, has_terminal).label(),
+                );
                 inspector_value(ui, theme, "state", node.display_state.label());
                 if let Some(safe_node) = safe_node {
                     inspector_value(
@@ -1074,6 +1138,18 @@ fn node_details(
                 }
                 inspector_value(ui, theme, "runtime", &format_duration(node.runtime_ms));
                 inspector_optional_owned(ui, theme, "pid", node.pid.map(|pid| pid.to_string()));
+                let runtime_host = terminal_runtime_host(session, node, has_terminal);
+                inspector_value(
+                    ui,
+                    theme,
+                    "runtime host",
+                    &runtime_host.map_or_else(
+                        || "self".to_string(),
+                        |runtime| {
+                            format!("{} · {}", runtime.title, node_kind_label(runtime.kind))
+                        },
+                    ),
+                );
                 if let Some(agent) = safe_node.and_then(|node| node.agent.as_ref()) {
                     inspector_optional(ui, theme, "provider", agent.agent.provider.as_deref());
                     inspector_optional(ui, theme, "tool", agent.agent.tool.as_deref());
@@ -1388,7 +1464,9 @@ fn metric(ui: &mut Ui, theme: &Theme, label: &str, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turn_core::model::{Layout, Pane, PaneKind, ProcessNode, Session, Workspace};
+    use turn_core::model::{
+        Layout, NodeKind, Pane, PaneKind, ProcessNode, Relation, Session, Workspace,
+    };
     use turn_proto::{SessionSummary, TreeSurfaceState, WorkspaceSummary};
 
     const T0: i64 = 1_700_000_000_000;
@@ -1450,6 +1528,88 @@ mod tests {
         assert_eq!(first_target, ViewTarget::Node(first));
         assert_eq!(second_target, ViewTarget::Node(second));
         assert_ne!(first_target, second_target);
+    }
+
+    #[test]
+    fn a_process_details_pane_resolves_only_its_exact_bound_node() {
+        let (snapshot, _, session, first, second) = targets();
+        assert_eq!(
+            resolve_process_details_pane(
+                &snapshot,
+                PaneKind::ProcessDetails,
+                Some(&first),
+                Some(&session),
+            )
+            .map(ResolvedViewTarget::public),
+            Some(ViewTarget::Node(first))
+        );
+        assert!(resolve_process_details_pane(
+            &snapshot,
+            PaneKind::Terminal,
+            Some(&second),
+            Some(&session),
+        )
+        .is_none());
+        assert!(resolve_process_details_pane(
+            &snapshot,
+            PaneKind::ProcessDetails,
+            Some(&NodeId::from_stored("missing")),
+            Some(&session),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn identity_resolves_the_exact_terminal_host_through_technical_wrappers() {
+        let workspace = Workspace::new("turn", "/repo/turn", T0);
+        let mut session = Session::new(
+            workspace.id,
+            "nested runtime",
+            "/repo/turn",
+            Layout::single(Pane::new(PaneKind::Shell)),
+            T0,
+        );
+        let shell =
+            ProcessNode::process(session.id.clone(), NodeKind::Shell, "zsh", "/repo/turn", T0);
+        let shell_id = shell.id.clone();
+        session.tree.insert(shell);
+        let mut wrapper = ProcessNode::process(
+            session.id.clone(),
+            NodeKind::Terminal,
+            "node",
+            "/repo/turn",
+            T0 + 1,
+        );
+        wrapper.link_to(shell_id.clone(), Relation::Inferred);
+        let wrapper_id = wrapper.id.clone();
+        session.tree.insert(wrapper);
+        let mut agent = ProcessNode::agent(session.id.clone(), "claude", "/repo/turn", T0 + 2);
+        agent.link_to(wrapper_id, Relation::Inferred);
+        let agent_id = agent.id.clone();
+        session.tree.insert(agent);
+
+        let mut nodes = TreeNodeView::for_session(&session, T0 + 3);
+        nodes
+            .iter_mut()
+            .find(|node| node.node_id == shell_id)
+            .unwrap()
+            .terminal_runtime_host = true;
+        let summary = SessionSummary::from_session(&session, 0, false, T0 + 3);
+        let session = SessionTreeView {
+            session: summary,
+            nodes,
+        };
+        let agent = session
+            .nodes
+            .iter()
+            .find(|node| node.node_id == agent_id)
+            .unwrap();
+
+        assert_eq!(
+            terminal_runtime_host(&session, agent, true).map(|host| &host.node_id),
+            Some(&shell_id)
+        );
+        assert!(terminal_runtime_host(&session, agent, false).is_none());
     }
 
     #[test]

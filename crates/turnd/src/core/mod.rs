@@ -54,7 +54,7 @@ use tokio::task::JoinHandle;
 use turn_agents::{AdapterRegistry, HookServer, IntegrationLevel, OutputHeuristic};
 use turn_core::attention::Effect;
 use turn_core::event::{Confidence, TurnEvent};
-use turn_core::ids::{HandoffId, LeaseId, NodeId, SessionId, TemplateId, WorkspaceId};
+use turn_core::ids::{HandoffId, LeaseId, NodeId, PaneId, SessionId, TemplateId, WorkspaceId};
 use turn_core::model::{ContextHandoffOutcome, Session, Template, Workspace};
 use turn_core::{AttentionManager, UserContext};
 use turn_proto::{ErrorCode, Grid, ProtoError, ServerEvent};
@@ -115,7 +115,10 @@ pub struct Process {
     pub fallback_title: String,
     /// Agent name to restore when a low-priority process title is cleared.
     pub fallback_agent_name: Option<turn_core::model::AgentName>,
-    /// The adapter that prepared this launch, for relaunching and for reporting.
+    /// Adapter currently observing the foreground terminal subject.
+    ///
+    /// A hosted launch token has independent lifecycle authority; this field may
+    /// follow another Agent that takes the same Shell PTY's foreground.
     pub adapter_id: String,
     /// The integration the launch actually achieved, which may be lower than the
     /// adapter's best if something was missing.
@@ -150,6 +153,25 @@ pub struct Process {
     /// the supervisor which process in the table is the one Turn typed, so a sweep
     /// identifies it instead of adopting it a second time as an anonymous child.
     pub hosted: Option<NodeId>,
+    /// Integration facts for the command Turn launched as `hosted`.
+    ///
+    /// Foreground observation fields may temporarily follow another Agent sharing
+    /// this PTY. These two values restore the launched Agent's own observation tier
+    /// when job control returns it to the foreground.
+    pub hosted_adapter_id: Option<String>,
+    pub hosted_level: Option<IntegrationLevel>,
+    /// The Agent that currently owns this Shell PTY's foreground process group.
+    ///
+    /// This is terminal/presentation authority only, regardless of whether Turn
+    /// launched the Agent. `hosted` separately records lifecycle/relaunch authority.
+    /// Keeping both facts means Ctrl-Z can remove A's terminal without pretending A
+    /// ended, and `fg` can restore the same Agent without relaunching it.
+    pub observed_subject: Option<NodeId>,
+    /// The original Pane whose subject follows this PTY's foreground job.
+    ///
+    /// Duplicated or explicitly opened Panes are exact views of their bound Node and
+    /// must not be retargeted when job control changes this runtime's foreground.
+    pub foreground_pane: Option<PaneId>,
 }
 
 /// Sensitive handoff material is ephemeral: it is never put in SQLite or an event.
@@ -319,6 +341,13 @@ pub struct Core {
     /// that has just started has not had time to start anything, and a sweep fired the
     /// instant it spawned would find nothing and clear the request.
     pub(crate) sweep_due_ms: Option<i64>,
+    /// Foreground groups already given the pre-output reconciliation barrier for the
+    /// current deferred sweep request, keyed by the Shell runtime.
+    ///
+    /// Output is allowed one eager process-table refresh per distinct foreground job:
+    /// enough to fence B's first byte before publication, without turning every batch
+    /// from a verbose ordinary command into another full system scan.
+    pub(crate) eager_sweep_observations: HashMap<NodeId, (i64, u32)>,
 }
 
 impl Core {
@@ -370,6 +399,7 @@ impl Core {
             // at all, so the slow safety net does not fire on the first tick.
             last_sweep_ms: turn_core::now_ms(),
             sweep_due_ms: None,
+            eager_sweep_observations: HashMap::new(),
         };
         let now_ms = turn_core::now_ms();
         core.restore(now_ms)?;
@@ -451,7 +481,10 @@ impl Core {
                 node,
                 data,
                 dropped,
-            } => self.deliver_output(&node, data, dropped, now),
+            } => {
+                self.reconcile_before_output(&node, now);
+                self.deliver_output(&node, data, dropped, now);
+            }
             Command::Exited { node, info } => self.node_exited(&node, info, now),
             Command::AccountQuotaProbeFinished { result } => {
                 self.account_quota_probe_finished(result, now)
@@ -837,6 +870,10 @@ pub(crate) mod testing {
                     exited_ms: None,
                     title_generation: 0,
                     hosted: None,
+                    hosted_adapter_id: None,
+                    hosted_level: None,
+                    observed_subject: None,
+                    foreground_pane: Some(pane_id.clone()),
                 },
             );
             if let Some(session) = self.core.sessions.get_mut(session_id) {

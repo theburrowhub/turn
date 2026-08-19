@@ -135,10 +135,12 @@ pub fn encode_key(key: Key, modifiers: &Modifiers, modes: &Modes) -> Option<Vec<
         {
             // A bare carriage return cannot carry Shift, so sending the ordinary
             // Enter byte here makes an agent submit instead of inserting a line.
-            // Meta-Enter is the portable multiline fallback understood by agent
+            // Control-J is the common multiline fallback understood by agent
             // composers and survives an ordinary pty without enhanced-key
-            // negotiation.
-            vec![0x1b, b'\r']
+            // negotiation. Keep this case pure: adding another modifier must fall
+            // through to that chord's legacy encoding rather than silently becoming
+            // Ctrl-J. Some legacy Enter chords are necessarily indistinguishable.
+            vec![b'\n']
         }
         Key::Enter => {
             // Carriage return, not newline. A pty in canonical mode turns CR into
@@ -349,11 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn shift_enter_uses_the_portable_multiline_sequence() {
+    fn shift_enter_uses_control_j_without_reclassifying_other_chords() {
         assert_eq!(
             encode_key(Key::Enter, &shift(), &normal()),
-            Some(b"\x1b\r".to_vec()),
-            "Shift+Enter must remain distinct from the carriage return that submits"
+            Some(b"\n".to_vec()),
+            "Shift+Enter must be the Control-J multiline fallback, not submitting CR"
         );
 
         let alt_shift = Modifiers {
@@ -364,7 +366,30 @@ mod tests {
         assert_eq!(
             encode_key(Key::Enter, &alt_shift, &normal()),
             Some(b"\x1b\r".to_vec()),
-            "composing Shift with Alt must not add a second escape"
+            "Alt+Shift+Enter remains Meta-Enter instead of collapsing into Control-J"
+        );
+
+        let control_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            encode_key(Key::Enter, &control_shift, &normal()),
+            Some(b"\r".to_vec()),
+            "Ctrl+Shift+Enter uses legacy Enter rather than becoming Ctrl-J"
+        );
+
+        let command_shift = Modifiers {
+            shift: true,
+            mac_cmd: true,
+            command: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            encode_key(Key::Enter, &command_shift, &normal()),
+            Some(b"\r".to_vec()),
+            "Cmd+Shift+Enter uses legacy Enter rather than becoming Ctrl-J"
         );
     }
 

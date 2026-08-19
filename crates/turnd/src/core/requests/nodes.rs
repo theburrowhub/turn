@@ -1,9 +1,10 @@
 //! Writing to processes, stopping them, and the one way one comes back.
 
+use super::workspaces::store;
 use super::{validate_terminal_size, Answer};
 use crate::core::{ClientId, Core};
 use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::SessionStatus;
+use turn_core::model::{ObservationSourceKind, Relation, SessionStatus};
 use turn_proto::{ErrorCode, ProtoError, PtySize, Response, ServerEvent};
 use turn_pty::ScreenSize;
 
@@ -36,6 +37,14 @@ impl Core {
             // Recorded in memory only. A write happens per keystroke, and a database
             // transaction per keystroke would be a strange way to spend a session.
             session.touch(now_ms);
+        }
+        // A submitted shell command may have created the process the operator now
+        // sees. A job-control byte can also end, interrupt or background the foreground
+        // subject without a newline. Use the existing debounced supervisor sweep for
+        // those boundaries, never per ordinary keystroke, so the Pane follows the PTY
+        // within a moment rather than at the thirty-second safety interval.
+        if input_may_change_process_tree(data) {
+            self.request_sweep(now_ms);
         }
         Ok(Response::Ack)
     }
@@ -163,7 +172,7 @@ impl Core {
         self.supervisor.refresh();
         let observed = self.supervisor.observe(pid);
         if !observed.as_ref().is_some_and(|observed| {
-            crate::core::supervise::corroborates_hosted_process(&node, observed)
+            crate::core::supervise::corroborates_hosted_process(&self.registry, &node, observed)
         }) {
             self.publish_hosted_loss(session_id, node_id, now_ms);
             return Err(ProtoError::new(
@@ -193,10 +202,12 @@ impl Core {
     /// An agent hosted in a pane's shell types into that shell's tty. Anything else is
     /// its own.
     fn tty_node(&self, session_id: &SessionId, node_id: &NodeId) -> NodeId {
-        if self.processes.contains_key(node_id) {
-            return node_id.clone();
-        }
-        self.hosting_shell(session_id, node_id)
+        self.terminal_node(node_id)
+            .filter(|runtime| {
+                self.processes
+                    .get(runtime)
+                    .is_some_and(|process| process.session_id == *session_id)
+            })
             .unwrap_or_else(|| node_id.clone())
     }
 
@@ -308,11 +319,14 @@ impl Core {
     /// The shell one of Turn's processes is running an agent in, if this node is that
     /// agent.
     ///
-    /// Read from [`crate::core::Process::hosted`] rather than from the node's parent
-    /// edge: what makes this a relaunch Turn can perform is that Turn still holds the
-    /// pty the command would be typed into, not what the tree says about lineage.
+    /// A live association comes from [`crate::core::Process::hosted`]. Once that Agent
+    /// ends the Shell is deliberately released for another foreground command, so the
+    /// durable launch receipt plus the confirmed original Shell edge carries the
+    /// narrower authority to type the configured Agent command there again. A process
+    /// merely observed in the table has no launch receipt and can never take this path.
     fn hosting_shell(&self, session_id: &SessionId, node_id: &NodeId) -> Option<NodeId> {
-        self.processes
+        if let Some(shell) = self
+            .processes
             .iter()
             .find(|(_, process)| {
                 process.session_id == *session_id
@@ -320,6 +334,26 @@ impl Core {
                     && process.pty.is_running()
             })
             .map(|(shell, _)| shell.clone())
+        {
+            return Some(shell);
+        }
+
+        let node = self.sessions.get(session_id)?.tree.get(node_id)?;
+        let was_started_by_turn = !node.is_running()
+            && node.relation == Relation::Confirmed
+            && node
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.runtime.launch.requested.source())
+                .is_some_and(|source| source.kind == ObservationSourceKind::LaunchRequest);
+        if !was_started_by_turn {
+            return None;
+        }
+        let shell = node.parent.as_ref()?;
+        self.processes
+            .get(shell)
+            .filter(|process| process.session_id == *session_id && process.pty.is_running())
+            .map(|_| shell.clone())
     }
 
     /// Starts an agent again in the shell it was running in.
@@ -343,7 +377,9 @@ impl Core {
             .layout
             .panes()
             .into_iter()
-            .find(|pane| pane.node_id.as_ref() == Some(shell))
+            .find(|pane| {
+                pane.node_id.as_ref() == Some(node_id) || pane.node_id.as_ref() == Some(shell)
+            })
             .map(|pane| pane.id.clone())
             .ok_or_else(|| {
                 ProtoError::new(
@@ -398,6 +434,9 @@ impl Core {
         // that infers from its output.
         let previous_token = std::mem::replace(&mut process.hook_token, token);
         process.hosted = Some(new_node.clone());
+        process.hosted_adapter_id = Some(selection.adapter.id().to_string());
+        process.hosted_level = Some(plan.level);
+        process.observed_subject = Some(new_node.clone());
         process.level = plan.level;
         process.adapter_id = selection.adapter.id().to_string();
         process.heuristic = (plan.level == turn_agents::IntegrationLevel::Heuristic)
@@ -408,6 +447,10 @@ impl Core {
         agent.link_to(shell.clone(), turn_core::model::Relation::Confirmed);
         if let Ok(session) = self.session_mut(session_id) {
             session.tree.insert(agent);
+            if let Some(pane) = session.layout.get_mut(&pane_id) {
+                pane.node_id = Some(new_node.clone());
+                pane.detect_kind(turn_core::model::PaneKind::Agent);
+            }
             session.touch(now_ms);
         }
         self.retire_replaced_node(session_id, node_id, &descendants, now_ms)?;
@@ -415,10 +458,23 @@ impl Core {
             session.status = SessionStatus::Active;
         }
         self.persist_session(session_id)?;
+        self.store
+            .hierarchy()
+            .bind_pane(&turn_core::model::PaneNodeBinding {
+                pane_id: pane_id.clone(),
+                session_id: session_id.clone(),
+                node_id: new_node.clone(),
+                temporary: false,
+                surface_id: None,
+                opened_ms: now_ms,
+            })
+            .map_err(store)?;
+        self.bump_hierarchy();
         // The pid arrives when the sweep identifies it: the shell has only just been
         // told to run this, and it has not forked yet.
         self.request_sweep(now_ms);
         self.push_tree(session_id, now_ms);
+        self.push_layout(session_id, None);
         self.push_session_state(session_id, now_ms);
         tracing::info!(
             %session_id, %shell, agent = %new_node, level = plan.level.label(),
@@ -668,6 +724,12 @@ struct ResumeTarget {
     resumable: bool,
 }
 
+/// Input boundaries after which the foreground process tree may have changed.
+fn input_may_change_process_tree(data: &[u8]) -> bool {
+    data.iter()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0x03 | 0x04 | 0x1a))
+}
+
 /// The arguments that resume an agent's previous conversation.
 ///
 /// Only spelled out for tools where the flag is known to exist. Guessing at one would
@@ -778,6 +840,46 @@ mod tests {
     use turn_core::state::Lifecycle;
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[test]
+    fn line_and_job_control_boundaries_are_the_only_inputs_that_request_a_sweep() {
+        for boundary in [b'\r', b'\n', 0x03, 0x04, 0x1a] {
+            assert!(
+                input_may_change_process_tree(&[boundary]),
+                "byte {boundary:#04x} can change foreground ownership"
+            );
+        }
+        assert!(!input_may_change_process_tree(b"ordinary typing"));
+        assert!(!input_may_change_process_tree(&[]));
+    }
+
+    #[tokio::test]
+    async fn a_job_control_write_schedules_the_debounced_supervisor_sweep() {
+        let mut harness = Harness::new().await;
+        let session = SessionId::from_stored("sess_job_control");
+        let pane = PaneId::from_stored("pane_job_control");
+        harness.add_session(session.clone(), pane.clone(), NOW);
+        let node = harness.spawn_process(&session, &pane, NOW).await;
+
+        harness.core.sweep_due_ms = None;
+        harness
+            .core
+            .write_pty(&session, &node, b"x", NOW)
+            .expect("ordinary input writes");
+        assert_eq!(
+            harness.core.sweep_due_ms, None,
+            "ordinary keystrokes must not poll the process table"
+        );
+
+        harness
+            .core
+            .write_pty(&session, &node, &[0x1a], NOW + 1)
+            .expect("Ctrl-Z writes unchanged");
+        assert_eq!(
+            harness.core.sweep_due_ms,
+            Some(NOW + 1 + crate::core::supervise::SWEEP_DELAY_MS)
+        );
+    }
 
     /// A stop whose signal never reached the process stopped nothing. Whatever ends that
     /// process later ends it for its own reasons, and a crash that reports nothing —

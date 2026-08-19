@@ -128,6 +128,10 @@ impl AgentAdapter for OpenCodeAdapter {
         &["opencode"]
     }
 
+    fn observed_wrapper_path_suffixes(&self) -> &'static [&'static str] {
+        &["node_modules/opencode-ai/bin/opencode"]
+    }
+
     fn best_level(&self) -> IntegrationLevel {
         IntegrationLevel::Structured
     }

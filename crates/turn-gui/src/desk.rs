@@ -874,7 +874,7 @@ impl Desk {
 
         let layout = self.layouts.get(session_id)?;
         let is_candidate = |pane: &Pane| {
-            pane.kind.is_terminal()
+            pane.has_terminal_capability()
                 && self.runtime_of(&pane.id).as_ref() == Some(node_id)
                 && self.pty_sizes.contains_key(&pane.id)
                 && self.attachments.get(&pane.id).is_some_and(|attachment| {
@@ -1886,8 +1886,7 @@ impl Desk {
                 self.upsert_session(details.summary);
                 self.trees.insert(session_id.clone(), details.tree);
                 self.policies.insert(session_id.clone(), details.attention);
-                self.remember_layout(session_id, details.layout);
-                self.attach_wanted()
+                self.apply_layout(&session_id, details.layout)
             }
             (_, Response::Layout { session_id, layout }) => self.apply_layout(&session_id, layout),
             (
@@ -2370,7 +2369,7 @@ impl Desk {
             .filter(|session| !visible_sessions.contains(&session.id))
             .map(|session| session.id.clone())
             .collect();
-        let mut reactions = Vec::new();
+        let mut reactions = self.reconcile_temporary_capability(&snapshot);
         for session_id in hidden_sessions {
             reactions.extend(self.forget_hidden_session_views(&session_id));
         }
@@ -2423,9 +2422,80 @@ impl Desk {
                 request: Request::GetSession { session_id: active },
             });
         } else {
-            reactions.extend(self.attach_wanted());
+            reactions.extend(self.reconcile_wanted_attachments());
         }
         reactions
+    }
+
+    /// Keeps a surface-scoped exact view on the semantic node it was opened for
+    /// without letting it retain a terminal that node no longer owns.
+    ///
+    /// Temporary Panes are absent from `Layout`, so layout reconciliation cannot see
+    /// this capability transition. The hierarchy is authoritative for them. Dropping
+    /// the local generation here and sending its fenced Detach is safe even when the
+    /// daemon already performed the hard subscription cut during the PTY hand-off.
+    fn reconcile_temporary_capability(&mut self, snapshot: &HierarchySnapshot) -> Vec<Reaction> {
+        let Some((session_id, node_id, pane_id)) = self.temporary_pane.as_ref().map(|temporary| {
+            (
+                temporary.binding.session_id.clone(),
+                temporary.binding.node_id.clone(),
+                temporary.binding.pane_id.clone(),
+            )
+        }) else {
+            return Vec::new();
+        };
+        let branch = snapshot
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .find(|branch| branch.session.id == session_id);
+        let Some(branch) = branch else {
+            // A filtered hierarchy may omit an archived Session without deleting its
+            // bindings. `forget_hidden_session_views` below owns that path and sends
+            // the explicit ClosePane needed to remove the daemon-side temporary view.
+            return Vec::new();
+        };
+        let capability = branch
+            .nodes
+            .iter()
+            .find(|node| {
+                node.node_id == node_id
+                    && node.pane_bindings.iter().any(|binding| {
+                        binding.pane_id == pane_id
+                            && binding.session_id == session_id
+                            && binding.temporary
+                            && binding.surface_id.as_deref() == Some(self.surface_id.as_str())
+                    })
+            })
+            .map(|node| node.pane_capability.clone());
+        let Some(capability) = capability else {
+            // The hierarchy is the daemon's complete, surface-scoped binding set.
+            // Absence therefore closes this temporary identity; retaining its local
+            // feed would let a missed PaneClosed push keep painting a terminal that
+            // no longer exists server-side.
+            self.temporary_pane = None;
+            self.pane_owner.remove(&pane_id);
+            self.attaching.remove(&pane_id);
+            self.pty_sizes.remove(&pane_id);
+            return self.detach_subscription(&pane_id).into_iter().collect();
+        };
+        let changed = self
+            .temporary_pane
+            .as_ref()
+            .is_some_and(|temporary| temporary.capability != capability);
+        if !changed {
+            return Vec::new();
+        }
+        let terminal = matches!(capability, NodePaneCapability::Terminal { .. });
+        self.temporary_pane
+            .as_mut()
+            .expect("the temporary Pane identity was just copied")
+            .capability = capability;
+        if terminal {
+            return Vec::new();
+        }
+        self.attaching.remove(&pane_id);
+        self.detach_subscription(&pane_id).into_iter().collect()
     }
 
     fn apply_event(&mut self, event: turn_proto::ServerEvent, now_ms: i64) -> Vec<Reaction> {
@@ -2858,7 +2928,9 @@ impl Desk {
     /// What it needs is in the window already: the layout says each pane's `RestoreBehaviour` and
     /// the tree says whether its process has ended. `Relaunch` means running it again is harmless,
     /// which every built-in template sets for its shells, its agent panes and its file browsers.
-    /// A commandless terminal is also a safe shell fallback, including in legacy layouts.
+    /// A bare commandless non-Agent terminal is also a safe shell fallback, including in
+    /// legacy layouts. Agent intent may resolve an installed/default agent and therefore
+    /// still requires explicit `Relaunch`.
     /// `ReattachOnly` keeps a consequential command stopped without putting an action in the pane.
     ///
     /// Held back in the two cases where starting would be wrong rather than merely eager: a pane
@@ -2880,11 +2952,7 @@ impl Desk {
             };
             let mut wanted: Vec<NodeId> = Vec::new();
             for pane in layout.panes() {
-                let shell_fallback = pane.kind.is_terminal()
-                    && pane
-                        .command
-                        .as_deref()
-                        .is_none_or(|command| command.trim().is_empty());
+                let shell_fallback = pane.is_commandless_shell_fallback();
                 if pane.restore != turn_core::model::RestoreBehaviour::Relaunch && !shell_fallback {
                     continue;
                 }
@@ -3148,8 +3216,57 @@ impl Desk {
     }
 
     fn apply_layout(&mut self, session_id: &SessionId, layout: Layout) -> Vec<Reaction> {
+        let mut reactions = self.detach_incompatible_layout_subscriptions(session_id, &layout);
         self.remember_layout(session_id.clone(), layout);
-        self.attach_wanted()
+        reactions.extend(self.reconcile_wanted_attachments());
+        reactions
+    }
+
+    /// Retires subscriptions whose semantic binding or terminal capability changed.
+    ///
+    /// This runs before replacing the cached Layout so the generation-fenced Detach
+    /// still has the exact attachment id. Temporary panes are surface-scoped and are
+    /// intentionally independent of durable Layout updates.
+    fn detach_incompatible_layout_subscriptions(
+        &mut self,
+        session_id: &SessionId,
+        layout: &Layout,
+    ) -> Vec<Reaction> {
+        let temporary = self.temporary_pane.as_ref().map(|temporary| {
+            (
+                temporary.binding.session_id.clone(),
+                temporary.binding.pane_id.clone(),
+            )
+        });
+        let is_temporary = |pane_id: &PaneId| {
+            temporary
+                .as_ref()
+                .is_some_and(|(session, pane)| session == session_id && pane == pane_id)
+        };
+        let incompatible = self
+            .attachments
+            .iter()
+            .filter(|(pane_id, attachment)| {
+                attachment.session_id == *session_id
+                    && !is_temporary(pane_id)
+                    && layout.get(pane_id).is_none_or(|pane| {
+                        !pane.has_terminal_capability() || pane.node_id != attachment.node_id
+                    })
+            })
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect::<Vec<_>>();
+        let reactions = incompatible
+            .iter()
+            .filter_map(|pane_id| self.detach_subscription(pane_id))
+            .collect::<Vec<_>>();
+        self.attaching.retain(|pane_id, pending| {
+            pending.session_id != *session_id
+                || is_temporary(pane_id)
+                || layout.get(pane_id).is_some_and(|pane| {
+                    pane.has_terminal_capability() && pane.node_id == pending.node_id
+                })
+        });
+        reactions
     }
 
     /// Records a session's layout, and forgets the panes that went away.
@@ -3244,7 +3361,7 @@ impl Desk {
                 // Semantic Agent lifecycle is not terminal ownership: a hosted Agent
                 // can finish while its shell PTY remains live and readable. The daemon
                 // is the authority on attachability and resolves that runtime.
-                if pane.kind.is_terminal() && !has_restore_outcome {
+                if pane.has_terminal_capability() && !has_restore_outcome {
                     wanted.push((session_id.clone(), pane.id.clone()));
                 }
             }
@@ -3272,6 +3389,33 @@ impl Desk {
             let size = self.attach_size(&session_id, &pane_id);
             reactions.push(self.request_attach(session_id, pane_id, size));
         }
+        reactions
+    }
+
+    /// Makes terminal subscriptions match the effective renderer after a Layout change.
+    ///
+    /// Node identity is not the only terminal boundary: Automatic can move an exact
+    /// Agent view from `Agent` to `ProcessDetails` while deliberately keeping its
+    /// `node_id`. Retaining the old feed in that case would let the replacement Agent's
+    /// Shell repaint a view still labelled as the previous Agent.
+    fn reconcile_wanted_attachments(&mut self) -> Vec<Reaction> {
+        let wanted: HashSet<(SessionId, PaneId)> = self.wanted_panes().into_iter().collect();
+        let unwanted = self
+            .attachments
+            .iter()
+            .filter(|(pane_id, attachment)| {
+                !wanted.contains(&(attachment.session_id.clone(), (*pane_id).clone()))
+            })
+            .map(|(pane_id, _)| pane_id.clone())
+            .collect::<Vec<_>>();
+        let mut reactions = unwanted
+            .iter()
+            .filter_map(|pane_id| self.detach_subscription(pane_id))
+            .collect::<Vec<_>>();
+        self.attaching.retain(|pane_id, pending| {
+            wanted.contains(&(pending.session_id.clone(), pane_id.clone()))
+        });
+        reactions.extend(self.attach_wanted());
         reactions
     }
 
@@ -3324,26 +3468,7 @@ impl Desk {
         // in the Session just left unless it is an explicit temporary Pane. Tell the
         // daemon too: an invisible busy PTY must not keep filling this client's bounded
         // inbound queue.
-        let wanted: HashSet<(SessionId, PaneId)> = self.wanted_panes().into_iter().collect();
-        let hidden: Vec<PaneId> = self
-            .attachments
-            .iter()
-            .filter(|(pane, attachment)| {
-                !wanted.contains(&(attachment.session_id.clone(), (*pane).clone()))
-            })
-            .map(|(pane, _)| pane.clone())
-            .collect();
-        let mut reactions: Vec<Reaction> = hidden
-            .iter()
-            .filter_map(|pane| self.detach_subscription(pane))
-            .collect();
-        self.feeds.retain(|pane, _| {
-            self.pane_owner
-                .get(pane)
-                .is_some_and(|session| wanted.contains(&(session.clone(), pane.clone())))
-        });
-        self.attaching
-            .retain(|pane, pending| wanted.contains(&(pending.session_id.clone(), pane.clone())));
+        let mut reactions = self.reconcile_wanted_attachments();
 
         reactions.extend([
             select_tree,
@@ -3363,7 +3488,6 @@ impl Desk {
                 },
             },
         ]);
-        reactions.extend(self.attach_wanted());
         reactions
     }
 
@@ -4961,6 +5085,16 @@ impl Desk {
                 }],
                 None => Vec::new(),
             },
+            ViewAction::ResetPaneKind { pane_id } => match self.selected.clone() {
+                Some(session_id) => vec![Reaction::Send {
+                    ask: Ask::Action("restoring automatic Pane view detection"),
+                    request: Request::ResetPaneKind {
+                        session_id,
+                        pane_id,
+                    },
+                }],
+                None => Vec::new(),
+            },
             ViewAction::FloatPane { pane_id, geometry } => match self.selected.clone() {
                 Some(session_id) => vec![Reaction::Send {
                     ask: Ask::Action("detaching a Pane from the tiled Layout"),
@@ -5502,7 +5636,7 @@ fn pane_display_title(pane: &Pane, nodes: Option<&[TreeNodeView]>) -> String {
         .map(|node| node.title.clone())
         .or_else(|| pane.title.clone())
         .or_else(|| pane.command.clone())
-        .unwrap_or_else(|| format!("{:?}", pane.kind).to_lowercase())
+        .unwrap_or_else(|| format!("{:?}", pane.presentation_kind()).to_lowercase())
 }
 
 /// Whether a desync is worth telling the user about.
@@ -6789,6 +6923,29 @@ mod tests {
             other => panic!("expected one write, got {other:?}"),
         }
 
+        let multiline = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id: pane_id.clone(),
+                action: PaneAction::Write(b"\n".to_vec()),
+            },
+            T0,
+        );
+        match sent(&multiline).as_slice() {
+            [Request::WritePty {
+                node_id: written,
+                data,
+                ..
+            }] => {
+                assert_eq!(written, &node_id);
+                assert_eq!(
+                    data.as_slice(),
+                    b"\n",
+                    "the Shift+Enter Ctrl-J byte survives Desk and protocol framing"
+                );
+            }
+            other => panic!("expected one multiline write, got {other:?}"),
+        }
+
         // And no command produces anything that approves on the user's behalf.
         for command in Command::ALL {
             for request in sent(&desk.dispatch(*command, T0)) {
@@ -6798,6 +6955,114 @@ mod tests {
                     "{command:?} must not type on the user's behalf"
                 );
             }
+        }
+    }
+
+    /// The regression path, kept above the byte encoder: a real focused terminal frame
+    /// receives the macOS-shaped modifier/key sequence, its chrome leaves the chord for the
+    /// program, and Desk addresses the resulting byte to the Pane's runtime node.
+    #[test]
+    fn shift_enter_in_a_focused_terminal_becomes_one_write_pty_request() {
+        let (session, pane_id, node_id) = session_with_agent("Multiline prompt");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::default()
+        };
+        let mut raw = egui::RawInput::default();
+        raw.events.extend([
+            egui::Event::ModifiersChanged(shift),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: shift,
+            },
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: false,
+                repeat: false,
+                modifiers: shift,
+            },
+            egui::Event::ModifiersChanged(egui::Modifiers::default()),
+        ]);
+
+        let grid = Grid::from_lines(&["agent prompt"], 80);
+        let theme = crate::theme::Theme::dark();
+        let shortcuts =
+            crate::terminal::menu::PaneShortcuts::from_keymap(&crate::keymap::Keymap::build(
+                &crate::keymap::Overrides::new(),
+                crate::keymap::Platform::MAC,
+            ));
+        let pane_context = crate::terminal::menu::PaneContext::default();
+        let mut interaction = crate::terminal::PaneInteraction::default();
+        let mut pane_actions = Vec::new();
+        let context = egui::Context::default();
+        let _ = crate::frames::measure_with(&context, raw, |ui| {
+            pane_actions = crate::terminal::show_pane(
+                ui,
+                &mut interaction,
+                crate::terminal::PaneInput {
+                    theme: &theme,
+                    rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(640.0, 320.0),
+                    ),
+                    grid: &grid,
+                    options: crate::terminal::PaneOptions {
+                        focused: true,
+                        accepts_input: true,
+                        now_ms: T0,
+                        ..crate::terminal::PaneOptions::default()
+                    },
+                    id: ui.id().with("shift-enter-integration"),
+                    resize_claim: None,
+                    chrome: Some(crate::terminal::PaneChrome {
+                        shortcuts: &shortcuts,
+                        context: &pane_context,
+                    }),
+                },
+            )
+            .actions;
+        });
+        assert_eq!(
+            pane_actions,
+            vec![PaneAction::Write(b"\n".to_vec())],
+            "key-up and modifier transitions must not duplicate the multiline byte"
+        );
+
+        let reactions = desk.apply_view_action(
+            ViewAction::Pane {
+                pane_id,
+                action: pane_actions.pop().expect("one terminal write"),
+            },
+            T0,
+        );
+        match sent(&reactions).as_slice() {
+            [Request::WritePty {
+                node_id: written,
+                data,
+                ..
+            }] => {
+                assert_eq!(written, &node_id, "the Pane resolves to its runtime node");
+                assert_eq!(data.as_slice(), b"\n", "the Ctrl-J byte survives framing");
+            }
+            other => panic!("expected one multiline WritePty, got {other:?}"),
         }
     }
 
@@ -7655,13 +7920,20 @@ mod tests {
         assert!(
             matches!(
                 sent(&rebound).as_slice(),
-                [Request::AttachPane {
-                    pane_id: attached,
-                    size,
-                    ..
-                }] if attached == &pane_id && *size == visible
+                [
+                    Request::DetachPane {
+                        pane_id: detached,
+                        attachment_id: Some(7),
+                        ..
+                    },
+                    Request::AttachPane {
+                        pane_id: attached,
+                        size,
+                        ..
+                    }
+                ] if detached == &pane_id && attached == &pane_id && *size == visible
             ),
-            "the replacement attaches at the Pane's already-measured geometry: {rebound:?}"
+            "the old generation is fenced off before the replacement attaches at the Pane's already-measured geometry: {rebound:?}"
         );
 
         let replacement_resize = desk.apply_inbound(
@@ -8982,6 +9254,38 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn a_commandless_agent_needs_explicit_relaunch_permission() {
+        let (mut session, pane_id, node_id) = session_with_agent("Agent restore boundary");
+        if let Some(pane) = session.layout.get_mut(&pane_id) {
+            pane.kind = PaneKind::Agent;
+            pane.launch_kind = None;
+            pane.command = None;
+            pane.args.clear();
+            pane.launch_profile = None;
+            pane.restore = turn_core::model::RestoreBehaviour::ReattachOnly;
+        }
+        if let Some(node) = session.tree.get_mut(&node_id) {
+            node.lifecycle = Lifecycle::Lost;
+            node.turn = None;
+        }
+
+        let mut desk = Desk::new();
+        desk.apply_inbound(connected(), T0);
+        let reactions = desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        assert!(
+            !sent(&reactions)
+                .iter()
+                .any(|request| matches!(request, Request::RelaunchNode { .. })),
+            "commandless Agent intent may resolve a real agent and is not a shell-safe fallback"
+        );
+    }
+
     /// A pane whose command has a consequence stays stopped when it was not marked safe.
     ///
     /// `ReattachOnly` is the default and now means what it says. This is the half of the original
@@ -9273,6 +9577,259 @@ mod tests {
         );
         desk.refresh_screens();
         assert_eq!(desk.view(T0 + 3).panes.len(), 1);
+    }
+
+    #[test]
+    fn terminal_capability_changes_detach_and_reattach_without_rebinding_identity() {
+        let (mut session, pane_id, node_id) = session_with_agent("Exact Agent override");
+        session
+            .layout
+            .get_mut(&pane_id)
+            .unwrap()
+            .override_kind(PaneKind::Terminal);
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::from_lines(&["Agent A"], 20),
+                1,
+            ),
+            T0,
+        );
+
+        let mut unavailable = session.layout.clone();
+        unavailable
+            .get_mut(&pane_id)
+            .unwrap()
+            .detect_kind(PaneKind::ProcessDetails);
+        let detached = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::LayoutChanged {
+                session_id: session.id.clone(),
+                layout: unavailable.clone(),
+            })),
+            T0 + 1,
+        );
+        assert!(matches!(
+            sent(&detached).as_slice(),
+            [Request::DetachPane {
+                session_id,
+                pane_id: detached,
+                attachment_id: Some(7),
+            }] if session_id == &session.id && detached == &pane_id
+        ));
+        assert!(!desk.attachments.contains_key(&pane_id));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attaching.contains_key(&pane_id));
+        let unavailable_pane = desk.layouts[&session.id].get(&pane_id).unwrap();
+        assert_eq!(unavailable_pane.node_id.as_ref(), Some(&node_id));
+        assert_eq!(unavailable_pane.presentation_kind(), PaneKind::Terminal);
+        assert!(!unavailable_pane.has_terminal_capability());
+
+        unavailable
+            .get_mut(&pane_id)
+            .unwrap()
+            .detect_kind(PaneKind::Agent);
+        let reattached = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::LayoutChanged {
+                session_id: session.id.clone(),
+                layout: unavailable,
+            })),
+            T0 + 2,
+        );
+        assert!(matches!(
+            sent(&reattached).as_slice(),
+            [Request::AttachPane {
+                session_id,
+                pane_id: attached,
+                ..
+            }] if session_id == &session.id && attached == &pane_id
+        ));
+    }
+
+    #[test]
+    fn temporary_exact_pane_loses_and_regains_its_terminal_with_hierarchy_authority() {
+        let (session, _, node_id) = session_with_agent("Temporary exact Agent");
+        let mut desk = Desk::new();
+        desk.apply_inbound(
+            answer(Response::Sessions {
+                sessions: vec![summary(&session, 0)],
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            answer(Response::SessionDetails {
+                details: Box::new(details(&session)),
+            }),
+            T0,
+        );
+        desk.apply_inbound(
+            hierarchy_of(&[&session], Some(HierarchyKey::process(node_id.clone()))),
+            T0,
+        );
+
+        let pane_id = PaneId::from_stored("pane_temporary_capability");
+        let binding = PaneNodeBinding {
+            pane_id: pane_id.clone(),
+            session_id: session.id.clone(),
+            node_id: node_id.clone(),
+            temporary: true,
+            surface_id: Some("main-window".into()),
+            opened_ms: T0,
+        };
+        let terminal = NodePaneCapability::Terminal {
+            streams: vec![PaneStream::Cells],
+        };
+        let opened_answer = node_pane_answer(
+            &mut desk,
+            NodePaneView {
+                binding: binding.clone(),
+                capability: terminal.clone(),
+            },
+        );
+        let opened = desk.apply_inbound(opened_answer, T0);
+        assert!(sent(&opened).iter().any(|request| matches!(
+            request,
+            Request::AttachPane { pane_id: attached, .. } if attached == &pane_id
+        )));
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::from_lines(&["Agent A"], 20),
+                1,
+            ),
+            T0,
+        );
+        assert!(desk.attachments.contains_key(&pane_id));
+        assert!(desk.feeds.contains_key(&pane_id));
+
+        let snapshot = |revision: u64, capability: NodePaneCapability| {
+            let Inbound::Answer { response, .. } =
+                hierarchy_of(&[&session], Some(HierarchyKey::process(node_id.clone())))
+            else {
+                unreachable!("the hierarchy helper always returns an answer")
+            };
+            let Response::Hierarchy { snapshot } = *response else {
+                unreachable!("the hierarchy helper always returns a snapshot")
+            };
+            let mut snapshot = *snapshot;
+            snapshot.revision = revision;
+            let node = snapshot.workspaces[0].sessions[0]
+                .nodes
+                .iter_mut()
+                .find(|node| node.node_id == node_id)
+                .expect("the exact Agent row");
+            node.pane_bindings.push(binding.clone());
+            node.pane_capability = capability;
+            snapshot
+        };
+
+        let detached = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::HierarchyChanged {
+                snapshot: Box::new(snapshot(2, NodePaneCapability::PreviewDetails)),
+            })),
+            T0 + 1,
+        );
+        assert!(matches!(
+            sent(&detached).as_slice(),
+            [Request::DetachPane {
+                session_id,
+                pane_id: detached,
+                attachment_id: Some(7),
+            }] if session_id == &session.id && detached == &pane_id
+        ));
+        assert_eq!(
+            desk.temporary_pane().map(|pane| &pane.binding),
+            Some(&binding),
+            "capability changes never retarget an exact temporary view"
+        );
+        assert_eq!(
+            desk.temporary_pane().map(|pane| &pane.capability),
+            Some(&NodePaneCapability::PreviewDetails)
+        );
+        assert!(!desk.attachments.contains_key(&pane_id));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attaching.contains_key(&pane_id));
+
+        let reattached = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::HierarchyChanged {
+                snapshot: Box::new(snapshot(3, terminal)),
+            })),
+            T0 + 2,
+        );
+        assert!(matches!(
+            sent(&reattached).as_slice(),
+            [Request::AttachPane {
+                session_id,
+                pane_id: attached,
+                ..
+            }] if session_id == &session.id && attached == &pane_id
+        ));
+        assert_eq!(
+            desk.attaching
+                .get(&pane_id)
+                .and_then(|pending| pending.node_id.as_ref()),
+            Some(&node_id)
+        );
+        desk.apply_inbound(
+            attached(
+                &desk,
+                &pane_id,
+                &session.id,
+                &node_id,
+                Grid::from_lines(&["Agent A restored"], 20),
+                2,
+            ),
+            T0 + 3,
+        );
+
+        let Inbound::Answer { response, .. } =
+            hierarchy_of(&[&session], Some(HierarchyKey::process(node_id.clone())))
+        else {
+            unreachable!("the hierarchy helper always returns an answer")
+        };
+        let Response::Hierarchy { snapshot } = *response else {
+            unreachable!("the hierarchy helper always returns a snapshot")
+        };
+        let mut without_temporary_binding = *snapshot;
+        without_temporary_binding.revision = 4;
+        let disappeared = desk.apply_inbound(
+            Inbound::Event(Box::new(ServerEvent::HierarchyChanged {
+                snapshot: Box::new(without_temporary_binding),
+            })),
+            T0 + 4,
+        );
+        assert!(matches!(
+            sent(&disappeared).as_slice(),
+            [Request::DetachPane {
+                session_id,
+                pane_id: detached,
+                attachment_id: Some(7),
+            }] if session_id == &session.id && detached == &pane_id
+        ));
+        assert!(desk.temporary_pane().is_none());
+        assert!(!desk.pane_owner.contains_key(&pane_id));
+        assert!(!desk.attachments.contains_key(&pane_id));
+        assert!(!desk.feeds.contains_key(&pane_id));
+        assert!(!desk.attaching.contains_key(&pane_id));
+        assert!(!desk.pty_sizes.contains_key(&pane_id));
     }
 
     #[test]

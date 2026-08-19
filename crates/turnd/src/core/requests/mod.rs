@@ -520,6 +520,10 @@ impl Core {
                 pane_id,
                 kind,
             } => self.change_pane_kind(client, &session_id, &pane_id, kind),
+            Request::ResetPaneKind {
+                session_id,
+                pane_id,
+            } => self.reset_pane_kind(client, &session_id, &pane_id),
             Request::FloatPane {
                 session_id,
                 pane_id,
