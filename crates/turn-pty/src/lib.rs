@@ -15,4 +15,4 @@ pub use links::{LinkSpan, LinkTracker, MAX_LINK_URI_CHARS};
 pub use process::{
     ExitInfo, OutputChunk, ProcessSpec, PtyError, PtyProcess, ReadOnlySandbox, ReadOnlySandboxError,
 };
-pub use supervisor::{classify, ObservedProcess, ProcessSupervisor};
+pub use supervisor::{classify, classify_argv, ObservedProcess, ProcessSupervisor};

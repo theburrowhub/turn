@@ -189,10 +189,28 @@ impl Template {
     }
 }
 
-/// Clears live process bindings from a captured layout.
+/// Clears live process bindings and transient automatic presentation from a
+/// captured layout.
 fn strip_runtime(node: &mut LayoutNode) {
     match node {
-        LayoutNode::Leaf(pane) => pane.node_id = None,
+        LayoutNode::Leaf(pane) => {
+            pane.node_id = None;
+            pane.detected_kind = None;
+            if pane.kind_is_user_set && pane.presentation_kind().is_display_override() {
+                // Keep a deliberate operational renderer choice and canonicalise
+                // launch intent relative to that historical presentation field.
+                let launch = pane.launch_kind();
+                pane.launch_kind = (launch != pane.kind).then_some(launch);
+            } else {
+                // Automatic detection describes a live semantic subject, not what a
+                // future Session should pretend exists before its process starts.
+                // Invalid legacy pins fail safely back to Automatic as well.
+                let launch = pane.launch_kind();
+                pane.kind = launch;
+                pane.launch_kind = None;
+                pane.kind_is_user_set = false;
+            }
+        }
         LayoutNode::Split(split) => {
             for child in split.children.iter_mut() {
                 strip_runtime(&mut child.node);
@@ -273,6 +291,51 @@ mod tests {
             "a template must not remember which process it was cloned from"
         );
         assert_eq!(t.layout.panes()[0].command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn saving_a_live_layout_drops_detection_but_keeps_an_operational_display_pin() {
+        let mut automatic = Pane::new(PaneKind::Shell).with_command("zsh");
+        automatic.detect_kind(PaneKind::Agent);
+        let automatic_id = automatic.id.clone();
+        let mut layout = Layout::single(automatic);
+        layout.split(
+            &automatic_id,
+            Direction::Horizontal,
+            Pane::new(PaneKind::Shell).with_command("zsh"),
+        );
+        let pinned_id = layout.active.clone().unwrap();
+        layout
+            .get_mut(&pinned_id)
+            .unwrap()
+            .override_kind(PaneKind::Logs);
+
+        let template = Template::from_layout("Presentation", &layout, 0);
+        let automatic = template.layout.get(&automatic_id).unwrap();
+        assert_eq!(automatic.presentation_kind(), PaneKind::Shell);
+        assert_eq!(automatic.launch_kind(), PaneKind::Shell);
+        assert!(!automatic.kind_is_user_set);
+        assert!(automatic.launch_kind.is_none());
+
+        let pinned = template.layout.get(&pinned_id).unwrap();
+        assert_eq!(pinned.presentation_kind(), PaneKind::Logs);
+        assert!(pinned.kind_is_user_set);
+        assert_eq!(pinned.kind, PaneKind::Logs);
+        assert_eq!(pinned.launch_kind(), PaneKind::Shell);
+        assert_eq!(pinned.launch_kind, Some(PaneKind::Shell));
+    }
+
+    #[test]
+    fn capturing_an_invalid_internal_display_pin_returns_to_launch_intent() {
+        let mut pane = Pane::new(PaneKind::Shell).with_command("zsh");
+        pane.override_kind(PaneKind::ProcessDetails);
+        let template = Template::from_layout("Legacy invalid pin", &Layout::single(pane), 0);
+        let pane = template.layout.panes()[0];
+
+        assert_eq!(pane.presentation_kind(), PaneKind::Shell);
+        assert_eq!(pane.launch_kind(), PaneKind::Shell);
+        assert!(pane.launch_kind.is_none());
+        assert!(!pane.kind_is_user_set);
     }
 
     /// The last step of the first vertical: a second session from the same

@@ -398,6 +398,26 @@ pub struct PtyProcess {
 }
 
 impl PtyProcess {
+    /// Kernel-authoritative foreground process group for this PTY.
+    ///
+    /// A child merely descending from the shell is not enough to say it owns what the
+    /// operator sees: background jobs share the same terminal. `tcgetpgrp` is the fact
+    /// that distinguishes the one process group currently receiving terminal input.
+    #[cfg(unix)]
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        let fd = self.master.as_raw_fd()?;
+        // Safe: `tcgetpgrp` reads kernel terminal metadata for one valid descriptor and
+        // does not retain or mutate Rust-owned memory.
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        (group > 0).then_some(group as u32)
+    }
+
+    /// Unsupported platforms make no foreground claim.
+    #[cfg(not(unix))]
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        None
+    }
+
     /// Opens a pty, launches the command on it and starts pumping output.
     pub fn spawn(node_id: NodeId, spec: ProcessSpec, now_ms: i64) -> Result<Self, PtyError> {
         Self::spawn_with_preserved_fds(node_id, spec, now_ms, &[])

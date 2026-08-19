@@ -15,8 +15,8 @@
 //! would be the most convenient lie available.
 //!
 //! **Nothing is relaunched unattended.** The daemon reports what can be started again; a
-//! connected window immediately restores panes marked `Relaunch` and every commandless terminal
-//! as the user's shell. Booting a daemon with no window still runs no user process.
+//! connected window immediately restores panes marked `Relaunch` and bare commandless non-Agent
+//! terminals as the user's shell. Booting a daemon with no window still runs no user process.
 //!
 //! Checkout write authority is decided in the same pass, by [`super::authority`]: every
 //! unreleased lease is fenced before a single Session is loaded, and only evidence — the
@@ -569,11 +569,7 @@ impl Core {
             let Some(node) = session.tree.get(&node_id) else {
                 continue;
             };
-            let shell_fallback = pane.kind.is_terminal()
-                && pane
-                    .command
-                    .as_deref()
-                    .is_none_or(|command| command.trim().is_empty());
+            let shell_fallback = pane.is_commandless_shell_fallback();
             let relaunchable = pane.restore != RestoreBehaviour::Skip
                 && !node.lifecycle.is_running()
                 && (pane.command.is_some() || shell_fallback);
@@ -582,9 +578,9 @@ impl Core {
                 node_id,
                 lifecycle: node.lifecycle.clone(),
                 can_relaunch: relaunchable,
-                // `Relaunch` means running this again is harmless. A commandless terminal is
-                // harmless too, including legacy layouts that predate that metadata: it becomes
-                // the configured shell rather than a dead panel requiring a click.
+                // `Relaunch` is the explicit permission to run this again. The narrow
+                // commandless-shell exception also covers legacy generic terminals, but
+                // excludes Agent intent: that shape may resolve an installed/default Agent.
                 auto_start: relaunchable
                     && (pane.restore == RestoreBehaviour::Relaunch || shell_fallback),
                 // Descriptive only; relaunch authority is the durable node id.
@@ -983,7 +979,10 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
         .layout
         .panes()
         .iter()
-        .filter(|pane| pane.kind == PaneKind::AgentTree)
+        .filter(|pane| {
+            pane.presentation_kind() == PaneKind::AgentTree
+                || pane.launch_kind() == PaneKind::AgentTree
+        })
         .map(|pane| pane.id.clone())
         .collect();
     for pane_id in &obsolete {
@@ -992,6 +991,8 @@ fn migrate_obsolete_navigation_panes(session: &mut Session) -> bool {
             .get_mut(pane_id)
             .expect("the Pane id came from this Layout");
         pane.kind = PaneKind::Shell;
+        pane.launch_kind = None;
+        pane.kind_is_user_set = false;
         pane.title = Some("shell".into());
         pane.command = None;
         pane.args.clear();
@@ -1588,6 +1589,30 @@ mod migration_tests {
             .panes()
             .iter()
             .any(|pane| pane.kind == PaneKind::Shell && pane.command.is_none()));
+        assert!(!migrate_obsolete_navigation_panes(&mut session));
+    }
+
+    #[test]
+    fn a_legacy_navigation_launch_intent_is_normalised_after_a_view_override() {
+        let mut pane = Pane::new(PaneKind::AgentTree).with_launch_profile(
+            turn_core::model::AgentLaunchProfileRef::new("claude", "autonomous"),
+        );
+        pane.override_kind(PaneKind::Shell);
+        let pane_id = pane.id.clone();
+        let mut session = Session::new(
+            WorkspaceId::from_stored("ws_restore_launch_kind"),
+            "Legacy",
+            "/repo",
+            Layout::single(pane),
+            1,
+        );
+
+        assert!(migrate_obsolete_navigation_panes(&mut session));
+        let migrated = session.layout.get(&pane_id).unwrap();
+        assert_eq!(migrated.presentation_kind(), PaneKind::Shell);
+        assert_eq!(migrated.launch_kind(), PaneKind::Shell);
+        assert!(!migrated.kind_is_user_set);
+        assert!(migrated.launch_profile.is_none());
         assert!(!migrate_obsolete_navigation_panes(&mut session));
     }
 

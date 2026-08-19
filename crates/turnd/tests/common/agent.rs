@@ -13,11 +13,11 @@ use turn_proto::{NewPane, Request, ServerEvent};
 /// An agent session, with the callback URL its adapter was handed.
 pub struct Agent {
     pub session: turn_core::ids::SessionId,
-    /// The agent's own node, which is not the pane's process: the pane runs the user's
-    /// shell and the agent runs inside it, so the agent is the shell's child.
+    /// The Pane's semantic subject. Its runtime still runs inside the user's shell,
+    /// so the Agent is the shell's child without being mislabelled as that shell.
     pub node: turn_core::ids::NodeId,
-    /// The pane's process — the shell hosting the agent. This is what a keystroke goes
-    /// to and what owns the screen.
+    /// The Pane's runtime process — the shell hosting the agent. This is what a
+    /// keystroke reaches and what owns the screen.
     pub shell: turn_core::ids::NodeId,
     pub hook: String,
 }

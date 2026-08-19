@@ -357,6 +357,31 @@ pub trait AgentAdapter: Send + Sync {
     /// Command names this adapter claims.
     fn executables(&self) -> &'static [&'static str];
 
+    /// Exact package-owned path suffixes that may identify this adapter when the
+    /// process table exposes a language runtime instead of the command shim.
+    ///
+    /// A loose component such as `codex` is not evidence: arbitrary projects can
+    /// have that directory name. Signatures therefore include the package-manager
+    /// namespace and executable path. The registry normalises separators and checks
+    /// a component boundary before accepting one.
+    fn observed_wrapper_path_suffixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Exact modules this adapter owns for runtime forms such as `python -m foo`.
+    /// Empty by default; declaring an executable does not implicitly claim a module.
+    fn observed_wrapper_modules(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Kernel executable basenames that this adapter explicitly accepts when argv[0]
+    /// is one of [`Self::executables`]. This models a launcher that immediately execs
+    /// a known compatibility runtime without making that runtime an operator-facing
+    /// launch command. Empty by default; aliases are never inferred from argv text.
+    fn observed_executable_aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// The best integration this adapter can offer.
     fn best_level(&self) -> IntegrationLevel;
 

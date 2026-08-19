@@ -411,12 +411,13 @@ impl Core {
             .layout
             .get(pane_id)
             .ok_or_else(|| ProtoError::not_found("pane", pane_id.as_str()))?;
-        if !pane.kind.is_terminal() {
+        let launch_kind = pane.launch_kind();
+        if !launch_kind.is_terminal() {
             return Ok(None);
         }
         let workspace = self.workspaces.get(&session.workspace_id);
         let Some(launch) = pane_launch(
-            pane.kind,
+            launch_kind,
             pane.command.as_deref(),
             workspace,
             self.shell_for(Some(session_id)),
@@ -433,9 +434,9 @@ impl Core {
         // Resume and other one-launch controls are Turn-owned too: they must be
         // parsed as options, never appended into the literal prompt after `--`.
         let args = one_launch_arguments(&pane.args, extra_args)?;
-        let needs = launch_authority(&launch, pane.kind, &args);
+        let needs = launch_authority(&launch, launch_kind, &args);
         let request = PaneRequest {
-            kind: pane.kind,
+            kind: launch_kind,
             title: pane.title.clone(),
             args,
             launch_profile: pane.launch_profile.clone(),
@@ -464,8 +465,9 @@ impl Core {
         let Some(pane) = session.layout.get(pane_id) else {
             return LaunchAuthority::CheckoutWrite;
         };
+        let launch_kind = pane.launch_kind();
         let Some(launch) = pane_launch(
-            pane.kind,
+            launch_kind,
             pane.command.as_deref(),
             self.workspaces.get(&session.workspace_id),
             self.shell_for(Some(session_id)),
@@ -473,7 +475,7 @@ impl Core {
         ) else {
             return LaunchAuthority::CheckoutWrite;
         };
-        launch_authority(&launch, pane.kind, &pane.args)
+        launch_authority(&launch, launch_kind, &pane.args)
     }
 
     /// The agent a pane would host, for starting one again in a shell that never died.
@@ -508,7 +510,8 @@ impl Core {
         now_ms: i64,
     ) -> std::result::Result<Option<NodeId>, ProtoError> {
         let selection = self.select_installed(command, &request.args)?;
-        let kind = node_kind(request.kind, selection.level);
+        let kind = node_kind(request.kind, selection.level, command, &request.args);
+        let detected_kind = PaneKind::detected_for_node(kind, true);
         let mut node = new_node(session_id, kind, command, &request.cwd, now_ms);
         node.title = request
             .title
@@ -582,6 +585,7 @@ impl Core {
             &selection,
             &plan,
             token,
+            pane_id,
             None,
             fallback_title,
             fallback_agent_name,
@@ -592,6 +596,7 @@ impl Core {
             session.tree.insert(node);
             if let Some(pane) = session.layout.get_mut(pane_id) {
                 pane.node_id = Some(node_id.clone());
+                pane.detect_kind(detected_kind);
             }
             session.touch(now_ms);
         }
@@ -610,8 +615,8 @@ impl Core {
     /// Starts the pane's shell and runs an agent inside it.
     ///
     /// Two nodes, because two things are running and only one of them is Turn's: the
-    /// shell node owns the pty and the pane, and the agent node owns everything that
-    /// makes an agent an agent. The agent's edge to the shell is
+    /// shell node owns the PTY, the Pane represents the Agent, and the agent node owns
+    /// everything that makes an agent an agent. The agent's edge to the shell is
     /// [`Relation::Confirmed`] because Turn wrote the command line itself — there is
     /// nothing to infer.
     fn spawn_hosted_agent(
@@ -695,6 +700,7 @@ impl Core {
             &selection,
             &plan,
             token,
+            pane_id,
             Some(agent_id.clone()),
             fallback_title,
             None,
@@ -705,7 +711,12 @@ impl Core {
             session.tree.insert(shell_node);
             session.tree.insert(agent);
             if let Some(pane) = session.layout.get_mut(pane_id) {
-                pane.node_id = Some(shell_id.clone());
+                // The Pane represents the Agent the operator is controlling. The
+                // shell still owns the PTY and is resolved as its runtime by
+                // `terminal_node`; binding identity to the shell is what made the
+                // inspector falsely report SHELL for Claude and Codex.
+                pane.node_id = Some(agent_id.clone());
+                pane.detect_kind(PaneKind::Agent);
             }
             session.touch(now_ms);
         }
@@ -798,6 +809,10 @@ impl Core {
                 exited_ms: None,
                 title_generation: 0,
                 hosted: None,
+                hosted_adapter_id: None,
+                hosted_level: None,
+                observed_subject: None,
+                foreground_pane: Some(pane_id.clone()),
             },
         );
         {
@@ -805,6 +820,7 @@ impl Core {
             session.tree.insert(node);
             if let Some(pane) = session.layout.get_mut(pane_id) {
                 pane.node_id = Some(node_id.clone());
+                pane.detect_kind(PaneKind::Shell);
             }
             session.touch(now_ms);
         }
@@ -839,7 +855,7 @@ impl Core {
         selection: &Selection,
         now_ms: i64,
     ) -> std::result::Result<(ProcessNode, LaunchPlan, Option<String>), ProtoError> {
-        let kind = node_kind(request.kind, selection.level);
+        let kind = node_kind(request.kind, selection.level, command, &request.args);
         let mut agent = new_node(session_id, kind, command, &request.cwd, now_ms);
         agent.title = request
             .title
@@ -1091,6 +1107,7 @@ impl Core {
         selection: &Selection,
         plan: &LaunchPlan,
         token: Option<String>,
+        foreground_pane: &PaneId,
         hosted: Option<NodeId>,
         fallback_title: String,
         fallback_agent_name: Option<turn_core::model::AgentName>,
@@ -1101,6 +1118,9 @@ impl Core {
         // adapter's name: anything that ends up inferring from output needs the
         // observer, and nothing above that tier should have one.
         let heuristic = (plan.level == IntegrationLevel::Heuristic).then(OutputHeuristic::new);
+        let observed_subject = hosted.clone();
+        let hosted_adapter_id = hosted.as_ref().map(|_| selection.adapter.id().to_string());
+        let hosted_level = hosted.as_ref().map(|_| plan.level);
         self.processes.insert(
             node_id.clone(),
             Process {
@@ -1117,6 +1137,10 @@ impl Core {
                 exited_ms: None,
                 title_generation: 0,
                 hosted,
+                hosted_adapter_id,
+                hosted_level,
+                observed_subject,
+                foreground_pane: Some(foreground_pane.clone()),
             },
         );
     }
@@ -1247,6 +1271,10 @@ impl Core {
                 exited_ms: None,
                 title_generation: 0,
                 hosted: None,
+                hosted_adapter_id: None,
+                hosted_level: None,
+                observed_subject: None,
+                foreground_pane: None,
             },
         );
         self.session_mut(session_id)?.tree.insert(node);
@@ -1540,7 +1568,7 @@ fn new_node(
 }
 
 /// Records which tool an agent node is, and what it can be asked to do.
-fn describe_agent(node: &mut ProcessNode, selection: &Selection) {
+pub(crate) fn describe_agent(node: &mut ProcessNode, selection: &Selection) {
     if let Some(agent) = node.agent.as_mut() {
         agent.agent = AgentRef {
             provider: Some(selection.adapter.provider().to_string()),
@@ -1741,9 +1769,13 @@ fn resolve_contained_cwd(
 /// the user typed `claude` into is an agent, and an `Agent` pane running a program
 /// Turn has no integration for is not — it gets the turn axis it can actually fill,
 /// which is none.
-fn node_kind(pane: PaneKind, level: IntegrationLevel) -> NodeKind {
+fn node_kind(pane: PaneKind, level: IntegrationLevel, command: &str, args: &[String]) -> NodeKind {
     if level >= IntegrationLevel::Heuristic {
         return NodeKind::Agent;
+    }
+    let observed = turn_pty::classify_argv(command, args);
+    if observed != NodeKind::Unknown {
+        return observed;
     }
     match pane {
         PaneKind::Agent | PaneKind::Terminal => NodeKind::Terminal,
@@ -2094,20 +2126,94 @@ mod tests {
     fn the_adapter_decides_what_counts_as_an_agent_not_the_pane_kind() {
         // `claude` typed into a plain terminal pane is an agent.
         assert_eq!(
-            node_kind(PaneKind::Terminal, IntegrationLevel::Structured),
+            node_kind(
+                PaneKind::Terminal,
+                IntegrationLevel::Structured,
+                "claude",
+                &[],
+            ),
             NodeKind::Agent
         );
         // An "agent" pane running something Turn cannot integrate with does not get a
         // turn axis it would never be able to fill.
         assert_eq!(
-            node_kind(PaneKind::Agent, IntegrationLevel::GenericTerminal),
+            node_kind(
+                PaneKind::Agent,
+                IntegrationLevel::GenericTerminal,
+                "unknown-tool",
+                &[],
+            ),
             NodeKind::Terminal
         );
         assert_eq!(
-            node_kind(PaneKind::Shell, IntegrationLevel::GenericTerminal),
+            node_kind(
+                PaneKind::Shell,
+                IntegrationLevel::GenericTerminal,
+                "zsh",
+                &[],
+            ),
             NodeKind::Shell
         );
-        assert!(node_kind(PaneKind::Terminal, IntegrationLevel::Heuristic).is_agentic());
+        assert!(node_kind(
+            PaneKind::Terminal,
+            IntegrationLevel::Heuristic,
+            "aider",
+            &[],
+        )
+        .is_agentic());
+        assert_eq!(
+            node_kind(
+                PaneKind::Terminal,
+                IntegrationLevel::GenericTerminal,
+                "lazygit",
+                &[],
+            ),
+            NodeKind::Tui,
+            "automatic view classification uses observed executable identity"
+        );
+
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            node_kind(
+                PaneKind::Terminal,
+                IntegrationLevel::GenericTerminal,
+                "cargo",
+                &args(&["test"]),
+            ),
+            NodeKind::TestRunner,
+        );
+        assert_eq!(
+            node_kind(
+                PaneKind::Terminal,
+                IntegrationLevel::GenericTerminal,
+                "npm",
+                &args(&["run", "dev"]),
+            ),
+            NodeKind::Server,
+        );
+        for (program, arguments) in [
+            ("echo", args(&["test"])),
+            ("node", args(&["--eval", "npm run dev"])),
+            ("cargo", args(&["metadata", "test"])),
+            ("npm", args(&["exec", "echo", "run", "dev"])),
+            ("npm", args(&["run", "developer"])),
+        ] {
+            assert_eq!(
+                node_kind(
+                    PaneKind::Terminal,
+                    IntegrationLevel::GenericTerminal,
+                    program,
+                    &arguments,
+                ),
+                NodeKind::Terminal,
+                "{program} {arguments:?} must fail closed",
+            );
+        }
     }
 
     #[test]
@@ -2418,9 +2524,10 @@ mod tests {
         assert_eq!(session.tree.get(&shell).unwrap().kind, NodeKind::Shell);
         assert_eq!(
             session.layout.get(&pane).unwrap().node_id.as_ref(),
-            Some(&shell),
-            "the pane shows the process it runs, which is the shell"
+            Some(&started),
+            "the Pane represents the Agent while its process runtime is the shell"
         );
+        assert_eq!(session.layout.get(&pane).unwrap().kind, PaneKind::Agent);
         assert_eq!(
             harness.core.processes[&shell].hosted.as_ref(),
             Some(&started),

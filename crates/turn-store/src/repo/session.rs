@@ -749,6 +749,31 @@ mod tests {
         Session::new(workspace.clone(), "Fix climbing bugs", "/repo", layout, T0)
     }
 
+    #[test]
+    fn sqlite_round_trip_preserves_distinct_launch_presentation_and_manual_provenance() {
+        let store = testing::store();
+        let workspace = testing::saved_workspace(&store, "pane-kind-axes");
+        let mut pane = Pane::new(PaneKind::Shell).with_command("zsh");
+        pane.detect_kind(PaneKind::Agent);
+        pane.override_kind(PaneKind::Logs);
+        let pane_id = pane.id.clone();
+        let session = Session::new(
+            workspace.id,
+            "Pane kind axes",
+            "/repo",
+            Layout::single(pane),
+            T0,
+        );
+
+        store.sessions().save(&session).unwrap();
+        let restored = store.sessions().get(&session.id).unwrap().unwrap();
+        let pane = restored.layout.get(&pane_id).unwrap();
+        assert_eq!(pane.presentation_kind(), PaneKind::Logs);
+        assert_eq!(pane.launch_kind(), PaneKind::Shell);
+        assert!(pane.kind_is_user_set);
+        assert_eq!(pane.command.as_deref(), Some("zsh"));
+    }
+
     fn session_with_duplicate_agents(
         store: &crate::Store,
     ) -> (Session, NodeId, NodeId, ActivityPreview) {
@@ -795,6 +820,7 @@ mod tests {
                 pid: 42,
                 ppid: None,
                 command: format!("literal evidence mentions {retired}"),
+                executable: String::new(),
                 args: Vec::new(),
                 cwd: None,
                 confirmed_parent: true,

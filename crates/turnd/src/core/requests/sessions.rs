@@ -1565,6 +1565,11 @@ fn validate_template_layout(layout: &Layout) -> Result<(), ProtoError> {
                 if !pane_ids.insert(pane.id.as_str().to_string()) {
                     return Err(ProtoError::invalid("A layout contains a duplicate Pane id"));
                 }
+                if pane.kind_is_user_set && !pane.presentation_kind().is_display_override() {
+                    return Err(ProtoError::invalid(
+                        "A saved Pane display override must use an operational renderer",
+                    ));
+                }
                 if pane
                     .command
                     .as_ref()
@@ -2296,6 +2301,30 @@ mod tests {
             a.panes().iter().all(|pane| b.get(&pane.id).is_none()),
             "each Session needs fresh Pane ids"
         );
+    }
+
+    #[tokio::test]
+    async fn a_template_cannot_persist_a_manual_pin_to_an_internal_view_kind() {
+        let mut harness = Harness::new().await;
+        let mut layout = Template::two_shells(1).layout;
+        let pane_id = layout.panes()[0].id.clone();
+        let pane = layout.get_mut(&pane_id).unwrap();
+        pane.kind = PaneKind::ProcessDetails;
+        pane.launch_kind = Some(PaneKind::Shell);
+        pane.kind_is_user_set = true;
+
+        let error = harness
+            .core
+            .create_layout_template("Forged display pin".into(), layout, None, 2)
+            .expect_err("internal view kinds are not operational saved-Pane overrides");
+        assert_eq!(error.code, turn_proto::ErrorCode::InvalidArgument);
+        assert!(harness.core.templates.values().all(|template| {
+            template
+                .layout
+                .panes()
+                .iter()
+                .all(|pane| !pane.kind_is_user_set)
+        }));
     }
 
     #[tokio::test]
@@ -3346,6 +3375,7 @@ mod tests {
                 .get_mut(&original_pane)
                 .unwrap();
             pane.kind = PaneKind::Shell;
+            pane.launch_kind = None;
             pane.command = Some("/bin/sh".into());
             pane.cwd = Some("escape-link".into());
         }

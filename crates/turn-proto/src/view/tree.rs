@@ -84,6 +84,11 @@ pub struct TreeNodeView {
     /// but remains searchable and is always visible in Technical mode.
     #[serde(default)]
     pub ephemeral: bool,
+    /// This Shell owns a PTY on behalf of a semantic Agent shown as its child.
+    /// Normal navigation treats it as transparent plumbing unless it also has an
+    /// explicit Pane binding; Technical mode retains the exact process row.
+    #[serde(default)]
+    pub terminal_runtime_host: bool,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
     /// How long it has been running, or how long it ran.
@@ -138,6 +143,7 @@ impl TreeNodeView {
             pane_bindings: Vec::new(),
             pane_capability: NodePaneCapability::default(),
             ephemeral: false,
+            terminal_runtime_host: false,
             started_ms: node.started_ms,
             ended_ms: node.ended_ms,
             runtime_ms: node.runtime_ms(now_ms),

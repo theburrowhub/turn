@@ -807,6 +807,13 @@ impl AgentAdapter for InferredAgent {
         &["sh"]
     }
 
+    fn observed_executable_aliases(&self) -> &'static [&'static str] {
+        // `/bin/sh` becomes one of these kernel identities depending on the Unix.
+        // They are observation aliases, not launch commands: the fixture must not
+        // classify the Session's ordinary interactive bash as an Agent.
+        &["bash", "dash", "ash", "busybox"]
+    }
+
     fn detect(&self, _executable: &str) -> Option<PathBuf> {
         turn_agents::adapter::which("sh")
     }

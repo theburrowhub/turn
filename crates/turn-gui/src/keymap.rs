@@ -1198,6 +1198,27 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_is_reserved_for_terminal_multiline_input_on_every_platform() {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        for platform in [Platform::MAC, Platform::PC] {
+            let keymap = Keymap::build(&Overrides::new(), platform);
+            assert_eq!(
+                keymap.resolve(Key::Enter, &shift, true),
+                None,
+                "Shift+Enter must reach a focused terminal on {platform:?}"
+            );
+            assert_eq!(
+                keymap.resolve(Key::Enter, &shift, false),
+                None,
+                "Shift+Enter must not be captured as a window command on {platform:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_command_is_bound_exactly_once_and_appears_in_the_palette() {
         for platform in [Platform::MAC, Platform::PC] {
             let keymap = Keymap::build(&Overrides::new(), platform);

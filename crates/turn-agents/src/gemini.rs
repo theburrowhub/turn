@@ -184,6 +184,13 @@ impl AgentAdapter for GeminiCliAdapter {
         &["gemini"]
     }
 
+    fn observed_wrapper_path_suffixes(&self) -> &'static [&'static str] {
+        &[
+            "node_modules/@google/gemini-cli/bundle/gemini.js",
+            "node_modules/@google/gemini-cli/dist/index.js",
+        ]
+    }
+
     fn best_level(&self) -> IntegrationLevel {
         IntegrationLevel::Structured
     }

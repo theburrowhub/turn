@@ -1161,7 +1161,14 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
         outcome.actions.push(PaneAction::GeometryUnavailable);
         return outcome;
     };
+    // Keep the focusable accessibility node (its geometry is part of the AccessKit
+    // contract), but never leave egui widget focus on the grid. Terminal keyboard
+    // ownership belongs to Turn's Pane/Layout lease; otherwise Tab/arrows/Escape can
+    // both reach the PTY and traverse unrelated chrome.
     let response = ui.interact(rect, id, Sense::click_and_drag());
+    if response.has_focus() {
+        ui.memory_mut(|memory| memory.surrender_focus(response.id));
+    }
 
     // The size in cells, reported when it changes rather than every frame: a
     // `resize_pty` per frame during a window drag would be hundreds of requests. Measured
@@ -1245,8 +1252,16 @@ pub fn show_pane(ui: &mut Ui, state: &mut PaneInteraction, input: PaneInput<'_>)
     }
     let notice_strip = state.notices.is_open(&grid.notices);
 
-    if response.clicked() && !options.focused {
-        outcome.actions.push(PaneAction::Focus);
+    if response.clicked() {
+        // Clicking the terminal is an explicit keyboard hand-off from an inspector,
+        // header button or text field. The caller's logical Pane focus is authoritative;
+        // clearing egui focus here prevents the control and PTY sharing the next key.
+        if let Some(focused) = ui.memory(|memory| memory.focused()) {
+            ui.memory_mut(|memory| memory.surrender_focus(focused));
+        }
+        if !options.focused {
+            outcome.actions.push(PaneAction::Focus);
+        }
     }
     if !(searching && pointer_in_bar(ui, rect)) && !(notice_strip && pointer_in_strip(ui, rect)) {
         collect_pointer(
@@ -3393,18 +3408,23 @@ mod tests {
         outcome
     }
 
-    /// Feeds one input event to a focused pane and returns what it decided to do.
-    fn input_event(event: egui::Event) -> PaneOutcome {
+    /// Feeds input events to a focused pane and returns what it decided to do.
+    fn input_events(events: impl IntoIterator<Item = egui::Event>) -> PaneOutcome {
         let grid = Grid::from_lines(&["$ "], 20);
         let mut state = PaneInteraction::default();
         let mut outcome = PaneOutcome::default();
         let context = egui::Context::default();
         let mut raw = egui::RawInput::default();
-        raw.events.push(event);
+        raw.events.extend(events);
         let _ = crate::frames::measure_with(&context, raw, |ui| {
             collect_keys(ui, &grid, &mut state, None, &mut outcome);
         });
         outcome
+    }
+
+    /// Feeds one input event to a focused pane and returns what it decided to do.
+    fn input_event(event: egui::Event) -> PaneOutcome {
+        input_events([event])
     }
 
     /// An accent has to reach the program.
@@ -3429,20 +3449,32 @@ mod tests {
 
     #[test]
     fn shift_enter_reaches_the_program_as_multiline_input() {
-        let outcome = input_event(egui::Event::Key {
-            key: egui::Key::Enter,
-            physical_key: Some(egui::Key::Enter),
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers {
-                shift: true,
-                ..egui::Modifiers::default()
+        let shift = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::default()
+        };
+        let outcome = input_events([
+            egui::Event::ModifiersChanged(shift),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: shift,
             },
-        });
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: false,
+                repeat: false,
+                modifiers: shift,
+            },
+            egui::Event::ModifiersChanged(egui::Modifiers::default()),
+        ]);
         assert_eq!(
             outcome.actions,
-            vec![PaneAction::Write(b"\x1b\r".to_vec())],
-            "the focused pane must receive one multiline chord, not a submitting carriage return"
+            vec![PaneAction::Write(b"\n".to_vec())],
+            "the focused pane must receive one Control-J multiline byte on key-down only"
         );
     }
 

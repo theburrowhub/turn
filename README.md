@@ -287,6 +287,8 @@ bounded by the Makefile so local and CI runs do not exhaust PTYs or file descrip
   write leases, previews, and persistence contracts.
 - [Agent node views and context routing](docs/AGENT_NODE_VIEWS_AND_CONTEXT.md) — the accepted post-v0.1
   WorkSurface, stable instance, runtime metadata, attention route, context-link and handoff contract.
+- [Pane and view types](docs/VIEW_TYPES.md) — the complete current catalog, automatic Agent/tool detection,
+  semantic-subject versus PTY ownership, display overrides, multiline input and truthful fallback states.
 - [Local voice input](docs/LOCAL_VOICE_INPUT.md) — the accepted post-v0.1 local dictation, exact-target,
   model-supply-chain, privacy and Attention-preservation contract.
 - [Authenticated Reviewer acceptance](docs/REVIEWER_ACCEPTANCE.md) — local macOS bundle,

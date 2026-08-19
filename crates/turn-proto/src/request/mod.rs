@@ -684,6 +684,12 @@ pub enum Request {
         pane_id: PaneId,
         kind: PaneKind,
     },
+    /// Removes a manual renderer override and immediately derives the presentation
+    /// from the Pane's semantic subject.
+    ResetPaneKind {
+        session_id: SessionId,
+        pane_id: PaneId,
+    },
     /// Renders a Pane as a persistent floating window while retaining its dock
     /// position in the split tree.
     FloatPane {
@@ -1040,6 +1046,7 @@ impl Request {
             Request::PromoteTemporaryPane { .. } => "promote_temporary_pane",
             Request::DuplicatePane { .. } => "duplicate_pane",
             Request::ChangePaneKind { .. } => "change_pane_kind",
+            Request::ResetPaneKind { .. } => "reset_pane_kind",
             Request::FloatPane { .. } => "float_pane",
             Request::DockPane { .. } => "dock_pane",
             Request::SetFloatingPaneGeometry { .. } => "set_floating_pane_geometry",
@@ -1153,6 +1160,7 @@ impl Request {
             | Request::PromoteTemporaryPane { .. }
             | Request::DuplicatePane { .. }
             | Request::ChangePaneKind { .. }
+            | Request::ResetPaneKind { .. }
             | Request::FloatPane { .. }
             | Request::DockPane { .. }
             | Request::SetFloatingPaneGeometry { .. } => "layout",
@@ -1270,6 +1278,7 @@ impl Request {
             | Request::PromoteTemporaryPane { session_id, .. }
             | Request::DuplicatePane { session_id, .. }
             | Request::ChangePaneKind { session_id, .. }
+            | Request::ResetPaneKind { session_id, .. }
             | Request::FloatPane { session_id, .. }
             | Request::DockPane { session_id, .. }
             | Request::SetFloatingPaneGeometry { session_id, .. }

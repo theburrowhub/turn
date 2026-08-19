@@ -281,6 +281,10 @@ impl AgentAdapter for CodexAdapter {
         &["codex"]
     }
 
+    fn observed_wrapper_path_suffixes(&self) -> &'static [&'static str] {
+        &["node_modules/@openai/codex/bin/codex.js"]
+    }
+
     fn best_level(&self) -> IntegrationLevel {
         IntegrationLevel::Structured
     }

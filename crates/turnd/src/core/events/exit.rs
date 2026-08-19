@@ -1,9 +1,11 @@
 //! Processes ending, and the guesses made about the ones we never held.
 
 use crate::core::{Core, DeferredRuntimeInput, FINISHED_PTY_RETENTION_MS};
+use std::collections::HashSet;
+use turn_agents::IntegrationLevel;
 use turn_core::event::{Confidence, EventKind, EventSource, TurnEvent};
-use turn_core::ids::{NodeId, SessionId};
-use turn_core::model::{NodeKind, Relation};
+use turn_core::ids::{NodeId, PaneId, SessionId};
+use turn_core::model::{NodeKind, PaneKind, Relation};
 use turn_core::state::Lifecycle;
 use turn_pty::ExitInfo;
 
@@ -186,7 +188,7 @@ impl Core {
         session_id: &SessionId,
         hosted: &NodeId,
         now_ms: i64,
-    ) {
+    ) -> bool {
         let retired = match self.sessions.get_mut(session_id) {
             Some(session) => match session
                 .tree
@@ -208,15 +210,251 @@ impl Core {
                         }),
                     )
                 }
-                None => return,
+                None => return false,
             },
-            None => return,
+            None => return false,
         };
+        let returned_to_runtime = retired.1.as_ref().is_some_and(|runtime| {
+            self.release_terminal_subject(session_id, hosted, runtime, true)
+        });
         // Whatever the agent itself had reported — subagents, a pending permission — went
         // with it, and the demands it raised stop being answerable.
         let mut gone = vec![retired];
         gone.extend(self.mark_runtime_dependents(session_id, hosted, now_ms));
         self.resolve_lifecycle_attention(session_id, &gone, now_ms);
+        returned_to_runtime
+    }
+
+    /// Makes an Agent observed in a Shell-owned foreground process group the semantic
+    /// subject of that terminal.
+    ///
+    /// This records presentation and input routing only. In particular it never writes
+    /// `Process::hosted`: foreground ownership grants no stop or relaunch authority,
+    /// whether the Agent was launched by Turn or merely found in the process table.
+    pub(crate) fn record_observed_terminal_subject(
+        &mut self,
+        session_id: &SessionId,
+        runtime: &NodeId,
+        subject: &NodeId,
+        adapter_id: &str,
+    ) -> bool {
+        let subject_is_live_agent = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.tree.get(subject))
+            .is_some_and(|node| node.kind == NodeKind::Agent && node.is_running());
+        if !subject_is_live_agent {
+            return false;
+        }
+
+        let (previous, foreground_pane) =
+            {
+                let Some(process) = self.processes.get_mut(runtime).filter(|process| {
+                    process.session_id == *session_id && process.pty.is_running()
+                }) else {
+                    return false;
+                };
+                if process.observed_subject.as_ref() == Some(subject) {
+                    return false;
+                }
+                let previous = process.observed_subject.replace(subject.clone());
+                // These fields describe low-latency observation of the foreground
+                // terminal subject. `hosted` and `hook_token` retain the independent
+                // lifecycle authority for an Agent Turn launched even while it is in the
+                // background.
+                if process.hosted.as_ref() == Some(subject) {
+                    process.adapter_id = process
+                        .hosted_adapter_id
+                        .clone()
+                        .unwrap_or_else(|| adapter_id.to_string());
+                    process.level = process.hosted_level.unwrap_or(IntegrationLevel::Heuristic);
+                    process.heuristic = (process.level == IntegrationLevel::Heuristic)
+                        .then(turn_agents::OutputHeuristic::new);
+                } else {
+                    process.adapter_id = adapter_id.to_string();
+                    process.level = IntegrationLevel::Heuristic;
+                    process.heuristic = Some(turn_agents::OutputHeuristic::new());
+                }
+                (previous, process.foreground_pane.clone())
+            };
+
+        let mut stale_exact_panes = previous
+            .as_ref()
+            .map(|previous| self.exact_temporary_panes(session_id, previous))
+            .unwrap_or_default();
+        {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return false;
+            };
+            let pane_ids = session
+                .layout
+                .panes()
+                .into_iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>();
+            for pane_id in pane_ids {
+                let Some(pane) = session.layout.get_mut(&pane_id) else {
+                    continue;
+                };
+                let follows_foreground = foreground_pane.as_ref() == Some(&pane_id)
+                    && (pane.node_id.as_ref() == Some(runtime)
+                        || previous
+                            .as_ref()
+                            .is_some_and(|previous| pane.node_id.as_ref() == Some(previous)));
+                if follows_foreground {
+                    pane.node_id = Some(subject.clone());
+                } else if previous
+                    .as_ref()
+                    .is_some_and(|previous| pane.node_id.as_ref() == Some(previous))
+                {
+                    // An exact view keeps A's identity when its Shell moves to B. It
+                    // must stop consuming that Shell's feed before B writes a byte;
+                    // Automatic falls back to the truthful semantic details surface.
+                    pane.detect_kind(PaneKind::ProcessDetails);
+                    stale_exact_panes.insert(pane_id.clone());
+                }
+                if pane.node_id.as_ref() == Some(subject) {
+                    // A durable exact view may already exist as ProcessDetails because
+                    // this Agent was in the background. Foreground ownership gives it
+                    // an attachable terminal again; manual display overrides remain.
+                    pane.detect_kind(PaneKind::Agent);
+                }
+            }
+        }
+        for pane_id in stale_exact_panes {
+            self.detach_everyone(session_id, &pane_id);
+        }
+        true
+    }
+
+    /// Gives a live Shell-owned terminal back after its semantic foreground subject
+    /// ends. This changes presentation/binding only; it grants no lifecycle authority.
+    pub(crate) fn release_terminal_subject(
+        &mut self,
+        session_id: &SessionId,
+        subject: &NodeId,
+        runtime: &NodeId,
+        release_hosted: bool,
+    ) -> bool {
+        let (foreground_pane, was_foreground, retired_token) = {
+            let Some(process) = self.processes.get_mut(runtime).filter(|process| {
+                process.session_id == *session_id
+                    && process.pty.is_running()
+                    && (process.observed_subject.as_ref() == Some(subject)
+                        || (release_hosted && process.hosted.as_ref() == Some(subject)))
+            }) else {
+                return false;
+            };
+            let retired_token = if release_hosted && process.hosted.as_ref() == Some(subject) {
+                process.hosted = None;
+                process.hosted_adapter_id = None;
+                process.hosted_level = None;
+                process.hook_token.take()
+            } else {
+                None
+            };
+            let was_foreground = process.observed_subject.as_ref() == Some(subject);
+            if was_foreground {
+                process.observed_subject = None;
+            }
+            if process.observed_subject.is_none() {
+                process.adapter_id = "generic-terminal".into();
+                process.level = IntegrationLevel::GenericTerminal;
+                process.heuristic = None;
+                process.fallback_agent_name = None;
+            }
+            (
+                process.foreground_pane.clone(),
+                was_foreground,
+                retired_token,
+            )
+        };
+        self.revoke(retired_token.as_deref());
+        if !was_foreground {
+            // Lifecycle authority can end while the Agent is already in the
+            // background. Its exact views were fenced when foreground changed.
+            return false;
+        }
+
+        let mut stale_exact_panes = self.exact_temporary_panes(session_id, subject);
+        let mut changed = !stale_exact_panes.is_empty();
+        {
+            let Some(session) = self.sessions.get_mut(session_id) else {
+                return false;
+            };
+            let pane_ids = session
+                .layout
+                .panes()
+                .into_iter()
+                .map(|pane| pane.id.clone())
+                .collect::<Vec<_>>();
+            for pane_id in pane_ids {
+                let Some(pane) = session.layout.get_mut(&pane_id) else {
+                    continue;
+                };
+                if foreground_pane.as_ref() == Some(&pane_id)
+                    && pane.node_id.as_ref() == Some(subject)
+                {
+                    pane.node_id = Some(runtime.clone());
+                    pane.detect_kind(PaneKind::Shell);
+                    changed = true;
+                } else if pane.node_id.as_ref() == Some(subject) {
+                    // This Pane is an exact view of the Agent, not another follower of
+                    // the Shell. Keep that binding, retire the shared PTY feed and let
+                    // Automatic render the Agent's durable details.
+                    pane.detect_kind(PaneKind::ProcessDetails);
+                    stale_exact_panes.insert(pane_id.clone());
+                    changed = true;
+                }
+            }
+        }
+        for pane_id in stale_exact_panes {
+            self.detach_everyone(session_id, &pane_id);
+        }
+        changed
+    }
+
+    /// Every temporary exact view of one semantic subject.
+    ///
+    /// Temporary Panes do not live in `Layout`, but their attachments are just as
+    /// capable of consuming a shared Shell feed. A foreground hand-off must therefore
+    /// fence them alongside durable exact views. If the binding index is unavailable,
+    /// fail closed by detaching every non-Layout attachment in this Session; briefly
+    /// refreshing an unrelated preview is safer than ever showing Agent B as Agent A.
+    fn exact_temporary_panes(&self, session_id: &SessionId, subject: &NodeId) -> HashSet<PaneId> {
+        match self.store.hierarchy().bindings_for_session(session_id) {
+            Ok(bindings) => bindings
+                .into_iter()
+                .filter(|binding| binding.temporary && binding.node_id == *subject)
+                .map(|binding| binding.pane_id)
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session = %session_id,
+                    node = %subject,
+                    "could not read temporary Pane bindings during terminal hand-off; detaching all ephemeral feeds"
+                );
+                let durable = self
+                    .sessions
+                    .get(session_id)
+                    .map(|session| {
+                        session
+                            .layout
+                            .panes()
+                            .into_iter()
+                            .map(|pane| pane.id.clone())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                self.clients
+                    .values()
+                    .flat_map(|client| client.attachments.keys())
+                    .filter(|(owner, pane)| owner == session_id && !durable.contains(pane))
+                    .map(|(_, pane)| pane.clone())
+                    .collect()
+            }
+        }
     }
 
     /// Applies only the in-memory part of dependent retirement. Event ingestion
@@ -332,8 +570,12 @@ impl Core {
                 %session_id, %node_id,
                 "an agent running in a pane's shell has ended; the shell is still there"
             );
-            self.record_hosted_loss(&session_id, &node_id, now_ms);
+            let layout_changed = self.record_hosted_loss(&session_id, &node_id, now_ms);
             self.persist_session_quietly(&session_id);
+            if layout_changed {
+                self.bump_hierarchy();
+                self.push_layout(&session_id, None);
+            }
             self.push_tree(&session_id, now_ms);
             self.push_node_state(&session_id, &node_id, None, now_ms);
             self.push_session_state(&session_id, now_ms);
@@ -360,7 +602,11 @@ impl Core {
                 // the agent drawing on it. Attributing a hosted agent's inferred state
                 // to the shell around it would give the shell a turn axis and leave the
                 // agent's own permanently unknown.
-                node_id: process.hosted.clone().unwrap_or_else(|| node.clone()),
+                node_id: process
+                    .observed_subject
+                    .clone()
+                    .or_else(|| process.hosted.clone())
+                    .unwrap_or_else(|| node.clone()),
                 timestamp_ms: now_ms,
             };
             inferred.extend(heuristic.observe(&snapshot, now_ms, &ctx));
@@ -445,6 +691,110 @@ mod tests {
     use turn_core::model::ProcessNode;
 
     const NOW: i64 = 1_775_000_000_000;
+
+    #[tokio::test]
+    async fn hosted_lifecycle_authority_survives_foreground_agent_handoffs() {
+        let mut harness = Harness::new().await;
+        let session_id = SessionId::from_stored("sess_hosted_foreground_handoff");
+        let pane_id = PaneId::from_stored("pane_hosted_foreground_handoff");
+        harness.add_session(session_id.clone(), pane_id.clone(), NOW);
+        let runtime = harness.spawn_process(&session_id, &pane_id, NOW).await;
+
+        let mut hosted = ProcessNode::agent(session_id.clone(), "claude", "/tmp", NOW);
+        hosted.lifecycle = Lifecycle::Alive;
+        hosted.link_to(runtime.clone(), Relation::Confirmed);
+        let hosted_id = hosted.id.clone();
+        let mut foreground = ProcessNode::agent(session_id.clone(), "codex", "/tmp", NOW);
+        foreground.lifecycle = Lifecycle::Alive;
+        foreground.link_to(runtime.clone(), Relation::Inferred);
+        let foreground_id = foreground.id.clone();
+        {
+            let session = harness.core.sessions.get_mut(&session_id).unwrap();
+            session.tree.get_mut(&runtime).unwrap().kind = NodeKind::Shell;
+            session.tree.insert(hosted);
+            session.tree.insert(foreground);
+            session.layout.get_mut(&pane_id).unwrap().node_id = Some(hosted_id.clone());
+        }
+        {
+            let process = harness.core.processes.get_mut(&runtime).unwrap();
+            process.hosted = Some(hosted_id.clone());
+            process.hosted_adapter_id = Some("claude-code".into());
+            process.hosted_level = Some(IntegrationLevel::Heuristic);
+            process.observed_subject = Some(hosted_id.clone());
+            process.adapter_id = "claude-code".into();
+            process.level = IntegrationLevel::Heuristic;
+            process.heuristic = Some(turn_agents::OutputHeuristic::new());
+            process.hook_token = Some("hook-a".into());
+        }
+
+        assert!(harness
+            .core
+            .release_terminal_subject(&session_id, &hosted_id, &runtime, false,));
+        let process = &harness.core.processes[&runtime];
+        assert_eq!(process.hosted.as_ref(), Some(&hosted_id));
+        assert_eq!(process.hook_token.as_deref(), Some("hook-a"));
+        assert!(process.observed_subject.is_none());
+        assert_eq!(process.level, IntegrationLevel::GenericTerminal);
+        assert!(process.heuristic.is_none());
+        assert!(harness.core.terminal_node(&hosted_id).is_none());
+
+        assert!(harness.core.record_observed_terminal_subject(
+            &session_id,
+            &runtime,
+            &foreground_id,
+            "codex",
+        ));
+        let process = &harness.core.processes[&runtime];
+        assert_eq!(process.hosted.as_ref(), Some(&hosted_id));
+        assert_eq!(process.observed_subject.as_ref(), Some(&foreground_id));
+        assert_eq!(process.adapter_id, "codex");
+        assert_eq!(process.level, IntegrationLevel::Heuristic);
+        assert!(process.heuristic.is_some());
+        assert_eq!(
+            harness.core.terminal_node(&foreground_id),
+            Some(runtime.clone())
+        );
+        assert!(harness.core.terminal_node(&hosted_id).is_none());
+
+        let hook = TurnEvent::new(
+            session_id.clone(),
+            EventKind::AgentIdle,
+            EventSource::Hook {
+                tool: "claude-code".into(),
+                event_name: "Stop".into(),
+            },
+            Confidence::Explicit,
+            NOW + 1,
+        )
+        .with_node(hosted_id.clone());
+        harness.core.promote_authenticated_integration(&hook);
+        let process = &harness.core.processes[&runtime];
+        assert_eq!(process.hosted_level, Some(IntegrationLevel::Structured));
+        assert_eq!(process.adapter_id, "codex");
+        assert_eq!(process.level, IntegrationLevel::Heuristic);
+        assert!(process.heuristic.is_some());
+
+        assert!(harness.core.release_terminal_subject(
+            &session_id,
+            &foreground_id,
+            &runtime,
+            false,
+        ));
+        assert!(harness.core.record_observed_terminal_subject(
+            &session_id,
+            &runtime,
+            &hosted_id,
+            "claude-code",
+        ));
+        let process = &harness.core.processes[&runtime];
+        assert_eq!(process.hosted.as_ref(), Some(&hosted_id));
+        assert_eq!(process.observed_subject.as_ref(), Some(&hosted_id));
+        assert_eq!(process.adapter_id, "claude-code");
+        assert_eq!(process.level, IntegrationLevel::Structured);
+        assert!(process.heuristic.is_none());
+        assert_eq!(process.hook_token.as_deref(), Some("hook-a"));
+        assert_eq!(harness.core.terminal_node(&hosted_id), Some(runtime));
+    }
 
     #[tokio::test]
     async fn a_confirmed_child_with_a_dead_pid_is_lost_with_its_runtime_owner() {

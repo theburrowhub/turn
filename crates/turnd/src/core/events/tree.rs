@@ -10,6 +10,7 @@ use super::{
     MAX_DISCOVERED_COMMAND_CHARS, MAX_DISCOVERED_CWD_CHARS, UNPRINTABLE_LABEL,
 };
 use crate::core::Core;
+use turn_agents::IntegrationLevel;
 use turn_core::event::Confidence;
 use turn_core::ids::{NodeId, SessionId};
 use turn_core::model::{
@@ -333,6 +334,7 @@ impl Core {
         pid: u32,
         ppid: Option<u32>,
         command: String,
+        executable: String,
         args: Vec<String>,
         observed_cwd: Option<String>,
         confirmed_parent: bool,
@@ -342,17 +344,104 @@ impl Core {
         // traverse them. A child node is the human-facing, durable projection and
         // therefore must not retain hostile argv/path text. Repeat the ingress
         // normalisation here so no internal caller can bypass it.
+        let observed_program = if executable.is_empty() {
+            args.first().map(String::as_str).unwrap_or(&command)
+        } else {
+            &executable
+        };
+        let bootstrap_program = observed_program.to_string();
+        let observed_arguments = args.get(1..).unwrap_or_default();
+        let selection = self.registry.select_observed(
+            observed_program,
+            &args,
+            &command,
+            observed_cwd.as_deref(),
+        );
+        let observed_kind = if args.is_empty() {
+            // Protocol-era child events may carry only the historical command-line
+            // string. New supervisor events always retain argv boundaries.
+            turn_pty::classify(&command)
+        } else {
+            turn_pty::classify_argv(observed_program, observed_arguments)
+        };
+        let parent_runtime_program = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.tree.get(parent))
+            .and_then(|parent| parent.pid)
+            .and_then(|pid| self.supervisor.observe(pid));
+        let same_wrapper_subject = parent_runtime_program.as_ref().is_some_and(|observed| {
+            self.registry.same_observed_wrapper_subject(
+                &observed.executable,
+                &observed.args,
+                observed.cwd.as_deref(),
+                &executable,
+                &args,
+                observed_cwd.as_deref(),
+            )
+        });
         let command = safe_untrusted_label(&command, MAX_DISCOVERED_COMMAND_CHARS)
             .unwrap_or_else(|| "process".into());
+        let executable =
+            safe_untrusted_label(&executable, MAX_DISCOVERED_COMMAND_CHARS).unwrap_or_default();
         let args = safe_untrusted_args(args);
         let observed_cwd = observed_cwd.map(|cwd| {
             safe_untrusted_label(&cwd, MAX_DISCOVERED_CWD_CHARS)
                 .unwrap_or_else(|| UNPRINTABLE_LABEL.into())
         });
+        // The adapter registry is the authority for agent executables. The generic
+        // process classifier still owns shells, TUIs, tests and servers, but must not
+        // maintain a second, diverging list of agent products.
+        let is_agent = selection.level >= IntegrationLevel::Heuristic;
+        let parent_owns_foreground = self
+            .processes
+            .get(parent)
+            .filter(|process| {
+                process.session_id == *session_id
+                    && process.hosted.is_none()
+                    && process.observed_subject.is_none()
+            })
+            .and_then(|process| process.pty.foreground_process_group())
+            .zip(crate::core::supervise::process_group(pid))
+            .is_some_and(|(foreground, child_group)| foreground == child_group);
         let Some(session) = self.sessions.get_mut(session_id) else {
             return Changed::default();
         };
         if session.tree.get(&child).is_some() || session.tree.find_by_pid(pid).is_some() {
+            return Changed::default();
+        }
+        let same_job = session
+            .tree
+            .get(parent)
+            .and_then(|parent| parent.pid)
+            .is_some_and(|parent_pid| {
+                match (
+                    crate::core::supervise::process_group(parent_pid),
+                    crate::core::supervise::process_group(pid),
+                ) {
+                    (Some(parent_group), Some(child_group)) => parent_group == child_group,
+                    _ => ppid == Some(parent_pid),
+                }
+            });
+        if is_agent
+            && session.tree.get(parent).is_some_and(|parent| {
+                same_provider_bootstrap_child(
+                    parent,
+                    parent_runtime_program
+                        .as_ref()
+                        .map(|observed| observed.executable.as_str()),
+                    selection.adapter.id(),
+                    &bootstrap_program,
+                    same_job,
+                    same_wrapper_subject,
+                )
+            })
+        {
+            // npm shims commonly become `node .../bin/codex` and then exec/spawn the
+            // package's native Codex binary in the same job. That is one provider
+            // invocation, not a parent Agent plus a phantom child Agent. Structured
+            // subagents keep their own semantic events; only this runtime-wrapper to
+            // same-provider native transition is coalesced.
             return Changed::default();
         }
         let cwd = observed_cwd.unwrap_or_else(|| {
@@ -362,23 +451,48 @@ impl Core {
                 .map(|node| node.cwd.clone())
                 .unwrap_or_else(|| session.cwd.clone())
         });
-        let kind = turn_pty::classify(&command);
-        let mut node = ProcessNode::process(session_id.clone(), kind, command, cwd, now_ms);
+        let kind = if is_agent {
+            NodeKind::Agent
+        } else {
+            observed_kind
+        };
+        let mut node = if is_agent {
+            let mut node =
+                ProcessNode::agent(session_id.clone(), selection.adapter.id(), cwd, now_ms);
+            node.command = command;
+            node
+        } else {
+            ProcessNode::process(session_id.clone(), kind, command, cwd, now_ms)
+        };
+        if is_agent {
+            crate::core::spawn::describe_agent(&mut node, &selection);
+            // Discovery establishes identity, not turn state. The conservative PTY
+            // heuristic below may infer Active/Idle/Awaiting from visible evidence;
+            // until then Turn must not paint an invented Idle state.
+            node.turn = None;
+            node.env_highlights
+                .insert("TURN_INTEGRATION".into(), "heuristic".into());
+        }
         node.id = child;
         node.pid = Some(pid);
         node.ppid = ppid;
         node.args = args;
         node.lifecycle = Lifecycle::Alive;
-        let executable = node
-            .command
-            .split_whitespace()
-            .next()
-            .unwrap_or(&node.command)
-            .rsplit('/')
+        if !is_agent {
+            let title_executable = if executable.is_empty() {
+                node.command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(&node.command)
+            } else {
+                &executable
+            }
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or("process");
-        node.title = safe_untrusted_label(executable, turn_pty::MAX_TITLE_CHARS)
-            .unwrap_or_else(|| "process".into());
+            node.title = safe_untrusted_label(title_executable, turn_pty::MAX_TITLE_CHARS)
+                .unwrap_or_else(|| "process".into());
+        }
         // Inferred unless a tool said so. The UI draws the difference.
         let relation = if confirmed_parent {
             Relation::Confirmed
@@ -387,12 +501,63 @@ impl Core {
         };
         node.link_to(parent.clone(), relation);
         let id = session.tree.insert(node);
+        // A program typed into an interactive shell becomes the subject of that
+        // Pane while it owns the shell's foreground UI. Identity moves to the Agent;
+        // terminal ownership does not. Manual display overrides survive because
+        // `detect_kind` changes only automatic Panes.
+        if is_agent && parent_owns_foreground {
+            self.record_observed_terminal_subject(session_id, parent, &id, selection.adapter.id());
+        }
         Changed {
             node: Some(id),
             structure: true,
             refused: false,
         }
     }
+}
+
+pub(crate) fn same_provider_bootstrap_child(
+    parent: &ProcessNode,
+    parent_runtime_program: Option<&str>,
+    child_adapter_id: &str,
+    child_program: &str,
+    same_job: bool,
+    same_wrapper_subject: bool,
+) -> bool {
+    if !same_job || !parent.kind.is_agentic() {
+        return false;
+    }
+    let parent_adapter = parent
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.agent.tool.as_deref());
+    if parent_adapter != Some(child_adapter_id) {
+        return false;
+    }
+    let executable = |value: &str| {
+        let lower = value
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(value)
+            .to_ascii_lowercase();
+        lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+    };
+    let parent_program = parent_runtime_program.unwrap_or_else(|| {
+        parent
+            .args
+            .first()
+            .map(String::as_str)
+            .unwrap_or(&parent.command)
+    });
+    let parent_is_wrapper = matches!(
+        executable(parent_program).as_str(),
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "ruby"
+    );
+    let child_is_wrapper = matches!(
+        executable(child_program).as_str(),
+        "node" | "nodejs" | "bun" | "deno" | "python" | "python3" | "ruby"
+    );
+    parent_is_wrapper && (!child_is_wrapper || same_wrapper_subject)
 }
 
 fn opposite_identity_source(source: AgentIdentitySource) -> AgentIdentitySource {
@@ -517,6 +682,86 @@ mod tests {
             "{} characters exceeded the {max_chars}-character bound",
             value.chars().count()
         );
+    }
+
+    #[test]
+    fn a_same_job_provider_native_child_is_coalesced_only_below_its_runtime_wrapper() {
+        let session = SessionId::from_stored("sess_provider_bootstrap");
+        let mut wrapper = ProcessNode::agent(session.clone(), "codex", "/tmp", NOW);
+        wrapper.agent.as_mut().unwrap().agent.tool = Some("codex".into());
+        wrapper.args = vec![
+            "node".into(),
+            "/opt/homebrew/bin/codex".into(),
+            "--yolo".into(),
+        ];
+        assert!(same_provider_bootstrap_child(
+            &wrapper,
+            None,
+            "codex",
+            "/opt/lib/node_modules/@openai/codex/vendor/bin/codex",
+            true,
+            false,
+        ));
+        wrapper.args[0] = r"C:\Program Files\node\NODE.EXE".into();
+        assert!(same_provider_bootstrap_child(
+            &wrapper,
+            None,
+            "codex",
+            r"C:\npm\node_modules\@openai\codex\vendor\bin\CODEX.EXE",
+            true,
+            false,
+        ));
+        assert!(!same_provider_bootstrap_child(
+            &wrapper,
+            None,
+            "gemini-cli",
+            "/opt/homebrew/bin/gemini",
+            true,
+            false,
+        ));
+        assert!(!same_provider_bootstrap_child(
+            &wrapper,
+            None,
+            "codex",
+            "/opt/lib/node_modules/@openai/codex/vendor/bin/codex",
+            false,
+            false,
+        ));
+
+        let mut semantic_parent = ProcessNode::agent(session.clone(), "codex", "/tmp", NOW);
+        semantic_parent.agent.as_mut().unwrap().agent.tool = Some("codex".into());
+        semantic_parent.args = vec!["codex".into(), "exec".into()];
+        assert!(
+            !same_provider_bootstrap_child(&semantic_parent, None, "codex", "codex", true, false,),
+            "a real same-provider child below a semantic Agent is not a bootstrap shim"
+        );
+        assert!(same_provider_bootstrap_child(
+            &semantic_parent,
+            Some("/opt/homebrew/bin/node"),
+            "codex",
+            "/opt/lib/node_modules/@openai/codex/vendor/bin/codex",
+            true,
+            false,
+        ));
+
+        let mut gemini = ProcessNode::agent(session.clone(), "gemini-cli", "/tmp", NOW);
+        gemini.agent.as_mut().unwrap().agent.tool = Some("gemini-cli".into());
+        assert!(same_provider_bootstrap_child(
+            &gemini,
+            Some("/usr/local/bin/node"),
+            "gemini-cli",
+            "/usr/local/bin/node",
+            true,
+            true,
+        ));
+        assert!(!same_provider_bootstrap_child(
+            &gemini,
+            Some("/usr/local/bin/node"),
+            "gemini-cli",
+            "/usr/local/bin/node",
+            true,
+            false,
+        ));
     }
 
     fn add_parent(harness: &mut Harness, session_id: &SessionId, suffix: &str) -> NodeId {
@@ -1051,6 +1296,7 @@ mod tests {
                     pid: 42_424,
                     ppid: Some(42_000),
                     command: huge_argv,
+                    executable: "/opt/runner".into(),
                     args: hostile_args,
                     cwd: Some(hostile_cwd),
                     confirmed_parent: false,
@@ -1161,7 +1407,12 @@ mod tests {
                     pid: 42_001,
                     ppid: Some(42_000),
                     command: "/Applications/Godot.app/Godot --editor project.godot".into(),
-                    args: vec!["--editor".into(), "project.godot".into()],
+                    executable: "/Applications/Godot.app/Godot".into(),
+                    args: vec![
+                        "/Applications/Godot.app/Godot".into(),
+                        "--editor".into(),
+                        "project.godot".into(),
+                    ],
                     cwd: Some("/tmp/game".into()),
                     confirmed_parent: false,
                 },

@@ -4084,6 +4084,164 @@ fn pane_writes(actions: &[ViewAction]) -> Vec<&[u8]> {
         .collect()
 }
 
+fn pane_write_targets(actions: &[ViewAction]) -> Vec<(&PaneId, &[u8])> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            ViewAction::Pane {
+                pane_id,
+                action: PaneAction::Write(bytes),
+            } => Some((pane_id, bytes.as_slice())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Installs an operational Temporary Pane over the fixture without replacing its saved
+/// layout. Returning the durable binding as well makes it possible to exercise the exact
+/// Node WorkSurface with the same runtime underneath the overlay.
+fn with_temporary_terminal(mut fixture: Fixture) -> (Fixture, PaneId, NodeId, PaneId) {
+    fixture.permission = None;
+    fixture.queue.clear();
+    let temporary_id = PaneId::from_stored("pane_keyboard_lease_temporary");
+    let (binding, node_id, durable_id) = {
+        let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+        let surface_id = snapshot.tree_state.surface_id.clone();
+        let node = snapshot
+            .workspaces
+            .iter_mut()
+            .flat_map(|workspace| &mut workspace.sessions)
+            .flat_map(|session| &mut session.nodes)
+            .find(|node| node.title == "Claude Code")
+            .expect("Claude Code");
+        let durable_id = node
+            .pane_bindings
+            .iter()
+            .find(|binding| !binding.temporary)
+            .expect("Claude Code has a durable Pane")
+            .pane_id
+            .clone();
+        let binding = PaneNodeBinding {
+            pane_id: temporary_id.clone(),
+            session_id: node.session_id.clone(),
+            node_id: node.node_id.clone(),
+            temporary: true,
+            surface_id: Some(surface_id),
+            opened_ms: T0 + 16_000,
+        };
+        node.pane_bindings.push(binding.clone());
+        (binding, node.node_id.clone(), durable_id)
+    };
+    fixture.grids.insert(temporary_id.clone(), agent_screen());
+    fixture
+        .titles
+        .insert(temporary_id.clone(), "temporary Claude Code".into());
+    fixture.temporary_pane = Some(NodePaneView {
+        binding,
+        capability: NodePaneCapability::Terminal {
+            streams: vec![PaneStream::Cells],
+        },
+    });
+    (fixture, temporary_id, node_id, durable_id)
+}
+
+fn assert_temporary_terminal_owns_shift_enter(
+    fixture: Fixture,
+    temporary_id: &PaneId,
+    underlay: &str,
+) {
+    let mut h = harness(fixture);
+    h.run();
+    h.state_mut().actions.clear();
+
+    let shift = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::default()
+    };
+    h.event(egui::Event::ModifiersChanged(shift));
+    h.event(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: true,
+        repeat: false,
+        modifiers: shift,
+    });
+    h.event(egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: false,
+        repeat: false,
+        modifiers: shift,
+    });
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::default()));
+    h.run_steps(1);
+
+    let writes = pane_write_targets(&h.state().actions);
+    assert_eq!(
+        writes.len(),
+        1,
+        "one Shift+Enter over {underlay} must produce one PTY write; got {writes:?}"
+    );
+    assert_eq!(
+        writes[0].0, temporary_id,
+        "the Temporary Pane, not {underlay}, owns the keyboard lease"
+    );
+    assert_eq!(writes[0].1, b"\n", "the single write is multiline Ctrl-J");
+}
+
+#[test]
+fn a_temporary_terminal_is_the_only_shift_enter_recipient_over_a_tiled_layout() {
+    let (fixture, temporary_id, _, _) = with_temporary_terminal(busy_desk());
+    assert_temporary_terminal_owns_shift_enter(fixture, &temporary_id, "the tiled Layout");
+}
+
+#[test]
+fn a_temporary_terminal_is_the_only_shift_enter_recipient_over_a_floating_pane() {
+    let mut fixture = busy_desk();
+    let floating_id = fixture.focused.clone().expect("focused Pane");
+    assert!(fixture.layout.as_mut().expect("layout").float(
+        &floating_id,
+        PaneGeometry {
+            x: 520.0,
+            y: 100.0,
+            width: 460.0,
+            height: 320.0,
+        },
+    ));
+    let (fixture, temporary_id, _, _) = with_temporary_terminal(fixture);
+    assert_temporary_terminal_owns_shift_enter(fixture, &temporary_id, "a floating Pane");
+}
+
+#[test]
+fn a_temporary_terminal_is_the_only_shift_enter_recipient_over_an_exact_terminal() {
+    let (mut fixture, temporary_id, node_id, durable_id) = with_temporary_terminal(busy_desk());
+    fixture
+        .layout
+        .as_mut()
+        .expect("layout")
+        .get_mut(&durable_id)
+        .expect("durable Pane")
+        .node_id = Some(node_id.clone());
+    let snapshot = fixture.hierarchy.as_mut().expect("hierarchy");
+    snapshot.tree_state.selected = Some(HierarchyKey::process(node_id.clone()));
+    snapshot
+        .workspaces
+        .iter_mut()
+        .flat_map(|workspace| &mut workspace.sessions)
+        .flat_map(|session| &mut session.nodes)
+        .find(|node| node.node_id == node_id)
+        .expect("Claude Code")
+        .pane_capability = NodePaneCapability::Terminal {
+        streams: vec![PaneStream::Cells],
+    };
+
+    assert_temporary_terminal_owns_shift_enter(
+        fixture,
+        &temporary_id,
+        "the exact Node WorkSurface",
+    );
+}
+
 /// A modal is a keyboard lease, not just dark paint over a still-focused terminal.
 /// This drives real egui Text, Paste and Key events through a focused pane and the
 /// workspace sheet in the same frame — the ordering that previously leaked into PTY.

@@ -20,7 +20,7 @@
 
 use super::command::ClientId;
 use super::Core;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use turn_core::ids::{NodeId, PaneId, SessionId};
 use turn_proto::{PaneStream, ServerEvent, ServerFrame, ServerMessage};
@@ -398,8 +398,16 @@ impl Core {
     /// pane a second window was showing does not survive the first window closing it.
     pub(crate) fn detach_everyone(&mut self, session_id: &SessionId, pane_id: &PaneId) {
         let key = (session_id.clone(), pane_id.clone());
+        let runtimes = self
+            .clients
+            .values()
+            .filter_map(|client| client.attachments.get(&key)?.node_id.clone())
+            .collect::<HashSet<_>>();
         for client in self.clients.values_mut() {
             client.attachments.remove(&key);
+        }
+        for runtime in runtimes {
+            self.stop_pump_if_unwatched(&runtime);
         }
     }
 
@@ -697,6 +705,7 @@ mod tests {
     use crate::core::testing::Harness;
     use turn_core::ids::{NodeId, PaneId, SessionId};
     use turn_proto::{PtySize, Request, ServerEvent, ServerMessage};
+    use turn_pty::{ScreenSize, TerminalBuffer};
 
     const NOW: i64 = 1_775_000_000_000;
 
@@ -744,6 +753,10 @@ mod tests {
                 .expect("the session")
                 .layout;
             layout.get_mut(&pane).expect("the pane").node_id = Some(node.clone());
+            harness
+                .core
+                .recovered_terminals
+                .insert(node.clone(), TerminalBuffer::new(ScreenSize::new(24, 80)));
         }
 
         let (client, mut frames) = harness.add_client(64);
